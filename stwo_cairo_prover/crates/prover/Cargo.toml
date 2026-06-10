@@ -51,7 +51,7 @@ getrandom_v3 = { version = "0.3", package = "getrandom", features = ["wasm_js"] 
 
 [dev-dependencies]
 stwo-backend-cuda.workspace = true
-stwo-backend-cuda-kernels = { git = "https://github.com/teddyjfpender/stwo", rev = "90bdf523dd3ec473295795a0413d2dd947433aeb" }
+stwo-backend-cuda-kernels = { git = "https://github.com/teddyjfpender/stwo", rev = "8253222b4548b7318b5aec1339ed2a8f3dacdb03" }
 stwo-cairo-dev-utils = { path = "../dev_utils" }
 cairo-vm.workspace = true
 generic-tests = "0.1.3"
