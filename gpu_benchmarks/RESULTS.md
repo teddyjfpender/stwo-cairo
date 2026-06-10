@@ -87,3 +87,39 @@ kernels; NitrooZK report 67× on this exact phase) — removes ~11 s/prove and a
 CUDA ahead of same-host SIMD; (2) parameterize the logup cumsum to stop per-statement
 NVRTC recompiles (~17 s cold); (3) stream pipelining to remove per-launch
 synchronization; (4) witness-on-GPU / pinned transfers.
+
+## Optimized results — round 1 (RTX 3090 pod, same-host CUDA vs SIMD)
+
+After the OODS weights fix (parallel + batch inversion) and statement-independent
+NVRTC kernels — proofs byte-identical, all gates green. Community-pod host CPUs vary
+wildly between sessions, so only same-pod comparisons are meaningful:
+
+| program | n | cycles | CUDA warm (s) | SIMD warm (s) | verdict |
+|---|---|---|---|---|---|
+| fib | 1,048,576 | 7.34 M | **19.1** | 30.2 | **GPU 1.6×** |
+| mat_mul | 64 | 5.44 M | **13.3** | 16.6 | **GPU 1.25×** |
+| fib | 65,536 | 0.46 M | 9.8 | 8.1 | SIMD (floor-bound) |
+| ec | 1,024 | 0.24 M | 12.4 | 10.3 | SIMD (floor-bound) |
+| mat_mul | 32 | 0.71 M | 9.6 | ~8 | SIMD (floor-bound) |
+
+**Where the remaining GPU time goes** (optimized fib 1M, per rep): Composition 13.5 s
+(now dominant — the JIT kernels are suspected register-bound from full unrolling;
+`__launch_bounds__`/register budgeting is the round-2 fix), OODS 4.7 s (down from
+11.2 s — now equal to SIMD's), base+interaction witness on CPU 5.0 s (witness-on-GPU /
+pinned transfers), commits ~2 s.
+
+**Pattern**: the GPU wins where proving time actually hurts (multi-million-cycle
+workloads) and loses small workloads to its ~10 s fixed floor — dominated by
+preprocessed-tree construction and first-touch costs that NitrooZK eliminate with
+prove-cycle caches (their warm small-PIE is 0.25 s). Porting that caching layer (with
+explicit content keys — their implicit-key cache has an aliasing hazard) is the
+known fix for the floor.
+
+**Known issue**: fib at n=4,194,304 fails on this backend with "Error copying memory:
+invalid argument" — a u32 length overflow in the flat-trace device copy at log≥23
+sizes; fix queued (u64 lengths or chunked copies).
+
+**Normalized vs the NitrooZK base** (their RTX 5090: ~0.9 s per 1M VM steps warm):
+ours is now ~2.6 s per 1M steps on an RTX 3090 — within ~1.5–2× after accounting for
+the GPU generation gap, with composition register pressure, witness-on-GPU, batch NTT,
+and warm caches as the remaining levers to close and pass it.
