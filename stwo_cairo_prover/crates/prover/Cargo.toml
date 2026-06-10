@@ -41,6 +41,7 @@ stwo-constraint-framework = { workspace = true, features = ["parallel", "prover"
 cairo-vm.workspace = true
 libc = "0.2"
 bincode = "1"
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 tracing.workspace = true
 dashmap.workspace = true
 indexmap.workspace = true

@@ -108,6 +108,17 @@ fn prover_params() -> ProverParameters {
 }
 
 fn main() {
+    // STWO_BENCH_TRACE=1 prints every prover span with its duration on close;
+    // aggregate externally to get the phase breakdown.
+    if std::env::var("STWO_BENCH_TRACE").as_deref() == Ok("1") {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        tracing_subscriber::fmt()
+            .with_span_events(FmtSpan::CLOSE)
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let program = arg("--program").expect("--program <compiled.json>");
     let iterations: u64 = arg("--iterations")
         .expect("--iterations <n>")
