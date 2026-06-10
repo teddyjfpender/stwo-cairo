@@ -123,3 +123,38 @@ sizes; fix queued (u64 lengths or chunked copies).
 ours is now ~2.6 s per 1M steps on an RTX 3090 — within ~1.5–2× after accounting for
 the GPU generation gap, with composition register pressure, witness-on-GPU, batch NTT,
 and warm caches as the remaining levers to close and pass it.
+
+## Optimized results — round 2 (RTX 3090 pod, warm incl. prove-cycle caches)
+
+Round-2 levers: JIT **register compaction** (linear-scan reuse; the recorder's
+monotonic SSA allocation was spilling large kernels to local memory) +
+`__launch_bounds__(128)`; **pointer-table trace ABI** (no flatten copies, no u32
+overflow); **prove-cycle caches with explicit content keys** (twiddles, preprocessed
+tree). All gates green (conformance byte-equality, differential verify, Cairo e2e).
+
+| program | n | R1 CUDA (s) | **R2 CUDA (s)** | R2 SIMD same-host (s) | verdict |
+|---|---|---|---|---|---|
+| fib | 1,048,576 | 19.1 | **13.2** | 24.3 | **GPU 1.84×** |
+| mat_mul | 64 | 13.3 | **9.4** | 11.7 | **GPU 1.24×** |
+| mat_mul | 32 | 9.6 | **6.7** | — | — |
+| fib | 65,536 | 9.8 | **6.9** | 2.7 | SIMD 2.5× |
+| ec | 1,024 | 12.4 | **8.8** | 5.2 | SIMD 1.7× |
+| ec | 256 | 12.0 | **8.5** | — | — |
+
+Notes:
+- CUDA improved ~30% across every program; verify dropped to ~4 ms.
+- The caches are backend-generic, so **SIMD's small-n floor collapsed too** (fib 65k:
+  8.1 → 2.7 s) — honest accounting: the cache lever lifted both backends.
+- The remaining GPU small-n floor (~6.8 s) is per-launch synchronization, per-column
+  OODS launches, and CPU witness + transfer — the queued round-3 items (stream
+  pipelining, batched OODS, witness-on-GPU, parallel NVRTC for cold).
+- fib 4M exceeds 24 GB VRAM on the 3090 (peaks in the quotient/FRI phase, which tree
+  compaction does not cover) — needs the full host-spill streaming (L1) or a ≥40 GB
+  card; the H100 ran it in 36.9 GB.
+- 5090/4090 were out of stock for this session; the multi-arch fatbin binary makes a
+  5090 rerun a minutes-long job when stock returns.
+
+**Journey on fib 1M (same GPU class, same-host SIMD)**: v1 30.2 s CUDA-loses →
+round 1 19.1 s (GPU 1.6×) → round 2 **13.2 s (GPU 1.84×)** ≈ 1.8 s per 1M VM steps —
+at NitrooZK's published 5090 base (~0.9 s/1M steps) once adjusted for the GPU
+generation gap.
