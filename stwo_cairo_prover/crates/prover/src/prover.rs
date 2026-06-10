@@ -60,6 +60,7 @@ fn prove_verify_serialize<MC: MerkleChannel>(
 ) -> Result<()>
 where
     SimdBackend: BackendForChannel<MC>,
+    MC: 'static,
     MC::H: MerkleHasherLifted + Serialize,
     <MC::H as MerkleHasherLifted>::Hash: CairoSerialize,
 {
@@ -80,7 +81,9 @@ pub fn prove_cairo<B, MC: MerkleChannel>(
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
     B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
-        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace,
+        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + 'static,
+    MC: 'static,
 {
     let _span = span!(Level::INFO, "prove_cairo").entered();
     let ProverParameters {
@@ -131,30 +134,79 @@ where
         max_domain_log_size = lifting_log_size;
     }
     let span = span!(Level::INFO, "Precompute Twiddles").entered();
-    let twiddles = B::precompute_twiddles(
-        CanonicCoset::try_new(max_domain_log_size)?
-            .circle_domain()
-            .half_coset,
-    );
+    // Prove-cycle twiddle cache, EXPLICITLY keyed by (backend type, log size) —
+    // never by pointers or implicit scope. Cached trees are leaked (bounded by the
+    // number of distinct sizes per process) and shared read-only across proves.
+    let twiddles: &'static _ = {
+        use std::any::TypeId;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        static CACHE: Mutex<Option<HashMap<(TypeId, u32), usize>>> = Mutex::new(None);
+        let key = (TypeId::of::<B>(), max_domain_log_size);
+        let mut guard = CACHE.lock().unwrap();
+        let map = guard.get_or_insert_with(HashMap::new);
+        let ptr = *map.entry(key).or_insert_with(|| {
+            let tree = B::precompute_twiddles(
+                CanonicCoset::new(max_domain_log_size).circle_domain().half_coset,
+            );
+            Box::leak(Box::new(tree)) as *const _ as usize
+        });
+        // Safety: the leaked tree is 'static, read-only after construction, and the
+        // key includes the backend type, so the cast type always matches.
+        unsafe { &*(ptr as *const stwo::prover::poly::twiddles::TwiddleTree<B>) }
+    };
     span.exit();
 
     let span = span!(Level::INFO, "Compute preprocessed trace commitment").entered();
-    // The preprocessed trace is generated on the SIMD (witness) backend and transferred to
-    // the proving backend at the commitment boundary.
-    let preprocessed_trace_polys = B::interpolate_columns(
-        B::gen_preprocessed_trace(preprocessed_trace.clone()),
-        &twiddles,
-    );
-
     let base_column_pool = BaseColumnPool::new();
-    let preprocessed_tree = MaybeOwned::Owned(CommitmentTreeProver::<B, MC>::new(
-        preprocessed_trace_polys,
-        pcs_config.fri_config.log_blowup_factor,
-        &twiddles,
-        store_polynomials_coefficients,
-        pcs_config.lifting_log_size,
-        &base_column_pool,
-    ));
+    // Prove-cycle preprocessed-tree cache, EXPLICITLY keyed by (backend+channel type,
+    // column ids + log sizes digest, blowup, lifting, store-coeffs). Skipped in
+    // low-memory mode (compaction wants ownership). The commitment root is mixed into
+    // the channel as usual, so transcripts are unchanged.
+    let low_memory = std::env::var("STWO_CAIRO_LOW_MEMORY").as_deref() == Ok("1");
+    let preprocessed_tree: MaybeOwned<'_, CommitmentTreeProver<B, MC>> = {
+        use std::any::TypeId;
+        use std::collections::hash_map::DefaultHasher;
+        use std::collections::HashMap;
+        use std::hash::{Hash, Hasher};
+        use std::sync::Mutex;
+        let mut hasher = DefaultHasher::new();
+        for id in preprocessed_trace.ids() {
+            id.id.hash(&mut hasher);
+        }
+        preprocessed_trace.log_sizes().hash(&mut hasher);
+        pcs_config.fri_config.log_blowup_factor.hash(&mut hasher);
+        pcs_config.lifting_log_size.hash(&mut hasher);
+        store_polynomials_coefficients.hash(&mut hasher);
+        let key = (TypeId::of::<(B, MC)>(), hasher.finish());
+
+        static CACHE: Mutex<Option<HashMap<(TypeId, u64), usize>>> = Mutex::new(None);
+        let build = || {
+            let preprocessed_trace_polys = B::interpolate_columns(
+                B::gen_preprocessed_trace(preprocessed_trace.clone()),
+                twiddles,
+            );
+            CommitmentTreeProver::<B, MC>::new(
+                preprocessed_trace_polys,
+                pcs_config.fri_config.log_blowup_factor,
+                twiddles,
+                store_polynomials_coefficients,
+                pcs_config.lifting_log_size,
+                &base_column_pool,
+            )
+        };
+        if low_memory {
+            MaybeOwned::Owned(build())
+        } else {
+            let mut guard = CACHE.lock().unwrap();
+            let map = guard.get_or_insert_with(HashMap::new);
+            let ptr = *map
+                .entry(key)
+                .or_insert_with(|| Box::leak(Box::new(build())) as *const _ as usize);
+            // Safety: 'static leaked tree, read-only, key includes (B, MC) TypeId.
+            MaybeOwned::Borrowed(unsafe { &*(ptr as *const CommitmentTreeProver<B, MC>) })
+        }
+    };
     span.exit();
 
     prove_cairo_common::<B, MC>(
@@ -179,7 +231,9 @@ pub fn prove_cairo_with_precompute<'a, B, MC: MerkleChannel>(
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
     B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
-        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace,
+        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + 'static,
+    MC: 'static,
 {
     let _span = span!(Level::INFO, "prove_cairo").entered();
 
@@ -215,7 +269,9 @@ fn prove_cairo_common<'a, B, MC: MerkleChannel>(
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
     B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
-        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace,
+        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + 'static,
+    MC: 'static,
 {
     let ProverParameters {
         channel_hash: _,
