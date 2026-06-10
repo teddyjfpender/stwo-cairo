@@ -41,7 +41,7 @@ use tracing::{event, span, Level};
 use crate::utils::cairo_provers;
 use crate::witness::cairo::create_cairo_claim_generator;
 use crate::witness::cairo_claim_generator::CairoInteractionClaimGenerator;
-use crate::witness::preprocessed_trace::gen_trace;
+use crate::witness::preprocessed_trace_backend::GenPreprocessedTrace;
 use crate::witness::utils::witness_trace_cells;
 
 mod json {
@@ -79,7 +79,8 @@ pub fn prove_cairo<B, MC: MerkleChannel>(
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns,
+    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace,
 {
     let _span = span!(Level::INFO, "prove_cairo").entered();
     let ProverParameters {
@@ -141,7 +142,7 @@ where
     // The preprocessed trace is generated on the SIMD (witness) backend and transferred to
     // the proving backend at the commitment boundary.
     let preprocessed_trace_polys = B::interpolate_columns(
-        B::from_simd_evals(gen_trace(preprocessed_trace.clone())),
+        B::gen_preprocessed_trace(preprocessed_trace.clone()),
         &twiddles,
     );
 
@@ -177,7 +178,8 @@ pub fn prove_cairo_with_precompute<'a, B, MC: MerkleChannel>(
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns,
+    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace,
 {
     let _span = span!(Level::INFO, "prove_cairo").entered();
 
@@ -212,7 +214,8 @@ fn prove_cairo_common<'a, B, MC: MerkleChannel>(
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns,
+    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace,
 {
     let ProverParameters {
         channel_hash: _,
