@@ -1,0 +1,68 @@
+# Cairo e2e GPU proving benchmarks (stwo-book format)
+
+Methodology mirrors [zksecurity/zkvm-benchmarks](https://github.com/zksecurity/zkvm-benchmarks)'
+stwo runner (the source of the [stwo-book benchmark tables](https://zksecurity.github.io/stwo-book/benchmarks/index.html)):
+same Cairo programs and `program_input` hint, Cairo VM in proof mode, secure prover
+configuration (`pow_bits=26`, blowup 1, 70 FRI queries — ~96 bits), preprocessed trace
+`CanonicalWithoutPedersen`, proof size via bincode, cycle count = sum of opcode counts.
+Harness: `crates/prover/src/bin/gpu_bench.rs`.
+
+**Hardware**: RunPod secure-cloud **H100 SXM 80 GB**, 208-vCPU host, CUDA 11.8.
+**Warm** times exclude the per-process NVRTC compile of the JIT constraint kernels
+(~20–40 s once per process per statement shape); **cold** includes it. The SIMD rows
+ran on the same host's 208 vCPUs for a like-for-like comparison. stwo-book CPU rows
+(48-vCPU EPYC-Rome, July 2025 stwo) included for reference.
+
+## Fibonacci (`n` iterations)
+
+| n | backend | cycle count | prove warm (s) | prove cold (s) | verify (ms) | proof (KB) | peak RSS (GB) | peak VRAM (GB) | steps/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 65,536 | **CUDA H100** | 458,768 | **13.57** | 35.9 | 6.0 | 1,097 | 1.7 | 4.8 | 33.8 k |
+| 1,048,576 | **CUDA H100** | 7,340,048 | **30.23** | 52.0 | 6.2 | 1,242 | 10.2 | 10.9 | 242.8 k |
+| 4,194,304 | **CUDA H100** | 29,360,144 | **98.78** | 120.7 | 6.7 | 1,375 | 31.9 | 36.9 | 297.2 k |
+| 1,048,576 | SIMD (208 vCPU, same host) | 7,340,048 | 13.11 | 13.9 | 5.9 | 1,242 | 15.2 | — | 560.0 k |
+| 65,536 | stwo-book CPU (48 vCPU) | — | 11.37 | — | — | — | — | — | — |
+| 1,048,576 | stwo-book CPU (48 vCPU) | — | 18.61 | — | — | — | — | — | — |
+| 4,194,304 | stwo-book CPU (48 vCPU) | — | 60.94 | — | — | — | — | — | — |
+
+## Matrix multiplication (`n`×`n`)
+
+| n | backend | cycle count | prove warm (s) | prove cold (s) | verify (ms) | proof (KB) | peak RSS (GB) | peak VRAM (GB) | steps/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 32 | **CUDA H100** | 705,179 | **13.77** | 34.6 | 5.8 | 1,087 | 1.8 | 4.8 | 51.2 k |
+| 64 | **CUDA H100** | 5,440,763 | **19.58** | 41.5 | 5.8 | 1,165 | 6.1 | 6.4 | 277.8 k |
+| 64 | SIMD (208 vCPU, same host) | 5,440,763 | 7.41 | 8.0 | 5.8 | 1,165 | 10.3 | — | 734.3 k |
+
+## EC add, secp256k1 (`n` operations)
+
+| n | backend | cycle count | prove warm (s) | prove cold (s) | verify (ms) | proof (KB) | peak RSS (GB) | peak VRAM (GB) | steps/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 256 | **CUDA H100** | 59,938 | **16.55** | 55.7 | 7.1 | 1,189 | 1.0 | 4.8 | 3.6 k |
+| 1,024 | **CUDA H100** | 239,650 | **17.01** | 55.2 | 6.5 | 1,197 | 1.4 | 4.8 | 14.1 k |
+| 1,024 | SIMD (208 vCPU, same host) | 239,650 | 5.22 | 5.4 | 6.4 | 1,197 | 6.1 | — | 45.9 k |
+
+## SHA2-chain (`n` chained hashes)
+
+| n | backend | cycle count | prove warm (s) | prove cold (s) | verify (ms) | proof (KB) | peak RSS (GB) | peak VRAM (GB) | steps/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | **CUDA H100** | 23,058 | **15.98** | 52.9 | 7.4 | 1,221 | 1.0 | 4.8 | 1.4 k |
+
+## Honest reading
+
+- **The v1 CUDA lane does not yet beat a strong CPU on real Cairo e2e proving.** On
+  this 208-vCPU host, SIMD is 2.3–3.3× faster across these workloads; the stwo-book's
+  48-vCPU rows also beat the H100 at every fib size. Real Cairo proofs are dominated by
+  the ~46-component pipeline's per-component overheads (per-launch synchronization,
+  host roundtrips, witness on CPU + transfer), not by the bulk math the GPU wins at —
+  the same conclusion as the backend's microbenchmarks, where the GPU *does* win 2×+
+  against weaker hosts on single-component AIRs.
+- **GPU throughput scales with size** (fib: 34 k → 243 k → 297 k steps/s from 65 k to
+  4 M cycles) while its absolute floor (~13.5 s at small n, all programs) is fixed
+  overhead — small workloads are entirely floor. The crossover vs strong CPUs lies
+  beyond these sizes and/or after the documented v1 headroom is removed (stream
+  pipelining, witness-on-GPU, batched commits, cumsum parameterization to kill the
+  20–40 s cold NVRTC cost).
+- **Memory**: fib 4 M peaked at 36.9 GB VRAM (an 80 GB card is comfortable; 24 GB
+  consumer cards would need the low-memory mode) and ~32 GB host RSS. Proof sizes and
+  ~6 ms verification match the CPU backend byte-for-byte, as gated by the conformance
+  suite.
