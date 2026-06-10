@@ -649,6 +649,55 @@ pub mod tests {
             verify_cairo::<Blake2sMerkleChannel>(cairo_proof.into()).unwrap();
         }
 
+        /// E2E Cairo proof on the CUDA backend, byte-compared against the SIMD proof of
+        /// the same input. Skips without a CUDA build (the kernels crate stubs out).
+        #[test_log::test]
+        fn test_prove_verify_all_opcode_components_cuda() {
+            if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+                eprintln!("skipping CUDA e2e: kernels not built (no nvcc)");
+                return;
+            }
+            let compiled_program =
+                get_compiled_cairo_program_path("test_prove_verify_all_opcode_components");
+            let prover_params = || ProverParameters {
+                channel_hash: ChannelHash::Blake2s,
+                pcs_config: PcsConfig::default(),
+                preprocessed_trace: PreProcessedTraceVariant::CanonicalWithoutPedersen,
+                channel_salt: 0,
+                store_polynomials_coefficients: true,
+                include_all_preprocessed_columns: false,
+                opt_n_id_to_big_components: None,
+            };
+            let run_input = || {
+                run_and_adapt(
+                    &compiled_program,
+                    ProgramType::Json,
+                    LayoutName::all_cairo_stwo,
+                    None,
+                )
+                .unwrap()
+            };
+
+            let cuda_proof = prove_cairo::<stwo_backend_cuda::CudaBackend, Blake2sMerkleChannel>(
+                run_input(),
+                prover_params(),
+            )
+            .unwrap();
+            verify_cairo::<Blake2sMerkleChannel>(cuda_proof.clone().into()).unwrap();
+
+            // The decisive gate: byte-identical to the reference backend's proof.
+            let simd_proof = prove_cairo::<SimdBackend, Blake2sMerkleChannel>(
+                run_input(),
+                prover_params(),
+            )
+            .unwrap();
+            let mut cuda_felts: Vec<starknet_ff::FieldElement> = Vec::new();
+            CairoSerialize::serialize(&cuda_proof, &mut cuda_felts);
+            let mut simd_felts: Vec<starknet_ff::FieldElement> = Vec::new();
+            CairoSerialize::serialize(&simd_proof, &mut simd_felts);
+            assert_eq!(cuda_felts, simd_felts, "CUDA proof differs from SIMD proof");
+        }
+
         #[test]
         fn test_e2e_prove_cairo_verify_all_opcode_components() {
             let compiled_program =
