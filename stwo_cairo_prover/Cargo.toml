@@ -55,11 +55,11 @@ stwo-cairo-common = { path = "crates/common", version = "~1.2.2" }
 cairo-air = { path = "crates/cairo-air", version = "~1.2.2" }
 stwo-cairo-serialize = { path = "crates/cairo-serialize", version = "~1.2.2" }
 stwo-cairo-serialize-derive = { path = "crates/cairo-serialize-derive", version = "~1.2.2" }
-stwo = { git = "https://github.com/teddyjfpender/stwo", rev = "90973bf6fc3402836aee33fadddf0582b2ddf8c0" }
-stwo-backend-cuda = { git = "https://github.com/teddyjfpender/stwo", rev = "90973bf6fc3402836aee33fadddf0582b2ddf8c0" }
-stwo-constraint-framework = { git = "https://github.com/teddyjfpender/stwo", rev = "90973bf6fc3402836aee33fadddf0582b2ddf8c0" }
-stwo-air-utils-derive = { git = "https://github.com/teddyjfpender/stwo", rev = "90973bf6fc3402836aee33fadddf0582b2ddf8c0" }
-stwo-air-utils = { git = "https://github.com/teddyjfpender/stwo", rev = "90973bf6fc3402836aee33fadddf0582b2ddf8c0" }
+stwo = { git = "https://github.com/teddyjfpender/stwo", rev = "d8d4b09c2d89ed5afda491ebdb4122df1d9b2cea" }
+stwo-backend-cuda = { git = "https://github.com/teddyjfpender/stwo", rev = "d8d4b09c2d89ed5afda491ebdb4122df1d9b2cea" }
+stwo-constraint-framework = { git = "https://github.com/teddyjfpender/stwo", rev = "d8d4b09c2d89ed5afda491ebdb4122df1d9b2cea" }
+stwo-air-utils-derive = { git = "https://github.com/teddyjfpender/stwo", rev = "d8d4b09c2d89ed5afda491ebdb4122df1d9b2cea" }
+stwo-air-utils = { git = "https://github.com/teddyjfpender/stwo", rev = "d8d4b09c2d89ed5afda491ebdb4122df1d9b2cea" }
 test-case = "3.3.1"
 thiserror = { version = "2.0.12", default-features = false }
 tracing = "0.1.40"
