@@ -235,6 +235,12 @@ where
     pcs_config.mix_into(channel);
     let mut commitment_scheme =
         CommitmentSchemeProver::<B, MC>::with_memory_pool(pcs_config, twiddles, base_column_pool);
+    // Big-trace mode (the L1 spill architecture): compact committed columns after each
+    // commit and regenerate bit-exactly at decommit. Proofs are byte-identical either
+    // way; peak memory drops by the committed-LDE retention term.
+    if std::env::var("STWO_CAIRO_LOW_MEMORY").as_deref() == Ok("1") {
+        commitment_scheme.set_low_memory();
+    }
     if store_polynomials_coefficients {
         commitment_scheme.set_store_polynomials_coefficients();
     }
