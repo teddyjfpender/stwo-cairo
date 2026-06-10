@@ -66,3 +66,24 @@ ran on the same host's 208 vCPUs for a like-for-like comparison. stwo-book CPU r
   consumer cards would need the low-memory mode) and ~32 GB host RSS. Proof sizes and
   ~6 ms verification match the CPU backend byte-for-byte, as gated by the conformance
   suite.
+
+## Utilization investigation (fib 1M, RTX 3090 pod)
+
+`nvidia-smi dmon` during the CUDA prove: **median SM utilization 0%, max 100%** — the
+GPU is idle most of the prove. Per-phase span totals (2 reps) confirm the bulk math
+already wins on GPU and two host-bound phases dominate:
+
+| phase (fib 1M, per 2 reps) | CUDA | SIMD (same host) | verdict |
+|---|---|---|---|
+| OODS column evaluation | 22.4 s | 4.7 s | **host-roundtrip barycentric — top fix: GPU batch OODS** |
+| Composition (constraint eval) | 33.6 s (incl. ~17 s one-time NVRTC) | 16.1 s | cumsum param kills the NVRTC share |
+| Commitments (Merkle+NTT) | 1.2 s | 5.2 s | GPU wins 4× |
+| FRI quotients | 0.2 s | 0.7 s | GPU wins |
+| Interpolation | 0.1 s | 0.8 s | GPU wins |
+| PoW grind (pow_bits 26) | 0.04 s | 2.2 s | GPU wins ~60× |
+
+Ranked fixes: (1) batch OODS evaluation on GPU (the staged `batch_eval_at_point`
+kernels; NitrooZK report 67× on this exact phase) — removes ~11 s/prove and alone puts
+CUDA ahead of same-host SIMD; (2) parameterize the logup cumsum to stop per-statement
+NVRTC recompiles (~17 s cold); (3) stream pipelining to remove per-launch
+synchronization; (4) witness-on-GPU / pinned transfers.
