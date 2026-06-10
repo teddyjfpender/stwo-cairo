@@ -3586,6 +3586,7 @@ name = "stwo-cairo-prover"
 version = "1.2.2"
 dependencies = [
  "anyhow",
+ "bincode 1.3.3",
  "bytemuck",
  "cairo-air",
  "cairo-vm",
@@ -3596,6 +3597,7 @@ dependencies = [
  "hex",
  "indexmap",
  "itertools 0.12.1",
+ "libc",
  "num-traits",
  "paste",
  "rand 0.8.5",

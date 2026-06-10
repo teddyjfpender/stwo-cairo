@@ -38,6 +38,9 @@ stwo = { workspace = true, features = ["parallel", "prover"] }
 stwo-backend-cuda.workspace = true
 stwo-backend-cuda-kernels = { git = "https://github.com/teddyjfpender/stwo", rev = "73f371d546c0abb4a6be0ac9807863547c40d0f6" }
 stwo-constraint-framework = { workspace = true, features = ["parallel", "prover"] }
+cairo-vm.workspace = true
+libc = "0.2"
+bincode = "1"
 tracing.workspace = true
 dashmap.workspace = true
 indexmap.workspace = true
@@ -54,7 +57,6 @@ getrandom_v3 = { version = "0.3", package = "getrandom", features = ["wasm_js"] 
 [dev-dependencies]
 stwo-backend-cuda-kernels = { git = "https://github.com/teddyjfpender/stwo", rev = "73f371d546c0abb4a6be0ac9807863547c40d0f6" }
 stwo-cairo-dev-utils = { path = "../dev_utils" }
-cairo-vm.workspace = true
 generic-tests = "0.1.3"
 tempfile = "3.19.1"
 test-log = { version = "0.2.17", features = ["trace"] }
