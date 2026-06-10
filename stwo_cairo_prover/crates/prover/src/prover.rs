@@ -23,7 +23,7 @@ use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::BackendForChannel;
+use stwo::prover::backend::{BackendForChannel, FromSimdColumns};
 use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
@@ -35,6 +35,7 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
 };
 use stwo_cairo_common::preprocessed_columns::simd_prelude::CircleEvaluation;
 use stwo_cairo_serialize::CairoSerialize;
+use stwo_constraint_framework::FrameworkBackend;
 use tracing::{event, span, Level};
 
 use crate::utils::cairo_provers;
@@ -62,7 +63,7 @@ where
     MC::H: MerkleHasherLifted + Serialize,
     <MC::H as MerkleHasherLifted>::Hash: CairoSerialize,
 {
-    let cairo_proof = prove_cairo::<MC>(input, proof_params)?;
+    let cairo_proof = prove_cairo::<SimdBackend, MC>(input, proof_params)?;
     if verify {
         verify_cairo_ex::<MC>(
             cairo_proof.clone().into(),
@@ -73,12 +74,12 @@ where
     Ok(())
 }
 
-pub fn prove_cairo<MC: MerkleChannel>(
+pub fn prove_cairo<B, MC: MerkleChannel>(
     input: ProverInput,
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    SimdBackend: BackendForChannel<MC>,
+    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns,
 {
     let _span = span!(Level::INFO, "prove_cairo").entered();
     let ProverParameters {
@@ -129,7 +130,7 @@ where
         max_domain_log_size = lifting_log_size;
     }
     let span = span!(Level::INFO, "Precompute Twiddles").entered();
-    let twiddles = SimdBackend::precompute_twiddles(
+    let twiddles = B::precompute_twiddles(
         CanonicCoset::try_new(max_domain_log_size)?
             .circle_domain()
             .half_coset,
@@ -137,11 +138,15 @@ where
     span.exit();
 
     let span = span!(Level::INFO, "Compute preprocessed trace commitment").entered();
-    let preprocessed_trace_polys =
-        SimdBackend::interpolate_columns(gen_trace(preprocessed_trace.clone()), &twiddles);
+    // The preprocessed trace is generated on the SIMD (witness) backend and transferred to
+    // the proving backend at the commitment boundary.
+    let preprocessed_trace_polys = B::interpolate_columns(
+        B::from_simd_evals(gen_trace(preprocessed_trace.clone())),
+        &twiddles,
+    );
 
     let base_column_pool = BaseColumnPool::new();
-    let preprocessed_tree = MaybeOwned::Owned(CommitmentTreeProver::<SimdBackend, MC>::new(
+    let preprocessed_tree = MaybeOwned::Owned(CommitmentTreeProver::<B, MC>::new(
         preprocessed_trace_polys,
         pcs_config.fri_config.log_blowup_factor,
         &twiddles,
@@ -151,7 +156,7 @@ where
     ));
     span.exit();
 
-    prove_cairo_common::<MC>(
+    prove_cairo_common::<B, MC>(
         &twiddles,
         &base_column_pool,
         preprocessed_trace,
@@ -163,16 +168,16 @@ where
     )
 }
 
-pub fn prove_cairo_with_precompute<'a, MC: MerkleChannel>(
-    base_column_pool: &BaseColumnPool<SimdBackend>,
-    twiddles: &TwiddleTree<SimdBackend>,
+pub fn prove_cairo_with_precompute<'a, B, MC: MerkleChannel>(
+    base_column_pool: &BaseColumnPool<B>,
+    twiddles: &TwiddleTree<B>,
     preprocessed_trace: Arc<PreProcessedTrace>,
-    preprocessed_tree: MaybeOwned<'a, CommitmentTreeProver<SimdBackend, MC>>,
+    preprocessed_tree: MaybeOwned<'a, CommitmentTreeProver<B, MC>>,
     input: ProverInput,
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    SimdBackend: BackendForChannel<MC>,
+    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns,
 {
     let _span = span!(Level::INFO, "prove_cairo").entered();
 
@@ -184,7 +189,7 @@ where
         cairo_claim_generator.write_trace(prover_params.opt_n_id_to_big_components);
     span.exit();
 
-    prove_cairo_common::<MC>(
+    prove_cairo_common::<B, MC>(
         twiddles,
         base_column_pool,
         preprocessed_trace,
@@ -196,18 +201,18 @@ where
     )
 }
 
-fn prove_cairo_common<'a, MC: MerkleChannel>(
-    twiddles: &TwiddleTree<SimdBackend>,
-    base_column_pool: &BaseColumnPool<SimdBackend>,
+fn prove_cairo_common<'a, B, MC: MerkleChannel>(
+    twiddles: &TwiddleTree<B>,
+    base_column_pool: &BaseColumnPool<B>,
     preprocessed_trace: Arc<PreProcessedTrace>,
-    preprocessed_tree: MaybeOwned<'a, CommitmentTreeProver<SimdBackend, MC>>,
+    preprocessed_tree: MaybeOwned<'a, CommitmentTreeProver<B, MC>>,
     trace_evals: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
     claim: CairoClaim,
     interaction_generator: CairoInteractionClaimGenerator,
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    SimdBackend: BackendForChannel<MC>,
+    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns,
 {
     let ProverParameters {
         channel_hash: _,
@@ -225,11 +230,8 @@ where
     // Mix channel salt. Note that we first reduce it modulo `M31::P`, then cast it as QM31.
     channel.mix_felts(&[channel_salt.into()]);
     pcs_config.mix_into(channel);
-    let mut commitment_scheme = CommitmentSchemeProver::<SimdBackend, MC>::with_memory_pool(
-        pcs_config,
-        twiddles,
-        base_column_pool,
-    );
+    let mut commitment_scheme =
+        CommitmentSchemeProver::<B, MC>::with_memory_pool(pcs_config, twiddles, base_column_pool);
     if store_polynomials_coefficients {
         commitment_scheme.set_store_polynomials_coefficients();
     }
@@ -241,12 +243,13 @@ where
     claim.mix_into::<MC>(channel);
     let span = span!(Level::INFO, "Compute base trace commitment").entered();
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(trace_evals);
+    // The witness is generated on the SIMD backend; transfer it to the proving backend.
+    tree_builder.extend_evals(B::from_simd_evals(trace_evals));
     tree_builder.commit(channel);
     span.exit();
 
     // Draw interaction elements.
-    let interaction_pow = SimdBackend::grind(channel, INTERACTION_POW_BITS);
+    let interaction_pow = B::grind(channel, INTERACTION_POW_BITS);
     channel.mix_u64(interaction_pow);
     let interaction_elements = CommonLookupElements::draw(channel);
 
@@ -269,7 +272,7 @@ where
 
     let span = span!(Level::INFO, "Compute interaction trace commitment").entered();
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(interaction_trace_evals);
+    tree_builder.extend_evals(B::from_simd_evals(interaction_trace_evals));
     tree_builder.commit(channel);
     span.exit();
 
@@ -293,11 +296,11 @@ where
         tracing::info!("Relations summary: {:?}", summary);
     }
 
-    let components = cairo_provers(&component_builder);
+    let components = cairo_provers::<B>(&component_builder);
 
     // Prove stark.
     let span = span!(Level::INFO, "Prove STARKs").entered();
-    let proof = prove_ex::<SimdBackend, _>(
+    let proof = prove_ex::<B, _>(
         &components,
         channel,
         commitment_scheme,
@@ -490,6 +493,7 @@ pub mod tests {
         use stwo::core::fri::FriConfig;
         use stwo::core::pcs::PcsConfig;
         use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel;
+        use stwo::prover::backend::simd::SimdBackend;
         use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
         use stwo_cairo_dev_utils::utils::get_proof_file_path;
         use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
@@ -524,7 +528,7 @@ pub mod tests {
                 opt_n_id_to_big_components: None,
             };
             let cairo_proof =
-                prove_cairo::<Poseidon252MerkleChannel>(input, prover_params).unwrap();
+                prove_cairo::<SimdBackend, Poseidon252MerkleChannel>(input, prover_params).unwrap();
             let mut proof_file = NamedTempFile::new().unwrap();
             let mut serialized: Vec<starknet_ff::FieldElement> = Vec::new();
             CairoSerialize::serialize(&cairo_proof, &mut serialized);
@@ -583,6 +587,7 @@ pub mod tests {
         use stwo::core::fri::FriConfig;
         use stwo::core::pcs::PcsConfig;
         use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+        use stwo::prover::backend::simd::SimdBackend;
         use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
         use stwo_cairo_dev_utils::utils::{get_compiled_cairo_program_path, get_proof_file_path};
         use stwo_cairo_serialize::CairoSerialize;
@@ -639,7 +644,8 @@ pub mod tests {
                 include_all_preprocessed_columns: false,
                 opt_n_id_to_big_components: None,
             };
-            let cairo_proof = prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
+            let cairo_proof =
+                prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input, prover_params).unwrap();
             verify_cairo::<Blake2sMerkleChannel>(cairo_proof.into()).unwrap();
         }
 
@@ -667,7 +673,8 @@ pub mod tests {
                 include_all_preprocessed_columns: false,
                 opt_n_id_to_big_components: None,
             };
-            let cairo_proof = prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
+            let cairo_proof =
+                prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input, prover_params).unwrap();
             let mut proof_file = NamedTempFile::new().unwrap();
             let mut serialized: Vec<starknet_ff::FieldElement> = Vec::new();
             CairoSerialize::serialize(&cairo_proof, &mut serialized);
@@ -737,7 +744,8 @@ pub mod tests {
                 include_all_preprocessed_columns: false,
                 opt_n_id_to_big_components: None,
             };
-            let cairo_proof = prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
+            let cairo_proof =
+                prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input, prover_params).unwrap();
             let mut proof_file = NamedTempFile::new().unwrap();
             let mut serialized: Vec<starknet_ff::FieldElement> = Vec::new();
             CairoSerialize::serialize(&cairo_proof, &mut serialized);
@@ -787,9 +795,12 @@ pub mod tests {
             let proofs = (0..n_proofs_to_compare)
                 .map(|_| {
                     let proof: CairoProofForRustVerifier<_> =
-                        prove_cairo::<Blake2sMerkleChannel>(input.clone(), prover_params)
-                            .unwrap()
-                            .into();
+                        prove_cairo::<SimdBackend, Blake2sMerkleChannel>(
+                            input.clone(),
+                            prover_params,
+                        )
+                        .unwrap()
+                        .into();
                     sonic_rs::to_string(&proof).unwrap()
                 })
                 .collect_vec();
@@ -855,7 +866,7 @@ pub mod tests {
                     opt_n_id_to_big_components: None,
                 };
                 let cairo_proof =
-                    prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
+                    prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input, prover_params).unwrap();
                 verify_cairo::<Blake2sMerkleChannel>(cairo_proof.into()).unwrap();
             }
 
@@ -880,7 +891,7 @@ pub mod tests {
                     opt_n_id_to_big_components: None,
                 };
                 let cairo_proof =
-                    prove_cairo::<Blake2sMerkleChannel>(input, prover_params).unwrap();
+                    prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input, prover_params).unwrap();
                 verify_cairo::<Blake2sMerkleChannel>(cairo_proof.into()).unwrap();
             }
 
@@ -1023,7 +1034,9 @@ pub mod tests {
                     None,
                 )
                 .unwrap();
-                let proof_a = prove_cairo::<Blake2sMerkleChannel>(input_a, prover_params).unwrap();
+                let proof_a =
+                    prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input_a, prover_params)
+                        .unwrap();
                 let poseidon_builtin_size_a = 2u32.pow(
                     proof_a
                         .claim
@@ -1049,7 +1062,9 @@ pub mod tests {
                     None,
                 )
                 .unwrap();
-                let proof_b = prove_cairo::<Blake2sMerkleChannel>(input_b, prover_params).unwrap();
+                let proof_b =
+                    prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input_b, prover_params)
+                        .unwrap();
                 let poseidon_builtin_size_b = 2u32.pow(
                     proof_b
                         .claim
@@ -1094,7 +1109,9 @@ pub mod tests {
                     None,
                 )
                 .unwrap();
-                let proof_a = prove_cairo::<Blake2sMerkleChannel>(input_a, prover_params).unwrap();
+                let proof_a =
+                    prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input_a, prover_params)
+                        .unwrap();
                 let pedersen_builtin_size_a = 2u32.pow(
                     proof_a
                         .claim
@@ -1120,7 +1137,9 @@ pub mod tests {
                     None,
                 )
                 .unwrap();
-                let proof_b = prove_cairo::<Blake2sMerkleChannel>(input_b, prover_params).unwrap();
+                let proof_b =
+                    prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input_b, prover_params)
+                        .unwrap();
                 let pedersen_builtin_size_b = 2u32.pow(
                     proof_b
                         .claim

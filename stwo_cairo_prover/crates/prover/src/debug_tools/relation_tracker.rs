@@ -6,8 +6,7 @@ use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::pcs::TreeVec;
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::{BackendForChannel, Col, Column};
+use stwo::prover::backend::{Backend, BackendForChannel, Col, Column};
 use stwo::prover::poly::circle::CircleCoefficients;
 use stwo::prover::CommitmentSchemeProver;
 use stwo_cairo_common::prover_types::felt::split_f252;
@@ -15,25 +14,25 @@ use stwo_constraint_framework::relation_tracker::{
     add_to_relation_entries, RelationSummary, RelationTrackerEntry,
 };
 
-pub fn track_and_summarize_cairo_relations<MC: MerkleChannel>(
-    commitment_scheme: &CommitmentSchemeProver<'_, SimdBackend, MC>,
+pub fn track_and_summarize_cairo_relations<B, MC: MerkleChannel>(
+    commitment_scheme: &CommitmentSchemeProver<'_, B, MC>,
     components: &CairoComponents,
     public_data: &PublicData,
 ) -> RelationSummary
 where
-    SimdBackend: BackendForChannel<MC>,
+    B: BackendForChannel<MC>,
 {
     let entries = track_cairo_relations(commitment_scheme, components, public_data);
     RelationSummary::summarize_relations(&entries).cleaned()
 }
 
-pub fn track_cairo_relations<MC: MerkleChannel>(
-    commitment_scheme: &CommitmentSchemeProver<'_, SimdBackend, MC>,
+pub fn track_cairo_relations<B, MC: MerkleChannel>(
+    commitment_scheme: &CommitmentSchemeProver<'_, B, MC>,
     components: &CairoComponents,
     public_data: &PublicData,
 ) -> Vec<RelationTrackerEntry>
 where
-    SimdBackend: BackendForChannel<MC>,
+    B: BackendForChannel<MC>,
 {
     // Cairo air aggregates interpolated polynomials. Evaluate to get the original trace.
     // NOTE: this process is slow, and should be only used for debugging.
@@ -305,7 +304,7 @@ fn cairo_relation_entries(
 }
 
 /// Reduces the polynomial to a minimal degree polynomial that evaluates to the same values.
-pub fn reduce_degree(coeffs: CircleCoefficients<SimdBackend>) -> CircleCoefficients<SimdBackend> {
+pub fn reduce_degree<B: Backend>(coeffs: CircleCoefficients<B>) -> CircleCoefficients<B> {
     let mut new_log_size = coeffs.log_size();
     while new_log_size > 1 {
         if ((1 << (new_log_size - 1))..(1 << new_log_size))
@@ -315,7 +314,7 @@ pub fn reduce_degree(coeffs: CircleCoefficients<SimdBackend>) -> CircleCoefficie
         }
         new_log_size -= 1;
     }
-    CircleCoefficients::new(Col::<SimdBackend, BaseField>::from_iter(
+    CircleCoefficients::new(Col::<B, BaseField>::from_iter(
         coeffs.coeffs.to_cpu()[..1 << new_log_size].iter().copied(),
     ))
 }
