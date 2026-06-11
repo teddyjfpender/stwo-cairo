@@ -83,6 +83,7 @@ where
     B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + 'static,
     MC: 'static,
 {
@@ -234,6 +235,7 @@ where
     B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + 'static,
     MC: 'static,
 {
@@ -266,13 +268,14 @@ fn prove_cairo_common<'a, B, MC: MerkleChannel>(
     preprocessed_tree: MaybeOwned<'a, CommitmentTreeProver<B, MC>>,
     trace_evals: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
     claim: CairoClaim,
-    interaction_generator: CairoInteractionClaimGenerator,
+    interaction_generator: CairoInteractionClaimGenerator<B>,
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
     B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + 'static,
     MC: 'static,
 {
@@ -325,7 +328,7 @@ where
     // Interaction trace.
     let span = span!(Level::INFO, "Write interaction trace").entered();
     let (interaction_trace_evals, interaction_claim) =
-        interaction_generator.write_interaction_trace::<B>(&interaction_elements);
+        interaction_generator.write_interaction_trace(&interaction_elements);
     span.exit();
 
     tracing::info!(

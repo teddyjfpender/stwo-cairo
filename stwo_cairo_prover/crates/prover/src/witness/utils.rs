@@ -52,6 +52,17 @@ impl AtomicMultiplicityColumn {
         unsafe { AtomicU32::from_ptr(ptr).fetch_add(1, Ordering::Relaxed) };
     }
 
+    /// Atomically adds `amount` to the multiplicity at `address` (the bulk
+    /// counterpart of [`Self::increase_at`], used to merge device-computed count
+    /// tables).
+    ///
+    /// # Safety
+    /// Caller must ensure `address` is in bounds for the column (no bounds check is performed).
+    pub fn add_at(&self, address: u32, amount: u32) {
+        let ptr = unsafe { (self.data.as_ptr() as *mut u32).add(address as usize) };
+        unsafe { AtomicU32::from_ptr(ptr).fetch_add(amount, Ordering::Relaxed) };
+    }
+
     /// Returns the internal data as a Vec<PackedM31>. The last element of the vector is padded with
     /// zeros if needed. This function performs a copy on the inner data, If atomics are not
     /// necessary, use [`MultiplicityColumn`] instead.

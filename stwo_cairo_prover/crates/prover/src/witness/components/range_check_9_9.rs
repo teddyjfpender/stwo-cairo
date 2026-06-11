@@ -35,6 +35,36 @@ impl ClaimGenerator {
         }
     }
 
+    /// Dense `(v0 << 9) | v1 -> rc row` LUT inverted from the ACTUAL `input_to_row`
+    /// map (the preprocessed table layout, NOT a closed form), for the device
+    /// witness feed. Asserts full coverage of the 2^18 input space.
+    pub fn input_to_row_lut(&self) -> Vec<u32> {
+        let mut lut = vec![u32::MAX; 1 << (2 * 9)];
+        for (input, row) in &self.input_to_row {
+            lut[((input[0].0 << 9) | input[1].0) as usize] = *row as u32;
+        }
+        assert!(
+            lut.iter().all(|&row| row != u32::MAX),
+            "rc_9_9 input_to_row map does not cover the full 2^18 input space"
+        );
+        lut
+    }
+
+    /// Merges device-computed count tables (8 relation-indexed tables of
+    /// `1 << LOG_SIZE` rows each) into the multiplicity columns. Adds commute, so
+    /// this is byte-equal to having fed the inputs through `add_packed_inputs`.
+    pub fn add_count_tables(&self, counts: &[u32]) {
+        let table_size = 1usize << LOG_SIZE;
+        assert_eq!(counts.len(), 8 * table_size);
+        for (relation_index, table) in counts.chunks(table_size).enumerate() {
+            for (row, &count) in table.iter().enumerate() {
+                if count != 0 {
+                    self.mults[relation_index].add_at(row as u32, count);
+                }
+            }
+        }
+    }
+
     pub fn write_trace(
         self,
     ) -> (

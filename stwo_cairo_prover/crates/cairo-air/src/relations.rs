@@ -23,3 +23,16 @@ pub const VERIFY_BITWISE_XOR_12_RELATION_ID: M31 = M31::from_u32_unchecked(64836
 // Shouldn't be too large, as this many values will be stored in memory.
 const COMMON_LOOKUP_ELEMENTS_SIZE: usize = 128;
 relation!(CommonLookupElements, COMMON_LOOKUP_ELEMENTS_SIZE);
+
+// Accessors for backends that evaluate `combine()` off-host (the device witness
+// lane): the inner `LookupElements` tuple field is module-private, so the
+// accessors live here in the defining module.
+impl CommonLookupElements {
+    pub fn z(&self) -> stwo::core::fields::qm31::SecureField {
+        self.0.z
+    }
+
+    pub fn alpha_powers(&self) -> &[stwo::core::fields::qm31::SecureField] {
+        &self.0.alpha_powers
+    }
+}

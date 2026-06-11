@@ -3,6 +3,7 @@ pub mod cairo;
 pub mod cairo_claim_generator;
 pub mod components;
 pub mod fast_deduction;
+pub mod memory_witness_backend;
 pub mod opcodes;
 pub mod prelude;
 pub mod preprocessed_trace;

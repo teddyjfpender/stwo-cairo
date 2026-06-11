@@ -9,7 +9,13 @@
 //!
 //! Usage:
 //!   gpu_bench --program path/to/compiled.json --iterations N --backend cuda|simd \
-//!             [--reps 3]
+//!             [--reps 3] [--pipeline]
+//!
+//! `--pipeline` (P5, throughput pipelining): the VM run + adapt of proof N+1
+//! executes on a worker thread while proof N is being proven — pure
+//! orchestration, every prove is the unmodified path on its own input, zero
+//! soundness surface. Reports sustained throughput over the steady-state window
+//! (after the first prove) alongside the per-proof numbers.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,7 +23,6 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use cairo_air::verifier::verify_cairo;
-use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use cairo_vm::cairo_run::{cairo_run_program, CairoRunConfig};
 use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::{
     BuiltinHintProcessor, HintFunc,
@@ -32,6 +37,7 @@ use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo_cairo_adapter::adapter::adapt;
 use stwo_cairo_adapter::ProverInput;
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_prover::prover::{prove_cairo, ChannelHash, ProverParameters};
 use stwo_cairo_serialize::CairoSerialize;
 
@@ -40,6 +46,10 @@ fn arg(name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+fn flag(name: &str) -> bool {
+    std::env::args().any(|a| a == name)
 }
 
 fn peak_rss_gb() -> f64 {
@@ -135,7 +145,11 @@ fn main() {
         .parse()
         .unwrap();
     let backend = arg("--backend").unwrap_or_else(|| "cuda".to_string());
-    let reps: usize = arg("--reps").unwrap_or_else(|| "3".to_string()).parse().unwrap();
+    let reps: usize = arg("--reps")
+        .unwrap_or_else(|| "3".to_string())
+        .parse()
+        .unwrap();
+    let pipeline = flag("--pipeline");
 
     let input = run_vm(&program, iterations);
     let cycle_count: usize = input
@@ -146,32 +160,67 @@ fn main() {
         .map(|(_, count)| *count)
         .sum();
 
+    let prove_once = |input| match backend.as_str() {
+        "cuda" => prove_cairo::<stwo_backend_cuda::CudaBackend, Blake2sMerkleChannel>(
+            input,
+            prover_params(),
+        )
+        .unwrap(),
+        "simd" => prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input, prover_params()).unwrap(),
+        other => panic!("unknown backend {other}"),
+    };
+
     let mut times = Vec::new();
     let mut proof_size = 0usize;
     let mut verify_ms = 0.0f64;
-    for rep in 0..reps {
-        let input = run_vm(&program, iterations);
-        let start = Instant::now();
-        let proof = match backend.as_str() {
-            "cuda" => prove_cairo::<stwo_backend_cuda::CudaBackend, Blake2sMerkleChannel>(
-                input,
-                prover_params(),
-            )
-            .unwrap(),
-            "simd" => {
-                prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input, prover_params()).unwrap()
+    // P5 sustained-throughput window: wall seconds covering the last `reps - 1`
+    // pipelined proves (the steady state, after the cold prove + verify).
+    let mut sustained_s = None;
+    if pipeline {
+        // Proof N+1's VM run + adapt overlap proof N's prove. The prove path
+        // itself is untouched; only the input preparation is hoisted to a thread.
+        let mut next_input = Some(run_vm(&program, iterations));
+        let mut steady_start = None;
+        for rep in 0..reps {
+            let input = next_input.take().unwrap();
+            let prefetch = (rep + 1 < reps).then(|| {
+                let program = program.clone();
+                std::thread::spawn(move || run_vm(&program, iterations))
+            });
+            let start = Instant::now();
+            let proof = prove_once(input);
+            let elapsed = start.elapsed().as_secs_f64();
+            times.push(elapsed);
+            if rep == 0 {
+                proof_size = bincode::serialized_size(&proof).unwrap() as usize;
+                let vstart = Instant::now();
+                verify_cairo::<Blake2sMerkleChannel>(proof.into()).unwrap();
+                verify_ms = vstart.elapsed().as_secs_f64() * 1000.0;
+                steady_start = Some(Instant::now());
             }
-            other => panic!("unknown backend {other}"),
-        };
-        let elapsed = start.elapsed().as_secs_f64();
-        times.push(elapsed);
-        if rep == 0 {
-            proof_size = bincode::serialized_size(&proof).unwrap() as usize;
-            let vstart = Instant::now();
-            verify_cairo::<Blake2sMerkleChannel>(proof.into()).unwrap();
-            verify_ms = vstart.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("rep={rep} prove_s={elapsed:.3} pipelined=1");
+            if let Some(handle) = prefetch {
+                next_input = Some(handle.join().expect("pipelined vm/adapt"));
+            }
         }
-        eprintln!("rep={rep} prove_s={elapsed:.3}");
+        if reps > 1 {
+            sustained_s = Some(steady_start.unwrap().elapsed().as_secs_f64());
+        }
+    } else {
+        for rep in 0..reps {
+            let input = run_vm(&program, iterations);
+            let start = Instant::now();
+            let proof = prove_once(input);
+            let elapsed = start.elapsed().as_secs_f64();
+            times.push(elapsed);
+            if rep == 0 {
+                proof_size = bincode::serialized_size(&proof).unwrap() as usize;
+                let vstart = Instant::now();
+                verify_cairo::<Blake2sMerkleChannel>(proof.into()).unwrap();
+                verify_ms = vstart.elapsed().as_secs_f64() * 1000.0;
+            }
+            eprintln!("rep={rep} prove_s={elapsed:.3}");
+        }
     }
     let cold = times[0];
     let warm = times[1..].iter().cloned().fold(f64::INFINITY, f64::min);
@@ -183,11 +232,19 @@ fn main() {
         0.0
     };
 
+    // Sustained throughput (P5): proofs completed per wall second in the
+    // steady-state pipelined window, expressed as cycles/s.
+    let pipeline_fields = sustained_s
+        .map(|s| {
+            let sustained_mhz = (reps - 1) as f64 * cycle_count as f64 / s / 1e6;
+            format!(",\"sustained_s\":{s:.3},\"sustained_mhz\":{sustained_mhz:.3}")
+        })
+        .unwrap_or_default();
     println!(
         "{{\"program\":\"{program}\",\"backend\":\"{backend}\",\"n\":{iterations},\
          \"cycle_count\":{cycle_count},\"prove_s_cold\":{cold:.3},\"prove_s_warm\":{warm:.3},\
          \"verify_ms\":{verify_ms:.1},\"proof_kb\":{:.1},\"peak_rss_gb\":{:.2},\
-         \"vram_gb\":{vram_gb:.2},\"steps_per_s\":{:.0},\"mhz\":{:.3}}}",
+         \"vram_gb\":{vram_gb:.2},\"steps_per_s\":{:.0},\"mhz\":{:.3}{pipeline_fields}}}",
         proof_size as f64 / 1024.0,
         peak_rss_gb(),
         cycle_count as f64 / warm,

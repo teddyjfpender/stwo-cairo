@@ -277,7 +277,7 @@ pub fn assert_cairo_constraints(input: ProverInput, preprocessed_trace: Arc<PreP
     let interaction_elements = CommonLookupElements::draw(&mut dummy_channel);
     let mut tree_builder = commitment_scheme.tree_builder();
     let (interaction_trace_evals, interaction_claim) =
-        interaction_generator.write_interaction_trace::<SimdBackend>(&interaction_elements);
+        interaction_generator.write_interaction_trace(&interaction_elements);
     tree_builder.extend_evals(interaction_trace_evals);
     tree_builder.finalize_interaction();
 

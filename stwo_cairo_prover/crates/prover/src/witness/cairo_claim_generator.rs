@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use cairo_air::air::PublicData;
 use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
+use cairo_air::components::memory_id_to_big::InteractionClaim as MemoryBigInteractionClaim;
+use cairo_air::components::memory_id_to_small::InteractionClaim as MemorySmallInteractionClaim;
 use cairo_air::relations::CommonLookupElements;
+use stwo::core::fields::qm31::SecureField;
 use indexmap::IndexSet;
 use rayon::scope;
 pub use stwo::prover::backend::simd::SimdBackend;
@@ -19,6 +22,7 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
 use stwo_cairo_common::preprocessed_columns::simd_prelude::{BaseField, CircleEvaluation};
 
 use crate::witness::components::*;
+use crate::witness::memory_witness_backend::MemoryIdToBigWitness;
 
 #[derive(Default)]
 pub struct CairoClaimGenerator {
@@ -722,14 +726,17 @@ impl CairoClaimGenerator {
     /// spawned task (`from_simd_evals` — the device upload, for GPU backends), so
     /// transfers overlap the generation of later components; collection order is
     /// unchanged, so the committed column order is identical.
-    pub fn write_trace<B: stwo::prover::backend::FromSimdColumns>(
+    pub fn write_trace<B>(
         self,
         opt_n_id_to_big_components: Option<usize>,
     ) -> (
         Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
         CairoClaim,
-        CairoInteractionClaimGenerator,
-    ) {
+        CairoInteractionClaimGenerator<B>,
+    )
+    where
+        B: stwo::prover::backend::FromSimdColumns + MemoryIdToBigWitness,
+    {
         let mut evals = Vec::new();
         let mut add_opcode_result = None;
         let mut add_opcode_small_result = None;
@@ -1489,15 +1496,19 @@ impl CairoClaimGenerator {
             .memory_id_to_big
             .map(|gen| {
                 const LOG_MAX_BIG_SIZE: u32 = MAX_SEQUENCE_LOG_SIZE;
-                let (big_traces, small_trace, claim, interaction_gen) = gen.write_trace(
+                // Backend hook (witness-on-GPU P1): trace columns are born on B and
+                // the rc_9_9 feed happens inside (device count tables for GPU
+                // backends, the host loop for SIMD).
+                let (big_traces, small_trace, claim, interaction_gen) = B::write_trace(
+                    gen,
                     self.range_check_9_9.as_ref().unwrap(),
                     LOG_MAX_BIG_SIZE,
                     opt_n_id_to_big_components,
                 );
                 for big_trace in big_traces {
-                    evals.extend(B::from_simd_evals(big_trace));
+                    evals.extend(big_trace);
                 }
-                evals.extend(B::from_simd_evals(small_trace));
+                evals.extend(small_trace);
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1789,8 +1800,7 @@ impl CairoClaimGenerator {
     }
 }
 
-#[derive(Default)]
-pub struct CairoInteractionClaimGenerator {
+pub struct CairoInteractionClaimGenerator<B: MemoryIdToBigWitness> {
     pub add_opcode: Option<add_opcode::InteractionClaimGenerator>,
     pub add_opcode_small: Option<add_opcode_small::InteractionClaimGenerator>,
     pub add_ap_opcode: Option<add_ap_opcode::InteractionClaimGenerator>,
@@ -1849,7 +1859,7 @@ pub struct CairoInteractionClaimGenerator {
     pub poseidon_round_keys: Option<poseidon_round_keys::InteractionClaimGenerator>,
     pub range_check_252_width_27: Option<range_check_252_width_27::InteractionClaimGenerator>,
     pub memory_address_to_id: Option<memory_address_to_id::InteractionClaimGenerator>,
-    pub memory_id_to_big: Option<memory_id_to_big::InteractionClaimGenerator>,
+    pub memory_id_to_big: Option<B::InteractionGen>,
     pub range_check_6: Option<range_check_6::InteractionClaimGenerator>,
     pub range_check_8: Option<range_check_8::InteractionClaimGenerator>,
     pub range_check_11: Option<range_check_11::InteractionClaimGenerator>,
@@ -1869,25 +1879,26 @@ pub struct CairoInteractionClaimGenerator {
     pub verify_bitwise_xor_9: Option<verify_bitwise_xor_9::InteractionClaimGenerator>,
 }
 
-impl CairoInteractionClaimGenerator {
+impl<B> CairoInteractionClaimGenerator<B>
+where
+    B: stwo_constraint_framework::LogupFinalizeBackend
+        + stwo::prover::backend::FromSimdColumns
+        + MemoryIdToBigWitness,
+{
     /// Writes the raw interaction fractions on the host (parallel across
     /// components), then finalizes each component's logup trace on `B` — the
     /// device, for GPU backends — in the same fixed component order as before.
     /// Claims are constructed from the finalized sums, so the Fiat-Shamir
-    /// transcript is unchanged. `memory_id_to_big` still finalizes eagerly on
-    /// SIMD (its multi-segment writer is structurally different) and bridges via
-    /// `from_simd_evals`.
-    pub fn write_interaction_trace<B>(
+    /// transcript is unchanged. `memory_id_to_big` goes through the
+    /// `MemoryIdToBigWitness` backend hook (witness-on-GPU P1): device-resident
+    /// writers for GPU backends, the host writers + `finalize_on_simd` for SIMD.
+    pub fn write_interaction_trace(
         self,
         common_lookup_elements: &CommonLookupElements,
     ) -> (
         Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
         CairoInteractionClaim,
-    )
-    where
-        B: stwo_constraint_framework::LogupFinalizeBackend
-            + stwo::prover::backend::FromSimdColumns,
-    {
+    ) {
         let mut evals = Vec::new();
         let mut add_opcode_result = None;
         let mut add_opcode_small_result = None;
@@ -2249,7 +2260,7 @@ impl CairoInteractionClaimGenerator {
             if let Some(gen) = self.memory_id_to_big {
                 s.spawn(|_| {
                     memory_id_to_big_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                        Some(B::write_interaction(gen, common_lookup_elements));
                 });
             }
             if let Some(gen) = self.range_check_6 {
@@ -2646,20 +2657,28 @@ impl CairoInteractionClaimGenerator {
             });
         let (memory_id_to_big_interaction_claim, memory_id_to_small_interaction_claim) =
             memory_id_to_big_result
-                .map(|(big_raws, small_raw, build_big_claim, build_small_claim)| {
-                    // Finalize each big segment then the small table on B, in the
-                    // same order the eager path extended the traces.
-                    let mut big_claimed_sums = Vec::with_capacity(big_raws.len());
-                    for raw in big_raws {
-                        let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                .map(|result| {
+                    // Extend each big segment then the small table, in the same
+                    // order the eager path extended the traces; build the claims
+                    // from the returned sums exactly as the old closures did (the
+                    // big total is a field sum — associative/commutative, so
+                    // identical to the eager computation).
+                    let mut big_claimed_sums = Vec::with_capacity(result.big.len());
+                    for (trace, claimed_sum) in result.big {
                         evals.extend(trace);
                         big_claimed_sums.push(claimed_sum);
                     }
-                    let (small_trace, small_claimed_sum) = B::finalize_raw_logup(small_raw);
+                    let (small_trace, small_claimed_sum) = result.small;
                     evals.extend(small_trace);
+                    let claimed_sum = big_claimed_sums.iter().sum::<SecureField>();
                     (
-                        build_big_claim(big_claimed_sums),
-                        build_small_claim(small_claimed_sum),
+                        MemoryBigInteractionClaim {
+                            big_claimed_sums,
+                            claimed_sum,
+                        },
+                        MemorySmallInteractionClaim {
+                            claimed_sum: small_claimed_sum,
+                        },
                     )
                 })
                 .unzip();

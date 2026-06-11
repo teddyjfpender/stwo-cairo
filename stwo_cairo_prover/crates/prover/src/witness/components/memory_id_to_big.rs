@@ -105,6 +105,17 @@ impl ClaimGenerator {
         }
     }
 
+    /// Decomposes the generator into its raw inputs (values padded to a multiple of
+    /// `N_LANES`, multiplicities as packed columns) for the device witness path.
+    pub(crate) fn into_parts(self) -> (Vec<[u32; 8]>, Vec<PackedM31>, Vec<u128>, Vec<PackedM31>) {
+        (
+            self.big_values,
+            self.big_mults.into_simd_vec(),
+            self.small_values,
+            self.small_mults.into_simd_vec(),
+        )
+    }
+
     pub fn write_trace(
         self,
         range_check_9_9_trace_generator: &range_check_9_9::ClaimGenerator,
@@ -301,7 +312,7 @@ impl AddInputs for ClaimGenerator {
 /// Generates the trace for the id -> f252 `big` tables. Splits the table to multiple traces
 /// according to `log_max_big_size`.
 /// If `opt_n_components` is provided, the function will pad the traces to the number of components.
-fn gen_big_memory_traces(
+pub(crate) fn gen_big_memory_traces(
     values: Vec<[u32; 8]>,
     mults: Vec<PackedM31>,
     log_max_big_size: u32,
@@ -370,7 +381,7 @@ fn gen_single_big_memory_trace(values: &[[u32; 8]], mults: &[PackedM31]) -> Vec<
 }
 
 // Generates the trace of the small value memory table.
-fn gen_small_memory_trace(values: Vec<u128>, mut mults: Vec<PackedM31>) -> Vec<BaseColumn> {
+pub(crate) fn gen_small_memory_trace(values: Vec<u128>, mut mults: Vec<PackedM31>) -> Vec<BaseColumn> {
     assert_eq!(values.len(), mults.len() * N_LANES);
     let column_length = values.len().next_power_of_two();
 
