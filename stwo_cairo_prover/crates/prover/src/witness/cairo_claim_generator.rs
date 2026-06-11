@@ -2582,15 +2582,22 @@ impl CairoInteractionClaimGenerator {
             });
         let (memory_id_to_big_interaction_claim, memory_id_to_small_interaction_claim) =
             memory_id_to_big_result
-                .map(
-                    |(big_traces, small_trace, big_interaction_claim, small_interaction_claim)| {
-                        for big_trace in big_traces {
-                            evals.extend(B::from_simd_evals(big_trace));
-                        }
-                        evals.extend(B::from_simd_evals(small_trace));
-                        (big_interaction_claim, small_interaction_claim)
-                    },
-                )
+                .map(|(big_raws, small_raw, build_big_claim, build_small_claim)| {
+                    // Finalize each big segment then the small table on B, in the
+                    // same order the eager path extended the traces.
+                    let mut big_claimed_sums = Vec::with_capacity(big_raws.len());
+                    for raw in big_raws {
+                        let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                        evals.extend(trace);
+                        big_claimed_sums.push(claimed_sum);
+                    }
+                    let (small_trace, small_claimed_sum) = B::finalize_raw_logup(small_raw);
+                    evals.extend(small_trace);
+                    (
+                        build_big_claim(big_claimed_sums),
+                        build_small_claim(small_claimed_sum),
+                    )
+                })
                 .unzip();
         let range_check_6_interaction_claim =
             range_check_6_result.map(|(raw, build_claim)| {

@@ -28,6 +28,7 @@ use stwo_cairo_common::prover_types::simd::{PackedFelt252, SIMD_ENUMERATION_0};
 use crate::witness::components::range_check_9_9;
 use crate::witness::prelude::*;
 use crate::witness::utils::AtomicMultiplicityColumn;
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 pub type InputType = M31;
 pub type PackedInputType = PackedM31;
@@ -422,13 +423,13 @@ impl InteractionClaimGenerator {
         self,
         common_lookup_elements: &relations::CommonLookupElements,
     ) -> (
-        BigTraces,
-        SmallTrace,
-        BigInteractionClaim,
-        SmallInteractionClaim,
+        Vec<RawLogupTrace>,
+        RawLogupTrace,
+        impl FnOnce(Vec<SecureField>) -> BigInteractionClaim,
+        impl FnOnce(SecureField) -> SmallInteractionClaim,
     ) {
         let mut offset = 0;
-        let (big_traces, big_claimed_sums): (Vec<_>, Vec<_>) = self
+        let big_raws: Vec<RawLogupTrace> = self
             .big_components_values
             .iter()
             .zip(self.big_multiplicities.iter())
@@ -442,22 +443,23 @@ impl InteractionClaimGenerator {
                 offset += big_multiplicities.len() as u32 * N_LANES as u32;
                 res
             })
-            .unzip();
+            .collect();
 
-        let (small_trace, small_claimed_sum) =
-            self.gen_small_memory_interaction_trace(common_lookup_elements);
-        let claimed_sum = big_claimed_sums.iter().sum::<SecureField>();
+        let small_raw = self.gen_small_memory_interaction_trace(common_lookup_elements);
 
         (
-            big_traces,
-            small_trace,
-            BigInteractionClaim {
-                big_claimed_sums,
-                claimed_sum,
+            big_raws,
+            small_raw,
+            // The big claim's total is the field sum of the per-segment sums —
+            // associative/commutative, so identical to the eager computation.
+            |big_claimed_sums: Vec<SecureField>| {
+                let claimed_sum = big_claimed_sums.iter().sum::<SecureField>();
+                BigInteractionClaim {
+                    big_claimed_sums,
+                    claimed_sum,
+                }
             },
-            SmallInteractionClaim {
-                claimed_sum: small_claimed_sum,
-            },
+            |claimed_sum| SmallInteractionClaim { claimed_sum },
         )
     }
 
@@ -466,16 +468,13 @@ impl InteractionClaimGenerator {
         big_multiplicities: &[PackedM31],
         offset: u32,
         common_lookup_elements: &relations::CommonLookupElements,
-    ) -> (
-        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
-        QM31,
-    ) {
+    ) -> RawLogupTrace {
         assert!(big_components_values
             .iter()
             .all(|v| v.len() == big_multiplicities.len()));
         let big_table_log_size = big_components_values[0].len().ilog2() + LOG_N_LANES;
         let mut big_values_logup_gen =
-            unsafe { LogupTraceGenerator::uninitialized(big_table_log_size) };
+            unsafe { RawLogupTraceGenerator::uninitialized(big_table_log_size) };
 
         // Every element is 9-bit.
         for (i, (limb0, limb1, limb2, limb3)) in big_components_values.iter().tuples().enumerate() {
@@ -565,19 +564,16 @@ impl InteractionClaimGenerator {
         }
         col_gen.finalize_col();
 
-        big_values_logup_gen.finalize_last()
+        big_values_logup_gen.into_raw()
     }
 
     fn gen_small_memory_interaction_trace(
         &self,
         common_lookup_elements: &relations::CommonLookupElements,
-    ) -> (
-        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
-        QM31,
-    ) {
+    ) -> RawLogupTrace {
         let small_table_log_size = self.small_values[0].len().ilog2() + LOG_N_LANES;
         let mut small_values_logup_gen =
-            unsafe { LogupTraceGenerator::uninitialized(small_table_log_size) };
+            unsafe { RawLogupTraceGenerator::uninitialized(small_table_log_size) };
 
         // Every element is 9-bit.
         for (i, (limb0, limb1, limb2, limb3)) in self.small_values.iter().tuples().enumerate() {
@@ -641,7 +637,7 @@ impl InteractionClaimGenerator {
         }
         col_gen.finalize_col();
 
-        small_values_logup_gen.finalize_last()
+        small_values_logup_gen.into_raw()
     }
 }
 
@@ -716,13 +712,19 @@ mod tests {
         let mut dummy_channel = Blake2sChannel::default();
         let interaction_elements = CommonLookupElements::draw(&mut dummy_channel);
         let mut tree_builder = commitment_scheme.tree_builder();
-        let (big_traces, small_trace, big_interaction_claim, small_interaction_claim) =
+        let (big_raws, small_raw, build_big_claim, build_small_claim) =
             interaction_generator.write_interaction_trace(&interaction_elements);
-        for big_trace in big_traces {
+        let mut big_claimed_sums = Vec::new();
+        for raw in big_raws {
+            let (big_trace, claimed_sum) = raw.finalize_on_simd();
             tree_builder.extend_evals(big_trace);
+            big_claimed_sums.push(claimed_sum);
         }
+        let (small_trace, small_claimed_sum) = small_raw.finalize_on_simd();
         tree_builder.extend_evals(small_trace);
         tree_builder.finalize_interaction();
+        let big_interaction_claim = build_big_claim(big_claimed_sums);
+        let small_interaction_claim = build_small_claim(small_claimed_sum);
 
         let mut location_allocator =
             TraceLocationAllocator::new_with_preprocessed_columns(&preprocessed_trace.ids());
