@@ -296,3 +296,31 @@ writing and the VM/adapter. GPU generation has stopped mattering — which is ex
 where this work was trying to get. The next speedups live in W4 (adapt, 2.8 s of
 wall clock), W2 (streamed base upload), and W3 (codegen witness on GPU) — host-side
 and host-to-device work, per `WITNESS_ON_GPU.md`.
+
+## Round 6: W4 (parallel adapter) + W2 (streamed base upload) + W3 blueprint
+
+All gates green on an RTX 4090 (conformance, device-finalize differential, **CUDA
+e2e proof byte-identical**). What landed:
+
+- **W4 — adapter**: dedup maps on hashbrown/foldhash (ids depend on first-encounter
+  order only — hash function invisible to the proof), relocation loops parallel with
+  order preserved by indexed collection. Gated by the new `STWO_DUMP_INPUT`
+  ProverInput byte-diff (which also surfaced a pre-existing serde nondeterminism in
+  the instance-counter HashMaps — content identical, iteration order not; verified
+  same-binary). Local M-series: MemoryBuilder -46%, relocate_trace -88%, adapt -23%.
+  NOTE: adapt sits OUTSIDE the prove span — this is a wall-clock win, invisible in
+  `prove_s`.
+- **W2 — streamed upload**: every component's columns convert to the prove backend
+  inside its generation task; H2D transfers overlap later components' generation and
+  the base tree's bulk `from_simd_evals` is gone. The sequential deduction-phase
+  components (incl. the big memory tables) convert inline — their overlap arrives
+  with W3.
+- **W3 — blueprint locked** (see WITNESS_ON_GPU.md): the memory_id_to_big vertical
+  slice (device limb-split, device rc-count table, device denominators feeding the
+  W1 finalize), with the key coupling identified: device-born base columns require
+  device denominators, or readbacks eat the win. Per-component differential gating,
+  NitrooZK-lesson fallbacks.
+
+4090 numbers (host variance applies): fib 1M warm 5.15 s / 1.42 MHz, fib 65k
+0.94 s, ec 1024 1.13 s. The prove span is now dominated by the host write loops
+that W3 removes; wall clock additionally gained the adapter speedup.
