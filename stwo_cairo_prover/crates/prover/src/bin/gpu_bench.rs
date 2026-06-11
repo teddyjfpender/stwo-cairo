@@ -87,7 +87,17 @@ fn run_vm(program_path: &str, iterations: u64) -> ProverInput {
         ..Default::default()
     };
     let runner = cairo_run_program(&program, &config, &mut hint_processor).expect("vm run");
-    adapt(&runner).expect("adapt")
+    let input = adapt(&runner).expect("adapt");
+    // Adapter byte-equality harness: STWO_DUMP_INPUT=<path> serializes the adapted
+    // ProverInput and exits — diff the dumps across adapter changes (the adapter has
+    // no other content gate; ids and orders in it flow into the proof).
+    if let Ok(path) = std::env::var("STWO_DUMP_INPUT") {
+        let bytes = bincode::serialize(&input).expect("serialize prover input");
+        std::fs::write(&path, &bytes).expect("write input dump");
+        eprintln!("prover input dumped: {} bytes -> {path}", bytes.len());
+        std::process::exit(0);
+    }
+    input
 }
 
 fn prover_params() -> ProverParameters {

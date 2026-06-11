@@ -44,32 +44,41 @@ impl Relocator {
     pub fn relocate_memory(&self, memory: &[Vec<Option<MaybeRelocatable>>]) -> Vec<MemoryEntry> {
         let _span = span!(Level::INFO, "get_relocated_memory").entered();
 
-        // Pre-allocate with exact size to avoid realloc overhead.
-        let total_size: usize = memory.iter().map(|seg| seg.len()).sum();
-        let mut res = Vec::with_capacity(total_size);
-
-        for (segment_index, segment) in memory.iter().enumerate() {
-            for (offset, value) in segment.iter().enumerate() {
-                let address = self.calc_relocated_addr(segment_index, offset) as u64;
-                let value = if let Some(val) = value {
-                    let mut relocated_value = [0; 8];
-                    match val {
-                        MaybeRelocatable::RelocatableValue(addr) => {
-                            relocated_value[0] =
-                                self.calc_relocated_addr(addr.segment_index as usize, addr.offset)
-                        }
-                        MaybeRelocatable::Int(val) => {
-                            relocated_value = bytemuck::cast(val.to_bytes_le())
-                        }
-                    };
-                    relocated_value
-                } else {
-                    // If this cell is None, fill with zero.
-                    [0; 8]
-                };
-                res.push(MemoryEntry { address, value });
-            }
-        }
+        // Parallel within each segment: every entry is a pure function of
+        // (segment_index, offset, value), and indexed parallel collection preserves
+        // sequential order — the output is element-for-element identical to the
+        // nested loop (gated by the STWO_DUMP_INPUT byte diff).
+        use rayon::prelude::*;
+        let res: Vec<MemoryEntry> = memory
+            .iter()
+            .enumerate()
+            .flat_map(|(segment_index, segment)| {
+                segment
+                    .par_iter()
+                    .enumerate()
+                    .map(move |(offset, value)| {
+                        let address = self.calc_relocated_addr(segment_index, offset) as u64;
+                        let value = if let Some(val) = value {
+                            let mut relocated_value = [0; 8];
+                            match val {
+                                MaybeRelocatable::RelocatableValue(addr) => {
+                                    relocated_value[0] = self
+                                        .calc_relocated_addr(addr.segment_index as usize, addr.offset)
+                                }
+                                MaybeRelocatable::Int(val) => {
+                                    relocated_value = bytemuck::cast(val.to_bytes_le())
+                                }
+                            };
+                            relocated_value
+                        } else {
+                            // If this cell is None, fill with zero.
+                            [0; 8]
+                        };
+                        MemoryEntry { address, value }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         assert!(
             res.len() <= MEMORY_ADDRESS_BOUND,
             "Relocated memory size exceeded the maximum address value",
@@ -119,10 +128,11 @@ impl Relocator {
     // Relocates the trace entries according to the relocation table.
     pub fn relocate_trace(&self, relocatble_trace: &[TraceEntry]) -> Vec<RelocatedTraceEntry> {
         let _span = span!(Level::INFO, "relocate_trace").entered();
-        // Pre-allocate with exact size to avoid realloc overhead.
-        let mut res = Vec::with_capacity(relocatble_trace.len());
-        for entry in relocatble_trace {
-            res.push(RelocatedTraceEntry {
+        // Indexed parallel map preserves order: identical output to the loop.
+        use rayon::prelude::*;
+        relocatble_trace
+            .par_iter()
+            .map(|entry| RelocatedTraceEntry {
                 pc: self.relocation_table[entry.pc.segment_index as usize] as usize
                     + entry.pc.offset,
                 // The segment indexes for `ap` and `fp` are always 1, see
@@ -130,8 +140,7 @@ impl Relocator {
                 ap: self.relocation_table[1] as usize + entry.ap,
                 fp: self.relocation_table[1] as usize + entry.fp,
             })
-        }
-        res
+            .collect()
     }
 
     // Relocates the publoc memory addresses according to the relocation table.

@@ -3518,6 +3518,7 @@ dependencies = [
  "clap",
  "crypto-bigint",
  "dashmap",
+ "hashbrown 0.15.5",
  "indoc",
  "itertools 0.12.1",
  "log",

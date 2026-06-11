@@ -106,7 +106,7 @@ where
     // Base trace.
     let span = span!(Level::INFO, "Write Base trace").entered();
     let (trace_evals, claim, interaction_generator) =
-        cairo_claim_generator.write_trace(opt_n_id_to_big_components);
+        cairo_claim_generator.write_trace::<B>(opt_n_id_to_big_components);
     span.exit();
 
     // The maximal log trace size (without blowup factor) is the maximum over preprocessed trace
@@ -244,7 +244,7 @@ where
     // Base trace.
     let span = span!(Level::INFO, "Write Base trace").entered();
     let (trace_evals, claim, interaction_generator) =
-        cairo_claim_generator.write_trace(prover_params.opt_n_id_to_big_components);
+        cairo_claim_generator.write_trace::<B>(prover_params.opt_n_id_to_big_components);
     span.exit();
 
     prove_cairo_common::<B, MC>(
@@ -264,7 +264,7 @@ fn prove_cairo_common<'a, B, MC: MerkleChannel>(
     base_column_pool: &BaseColumnPool<B>,
     preprocessed_trace: Arc<PreProcessedTrace>,
     preprocessed_tree: MaybeOwned<'a, CommitmentTreeProver<B, MC>>,
-    trace_evals: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    trace_evals: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
     claim: CairoClaim,
     interaction_generator: CairoInteractionClaimGenerator,
     prover_params: ProverParameters,
@@ -311,8 +311,9 @@ where
     claim.mix_into::<MC>(channel);
     let span = span!(Level::INFO, "Compute base trace commitment").entered();
     let mut tree_builder = commitment_scheme.tree_builder();
-    // The witness is generated on the SIMD backend; transfer it to the proving backend.
-    tree_builder.extend_evals(B::from_simd_evals(trace_evals));
+    // The witness columns arrive already on B: each component's task converted
+    // (uploaded, for GPU backends) as it finished, overlapped with generation.
+    tree_builder.extend_evals(trace_evals);
     tree_builder.commit(channel);
     span.exit();
 

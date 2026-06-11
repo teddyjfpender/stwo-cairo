@@ -718,11 +718,15 @@ impl CairoClaimGenerator {
         });
     }
 
-    pub fn write_trace(
+    /// Writes the base trace. Each component's columns convert to `B` inside its
+    /// spawned task (`from_simd_evals` — the device upload, for GPU backends), so
+    /// transfers overlap the generation of later components; collection order is
+    /// unchanged, so the committed column order is identical.
+    pub fn write_trace<B: stwo::prover::backend::FromSimdColumns>(
         self,
         opt_n_id_to_big_components: Option<usize>,
     ) -> (
-        Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+        Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
         CairoClaim,
         CairoInteractionClaimGenerator,
     ) {
@@ -751,63 +755,82 @@ impl CairoClaimGenerator {
         scope(|s| {
             if let Some(gen) = self.add_opcode {
                 s.spawn(|_| {
-                    add_opcode_result = Some(gen.write_trace(
+                    add_opcode_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.add_opcode_small {
                 s.spawn(|_| {
-                    add_opcode_small_result = Some(gen.write_trace(
+                    add_opcode_small_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.add_ap_opcode {
                 s.spawn(|_| {
-                    add_ap_opcode_result = Some(gen.write_trace(
+                    add_ap_opcode_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
                         self.range_check_18.as_ref().unwrap(),
                         self.range_check_11.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.assert_eq_opcode {
                 s.spawn(|_| {
-                    assert_eq_opcode_result = Some(gen.write_trace(
+                    assert_eq_opcode_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.assert_eq_opcode_imm {
                 s.spawn(|_| {
-                    assert_eq_opcode_imm_result = Some(gen.write_trace(
+                    assert_eq_opcode_imm_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.assert_eq_opcode_double_deref {
                 s.spawn(|_| {
-                    assert_eq_opcode_double_deref_result = Some(gen.write_trace(
+                    assert_eq_opcode_double_deref_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.blake_compress_opcode {
                 s.spawn(|_| {
-                    blake_compress_opcode_result = Some(gen.write_trace(
+                    blake_compress_opcode_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
@@ -815,30 +838,39 @@ impl CairoClaimGenerator {
                         self.verify_bitwise_xor_8.as_ref().unwrap(),
                         self.blake_round.as_ref().unwrap(),
                         self.triple_xor_32.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.call_opcode_abs {
                 s.spawn(|_| {
-                    call_opcode_abs_result = Some(gen.write_trace(
+                    call_opcode_abs_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.call_opcode_rel_imm {
                 s.spawn(|_| {
-                    call_opcode_rel_imm_result = Some(gen.write_trace(
+                    call_opcode_rel_imm_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.generic_opcode {
                 s.spawn(|_| {
-                    generic_opcode_result = Some(gen.write_trace(
+                    generic_opcode_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
@@ -846,229 +878,261 @@ impl CairoClaimGenerator {
                         self.range_check_20.as_ref().unwrap(),
                         self.range_check_18.as_ref().unwrap(),
                         self.range_check_11.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.jnz_opcode_non_taken {
                 s.spawn(|_| {
-                    jnz_opcode_non_taken_result = Some(gen.write_trace(
+                    jnz_opcode_non_taken_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.jnz_opcode_taken {
                 s.spawn(|_| {
-                    jnz_opcode_taken_result = Some(gen.write_trace(
+                    jnz_opcode_taken_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.jump_opcode_abs {
                 s.spawn(|_| {
-                    jump_opcode_abs_result = Some(gen.write_trace(
+                    jump_opcode_abs_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.jump_opcode_double_deref {
                 s.spawn(|_| {
-                    jump_opcode_double_deref_result = Some(gen.write_trace(
+                    jump_opcode_double_deref_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.jump_opcode_rel {
                 s.spawn(|_| {
-                    jump_opcode_rel_result = Some(gen.write_trace(
+                    jump_opcode_rel_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.jump_opcode_rel_imm {
                 s.spawn(|_| {
-                    jump_opcode_rel_imm_result = Some(gen.write_trace(
+                    jump_opcode_rel_imm_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.mul_opcode {
                 s.spawn(|_| {
-                    mul_opcode_result = Some(gen.write_trace(
+                    mul_opcode_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
                         self.range_check_20.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.mul_opcode_small {
                 s.spawn(|_| {
-                    mul_opcode_small_result = Some(gen.write_trace(
+                    mul_opcode_small_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
                         self.range_check_11.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.qm_31_add_mul_opcode {
                 s.spawn(|_| {
-                    qm_31_add_mul_opcode_result = Some(gen.write_trace(
+                    qm_31_add_mul_opcode_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
                         self.range_check_4_4_4_4.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
             if let Some(gen) = self.ret_opcode {
                 s.spawn(|_| {
-                    ret_opcode_result = Some(gen.write_trace(
+                    ret_opcode_result = Some({
+                        let (trace, claim, interaction_gen) = gen.write_trace(
                         self.memory_address_to_id.as_ref().unwrap(),
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.verify_instruction.as_ref().unwrap(),
-                    ));
+                    );
+                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                    });
                 });
             }
         });
 
         let (add_opcode_claim, add_opcode_interaction_gen) = add_opcode_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (add_opcode_small_claim, add_opcode_small_interaction_gen) = add_opcode_small_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (add_ap_opcode_claim, add_ap_opcode_interaction_gen) = add_ap_opcode_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (assert_eq_opcode_claim, assert_eq_opcode_interaction_gen) = assert_eq_opcode_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (assert_eq_opcode_imm_claim, assert_eq_opcode_imm_interaction_gen) =
             assert_eq_opcode_imm_result
                 .map(|(trace, claim, interaction_gen)| {
-                    evals.extend(trace.to_evals());
+                    evals.extend(trace);
                     (claim, interaction_gen)
                 })
                 .unzip();
         let (assert_eq_opcode_double_deref_claim, assert_eq_opcode_double_deref_interaction_gen) =
             assert_eq_opcode_double_deref_result
                 .map(|(trace, claim, interaction_gen)| {
-                    evals.extend(trace.to_evals());
+                    evals.extend(trace);
                     (claim, interaction_gen)
                 })
                 .unzip();
         let (blake_compress_opcode_claim, blake_compress_opcode_interaction_gen) =
             blake_compress_opcode_result
                 .map(|(trace, claim, interaction_gen)| {
-                    evals.extend(trace.to_evals());
+                    evals.extend(trace);
                     (claim, interaction_gen)
                 })
                 .unzip();
         let (call_opcode_abs_claim, call_opcode_abs_interaction_gen) = call_opcode_abs_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (call_opcode_rel_imm_claim, call_opcode_rel_imm_interaction_gen) =
             call_opcode_rel_imm_result
                 .map(|(trace, claim, interaction_gen)| {
-                    evals.extend(trace.to_evals());
+                    evals.extend(trace);
                     (claim, interaction_gen)
                 })
                 .unzip();
         let (generic_opcode_claim, generic_opcode_interaction_gen) = generic_opcode_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (jnz_opcode_non_taken_claim, jnz_opcode_non_taken_interaction_gen) =
             jnz_opcode_non_taken_result
                 .map(|(trace, claim, interaction_gen)| {
-                    evals.extend(trace.to_evals());
+                    evals.extend(trace);
                     (claim, interaction_gen)
                 })
                 .unzip();
         let (jnz_opcode_taken_claim, jnz_opcode_taken_interaction_gen) = jnz_opcode_taken_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (jump_opcode_abs_claim, jump_opcode_abs_interaction_gen) = jump_opcode_abs_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (jump_opcode_double_deref_claim, jump_opcode_double_deref_interaction_gen) =
             jump_opcode_double_deref_result
                 .map(|(trace, claim, interaction_gen)| {
-                    evals.extend(trace.to_evals());
+                    evals.extend(trace);
                     (claim, interaction_gen)
                 })
                 .unzip();
         let (jump_opcode_rel_claim, jump_opcode_rel_interaction_gen) = jump_opcode_rel_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (jump_opcode_rel_imm_claim, jump_opcode_rel_imm_interaction_gen) =
             jump_opcode_rel_imm_result
                 .map(|(trace, claim, interaction_gen)| {
-                    evals.extend(trace.to_evals());
+                    evals.extend(trace);
                     (claim, interaction_gen)
                 })
                 .unzip();
         let (mul_opcode_claim, mul_opcode_interaction_gen) = mul_opcode_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (mul_opcode_small_claim, mul_opcode_small_interaction_gen) = mul_opcode_small_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (qm_31_add_mul_opcode_claim, qm_31_add_mul_opcode_interaction_gen) =
             qm_31_add_mul_opcode_result
                 .map(|(trace, claim, interaction_gen)| {
-                    evals.extend(trace.to_evals());
+                    evals.extend(trace);
                     (claim, interaction_gen)
                 })
                 .unzip();
         let (ret_opcode_claim, ret_opcode_interaction_gen) = ret_opcode_result
             .map(|(trace, claim, interaction_gen)| {
-                evals.extend(trace.to_evals());
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1082,7 +1146,7 @@ impl CairoClaimGenerator {
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1096,7 +1160,7 @@ impl CairoClaimGenerator {
                     self.range_check_7_2_5.as_ref().unwrap(),
                     self.blake_g.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1110,7 +1174,7 @@ impl CairoClaimGenerator {
                     self.verify_bitwise_xor_7.as_ref().unwrap(),
                     self.verify_bitwise_xor_9.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1118,7 +1182,7 @@ impl CairoClaimGenerator {
             .blake_round_sigma
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1127,7 +1191,7 @@ impl CairoClaimGenerator {
             .map(|gen| {
                 let (trace, claim, interaction_gen) =
                     gen.write_trace(self.verify_bitwise_xor_8.as_ref().unwrap());
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1135,7 +1199,7 @@ impl CairoClaimGenerator {
             .verify_bitwise_xor_12
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace);
+                evals.extend(B::from_simd_evals(trace));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1146,7 +1210,7 @@ impl CairoClaimGenerator {
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1159,7 +1223,7 @@ impl CairoClaimGenerator {
                     self.verify_bitwise_xor_9.as_ref().unwrap(),
                     self.verify_bitwise_xor_8.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1173,7 +1237,7 @@ impl CairoClaimGenerator {
                     self.range_check_3_6_6_3.as_ref().unwrap(),
                     self.range_check_18.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1184,7 +1248,7 @@ impl CairoClaimGenerator {
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.pedersen_aggregator_window_bits_18.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1198,7 +1262,7 @@ impl CairoClaimGenerator {
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.pedersen_aggregator_window_bits_9.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1209,7 +1273,7 @@ impl CairoClaimGenerator {
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.poseidon_aggregator.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1221,7 +1285,7 @@ impl CairoClaimGenerator {
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.range_check_6.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1232,7 +1296,7 @@ impl CairoClaimGenerator {
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1245,7 +1309,7 @@ impl CairoClaimGenerator {
                     self.range_check_8.as_ref().unwrap(),
                     self.partial_ec_mul_generic.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1257,7 +1321,7 @@ impl CairoClaimGenerator {
                     self.range_check_9_9.as_ref().unwrap(),
                     self.range_check_20.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1272,7 +1336,7 @@ impl CairoClaimGenerator {
                     self.range_check_8.as_ref().unwrap(),
                     self.partial_ec_mul_window_bits_18.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1284,7 +1348,7 @@ impl CairoClaimGenerator {
                         self.range_check_9_9.as_ref().unwrap(),
                         self.range_check_20.as_ref().unwrap(),
                     );
-                    evals.extend(trace.to_evals());
+                    evals.extend(B::from_simd_evals(trace.to_evals()));
                     (claim, interaction_gen)
                 })
                 .unzip();
@@ -1295,7 +1359,7 @@ impl CairoClaimGenerator {
             .pedersen_points_table_window_bits_18
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1310,7 +1374,7 @@ impl CairoClaimGenerator {
                     self.range_check_8.as_ref().unwrap(),
                     self.partial_ec_mul_window_bits_9.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1322,7 +1386,7 @@ impl CairoClaimGenerator {
                         self.range_check_9_9.as_ref().unwrap(),
                         self.range_check_20.as_ref().unwrap(),
                     );
-                    evals.extend(trace.to_evals());
+                    evals.extend(B::from_simd_evals(trace.to_evals()));
                     (claim, interaction_gen)
                 })
                 .unzip();
@@ -1333,7 +1397,7 @@ impl CairoClaimGenerator {
             .pedersen_points_table_window_bits_9
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1350,7 +1414,7 @@ impl CairoClaimGenerator {
                     self.range_check_4_4.as_ref().unwrap(),
                     self.poseidon_3_partial_rounds_chain.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1367,7 +1431,7 @@ impl CairoClaimGenerator {
                     self.range_check_4_4.as_ref().unwrap(),
                     self.range_check_252_width_27.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1379,7 +1443,7 @@ impl CairoClaimGenerator {
                     self.poseidon_round_keys.as_ref().unwrap(),
                     self.range_check_3_3_3_3_3.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1390,7 +1454,7 @@ impl CairoClaimGenerator {
                     self.range_check_9_9.as_ref().unwrap(),
                     self.range_check_20.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1398,7 +1462,7 @@ impl CairoClaimGenerator {
             .poseidon_round_keys
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1409,7 +1473,7 @@ impl CairoClaimGenerator {
                     self.range_check_9_9.as_ref().unwrap(),
                     self.range_check_18.as_ref().unwrap(),
                 );
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1417,7 +1481,7 @@ impl CairoClaimGenerator {
             .memory_address_to_id
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace);
+                evals.extend(B::from_simd_evals(trace));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1431,9 +1495,9 @@ impl CairoClaimGenerator {
                     opt_n_id_to_big_components,
                 );
                 for big_trace in big_traces {
-                    evals.extend(big_trace);
+                    evals.extend(B::from_simd_evals(big_trace));
                 }
-                evals.extend(small_trace);
+                evals.extend(B::from_simd_evals(small_trace));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1441,7 +1505,7 @@ impl CairoClaimGenerator {
             .range_check_6
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1449,7 +1513,7 @@ impl CairoClaimGenerator {
             .range_check_8
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1457,7 +1521,7 @@ impl CairoClaimGenerator {
             .range_check_11
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1465,7 +1529,7 @@ impl CairoClaimGenerator {
             .range_check_12
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1473,7 +1537,7 @@ impl CairoClaimGenerator {
             .range_check_18
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1481,7 +1545,7 @@ impl CairoClaimGenerator {
             .range_check_20
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1489,7 +1553,7 @@ impl CairoClaimGenerator {
             .range_check_4_3
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1497,7 +1561,7 @@ impl CairoClaimGenerator {
             .range_check_4_4
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1505,7 +1569,7 @@ impl CairoClaimGenerator {
             .range_check_9_9
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1513,7 +1577,7 @@ impl CairoClaimGenerator {
             .range_check_7_2_5
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1521,7 +1585,7 @@ impl CairoClaimGenerator {
             .range_check_3_6_6_3
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1529,7 +1593,7 @@ impl CairoClaimGenerator {
             .range_check_4_4_4_4
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1537,7 +1601,7 @@ impl CairoClaimGenerator {
             .range_check_3_3_3_3_3
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1545,7 +1609,7 @@ impl CairoClaimGenerator {
             .verify_bitwise_xor_4
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1553,7 +1617,7 @@ impl CairoClaimGenerator {
             .verify_bitwise_xor_7
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1561,7 +1625,7 @@ impl CairoClaimGenerator {
             .verify_bitwise_xor_8
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1569,7 +1633,7 @@ impl CairoClaimGenerator {
             .verify_bitwise_xor_9
             .map(|gen| {
                 let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(trace.to_evals());
+                evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
             })
             .unzip();

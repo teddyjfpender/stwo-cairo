@@ -1,5 +1,8 @@
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+// hashbrown (foldhash) over std SipHash: these dedup maps are the adapter's hot
+// path, and ids depend only on first-encounter ORDER, never the hash function -
+// the swap is byte-equality-invisible (gated by the STWO_DUMP_INPUT diff).
+use hashbrown::hash_map::Entry;
+use hashbrown::HashMap;
 use std::ops::{Deref, DerefMut};
 
 use bytemuck::{Pod, Zeroable};
