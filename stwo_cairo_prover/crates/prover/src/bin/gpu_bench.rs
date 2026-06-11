@@ -177,16 +177,39 @@ fn main() {
     // pipelined proves (the steady state, after the cold prove + verify).
     let mut sustained_s = None;
     if pipeline {
-        // Proof N+1's VM run + adapt overlap proof N's prove. The prove path
-        // itself is untouched; only the input preparation is hoisted to a thread.
-        let mut next_input = Some(run_vm(&program, iterations));
+        // Proof N+k's VM run + adapt overlap proof N's prove: `--prefetch D`
+        // (default 2) independent VM/adapt workers feed a bounded queue, so a
+        // host-side input preparation slower than the prove no longer caps
+        // sustained throughput. The prove path itself is untouched.
+        let prefetch_depth: usize = arg("--prefetch")
+            .map(|v| v.parse().expect("--prefetch <n>"))
+            .unwrap_or(2)
+            .max(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel(prefetch_depth);
+        let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(reps));
+        for _ in 0..prefetch_depth.min(reps) {
+            let tx = tx.clone();
+            let program = program.clone();
+            let remaining = remaining.clone();
+            std::thread::spawn(move || loop {
+                // Claim one rep's input slot; stop when all are claimed.
+                let claimed = remaining
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok();
+                if !claimed || tx.send(run_vm(&program, iterations)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(tx);
+
         let mut steady_start = None;
         for rep in 0..reps {
-            let input = next_input.take().unwrap();
-            let prefetch = (rep + 1 < reps).then(|| {
-                let program = program.clone();
-                std::thread::spawn(move || run_vm(&program, iterations))
-            });
+            let input = rx.recv().expect("pipelined vm/adapt");
             let start = Instant::now();
             let proof = prove_once(input);
             let elapsed = start.elapsed().as_secs_f64();
@@ -198,10 +221,7 @@ fn main() {
                 verify_ms = vstart.elapsed().as_secs_f64() * 1000.0;
                 steady_start = Some(Instant::now());
             }
-            eprintln!("rep={rep} prove_s={elapsed:.3} pipelined=1");
-            if let Some(handle) = prefetch {
-                next_input = Some(handle.join().expect("pipelined vm/adapt"));
-            }
+            eprintln!("rep={rep} prove_s={elapsed:.3} pipelined=1 prefetch={prefetch_depth}");
         }
         if reps > 1 {
             sustained_s = Some(steady_start.unwrap().elapsed().as_secs_f64());
