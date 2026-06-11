@@ -199,3 +199,50 @@ Saturated final numbers (this host, warm/cold): fib 1M 16.6/19.3 s, fib 65k
 9.5/10.6 s, mat_mul 64 12.0/13.9 s, ec 1024 12.5/12.9 s. Saturation pass adds
 zero-copy witness packing and borrowed quotient twiddles; surveyed-and-rejected
 levers (with reasoning) are in stwo commit `5d1d851e`.
+
+## Round 4: trace-driven — the floor was decommit, then OODS weights
+
+A phase-trace profile (`STWO_BENCH_TRACE=1` spans + 500 ms GPU-utilization sampling)
+attributed the warm prove precisely: the GPU was idle 75-93% of the time, and the
+dominant cost was an UNINSTRUMENTED post-grind phase — decommit — at 6.7-9.7 s,
+nearly size-independent (the long-suspected "GPU floor"). Second was OODS sampling
+(3.8 s at fib 1M). Composition was already solved (78 ms vs SIMD's 1,990 ms — the
+JIT lane is 25x SIMD there).
+
+Two fixes, each gated by conformance + Cairo e2e byte-equality:
+
+1. **Batched decommit gathers** (stwo `ffafce22`): the dense decommit read queried
+   values via `Column::at` per (column, row) — one 4-byte synchronous PCIe roundtrip
+   each, ~100k per prove. Now: `Column::gather_unreduced` (one gather kernel + one
+   D2H per column) feeding the existing sparse `decommit_gathered` path.
+2. **Device-side OODS weights** (stwo `345c68c3`): barycentric weights per unique
+   (log_size, point) generated and inverted millions of circle points ON THE HOST.
+   Now the whole pipeline runs on device, reusing the quotient kernels'
+   conformance-proven point generator. (The first kernel attempt used coordinate-wise
+   point subtraction instead of the circle group law — the conformance differential
+   rejected it instantly; the gate works.)
+
+**Same host (RTX 3090, the round-3 trace pod), warm / cold:**
+
+| program | n | start of session | + decommit fix | + OODS fix | total speedup |
+|---|---|---|---|---|---|
+| fib | 1,048,576 | 14.7 / 40.0 s | 8.0 / 10.0 s | **5.37 / 8.26 s** | **2.7x warm** |
+| fib | 65,536 | 8.1 s | 1.68 s | **0.87 / 1.94 s** | **9.3x warm** |
+| ec | 1,024 | 11.2 s | 1.90 s | **1.36 / 2.34 s** | **8.2x warm** |
+
+- fib 1M: **1.37 MHz** (1,367,453 steps/s) — **2.1x same-host SIMD** (11.3 s / 0.65
+  MHz), and at **0.73 s per 1M VM steps on a 3090 this clears NitrooZK's published
+  0.9 s/1M-steps from an RTX 5090**.
+- The small-n floor collapsed: fib 65k warm 0.87 s, ec 1024 warm 1.36 s — CUDA now
+  wins every workload measured, at every size, on this host.
+- **Prove STARKs core: 10.7 s -> 813 ms (13x).** The warm prove is now dominated by
+  Cairo witness generation on the host (trace writing + adapt) — the next frontier
+  is witness-born-on-GPU, an XL item that would go beyond NitrooZK (their witness is
+  also host-generated).
+- VRAM at fib 1M rose to ~18.8 GB peak (cached OODS weight columns per (log_size,
+  point)); fine on 24 GB, worth watching at log 23+.
+
+**Journey on fib 1M, same GPU class**: v1 30.2 s (CUDA loses) -> R1 19.1 s -> R2
+13.2 s -> R3 rebuild (cold 2-4.7x, warm parity) -> **R4 5.37 s, 1.37 MHz, 2.1x over
+same-host SIMD**. Measure, then optimize: the two fixes that mattered most were
+invisible until the phase trace.
