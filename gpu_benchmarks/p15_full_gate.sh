@@ -24,13 +24,19 @@ STWO_REV=d9db63fcfdf2cfd1cb8fe82b0f66a473f38634e3
 CAIRO_BRANCH=generic-backend
 
 echo "=== SETUP ==="
+# Fast path: on the prebuilt image (ghcr.io/teddyjfpender/stwo-pod) the repos,
+# toolchains, and release target dirs are already baked — setup is a source
+# refresh and the cargo invocations below recompile only what changed.
+if [ -d /root/stwo-cairo/stwo_cairo_prover/target/release ]; then
+  echo "prebuilt pod image detected: warm target dirs, refreshing sources only"
+fi
 if ! command -v cargo >/dev/null; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q
   source "$HOME/.cargo/env"
 fi
 cd /root
 [ -d stwo ] || git clone https://github.com/teddyjfpender/stwo -b perf-optimizations
-[ -d stwo-cairo ] || git clone --depth 5 https://github.com/teddyjfpender/stwo-cairo -b "$CAIRO_BRANCH"
+[ -d stwo-cairo ] || git clone https://github.com/teddyjfpender/stwo-cairo -b "$CAIRO_BRANCH"
 (cd stwo && git fetch origin && git checkout "$STWO_REV")
 (cd stwo-cairo && git fetch origin "$CAIRO_BRANCH" && git reset --hard FETCH_HEAD)
 nvidia-smi --query-gpu=name,memory.total --format=csv || true
