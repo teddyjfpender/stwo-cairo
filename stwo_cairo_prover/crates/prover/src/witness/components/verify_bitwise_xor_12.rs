@@ -9,6 +9,8 @@ use cairo_air::relations::VERIFY_BITWISE_XOR_12_RELATION_ID;
 use itertools::{chain, Itertools};
 
 use crate::witness::prelude::*;
+use stwo::core::fields::qm31::SecureField;
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 pub type InputType = [M31; 3];
 pub type PackedInputType = [PackedM31; 3];
@@ -78,11 +80,8 @@ impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,
         common_lookup_elements: &relations::CommonLookupElements,
-    ) -> (
-        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
-        InteractionClaim,
-    ) {
-        let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(LOG_SIZE) };
+    ) -> (RawLogupTrace, impl FnOnce(SecureField) -> InteractionClaim) {
+        let mut logup_gen = unsafe { RawLogupTraceGenerator::uninitialized(LOG_SIZE) };
 
         // [0, 1, 2, ..., N_LANES - 1].
         let zero_to_n_lanes = u32x16::from_array(std::array::from_fn(|i| i as u32));
@@ -145,8 +144,6 @@ impl InteractionClaimGenerator {
             col_gen.finalize_col();
         }
 
-        let (trace, claimed_sum) = logup_gen.finalize_last();
-
-        (trace, InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
     }
 }

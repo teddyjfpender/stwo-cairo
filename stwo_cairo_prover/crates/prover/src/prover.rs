@@ -81,6 +81,7 @@ pub fn prove_cairo<B, MC: MerkleChannel>(
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
     B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+        + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
         + 'static,
     MC: 'static,
@@ -231,6 +232,7 @@ pub fn prove_cairo_with_precompute<'a, B, MC: MerkleChannel>(
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
     B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+        + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
         + 'static,
     MC: 'static,
@@ -269,6 +271,7 @@ fn prove_cairo_common<'a, B, MC: MerkleChannel>(
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
     B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+        + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
         + 'static,
     MC: 'static,
@@ -321,7 +324,7 @@ where
     // Interaction trace.
     let span = span!(Level::INFO, "Write interaction trace").entered();
     let (interaction_trace_evals, interaction_claim) =
-        interaction_generator.write_interaction_trace(&interaction_elements);
+        interaction_generator.write_interaction_trace::<B>(&interaction_elements);
     span.exit();
 
     tracing::info!(
@@ -337,7 +340,7 @@ where
 
     let span = span!(Level::INFO, "Compute interaction trace commitment").entered();
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(B::from_simd_evals(interaction_trace_evals));
+    tree_builder.extend_evals(interaction_trace_evals);
     tree_builder.commit(channel);
     span.exit();
 

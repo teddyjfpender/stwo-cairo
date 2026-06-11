@@ -2,8 +2,10 @@
 
 #![allow(unused_parens)]#![cfg_attr(rustfmt, rustfmt_skip)]
 use crate::witness::prelude::*;
+use stwo::core::fields::qm31::SecureField;
 use cairo_air::components::partial_ec_mul_generic::{Claim, InteractionClaim, N_TRACE_COLUMNS};
 use crate::witness::components::range_check_8;use crate::witness::components::range_check_9_9;use crate::witness::components::range_check_20;
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 pub type InputType = (M31, M31, (Felt252Width27, [Felt252; 2], [Felt252; 2], M31));
 pub type PackedInputType = (PackedM31, PackedM31, (PackedFelt252Width27, [PackedFelt252; 2], [PackedFelt252; 2], PackedM31));
@@ -1696,9 +1698,9 @@ impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,
         common_lookup_elements: &relations::CommonLookupElements
-    ) -> (Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>, InteractionClaim)
+    ) -> (RawLogupTrace, impl FnOnce(SecureField) -> InteractionClaim)
     {
-        let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(self.log_size) };
+        let mut logup_gen = unsafe { RawLogupTraceGenerator::uninitialized(self.log_size) };
 
         //Sum logup terms in pairs.
 let mut col_gen = logup_gen.new_col();
@@ -4370,10 +4372,6 @@ let mut col_gen = logup_gen.new_col();
             });
         col_gen.finalize_col();
 
-        let (trace, claimed_sum) = logup_gen.finalize_last();
-
-        (trace, InteractionClaim {
-            claimed_sum,
-        },)
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
     }
 }

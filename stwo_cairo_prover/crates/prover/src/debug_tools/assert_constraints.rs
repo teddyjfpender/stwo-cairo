@@ -16,6 +16,7 @@ use stwo_constraint_framework::{
 use crate::debug_tools::mock_tree_builder::MockCommitmentScheme;
 use crate::witness::cairo::create_cairo_claim_generator;
 use crate::witness::preprocessed_trace::gen_trace;
+use stwo::prover::backend::simd::SimdBackend;
 
 pub fn assert_component<E: FrameworkEval + Sync>(
     component: &FrameworkComponent<E>,
@@ -276,7 +277,7 @@ pub fn assert_cairo_constraints(input: ProverInput, preprocessed_trace: Arc<PreP
     let interaction_elements = CommonLookupElements::draw(&mut dummy_channel);
     let mut tree_builder = commitment_scheme.tree_builder();
     let (interaction_trace_evals, interaction_claim) =
-        interaction_generator.write_interaction_trace(&interaction_elements);
+        interaction_generator.write_interaction_trace::<SimdBackend>(&interaction_elements);
     tree_builder.extend_evals(interaction_trace_evals);
     tree_builder.finalize_interaction();
 

@@ -7,6 +7,8 @@ use cairo_air::components::pedersen_aggregator_window_bits_9::{
 
 use crate::witness::components::{memory_id_to_big, partial_ec_mul_window_bits_9, range_check_8};
 use crate::witness::prelude::*;
+use stwo::core::fields::qm31::SecureField;
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 pub type InputType = ([M31; 2], M31);
 pub type PackedInputType = ([PackedM31; 2], PackedM31);
@@ -693,11 +695,8 @@ impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,
         common_lookup_elements: &relations::CommonLookupElements,
-    ) -> (
-        Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>,
-        InteractionClaim,
-    ) {
-        let mut logup_gen = unsafe { LogupTraceGenerator::uninitialized(self.log_size) };
+    ) -> (RawLogupTrace, impl FnOnce(SecureField) -> InteractionClaim) {
+        let mut logup_gen = unsafe { RawLogupTraceGenerator::uninitialized(self.log_size) };
 
         // Sum logup terms in pairs.
         let mut col_gen = logup_gen.new_col();
@@ -796,8 +795,6 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        let (trace, claimed_sum) = logup_gen.finalize_last();
-
-        (trace, InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
     }
 }

@@ -33,7 +33,9 @@ pub use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
 pub use stwo_cairo_common::prover_types::cpu::*;
 pub use stwo_cairo_common::prover_types::simd::*;
 pub use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
-pub use stwo_constraint_framework::{LogupTraceGenerator, Relation};
+pub use stwo_constraint_framework::{
+    LogupFinalizeBackend, LogupTraceGenerator, RawLogupTrace, RawLogupTraceGenerator, Relation,
+};
 
 pub use crate::witness::fast_deduction::blake::{
     BlakeRound, PackedBlakeG, PackedBlakeRoundSigma, PackedTripleXor32,

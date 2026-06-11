@@ -114,7 +114,9 @@ mod tests {
         let mut mock_tree_builder = mock_commitment_scheme.tree_builder();
 
         // Interaction trace.
-        let (trace, _) = interaction_gen.write_interaction_trace(&common_lookup_elements);
+        let (raw_trace, _build_claim) =
+            interaction_gen.write_interaction_trace(&common_lookup_elements);
+        let (trace, _claimed_sum) = raw_trace.finalize_on_simd();
         mock_tree_builder.extend_evals(trace);
         mock_tree_builder.finalize_interaction();
         let trace = mock_commitment_scheme.trace_domain_evaluations();
