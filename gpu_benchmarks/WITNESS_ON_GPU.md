@@ -142,3 +142,39 @@ a research project, not an optimization).
 
 End-state: a ~2.5 s fib-1M prove (≈3 MHz) on a 3090-class card, witness-born-on-GPU,
 with the host reduced to the VM, the adapter, and Fiat-Shamir orchestration.
+
+## W3 phase-1 blueprint: memory_id_to_big, the full vertical slice
+
+Chosen first because it is (a) among the largest single components, (b) in the
+sequential deduction phase where W2's streaming cannot overlap it — its generation
+AND upload sit on the critical path, and (c) a pure function of the adapter's
+dedup'd tables (no cross-component mutation on its inputs).
+
+The coupling that defines the cut: if the base limb columns are device-born, the
+interaction writer must not read them back — so the component's denominators move
+to device with them. The slice:
+
+1. **Inputs up once**: the dedup'd f252 value table (8 u32/value — half the bytes of
+   the 28 limb output columns) and the multiplicity counts.
+2. **Limb-split kernel**: f252 words -> 9-bit limb columns (the `gen_big_memory_traces`
+   body), columns born on device; same for the small-value table.
+3. **Range-check feed on device**: the rc_9_9 input accumulation becomes one kernel
+   of atomic adds into a 2^18 device count table; download (1 MB) and add into the
+   host state's AtomicU32 table before rc components write. Counts are
+   order-independent — byte-equality preserved by construction.
+4. **Device denominators**: the interaction writer's `combine(limbs at row)` reads
+   the device-resident limb columns directly (the constraint-JIT recording already
+   proves the combine arithmetic byte-equal on device); numerators are the
+   (device-resident) multiplicities. Feeds the existing `finalize_raw_logup` device
+   pipeline — the component never materializes columns on the host at all.
+5. **Gate**: a per-component differential (host writer vs device writer, column
+   byte-compare — the `STWO_CUDA_CONSTRAINT_VERIFY` harness pattern) + the Cairo
+   e2e. Fallback per component, NitrooZK-lesson style.
+
+The same slice shape then applies component-by-component: memory_address_to_id,
+the range-check table families, verify_instruction, then the opcode cohort (which
+additionally uploads their packed VM inputs and keeps their sub-component input
+pushes as device count tables). Each lands independently behind its differential.
+
+Status: blueprint ready; W4 + W2 landed first (this session); phase-1 implementation
+is the next session's opening move.
