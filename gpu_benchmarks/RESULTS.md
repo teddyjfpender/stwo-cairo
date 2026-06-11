@@ -324,3 +324,33 @@ e2e proof byte-identical**). What landed:
 4090 numbers (host variance applies): fib 1M warm 5.15 s / 1.42 MHz, fib 65k
 0.94 s, ec 1024 1.13 s. The prove span is now dominated by the host write loops
 that W3 removes; wall clock additionally gained the adapter speedup.
+
+## Round 7: the big-n scaling curve (H100 80GB) — the road to 10 MHz, measured
+
+First-ever runs past the 24 GB ceiling (fib 4M was the round-1 blocker):
+
+| fib n | cycles | warm prove | **MHz** | VRAM |
+|---|---|---|---|---|
+| 1M | 7.34M | 3.86 s | **1.90** | 9.8 GB |
+| 2M | 14.7M | 6.68 s | **2.20** | 17.3 GB |
+| 4M | 29.4M | 13.8 s | 2.13 | 32.6 GB |
+| 8M | 58.7M | 28.9 s | 2.04 | 62.9 GB |
+| 16M | — | OOM (~125 GB working set; retry with STWO_CAIRO_LOW_MEMORY) | — | — |
+
+**Verdict: the curve plateaus at ~2.2 MHz by 2M steps.** Fixed costs are fully
+amortized there; beyond it the prove scales linearly at ~0.45-0.5 us/step. Big
+traces alone do NOT reach 10 MHz — the per-step cost is the wall, split roughly:
+host witness writes ~40%, commits (NTT+Merkle) ~25%, STARK core ~20%, rest ~15%.
+
+Gap analysis to 10 MHz (0.1 us/step):
+1. **W3 witness-on-GPU** (spec ready, formula level): removes the ~40% host write
+   share -> ~3.5-4 MHz at scale. The expected-3MHz goal is covered by W3 alone.
+2. **Core kernel round**: the remaining ~0.25 us/step is GPU compute (NTT, Merkle
+   blake2s, quotients, OODS) — needs a dedicated kernel-optimization pass
+   (occupancy/ILP via ncu, fusion, possibly warp-specialized NTT) for the next ~2x.
+3. **Beyond**: multi-GPU tree/phase parallelism or newer silicon (5090/B200) for the
+   final stretch. 10 MHz = W3 x kernel round x hardware, all three.
+
+H100 vs 4090 at 1M: 3.86 vs 5.15 s — the bigger card helps the GPU phases and the
+better host helps the witness, but neither changes the plateau; only removing
+per-step work does.
