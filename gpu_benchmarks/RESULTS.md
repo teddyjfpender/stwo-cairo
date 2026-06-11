@@ -276,3 +276,23 @@ fib 1M: **0.64 s per 1M VM steps on an RTX 3090** — NitrooZK's published 5090 
 (host, outside the prove span), base/interaction host write loops ~2.5 s, STARK core
 0.84 s — next levers per the design doc: W4 (adapt parallelization), W2 (streamed
 base upload), W3 (codegen witness on GPU, the road to ~3 MHz).
+
+### Round 5 completion: all 67 writers device-finalized + first RTX 4090 data
+
+`memory_id_to_big` (the memory table — multi-segment big values + small table, among
+the largest interaction traces) joined the raw path: per-segment finalize on the
+device in the eager extension order, big-claim total as the field sum of segment
+sums. **W1 is complete: the interaction tree has zero `from_simd` transfers and zero
+host finalize math left.** Gates: memory component constraint tests + SIMD e2e
+locally; conformance + logup differential + **CUDA e2e byte-equality on an RTX 4090**
+(first Ada validation — the JIT/PTX lane re-qualified on sm_89 from cold).
+
+4090 numbers (different host than the round-5 3090 — not directly comparable):
+fib 1M warm 5.51 s / 1.33 MHz, fib 65k 0.94 s, ec 1024 1.09 s.
+
+**The instructive result: the 4090 is no faster than the 3090 host.** The STARK core
+(~0.8 s at fib 1M) is now a minority of the prove; the rest is host-side witness
+writing and the VM/adapter. GPU generation has stopped mattering — which is exactly
+where this work was trying to get. The next speedups live in W4 (adapt, 2.8 s of
+wall clock), W2 (streamed base upload), and W3 (codegen witness on GPU) — host-side
+and host-to-device work, per `WITNESS_ON_GPU.md`.
