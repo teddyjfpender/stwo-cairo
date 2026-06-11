@@ -246,3 +246,33 @@ Two fixes, each gated by conformance + Cairo e2e byte-equality:
 13.2 s -> R3 rebuild (cold 2-4.7x, warm parity) -> **R4 5.37 s, 1.37 MHz, 2.1x over
 same-host SIMD**. Measure, then optimize: the two fixes that mattered most were
 invisible until the phase trace.
+
+## Round 5: witness-on-GPU W1 — device-finalized interaction trace
+
+First witness phase moved onto the device (design: `WITNESS_ON_GPU.md`; this is the
+step beyond NitrooZK, whose witness is fully host-generated). All 66 uniform
+generated writers now emit raw (numerator, denominator) fractions on the host
+(parallel, unchanged) and the finalize — batched inversion, fraction chain, claimed
+sums, cumsum shift, per-coordinate prefix sums — runs on the prove backend:
+on-device for CUDA, with the interaction columns **born on device** (the
+interaction tree's `from_simd_evals` transfer is gone; commit span 396 -> 202 ms).
+Claims build from the finalized sums in the same fixed order before channel mixing —
+the Fiat-Shamir transcript is unchanged. `memory_id_to_big` stays eager for now
+(multi-segment writer; bridged, order preserved).
+
+Gates at every step: the raw-vs-eager unit differential, the device-vs-SIMD finalize
+differential on hardware (also the first qualification of the CUB prefix-sum lane),
+the SIMD all-opcode e2e locally, and the **CUDA e2e proof byte-identical to SIMD**.
+
+| program | n | round 4 | **round 5 (W1)** | total session arc |
+|---|---|---|---|---|
+| fib | 1,048,576 | 5.37 s / 1.37 MHz | **4.67 s / 1.57 MHz** | 14.7 -> 4.67 s (**3.1x**) |
+| ec | 1,024 | 1.36 s | **1.10 s** | 11.2 -> 1.10 s (**10.2x**) |
+| fib | 65,536 | 0.87 s | 0.92 s (noise; tiny trace) | 8.1 -> 0.9 s (**9x**) |
+
+fib 1M: **0.64 s per 1M VM steps on an RTX 3090** — NitrooZK's published 5090 figure
+(0.9 s/1M) now exceeded by 40% on a two-generations-older card. The predicted W1 win
+(0.5-0.7 s) landed exactly. Remaining warm profile: adapt 2.8 s + cairo run 1.6 s
+(host, outside the prove span), base/interaction host write loops ~2.5 s, STARK core
+0.84 s — next levers per the design doc: W4 (adapt parallelization), W2 (streamed
+base upload), W3 (codegen witness on GPU, the road to ~3 MHz).
