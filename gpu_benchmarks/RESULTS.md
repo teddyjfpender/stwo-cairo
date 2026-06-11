@@ -354,3 +354,61 @@ Gap analysis to 10 MHz (0.1 us/step):
 H100 vs 4090 at 1M: 3.86 vs 5.15 s — the bigger card helps the GPU phases and the
 better host helps the witness, but neither changes the plateau; only removing
 per-step work does.
+
+## Round 8: P1 on hardware — every gate green, one real deadlock, plateau 2.2 → 4.3 MHz
+
+Hardware: RunPod secure-cloud H100 SXM 80 GB, 208-vCPU host. First round on the
+prebuilt pod image (`ghcr.io/teddyjfpender/stwo-pod`, CI-built): pod boot to
+first gate in ~1 minute — no rustup, no cold build, kernels fat-compiled
+sm_80/86/89/90.
+
+**Gates (all green):**
+- A — stwo CUDA conformance, including the `stwo_cuda_link` unit tests repaired
+  this round (they had NEVER compiled on an nvcc machine; the image build
+  exposed them — stwo @ 2e62f896).
+- B — P1 witness differential (`STWO_CUDA_WITNESS_VERIFY=1`) inside a full CUDA
+  e2e prove: pass (panics on any mismatch).
+- C — clean CUDA e2e **proof byte-identical to SIMD** with P1 + P3 live.
+- D — 3× repeated-prove determinism + streams-off cross-check.
+- Explicit device-path confirmation at bench scale (fib 1M): `trace columns OK`,
+  `rc_9_9 count tables OK`, `interaction columns + sums OK`.
+
+**P3 deadlock found (the gate class earned its keep):** streams-on prove hung at
+fib 2M rep 2 — all threads asleep (23 futex, 2 in CUDA poll), GPU 0%, no Xid —
+after ≥12 clean streams-on proves including the same size. Timing-dependent,
+exactly the silent-failure class ROAD_TO_10MHZ predicted for P3.
+`STWO_CUDA_DISABLE_STREAMS=1` engaged for the rest of the round. **Open item:**
+audit the pool-stream event bridges (incl. cross-thread launches from the rayon
+scope) before P3 re-enables by default.
+
+**The scaling curve (streams OFF — add ~5% when P3 is fixed):**
+
+| fib n | warm prove | **MHz** | VRAM | round 7 |
+|---|---|---|---|---|
+| 1M | 2.20 s | **3.18** (3.35 streams-on) | 7.5 GB | 1.90 |
+| 2M | 3.47 s | **4.04** | 12.9 GB | 2.20 |
+| 4M | 6.72 s | **4.17** | 23.6 GB | 2.13 |
+| 8M | 12.9 s | **4.34** | 45.1 GB | 2.04 |
+
+The plateau moved 2.2 → **~4.3 MHz and is still rising at 8M** (round 7 fell
+past 2M; fixed costs now amortize further out). P1 isolation at 1M:
+3.18 vs 2.28 MHz with `STWO_CUDA_MEMORY_WITNESS=0` — **1.40× from the memory
+slice alone**, right on the model's prediction.
+
+**P5 sustained (1M, prefetch depth 1): 2.14 MHz** vs ~1.3 serial — pipelining
+works and exposes the next ceiling: VM + adapt (~3.2 s/proof) now exceeds the
+prove (2.2 s), so sustained throughput is **VM-bound**. Fix: prefetch depth ≥ 2
+(independent VM workers) — pure orchestration, next round.
+
+**Cost-per-MHz (RunPod list prices, bandwidth-scaled from measured anchors):**
+community 3090/4090 deliver ~4–6 MHz per $/hr vs ~1.0–1.25 for H100 SXM —
+consumer farms win sustained-throughput economics ~3–5× while 24 GB caps single
+proofs at ~2M steps; datacenter cards keep single-proof latency and big traces.
+Strategy: optimize on H100, price the product on sharded consumer fleets.
+
+M1 ncu trace captured at 1M steady-state (400 launches past warmup) — the P2
+kernel ranking comes from it next round.
+
+Next: P3 deadlock audit, witness-on-GPU for the remaining component cohort
+(address_to_id, rc families, opcodes — the 4.3 → ~6 MHz leg), M1-ranked P2
+kernel round, P5 prefetch depth.
