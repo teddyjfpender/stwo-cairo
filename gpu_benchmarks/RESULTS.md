@@ -158,3 +158,44 @@ Notes:
 round 1 19.1 s (GPU 1.6×) → round 2 **13.2 s (GPU 1.84×)** ≈ 1.8 s per 1M VM steps —
 at NitrooZK's published 5090 base (~0.9 s/1M steps) once adjusted for the GPU
 generation gap.
+
+## Round 3: the stream-ordered rebuild (+ saturation pass)
+
+Implements the full 5-point plan from `docs/gpu-architecture-analysis.md` in the stwo
+fork (commits `25798d20`..`5d1d851e`): **stream-ordered execution** (all 82 wrapper
+device-syncs removed; allocator without per-alloc private-stream churn; host reads
+fenced by synchronous `cudaMemcpy` by construction), **statement-independent JIT
+kernels + on-disk PTX cache** (all ext constants hoisted to runtime params; kernels
+shared across statements, inputs, and processes), **batched `evaluate_polynomials`**
+(one multi-column NTT per size group), **pinned witness staging** (parallel zero-copy
+packing from the SIMD columns), and the **waste bundle** (fused in-kernel accumulate,
+device-side split/join/twiddle-extract, no uninitialized-clone FRI buffers, borrowed
+quotient twiddles). Gates green at every step: conformance byte-equality + repeated
+prove on both channels, Cairo e2e proof byte-identical to SIMD.
+
+**Same-host interleaved A/B (old = round-2 code, new = rebuild; RTX 3090, 16 vCPU):**
+
+| program | n | warm old → new | cold old → new | cold speedup |
+|---|---|---|---|---|
+| fib | 1,048,576 | 17.2 → 16.8 s | 37.4 → 18.7 s | **2.0×** |
+| fib | 65,536 | 9.7 → 9.4 s | 36.7 → 10.2 s | **3.6×** |
+| ec | 1,024 | 12.8 → 12.4 s | 47.7 → 13.5 s | **3.5×** |
+
+**The headline is cold-start: 2–4.7× faster.** First-prove latency is now warm+1–3 s
+instead of +20–50 s — the disk PTX cache means a fresh process (or a fresh statement,
+or a different input) reuses compiled kernels (`STWO_JIT_LOG=1` shows 1–3 ms
+disk-cache hits vs ~1.8 s NVRTC compiles). Warm proves improved a real but modest
+2–9%: at these sizes on this hardware the warm path is dominated by GPU compute and
+host witness phases, not launch latency — the sync-census prediction overweighted
+steady-state and underweighted cold.
+
+Honest host caveat: round-2 and round-3 ran on *different* 3090 community hosts. This
+host's CPU is ~2× faster (SIMD fib 1M: 12.3 s vs 24.3 s), which compresses the
+CUDA-vs-SIMD gap here (SIMD wins warm on this host; CUDA won on the round-2 host).
+The cross-backend verdict is host-dependent at 3090 scale; the rebuild's wins
+(cold-start, byte-equal correctness, removed PCIe roundtrips) hold on both.
+
+Saturated final numbers (this host, warm/cold): fib 1M 16.6/19.3 s, fib 65k
+9.5/10.6 s, mat_mul 64 12.0/13.9 s, ec 1024 12.5/12.9 s. Saturation pass adds
+zero-copy witness packing and borrowed quotient twiddles; surveyed-and-rejected
+levers (with reasoning) are in stwo commit `5d1d851e`.
