@@ -178,3 +178,36 @@ pushes as device count tables). Each lands independently behind its differential
 
 Status: blueprint ready; W4 + W2 landed first (this session); phase-1 implementation
 is the next session's opening move.
+
+### W3 phase-1 implementation spec (formula level)
+
+Extracted from the generated code so the port is mechanical:
+
+- **Limb split** (`split` in `common/src/prover_types/felt.rs`): walk the 8 (big) or
+  4 (small) u32 words LSB-first, emitting 28 (resp. 8) limbs of
+  `FELT252_BITS_PER_WORD = 9` bits: keep a bit-buffer; while >= 9 bits remain in the
+  current word emit `word & 0x1FF` and shift; on word exhaustion OR in the next
+  word's low bits. Device kernel: thread per element, unrolled 28-limb emit, columns
+  written column-major (coalesced). Padding rows (beyond `n_values` up to the
+  power-of-two column length) are zeros; multiplicity column uploads as-is.
+- **rc_9_9 feed**: the state holds `mults: [AtomicMultiplicityColumn; 8]` (one per
+  relation_index = pair position i%8) and maps inputs via `input_to_row:
+  HashMap<(M31,M31), row>` derived from the preprocessed table layout — NOT a
+  closed-form index. Device port: upload the input->row table once as a dense
+  2^18 u32 LUT (content = preprocessed layout, content-keyed), kernel does
+  `atomicAdd(&counts[rel][lut[a * 512 + b]], 1)` over the limb pairs, then the 8
+  count tables (8 x 1 MB) download and add into the host atomics before rc
+  components write. Counts are order-independent: byte-equality by construction.
+- **Denominators**: per segment, per row: `combine(chain([MEMORY_ID_TO_BIG_RELATION_ID],
+  [offset + row], limbs[0..28]))` with the channel-drawn (z, alpha-powers) passed as
+  kernel params; numerators are `-multiplicity`. Output feeds `finalize_raw_logup`'s
+  device pipeline directly (a device-resident variant of `RawLogupColumn` — add a
+  `DeviceRawLogupColumn` alongside, consumed by the same chain kernels without the
+  H2D pair upload).
+- **Gate**: differential harness `STWO_CUDA_WITNESS_VERIFY=1` — run host and device
+  writers, byte-compare all columns + lookup sums (the constraint-verify harness
+  pattern); per-component opt-in until 0 mismatches, SIMD fallback wired first.
+
+Estimated surface: one kernel file (4 kernels), FFI x4 layers, the component's two
+writers restructured behind the hook, claim plumbing unchanged (sums still arrive
+in order). One focused session.
