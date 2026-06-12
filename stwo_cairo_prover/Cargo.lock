@@ -1886,7 +1886,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.1.5",
- "serde",
 ]
 
 [[package]]
@@ -3447,7 +3446,7 @@ dependencies = [
  "dashmap",
  "educe 0.5.11",
  "fnv",
- "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
  "hex",
  "indexmap",
  "itertools 0.12.1",
@@ -3533,6 +3532,24 @@ dependencies = [
  "test-case",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "stwo-cairo-bootloader"
+version = "1.2.2"
+dependencies = [
+ "anyhow",
+ "cairo-vm",
+ "num-traits",
+ "serde",
+ "serde_json",
+ "starknet-crypto 0.6.2",
+ "starknet-types-core",
+ "stwo-cairo-adapter",
+ "thiserror",
+ "thiserror-no-std",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3658,7 +3675,7 @@ name = "stwo-constraint-framework"
 version = "2.2.0"
 source = "git+https://github.com/teddyjfpender/stwo?rev=d52454fe6d1003082f284506e34aafd061d14f73#d52454fe6d1003082f284506e34aafd061d14f73"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
  "itertools 0.12.1",
  "num-traits",
  "rand 0.8.5",
@@ -3820,6 +3837,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "thiserror-impl-no-std"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58e6318948b519ba6dc2b442a6d0b904ebfb8d411a3ad3e07843615a72249758"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "thiserror-no-std"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3ad459d94dd517257cc96add8a43190ee620011bb6e6cdc82dafd97dfafafea"
+dependencies = [
+ "thiserror-impl-no-std",
 ]
 
 [[package]]

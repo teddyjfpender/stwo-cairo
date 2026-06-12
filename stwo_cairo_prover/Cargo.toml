@@ -8,6 +8,7 @@ members = [
     "crates/common",
     "crates/cairo-air",
     "crates/dev_utils",
+    "crates/bootloader",
 ]
 resolver = "2"
 
