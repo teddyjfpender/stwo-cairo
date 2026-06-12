@@ -159,6 +159,18 @@ fn main() {
         .iter()
         .map(|(_, count)| *count)
         .sum();
+    // Witness-port ranking input: per-opcode row counts (multiply by each
+    // component's N_TRACE_COLUMNS to rank by mass). --counts-only skips proving.
+    if std::env::var("STWO_OPCODE_COUNTS").as_deref() == Ok("1") || flag("--counts-only") {
+        let mut counts = input.state_transitions.casm_states_by_opcode.counts();
+        counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        for (name, count) in &counts {
+            eprintln!("OPCODE_COUNT {name} {count}");
+        }
+        if flag("--counts-only") {
+            return;
+        }
+    }
 
     let prove_once = |input| match backend.as_str() {
         "cuda" => prove_cairo::<stwo_backend_cuda::CudaBackend, Blake2sMerkleChannel>(

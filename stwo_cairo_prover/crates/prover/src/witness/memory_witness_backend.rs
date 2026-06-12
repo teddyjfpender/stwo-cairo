@@ -584,7 +584,7 @@ fn verify_rc_counts(
     eprintln!("STWO_CUDA_WITNESS_VERIFY: rc_9_9 count tables OK");
 }
 
-fn compare_interaction(
+pub(crate) fn compare_interaction(
     label: &str,
     device_trace: &MemoryEvals<CudaBackend>,
     device_sum: SecureField,

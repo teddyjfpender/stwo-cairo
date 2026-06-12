@@ -88,6 +88,7 @@ where
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + crate::witness::memory_witness_backend::MemoryAddressToIdWitness
         + crate::witness::memory_witness_backend::VerifyInstructionWitness
+        + crate::witness::opcode_witness_backend::OpcodeWitness
         + 'static,
     MC: 'static,
 {
@@ -246,6 +247,7 @@ where
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + crate::witness::memory_witness_backend::MemoryAddressToIdWitness
         + crate::witness::memory_witness_backend::VerifyInstructionWitness
+        + crate::witness::opcode_witness_backend::OpcodeWitness
         + 'static,
     MC: 'static,
 {
@@ -290,6 +292,7 @@ where
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + crate::witness::memory_witness_backend::MemoryAddressToIdWitness
         + crate::witness::memory_witness_backend::VerifyInstructionWitness
+        + crate::witness::opcode_witness_backend::OpcodeWitness
         + 'static,
     MC: 'static,
 {

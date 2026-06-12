@@ -98,6 +98,12 @@ impl ClaimGenerator {
         }
     }
 
+    /// Borrow of the raw value tables (big: 8 words per value, small: u128)
+    /// for the device witness path's prove-wide table upload.
+    pub(crate) fn value_tables(&self) -> (&[[u32; 8]], &[u128]) {
+        (&self.big_values, &self.small_values)
+    }
+
     pub fn add_packed_m31(&self, inputs: &PackedM31) {
         let memory_ids = inputs.to_array();
         for memory_id in memory_ids {

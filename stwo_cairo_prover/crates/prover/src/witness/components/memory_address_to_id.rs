@@ -62,6 +62,10 @@ impl AddressToId {
     pub(crate) fn clone_inner(&self) -> Vec<u32> {
         self.data.clone()
     }
+
+    pub(crate) fn raw_slice(&self) -> &[u32] {
+        &self.data
+    }
 }
 
 impl Index<usize> for AddressToId {
@@ -108,6 +112,12 @@ impl ClaimGenerator {
         for input in inputs {
             self.add_input(input, 0);
         }
+    }
+
+    /// Borrow of the raw address-ordered id table (index 0 = address 1) for
+    /// the device witness path's prove-wide table upload.
+    pub(crate) fn raw_id_table(&self) -> &[u32] {
+        self.address_to_raw_id.raw_slice()
     }
 
     pub fn add_packed_m31(&self, inputs: &PackedBaseField) {
