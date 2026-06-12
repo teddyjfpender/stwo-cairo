@@ -211,7 +211,7 @@ impl OpcodeWitness for CudaBackend {
             let mut padded = raw_inputs;
             padded.resize(column_length, *padded.first().unwrap());
             let packed_inputs = pack_values(&padded);
-            let (host_trace, host_lookup_data, _host_feeds) = ret_opcode::write_trace_simd(
+            let (host_trace, host_lookup_data, host_feeds) = ret_opcode::write_trace_simd(
                 packed_inputs,
                 n_rows,
                 memory_address_to_id,
@@ -220,6 +220,45 @@ impl OpcodeWitness for CudaBackend {
             );
             let host_evals = host_trace.to_evals();
             let mut mismatches = 0usize;
+            // Feed differential: the values this path fed host-side must match
+            // the writer's sub_component_inputs buffers element-for-element.
+            {
+                use stwo::prover::backend::simd::m31::PackedM31;
+                let unpack = |cols: &[PackedM31]| -> Vec<M31> {
+                    cols.iter().flat_map(|p| p.to_array()).collect()
+                };
+                let vi_feed: Vec<_> = host_feeds.verify_instruction[0]
+                    .iter()
+                    .flat_map(|p| {
+                        let pcs = p.0.to_array();
+                        pcs.into_iter()
+                    })
+                    .collect();
+                let addr0_feed = unpack(&host_feeds.memory_address_to_id[0]);
+                let addr1_feed = unpack(&host_feeds.memory_address_to_id[1]);
+                let id0_feed = unpack(&host_feeds.memory_id_to_big[0]);
+                let id1_feed = unpack(&host_feeds.memory_id_to_big[1]);
+                for (i, state) in padded.iter().enumerate() {
+                    let expected = [
+                        (vi_feed[i], state.pc),
+                        (addr0_feed[i], state.fp - M31::from(1)),
+                        (addr1_feed[i], state.fp - M31::from(2)),
+                        (
+                            id0_feed[i],
+                            memory_address_to_id.get_id(state.fp - M31::from(1)),
+                        ),
+                        (
+                            id1_feed[i],
+                            memory_address_to_id.get_id(state.fp - M31::from(2)),
+                        ),
+                    ];
+                    if expected.iter().any(|(host, device)| host != device) {
+                        eprintln!("STWO_CUDA_WITNESS_VERIFY: ret_opcode feed MISMATCH at row {i}");
+                        mismatches += 1;
+                        break;
+                    }
+                }
+            }
             for (col_idx, (device_col, host_col)) in cols.iter().zip(&host_evals).enumerate() {
                 let device_values = device_col.to_vec();
                 let host_values = host_col.values.to_cpu();

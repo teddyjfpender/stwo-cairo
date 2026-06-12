@@ -84,9 +84,9 @@ impl ClaimGenerator {
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
 pub(crate) struct SubComponentInputs {
-    verify_instruction: [Vec<verify_instruction::PackedInputType>; 1],
-    memory_address_to_id: [Vec<memory_address_to_id::PackedInputType>; 2],
-    memory_id_to_big: [Vec<memory_id_to_big::PackedInputType>; 2],
+    pub(crate) verify_instruction: [Vec<verify_instruction::PackedInputType>; 1],
+    pub(crate) memory_address_to_id: [Vec<memory_address_to_id::PackedInputType>; 2],
+    pub(crate) memory_id_to_big: [Vec<memory_id_to_big::PackedInputType>; 2],
 }
 
 #[allow(clippy::useless_conversion)]
