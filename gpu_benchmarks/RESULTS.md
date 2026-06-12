@@ -536,3 +536,64 @@ pending the H100 streams-on recheck of the bridge-mutex rev.
 Costs this round: ~2.5 h of one community 3090 (~$0.55). One community GPU
 died mid-round (host fault, not reproducible by our code; the same binary
 passed all gates seconds earlier) — fleet host-screening remains the lesson.
+
+## Round 11: the generic witness lane, streams settled, MPS, and the EC record
+
+**(1) W3 — the generic witness lane + verify_instruction (the beachhead).**
+Every generated interaction writer reduces to two kernel shapes; the lane ships
+them once (`tuple_pair_logup`, `tuple_single_logup` with 1/column/Enabler
+multiplicities and sign, `tuple_count` with per-slot LUT bit packing), so each
+cohort port now only supplies a base-trace kernel. verify_instruction is the
+first component through it: decode kernel + 3 staged combination columns,
+device rc_7_2_5/rc_4_3 count feeds, host memory feeds from the same uploaded
+arrays. Differential green on hardware (`verify_instruction trace columns OK /
+interaction columns + sums OK`, both rc deltas), proof byte-identical to SIMD.
+fib delta ~0 as predicted (dedup'd-tiny component) — the value is the proven
+lane; the loop-body opcodes ride it next (multi-session by nature; mechanism
+doc: WITNESS_CODEGEN.md).
+
+**(2) NTT P2 slice — honest verdict.** The n2b/b2n family is already a tuned
+NitrooZK-lineage implementation (warp-shuffle butterflies, smem transposes,
+fused 6/8-stage blocks, poly batching). Further gains need ncu-driven
+change-measure iteration on secure cloud (perf counters are blocked on
+community pods) — queued as its own work item, not blind edits.
+
+**(3) Streams settled on H100.** At the bridge-mutex rev: byte-equality green
+streams-ON, then **12 repro rounds (36 proves) at the exact round-8 hang
+conditions: zero hangs** — the deadlock class is closed. The on/off bench pair
+shows no streams gain at the current pipeline (off even reads faster within
+warm-up ordering noise), so streams stay off by default until the
+commit-of-tree-N-over-witness-of-N+1 scheduler gives them real work; the async
+upload lane already provides the copy/compute overlap.
+
+**(4) The tail.**
+- The 61.7k D2H reads are NOT the queried-values loop (that gather landed) —
+  they are `node_hash`'s per-(column, leaf) `raw_value` reads in the
+  pruned-tree recompute (`vcs_lifted/prover.rs:441`). Fix designed: per-leaf
+  row-gather kernel, or recompute queried leaf hashes fully on device via the
+  commit kernel with an index list (~1 launch). Next tail item.
+- **MPS beats raw process sharing by +11%**: dual provers on one 3090 =
+  **5.38 MHz aggregate** (2.70 + 2.67) vs 4.84 raw — and that raw dual is
+  itself +19% over round 9's (the round-10 levers freed GPU time exactly as
+  predicted). Fleet math: two MPS-dual 3090s ≈ **10.8 MHz at $0.44/hr** — the
+  10 MHz fleet cost halved since round 9.
+- Host-screening probe shipped (`gpu_benchmarks/pod/screen_host.sh`).
+- CUDA graphs over the JIT constraint launches: assessed, deferred (per-prove
+  pointer churn makes capture/update fiddly; the OODS batching already removed
+  the worst launch-storm cost).
+
+**EC benchmark — first record** (3090 community, current stack, secure
+config): 5,000 ec-double iterations = 1.17M cycles, **warm prove 1.033 s**
+(1.13 MHz single; sustained 1.07 — GPU-bound, pipeline saturated). EC cycles
+drag the wide builtin traces (pedersen/ec_op/mod), so MHz reads lower than fib
+by construction; the per-proof second is the comparable number.
+
+**Headline single-proof numbers at this rev (fib 1M/2M):**
+- 3090 community ($0.22): 1.70 s / 4.11 MHz @1M — a $0.22 card now beats
+  round-8's H100.
+- H100 SXM: 1.79 s / 3.92 @1M, 2.87 s / **4.87 MHz @2M** (+21% vs round 8) —
+  and the strong-host 3090 outruns it at 1M: the workload is host-bound, which
+  is the whole W3 thesis in one line.
+
+Costs: ~1.2 h H100 (~$4) + ~3 h of 3090s (~$0.70). One earlier community 3090
+GPU death (round 10) remains the only hardware casualty.
