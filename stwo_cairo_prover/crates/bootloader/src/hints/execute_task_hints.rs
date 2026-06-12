@@ -2,7 +2,7 @@ use std::any::Any;
 use std::collections::HashMap;
 
 use cairo_vm::hint_processor::builtin_hint_processor::hint_utils::{
-    get_ptr_from_var_name, get_relocatable_from_var_name, insert_value_from_var_name,
+    get_integer_from_var_name, get_ptr_from_var_name, get_relocatable_from_var_name, insert_value_from_var_name, insert_value_into_ap,
 };
 use cairo_vm::hint_processor::hint_processor_definition::HintReference;
 use cairo_vm::serde::deserialize_program::{ApTracking, Identifier};
@@ -153,6 +153,15 @@ pub fn validate_hash(
     let task: Task = exec_scopes.get(vars::TASK)?;
     let program = get_program_from_task(&task)?;
 
+    let use_poseidon = get_integer_from_var_name("use_poseidon", vm, ids_data, ap_tracking)?;
+    if use_poseidon != Felt252::ZERO {
+        return Err(HintError::CustomHint(
+            "use_poseidon=1 program-hash chain is not implemented in this port"
+                .to_string()
+                .into_boxed_str(),
+        ));
+    }
+
     let output_ptr = get_ptr_from_var_name("output_ptr", vm, ids_data, ap_tracking)?;
     let program_hash_ptr = (output_ptr + 1)?;
 
@@ -175,8 +184,18 @@ pub fn validate_hash(
     Ok(())
 }
 
+/// Implements
+/// memory[ap] = to_felt_or_relocatable(1 if task.use_poseidon else 0)
+pub fn task_use_poseidon(
+    vm: &mut VirtualMachine,
+    exec_scopes: &mut ExecutionScopes,
+) -> Result<(), HintError> {
+    let use_poseidon: bool = exec_scopes.get(vars::TASK_USE_POSEIDON).unwrap_or(false);
+    insert_value_into_ap(vm, Felt252::from(use_poseidon as u64))
+}
+
 /// List of all builtins in the order used by the bootloader.
-const ALL_BUILTINS: [BuiltinName; 8] = [
+const ALL_BUILTINS: [BuiltinName; 11] = [
     BuiltinName::output,
     BuiltinName::pedersen,
     BuiltinName::range_check,
@@ -185,6 +204,9 @@ const ALL_BUILTINS: [BuiltinName; 8] = [
     BuiltinName::ec_op,
     BuiltinName::keccak,
     BuiltinName::poseidon,
+    BuiltinName::range_check96,
+    BuiltinName::add_mod,
+    BuiltinName::mul_mod,
 ];
 
 fn check_cairo_pie_builtin_usage(

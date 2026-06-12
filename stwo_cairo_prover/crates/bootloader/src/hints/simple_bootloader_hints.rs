@@ -122,9 +122,11 @@ pub fn set_current_task(
     let task_id = simple_bootloader_input.tasks.len() - n_tasks;
     // TODO: it's still unclear how we need to model TaskSpec/Task objects.
     //       Check if we need to keep TaskSpec, or if it needs to be implemented as a trait, etc.
-    let task = simple_bootloader_input.tasks[task_id].load_task();
+    let task_spec = simple_bootloader_input.tasks[task_id].clone();
+    let task = task_spec.load_task();
 
     exec_scopes.insert_value(vars::TASK, task.clone());
+    exec_scopes.insert_value(vars::TASK_USE_POSEIDON, task_spec.use_poseidon);
 
     Ok(())
 }

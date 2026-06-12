@@ -27,6 +27,7 @@ pub const TASKS: &str = "tasks";
 
 /// Current simple bootloader task.
 pub const TASK: &str = "task";
+pub const TASK_USE_POSEIDON: &str = "task_use_poseidon";
 
 /// Program data segment. Used in `execute_task()`.
 pub const PROGRAM_DATA_BASE: &str = "program_data_base";

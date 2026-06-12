@@ -20,9 +20,11 @@ use crate::hints::bootloader_hints::{
     save_packed_outputs, set_packed_output_to_subtasks,
 };
 use crate::hints::codes::*;
+use crate::hints::types::BootloaderInput;
+use crate::hints::vars;
 use crate::hints::execute_task_hints::{
     allocate_program_data_segment, append_fact_topologies, call_task, load_program_hint,
-    validate_hash, write_return_builtins_hint,
+    task_use_poseidon, validate_hash, write_return_builtins_hint,
 };
 use crate::hints::inner_select_builtins::select_builtin;
 use crate::hints::select_builtins::select_builtins_enter_scope;
@@ -79,6 +81,13 @@ impl HintProcessorLogic for MinimalBootloaderHintProcessor {
             BOOTLOADER_GUESS_PRE_IMAGE_OF_SUBTASKS_OUTPUT_HASH => {
                 guess_pre_image_of_subtasks_output_hash(vm, exec_scopes, ids_data, ap_tracking)
             }
+            BOOTLOADER_LOAD_INPUT => {
+                // The input is inserted into exec_scopes by the caller before
+                // the run; this hint just asserts it is present.
+                exec_scopes
+                    .get_ref::<BootloaderInput>(vars::BOOTLOADER_INPUT)
+                    .map(|_| ())
+            }
             BOOTLOADER_PREPARE_SIMPLE_BOOTLOADER_OUTPUT_SEGMENT => {
                 prepare_simple_bootloader_output_segment(vm, exec_scopes, ids_data, ap_tracking)
             }
@@ -105,6 +114,7 @@ impl HintProcessorLogic for MinimalBootloaderHintProcessor {
             }
             EXECUTE_TASK_LOAD_PROGRAM => load_program_hint(vm, exec_scopes, ids_data, ap_tracking),
             EXECUTE_TASK_VALIDATE_HASH => validate_hash(vm, exec_scopes, ids_data, ap_tracking),
+            EXECUTE_TASK_USE_POSEIDON => task_use_poseidon(vm, exec_scopes),
             EXECUTE_TASK_ASSERT_PROGRAM_ADDRESS => {
                 assert_program_address(vm, exec_scopes, ids_data, ap_tracking)
             }

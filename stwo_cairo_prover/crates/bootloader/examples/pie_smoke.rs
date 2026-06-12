@@ -82,7 +82,9 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Clean up the temp PIE.
-    let _ = std::fs::remove_file(&pie_path);
+    if std::env::var("KEEP_PIE").is_err() {
+        let _ = std::fs::remove_file(&pie_path);
+    }
 
     println!("[pie_smoke] PASS");
     Ok(())

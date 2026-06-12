@@ -3633,6 +3633,7 @@ dependencies = [
  "stwo-backend-cuda",
  "stwo-backend-cuda-kernels",
  "stwo-cairo-adapter",
+ "stwo-cairo-bootloader",
  "stwo-cairo-common",
  "stwo-cairo-dev-utils",
  "stwo-cairo-serialize",

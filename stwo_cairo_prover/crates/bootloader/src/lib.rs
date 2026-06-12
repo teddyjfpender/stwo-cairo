@@ -83,6 +83,7 @@ pub fn run_cairo_pie_with_bootloader(pie: CairoPie) -> anyhow::Result<CairoRunne
     // `run_program` example's fact topology; the bootloader emits two output
     // words per task plus the task's own pages.
     let tasks = vec![TaskSpec {
+        use_poseidon: false,
         task: Task::Pie(pie),
     }];
 

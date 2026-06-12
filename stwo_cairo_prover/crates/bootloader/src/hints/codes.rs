@@ -1,8 +1,9 @@
-pub const BOOTLOADER_PREPARE_SIMPLE_BOOTLOADER_OUTPUT_SEGMENT: &str =
+pub const BOOTLOADER_LOAD_INPUT: &str =
     "from starkware.cairo.bootloaders.bootloader.objects import BootloaderInput
-bootloader_input = BootloaderInput.Schema().load(program_input)
+bootloader_input = BootloaderInput.Schema().load(program_input)";
 
-ids.simple_bootloader_output_start = segments.add()
+pub const BOOTLOADER_PREPARE_SIMPLE_BOOTLOADER_OUTPUT_SEGMENT: &str =
+    "ids.simple_bootloader_output_start = segments.add()
 
 # Change output builtin state to a different segment in preparation for calling the
 # simple bootloader.
@@ -132,8 +133,12 @@ segments.finalize(program_data_base.segment_index, program_data_size)";
 pub const EXECUTE_TASK_VALIDATE_HASH: &str = "# Validate hash.
 from starkware.cairo.bootloaders.hash_program import compute_program_hash_chain
 
-assert memory[ids.output_ptr + 1] == compute_program_hash_chain(task.get_program()), \\
-  'Computed hash does not match input.'";
+assert memory[ids.output_ptr + 1] == compute_program_hash_chain(
+    program=task.get_program(),
+    use_poseidon=bool(ids.use_poseidon)), 'Computed hash does not match input.'";
+
+pub const EXECUTE_TASK_USE_POSEIDON: &str =
+    "memory[ap] = to_felt_or_relocatable(1 if task.use_poseidon else 0)";
 
 pub const EXECUTE_TASK_ASSERT_PROGRAM_ADDRESS: &str = "# Sanity check.
 assert ids.program_address == program_address";

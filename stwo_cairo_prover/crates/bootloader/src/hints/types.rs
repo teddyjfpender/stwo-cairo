@@ -57,6 +57,10 @@ impl Task {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskSpec {
     pub task: Task,
+    /// Mirrors the python Task.use_poseidon flag (0.13.3 bootloader): selects
+    /// the poseidon program-hash chain instead of pedersen. PIE proving uses
+    /// the pedersen chain (false).
+    pub use_poseidon: bool,
 }
 
 impl TaskSpec {
