@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use cairo_air::air::PublicData;
 use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
+use cairo_air::components::add_opcode_small::InteractionClaim as AddSmallInteractionClaim;
+use cairo_air::components::jnz_opcode_taken::InteractionClaim as JnzTakenInteractionClaim;
 use cairo_air::components::memory_address_to_id::InteractionClaim as MemoryAddrInteractionClaim;
 use cairo_air::components::memory_id_to_big::InteractionClaim as MemoryBigInteractionClaim;
 use cairo_air::components::memory_id_to_small::InteractionClaim as MemorySmallInteractionClaim;
-use cairo_air::components::add_opcode_small::InteractionClaim as AddSmallInteractionClaim;
-use cairo_air::components::jnz_opcode_taken::InteractionClaim as JnzTakenInteractionClaim;
 use cairo_air::components::ret_opcode::InteractionClaim as RetInteractionClaim;
 use cairo_air::components::verify_instruction::InteractionClaim as ViInteractionClaim;
 use cairo_air::relations::CommonLookupElements;
@@ -2012,8 +2012,10 @@ where
             }
             if let Some(gen) = self.add_opcode_small {
                 s.spawn(|_| {
-                    add_opcode_small_result =
-                        Some(B::write_add_opcode_small_interaction(gen, common_lookup_elements));
+                    add_opcode_small_result = Some(B::write_add_opcode_small_interaction(
+                        gen,
+                        common_lookup_elements,
+                    ));
                 });
             }
             if let Some(gen) = self.add_ap_opcode {

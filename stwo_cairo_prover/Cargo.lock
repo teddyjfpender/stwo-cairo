@@ -1886,7 +1886,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.1.5",
- "serde",
 ]
 
 [[package]]
@@ -3438,7 +3437,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "stwo"
 version = "2.2.0"
-source = "git+https://github.com/teddyjfpender/stwo?rev=0f1ef1c3895d3263fdef22ee46478473e63a38ee#0f1ef1c3895d3263fdef22ee46478473e63a38ee"
+source = "git+https://github.com/teddyjfpender/stwo?rev=bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d#bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d"
 dependencies = [
  "blake2",
  "blake3",
@@ -3447,7 +3446,7 @@ dependencies = [
  "dashmap",
  "educe 0.5.11",
  "fnv",
- "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
  "hex",
  "indexmap",
  "itertools 0.12.1",
@@ -3467,7 +3466,7 @@ dependencies = [
 [[package]]
 name = "stwo-air-utils"
 version = "2.2.0"
-source = "git+https://github.com/teddyjfpender/stwo?rev=0f1ef1c3895d3263fdef22ee46478473e63a38ee#0f1ef1c3895d3263fdef22ee46478473e63a38ee"
+source = "git+https://github.com/teddyjfpender/stwo?rev=bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d#bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d"
 dependencies = [
  "bytemuck",
  "itertools 0.12.1",
@@ -3479,7 +3478,7 @@ dependencies = [
 [[package]]
 name = "stwo-air-utils-derive"
 version = "2.2.0"
-source = "git+https://github.com/teddyjfpender/stwo?rev=0f1ef1c3895d3263fdef22ee46478473e63a38ee#0f1ef1c3895d3263fdef22ee46478473e63a38ee"
+source = "git+https://github.com/teddyjfpender/stwo?rev=bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d#bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d"
 dependencies = [
  "itertools 0.13.0",
  "proc-macro2",
@@ -3490,7 +3489,7 @@ dependencies = [
 [[package]]
 name = "stwo-backend-cuda"
 version = "2.2.0"
-source = "git+https://github.com/teddyjfpender/stwo?rev=0f1ef1c3895d3263fdef22ee46478473e63a38ee#0f1ef1c3895d3263fdef22ee46478473e63a38ee"
+source = "git+https://github.com/teddyjfpender/stwo?rev=bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d#bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d"
 dependencies = [
  "itertools 0.12.1",
  "num-traits",
@@ -3504,7 +3503,7 @@ dependencies = [
 [[package]]
 name = "stwo-backend-cuda-kernels"
 version = "0.1.0"
-source = "git+https://github.com/teddyjfpender/stwo?rev=0f1ef1c3895d3263fdef22ee46478473e63a38ee#0f1ef1c3895d3263fdef22ee46478473e63a38ee"
+source = "git+https://github.com/teddyjfpender/stwo?rev=bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d#bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d"
 
 [[package]]
 name = "stwo-cairo-adapter"
@@ -3656,9 +3655,9 @@ dependencies = [
 [[package]]
 name = "stwo-constraint-framework"
 version = "2.2.0"
-source = "git+https://github.com/teddyjfpender/stwo?rev=0f1ef1c3895d3263fdef22ee46478473e63a38ee#0f1ef1c3895d3263fdef22ee46478473e63a38ee"
+source = "git+https://github.com/teddyjfpender/stwo?rev=bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d#bf6c0331a2755309fc43e4caa5c3e3cdfb2e892d"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
  "itertools 0.12.1",
  "num-traits",
  "rand 0.8.5",

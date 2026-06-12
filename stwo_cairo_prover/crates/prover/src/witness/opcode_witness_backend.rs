@@ -23,6 +23,7 @@
 
 use cairo_air::components::add_opcode_small::{
     Claim as AddSmallClaim, N_TRACE_COLUMNS as ADD_SMALL_N_COLS,
+};
 use cairo_air::components::jnz_opcode_taken::{
     Claim as JnzTakenClaim, N_TRACE_COLUMNS as JNZ_TAKEN_N_COLS,
 };
@@ -176,7 +177,11 @@ pub trait OpcodeWitness: FromSimdColumns + LogupFinalizeBackend {
         memory_address_to_id: &memory_address_to_id::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         verify_instruction: &verify_instruction::ClaimGenerator,
-    ) -> (MemoryEvals<Self>, AddSmallClaim, Self::AddSmallInteractionGen);
+    ) -> (
+        MemoryEvals<Self>,
+        AddSmallClaim,
+        Self::AddSmallInteractionGen,
+    );
 
     fn write_add_opcode_small_interaction(
         gen: Self::AddSmallInteractionGen,
@@ -202,7 +207,11 @@ pub trait OpcodeWitness: FromSimdColumns + LogupFinalizeBackend {
         memory_address_to_id: &memory_address_to_id::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         verify_instruction: &verify_instruction::ClaimGenerator,
-    ) -> (MemoryEvals<Self>, JnzTakenClaim, Self::JnzTakenInteractionGen);
+    ) -> (
+        MemoryEvals<Self>,
+        JnzTakenClaim,
+        Self::JnzTakenInteractionGen,
+    );
 
     fn write_jnz_taken_interaction(
         gen: Self::JnzTakenInteractionGen,
@@ -228,7 +237,11 @@ impl OpcodeWitness for SimdBackend {
         memory_address_to_id: &memory_address_to_id::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         verify_instruction: &verify_instruction::ClaimGenerator,
-    ) -> (MemoryEvals<Self>, AddSmallClaim, Self::AddSmallInteractionGen) {
+    ) -> (
+        MemoryEvals<Self>,
+        AddSmallClaim,
+        Self::AddSmallInteractionGen,
+    ) {
         let (trace, claim, interaction_gen) =
             gen.write_trace(memory_address_to_id, memory_id_to_big, verify_instruction);
         (trace.to_evals(), claim, interaction_gen)
@@ -268,7 +281,11 @@ impl OpcodeWitness for SimdBackend {
         memory_address_to_id: &memory_address_to_id::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         verify_instruction: &verify_instruction::ClaimGenerator,
-    ) -> (MemoryEvals<Self>, JnzTakenClaim, Self::JnzTakenInteractionGen) {
+    ) -> (
+        MemoryEvals<Self>,
+        JnzTakenClaim,
+        Self::JnzTakenInteractionGen,
+    ) {
         let (trace, claim, interaction_gen) =
             gen.write_trace(memory_address_to_id, memory_id_to_big, verify_instruction);
         (trace.to_evals(), claim, interaction_gen)
@@ -311,6 +328,8 @@ pub struct DeviceAddSmallWitness {
 pub enum CudaAddSmallInteractionGen {
     Device(Box<DeviceAddSmallWitness>),
     Host(Box<add_opcode_small::InteractionClaimGenerator>),
+}
+
 /// Device-born jnz_opcode_taken state: the 47 trace columns plus the 10 staged
 /// columns its interaction tuples reference (vi off1/off2, dst read addr, pc+1,
 /// the four memory_id_to_big_4 slots, and the opcodes-out next_pc / next_ap).
@@ -383,7 +402,11 @@ impl OpcodeWitness for CudaBackend {
         memory_address_to_id: &memory_address_to_id::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         verify_instruction: &verify_instruction::ClaimGenerator,
-    ) -> (MemoryEvals<Self>, AddSmallClaim, Self::AddSmallInteractionGen) {
+    ) -> (
+        MemoryEvals<Self>,
+        AddSmallClaim,
+        Self::AddSmallInteractionGen,
+    ) {
         if !add_small_device_path_enabled() {
             let (trace, claim, interaction_gen) =
                 gen.write_trace(memory_address_to_id, memory_id_to_big, verify_instruction);
@@ -419,12 +442,8 @@ impl OpcodeWitness for CudaBackend {
         let (big_values, small_values) = memory_id_to_big.value_tables();
         let m31 = M31::from;
         for state in &inputs {
-            let decoded = decode_add_small_row(
-                state,
-                memory_address_to_id,
-                big_values,
-                small_values,
-            );
+            let decoded =
+                decode_add_small_row(state, memory_address_to_id, big_values, small_values);
             AddInputs::add_input(
                 verify_instruction,
                 &(
@@ -474,12 +493,8 @@ impl OpcodeWitness for CudaBackend {
                 let id_op0_feed = unpack(&host_feeds.memory_id_to_big[1]);
                 let id_op1_feed = unpack(&host_feeds.memory_id_to_big[2]);
                 for (i, state) in padded.iter().enumerate() {
-                    let decoded = decode_add_small_row(
-                        state,
-                        memory_address_to_id,
-                        big_values,
-                        small_values,
-                    );
+                    let decoded =
+                        decode_add_small_row(state, memory_address_to_id, big_values, small_values);
                     let expected = [
                         (vi_pc_feed[i], state.pc),
                         (addr_dst_feed[i], decoded.dst_addr),
@@ -969,7 +984,11 @@ impl OpcodeWitness for CudaBackend {
         memory_address_to_id: &memory_address_to_id::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         verify_instruction: &verify_instruction::ClaimGenerator,
-    ) -> (MemoryEvals<Self>, JnzTakenClaim, Self::JnzTakenInteractionGen) {
+    ) -> (
+        MemoryEvals<Self>,
+        JnzTakenClaim,
+        Self::JnzTakenInteractionGen,
+    ) {
         if !jnz_taken_device_path_enabled() {
             let (trace, claim, interaction_gen) =
                 gen.write_trace(memory_address_to_id, memory_id_to_big, verify_instruction);
@@ -1018,7 +1037,7 @@ impl OpcodeWitness for CudaBackend {
             let il5 = decode_limb(instr_id, 5);
             let il6 = decode_limb(instr_id, 6);
             let il0 = decode_limb(instr_id, 0);
-            let offset0 = m31(il0.0 + (((il1.0 & 127) << 9)));
+            let offset0 = m31(il0.0 + ((il1.0 & 127) << 9));
             let flags = (il5.0 >> 3) + (il6.0 << 6);
             let dst_base_fp = m31((flags >> 0) & 1);
             let ap_update_add_1 = m31((flags >> 11) & 1);
@@ -1036,8 +1055,7 @@ impl OpcodeWitness for CudaBackend {
             );
 
             // Read dst at mem_dst_base + (offset0 - 32768).
-            let mem_dst_base =
-                (dst_base_fp * state.fp) + ((m31(1) - dst_base_fp) * state.ap);
+            let mem_dst_base = (dst_base_fp * state.fp) + ((m31(1) - dst_base_fp) * state.ap);
             let dst_addr = mem_dst_base + (offset0 - m31(32768));
             let dst_id = memory_address_to_id.get_id(dst_addr);
             AddInputs::add_input(memory_address_to_id, &dst_addr, 0);
@@ -1083,7 +1101,7 @@ impl OpcodeWitness for CudaBackend {
                     let il1 = decode_limb(instr_id, 1);
                     let il5 = decode_limb(instr_id, 5);
                     let il6 = decode_limb(instr_id, 6);
-                    let offset0 = m31(il0.0 + (((il1.0 & 127) << 9)));
+                    let offset0 = m31(il0.0 + ((il1.0 & 127) << 9));
                     let flags = (il5.0 >> 3) + (il6.0 << 6);
                     let dst_base_fp = m31((flags >> 0) & 1);
                     let mem_dst_base =
@@ -1186,8 +1204,8 @@ impl OpcodeWitness for CudaBackend {
             device_witness::tuple_pair_logup_slots(
                 VERIFY_INSTRUCTION_RELATION_ID,
                 &[
-                    Col(&cols[0]),    // input_pc
-                    Col(&cols[3]),    // offset0
+                    Col(&cols[0]), // input_pc
+                    Col(&cols[3]), // offset0
                     Const(32767),
                     Const(32769),
                     Col(&staged[0]), // vi_off1
@@ -1230,18 +1248,18 @@ impl OpcodeWitness for CudaBackend {
                 MEMORY_ID_TO_BIG_RELATION_ID.0,
                 &{
                     let mut s = vec![
-                        Col(&cols[38]), // next_pc_id
-                        Col(&cols[41]), // next_pc_limb_0
-                        Col(&cols[42]), // next_pc_limb_1
-                        Col(&cols[43]), // next_pc_limb_2
+                        Col(&cols[38]),  // next_pc_id
+                        Col(&cols[41]),  // next_pc_limb_0
+                        Col(&cols[42]),  // next_pc_limb_1
+                        Col(&cols[43]),  // next_pc_limb_2
                         Col(&staged[4]), // remainder_bits + dss[2]
                     ];
                     for _ in 0..17 {
                         s.push(Col(&staged[5])); // dss[3]
                     }
                     s.push(Col(&staged[6])); // dss[4]
-                    // Five interior zeros — kept as Const because dss[5] follows
-                    // them (only trailing zeros may be truncated).
+                                             // Five interior zeros — kept as Const because dss[5] follows
+                                             // them (only trailing zeros may be truncated).
                     for _ in 0..5 {
                         s.push(Const(0));
                     }
