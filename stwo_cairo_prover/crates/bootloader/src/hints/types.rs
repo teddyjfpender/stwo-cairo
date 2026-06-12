@@ -54,13 +54,39 @@ impl Task {
     }
 }
 
+/// A program-hash function. In the v0.14 simple bootloader, `Task.use_poseidon`
+/// (a bool) was replaced by `Task.program_hash_function`, an integer selecting
+/// the hash used to compute the program hash in `compute_program_hash`
+/// (execute_task.cairo): `PEDERSEN_HASH = 0`, `POSEIDON_HASH = 1`,
+/// `BLAKE_HASH = 2`. The `tempvar program_hash_function = nondet
+/// %{ task.program_hash_function %}` hint pushes this integer to the AP.
+///
+/// For the pedersen-hashed Starknet PIEs we run, the value is `Pedersen` (0).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashFunc {
+    Pedersen = 0,
+    Poseidon = 1,
+    Blake = 2,
+}
+
+impl Default for HashFunc {
+    fn default() -> Self {
+        HashFunc::Pedersen
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskSpec {
     pub task: Task,
     /// Mirrors the python Task.use_poseidon flag (0.13.3 bootloader): selects
     /// the poseidon program-hash chain instead of pedersen. PIE proving uses
-    /// the pedersen chain (false).
+    /// the pedersen chain (false). Retained for the existing full-bootloader
+    /// (0.13.3) path.
     pub use_poseidon: bool,
+    /// The v0.14 simple bootloader program-hash function selector. For PIE
+    /// proving this is `HashFunc::Pedersen` (0).
+    pub program_hash_function: HashFunc,
 }
 
 impl TaskSpec {

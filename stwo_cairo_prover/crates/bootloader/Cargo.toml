@@ -16,6 +16,7 @@ description = "Cairo bootloader (vendored from Moonsong-Labs/cairo-bootloader, A
 # transitively via the workspace too. `zip` (for CairoPie::read_zip_file /
 # write_zip_file) is a non-optional dependency of cairo-vm 3.2, always present.
 cairo-vm.workspace = true
+num-bigint = { version = "0.4", default-features = false }
 num-traits.workspace = true
 serde.workspace = true
 serde_json.workspace = true

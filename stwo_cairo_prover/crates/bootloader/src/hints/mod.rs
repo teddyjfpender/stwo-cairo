@@ -14,7 +14,8 @@ mod vars;
 
 pub use hint_processors::{BootloaderHintProcessor, MinimalBootloaderHintProcessor};
 pub use types::{
-    BootloaderConfig, BootloaderInput, PackedOutput, SimpleBootloaderInput, Task, TaskSpec,
+    BootloaderConfig, BootloaderInput, HashFunc, PackedOutput, SimpleBootloaderInput, Task,
+    TaskSpec,
 };
 
-pub use vars::{BOOTLOADER_INPUT, BOOTLOADER_PROGRAM_IDENTIFIERS};
+pub use vars::{BOOTLOADER_INPUT, BOOTLOADER_PROGRAM_IDENTIFIERS, SIMPLE_BOOTLOADER_INPUT};

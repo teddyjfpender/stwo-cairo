@@ -84,6 +84,7 @@ pub fn run_cairo_pie_with_bootloader(pie: CairoPie) -> anyhow::Result<CairoRunne
     // words per task plus the task's own pages.
     let tasks = vec![TaskSpec {
         use_poseidon: false,
+        program_hash_function: HashFunc::Pedersen,
         task: Task::Pie(pie),
     }];
 
@@ -137,6 +138,84 @@ pub fn run_cairo_pie_with_bootloader(pie: CairoPie) -> anyhow::Result<CairoRunne
         exec_scopes,
     )
     .map_err(|e| anyhow::anyhow!("bootloader VM run failed: {e}"))?;
+
+    Ok(runner)
+}
+
+/// Loads a Starknet Cairo PIE from a zip file and runs it wrapped in the
+/// cairo-lang v0.14.0 **simple** bootloader program, in proof mode, ready to be
+/// proven with the stwo prover.
+///
+/// Unlike [`run_pie_with_bootloader`] (the full 0.13.3 bootloader), the simple
+/// bootloader executes the single task directly and — under the
+/// `all_cairo_stwo` layout, which lacks the ecdsa/keccak/ec_op builtins —
+/// simulates those builtins in Cairo (`verify_builtins.cairo`). For a CairoPie
+/// task every keccak/ec_op/ecdsa input AND output cell is pre-loaded by
+/// `load_cairo_pie`, so the in-Cairo verification re-reads the values (the
+/// simulated cairo-vm builtin runners auto-deduce the rest).
+///
+/// The returned [`CairoRunner`] can be passed directly to
+/// `stwo_cairo_adapter::adapt(&runner)`.
+pub fn run_pie_with_simple_bootloader(pie_path: &Path) -> anyhow::Result<CairoRunner> {
+    let pie = CairoPie::read_zip_file(pie_path)
+        .with_context(|| format!("failed to read Cairo PIE zip: {}", pie_path.display()))?;
+
+    run_cairo_pie_with_simple_bootloader(pie)
+}
+
+/// Same as [`run_pie_with_simple_bootloader`] but takes an already-loaded
+/// [`CairoPie`].
+pub fn run_cairo_pie_with_simple_bootloader(pie: CairoPie) -> anyhow::Result<CairoRunner> {
+    let bootloader_program = bootloaders::load_simple_bootloader()
+        .map_err(|e| anyhow::anyhow!("failed to load simple bootloader program: {e}"))?;
+
+    let tasks = vec![TaskSpec {
+        use_poseidon: false,
+        program_hash_function: HashFunc::Pedersen,
+        task: Task::Pie(pie),
+    }];
+
+    let simple_bootloader_input = SimpleBootloaderInput {
+        fact_topologies_path: None,
+        single_page: false,
+        tasks,
+    };
+
+    let mut hint_processor = BootloaderHintProcessor::new();
+
+    let cairo_run_config = CairoRunConfig {
+        entrypoint: "main",
+        trace_enabled: true,
+        relocate_trace: false,
+        relocate_mem: false,
+        layout: LayoutName::all_cairo_stwo,
+        proof_mode: true,
+        secure_run: None,
+        disable_trace_padding: true,
+        fill_holes: true,
+        allow_missing_builtins: Some(true),
+        ..Default::default()
+    };
+
+    let mut exec_scopes = ExecutionScopes::new();
+    // The simple bootloader's entry hint expects `simple_bootloader_input`.
+    exec_scopes.insert_value(SIMPLE_BOOTLOADER_INPUT, simple_bootloader_input);
+
+    // The `execute_task` CairoPie hint resolves the `ret_pc_label` / `call_task`
+    // label offsets from the bootloader program's own identifiers.
+    let identifiers: HashMap<String, Identifier> = bootloader_program
+        .iter_identifiers()
+        .map(|(name, id)| (name.to_string(), id.clone()))
+        .collect();
+    exec_scopes.insert_value(BOOTLOADER_PROGRAM_IDENTIFIERS, identifiers);
+
+    let runner = cairo_run_program_with_initial_scope(
+        &bootloader_program,
+        &cairo_run_config,
+        &mut hint_processor,
+        exec_scopes,
+    )
+    .map_err(|e| anyhow::anyhow!("simple bootloader VM run failed: {e}"))?;
 
     Ok(runner)
 }

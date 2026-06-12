@@ -13,9 +13,9 @@ use cairo_vm::vm::vm_core::VirtualMachine;
 
 use crate::hints::bootloader_hints::{
     assert_is_composite_packed_output, assert_program_address,
-    compute_and_configure_fact_topologies, enter_packed_output_scope,
-    guess_pre_image_of_subtasks_output_hash, import_packed_output_schemas, is_plain_packed_output,
-    load_bootloader_config, prepare_simple_bootloader_input,
+    compute_and_configure_fact_topologies, compute_and_configure_fact_topologies_simple,
+    enter_packed_output_scope, guess_pre_image_of_subtasks_output_hash, import_packed_output_schemas,
+    is_plain_packed_output, load_bootloader_config, prepare_simple_bootloader_input,
     prepare_simple_bootloader_output_segment, restore_bootloader_output, save_output_pointer,
     save_packed_outputs, set_packed_output_to_subtasks,
 };
@@ -23,14 +23,20 @@ use crate::hints::codes::*;
 use crate::hints::types::BootloaderInput;
 use crate::hints::vars;
 use crate::hints::execute_task_hints::{
-    allocate_program_data_segment, append_fact_topologies, call_task, load_program_hint,
-    task_use_poseidon, validate_hash, write_return_builtins_hint,
+    allocate_program_data_segment, append_fact_topologies, call_task, determine_use_prev_hash,
+    load_program_hint, load_program_segment_hint, task_use_poseidon, validate_hash,
+    write_return_builtins_hint,
 };
 use crate::hints::inner_select_builtins::select_builtin;
 use crate::hints::select_builtins::select_builtins_enter_scope;
 use crate::hints::simple_bootloader_hints::{
-    divide_num_by_2, prepare_task_range_checks, set_ap_to_zero, set_current_task,
-    set_tasks_variable,
+    divide_num_by_2, prepare_task_range_checks, program_hash_function_to_ap, set_ap_to_zero,
+    set_current_task, set_tasks_variable, setup_run_simple_bootloader_before_task_execution,
+    simple_bootloader_simulate_ec_op, simple_bootloader_simulate_ecdsa,
+    simple_bootloader_simulate_keccak, simulate_ec_op_assert_false,
+    simulate_ec_op_fill_mem_with_bits_of_m, simulate_ecdsa_compute_w_wr_wz,
+    simulate_ecdsa_fill_mem_with_felt_96_bit_limbs, simulate_ecdsa_get_r_and_s,
+    simulate_keccak_calc_high_low, simulate_keccak_fill_mem_with_state,
 };
 
 /// A hint processor that can only execute the hints defined in this library.
@@ -62,6 +68,7 @@ impl HintProcessorLogic for MinimalBootloaderHintProcessor {
 
         let ids_data = &hint_data.ids_data;
         let ap_tracking = &hint_data.ap_tracking;
+        let constants = &hint_data.constants;
 
         match hint_data.code.as_str() {
             BOOTLOADER_RESTORE_BOOTLOADER_OUTPUT => restore_bootloader_output(vm, exec_scopes),
@@ -118,7 +125,9 @@ impl HintProcessorLogic for MinimalBootloaderHintProcessor {
             EXECUTE_TASK_ASSERT_PROGRAM_ADDRESS => {
                 assert_program_address(vm, exec_scopes, ids_data, ap_tracking)
             }
-            EXECUTE_TASK_CALL_TASK => call_task(vm, exec_scopes, ids_data, ap_tracking),
+            EXECUTE_TASK_CALL_TASK | EXECUTE_TASK_CALL_TASK_V14 => {
+                call_task(vm, exec_scopes, ids_data, ap_tracking)
+            }
             EXECUTE_TASK_WRITE_RETURN_BUILTINS => {
                 write_return_builtins_hint(vm, exec_scopes, ids_data, ap_tracking)
             }
@@ -131,6 +140,83 @@ impl HintProcessorLogic for MinimalBootloaderHintProcessor {
             }
             INNER_SELECT_BUILTINS_SELECT_BUILTIN => {
                 select_builtin(vm, exec_scopes, ids_data, ap_tracking)
+            }
+            // --- v0.14 simple bootloader hints ---
+            BOOTLOADER_READ_SIMPLE_BOOTLOADER_INPUT => {
+                // The simple bootloader input is inserted by the caller before
+                // the run; assert it is present.
+                exec_scopes
+                    .get_ref::<crate::hints::types::SimpleBootloaderInput>(
+                        vars::SIMPLE_BOOTLOADER_INPUT,
+                    )
+                    .map(|_| ())
+            }
+            BOOTLOADER_SIMPLE_BOOTLOADER_COMPUTE_FACT_TOPOLOGIES => {
+                compute_and_configure_fact_topologies_simple(vm, exec_scopes)
+            }
+            SETUP_RUN_SIMPLE_BOOTLOADER_BEFORE_TASK_EXECUTION => {
+                setup_run_simple_bootloader_before_task_execution(
+                    vm,
+                    exec_scopes,
+                    ids_data,
+                    ap_tracking,
+                )
+            }
+            SIMPLE_BOOTLOADER_SET_CURRENT_TASK_V14 => {
+                set_current_task(vm, exec_scopes, ids_data, ap_tracking)
+            }
+            SIMPLE_BOOTLOADER_PROGRAM_HASH_FUNCTION => {
+                program_hash_function_to_ap(vm, exec_scopes)
+            }
+            DETERMINE_USE_PREV_HASH => {
+                determine_use_prev_hash(vm, exec_scopes, ids_data, ap_tracking)
+            }
+            LOAD_PROGRAM_SEGMENT => {
+                load_program_segment_hint(vm, exec_scopes, ids_data, ap_tracking)
+            }
+            SIMPLE_BOOTLOADER_SIMULATE_EC_OP => {
+                simple_bootloader_simulate_ec_op(vm, ids_data, ap_tracking)
+            }
+            SIMULATE_EC_OP_FILL_MEM_WITH_BITS_OF_M => {
+                simulate_ec_op_fill_mem_with_bits_of_m(vm, ids_data, ap_tracking, constants)
+            }
+            SIMULATE_EC_OP_ASSERT_FALSE => simulate_ec_op_assert_false(),
+            SIMPLE_BOOTLOADER_SIMULATE_KECCAK => {
+                simple_bootloader_simulate_keccak(vm, ids_data, ap_tracking)
+            }
+            SIMULATE_KECCAK_FILL_MEM_WITH_STATE => {
+                simulate_keccak_fill_mem_with_state(vm, ids_data, ap_tracking)
+            }
+            SIMULATE_KECCAK_CALC_HIGH3_LOW3 => {
+                simulate_keccak_calc_high_low(vm, ids_data, ap_tracking, 3)
+            }
+            SIMULATE_KECCAK_CALC_HIGH6_LOW6 => {
+                simulate_keccak_calc_high_low(vm, ids_data, ap_tracking, 6)
+            }
+            SIMULATE_KECCAK_CALC_HIGH9_LOW9 => {
+                simulate_keccak_calc_high_low(vm, ids_data, ap_tracking, 9)
+            }
+            SIMULATE_KECCAK_CALC_HIGH12_LOW12 => {
+                simulate_keccak_calc_high_low(vm, ids_data, ap_tracking, 12)
+            }
+            SIMULATE_KECCAK_CALC_HIGH15_LOW15 => {
+                simulate_keccak_calc_high_low(vm, ids_data, ap_tracking, 15)
+            }
+            SIMULATE_KECCAK_CALC_HIGH18_LOW18 => {
+                simulate_keccak_calc_high_low(vm, ids_data, ap_tracking, 18)
+            }
+            SIMULATE_KECCAK_CALC_HIGH21_LOW21 => {
+                simulate_keccak_calc_high_low(vm, ids_data, ap_tracking, 21)
+            }
+            SIMPLE_BOOTLOADER_SIMULATE_ECDSA => {
+                simple_bootloader_simulate_ecdsa(vm, ids_data, ap_tracking)
+            }
+            SIMULATE_ECDSA_GET_R_AND_S => simulate_ecdsa_get_r_and_s(vm, ids_data, ap_tracking),
+            SIMULATE_ECDSA_COMPUTE_W_WR_WZ => {
+                simulate_ecdsa_compute_w_wr_wz(vm, ids_data, ap_tracking, constants)
+            }
+            SIMULATE_ECDSA_FILL_MEM_WITH_FELT_96_BIT_LIMBS => {
+                simulate_ecdsa_fill_mem_with_felt_96_bit_limbs(vm, ids_data, ap_tracking)
             }
             unknown_hint_code => Err(HintError::UnknownHint(
                 unknown_hint_code.to_string().into_boxed_str(),

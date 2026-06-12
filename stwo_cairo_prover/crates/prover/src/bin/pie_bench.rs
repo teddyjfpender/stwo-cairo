@@ -62,8 +62,9 @@ fn prover_params() -> ProverParameters {
 
 fn run_pie(pie_path: &str) -> (ProverInput, f64, f64) {
     let vm_start = Instant::now();
-    let runner = stwo_cairo_bootloader::run_pie_with_bootloader(std::path::Path::new(pie_path))
-        .expect("bootloader run");
+    let runner =
+        stwo_cairo_bootloader::run_pie_with_simple_bootloader(std::path::Path::new(pie_path))
+            .expect("bootloader run");
     let vm_s = vm_start.elapsed().as_secs_f64();
     let adapt_start = Instant::now();
     let input = adapt(&runner).expect("adapt");

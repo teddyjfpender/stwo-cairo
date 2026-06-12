@@ -29,6 +29,14 @@ pub const TASKS: &str = "tasks";
 pub const TASK: &str = "task";
 pub const TASK_USE_POSEIDON: &str = "task_use_poseidon";
 
+/// Whether the current task reuses the previous task's program hash/segment
+/// (v0.14 simple bootloader `load_program_segment` optimization). Always 0 for
+/// a single-task PIE run.
+pub const USE_PREV_HASH: &str = "use_prev_hash";
+
+/// The current task's program-hash-function selector (v0.14). See `HashFunc`.
+pub const PROGRAM_HASH_FUNCTION: &str = "program_hash_function";
+
 /// Program data segment. Used in `execute_task()`.
 pub const PROGRAM_DATA_BASE: &str = "program_data_base";
 

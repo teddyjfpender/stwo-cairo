@@ -3540,6 +3540,7 @@ version = "1.2.2"
 dependencies = [
  "anyhow",
  "cairo-vm",
+ "num-bigint",
  "num-traits",
  "serde",
  "serde_json",

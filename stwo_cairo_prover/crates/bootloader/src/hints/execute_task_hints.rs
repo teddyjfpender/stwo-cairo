@@ -96,6 +96,74 @@ pub fn load_program_hint(
     Ok(())
 }
 
+/// Implements the v0.14 macro hint `DETERMINE_USE_PREV_HASH`
+/// (execute_task.cairo:99): sets the `use_prev_hash` local from the scope var
+/// computed in `set_current_task`. Always 0 for a single PIE task.
+pub fn determine_use_prev_hash(
+    vm: &mut VirtualMachine,
+    exec_scopes: &mut ExecutionScopes,
+    ids_data: &HashMap<String, HintReference>,
+    ap_tracking: &ApTracking,
+) -> Result<(), HintError> {
+    let use_prev_hash: i32 = exec_scopes.get(vars::USE_PREV_HASH).unwrap_or(0);
+    insert_value_from_var_name(
+        "use_prev_hash",
+        Felt252::from(use_prev_hash as i64),
+        vm,
+        ids_data,
+        ap_tracking,
+    )?;
+    Ok(())
+}
+
+/// Implements the v0.14 macro hint `LOAD_PROGRAM_SEGMENT`
+/// (execute_task.cairo:112). Allocates a fresh segment, sets the
+/// `program_segment_ptr` local to it, loads the program header + code there, and
+/// records the program address. Unlike the 0.13.3 path this combines the segment
+/// allocation and `load_program` in a single hint (there is no separate
+/// `program_data_ptr`/VALIDATE_HASH; the hash is computed in Cairo).
+pub fn load_program_segment_hint(
+    vm: &mut VirtualMachine,
+    exec_scopes: &mut ExecutionScopes,
+    ids_data: &HashMap<String, HintReference>,
+    ap_tracking: &ApTracking,
+) -> Result<(), HintError> {
+    let program_data_base = vm.add_memory_segment();
+    insert_value_from_var_name(
+        "program_segment_ptr",
+        program_data_base,
+        vm,
+        ids_data,
+        ap_tracking,
+    )?;
+
+    let task: Task = exec_scopes.get(vars::TASK)?;
+    let program = get_program_from_task(&task)?;
+
+    // In v0.14 `program_header = cast(program_segment_ptr, ProgramHeader*)`,
+    // i.e. the program header is loaded at the freshly allocated segment base.
+    let program_header_ptr = program_data_base;
+
+    // Offset of the builtin_list field in `ProgramHeader`, cf. execute_task.cairo.
+    let builtins_offset = 4;
+    let mut program_loader = ProgramLoader::new(vm, builtins_offset);
+    let bootloader_version: BootloaderVersion = 0;
+    let loaded_program = program_loader
+        .load_program(program_header_ptr, &program, Some(bootloader_version))
+        .map_err(Into::<HintError>::into)?;
+
+    vm.segments.finalize(
+        Some(loaded_program.size),
+        program_data_base.segment_index as usize,
+        None,
+    );
+
+    exec_scopes.insert_value(vars::PROGRAM_DATA_BASE, program_data_base);
+    exec_scopes.insert_value(vars::PROGRAM_ADDRESS, loaded_program.code_address);
+
+    Ok(())
+}
+
 /// Implements
 /// from starkware.cairo.bootloaders.simple_bootloader.utils import get_task_fact_topology
 ///
