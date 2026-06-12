@@ -191,10 +191,34 @@ pub fn build_cairo_pie_relocation_table(
     let memory_map = build_cairo_pie_memory_map(&cairo_pie.memory);
 
     // Set initial stack relocations.
+    //
+    // For each builtin used by the inner program, map the PIE's builtin segment
+    // (the source segment, read from the origin execution segment in the PIE
+    // memory) to the destination builtin pointer that the bootloader placed on
+    // the live execution stack (read at `execution_segment_address + idx`).
+    //
+    // The `all_cairo_stwo` layout used by the stwo prover omits some builtins
+    // (notably `keccak` and `ecdsa`). When a builtin is declared by the inner
+    // program but absent from the layout, the cairo-vm runner pushes a plain
+    // `Felt252::ZERO` onto the bootloader's initial stack instead of a segment
+    // base (see `CairoRunner::initialize_main_entrypoint`). In that case the
+    // live stack slot is not relocatable, so there is no real builtin segment to
+    // relocate the PIE's data onto. We allocate a fresh memory segment to hold
+    // the PIE's builtin cells (exactly as is done below for `extra_segments`)
+    // and write its base back into the live execution stack slot so the replayed
+    // inner program reads/writes a consistent, valid pointer.
     for (idx, _builtin_name) in cairo_pie.metadata.program.builtins.iter().enumerate() {
         let memory_address = (origin_execution_segment + idx)?;
         let segment_index = extract_segment(memory_map[&memory_address].clone())?;
-        let relocation = vm.get_relocatable((execution_segment_address + idx)?)?;
+        let stack_slot = (execution_segment_address + idx)?;
+        let relocation = match vm.get_relocatable(stack_slot) {
+            Ok(relocation) => relocation,
+            Err(_) => {
+                // Missing-from-layout builtin: allocate a fresh segment for the
+                // PIE's builtin data.
+                vm.add_memory_segment()
+            }
+        };
         relocation_table.insert(segment_index, relocation)?;
     }
 
@@ -235,8 +259,14 @@ fn relocate_builtin_additional_data(
 ) -> Result<(), SignatureRelocationError> {
     let ecdsa_additional_data = match cairo_pie.additional_data.0.get(&BuiltinName::ecdsa) {
         Some(BuiltinAdditionalData::Signature(data)) => data,
+        // An unused ECDSA builtin serializes its additional data as an empty
+        // list / null (parsed by cairo-vm as `Empty`/`None`). There are no
+        // signatures to relocate in that case, so this is a no-op. The PIEs run
+        // under the `all_cairo_stwo` layout declare ecdsa with size 0.
+        Some(BuiltinAdditionalData::Empty(_)) | Some(BuiltinAdditionalData::None) | None => {
+            return Ok(())
+        }
         Some(_) => return Err(SignatureRelocationError::InvalidCairoPieEcdsaBuiltinData),
-        _ => return Ok(()),
     };
 
     let ecdsa_builtin = vm
@@ -264,7 +294,33 @@ fn relocate_cairo_pie_memory(
         let relocated_address = relocation_table.relocate_address(address)?;
         let relocated_value = relocation_table.relocate_value(value.clone())?;
 
-        vm.insert_value(relocated_address, relocated_value)?;
+        match vm.insert_value(relocated_address, relocated_value.clone()) {
+            Ok(()) => {}
+            Err(MemoryError::InconsistentMemory(boxed)) => {
+                // The bootloader runs under the `all_cairo_stwo` layout, which
+                // omits some builtins (keccak, ecdsa). For those, the bootloader
+                // wrote a `Felt252::ZERO` placeholder into the inner task's
+                // initial-stack builtin-pointer slot (see
+                // `build_cairo_pie_relocation_table`). Relocating the PIE's own
+                // initial-stack builtin pointer collides with that placeholder.
+                // Tolerate the collision iff the cell currently holds the
+                // `Felt252::ZERO` placeholder; the replayed inner program never
+                // reads that pointer as an address (its keccak/ecdsa memory
+                // accesses are relocated directly to the fresh segment), so
+                // leaving the placeholder in place is sound.
+                let (_addr, existing, _new) = *boxed;
+                if existing != MaybeRelocatable::Int(Felt252::ZERO) {
+                    return Err(MemoryRelocationError::Memory(
+                        MemoryError::InconsistentMemory(Box::new((
+                            relocated_address,
+                            existing,
+                            relocated_value,
+                        ))),
+                    ));
+                }
+            }
+            Err(e) => return Err(MemoryRelocationError::Memory(e)),
+        }
     }
 
     Ok(())
