@@ -68,6 +68,9 @@ cargo build --release -p stwo-cairo-prover --bin gpu_bench
 BIN=$(pwd)/target/release/gpu_bench
 FIB=/root/stwo-cairo/gpu_benchmarks/fib/compiled.json
 
+# Streams are ON by default since the H100 recheck (12x clean at the
+# round-8 hang conditions, bridge-mutex rev); the kill switch remains for
+# debugging.
 echo "=== GATE D2: streams-off isolation cross-check ==="
 STWO_CUDA_DISABLE_STREAMS=1 "$BIN" --program "$FIB" --iterations 1000000 --backend cuda --reps 2
 
