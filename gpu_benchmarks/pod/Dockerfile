@@ -24,10 +24,16 @@ ENV PATH=/root/.cargo/bin:$PATH
 ARG STWO_REV=9c5107553751fd6456dd10651e02fc7399188f6e
 ARG CAIRO_REF=generic-backend
 
-# nvcc compiles the kernels without a GPU; the fat binary covers
-# A100 (sm_80), 3090 (sm_86), 4090 (sm_89), H100 (sm_90).
+# nvcc compiles the kernels without a GPU. Consumer-fleet focus: 3090 (sm_86)
+# and 4090 (sm_89) only — datacenter archs dropped to halve the kernel compile
+# (5090/B200 need a CUDA >=12.8 base image before sm_120/sm_100 can be added).
 ENV STWO_CUDA_NVCC=/usr/local/cuda/bin/nvcc \
-    STWO_CUDA_ARCH=sm_80,sm_86,sm_89,sm_90
+    STWO_CUDA_ARCH=sm_86,sm_89
+
+# ssh sessions don't inherit docker ENV: scripts source this file instead, so
+# on-pod incremental builds keep the exact env the image's warm target dirs
+# were built with (a mismatch makes cargo recompile the kernels from scratch).
+RUN printf 'export STWO_CUDA_NVCC=/usr/local/cuda/bin/nvcc\nexport STWO_CUDA_ARCH=sm_86,sm_89\nsource /root/.cargo/env\n' > /root/stwo-env.sh
 
 RUN git clone https://github.com/teddyjfpender/stwo /root/stwo \
     && cd /root/stwo && git checkout "$STWO_REV"

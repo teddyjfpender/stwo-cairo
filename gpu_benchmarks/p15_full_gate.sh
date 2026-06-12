@@ -16,6 +16,9 @@
 #   M1       ncu roofline trace at 1M — ranks the P2 kernel worklist
 set -uo pipefail
 exec > >(tee /root/p15.log) 2>&1
+# The image bakes its build env here (ssh sessions don't see docker ENV);
+# matching it exactly keeps the warm target dirs valid.
+source /root/stwo-env.sh 2>/dev/null || true
 export STWO_CUDA_NVCC=${STWO_CUDA_NVCC:-/usr/local/cuda/bin/nvcc}
 export STWO_JIT_LOG=1
 source "$HOME/.cargo/env" 2>/dev/null || true
