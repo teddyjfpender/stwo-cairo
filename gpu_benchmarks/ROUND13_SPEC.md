@@ -21,11 +21,24 @@ pedersen 61k->321k, bitwise 44k->270k, poseidon 15k->84k, rc96/add_mod/mul_mod
 present, keccak 37->153, ecdsa 0). fib 1M/2M stays as the regression canary
 (one line per pod round), NOT the optimization target.
 
-Proving model: PIE -> vendored bootloader (proof mode, `all_cairo_stwo`
-layout; keccak/ecdsa are NOT in the layout — the bootloader program emulates
-missing builtins in Cairo, inflating n_steps; measure that inflation) ->
-`adapt(&runner)` -> `prove_cairo`. The integration (Item A) is the
-prerequisite for everything else.
+Proving model (CORRECTED after investigation): PIE -> the cairo-lang
+v0.14 SIMPLE bootloader program (proof mode, `all_cairo_stwo` layout) ->
+`adapt(&runner)` -> `prove_cairo`. Key findings that shaped this:
+- The FULL bootloader does NOT simulate missing builtins; only the v0.14
+  simple_bootloader.cairo main calls handle_uninitialized_{keccak,ecdsa,ec_op}
+  (verify_builtins.cairo) — required because every Sepolia PIE carries a real
+  keccak builtin segment and stwo has no keccak AIR / layout slot.
+- The stone-era bootloader (0.13.0, 8 builtins) and even 0.13.3 (11 builtins,
+  no simulation) CANNOT run these PIEs. The python bootloader runner modules
+  (objects/utils) are unpublished — no python escape hatch.
+- Rust cairo-vm has no dynamic auto-deduction rules — but CairoPie tasks do
+  not need them: load_cairo_pie loads ALL builtin cells (inputs AND outputs)
+  from the PIE memory, so re-execution only reads pre-loaded values; the
+  auto-deduction-registration hints are sound NO-OPS for PIE tasks (guarded:
+  error on RunProgramTask). Soundness of simulated builtins comes from the
+  bootloader's pure-Cairo verification, which the proof covers.
+- Keccak simulation inflates n_steps (the Cairo keccak-f per instance);
+  measure the inflation (PIE n_steps vs adapted cycle_count).
 
 ## Item A — PIE proving path (bootloader integration + pie_bench)
 
