@@ -590,12 +590,14 @@ impl OpcodeWitness for CudaBackend {
         // [+3]=s23, [+4]=s29.
         // The id_to_big tuples' 5 interior zeros (idx 24..28) stay Const(0) to
         // keep slot positions aligned (the trailing s29 is at slot 28).
-        let id_to_big_slots = |limb0, limb1, limb2, base: usize| {
+        let id_to_big_slots = |id, limb0, limb1, limb2, base: usize| {
             let s5 = base;
             let s6 = base + 1;
             let s23 = base + 2;
             let s29 = base + 3;
+            // Host tuple: [rel_id, id, limb0..2, s5, s6 x17, s23, 0 x5, s29].
             let mut v = vec![
+                Col(&cols[id]),
                 Col(&cols[limb0]),
                 Col(&cols[limb1]),
                 Col(&cols[limb2]),
@@ -638,7 +640,7 @@ impl OpcodeWitness for CudaBackend {
             // 2. (memory_id_to_big[dst], memory_address_to_id[op0]) — (1, 1).
             device_witness::tuple_pair_logup_slots(
                 MEMORY_ID_TO_BIG_RELATION_ID.0,
-                &id_to_big_slots(17, 18, 19, 5),
+                &id_to_big_slots(14, 17, 18, 19, 5),
                 MEMORY_ADDRESS_TO_ID_RELATION_ID.0,
                 &[Col(&staged[9]), Col(&cols[22])],
                 device_witness::Mult::One,
@@ -651,7 +653,7 @@ impl OpcodeWitness for CudaBackend {
             // 3. (memory_id_to_big[op0], memory_address_to_id[op1]) — (1, 1).
             device_witness::tuple_pair_logup_slots(
                 MEMORY_ID_TO_BIG_RELATION_ID.0,
-                &id_to_big_slots(25, 26, 27, 10),
+                &id_to_big_slots(22, 25, 26, 27, 10),
                 MEMORY_ADDRESS_TO_ID_RELATION_ID.0,
                 &[Col(&staged[14]), Col(&cols[30])],
                 device_witness::Mult::One,
@@ -664,7 +666,7 @@ impl OpcodeWitness for CudaBackend {
             // 4. (memory_id_to_big[op1], opcodes-in) — (1, enabler).
             device_witness::tuple_pair_logup_slots(
                 MEMORY_ID_TO_BIG_RELATION_ID.0,
-                &id_to_big_slots(33, 34, 35, 15),
+                &id_to_big_slots(30, 33, 34, 35, 15),
                 OPCODES_RELATION_ID,
                 &[Col(&cols[0]), Col(&cols[1]), Col(&cols[2])],
                 device_witness::Mult::One,
