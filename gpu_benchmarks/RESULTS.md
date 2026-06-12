@@ -664,3 +664,40 @@ Receipts: `stwo-things/round12{a,b,d,e,f}_*.log`. Remaining round-12 debt:
 item 3 (ncu NTT on secure cloud), nsys D2H receipt, vi-feed device path, and
 the next ranked queue (rc/builtin cohort ports on the same lane, device feeds
 via index_count, commit-over-witness scheduler before streams re-enable).
+
+### Round 12, item 3 — the NTT measurement verdict (secure 4090, 2026-06-12)
+
+**ncu counters are blocked on RunPod, secure cloud included**: probe returned
+`ERR_NVGPUCTRPERM`; `/proc/driver/nvidia/params` shows `RmProfilingAdminOnly: 1`
+— a host driver policy no container can override. Documented per the spec's
+contingency; real ncu iteration needs Lambda/own box.
+
+**M1 fallback executed** (nsys per-instance kernel durations + grid/block
+geometry from the sqlite export; byte model = one read + one write of each
+launch's covered elements, `threads x vals_per_thread x 8B` — twiddle traffic
+uncounted, so %peak is a mild underestimate; variant-relative ranking robust):
+
+fib 1M/2M, RTX 4090 (1008 GB/s peak), aggregate over 2 proves:
+- **NTT family total: ~444 GB/s ≈ 44% of DRAM peak — NOT at roofline.**
+  The round-11 "already NitrooZK-tuned" hypothesis is refuted by measurement.
+- Block variants are near roofline: `b2n_noinit<3>` **92%**, `b2n_noinit<4>`
+  69%, `n2b_nofinal<3>` 55%, `<4>` 46%.
+- The warp variants are the laggards and hold ~45% of family time:
+  `n2b_final_warp<2>/<3>` 32-33%, `b2n_init_warp<2>/<3>` 26-30%,
+  `n2b_final_block_warp` 14-28%.
+- **Quantified headroom: ~1.6x on the family** if the warp variants reach the
+  block variants' efficiency.
+- One-knob check (dispatch/config tables, `LAUNCH_N2B_CONFIG_20_27`):
+  computed against the measured per-variant bandwidths, alternative stage
+  splits at the hot sizes (log 21-23) net out neutral-to-worse — fewer passes
+  trade into intrinsically slower final kernels. The win is INSIDE the
+  warp-final/init kernels (strided global access -> vectorized uint4 loads,
+  smem bank conflicts in the shuffle stages) — a kernel-internal P2 slice,
+  now data-ranked for the next round.
+
+NTT share context at the current stack: ~107 ms/prove @1M (4090) out of
+~2.0 s — the family is ~5% of wall today, so the 1.6x family fix buys ~3% of
+wall; rank it accordingly against the rc/builtin witness cohort.
+
+Receipts: `stwo-things/round12g_*.{log,txt}`. Secure pod torn down; zero pods
+billing.
