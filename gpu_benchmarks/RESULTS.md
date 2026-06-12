@@ -412,3 +412,66 @@ kernel ranking comes from it next round.
 Next: P3 deadlock audit, witness-on-GPU for the remaining component cohort
 (address_to_id, rc families, opcodes — the 4.3 → ~6 MHz leg), M1-ranked P2
 kernel round, P5 prefetch depth.
+
+## Round 9: the cheap-fleet round — 13.66 MHz sustained at $1.00/hr
+
+Directive: 10 MHz on consumer cards, not H100s. Everything below ran on
+RunPod COMMUNITY 4090s ($0.34/hr) and 3090s ($0.22/hr) from the prebuilt
+image (consumer archs sm_86/89 only now — datacenter archs dropped).
+
+**W3 slice 2 — memory_address_to_id on device** (stwo addr_to_id_pair_logup
+kernel @ 3f1d0453, integration @ 58bbca43): flat chunk-major id/mult buffers
+upload once, every trace column is a device slice, SPLIT/2 pair-batched logup
+columns + device finalize. Differential green on the 4090
+(`memory_address_to_id trace columns OK / interaction columns + sums OK`),
+proof byte-identical to SIMD. Isolation at 1M: +2.7% (2.236 → 2.177 s warm).
+Small component, small win — the opcode cohort is where the rest lives.
+
+**P5 prefetch depth N** (gpu_bench `--prefetch`, default 2): VM/adapt worker
+pool feeds a bounded queue. 4090 sustained ladder at 1M: depth 1 = 2.29,
+depth 2 = 2.70, depth 3 = 2.94 MHz ≈ the single-proof rate — sustained
+throughput is GPU-bound again.
+
+**GPU sharing (new lever, zero code):** N pipelined prover processes share one
+card; each prover's host phases leave the GPU idle and the others fill them.
+4090 @1M: single 2.84 → dual 3.61 (+27%) → triple 4.02 MHz (+42%, 22 GB VRAM).
+3090 @1M dual: ~4.1 MHz on strong hosts (2×2.03) — community 3090 hosts with
+good CPUs are the value sweet spot.
+
+**M1 on consumer (nsys; ncu blocked by ERR_NVGPUCTRPERM on community pods):**
+H2D memcpy = 46.8% of ALL GPU time (4,698 copies / 2 proves) — witness upload
+traffic dominates; every W3 slice deletes it directly. Kernel ranking:
+commit_on_first_layer 36.7%, NTT family ~33%, barycentric_eval_partial 7.5%
+across 1,780 launches (launch-storm candidate). P2 worklist, in order:
+(1) finish W3, (2) first-layer Merkle commit, (3) NTT batches, (4) OODS
+launch batching. Trace archived: stwo-things/m1_4090.nsys-rep.
+
+**P3 disposition:** root cause identified at code level — the per-pool-stream
+bridge events are shared and record/wait pairs were not atomic across
+threads (P1 made concurrent pool use reachable); fix = mutex around each
+pair (stwo @ 9c510755), provably safe, negligible cost. Empirical repro on
+the 4090: 36 streams-on proves at 2M at the UNFIXED rev, zero hangs — the
+round-8 deadlock is H100-timing-correlated. Streams stay off by default
+until an H100 re-check; nothing in this round used them.
+
+**The fleet demo (all four simultaneously, synchronized window):**
+
+| member | card | $/hr | provers | sustained MHz |
+|---|---|---|---|---|
+| m1 | 4090 community | 0.34 | 3 | 3.83 |
+| m2 | 3090 community | 0.22 | 2 | 4.06 |
+| m3 | 3090 community | 0.22 | 2 | 1.61 (weak host CPU) |
+| m4 | 3090 community | 0.22 | 2 | 4.16 |
+| **total** | | **$1.00/hr** | 9 | **13.66 MHz** |
+
+Every proof verified (verify_ms in every receipt; the pipeline is the
+byte-equality-gated one). Excluding the weak host: 12.05 MHz at $0.78/hr.
+Versus round 8's H100 (4.3 MHz @ $3.29/hr): **~10× MHz per dollar**, and the
+whole fleet cold-starts in ~2 minutes from ghcr.io/teddyjfpender/stwo-pod.
+Host-CPU variance is the fleet's real risk: 1 of 4 community hosts delivered
+40% of the others — a production farm needs host screening (nproc + a 10s
+cargo-free CPU probe before committing a member).
+
+Single-proof on consumer after this round: 4090 3.22 MHz @1M / 3.34 @2M.
+10 MHz single-proof remains an H100+P2 story; 10 MHz **sustained** is now a
+$1/hr commodity.
