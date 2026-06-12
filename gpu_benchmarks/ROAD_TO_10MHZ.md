@@ -130,6 +130,17 @@ the repeated-prove gate), P2 yield uncertainty (mitigated by M1 first), P1 opcod
 long-tail effort (mitigated by per-component fallback — coverage is incremental
 by construction even if the program isn't).
 
+**Round-12 update (2026-06-12):** the W3 opcode cohort landed (six fib opcodes
+device-resident). Measured on a community 3090: fib 1M **0.224 µs/cycle
+(4.47 MHz)**, 2M **0.217 µs/cycle (4.61 MHz)** — the P1-complete row of the
+table is REAL and overshot (the table predicted 3.8 on H100-class). The
+opcode-cohort lever alone is +46% (kill-switch isolated). Remaining µs/cycle
+now sits in commits + STARK core (P2/ncu round, still gated on secure-cloud
+counters), host feeds (device `index_count` next), and the rc/builtin
+component long tail. Measured MPS dual at the final
+stack: **7.43 MHz aggregate on one 3090** → two cards ≈ 14.9 MHz at $0.44/hr;
+**10 MHz ≈ $0.30/hr** (round 9: $1.00; round 11: $0.44).
+
 ## 4. Execution order for the round
 
 1. P1 phase-1 (memory slice, spec ready) → gate → re-trace (feeds M1).

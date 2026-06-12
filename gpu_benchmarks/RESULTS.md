@@ -597,3 +597,70 @@ by construction; the per-proof second is the comparable number.
 
 Costs: ~1.2 h H100 (~$4) + ~3 h of 3090s (~$0.70). One earlier community 3090
 GPU death (round 10) remains the only hardware casualty.
+
+## Round 12 — 2026-06-12 (cont.): the opcode cohort lands (W3 essentially complete for fib)
+
+Per `ROUND12_SPEC.md`, executed 4 → 2 → 1; item 3 (ncu NTT) still queued for a
+secure pod. All numbers from one community 3090 ($0.22/hr, 64-core host —
+slower baseline than round 11's host, so compare within-host). Every change
+byte-equality-gated; every opcode port differential-gated (trace columns,
+feeds vs sub_component_inputs, interaction columns + sums).
+
+**(4) Overlap v1** (`638487ca`): `B::finalize_raw_logup` moved inside all 64
+component rayon spawns (generalizing the memory/vi in-scope pattern); evals +
+claims stay post-scope in fixed order — Fiat-Shamir untouched. Gates green.
+1M 2.681 → 2.618 s (+2.4%); 2M flat on this host.
+
+**(2) Device leaf-hash recompute** (stwo `89bfd0a9`):
+`MerkleOpsLifted::leaf_hashes_at` hook + `commit_on_first_layer_lifted_indexed`
+kernel — the pruned-tree decommit's unretained leaf hashes now come from one
+indexed launch + one D2H instead of 61.7k sync 4-byte `raw_value` reads.
+Unit differential (device vs CPU `build_leaves` at scattered indices) green on
+hardware; kill switch `STWO_CUDA_LEAF_HASHES=0`. 1M 2.618 → 2.540 s (+3.1%),
+2M +3.7%. (nsys was unavailable on this pod; the D2H-count receipt rides on a
+future profiled round.)
+
+**(1) THE WHALE: six opcode base-trace kernels on the generic lane.**
+Lane upgrades first: tuple kernels now take a folded combine base + repacked
+per-live-column alphas (`TupleSlot::{Col, Const}` — constant-heavy opcode
+tuples cost nothing on device); memory deduce fused as device gathers
+(`mem_addr_to_id`, `mem_id_to_limbs` — tag/val decode + 9-bit split identical
+to `deduce_output`); prove-wide `DeviceMemTables` uploaded once. Then the
+ports: **ret** (pilot, main session), **add_opcode_small, jnz_opcode_taken,
+add_opcode, call_opcode_rel_imm, assert_eq_opcode** (delegated transcriptions,
+integrated via union merges). Per-component kill switches
+`STWO_CUDA_{RET,ADD_SMALL,JNZ_TAKEN,ADD_OPCODE,CALL_REL_IMM,ASSERT_EQ}_WITNESS=0`.
+
+The differential EARNED ITS KEEP twice:
+- add_opcode_small's id_to_big tuples were missing the leading id slot —
+  caught at "interaction col 4 MISMATCH row 0" precision (trace cols green,
+  ret/jnz green in the same run), fixed in one line-set.
+- The first full-cohort round REGRESSED (1M 3.74 s) while gates stayed green:
+  the host-side feed loops were sequential per row and jnz decoded via a
+  16-lane PackedFelt252 broadcast per row. Fix: rayon-parallel feed loops +
+  scalar raw-table decode. (Lesson recorded: port the feeds with the same care
+  as the kernels — they are the new host critical path.)
+
+**Final validated stack** (stwo-cairo `0fe90916` / stwo `d52454fe`):
+- fib 1M: **1.566 s warm / 4.47 MHz** (stable ×6: 1.579 s) — vs 2.681 s
+  baseline on this host = **+71%** in one round; beats every previous
+  single-proof number on any host including round-11's faster-host 3090
+  (1.70 s) and round-11's H100 @2M MHz.
+- fib 2M: **3.036 s warm / 4.61 MHz**.
+- Opcode-cohort lever isolated (all six off → on): 2.281 → 1.566 s = +46%.
+- peak host RSS halved (5.8 → 2.5 GB @1M): the witness really left the host.
+
+**Process note:** `crates/prover/Cargo.toml` pins `stwo-backend-cuda-kernels`
+separately from the workspace manifest — bump BOTH (the round-12a leaf-hash
+gates were silently lost to a duplicate-archive link failure; rerun clean).
+
+**MPS dual at the final stack: 3.82 + 3.60 = 7.43 MHz aggregate on ONE
+community 3090** — two MPS-dual 3090s ≈ 14.9 MHz at $0.44/hr; the 10 MHz
+fleet now quotes at ~$0.30/hr (vs $1.00 in round 9, $0.44 in round 11).
+Sustained single-process (pipeline, prefetch 3) 3.64 MHz — VM+adapt bound on
+this host; the MPS pair is the throughput configuration.
+
+Receipts: `stwo-things/round12{a,b,d,e,f}_*.log`. Remaining round-12 debt:
+item 3 (ncu NTT on secure cloud), nsys D2H receipt, vi-feed device path, and
+the next ranked queue (rc/builtin cohort ports on the same lane, device feeds
+via index_count, commit-over-witness scheduler before streams re-enable).
