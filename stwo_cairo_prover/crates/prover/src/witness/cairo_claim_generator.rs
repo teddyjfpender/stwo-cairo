@@ -7,6 +7,7 @@ use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
 use cairo_air::components::memory_address_to_id::InteractionClaim as MemoryAddrInteractionClaim;
 use cairo_air::components::memory_id_to_big::InteractionClaim as MemoryBigInteractionClaim;
 use cairo_air::components::memory_id_to_small::InteractionClaim as MemorySmallInteractionClaim;
+use cairo_air::components::add_opcode_small::InteractionClaim as AddSmallInteractionClaim;
 use cairo_air::components::ret_opcode::InteractionClaim as RetInteractionClaim;
 use cairo_air::components::verify_instruction::InteractionClaim as ViInteractionClaim;
 use cairo_air::relations::CommonLookupElements;
@@ -771,7 +772,9 @@ impl CairoClaimGenerator {
 
         // Prove-wide device memory tables for the ported opcode kernels
         // (addr->id, id->value words), uploaded once before the opcode scope.
-        let opcode_mem_tables = self.ret_opcode.is_some().then(|| {
+        let opcode_mem_tables = (self.ret_opcode.is_some()
+            || self.add_opcode_small.is_some())
+        .then(|| {
             B::build_mem_tables(
                 self.memory_address_to_id.as_ref().unwrap(),
                 self.memory_id_to_big.as_ref().unwrap(),
@@ -793,14 +796,13 @@ impl CairoClaimGenerator {
             }
             if let Some(gen) = self.add_opcode_small {
                 s.spawn(|_| {
-                    add_opcode_small_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                            self.memory_address_to_id.as_ref().unwrap(),
-                            self.memory_id_to_big.as_ref().unwrap(),
-                            self.verify_instruction.as_ref().unwrap(),
-                        );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
-                    });
+                    add_opcode_small_result = Some(B::write_add_opcode_small_trace(
+                        gen,
+                        opcode_mem_tables.as_ref().unwrap(),
+                        self.memory_address_to_id.as_ref().unwrap(),
+                        self.memory_id_to_big.as_ref().unwrap(),
+                        self.verify_instruction.as_ref().unwrap(),
+                    ));
                 });
             }
             if let Some(gen) = self.add_ap_opcode {
@@ -1826,7 +1828,7 @@ pub struct CairoInteractionClaimGenerator<
     B: MemoryIdToBigWitness + MemoryAddressToIdWitness + VerifyInstructionWitness + OpcodeWitness,
 > {
     pub add_opcode: Option<add_opcode::InteractionClaimGenerator>,
-    pub add_opcode_small: Option<add_opcode_small::InteractionClaimGenerator>,
+    pub add_opcode_small: Option<<B as OpcodeWitness>::AddSmallInteractionGen>,
     pub add_ap_opcode: Option<add_ap_opcode::InteractionClaimGenerator>,
     pub assert_eq_opcode: Option<assert_eq_opcode::InteractionClaimGenerator>,
     pub assert_eq_opcode_imm: Option<assert_eq_opcode_imm::InteractionClaimGenerator>,
@@ -2009,9 +2011,8 @@ where
             }
             if let Some(gen) = self.add_opcode_small {
                 s.spawn(|_| {
-                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
-                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                    add_opcode_small_result = Some((trace, claimed_sum, build_claim));
+                    add_opcode_small_result =
+                        Some(B::write_add_opcode_small_interaction(gen, common_lookup_elements));
                 });
             }
             if let Some(gen) = self.add_ap_opcode {
@@ -2478,9 +2479,9 @@ where
                 build_claim(claimed_sum)
             });
         let add_opcode_small_interaction_claim =
-            add_opcode_small_result.map(|(trace, claimed_sum, build_claim)| {
+            add_opcode_small_result.map(|(trace, claimed_sum)| {
                 evals.extend(trace);
-                build_claim(claimed_sum)
+                AddSmallInteractionClaim { claimed_sum }
             });
         let add_ap_opcode_interaction_claim =
             add_ap_opcode_result.map(|(trace, claimed_sum, build_claim)| {

@@ -21,6 +21,9 @@
 //! the Cairo e2e proof byte-equality (CUDA vs SIMD) is decisive.
 //! `STWO_CUDA_RET_WITNESS=0` disables the device path per component.
 
+use cairo_air::components::add_opcode_small::{
+    Claim as AddSmallClaim, N_TRACE_COLUMNS as ADD_SMALL_N_COLS,
+};
 use cairo_air::components::ret_opcode::{Claim as RetClaim, N_TRACE_COLUMNS as RET_N_COLS};
 use cairo_air::relations::{
     CommonLookupElements, MEMORY_ADDRESS_TO_ID_RELATION_ID, MEMORY_ID_TO_BIG_RELATION_ID,
@@ -36,7 +39,7 @@ use stwo_cairo_adapter::memory::u128_to_4_limbs;
 use stwo_constraint_framework::LogupFinalizeBackend;
 
 use crate::witness::components::{
-    memory_address_to_id, memory_id_to_big, ret_opcode, verify_instruction,
+    add_opcode_small, memory_address_to_id, memory_id_to_big, ret_opcode, verify_instruction,
 };
 use crate::witness::memory_witness_backend::{compare_interaction, MemoryEvals};
 use crate::witness::utils::{pack_values, AddInputs};
@@ -46,6 +49,108 @@ use crate::witness::utils::{pack_values, AddInputs};
 const OPCODES_RELATION_ID: u32 = 428564188;
 const VERIFY_INSTRUCTION_RELATION_ID: u32 = 1719106205;
 
+/// The host-side decode of one add_opcode_small row (the sub-component feed
+/// values; mirrors `write_trace_simd`'s row math exactly, in M31 arithmetic).
+struct AddSmallDecoded {
+    offset0: M31,
+    offset1: M31,
+    offset2: M31,
+    vi_felt5: M31,
+    vi_felt6: M31,
+    dst_addr: M31,
+    op0_addr: M31,
+    op1_addr: M31,
+    dst_id: M31,
+    op0_id: M31,
+    op1_id: M31,
+}
+
+/// Decodes an id's first 28 9-bit limbs from the prove-wide raw tables, exactly
+/// like the kernel's `mem_id_to_limbs` / the host `deduce_output`: tag = id>>30,
+/// val = id & 0x3FFFFFFF; tag 1 = big (8 words), else small (u128 -> 4 words).
+fn id_to_limbs(id: M31, big_values: &[[u32; 8]], small_values: &[u128]) -> [M31; 28] {
+    let raw = id.0;
+    let tag = raw >> 30;
+    let val = (raw & 0x3FFF_FFFF) as usize;
+    let mut words = [0u32; 8];
+    if tag == 1 {
+        words = big_values[val];
+    } else {
+        let limbs = u128_to_4_limbs(small_values[val]);
+        words[..4].copy_from_slice(&limbs);
+    }
+    stwo_cairo_common::prover_types::felt::split_f252(words)
+}
+
+fn decode_add_small_row(
+    state: &crate::witness::prelude::CasmState,
+    memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+    big_values: &[[u32; 8]],
+    small_values: &[u128],
+) -> AddSmallDecoded {
+    let m31 = M31::from;
+    let pc = state.pc;
+    let ap = state.ap;
+    let fp = state.fp;
+
+    // Decode Instruction: pc -> id -> first 7 limbs (u16 bit-extraction math).
+    let instr_id = memory_address_to_id.get_id(pc);
+    let il = id_to_limbs(instr_id, big_values, small_values);
+    let l = |j: usize| il[j].0;
+    let offset0_u = l(0) + ((l(1) & 127) << 9);
+    let offset1_u = (l(1) >> 7) + (l(2) << 2) + ((l(3) & 31) << 11);
+    let offset2_u = (l(3) >> 5) + (l(4) << 4) + ((l(5) & 7) << 13);
+    let flags = (l(5) >> 3) + (l(6) << 6);
+    let dst_base_fp = (flags >> 0) & 1;
+    let op0_base_fp = (flags >> 1) & 1;
+    let op1_imm = (flags >> 2) & 1;
+    let op1_base_fp = (flags >> 3) & 1;
+    let ap_update_add_1 = (flags >> 11) & 1;
+
+    let offset0 = m31(offset0_u);
+    let offset1 = m31(offset1_u);
+    let offset2 = m31(offset2_u);
+    let dst_base_fp = m31(dst_base_fp);
+    let op0_base_fp = m31(op0_base_fp);
+    let op1_imm = m31(op1_imm);
+    let op1_base_fp = m31(op1_base_fp);
+    let ap_update_add_1 = m31(ap_update_add_1);
+    let op1_base_ap = m31(1) - op1_imm - op1_base_fp;
+
+    let vi_felt5 = dst_base_fp * m31(8)
+        + op0_base_fp * m31(16)
+        + op1_imm * m31(32)
+        + op1_base_fp * m31(64)
+        + op1_base_ap * m31(128)
+        + m31(256);
+    let vi_felt6 = ap_update_add_1 * m31(32) + m31(256);
+
+    let mem_dst_base = dst_base_fp * fp + (m31(1) - dst_base_fp) * ap;
+    let mem0_base = op0_base_fp * fp + (m31(1) - op0_base_fp) * ap;
+    let mem1_base = op1_imm * pc + op1_base_fp * fp + op1_base_ap * ap;
+
+    let dst_addr = mem_dst_base + (offset0 - m31(32768));
+    let op0_addr = mem0_base + (offset1 - m31(32768));
+    let op1_addr = mem1_base + (offset2 - m31(32768));
+    let dst_id = memory_address_to_id.get_id(dst_addr);
+    let op0_id = memory_address_to_id.get_id(op0_addr);
+    let op1_id = memory_address_to_id.get_id(op1_addr);
+
+    AddSmallDecoded {
+        offset0,
+        offset1,
+        offset2,
+        vi_felt5,
+        vi_felt6,
+        dst_addr,
+        op0_addr,
+        op1_addr,
+        dst_id,
+        op0_id,
+        op1_id,
+    }
+}
+
 /// Backend hook for the opcode-cohort witness writers. One trait for the whole
 /// cohort (one bound in `prover.rs`); each ported opcode adds a method pair +
 /// an interaction-generator associated type.
@@ -54,11 +159,25 @@ pub trait OpcodeWitness: FromSimdColumns + LogupFinalizeBackend {
     /// gather from. Built once, before the opcode write scope; unit for SIMD.
     type MemTables: Send + Sync;
     type RetInteractionGen: Send;
+    type AddSmallInteractionGen: Send;
 
     fn build_mem_tables(
         memory_address_to_id: &memory_address_to_id::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
     ) -> Self::MemTables;
+
+    fn write_add_opcode_small_trace(
+        gen: add_opcode_small::ClaimGenerator,
+        mem_tables: &Self::MemTables,
+        memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+        memory_id_to_big: &memory_id_to_big::ClaimGenerator,
+        verify_instruction: &verify_instruction::ClaimGenerator,
+    ) -> (MemoryEvals<Self>, AddSmallClaim, Self::AddSmallInteractionGen);
+
+    fn write_add_opcode_small_interaction(
+        gen: Self::AddSmallInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField);
 
     fn write_ret_trace(
         gen: ret_opcode::ClaimGenerator,
@@ -77,11 +196,32 @@ pub trait OpcodeWitness: FromSimdColumns + LogupFinalizeBackend {
 impl OpcodeWitness for SimdBackend {
     type MemTables = ();
     type RetInteractionGen = ret_opcode::InteractionClaimGenerator;
+    type AddSmallInteractionGen = add_opcode_small::InteractionClaimGenerator;
 
     fn build_mem_tables(
         _memory_address_to_id: &memory_address_to_id::ClaimGenerator,
         _memory_id_to_big: &memory_id_to_big::ClaimGenerator,
     ) -> Self::MemTables {
+    }
+
+    fn write_add_opcode_small_trace(
+        gen: add_opcode_small::ClaimGenerator,
+        _mem_tables: &Self::MemTables,
+        memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+        memory_id_to_big: &memory_id_to_big::ClaimGenerator,
+        verify_instruction: &verify_instruction::ClaimGenerator,
+    ) -> (MemoryEvals<Self>, AddSmallClaim, Self::AddSmallInteractionGen) {
+        let (trace, claim, interaction_gen) =
+            gen.write_trace(memory_address_to_id, memory_id_to_big, verify_instruction);
+        (trace.to_evals(), claim, interaction_gen)
+    }
+
+    fn write_add_opcode_small_interaction(
+        gen: Self::AddSmallInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField) {
+        let (raw, _build_claim) = gen.write_interaction_trace(common_lookup_elements);
+        raw.finalize_on_simd()
     }
 
     fn write_ret_trace(
@@ -120,9 +260,35 @@ pub enum CudaRetInteractionGen {
     Host(Box<ret_opcode::InteractionClaimGenerator>),
 }
 
+/// Device-born add_opcode_small state: the 39 trace columns plus the 19 staged
+/// columns its interaction tuples reference.
+pub struct DeviceAddSmallWitness {
+    cols: Vec<BaseFieldVec>,
+    staged: [BaseFieldVec; 19],
+    column_length: usize,
+    n_rows: usize,
+    verify_host: Option<add_opcode_small::InteractionClaimGenerator>,
+}
+
+pub enum CudaAddSmallInteractionGen {
+    Device(Box<DeviceAddSmallWitness>),
+    Host(Box<add_opcode_small::InteractionClaimGenerator>),
+}
+
 fn ret_device_path_enabled() -> bool {
     stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT
         && std::env::var("STWO_CUDA_RET_WITNESS").as_deref() != Ok("0")
+}
+
+fn add_small_device_path_enabled() -> bool {
+    stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT
+        && std::env::var("STWO_CUDA_ADD_SMALL_WITNESS").as_deref() != Ok("0")
+}
+
+/// The prove-wide device memory tables are real (worth uploading the tens of MB)
+/// iff ANY ported opcode's device path is enabled.
+fn any_opcode_device_path_enabled() -> bool {
+    ret_device_path_enabled() || add_small_device_path_enabled()
 }
 
 fn verify_enabled() -> bool {
@@ -132,12 +298,13 @@ fn verify_enabled() -> bool {
 impl OpcodeWitness for CudaBackend {
     type MemTables = device_witness::DeviceMemTables;
     type RetInteractionGen = CudaRetInteractionGen;
+    type AddSmallInteractionGen = CudaAddSmallInteractionGen;
 
     fn build_mem_tables(
         memory_address_to_id: &memory_address_to_id::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
     ) -> Self::MemTables {
-        if !ret_device_path_enabled() {
+        if !any_opcode_device_path_enabled() {
             // Kill-switched: every opcode write takes the host fallback, so
             // upload placeholder tables instead of the real ~tens-of-MB ones.
             return device_witness::DeviceMemTables::upload(vec![0], vec![0; 8], vec![0; 4]);
@@ -150,6 +317,322 @@ impl OpcodeWitness for CudaBackend {
             .flat_map(|value| u128_to_4_limbs(*value))
             .collect();
         device_witness::DeviceMemTables::upload(addr_table, big_words, small_words)
+    }
+
+    fn write_add_opcode_small_trace(
+        gen: add_opcode_small::ClaimGenerator,
+        mem_tables: &Self::MemTables,
+        memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+        memory_id_to_big: &memory_id_to_big::ClaimGenerator,
+        verify_instruction: &verify_instruction::ClaimGenerator,
+    ) -> (MemoryEvals<Self>, AddSmallClaim, Self::AddSmallInteractionGen) {
+        if !add_small_device_path_enabled() {
+            let (trace, claim, interaction_gen) =
+                gen.write_trace(memory_address_to_id, memory_id_to_big, verify_instruction);
+            return (
+                Self::from_simd_evals(trace.to_evals()),
+                claim,
+                CudaAddSmallInteractionGen::Host(Box::new(interaction_gen)),
+            );
+        }
+
+        let verify = verify_enabled();
+        let verify_inputs = verify.then(|| gen.inputs.clone());
+        let (inputs, n_rows) = gen.into_parts();
+        let column_length = inputs.len();
+        let log_size = column_length.ilog2();
+
+        // SoA upload of the padded CasmState inputs.
+        let pc = BaseFieldVec::from_vec(inputs.iter().map(|s| s.pc).collect());
+        let ap = BaseFieldVec::from_vec(inputs.iter().map(|s| s.ap).collect());
+        let fp = BaseFieldVec::from_vec(inputs.iter().map(|s| s.fp).collect());
+
+        let (cols, staged) = device_witness::add_opcode_small_trace(
+            [&pc, &ap, &fp],
+            mem_tables,
+            n_rows,
+            column_length,
+        );
+
+        // Sub-component feeds, host-side over the padded inputs — identical
+        // values and counts to the writer's sub_component_inputs loops. We
+        // replicate the writer's row math: decode the instruction at pc, then
+        // the three small reads at the derived addresses.
+        let (big_values, small_values) = memory_id_to_big.value_tables();
+        let m31 = M31::from;
+        for state in &inputs {
+            let decoded = decode_add_small_row(
+                state,
+                memory_address_to_id,
+                big_values,
+                small_values,
+            );
+            AddInputs::add_input(
+                verify_instruction,
+                &(
+                    state.pc,
+                    [decoded.offset0, decoded.offset1, decoded.offset2],
+                    [decoded.vi_felt5, decoded.vi_felt6],
+                    m31(0),
+                ),
+                0,
+            );
+            AddInputs::add_input(memory_address_to_id, &decoded.dst_addr, 0);
+            AddInputs::add_input(memory_address_to_id, &decoded.op0_addr, 0);
+            AddInputs::add_input(memory_address_to_id, &decoded.op1_addr, 0);
+            AddInputs::add_input(memory_id_to_big, &decoded.dst_id, 0);
+            AddInputs::add_input(memory_id_to_big, &decoded.op0_id, 0);
+            AddInputs::add_input(memory_id_to_big, &decoded.op1_id, 0);
+        }
+
+        let verify_host = verify_inputs.map(|raw_inputs| {
+            let mut padded = raw_inputs;
+            padded.resize(column_length, *padded.first().unwrap());
+            let packed_inputs = pack_values(&padded);
+            let (host_trace, host_lookup_data, host_feeds) = add_opcode_small::write_trace_simd(
+                packed_inputs,
+                n_rows,
+                memory_address_to_id,
+                memory_id_to_big,
+                verify_instruction,
+            );
+            let host_evals = host_trace.to_evals();
+            let mut mismatches = 0usize;
+            // Feed differential: the values this path fed host-side must match
+            // the writer's sub_component_inputs buffers element-for-element.
+            {
+                use stwo::prover::backend::simd::m31::PackedM31;
+                let unpack = |cols: &[PackedM31]| -> Vec<M31> {
+                    cols.iter().flat_map(|p| p.to_array()).collect()
+                };
+                let vi_pc_feed: Vec<_> = host_feeds.verify_instruction[0]
+                    .iter()
+                    .flat_map(|p| p.0.to_array())
+                    .collect();
+                let addr_dst_feed = unpack(&host_feeds.memory_address_to_id[0]);
+                let addr_op0_feed = unpack(&host_feeds.memory_address_to_id[1]);
+                let addr_op1_feed = unpack(&host_feeds.memory_address_to_id[2]);
+                let id_dst_feed = unpack(&host_feeds.memory_id_to_big[0]);
+                let id_op0_feed = unpack(&host_feeds.memory_id_to_big[1]);
+                let id_op1_feed = unpack(&host_feeds.memory_id_to_big[2]);
+                for (i, state) in padded.iter().enumerate() {
+                    let decoded = decode_add_small_row(
+                        state,
+                        memory_address_to_id,
+                        big_values,
+                        small_values,
+                    );
+                    let expected = [
+                        (vi_pc_feed[i], state.pc),
+                        (addr_dst_feed[i], decoded.dst_addr),
+                        (addr_op0_feed[i], decoded.op0_addr),
+                        (addr_op1_feed[i], decoded.op1_addr),
+                        (id_dst_feed[i], decoded.dst_id),
+                        (id_op0_feed[i], decoded.op0_id),
+                        (id_op1_feed[i], decoded.op1_id),
+                    ];
+                    if expected.iter().any(|(host, device)| host != device) {
+                        eprintln!(
+                            "STWO_CUDA_WITNESS_VERIFY: add_opcode_small feed MISMATCH at row {i}"
+                        );
+                        mismatches += 1;
+                        break;
+                    }
+                }
+            }
+            for (col_idx, (device_col, host_col)) in cols.iter().zip(&host_evals).enumerate() {
+                let device_values = device_col.to_vec();
+                let host_values = host_col.values.to_cpu();
+                if device_values != host_values {
+                    let first_diff = device_values
+                        .iter()
+                        .zip(&host_values)
+                        .position(|(d, h)| d != h);
+                    eprintln!(
+                        "STWO_CUDA_WITNESS_VERIFY: add_opcode_small col {col_idx} MISMATCH \
+                         (first diff at row {first_diff:?})"
+                    );
+                    mismatches += 1;
+                }
+            }
+            assert_eq!(
+                mismatches, 0,
+                "STWO_CUDA_WITNESS_VERIFY: add_opcode_small trace differential failed"
+            );
+            eprintln!("STWO_CUDA_WITNESS_VERIFY: add_opcode_small trace columns OK");
+            add_opcode_small::InteractionClaimGenerator {
+                log_size,
+                lookup_data: host_lookup_data,
+            }
+        });
+
+        let domain = CanonicCoset::new(log_size).circle_domain();
+        let trace_evals: MemoryEvals<CudaBackend> = cols
+            .iter()
+            .map(|col| CircleEvaluation::new(domain, col.clone()))
+            .collect();
+        assert_eq!(trace_evals.len(), ADD_SMALL_N_COLS);
+
+        (
+            trace_evals,
+            AddSmallClaim { log_size },
+            CudaAddSmallInteractionGen::Device(Box::new(DeviceAddSmallWitness {
+                cols,
+                staged,
+                column_length,
+                n_rows,
+                verify_host,
+            })),
+        )
+    }
+
+    fn write_add_opcode_small_interaction(
+        gen: Self::AddSmallInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField) {
+        let witness = match gen {
+            CudaAddSmallInteractionGen::Host(host_gen) => {
+                let (raw, _build_claim) =
+                    (*host_gen).write_interaction_trace(common_lookup_elements);
+                return <CudaBackend as LogupFinalizeBackend>::finalize_raw_logup(raw);
+            }
+            CudaAddSmallInteractionGen::Device(witness) => witness,
+        };
+        let DeviceAddSmallWitness {
+            cols,
+            staged,
+            column_length,
+            n_rows,
+            verify_host,
+        } = *witness;
+
+        let z = common_lookup_elements.z();
+        let alphas = common_lookup_elements.alpha_powers();
+        use device_witness::TupleSlot::{Col, Const};
+        let enabler = || device_witness::Mult::Enabler(n_rows as u32);
+
+        // Staged layout (see the kernel): [0]=vi_felt5, [1]=vi_felt6,
+        // [2]=next_pc, [3]=next_ap, then per read r in {dst, op0, op1} at base
+        // 4 + 5*r: [+0]=addr, [+1]=s5, [+2]=s6 (=mid_limbs_set*511, repeated 17x),
+        // [+3]=s23, [+4]=s29.
+        // The id_to_big tuples' 5 interior zeros (idx 24..28) stay Const(0) to
+        // keep slot positions aligned (the trailing s29 is at slot 28).
+        let id_to_big_slots = |limb0, limb1, limb2, base: usize| {
+            let s5 = base;
+            let s6 = base + 1;
+            let s23 = base + 2;
+            let s29 = base + 3;
+            let mut v = vec![
+                Col(&cols[limb0]),
+                Col(&cols[limb1]),
+                Col(&cols[limb2]),
+                Col(&staged[s5]),
+            ];
+            for _ in 0..17 {
+                v.push(Col(&staged[s6]));
+            }
+            v.push(Col(&staged[s23]));
+            for _ in 0..5 {
+                v.push(Const(0));
+            }
+            v.push(Col(&staged[s29]));
+            v
+        };
+
+        // Column order = the host writer's five col_gen blocks.
+        let columns = vec![
+            // 1. (verify_instruction, memory_address_to_id[dst]) — mults (1, 1).
+            device_witness::tuple_pair_logup_slots(
+                VERIFY_INSTRUCTION_RELATION_ID,
+                &[
+                    Col(&cols[0]),
+                    Col(&cols[3]),
+                    Col(&cols[4]),
+                    Col(&cols[5]),
+                    Col(&staged[0]),
+                    Col(&staged[1]),
+                    Const(0),
+                ],
+                MEMORY_ADDRESS_TO_ID_RELATION_ID.0,
+                &[Col(&staged[4]), Col(&cols[14])],
+                device_witness::Mult::One,
+                device_witness::Mult::One,
+                false,
+                column_length,
+                alphas,
+                z,
+            ),
+            // 2. (memory_id_to_big[dst], memory_address_to_id[op0]) — (1, 1).
+            device_witness::tuple_pair_logup_slots(
+                MEMORY_ID_TO_BIG_RELATION_ID.0,
+                &id_to_big_slots(17, 18, 19, 5),
+                MEMORY_ADDRESS_TO_ID_RELATION_ID.0,
+                &[Col(&staged[9]), Col(&cols[22])],
+                device_witness::Mult::One,
+                device_witness::Mult::One,
+                false,
+                column_length,
+                alphas,
+                z,
+            ),
+            // 3. (memory_id_to_big[op0], memory_address_to_id[op1]) — (1, 1).
+            device_witness::tuple_pair_logup_slots(
+                MEMORY_ID_TO_BIG_RELATION_ID.0,
+                &id_to_big_slots(25, 26, 27, 10),
+                MEMORY_ADDRESS_TO_ID_RELATION_ID.0,
+                &[Col(&staged[14]), Col(&cols[30])],
+                device_witness::Mult::One,
+                device_witness::Mult::One,
+                false,
+                column_length,
+                alphas,
+                z,
+            ),
+            // 4. (memory_id_to_big[op1], opcodes-in) — (1, enabler).
+            device_witness::tuple_pair_logup_slots(
+                MEMORY_ID_TO_BIG_RELATION_ID.0,
+                &id_to_big_slots(33, 34, 35, 15),
+                OPCODES_RELATION_ID,
+                &[Col(&cols[0]), Col(&cols[1]), Col(&cols[2])],
+                device_witness::Mult::One,
+                enabler(),
+                false,
+                column_length,
+                alphas,
+                z,
+            ),
+            // 5. opcodes-out yield: -enabler / (next_pc, next_ap, fp).
+            device_witness::tuple_single_logup_slots(
+                OPCODES_RELATION_ID,
+                &[Col(&staged[2]), Col(&staged[3]), Col(&cols[2])],
+                enabler(),
+                true,
+                column_length,
+                alphas,
+                z,
+            ),
+        ];
+        let (trace, claimed_sum) =
+            device_witness::finalize_device_raw_logup(column_length.ilog2(), columns);
+
+        if let Some(host_gen) = verify_host {
+            let (host_raw, _build_claim) = host_gen.write_interaction_trace(common_lookup_elements);
+            let (host_trace, host_sum) = host_raw.finalize_on_simd();
+            let mismatches = compare_interaction(
+                "add_opcode_small",
+                &trace,
+                claimed_sum,
+                &host_trace,
+                host_sum,
+            );
+            assert_eq!(
+                mismatches, 0,
+                "STWO_CUDA_WITNESS_VERIFY: add_opcode_small interaction differential failed"
+            );
+            eprintln!("STWO_CUDA_WITNESS_VERIFY: add_opcode_small interaction columns + sums OK");
+        }
+
+        (trace, claimed_sum)
     }
 
     fn write_ret_trace(
