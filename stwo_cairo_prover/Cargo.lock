@@ -3497,7 +3497,7 @@ dependencies = [
  "rayon",
  "serde",
  "stwo",
- "stwo-backend-cuda-kernels 0.1.0 (git+https://github.com/teddyjfpender/stwo?rev=0f1ef1c3895d3263fdef22ee46478473e63a38ee)",
+ "stwo-backend-cuda-kernels",
  "stwo-constraint-framework",
 ]
 
@@ -3505,11 +3505,6 @@ dependencies = [
 name = "stwo-backend-cuda-kernels"
 version = "0.1.0"
 source = "git+https://github.com/teddyjfpender/stwo?rev=0f1ef1c3895d3263fdef22ee46478473e63a38ee#0f1ef1c3895d3263fdef22ee46478473e63a38ee"
-
-[[package]]
-name = "stwo-backend-cuda-kernels"
-version = "0.1.0"
-source = "git+https://github.com/teddyjfpender/stwo?rev=9a8f8134d36c627e7b2bc3d3acc77a3b1d698355#9a8f8134d36c627e7b2bc3d3acc77a3b1d698355"
 
 [[package]]
 name = "stwo-cairo-adapter"
@@ -3619,7 +3614,7 @@ dependencies = [
  "stwo-air-utils",
  "stwo-air-utils-derive",
  "stwo-backend-cuda",
- "stwo-backend-cuda-kernels 0.1.0 (git+https://github.com/teddyjfpender/stwo?rev=9a8f8134d36c627e7b2bc3d3acc77a3b1d698355)",
+ "stwo-backend-cuda-kernels",
  "stwo-cairo-adapter",
  "stwo-cairo-common",
  "stwo-cairo-dev-utils",
