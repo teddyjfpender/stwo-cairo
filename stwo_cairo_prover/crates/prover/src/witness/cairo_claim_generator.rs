@@ -1901,12 +1901,16 @@ where
         + VerifyInstructionWitness,
 {
     /// Writes the raw interaction fractions on the host (parallel across
-    /// components), then finalizes each component's logup trace on `B` — the
-    /// device, for GPU backends — in the same fixed component order as before.
-    /// Claims are constructed from the finalized sums, so the Fiat-Shamir
-    /// transcript is unchanged. `memory_id_to_big` goes through the
-    /// `MemoryIdToBigWitness` backend hook (witness-on-GPU P1): device-resident
-    /// writers for GPU backends, the host writers + `finalize_on_simd` for SIMD.
+    /// components) and finalizes each component's logup trace on `B` — the
+    /// device, for GPU backends — INSIDE its rayon spawn, so device finalize
+    /// work overlaps the host's remaining interaction writes (overlap v1).
+    /// Trace evals are extended and claims constructed post-scope in the same
+    /// fixed component order as before, so the Fiat-Shamir transcript is
+    /// unchanged (per-component finalize is order-independent: each touches
+    /// only its own columns and the legacy stream serializes device math).
+    /// `memory_id_to_big` goes through the `MemoryIdToBigWitness` backend hook
+    /// (witness-on-GPU P1): device-resident writers for GPU backends, the host
+    /// writers + `finalize_on_simd` for SIMD.
     pub fn write_interaction_trace(
         self,
         common_lookup_elements: &CommonLookupElements,
@@ -1986,119 +1990,142 @@ where
         scope(|s| {
             if let Some(gen) = self.add_opcode {
                 s.spawn(|_| {
-                    add_opcode_result = Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    add_opcode_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.add_opcode_small {
                 s.spawn(|_| {
-                    add_opcode_small_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    add_opcode_small_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.add_ap_opcode {
                 s.spawn(|_| {
-                    add_ap_opcode_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    add_ap_opcode_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.assert_eq_opcode {
                 s.spawn(|_| {
-                    assert_eq_opcode_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    assert_eq_opcode_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.assert_eq_opcode_imm {
                 s.spawn(|_| {
-                    assert_eq_opcode_imm_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    assert_eq_opcode_imm_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.assert_eq_opcode_double_deref {
                 s.spawn(|_| {
-                    assert_eq_opcode_double_deref_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    assert_eq_opcode_double_deref_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.blake_compress_opcode {
                 s.spawn(|_| {
-                    blake_compress_opcode_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    blake_compress_opcode_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.call_opcode_abs {
                 s.spawn(|_| {
-                    call_opcode_abs_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    call_opcode_abs_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.call_opcode_rel_imm {
                 s.spawn(|_| {
-                    call_opcode_rel_imm_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    call_opcode_rel_imm_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.generic_opcode {
                 s.spawn(|_| {
-                    generic_opcode_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    generic_opcode_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.jnz_opcode_non_taken {
                 s.spawn(|_| {
-                    jnz_opcode_non_taken_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    jnz_opcode_non_taken_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.jnz_opcode_taken {
                 s.spawn(|_| {
-                    jnz_opcode_taken_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    jnz_opcode_taken_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.jump_opcode_abs {
                 s.spawn(|_| {
-                    jump_opcode_abs_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    jump_opcode_abs_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.jump_opcode_double_deref {
                 s.spawn(|_| {
-                    jump_opcode_double_deref_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    jump_opcode_double_deref_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.jump_opcode_rel {
                 s.spawn(|_| {
-                    jump_opcode_rel_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    jump_opcode_rel_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.jump_opcode_rel_imm {
                 s.spawn(|_| {
-                    jump_opcode_rel_imm_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    jump_opcode_rel_imm_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.mul_opcode {
                 s.spawn(|_| {
-                    mul_opcode_result = Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    mul_opcode_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.mul_opcode_small {
                 s.spawn(|_| {
-                    mul_opcode_small_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    mul_opcode_small_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.qm_31_add_mul_opcode {
                 s.spawn(|_| {
-                    qm_31_add_mul_opcode_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    qm_31_add_mul_opcode_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.ret_opcode {
                 s.spawn(|_| {
-                    ret_opcode_result = Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    ret_opcode_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.verify_instruction {
@@ -2109,161 +2136,197 @@ where
             }
             if let Some(gen) = self.blake_round {
                 s.spawn(|_| {
-                    blake_round_result = Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    blake_round_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.blake_g {
                 s.spawn(|_| {
-                    blake_g_result = Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    blake_g_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.blake_round_sigma {
                 s.spawn(|_| {
-                    blake_round_sigma_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    blake_round_sigma_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.triple_xor_32 {
                 s.spawn(|_| {
-                    triple_xor_32_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    triple_xor_32_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.verify_bitwise_xor_12 {
                 s.spawn(|_| {
-                    verify_bitwise_xor_12_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    verify_bitwise_xor_12_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.add_mod_builtin {
                 s.spawn(|_| {
-                    add_mod_builtin_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    add_mod_builtin_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.bitwise_builtin {
                 s.spawn(|_| {
-                    bitwise_builtin_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    bitwise_builtin_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.mul_mod_builtin {
                 s.spawn(|_| {
-                    mul_mod_builtin_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    mul_mod_builtin_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.pedersen_builtin {
                 s.spawn(|_| {
-                    pedersen_builtin_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    pedersen_builtin_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.pedersen_builtin_narrow_windows {
                 s.spawn(|_| {
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                     pedersen_builtin_narrow_windows_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                        Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.poseidon_builtin {
                 s.spawn(|_| {
-                    poseidon_builtin_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    poseidon_builtin_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check96_builtin {
                 s.spawn(|_| {
-                    range_check96_builtin_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check96_builtin_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_builtin {
                 s.spawn(|_| {
-                    range_check_builtin_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_builtin_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.ec_op_builtin {
                 s.spawn(|_| {
-                    ec_op_builtin_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    ec_op_builtin_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.partial_ec_mul_generic {
                 s.spawn(|_| {
-                    partial_ec_mul_generic_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    partial_ec_mul_generic_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.pedersen_aggregator_window_bits_18 {
                 s.spawn(|_| {
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                     pedersen_aggregator_window_bits_18_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                        Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.partial_ec_mul_window_bits_18 {
                 s.spawn(|_| {
-                    partial_ec_mul_window_bits_18_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    partial_ec_mul_window_bits_18_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.pedersen_points_table_window_bits_18 {
                 s.spawn(|_| {
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                     pedersen_points_table_window_bits_18_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                        Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.pedersen_aggregator_window_bits_9 {
                 s.spawn(|_| {
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                     pedersen_aggregator_window_bits_9_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                        Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.partial_ec_mul_window_bits_9 {
                 s.spawn(|_| {
-                    partial_ec_mul_window_bits_9_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    partial_ec_mul_window_bits_9_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.pedersen_points_table_window_bits_9 {
                 s.spawn(|_| {
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                     pedersen_points_table_window_bits_9_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                        Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.poseidon_aggregator {
                 s.spawn(|_| {
-                    poseidon_aggregator_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    poseidon_aggregator_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.poseidon_3_partial_rounds_chain {
                 s.spawn(|_| {
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                     poseidon_3_partial_rounds_chain_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                        Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.poseidon_full_round_chain {
                 s.spawn(|_| {
-                    poseidon_full_round_chain_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    poseidon_full_round_chain_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.cube_252 {
                 s.spawn(|_| {
-                    cube_252_result = Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    cube_252_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.poseidon_round_keys {
                 s.spawn(|_| {
-                    poseidon_round_keys_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    poseidon_round_keys_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_252_width_27 {
                 s.spawn(|_| {
-                    range_check_252_width_27_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_252_width_27_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.memory_address_to_id {
@@ -2280,376 +2343,361 @@ where
             }
             if let Some(gen) = self.range_check_6 {
                 s.spawn(|_| {
-                    range_check_6_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_6_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_8 {
                 s.spawn(|_| {
-                    range_check_8_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_8_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_11 {
                 s.spawn(|_| {
-                    range_check_11_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_11_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_12 {
                 s.spawn(|_| {
-                    range_check_12_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_12_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_18 {
                 s.spawn(|_| {
-                    range_check_18_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_18_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_20 {
                 s.spawn(|_| {
-                    range_check_20_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_20_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_4_3 {
                 s.spawn(|_| {
-                    range_check_4_3_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_4_3_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_4_4 {
                 s.spawn(|_| {
-                    range_check_4_4_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_4_4_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_9_9 {
                 s.spawn(|_| {
-                    range_check_9_9_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_9_9_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_7_2_5 {
                 s.spawn(|_| {
-                    range_check_7_2_5_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_7_2_5_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_3_6_6_3 {
                 s.spawn(|_| {
-                    range_check_3_6_6_3_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_3_6_6_3_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_4_4_4_4 {
                 s.spawn(|_| {
-                    range_check_4_4_4_4_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_4_4_4_4_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.range_check_3_3_3_3_3 {
                 s.spawn(|_| {
-                    range_check_3_3_3_3_3_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    range_check_3_3_3_3_3_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.verify_bitwise_xor_4 {
                 s.spawn(|_| {
-                    verify_bitwise_xor_4_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    verify_bitwise_xor_4_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.verify_bitwise_xor_7 {
                 s.spawn(|_| {
-                    verify_bitwise_xor_7_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    verify_bitwise_xor_7_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.verify_bitwise_xor_8 {
                 s.spawn(|_| {
-                    verify_bitwise_xor_8_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    verify_bitwise_xor_8_result = Some((trace, claimed_sum, build_claim));
                 });
             }
             if let Some(gen) = self.verify_bitwise_xor_9 {
                 s.spawn(|_| {
-                    verify_bitwise_xor_9_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
+                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                    verify_bitwise_xor_9_result = Some((trace, claimed_sum, build_claim));
                 });
             }
         });
 
-        let add_opcode_interaction_claim = add_opcode_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let add_opcode_small_interaction_claim =
-            add_opcode_small_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+        let add_opcode_interaction_claim =
+            add_opcode_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let add_ap_opcode_interaction_claim = add_ap_opcode_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let add_opcode_small_interaction_claim =
+            add_opcode_small_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let add_ap_opcode_interaction_claim =
+            add_ap_opcode_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let assert_eq_opcode_interaction_claim =
-            assert_eq_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            assert_eq_opcode_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let assert_eq_opcode_imm_interaction_claim =
-            assert_eq_opcode_imm_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            assert_eq_opcode_imm_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let assert_eq_opcode_double_deref_interaction_claim = assert_eq_opcode_double_deref_result
-            .map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            .map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let blake_compress_opcode_interaction_claim =
-            blake_compress_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            blake_compress_opcode_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let call_opcode_abs_interaction_claim = call_opcode_abs_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let call_opcode_abs_interaction_claim =
+            call_opcode_abs_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let call_opcode_rel_imm_interaction_claim =
-            call_opcode_rel_imm_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            call_opcode_rel_imm_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let generic_opcode_interaction_claim = generic_opcode_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let generic_opcode_interaction_claim =
+            generic_opcode_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let jnz_opcode_non_taken_interaction_claim =
-            jnz_opcode_non_taken_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            jnz_opcode_non_taken_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let jnz_opcode_taken_interaction_claim =
-            jnz_opcode_taken_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            jnz_opcode_taken_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let jump_opcode_abs_interaction_claim = jump_opcode_abs_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let jump_opcode_abs_interaction_claim =
+            jump_opcode_abs_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let jump_opcode_double_deref_interaction_claim =
-            jump_opcode_double_deref_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            jump_opcode_double_deref_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let jump_opcode_rel_interaction_claim = jump_opcode_rel_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let jump_opcode_rel_interaction_claim =
+            jump_opcode_rel_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let jump_opcode_rel_imm_interaction_claim =
-            jump_opcode_rel_imm_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            jump_opcode_rel_imm_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let mul_opcode_interaction_claim = mul_opcode_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let mul_opcode_interaction_claim =
+            mul_opcode_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let mul_opcode_small_interaction_claim =
-            mul_opcode_small_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            mul_opcode_small_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let qm_31_add_mul_opcode_interaction_claim =
-            qm_31_add_mul_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            qm_31_add_mul_opcode_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let ret_opcode_interaction_claim = ret_opcode_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let ret_opcode_interaction_claim =
+            ret_opcode_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let verify_instruction_interaction_claim =
             verify_instruction_result.map(|(trace, claimed_sum)| {
                 evals.extend(trace);
                 ViInteractionClaim { claimed_sum }
             });
-        let blake_round_interaction_claim = blake_round_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let blake_g_interaction_claim = blake_g_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+        let blake_round_interaction_claim =
+            blake_round_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let blake_g_interaction_claim = blake_g_result.map(|(trace, claimed_sum, build_claim)| {
             evals.extend(trace);
             build_claim(claimed_sum)
         });
         let blake_round_sigma_interaction_claim =
-            blake_round_sigma_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            blake_round_sigma_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let triple_xor_32_interaction_claim = triple_xor_32_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let triple_xor_32_interaction_claim =
+            triple_xor_32_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let verify_bitwise_xor_12_interaction_claim =
-            verify_bitwise_xor_12_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            verify_bitwise_xor_12_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let add_mod_builtin_interaction_claim = add_mod_builtin_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let bitwise_builtin_interaction_claim = bitwise_builtin_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let mul_mod_builtin_interaction_claim = mul_mod_builtin_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let add_mod_builtin_interaction_claim =
+            add_mod_builtin_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let bitwise_builtin_interaction_claim =
+            bitwise_builtin_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let mul_mod_builtin_interaction_claim =
+            mul_mod_builtin_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let pedersen_builtin_interaction_claim =
-            pedersen_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            pedersen_builtin_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let pedersen_builtin_narrow_windows_interaction_claim =
-            pedersen_builtin_narrow_windows_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            pedersen_builtin_narrow_windows_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let poseidon_builtin_interaction_claim =
-            poseidon_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            poseidon_builtin_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let range_check96_builtin_interaction_claim =
-            range_check96_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            range_check96_builtin_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let range_check_builtin_interaction_claim =
-            range_check_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            range_check_builtin_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let ec_op_builtin_interaction_claim = ec_op_builtin_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let ec_op_builtin_interaction_claim =
+            ec_op_builtin_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let partial_ec_mul_generic_interaction_claim =
-            partial_ec_mul_generic_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            partial_ec_mul_generic_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let pedersen_aggregator_window_bits_18_interaction_claim =
-            pedersen_aggregator_window_bits_18_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            pedersen_aggregator_window_bits_18_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let partial_ec_mul_window_bits_18_interaction_claim = partial_ec_mul_window_bits_18_result
-            .map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            .map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let pedersen_points_table_window_bits_18_interaction_claim =
-            pedersen_points_table_window_bits_18_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            pedersen_points_table_window_bits_18_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let pedersen_aggregator_window_bits_9_interaction_claim =
-            pedersen_aggregator_window_bits_9_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            pedersen_aggregator_window_bits_9_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let partial_ec_mul_window_bits_9_interaction_claim = partial_ec_mul_window_bits_9_result
-            .map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            .map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let pedersen_points_table_window_bits_9_interaction_claim =
-            pedersen_points_table_window_bits_9_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            pedersen_points_table_window_bits_9_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let poseidon_aggregator_interaction_claim =
-            poseidon_aggregator_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            poseidon_aggregator_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let poseidon_3_partial_rounds_chain_interaction_claim =
-            poseidon_3_partial_rounds_chain_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            poseidon_3_partial_rounds_chain_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let poseidon_full_round_chain_interaction_claim =
-            poseidon_full_round_chain_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            poseidon_full_round_chain_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let cube_252_interaction_claim = cube_252_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let cube_252_interaction_claim =
+            cube_252_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let poseidon_round_keys_interaction_claim =
-            poseidon_round_keys_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            poseidon_round_keys_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let range_check_252_width_27_interaction_claim =
-            range_check_252_width_27_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            range_check_252_width_27_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
@@ -2685,96 +2733,88 @@ where
                     )
                 })
                 .unzip();
-        let range_check_6_interaction_claim = range_check_6_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let range_check_8_interaction_claim = range_check_8_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let range_check_11_interaction_claim = range_check_11_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let range_check_12_interaction_claim = range_check_12_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let range_check_18_interaction_claim = range_check_18_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let range_check_20_interaction_claim = range_check_20_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let range_check_4_3_interaction_claim = range_check_4_3_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let range_check_4_4_interaction_claim = range_check_4_4_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let range_check_9_9_interaction_claim = range_check_9_9_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-            evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+        let range_check_6_interaction_claim =
+            range_check_6_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let range_check_8_interaction_claim =
+            range_check_8_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let range_check_11_interaction_claim =
+            range_check_11_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let range_check_12_interaction_claim =
+            range_check_12_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let range_check_18_interaction_claim =
+            range_check_18_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let range_check_20_interaction_claim =
+            range_check_20_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let range_check_4_3_interaction_claim =
+            range_check_4_3_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let range_check_4_4_interaction_claim =
+            range_check_4_4_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
+        let range_check_9_9_interaction_claim =
+            range_check_9_9_result.map(|(trace, claimed_sum, build_claim)| {
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            });
         let range_check_7_2_5_interaction_claim =
-            range_check_7_2_5_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            range_check_7_2_5_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let range_check_3_6_6_3_interaction_claim =
-            range_check_3_6_6_3_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            range_check_3_6_6_3_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let range_check_4_4_4_4_interaction_claim =
-            range_check_4_4_4_4_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            range_check_4_4_4_4_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let range_check_3_3_3_3_3_interaction_claim =
-            range_check_3_3_3_3_3_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            range_check_3_3_3_3_3_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let verify_bitwise_xor_4_interaction_claim =
-            verify_bitwise_xor_4_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            verify_bitwise_xor_4_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let verify_bitwise_xor_7_interaction_claim =
-            verify_bitwise_xor_7_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            verify_bitwise_xor_7_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let verify_bitwise_xor_8_interaction_claim =
-            verify_bitwise_xor_8_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            verify_bitwise_xor_8_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
         let verify_bitwise_xor_9_interaction_claim =
-            verify_bitwise_xor_9_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            verify_bitwise_xor_9_result.map(|(trace, claimed_sum, build_claim)| {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
