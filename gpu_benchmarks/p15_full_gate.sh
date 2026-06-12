@@ -23,7 +23,7 @@ export STWO_CUDA_NVCC=${STWO_CUDA_NVCC:-/usr/local/cuda/bin/nvcc}
 export STWO_JIT_LOG=1
 source "$HOME/.cargo/env" 2>/dev/null || true
 
-STWO_REV=b8c5348fd238a4bab5346f481a7ed1586ad8d1d2
+STWO_REV=68784bce44ba4b8cb1f324e27176d21b0b62df8c
 CAIRO_BRANCH=generic-backend
 
 echo "=== SETUP ==="

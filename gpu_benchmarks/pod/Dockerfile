@@ -21,7 +21,7 @@ ENV PATH=/root/.cargo/bin:$PATH
 # Pinned revisions: pass the current tips as build args so a rebuild picks up
 # new pushes (the workflow passes them explicitly; defaults match the P1-P5
 # round).
-ARG STWO_REV=b8c5348fd238a4bab5346f481a7ed1586ad8d1d2
+ARG STWO_REV=68784bce44ba4b8cb1f324e27176d21b0b62df8c
 ARG CAIRO_REF=generic-backend
 
 # nvcc compiles the kernels without a GPU. Consumer-fleet focus: 3090 (sm_86)
