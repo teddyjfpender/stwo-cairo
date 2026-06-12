@@ -84,6 +84,7 @@ where
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
+        + crate::witness::memory_witness_backend::MemoryAddressToIdWitness
         + 'static,
     MC: 'static,
 {
@@ -236,6 +237,7 @@ where
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
+        + crate::witness::memory_witness_backend::MemoryAddressToIdWitness
         + 'static,
     MC: 'static,
 {
@@ -276,6 +278,7 @@ where
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
+        + crate::witness::memory_witness_backend::MemoryAddressToIdWitness
         + 'static,
     MC: 'static,
 {

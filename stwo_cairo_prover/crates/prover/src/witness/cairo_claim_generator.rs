@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use cairo_air::air::PublicData;
 use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
+use cairo_air::components::memory_address_to_id::InteractionClaim as MemoryAddrInteractionClaim;
 use cairo_air::components::memory_id_to_big::InteractionClaim as MemoryBigInteractionClaim;
 use cairo_air::components::memory_id_to_small::InteractionClaim as MemorySmallInteractionClaim;
 use cairo_air::relations::CommonLookupElements;
@@ -22,7 +23,7 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
 use stwo_cairo_common::preprocessed_columns::simd_prelude::{BaseField, CircleEvaluation};
 
 use crate::witness::components::*;
-use crate::witness::memory_witness_backend::MemoryIdToBigWitness;
+use crate::witness::memory_witness_backend::{MemoryAddressToIdWitness, MemoryIdToBigWitness};
 
 #[derive(Default)]
 pub struct CairoClaimGenerator {
@@ -735,7 +736,7 @@ impl CairoClaimGenerator {
         CairoInteractionClaimGenerator<B>,
     )
     where
-        B: stwo::prover::backend::FromSimdColumns + MemoryIdToBigWitness,
+        B: stwo::prover::backend::FromSimdColumns + MemoryIdToBigWitness + MemoryAddressToIdWitness,
     {
         let mut evals = Vec::new();
         let mut add_opcode_result = None;
@@ -1487,8 +1488,9 @@ impl CairoClaimGenerator {
         let (memory_address_to_id_claim, memory_address_to_id_interaction_gen) = self
             .memory_address_to_id
             .map(|gen| {
-                let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(B::from_simd_evals(trace));
+                // Backend hook (witness-on-GPU W3): columns born on B.
+                let (trace, claim, interaction_gen) = B::write_addr_trace(gen);
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1800,7 +1802,7 @@ impl CairoClaimGenerator {
     }
 }
 
-pub struct CairoInteractionClaimGenerator<B: MemoryIdToBigWitness> {
+pub struct CairoInteractionClaimGenerator<B: MemoryIdToBigWitness + MemoryAddressToIdWitness> {
     pub add_opcode: Option<add_opcode::InteractionClaimGenerator>,
     pub add_opcode_small: Option<add_opcode_small::InteractionClaimGenerator>,
     pub add_ap_opcode: Option<add_ap_opcode::InteractionClaimGenerator>,
@@ -1858,7 +1860,7 @@ pub struct CairoInteractionClaimGenerator<B: MemoryIdToBigWitness> {
     pub cube_252: Option<cube_252::InteractionClaimGenerator>,
     pub poseidon_round_keys: Option<poseidon_round_keys::InteractionClaimGenerator>,
     pub range_check_252_width_27: Option<range_check_252_width_27::InteractionClaimGenerator>,
-    pub memory_address_to_id: Option<memory_address_to_id::InteractionClaimGenerator>,
+    pub memory_address_to_id: Option<<B as MemoryAddressToIdWitness>::AddrInteractionGen>,
     pub memory_id_to_big: Option<B::InteractionGen>,
     pub range_check_6: Option<range_check_6::InteractionClaimGenerator>,
     pub range_check_8: Option<range_check_8::InteractionClaimGenerator>,
@@ -1883,7 +1885,8 @@ impl<B> CairoInteractionClaimGenerator<B>
 where
     B: stwo_constraint_framework::LogupFinalizeBackend
         + stwo::prover::backend::FromSimdColumns
-        + MemoryIdToBigWitness,
+        + MemoryIdToBigWitness
+        + MemoryAddressToIdWitness,
 {
     /// Writes the raw interaction fractions on the host (parallel across
     /// components), then finalizes each component's logup trace on `B` — the
@@ -2254,7 +2257,7 @@ where
             if let Some(gen) = self.memory_address_to_id {
                 s.spawn(|_| {
                     memory_address_to_id_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                        Some(B::write_addr_interaction(gen, common_lookup_elements));
                 });
             }
             if let Some(gen) = self.memory_id_to_big {
@@ -2650,10 +2653,9 @@ where
                 build_claim(claimed_sum)
             });
         let memory_address_to_id_interaction_claim =
-            memory_address_to_id_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            memory_address_to_id_result.map(|(trace, claimed_sum)| {
                 evals.extend(trace);
-                build_claim(claimed_sum)
+                MemoryAddrInteractionClaim { claimed_sum }
             });
         let (memory_id_to_big_interaction_claim, memory_id_to_small_interaction_claim) =
             memory_id_to_big_result

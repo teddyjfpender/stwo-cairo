@@ -11,6 +11,7 @@ use cairo_air::relations::{self, MEMORY_ADDRESS_TO_ID_RELATION_ID};
 use itertools::{izip, Itertools};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use stwo::core::fields::m31::{BaseField, M31};
+use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::simd::m31::{PackedBaseField, PackedM31, LOG_N_LANES, N_LANES};
 use stwo::prover::backend::simd::qm31::PackedQM31;
@@ -20,12 +21,12 @@ use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo_cairo_adapter::memory::Memory;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{PreProcessedColumn, Seq};
-use stwo_constraint_framework::{LogupTraceGenerator, Relation};
+use stwo_constraint_framework::{
+    LogupTraceGenerator, RawLogupTrace, RawLogupTraceGenerator, Relation,
+};
 
 use crate::witness::prelude::AddInputs;
 use crate::witness::utils::AtomicMultiplicityColumn;
-use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
-use stwo::core::fields::qm31::SecureField;
 
 pub type InputType = M31;
 pub type PackedInputType = PackedM31;
@@ -55,6 +56,11 @@ impl AddressToId {
 
     pub fn array_chunks<const N: usize>(&self) -> impl Iterator<Item = &[u32; N]> {
         self.data.array_chunks::<N>()
+    }
+
+    /// The raw address-ordered id table (index 0 = address 1).
+    pub(crate) fn clone_inner(&self) -> Vec<u32> {
+        self.data.clone()
     }
 }
 
@@ -111,19 +117,37 @@ impl ClaimGenerator {
         }
     }
 
+    /// Decomposes the generator into its raw inputs (the address-ordered raw id
+    /// table and the packed multiplicity column) for the device witness path.
+    pub(crate) fn into_parts(self) -> (AddressToId, Vec<PackedM31>) {
+        (self.address_to_raw_id, self.multiplicities.into_simd_vec())
+    }
+
     pub fn write_trace(
-        mut self,
+        self,
     ) -> (
         Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
         Claim,
         InteractionClaimGenerator,
     ) {
+        let (address_to_raw_id, multiplicities) = self.into_parts();
+        write_trace_from_parts(address_to_raw_id, multiplicities)
+    }
+}
+
+/// The host trace writer, factored over the raw parts so the device path's
+/// differential can replay it on cloned inputs.
+pub(crate) fn write_trace_from_parts(
+    mut address_to_raw_id: AddressToId,
+    multiplicities: Vec<PackedM31>,
+) -> (
+    Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
+    Claim,
+    InteractionClaimGenerator,
+) {
+    {
         let size = std::cmp::max(
-            (self
-                .address_to_raw_id
-                .len()
-                .div_ceil(MEMORY_ADDRESS_TO_ID_SPLIT))
-            .next_power_of_two(),
+            (address_to_raw_id.len().div_ceil(MEMORY_ADDRESS_TO_ID_SPLIT)).next_power_of_two(),
             N_LANES,
         );
         let n_packed_rows = size.div_ceil(N_LANES);
@@ -131,14 +155,12 @@ impl ClaimGenerator {
             std::array::from_fn(|_| Col::<SimdBackend, M31>::zeros(size));
 
         // Pad to a multiple of `N_LANES`.
-        let next_multiple_of_16 = self.address_to_raw_id.len().next_multiple_of(16);
-        self.address_to_raw_id.resize(next_multiple_of_16, 0);
+        let next_multiple_of_16 = address_to_raw_id.len().next_multiple_of(16);
+        address_to_raw_id.resize(next_multiple_of_16, 0);
 
-        let id_it = self
-            .address_to_raw_id
+        let id_it = address_to_raw_id
             .array_chunks::<N_LANES>()
             .map(|&chunk| unsafe { PackedM31::from_simd_unchecked(Simd::from_array(chunk)) });
-        let multiplicities = self.multiplicities.into_simd_vec();
 
         for (i, (id, multiplicity)) in zip(id_it, multiplicities).enumerate() {
             let chunk_idx = i / n_packed_rows;
@@ -230,7 +252,9 @@ impl InteractionClaimGenerator {
             col_gen.finalize_col();
         }
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }
 

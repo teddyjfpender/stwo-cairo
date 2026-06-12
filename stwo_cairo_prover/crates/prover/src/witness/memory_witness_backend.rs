@@ -17,13 +17,14 @@
 //! `PREPROCESSED_TRACE_GPU_GENERATE` pattern); the fallback is the host writer
 //! bridged with `from_simd_evals`, byte-identical to the pre-P1 pipeline.
 
+use cairo_air::components::memory_address_to_id::{Claim as AddrClaim, MEMORY_ADDRESS_TO_ID_SPLIT};
 use cairo_air::components::memory_id_to_big::Claim as BigClaim;
 use cairo_air::components::memory_id_to_small::Claim as SmallClaim;
 use cairo_air::relations::{
-    CommonLookupElements, MEMORY_ID_TO_BIG_RELATION_ID, RANGE_CHECK_9_9_B_RELATION_ID,
-    RANGE_CHECK_9_9_C_RELATION_ID, RANGE_CHECK_9_9_D_RELATION_ID, RANGE_CHECK_9_9_E_RELATION_ID,
-    RANGE_CHECK_9_9_F_RELATION_ID, RANGE_CHECK_9_9_G_RELATION_ID, RANGE_CHECK_9_9_H_RELATION_ID,
-    RANGE_CHECK_9_9_RELATION_ID,
+    CommonLookupElements, MEMORY_ADDRESS_TO_ID_RELATION_ID, MEMORY_ID_TO_BIG_RELATION_ID,
+    RANGE_CHECK_9_9_B_RELATION_ID, RANGE_CHECK_9_9_C_RELATION_ID, RANGE_CHECK_9_9_D_RELATION_ID,
+    RANGE_CHECK_9_9_E_RELATION_ID, RANGE_CHECK_9_9_F_RELATION_ID, RANGE_CHECK_9_9_G_RELATION_ID,
+    RANGE_CHECK_9_9_H_RELATION_ID, RANGE_CHECK_9_9_RELATION_ID,
 };
 use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
@@ -40,7 +41,7 @@ use stwo_cairo_common::memory::{LARGE_MEMORY_VALUE_ID_BASE, N_M31_IN_SMALL_FELT2
 use stwo_cairo_common::prover_types::cpu::FELT252_N_WORDS;
 use stwo_constraint_framework::LogupFinalizeBackend;
 
-use crate::witness::components::{memory_id_to_big, range_check_9_9};
+use crate::witness::components::{memory_address_to_id, memory_id_to_big, range_check_9_9};
 
 pub type MemoryEvals<B> = Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>;
 
@@ -618,4 +619,245 @@ fn compare_interaction(
         mismatches += 1;
     }
     mismatches
+}
+
+// ---------------------------------------------------------------------------
+// memory_address_to_id (witness-on-GPU, W3 slice 2)
+// ---------------------------------------------------------------------------
+
+/// Backend hook for the `memory_address_to_id` witness. Same seam style as
+/// [`MemoryIdToBigWitness`]: base trace and finalized interaction trace born on
+/// `Self`; `STWO_CUDA_ADDR_WITNESS=0` falls back to the host writer; the
+/// `STWO_CUDA_WITNESS_VERIFY=1` differential byte-compares everything.
+pub trait MemoryAddressToIdWitness: FromSimdColumns {
+    type AddrInteractionGen: Send;
+
+    fn write_addr_trace(
+        gen: memory_address_to_id::ClaimGenerator,
+    ) -> (MemoryEvals<Self>, AddrClaim, Self::AddrInteractionGen);
+
+    fn write_addr_interaction(
+        gen: Self::AddrInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField);
+}
+
+impl MemoryAddressToIdWitness for SimdBackend {
+    type AddrInteractionGen = memory_address_to_id::InteractionClaimGenerator;
+
+    fn write_addr_trace(
+        gen: memory_address_to_id::ClaimGenerator,
+    ) -> (MemoryEvals<Self>, AddrClaim, Self::AddrInteractionGen) {
+        gen.write_trace()
+    }
+
+    fn write_addr_interaction(
+        gen: Self::AddrInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField) {
+        let (raw, _build_claim) = gen.write_interaction_trace(common_lookup_elements);
+        raw.finalize_on_simd()
+    }
+}
+
+/// Device-born `memory_address_to_id` state: the flat id and multiplicity
+/// buffers (`MEMORY_ADDRESS_TO_ID_SPLIT * size` words, chunk-major — each trace
+/// column is a `size`-long slice).
+pub struct DeviceAddrWitness {
+    ids: BaseFieldVec,
+    mults: BaseFieldVec,
+    size: usize,
+    verify_host: Option<memory_address_to_id::InteractionClaimGenerator>,
+}
+
+pub enum CudaAddrInteractionGen {
+    Device(Box<DeviceAddrWitness>),
+    Host(Box<memory_address_to_id::InteractionClaimGenerator>),
+}
+
+fn addr_device_path_enabled() -> bool {
+    stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT
+        && std::env::var("STWO_CUDA_ADDR_WITNESS").as_deref() != Ok("0")
+}
+
+/// An owned D2D copy of `len` words of `buffer` starting at `offset` words.
+fn slice_to_owned(buffer: &BaseFieldVec, offset: usize, len: usize) -> BaseFieldVec {
+    assert!(offset + len <= buffer.size);
+    BaseFieldVec::from_borrowed_ptr(unsafe { buffer.device_ptr.add(offset) }, len).clone()
+}
+
+/// A non-owning view of `len` words of `buffer` starting at `offset` words.
+fn slice_view(buffer: &BaseFieldVec, offset: usize, len: usize) -> BaseFieldVec {
+    assert!(offset + len <= buffer.size);
+    BaseFieldVec::from_borrowed_ptr(unsafe { buffer.device_ptr.add(offset) }, len)
+}
+
+impl MemoryAddressToIdWitness for CudaBackend {
+    type AddrInteractionGen = CudaAddrInteractionGen;
+
+    fn write_addr_trace(
+        gen: memory_address_to_id::ClaimGenerator,
+    ) -> (MemoryEvals<Self>, AddrClaim, Self::AddrInteractionGen) {
+        if !addr_device_path_enabled() {
+            let (trace, claim, interaction_gen) = gen.write_trace();
+            return (
+                Self::from_simd_evals(trace),
+                claim,
+                CudaAddrInteractionGen::Host(Box::new(interaction_gen)),
+            );
+        }
+
+        let verify = verify_enabled();
+        let (address_to_raw_id, multiplicities) = gen.into_parts();
+        let host_inputs = verify.then(|| (address_to_raw_id.clone_inner(), multiplicities.clone()));
+
+        // Layout mirror of the host writer: SPLIT chunks of `size` rows each
+        // (`size` = padded per-chunk length); ids and mults are uploaded once as
+        // flat chunk-major buffers, zero-padded — every trace column is a slice.
+        let ids_len = address_to_raw_id.len();
+        let size = std::cmp::max(
+            ids_len
+                .div_ceil(MEMORY_ADDRESS_TO_ID_SPLIT)
+                .next_power_of_two(),
+            N_LANES,
+        );
+        let total = MEMORY_ADDRESS_TO_ID_SPLIT * size;
+
+        let mut ids_host: Vec<BaseField> = address_to_raw_id
+            .clone_inner()
+            .into_iter()
+            .map(BaseField::from_u32_unchecked)
+            .collect();
+        ids_host.resize(total, BaseField::from_u32_unchecked(0));
+        let ids_dev = BaseFieldVec::from_vec(ids_host);
+
+        let mut mults_host: Vec<BaseField> = multiplicities
+            .iter()
+            .flat_map(|packed| packed.to_array())
+            .collect();
+        mults_host.truncate(total);
+        mults_host.resize(total, BaseField::from_u32_unchecked(0));
+        let mults_dev = BaseFieldVec::from_vec(mults_host);
+
+        let domain = CanonicCoset::new(size.ilog2()).circle_domain();
+        let mut trace: MemoryEvals<CudaBackend> =
+            Vec::with_capacity(2 * MEMORY_ADDRESS_TO_ID_SPLIT);
+        for chunk in 0..MEMORY_ADDRESS_TO_ID_SPLIT {
+            trace.push(CircleEvaluation::new(
+                domain,
+                slice_to_owned(&ids_dev, chunk * size, size),
+            ));
+            trace.push(CircleEvaluation::new(
+                domain,
+                slice_to_owned(&mults_dev, chunk * size, size),
+            ));
+        }
+
+        let verify_host = host_inputs.map(|(ids, mults)| {
+            let (host_trace, _claim, host_gen) = memory_address_to_id::write_trace_from_parts(
+                memory_address_to_id::AddressToId::new(ids),
+                mults,
+            );
+            let mut mismatches = 0usize;
+            for (col_idx, (device_col, host_col)) in trace.iter().zip(&host_trace).enumerate() {
+                let device_values = device_col.values.to_vec();
+                let host_values = host_col.values.to_cpu();
+                if device_values != host_values {
+                    let first_diff = device_values
+                        .iter()
+                        .zip(&host_values)
+                        .position(|(d, h)| d != h);
+                    eprintln!(
+                        "STWO_CUDA_WITNESS_VERIFY: memory_address_to_id col {col_idx} MISMATCH \
+                         (first diff at row {first_diff:?})"
+                    );
+                    mismatches += 1;
+                }
+            }
+            assert_eq!(
+                mismatches, 0,
+                "STWO_CUDA_WITNESS_VERIFY: memory_address_to_id trace differential failed"
+            );
+            eprintln!("STWO_CUDA_WITNESS_VERIFY: memory_address_to_id trace columns OK");
+            host_gen
+        });
+
+        (
+            trace,
+            AddrClaim {
+                log_size: size.ilog2(),
+            },
+            CudaAddrInteractionGen::Device(Box::new(DeviceAddrWitness {
+                ids: ids_dev,
+                mults: mults_dev,
+                size,
+                verify_host,
+            })),
+        )
+    }
+
+    fn write_addr_interaction(
+        gen: Self::AddrInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField) {
+        let witness = match gen {
+            CudaAddrInteractionGen::Host(host_gen) => {
+                let (raw, _build_claim) =
+                    (*host_gen).write_interaction_trace(common_lookup_elements);
+                return <CudaBackend as LogupFinalizeBackend>::finalize_raw_logup(raw);
+            }
+            CudaAddrInteractionGen::Device(witness) => witness,
+        };
+        let DeviceAddrWitness {
+            ids,
+            mults,
+            size,
+            verify_host,
+        } = *witness;
+
+        let z = common_lookup_elements.z();
+        let alphas = common_lookup_elements.alpha_powers();
+
+        // Pair-batched columns: split chunks (2i, 2i+1) share a column; addresses
+        // are `1 + row + chunk * size` (the host's Seq + 1 + chunk offset).
+        let mut columns = Vec::with_capacity(MEMORY_ADDRESS_TO_ID_SPLIT / 2);
+        for i in 0..MEMORY_ADDRESS_TO_ID_SPLIT / 2 {
+            let id0 = slice_view(&ids, (2 * i) * size, size);
+            let id1 = slice_view(&ids, (2 * i + 1) * size, size);
+            let mult0 = slice_view(&mults, (2 * i) * size, size);
+            let mult1 = slice_view(&mults, (2 * i + 1) * size, size);
+            columns.push(device_witness::addr_to_id_pair_logup(
+                [&id0, &id1],
+                [&mult0, &mult1],
+                MEMORY_ADDRESS_TO_ID_RELATION_ID.0,
+                (1 + (2 * i) * size) as u32,
+                (1 + (2 * i + 1) * size) as u32,
+                size,
+                alphas,
+                z,
+            ));
+        }
+        let (trace, claimed_sum) = device_witness::finalize_device_raw_logup(size.ilog2(), columns);
+
+        if let Some(host_gen) = verify_host {
+            let (host_raw, _build_claim) = host_gen.write_interaction_trace(common_lookup_elements);
+            let (host_trace, host_sum) = host_raw.finalize_on_simd();
+            let mismatches = compare_interaction(
+                "memory_address_to_id",
+                &trace,
+                claimed_sum,
+                &host_trace,
+                host_sum,
+            );
+            assert_eq!(
+                mismatches, 0,
+                "STWO_CUDA_WITNESS_VERIFY: memory_address_to_id interaction differential failed"
+            );
+            eprintln!(
+                "STWO_CUDA_WITNESS_VERIFY: memory_address_to_id interaction columns + sums OK"
+            );
+        }
+
+        (trace, claimed_sum)
+    }
 }
