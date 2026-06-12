@@ -475,3 +475,64 @@ cargo-free CPU probe before committing a member).
 Single-proof on consumer after this round: 4090 3.22 MHz @1M / 3.34 @2M.
 10 MHz single-proof remains an H100+P2 story; 10 MHz **sustained** is now a
 $1/hr commodity.
+
+## Round 10: the four levers — async copies, batched OODS, word-native Blake, batched gather
+
+Directive: design/engineer/benchmark (1) witness-on-GPU completion, (2) async
+copies, (3) the P2 kernel round, (4) launch-storm + overlap — toward the
+physical limits. All validation on community 3090s/4090s ($0.22-0.34/hr).
+Every lever is byte-equality-gated: the CUDA proof remained byte-identical to
+SIMD after each change, with all witness differentials green.
+
+**(2) Async upload lane** (stwo a096dfe3): pinned ping-pong staging halves on a
+DEDICATED copy stream; destination buffers allocated stream-ordered on that
+stream (uploads never trail pending legacy compute); one closing bridge orders
+consumers; record/wait pairs share the bridge mutex (the round-9 lesson).
+Applied to `from_simd_evals` (base trace) and `finalize_raw_logup` (raw logup
+pairs — previously pageable, synchronous, allocating). Kill switch
+`STWO_CUDA_SYNC_UPLOADS=1`. A/B on one 3090: 2.185 -> 2.098 s warm (+4.2%);
+kill-switch run restores baseline (clean attribution). H2D share of GPU ops
+46.8% -> 38.2%, now overlapped.
+
+**(4a) Batched OODS** (stwo b8c5348f): `PolyOps::barycentric_eval_many` — the
+pcs prover flattens all (column, point) jobs; CUDA enqueues every
+partial+reduce chain with NO intermediate synchronization into one device
+results buffer, single readback (was: 1,780 launches EACH followed by a
+16-byte stream-draining readback). Default impl keeps SIMD's parallel loop.
+
+**(3) P2, slice 1 — word-native Blake2s commits** (stwo 68784bce): the commit
+kernels fed u32 words through a byte-buffer incremental API (local-memory
+64-byte buffer, memcpy per word, byte->word repack per compress). Rewritten to
+16-word register blocks compressing directly, exact last-block semantics.
+`commit_on_first_layer`: 472 -> 145 ms / 2 proves on the 3090 — **3.25x on the
+biggest kernel** (40.4% -> 17.5% of kernel time). Wall impact small at 1M
+because the kernel already overlapped host work — the savings pay out in
+GPU-sharing fleet mode and as host work shrinks. NTT family (~32%) is the
+next P2 slice (documented, not yet attempted).
+
+**(4b) Batched decommit gather** (stwo 8edf8e3d): the queried-values loop read
+one element per (column, query) through `Column::at` — 61,726 synchronous
+4-byte readbacks per 2 proves (measured). `Column::at_many` +
+`ColumnAccess::values_at` batch it per column through the existing device
+gather kernel (~70x fewer roundtrips). Byte-equality + differentials GREEN at
+this rev; its bench delta was lost when the community host's GPU fell off the
+bus mid-round (driver death, "No devices were found" — gates had already
+passed; the pod was torn down).
+
+**(1) W3 completion — design** (`gpu_benchmarks/WITNESS_CODEGEN.md`): the
+constraint-JIT record-once recipe does NOT transfer to witness writers (no
+generic seam; branchy; side-effecting sub-component feeds). Mechanisms ranked:
+upstream a witness-IR emitter in stwo-air-infra (right answer, private repo),
+else hand-port by traffic share (verify_instruction -> loop-body opcodes -> rc
+families) with the proven P1/addr recipe. Memory tables + address_to_id are
+already device-born; the cohort port is the next multi-session program.
+
+**Cumulative, same 3090 host, single-proof 1M:** 2.185 s -> **1.998 s warm
+(3.50 MHz, +9.4%)** across the stack — and the freed GPU time (blake 3.25x,
+H2D overlapped) raises the GPU-sharing ceiling that round 9's fleet exploits.
+Phase overlap beyond the upload lane (commit N over witness N+1) is deferred
+pending the H100 streams-on recheck of the bridge-mutex rev.
+
+Costs this round: ~2.5 h of one community 3090 (~$0.55). One community GPU
+died mid-round (host fault, not reproducible by our code; the same binary
+passed all gates seconds earlier) — fleet host-screening remains the lesson.
