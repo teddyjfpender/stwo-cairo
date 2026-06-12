@@ -25,6 +25,9 @@ use cairo_air::components::add_opcode::{Claim as AddClaim, N_TRACE_COLUMNS as AD
 use cairo_air::components::add_opcode_small::{
     Claim as AddSmallClaim, N_TRACE_COLUMNS as ADD_SMALL_N_COLS,
 };
+use cairo_air::components::assert_eq_opcode::{
+    Claim as AssertEqClaim, N_TRACE_COLUMNS as ASSERT_EQ_N_COLS,
+};
 use cairo_air::components::call_opcode_rel_imm::{
     Claim as CallRelImmClaim, N_TRACE_COLUMNS as CALL_REL_IMM_N_COLS,
 };
@@ -46,7 +49,8 @@ use stwo_cairo_adapter::memory::u128_to_4_limbs;
 use stwo_constraint_framework::LogupFinalizeBackend;
 
 use crate::witness::components::{
-    add_opcode, add_opcode_small, call_opcode_rel_imm, jnz_opcode_taken, memory_address_to_id, memory_id_to_big, ret_opcode, verify_instruction,
+    add_opcode, add_opcode_small, assert_eq_opcode, call_opcode_rel_imm, jnz_opcode_taken,
+    memory_address_to_id, memory_id_to_big, ret_opcode, verify_instruction,
 };
 use crate::witness::memory_witness_backend::{compare_interaction, MemoryEvals};
 use crate::witness::utils::{pack_values, AddInputs};
@@ -158,6 +162,65 @@ fn decode_add_small_row(
     }
 }
 
+/// The host-side decode of one assert_eq_opcode row (the sub-component feed
+/// values; mirrors `write_trace_simd`'s row math exactly, in M31 arithmetic).
+struct AssertEqDecoded {
+    offset0: M31,
+    offset2: M31,
+    vi_felt5: M31,
+    vi_felt6: M31,
+    dst_addr: M31,
+    op1_addr: M31,
+}
+
+fn decode_assert_eq_row(
+    state: &crate::witness::prelude::CasmState,
+    memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+    big_values: &[[u32; 8]],
+    small_values: &[u128],
+) -> AssertEqDecoded {
+    let m31 = M31::from;
+    let pc = state.pc;
+    let ap = state.ap;
+    let fp = state.fp;
+
+    // Decode Instruction: pc -> id -> first 7 limbs (u16 bit-extraction math).
+    let instr_id = memory_address_to_id.get_id(pc);
+    let il = id_to_limbs(instr_id, big_values, small_values);
+    let l = |j: usize| il[j].0;
+    let offset0_u = l(0) + ((l(1) & 127) << 9);
+    let offset2_u = (l(3) >> 5) + (l(4) << 4) + ((l(5) & 7) << 13);
+    let flags = (l(5) >> 3) + (l(6) << 6);
+    let dst_base_fp = (flags >> 0) & 1;
+    let op1_base_fp = (flags >> 3) & 1;
+    let ap_update_add_1 = (flags >> 11) & 1;
+
+    let offset0 = m31(offset0_u);
+    let offset2 = m31(offset2_u);
+    let dst_base_fp = m31(dst_base_fp);
+    let op1_base_fp = m31(op1_base_fp);
+    let ap_update_add_1 = m31(ap_update_add_1);
+
+    let vi_felt5 = ((dst_base_fp * m31(8) + m31(16)) + op1_base_fp * m31(64))
+        + (m31(1) - op1_base_fp) * m31(128);
+    let vi_felt6 = ap_update_add_1 * m31(32) + m31(256);
+
+    let mem_dst_base = dst_base_fp * fp + (m31(1) - dst_base_fp) * ap;
+    let mem1_base = op1_base_fp * fp + (m31(1) - op1_base_fp) * ap;
+
+    let dst_addr = mem_dst_base + (offset0 - m31(32768));
+    let op1_addr = mem1_base + (offset2 - m31(32768));
+
+    AssertEqDecoded {
+        offset0,
+        offset2,
+        vi_felt5,
+        vi_felt6,
+        dst_addr,
+        op1_addr,
+    }
+}
+
 /// Backend hook for the opcode-cohort witness writers. One trait for the whole
 /// cohort (one bound in `prover.rs`); each ported opcode adds a method pair +
 /// an interaction-generator associated type.
@@ -169,6 +232,7 @@ pub trait OpcodeWitness: FromSimdColumns + LogupFinalizeBackend {
     type AddSmallInteractionGen: Send;
     type AddOpcodeInteractionGen: Send;
     type JnzTakenInteractionGen: Send;
+    type AssertEqInteractionGen: Send;
     type CallRelImmInteractionGen: Send;
 
     fn build_mem_tables(
@@ -236,6 +300,23 @@ pub trait OpcodeWitness: FromSimdColumns + LogupFinalizeBackend {
         common_lookup_elements: &CommonLookupElements,
     ) -> (MemoryEvals<Self>, SecureField);
 
+    fn write_assert_eq_trace(
+        gen: assert_eq_opcode::ClaimGenerator,
+        mem_tables: &Self::MemTables,
+        memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+        memory_id_to_big: &memory_id_to_big::ClaimGenerator,
+        verify_instruction: &verify_instruction::ClaimGenerator,
+    ) -> (
+        MemoryEvals<Self>,
+        AssertEqClaim,
+        Self::AssertEqInteractionGen,
+    );
+
+    fn write_assert_eq_interaction(
+        gen: Self::AssertEqInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField);
+
     fn write_call_rel_imm_trace(
         gen: call_opcode_rel_imm::ClaimGenerator,
         mem_tables: &Self::MemTables,
@@ -260,6 +341,7 @@ impl OpcodeWitness for SimdBackend {
     type AddSmallInteractionGen = add_opcode_small::InteractionClaimGenerator;
     type AddOpcodeInteractionGen = add_opcode::InteractionClaimGenerator;
     type JnzTakenInteractionGen = jnz_opcode_taken::InteractionClaimGenerator;
+    type AssertEqInteractionGen = assert_eq_opcode::InteractionClaimGenerator;
     type CallRelImmInteractionGen = call_opcode_rel_imm::InteractionClaimGenerator;
 
     fn build_mem_tables(
@@ -356,6 +438,30 @@ impl OpcodeWitness for SimdBackend {
         raw.finalize_on_simd()
     }
 
+    fn write_assert_eq_trace(
+        gen: assert_eq_opcode::ClaimGenerator,
+        _mem_tables: &Self::MemTables,
+        memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+        memory_id_to_big: &memory_id_to_big::ClaimGenerator,
+        verify_instruction: &verify_instruction::ClaimGenerator,
+    ) -> (
+        MemoryEvals<Self>,
+        AssertEqClaim,
+        Self::AssertEqInteractionGen,
+    ) {
+        let (trace, claim, interaction_gen) =
+            gen.write_trace(memory_address_to_id, memory_id_to_big, verify_instruction);
+        (trace.to_evals(), claim, interaction_gen)
+    }
+
+    fn write_assert_eq_interaction(
+        gen: Self::AssertEqInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField) {
+        let (raw, _build_claim) = gen.write_interaction_trace(common_lookup_elements);
+        raw.finalize_on_simd()
+    }
+
     fn write_call_rel_imm_trace(
         gen: call_opcode_rel_imm::ClaimGenerator,
         _mem_tables: &Self::MemTables,
@@ -444,6 +550,22 @@ pub enum CudaJnzTakenInteractionGen {
     Host(Box<jnz_opcode_taken::InteractionClaimGenerator>),
 }
 
+/// Device-born assert_eq_opcode state: the 12 trace columns plus the 6 staged
+/// columns its interaction tuples reference (vi_felt5/vi_felt6, the two read
+/// addresses dst_addr / op1_addr, and the opcodes-out next_pc / next_ap).
+pub struct DeviceAssertEqWitness {
+    cols: Vec<BaseFieldVec>,
+    staged: [BaseFieldVec; 6],
+    column_length: usize,
+    n_rows: usize,
+    verify_host: Option<assert_eq_opcode::InteractionClaimGenerator>,
+}
+
+pub enum CudaAssertEqInteractionGen {
+    Device(Box<DeviceAssertEqWitness>),
+    Host(Box<assert_eq_opcode::InteractionClaimGenerator>),
+}
+
 /// Device-born call_opcode_rel_imm state: the 24 trace columns plus the 8 staged
 /// columns its interaction tuples reference (ret_pc read addr ap+1, next_pc read
 /// addr pc+1, the four memory_id_to_big_6 sign slots, and the opcodes-out
@@ -481,6 +603,11 @@ fn jnz_taken_device_path_enabled() -> bool {
         && std::env::var("STWO_CUDA_JNZ_TAKEN_WITNESS").as_deref() != Ok("0")
 }
 
+fn assert_eq_device_path_enabled() -> bool {
+    stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT
+        && std::env::var("STWO_CUDA_ASSERT_EQ_WITNESS").as_deref() != Ok("0")
+}
+
 fn call_rel_imm_device_path_enabled() -> bool {
     stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT
         && std::env::var("STWO_CUDA_CALL_REL_IMM_WITNESS").as_deref() != Ok("0")
@@ -491,6 +618,7 @@ fn call_rel_imm_device_path_enabled() -> bool {
 fn any_opcode_device_path_enabled() -> bool {
     add_opcode_device_path_enabled()
         || add_small_device_path_enabled()
+        || assert_eq_device_path_enabled()
         || call_rel_imm_device_path_enabled()
         || jnz_taken_device_path_enabled()
         || ret_device_path_enabled()
@@ -506,6 +634,7 @@ impl OpcodeWitness for CudaBackend {
     type AddSmallInteractionGen = CudaAddSmallInteractionGen;
     type AddOpcodeInteractionGen = CudaAddInteractionGen;
     type JnzTakenInteractionGen = CudaJnzTakenInteractionGen;
+    type AssertEqInteractionGen = CudaAssertEqInteractionGen;
     type CallRelImmInteractionGen = CudaCallRelImmInteractionGen;
 
     fn build_mem_tables(
@@ -1719,6 +1848,255 @@ impl OpcodeWitness for CudaBackend {
                 "STWO_CUDA_WITNESS_VERIFY: jnz_opcode_taken interaction differential failed"
             );
             eprintln!("STWO_CUDA_WITNESS_VERIFY: jnz_opcode_taken interaction columns + sums OK");
+        }
+
+        (trace, claimed_sum)
+    }
+
+    fn write_assert_eq_trace(
+        gen: assert_eq_opcode::ClaimGenerator,
+        mem_tables: &Self::MemTables,
+        memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+        memory_id_to_big: &memory_id_to_big::ClaimGenerator,
+        verify_instruction: &verify_instruction::ClaimGenerator,
+    ) -> (
+        MemoryEvals<Self>,
+        AssertEqClaim,
+        Self::AssertEqInteractionGen,
+    ) {
+        if !assert_eq_device_path_enabled() {
+            let (trace, claim, interaction_gen) =
+                gen.write_trace(memory_address_to_id, memory_id_to_big, verify_instruction);
+            return (
+                Self::from_simd_evals(trace.to_evals()),
+                claim,
+                CudaAssertEqInteractionGen::Host(Box::new(interaction_gen)),
+            );
+        }
+
+        let verify = verify_enabled();
+        let verify_inputs = verify.then(|| gen.inputs.clone());
+        let (inputs, n_rows) = gen.into_parts();
+        let column_length = inputs.len();
+        let log_size = column_length.ilog2();
+
+        // SoA upload of the padded CasmState inputs.
+        let pc = BaseFieldVec::from_vec(inputs.iter().map(|s| s.pc).collect());
+        let ap = BaseFieldVec::from_vec(inputs.iter().map(|s| s.ap).collect());
+        let fp = BaseFieldVec::from_vec(inputs.iter().map(|s| s.fp).collect());
+
+        let (cols, staged) = device_witness::assert_eq_opcode_trace(
+            [&pc, &ap, &fp],
+            mem_tables,
+            n_rows,
+            column_length,
+        );
+
+        // Sub-component feeds, host-side over the padded inputs — identical
+        // values and counts to the writer's sub_component_inputs loops. The
+        // assert_eq writer feeds verify_instruction once and memory_address_to_id
+        // twice (dst / op1 reads); it does NOT feed memory_id_to_big.
+        let (big_values, small_values) = memory_id_to_big.value_tables();
+        let m31 = M31::from;
+        for state in &inputs {
+            let decoded =
+                decode_assert_eq_row(state, memory_address_to_id, big_values, small_values);
+            AddInputs::add_input(
+                verify_instruction,
+                &(
+                    state.pc,
+                    [decoded.offset0, m31(32767), decoded.offset2],
+                    [decoded.vi_felt5, decoded.vi_felt6],
+                    m31(0),
+                ),
+                0,
+            );
+            AddInputs::add_input(memory_address_to_id, &decoded.dst_addr, 0);
+            AddInputs::add_input(memory_address_to_id, &decoded.op1_addr, 0);
+        }
+
+        let verify_host = verify_inputs.map(|raw_inputs| {
+            let mut padded = raw_inputs;
+            padded.resize(column_length, *padded.first().unwrap());
+            let packed_inputs = pack_values(&padded);
+            let (host_trace, host_lookup_data, host_feeds) = assert_eq_opcode::write_trace_simd(
+                packed_inputs,
+                n_rows,
+                memory_address_to_id,
+                memory_id_to_big,
+                verify_instruction,
+            );
+            let host_evals = host_trace.to_evals();
+            let mut mismatches = 0usize;
+            // Feed differential: the values this path fed host-side must match
+            // the writer's sub_component_inputs buffers element-for-element.
+            {
+                use stwo::prover::backend::simd::m31::PackedM31;
+                let unpack = |cols: &[PackedM31]| -> Vec<M31> {
+                    cols.iter().flat_map(|p| p.to_array()).collect()
+                };
+                let vi_pc_feed: Vec<_> = host_feeds.verify_instruction[0]
+                    .iter()
+                    .flat_map(|p| p.0.to_array())
+                    .collect();
+                let addr_dst_feed = unpack(&host_feeds.memory_address_to_id[0]);
+                let addr_op1_feed = unpack(&host_feeds.memory_address_to_id[1]);
+                for (i, state) in padded.iter().enumerate() {
+                    let decoded =
+                        decode_assert_eq_row(state, memory_address_to_id, big_values, small_values);
+                    let expected = [
+                        (vi_pc_feed[i], state.pc),
+                        (addr_dst_feed[i], decoded.dst_addr),
+                        (addr_op1_feed[i], decoded.op1_addr),
+                    ];
+                    if expected.iter().any(|(host, device)| host != device) {
+                        eprintln!(
+                            "STWO_CUDA_WITNESS_VERIFY: assert_eq_opcode feed MISMATCH at row {i}"
+                        );
+                        mismatches += 1;
+                        break;
+                    }
+                }
+            }
+            for (col_idx, (device_col, host_col)) in cols.iter().zip(&host_evals).enumerate() {
+                let device_values = device_col.to_vec();
+                let host_values = host_col.values.to_cpu();
+                if device_values != host_values {
+                    let first_diff = device_values
+                        .iter()
+                        .zip(&host_values)
+                        .position(|(d, h)| d != h);
+                    eprintln!(
+                        "STWO_CUDA_WITNESS_VERIFY: assert_eq_opcode col {col_idx} MISMATCH \
+                         (first diff at row {first_diff:?})"
+                    );
+                    mismatches += 1;
+                }
+            }
+            assert_eq!(
+                mismatches, 0,
+                "STWO_CUDA_WITNESS_VERIFY: assert_eq_opcode trace differential failed"
+            );
+            eprintln!("STWO_CUDA_WITNESS_VERIFY: assert_eq_opcode trace columns OK");
+            assert_eq_opcode::InteractionClaimGenerator {
+                log_size,
+                lookup_data: host_lookup_data,
+            }
+        });
+
+        let domain = CanonicCoset::new(log_size).circle_domain();
+        let trace_evals: MemoryEvals<CudaBackend> = cols
+            .iter()
+            .map(|col| CircleEvaluation::new(domain, col.clone()))
+            .collect();
+        assert_eq!(trace_evals.len(), ASSERT_EQ_N_COLS);
+
+        (
+            trace_evals,
+            AssertEqClaim { log_size },
+            CudaAssertEqInteractionGen::Device(Box::new(DeviceAssertEqWitness {
+                cols,
+                staged,
+                column_length,
+                n_rows,
+                verify_host,
+            })),
+        )
+    }
+
+    fn write_assert_eq_interaction(
+        gen: Self::AssertEqInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField) {
+        let witness = match gen {
+            CudaAssertEqInteractionGen::Host(host_gen) => {
+                let (raw, _build_claim) =
+                    (*host_gen).write_interaction_trace(common_lookup_elements);
+                return <CudaBackend as LogupFinalizeBackend>::finalize_raw_logup(raw);
+            }
+            CudaAssertEqInteractionGen::Device(witness) => witness,
+        };
+        let DeviceAssertEqWitness {
+            cols,
+            staged,
+            column_length,
+            n_rows,
+            verify_host,
+        } = *witness;
+
+        let z = common_lookup_elements.z();
+        let alphas = common_lookup_elements.alpha_powers();
+        use device_witness::TupleSlot::{Col, Const};
+        let enabler = || device_witness::Mult::Enabler(n_rows as u32);
+
+        // staged: [0]=vi_felt5, [1]=vi_felt6, [2]=dst_addr, [3]=op1_addr,
+        // [4]=next_pc, [5]=next_ap. Column order = the host writer's col_gen
+        // sequence (mults_0 = constant 1, mults_1 = enabler).
+        let columns = vec![
+            // 1. (verify_instruction_0, memory_address_to_id_1) — mults (1, 1).
+            device_witness::tuple_pair_logup_slots(
+                VERIFY_INSTRUCTION_RELATION_ID,
+                &[
+                    Col(&cols[0]), // input_pc
+                    Col(&cols[3]), // offset0
+                    Const(32767),
+                    Col(&cols[4]),   // offset2
+                    Col(&staged[0]), // vi_felt5
+                    Col(&staged[1]), // vi_felt6
+                    Const(0),
+                ],
+                MEMORY_ADDRESS_TO_ID_RELATION_ID.0,
+                &[Col(&staged[2]), Col(&cols[10])], // dst_addr, dst_id
+                device_witness::Mult::One,
+                device_witness::Mult::One,
+                false,
+                column_length,
+                alphas,
+                z,
+            ),
+            // 2. (memory_address_to_id_2, opcodes-in) — mults (1, enabler).
+            // memory_address_to_id_2 reads the same dst_id at op1_addr.
+            device_witness::tuple_pair_logup_slots(
+                MEMORY_ADDRESS_TO_ID_RELATION_ID.0,
+                &[Col(&staged[3]), Col(&cols[10])], // op1_addr, dst_id
+                OPCODES_RELATION_ID,
+                &[Col(&cols[0]), Col(&cols[1]), Col(&cols[2])], // pc, ap, fp
+                device_witness::Mult::One,
+                enabler(),
+                false,
+                column_length,
+                alphas,
+                z,
+            ),
+            // 3. opcodes-out yield: -enabler / (pc+1, ap+ap_update, fp).
+            device_witness::tuple_single_logup_slots(
+                OPCODES_RELATION_ID,
+                &[Col(&staged[4]), Col(&staged[5]), Col(&cols[2])],
+                enabler(),
+                true,
+                column_length,
+                alphas,
+                z,
+            ),
+        ];
+        let (trace, claimed_sum) =
+            device_witness::finalize_device_raw_logup(column_length.ilog2(), columns);
+
+        if let Some(host_gen) = verify_host {
+            let (host_raw, _build_claim) = host_gen.write_interaction_trace(common_lookup_elements);
+            let (host_trace, host_sum) = host_raw.finalize_on_simd();
+            let mismatches = compare_interaction(
+                "assert_eq_opcode",
+                &trace,
+                claimed_sum,
+                &host_trace,
+                host_sum,
+            );
+            assert_eq!(
+                mismatches, 0,
+                "STWO_CUDA_WITNESS_VERIFY: assert_eq_opcode interaction differential failed"
+            );
+            eprintln!("STWO_CUDA_WITNESS_VERIFY: assert_eq_opcode interaction columns + sums OK");
         }
 
         (trace, claimed_sum)
