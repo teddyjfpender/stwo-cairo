@@ -6,6 +6,7 @@ use cairo_air::air::PublicData;
 use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
 use cairo_air::components::add_opcode::InteractionClaim as AddInteractionClaim;
 use cairo_air::components::add_opcode_small::InteractionClaim as AddSmallInteractionClaim;
+use cairo_air::components::call_opcode_rel_imm::InteractionClaim as CallRelImmInteractionClaim;
 use cairo_air::components::jnz_opcode_taken::InteractionClaim as JnzTakenInteractionClaim;
 use cairo_air::components::memory_address_to_id::InteractionClaim as MemoryAddrInteractionClaim;
 use cairo_air::components::memory_id_to_big::InteractionClaim as MemoryBigInteractionClaim;
@@ -777,7 +778,8 @@ impl CairoClaimGenerator {
         let opcode_mem_tables = (self.ret_opcode.is_some()
             || self.add_opcode.is_some()
             || self.add_opcode_small.is_some()
-            || self.jnz_opcode_taken.is_some())
+            || self.jnz_opcode_taken.is_some()
+            || self.call_opcode_rel_imm.is_some())
         .then(|| {
             B::build_mem_tables(
                 self.memory_address_to_id.as_ref().unwrap(),
@@ -888,14 +890,13 @@ impl CairoClaimGenerator {
             }
             if let Some(gen) = self.call_opcode_rel_imm {
                 s.spawn(|_| {
-                    call_opcode_rel_imm_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                            self.memory_address_to_id.as_ref().unwrap(),
-                            self.memory_id_to_big.as_ref().unwrap(),
-                            self.verify_instruction.as_ref().unwrap(),
-                        );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
-                    });
+                    call_opcode_rel_imm_result = Some(B::write_call_rel_imm_trace(
+                        gen,
+                        opcode_mem_tables.as_ref().unwrap(),
+                        self.memory_address_to_id.as_ref().unwrap(),
+                        self.memory_id_to_big.as_ref().unwrap(),
+                        self.verify_instruction.as_ref().unwrap(),
+                    ));
                 });
             }
             if let Some(gen) = self.generic_opcode {
@@ -1838,7 +1839,7 @@ pub struct CairoInteractionClaimGenerator<
         Option<assert_eq_opcode_double_deref::InteractionClaimGenerator>,
     pub blake_compress_opcode: Option<blake_compress_opcode::InteractionClaimGenerator>,
     pub call_opcode_abs: Option<call_opcode_abs::InteractionClaimGenerator>,
-    pub call_opcode_rel_imm: Option<call_opcode_rel_imm::InteractionClaimGenerator>,
+    pub call_opcode_rel_imm: Option<<B as OpcodeWitness>::CallRelImmInteractionGen>,
     pub generic_opcode: Option<generic_opcode::InteractionClaimGenerator>,
     pub jnz_opcode_non_taken: Option<jnz_opcode_non_taken::InteractionClaimGenerator>,
     pub jnz_opcode_taken: Option<<B as OpcodeWitness>::JnzTakenInteractionGen>,
@@ -2062,9 +2063,10 @@ where
             }
             if let Some(gen) = self.call_opcode_rel_imm {
                 s.spawn(|_| {
-                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
-                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                    call_opcode_rel_imm_result = Some((trace, claimed_sum, build_claim));
+                    call_opcode_rel_imm_result = Some(B::write_call_rel_imm_interaction(
+                        gen,
+                        common_lookup_elements,
+                    ));
                 });
             }
             if let Some(gen) = self.generic_opcode {
@@ -2515,9 +2517,9 @@ where
                 build_claim(claimed_sum)
             });
         let call_opcode_rel_imm_interaction_claim =
-            call_opcode_rel_imm_result.map(|(trace, claimed_sum, build_claim)| {
+            call_opcode_rel_imm_result.map(|(trace, claimed_sum)| {
                 evals.extend(trace);
-                build_claim(claimed_sum)
+                CallRelImmInteractionClaim { claimed_sum }
             });
         let generic_opcode_interaction_claim =
             generic_opcode_result.map(|(trace, claimed_sum, build_claim)| {

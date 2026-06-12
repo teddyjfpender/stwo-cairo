@@ -21,6 +21,17 @@ impl ClaimGenerator {
         Self { inputs }
     }
 
+    /// Decomposes the generator into its padded input vector (padding repeats
+    /// `inputs[0]`, exactly like `write_trace`) and the live row count, for
+    /// the device witness path.
+    pub(crate) fn into_parts(mut self) -> (Vec<InputType>, usize) {
+        let n_rows = self.inputs.len();
+        assert_ne!(n_rows, 0);
+        let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+        self.inputs.resize(size, *self.inputs.first().unwrap());
+        (self.inputs, n_rows)
+    }
+
     pub fn write_trace(
         mut self,
         memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
@@ -72,17 +83,17 @@ impl ClaimGenerator {
 }
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
-struct SubComponentInputs {
-    verify_instruction: [Vec<verify_instruction::PackedInputType>; 1],
-    memory_address_to_id: [Vec<memory_address_to_id::PackedInputType>; 3],
-    memory_id_to_big: [Vec<memory_id_to_big::PackedInputType>; 3],
+pub(crate) struct SubComponentInputs {
+    pub(crate) verify_instruction: [Vec<verify_instruction::PackedInputType>; 1],
+    pub(crate) memory_address_to_id: [Vec<memory_address_to_id::PackedInputType>; 3],
+    pub(crate) memory_id_to_big: [Vec<memory_id_to_big::PackedInputType>; 3],
 }
 
 #[allow(clippy::useless_conversion)]
 #[allow(unused_variables)]
 #[allow(clippy::double_parens)]
 #[allow(non_snake_case)]
-fn write_trace_simd(
+pub(crate) fn write_trace_simd(
     inputs: Vec<PackedInputType>,
     n_rows: usize,
     memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
@@ -508,7 +519,7 @@ fn write_trace_simd(
 }
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
-struct LookupData {
+pub(crate) struct LookupData {
     verify_instruction_0: Vec<[PackedM31; 8]>,
     memory_address_to_id_1: Vec<[PackedM31; 3]>,
     memory_id_to_big_2: Vec<[PackedM31; 30]>,
@@ -523,8 +534,8 @@ struct LookupData {
 }
 
 pub struct InteractionClaimGenerator {
-    log_size: u32,
-    lookup_data: LookupData,
+    pub(crate) log_size: u32,
+    pub(crate) lookup_data: LookupData,
 }
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
