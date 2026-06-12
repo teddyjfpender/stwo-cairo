@@ -7,10 +7,11 @@ use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
 use cairo_air::components::memory_address_to_id::InteractionClaim as MemoryAddrInteractionClaim;
 use cairo_air::components::memory_id_to_big::InteractionClaim as MemoryBigInteractionClaim;
 use cairo_air::components::memory_id_to_small::InteractionClaim as MemorySmallInteractionClaim;
+use cairo_air::components::verify_instruction::InteractionClaim as ViInteractionClaim;
 use cairo_air::relations::CommonLookupElements;
-use stwo::core::fields::qm31::SecureField;
 use indexmap::IndexSet;
 use rayon::scope;
+use stwo::core::fields::qm31::SecureField;
 pub use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::poly::BitReversedOrder;
 use stwo_cairo_adapter::builtins::BuiltinSegments;
@@ -23,7 +24,9 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
 use stwo_cairo_common::preprocessed_columns::simd_prelude::{BaseField, CircleEvaluation};
 
 use crate::witness::components::*;
-use crate::witness::memory_witness_backend::{MemoryAddressToIdWitness, MemoryIdToBigWitness};
+use crate::witness::memory_witness_backend::{
+    MemoryAddressToIdWitness, MemoryIdToBigWitness, VerifyInstructionWitness,
+};
 
 #[derive(Default)]
 pub struct CairoClaimGenerator {
@@ -736,7 +739,10 @@ impl CairoClaimGenerator {
         CairoInteractionClaimGenerator<B>,
     )
     where
-        B: stwo::prover::backend::FromSimdColumns + MemoryIdToBigWitness + MemoryAddressToIdWitness,
+        B: stwo::prover::backend::FromSimdColumns
+            + MemoryIdToBigWitness
+            + MemoryAddressToIdWitness
+            + VerifyInstructionWitness,
     {
         let mut evals = Vec::new();
         let mut add_opcode_result = None;
@@ -765,10 +771,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     add_opcode_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -777,10 +783,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     add_opcode_small_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -789,12 +795,12 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     add_ap_opcode_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_18.as_ref().unwrap(),
-                        self.range_check_11.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_18.as_ref().unwrap(),
+                            self.range_check_11.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -803,10 +809,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     assert_eq_opcode_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -815,10 +821,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     assert_eq_opcode_imm_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -827,10 +833,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     assert_eq_opcode_double_deref_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -839,14 +845,14 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     blake_compress_opcode_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_7_2_5.as_ref().unwrap(),
-                        self.verify_bitwise_xor_8.as_ref().unwrap(),
-                        self.blake_round.as_ref().unwrap(),
-                        self.triple_xor_32.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_7_2_5.as_ref().unwrap(),
+                            self.verify_bitwise_xor_8.as_ref().unwrap(),
+                            self.blake_round.as_ref().unwrap(),
+                            self.triple_xor_32.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -855,10 +861,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     call_opcode_abs_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -867,10 +873,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     call_opcode_rel_imm_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -879,14 +885,14 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     generic_opcode_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_9_9.as_ref().unwrap(),
-                        self.range_check_20.as_ref().unwrap(),
-                        self.range_check_18.as_ref().unwrap(),
-                        self.range_check_11.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_9_9.as_ref().unwrap(),
+                            self.range_check_20.as_ref().unwrap(),
+                            self.range_check_18.as_ref().unwrap(),
+                            self.range_check_11.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -895,10 +901,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     jnz_opcode_non_taken_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -907,10 +913,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     jnz_opcode_taken_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -919,10 +925,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     jump_opcode_abs_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -931,10 +937,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     jump_opcode_double_deref_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -943,10 +949,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     jump_opcode_rel_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -955,10 +961,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     jump_opcode_rel_imm_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -967,11 +973,11 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     mul_opcode_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_20.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_20.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -980,11 +986,11 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     mul_opcode_small_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_11.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_11.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -993,11 +999,11 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     qm_31_add_mul_opcode_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_4_4_4_4.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_4_4_4_4.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -1006,10 +1012,10 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     ret_opcode_result = Some({
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -1148,13 +1154,16 @@ impl CairoClaimGenerator {
         let (verify_instruction_claim, verify_instruction_interaction_gen) = self
             .verify_instruction
             .map(|gen| {
-                let (trace, claim, interaction_gen) = gen.write_trace(
+                // Backend hook (witness-on-GPU W3): columns born on B; rc feeds
+                // via device count tables, memory feeds host-side.
+                let (trace, claim, interaction_gen) = B::write_vi_trace(
+                    gen,
                     self.range_check_7_2_5.as_ref().unwrap(),
                     self.range_check_4_3.as_ref().unwrap(),
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
                 );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1802,7 +1811,9 @@ impl CairoClaimGenerator {
     }
 }
 
-pub struct CairoInteractionClaimGenerator<B: MemoryIdToBigWitness + MemoryAddressToIdWitness> {
+pub struct CairoInteractionClaimGenerator<
+    B: MemoryIdToBigWitness + MemoryAddressToIdWitness + VerifyInstructionWitness,
+> {
     pub add_opcode: Option<add_opcode::InteractionClaimGenerator>,
     pub add_opcode_small: Option<add_opcode_small::InteractionClaimGenerator>,
     pub add_ap_opcode: Option<add_ap_opcode::InteractionClaimGenerator>,
@@ -1824,7 +1835,7 @@ pub struct CairoInteractionClaimGenerator<B: MemoryIdToBigWitness + MemoryAddres
     pub mul_opcode_small: Option<mul_opcode_small::InteractionClaimGenerator>,
     pub qm_31_add_mul_opcode: Option<qm_31_add_mul_opcode::InteractionClaimGenerator>,
     pub ret_opcode: Option<ret_opcode::InteractionClaimGenerator>,
-    pub verify_instruction: Option<verify_instruction::InteractionClaimGenerator>,
+    pub verify_instruction: Option<<B as VerifyInstructionWitness>::ViInteractionGen>,
     pub blake_round: Option<blake_round::InteractionClaimGenerator>,
     pub blake_g: Option<blake_g::InteractionClaimGenerator>,
     pub blake_round_sigma: Option<blake_round_sigma::InteractionClaimGenerator>,
@@ -1886,7 +1897,8 @@ where
     B: stwo_constraint_framework::LogupFinalizeBackend
         + stwo::prover::backend::FromSimdColumns
         + MemoryIdToBigWitness
-        + MemoryAddressToIdWitness,
+        + MemoryAddressToIdWitness
+        + VerifyInstructionWitness,
 {
     /// Writes the raw interaction fractions on the host (parallel across
     /// components), then finalizes each component's logup trace on `B` — the
@@ -2092,7 +2104,7 @@ where
             if let Some(gen) = self.verify_instruction {
                 s.spawn(|_| {
                     verify_instruction_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                        Some(B::write_vi_interaction(gen, common_lookup_elements));
                 });
             }
             if let Some(gen) = self.blake_round {
@@ -2371,22 +2383,21 @@ where
         });
 
         let add_opcode_interaction_claim = add_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let add_opcode_small_interaction_claim =
             add_opcode_small_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let add_ap_opcode_interaction_claim =
-            add_ap_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let add_ap_opcode_interaction_claim = add_ap_opcode_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let assert_eq_opcode_interaction_claim =
             assert_eq_opcode_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2411,24 +2422,22 @@ where
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let call_opcode_abs_interaction_claim =
-            call_opcode_abs_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let call_opcode_abs_interaction_claim = call_opcode_abs_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let call_opcode_rel_imm_interaction_claim =
             call_opcode_rel_imm_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let generic_opcode_interaction_claim =
-            generic_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let generic_opcode_interaction_claim = generic_opcode_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let jnz_opcode_non_taken_interaction_claim =
             jnz_opcode_non_taken_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2441,24 +2450,22 @@ where
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let jump_opcode_abs_interaction_claim =
-            jump_opcode_abs_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let jump_opcode_abs_interaction_claim = jump_opcode_abs_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let jump_opcode_double_deref_interaction_claim =
             jump_opcode_double_deref_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let jump_opcode_rel_interaction_claim =
-            jump_opcode_rel_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let jump_opcode_rel_interaction_claim = jump_opcode_rel_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let jump_opcode_rel_imm_interaction_claim =
             jump_opcode_rel_imm_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2466,10 +2473,10 @@ where
                 build_claim(claimed_sum)
             });
         let mul_opcode_interaction_claim = mul_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let mul_opcode_small_interaction_claim =
             mul_opcode_small_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2483,62 +2490,57 @@ where
                 build_claim(claimed_sum)
             });
         let ret_opcode_interaction_claim = ret_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let verify_instruction_interaction_claim =
-            verify_instruction_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            verify_instruction_result.map(|(trace, claimed_sum)| {
                 evals.extend(trace);
-                build_claim(claimed_sum)
+                ViInteractionClaim { claimed_sum }
             });
         let blake_round_interaction_claim = blake_round_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let blake_g_interaction_claim = blake_g_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let blake_round_sigma_interaction_claim =
             blake_round_sigma_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let triple_xor_32_interaction_claim =
-            triple_xor_32_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let triple_xor_32_interaction_claim = triple_xor_32_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let verify_bitwise_xor_12_interaction_claim =
             verify_bitwise_xor_12_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let add_mod_builtin_interaction_claim =
-            add_mod_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let bitwise_builtin_interaction_claim =
-            bitwise_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let mul_mod_builtin_interaction_claim =
-            mul_mod_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let add_mod_builtin_interaction_claim = add_mod_builtin_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let bitwise_builtin_interaction_claim = bitwise_builtin_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let mul_mod_builtin_interaction_claim = mul_mod_builtin_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let pedersen_builtin_interaction_claim =
             pedersen_builtin_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2569,12 +2571,11 @@ where
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let ec_op_builtin_interaction_claim =
-            ec_op_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let ec_op_builtin_interaction_claim = ec_op_builtin_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let partial_ec_mul_generic_interaction_claim =
             partial_ec_mul_generic_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2636,10 +2637,10 @@ where
                 build_claim(claimed_sum)
             });
         let cube_252_interaction_claim = cube_252_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let poseidon_round_keys_interaction_claim =
             poseidon_round_keys_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2684,60 +2685,51 @@ where
                     )
                 })
                 .unzip();
-        let range_check_6_interaction_claim =
-            range_check_6_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_8_interaction_claim =
-            range_check_8_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_11_interaction_claim =
-            range_check_11_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_12_interaction_claim =
-            range_check_12_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_18_interaction_claim =
-            range_check_18_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_20_interaction_claim =
-            range_check_20_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_4_3_interaction_claim =
-            range_check_4_3_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_4_4_interaction_claim =
-            range_check_4_4_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_9_9_interaction_claim =
-            range_check_9_9_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let range_check_6_interaction_claim = range_check_6_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_8_interaction_claim = range_check_8_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_11_interaction_claim = range_check_11_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_12_interaction_claim = range_check_12_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_18_interaction_claim = range_check_18_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_20_interaction_claim = range_check_20_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_4_3_interaction_claim = range_check_4_3_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_4_4_interaction_claim = range_check_4_4_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_9_9_interaction_claim = range_check_9_9_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let range_check_7_2_5_interaction_claim =
             range_check_7_2_5_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);

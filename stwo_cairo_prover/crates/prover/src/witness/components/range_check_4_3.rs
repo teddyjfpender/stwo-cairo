@@ -2,10 +2,10 @@
 
 #![allow(unused_parens)]
 use cairo_air::components::range_check_4_3::{Claim, InteractionClaim, LOG_SIZE, N_TRACE_COLUMNS};
-
-use crate::witness::prelude::*;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
+
+use crate::witness::prelude::*;
 
 pub type InputType = [M31; 2];
 pub type PackedInputType = [PackedM31; 2];
@@ -33,6 +33,16 @@ impl ClaimGenerator {
             input_to_row: make_input_to_row(&preprocessed_trace, column_ids),
             preprocessed_trace,
         }
+    }
+
+    /// Dense `(v0 << 3) | v1 -> row` LUT (slot bits [4, 3]) for the device feed.
+    pub fn input_to_row_lut(&self) -> Vec<u32> {
+        crate::witness::utils::dense_input_to_row_lut(&self.input_to_row, [4, 3])
+    }
+
+    /// Merges device-computed count tables (1 relation x `1 << LOG_SIZE` rows).
+    pub fn add_count_tables(&self, counts: &[u32]) {
+        crate::witness::utils::merge_count_tables(&self.mults, counts, 1 << LOG_SIZE);
     }
 
     pub fn write_trace(
@@ -144,6 +154,8 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }

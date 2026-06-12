@@ -123,7 +123,9 @@ fn parse_range_check_id(id: &str) -> Option<(Vec<u32>, usize)> {
         .map(|part| part.parse::<u32>())
         .collect::<Result<_, _>>()
         .ok()?;
-    let idx = stripped[column_pos + "_column_".len()..].parse::<usize>().ok()?;
+    let idx = stripped[column_pos + "_column_".len()..]
+        .parse::<usize>()
+        .ok()?;
     (idx < bits.len()).then_some((bits, idx))
 }
 

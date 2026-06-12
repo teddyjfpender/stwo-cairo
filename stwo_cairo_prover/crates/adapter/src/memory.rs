@@ -1,12 +1,12 @@
 // hashbrown (foldhash) over std SipHash: these dedup maps are the adapter's hot
 // path, and ids depend only on first-encounter ORDER, never the hash function -
 // the swap is byte-equality-invisible (gated by the STWO_DUMP_INPUT diff).
-use hashbrown::hash_map::Entry;
-use hashbrown::HashMap;
 use std::ops::{Deref, DerefMut};
 
 use bytemuck::{Pod, Zeroable};
 use dashmap::DashMap;
+use hashbrown::hash_map::Entry;
+use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 use stwo_cairo_common::memory::{LARGE_MEMORY_VALUE_ID_BASE, N_M31_IN_SMALL_FELT252};
 use stwo_cairo_common::prover_types::cpu::FELT252_BITS_PER_WORD;

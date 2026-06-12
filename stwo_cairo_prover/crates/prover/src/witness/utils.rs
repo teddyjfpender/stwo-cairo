@@ -245,6 +245,46 @@ pub fn make_input_to_row<const N: usize>(
     result
 }
 
+/// Dense `input -> row` LUT for a const-size rc table, inverted from the ACTUAL
+/// `input_to_row` map (the preprocessed layout, NOT a closed form). Keys pack
+/// per-slot: `key = fold(key << bits_j | v_j)`. Asserts full coverage.
+pub(crate) fn dense_input_to_row_lut<const N: usize>(
+    input_to_row: &HashMap<[M31; N], usize>,
+    slot_bits: [u32; N],
+) -> Vec<u32> {
+    let total_bits: u32 = slot_bits.iter().sum();
+    let mut lut = vec![u32::MAX; 1usize << total_bits];
+    for (input, row) in input_to_row {
+        let mut key = 0usize;
+        for (value, bits) in input.iter().zip(slot_bits) {
+            key = (key << bits) | value.0 as usize;
+        }
+        lut[key] = *row as u32;
+    }
+    assert!(
+        lut.iter().all(|&row| row != u32::MAX),
+        "input_to_row map does not cover the full input space"
+    );
+    lut
+}
+
+/// Merges device-computed relation-indexed count tables into multiplicity
+/// columns. Adds commute, so this is byte-equal to per-input host feeding.
+pub(crate) fn merge_count_tables(
+    mults: &[AtomicMultiplicityColumn],
+    counts: &[u32],
+    table_size: usize,
+) {
+    assert_eq!(counts.len(), mults.len() * table_size);
+    for (relation_index, table) in counts.chunks(table_size).enumerate() {
+        for (row, &count) in table.iter().enumerate() {
+            if count != 0 {
+                mults[relation_index].add_at(row as u32, count);
+            }
+        }
+    }
+}
+
 pub trait AddInputs {
     type PackedInputType: Unpack<CpuType = Self::InputType>;
     type InputType: Pack<SimdType = Self::PackedInputType>;

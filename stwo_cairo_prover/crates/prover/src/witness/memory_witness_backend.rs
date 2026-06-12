@@ -20,6 +20,7 @@
 use cairo_air::components::memory_address_to_id::{Claim as AddrClaim, MEMORY_ADDRESS_TO_ID_SPLIT};
 use cairo_air::components::memory_id_to_big::Claim as BigClaim;
 use cairo_air::components::memory_id_to_small::Claim as SmallClaim;
+use cairo_air::components::verify_instruction::Claim as ViClaim;
 use cairo_air::relations::{
     CommonLookupElements, MEMORY_ADDRESS_TO_ID_RELATION_ID, MEMORY_ID_TO_BIG_RELATION_ID,
     RANGE_CHECK_9_9_B_RELATION_ID, RANGE_CHECK_9_9_C_RELATION_ID, RANGE_CHECK_9_9_D_RELATION_ID,
@@ -41,7 +42,11 @@ use stwo_cairo_common::memory::{LARGE_MEMORY_VALUE_ID_BASE, N_M31_IN_SMALL_FELT2
 use stwo_cairo_common::prover_types::cpu::FELT252_N_WORDS;
 use stwo_constraint_framework::LogupFinalizeBackend;
 
-use crate::witness::components::{memory_address_to_id, memory_id_to_big, range_check_9_9};
+use crate::witness::components::{
+    memory_address_to_id, memory_id_to_big, range_check_4_3, range_check_7_2_5, range_check_9_9,
+    verify_instruction,
+};
+use crate::witness::utils::pack_values;
 
 pub type MemoryEvals<B> = Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>;
 
@@ -856,6 +861,343 @@ impl MemoryAddressToIdWitness for CudaBackend {
             eprintln!(
                 "STWO_CUDA_WITNESS_VERIFY: memory_address_to_id interaction columns + sums OK"
             );
+        }
+
+        (trace, claimed_sum)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// verify_instruction (W3 opcode-cohort beachhead): the first component on the
+// GENERIC witness lane — a dedicated base-trace kernel plus the
+// tuple_pair/tuple_single/tuple_count primitives that every cohort port
+// shares. Same gates as P1: STWO_CUDA_WITNESS_VERIFY differential and the
+// Cairo e2e proof byte-equality; STWO_CUDA_VI_WITNESS=0 falls back.
+// ---------------------------------------------------------------------------
+
+/// Relation ids that exist only as literals in the generated writers (hashed
+/// relation names; the differential pins them against the host writer).
+const RC_7_2_5_RELATION_ID: u32 = 371240602;
+const RC_4_3_RELATION_ID: u32 = 1567323731;
+const VERIFY_INSTRUCTION_RELATION_ID: u32 = 1719106205;
+
+pub trait VerifyInstructionWitness: FromSimdColumns {
+    type ViInteractionGen: Send;
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_vi_trace(
+        gen: verify_instruction::ClaimGenerator,
+        range_check_7_2_5: &range_check_7_2_5::ClaimGenerator,
+        range_check_4_3: &range_check_4_3::ClaimGenerator,
+        memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+        memory_id_to_big: &memory_id_to_big::ClaimGenerator,
+    ) -> (MemoryEvals<Self>, ViClaim, Self::ViInteractionGen);
+
+    fn write_vi_interaction(
+        gen: Self::ViInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField);
+}
+
+impl VerifyInstructionWitness for SimdBackend {
+    type ViInteractionGen = verify_instruction::InteractionClaimGenerator;
+
+    fn write_vi_trace(
+        gen: verify_instruction::ClaimGenerator,
+        range_check_7_2_5: &range_check_7_2_5::ClaimGenerator,
+        range_check_4_3: &range_check_4_3::ClaimGenerator,
+        memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+        memory_id_to_big: &memory_id_to_big::ClaimGenerator,
+    ) -> (MemoryEvals<Self>, ViClaim, Self::ViInteractionGen) {
+        let (trace, claim, interaction_gen) = gen.write_trace(
+            range_check_7_2_5,
+            range_check_4_3,
+            memory_address_to_id,
+            memory_id_to_big,
+        );
+        (trace.to_evals(), claim, interaction_gen)
+    }
+
+    fn write_vi_interaction(
+        gen: Self::ViInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField) {
+        let (raw, _build_claim) = gen.write_interaction_trace(common_lookup_elements);
+        raw.finalize_on_simd()
+    }
+}
+
+/// Device-born verify_instruction state: the 17 trace columns plus the 3
+/// staged combination columns its interaction tuples reference.
+pub struct DeviceViWitness {
+    cols: Vec<BaseFieldVec>,
+    staged: [BaseFieldVec; 3],
+    column_length: usize,
+    verify_host: Option<verify_instruction::InteractionClaimGenerator>,
+}
+
+pub enum CudaViInteractionGen {
+    Device(Box<DeviceViWitness>),
+    Host(Box<verify_instruction::InteractionClaimGenerator>),
+}
+
+fn vi_device_path_enabled() -> bool {
+    stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT
+        && std::env::var("STWO_CUDA_VI_WITNESS").as_deref() != Ok("0")
+}
+
+impl VerifyInstructionWitness for CudaBackend {
+    type ViInteractionGen = CudaViInteractionGen;
+
+    fn write_vi_trace(
+        gen: verify_instruction::ClaimGenerator,
+        range_check_7_2_5: &range_check_7_2_5::ClaimGenerator,
+        range_check_4_3: &range_check_4_3::ClaimGenerator,
+        memory_address_to_id: &memory_address_to_id::ClaimGenerator,
+        memory_id_to_big: &memory_id_to_big::ClaimGenerator,
+    ) -> (MemoryEvals<Self>, ViClaim, Self::ViInteractionGen) {
+        if !vi_device_path_enabled() {
+            let (trace, claim, interaction_gen) = gen.write_trace(
+                range_check_7_2_5,
+                range_check_4_3,
+                memory_address_to_id,
+                memory_id_to_big,
+            );
+            return (
+                Self::from_simd_evals(trace.to_evals()),
+                claim,
+                CudaViInteractionGen::Host(Box::new(interaction_gen)),
+            );
+        }
+
+        let verify = verify_enabled();
+        let (inputs, mults) = gen.into_parts();
+        let column_length = inputs.len();
+        let log_size = column_length.ilog2();
+
+        // Host-resolved instruction ids: a read-only table lookup at the
+        // dedup'd-instruction size (identical to the writer's deduce_output).
+        let ids: Vec<M31> = inputs
+            .iter()
+            .map(|input| memory_address_to_id.get_id(input.0))
+            .collect();
+
+        // SoA upload of the 9 input columns.
+        let upload = |f: &dyn Fn(usize) -> M31| -> BaseFieldVec {
+            BaseFieldVec::from_vec((0..column_length).map(f).collect())
+        };
+        let pc = upload(&|i| inputs[i].0);
+        let off0 = upload(&|i| inputs[i].1[0]);
+        let off1 = upload(&|i| inputs[i].1[1]);
+        let off2 = upload(&|i| inputs[i].1[2]);
+        let felt5 = upload(&|i| inputs[i].2[0]);
+        let felt6 = upload(&|i| inputs[i].2[1]);
+        let ext = upload(&|i| inputs[i].3);
+        let id_col = upload(&|i| ids[i]);
+        let mult_col = upload(&|i| mults[i]);
+
+        let (cols, staged) = device_witness::verify_instruction_trace(
+            [
+                &pc, &off0, &off1, &off2, &felt5, &felt6, &ext, &id_col, &mult_col,
+            ],
+            column_length,
+        );
+
+        // Device rc feeds through the tables' layout LUTs (padding rows
+        // included, like the host feeding loops).
+        let lut_725 = range_check_7_2_5.input_to_row_lut();
+        let counts_725 = device_witness::tuple_count(
+            &[&cols[8], &cols[9], &cols[11]],
+            3,
+            &[7, 2, 5],
+            1,
+            column_length,
+            &lut_725,
+            1 << 14,
+        );
+        let lut_43 = range_check_4_3.input_to_row_lut();
+        let counts_43 = device_witness::tuple_count(
+            &[&cols[12], &cols[14]],
+            2,
+            &[4, 3],
+            1,
+            column_length,
+            &lut_43,
+            1 << 7,
+        );
+
+        // Memory feeds, host-side from the same arrays we uploaded — identical
+        // values and counts to the writer's sub_component_inputs loops.
+        for (input, id) in inputs.iter().zip(&ids) {
+            crate::witness::utils::AddInputs::add_input(memory_address_to_id, &input.0, 0);
+            crate::witness::utils::AddInputs::add_input(memory_id_to_big, id, 0);
+        }
+
+        let verify_host = verify.then(|| {
+            let packed_inputs = pack_values(&inputs);
+            let packed_mults = pack_values(&mults);
+            let (host_trace, host_lookup_data, _host_feeds) = verify_instruction::write_trace_simd(
+                packed_inputs,
+                vec![packed_mults],
+                range_check_7_2_5,
+                range_check_4_3,
+                memory_address_to_id,
+                memory_id_to_big,
+            );
+            let host_evals = host_trace.to_evals();
+            let mut mismatches = 0usize;
+            for (col_idx, (device_col, host_col)) in cols.iter().zip(&host_evals).enumerate() {
+                let device_values = device_col.to_vec();
+                let host_values = host_col.values.to_cpu();
+                if device_values != host_values {
+                    let first_diff = device_values
+                        .iter()
+                        .zip(&host_values)
+                        .position(|(d, h)| d != h);
+                    eprintln!(
+                        "STWO_CUDA_WITNESS_VERIFY: verify_instruction col {col_idx} MISMATCH \
+                         (first diff at row {first_diff:?})"
+                    );
+                    mismatches += 1;
+                }
+            }
+            // rc count deltas, recomputed from the host trace through the LUTs.
+            let host_col = |idx: usize| host_evals[idx].values.to_cpu();
+            let mut expected_725 = vec![0u32; 1 << 14];
+            let (c8, c9, c11) = (host_col(8), host_col(9), host_col(11));
+            for i in 0..column_length {
+                let key = ((((c8[i].0 << 2) | c9[i].0) << 5) | c11[i].0) as usize;
+                expected_725[lut_725[key] as usize] += 1;
+            }
+            if expected_725 != counts_725 {
+                eprintln!("STWO_CUDA_WITNESS_VERIFY: rc_7_2_5 count table MISMATCH");
+                mismatches += 1;
+            }
+            let mut expected_43 = vec![0u32; 1 << 7];
+            let (c12, c14) = (host_col(12), host_col(14));
+            for i in 0..column_length {
+                expected_43[lut_43[((c12[i].0 << 3) | c14[i].0) as usize] as usize] += 1;
+            }
+            if expected_43 != counts_43 {
+                eprintln!("STWO_CUDA_WITNESS_VERIFY: rc_4_3 count table MISMATCH");
+                mismatches += 1;
+            }
+            assert_eq!(
+                mismatches, 0,
+                "STWO_CUDA_WITNESS_VERIFY: verify_instruction trace differential failed"
+            );
+            eprintln!("STWO_CUDA_WITNESS_VERIFY: verify_instruction trace columns OK");
+            verify_instruction::InteractionClaimGenerator {
+                log_size,
+                lookup_data: host_lookup_data,
+            }
+        });
+
+        range_check_7_2_5.add_count_tables(&counts_725);
+        range_check_4_3.add_count_tables(&counts_43);
+
+        let domain = CanonicCoset::new(log_size).circle_domain();
+        let trace_evals: MemoryEvals<CudaBackend> = cols
+            .iter()
+            .map(|col| CircleEvaluation::new(domain, col.clone()))
+            .collect();
+
+        (
+            trace_evals,
+            ViClaim { log_size },
+            CudaViInteractionGen::Device(Box::new(DeviceViWitness {
+                cols,
+                staged,
+                column_length,
+                verify_host,
+            })),
+        )
+    }
+
+    fn write_vi_interaction(
+        gen: Self::ViInteractionGen,
+        common_lookup_elements: &CommonLookupElements,
+    ) -> (MemoryEvals<Self>, SecureField) {
+        let witness = match gen {
+            CudaViInteractionGen::Host(host_gen) => {
+                let (raw, _build_claim) =
+                    (*host_gen).write_interaction_trace(common_lookup_elements);
+                return <CudaBackend as LogupFinalizeBackend>::finalize_raw_logup(raw);
+            }
+            CudaViInteractionGen::Device(witness) => witness,
+        };
+        let DeviceViWitness {
+            cols,
+            staged,
+            column_length,
+            verify_host,
+        } = *witness;
+
+        let z = common_lookup_elements.z();
+        let alphas = common_lookup_elements.alpha_powers();
+
+        // Column order = the host writer's: (rc_7_2_5, rc_4_3) pair, then
+        // (addr_to_id, id_to_big) pair, then the -mult verify_instruction yield.
+        // The id_to_big tuple's 20 trailing zeros contribute exactly zero to the
+        // combine sum, so the tuple is passed truncated — identical field value.
+        let columns = vec![
+            device_witness::tuple_pair_logup(
+                RC_7_2_5_RELATION_ID,
+                &[&cols[8], &cols[9], &cols[11]],
+                RC_4_3_RELATION_ID,
+                &[&cols[12], &cols[14]],
+                device_witness::Mult::One,
+                device_witness::Mult::One,
+                false,
+                column_length,
+                alphas,
+                z,
+            ),
+            device_witness::tuple_pair_logup(
+                MEMORY_ADDRESS_TO_ID_RELATION_ID.0,
+                &[&cols[0], &cols[15]],
+                MEMORY_ID_TO_BIG_RELATION_ID.0,
+                &[
+                    &cols[15], &cols[7], &staged[0], &cols[10], &staged[1], &cols[13], &staged[2],
+                    &cols[5], &cols[6],
+                ],
+                device_witness::Mult::One,
+                device_witness::Mult::One,
+                false,
+                column_length,
+                alphas,
+                z,
+            ),
+            device_witness::tuple_single_logup(
+                VERIFY_INSTRUCTION_RELATION_ID,
+                &[
+                    &cols[0], &cols[1], &cols[2], &cols[3], &cols[4], &cols[5], &cols[6],
+                ],
+                device_witness::Mult::Column(&cols[16]),
+                true,
+                column_length,
+                alphas,
+                z,
+            ),
+        ];
+        let (trace, claimed_sum) =
+            device_witness::finalize_device_raw_logup(column_length.ilog2(), columns);
+
+        if let Some(host_gen) = verify_host {
+            let (host_raw, _build_claim) = host_gen.write_interaction_trace(common_lookup_elements);
+            let (host_trace, host_sum) = host_raw.finalize_on_simd();
+            let mismatches = compare_interaction(
+                "verify_instruction",
+                &trace,
+                claimed_sum,
+                &host_trace,
+                host_sum,
+            );
+            assert_eq!(
+                mismatches, 0,
+                "STWO_CUDA_WITNESS_VERIFY: verify_instruction interaction differential failed"
+            );
+            eprintln!("STWO_CUDA_WITNESS_VERIFY: verify_instruction interaction columns + sums OK");
         }
 
         (trace, claimed_sum)

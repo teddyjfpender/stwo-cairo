@@ -24,11 +24,11 @@ use stwo_cairo_common::memory::{LARGE_MEMORY_VALUE_ID_BASE, N_M31_IN_SMALL_FELT2
 use stwo_cairo_common::prover_types::cpu::FELT252_N_WORDS;
 use stwo_cairo_common::prover_types::felt::split_f252_simd;
 use stwo_cairo_common::prover_types::simd::{PackedFelt252, SIMD_ENUMERATION_0};
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 use crate::witness::components::range_check_9_9;
 use crate::witness::prelude::*;
 use crate::witness::utils::AtomicMultiplicityColumn;
-use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 pub type InputType = M31;
 pub type PackedInputType = PackedM31;
@@ -381,7 +381,10 @@ fn gen_single_big_memory_trace(values: &[[u32; 8]], mults: &[PackedM31]) -> Vec<
 }
 
 // Generates the trace of the small value memory table.
-pub(crate) fn gen_small_memory_trace(values: Vec<u128>, mut mults: Vec<PackedM31>) -> Vec<BaseColumn> {
+pub(crate) fn gen_small_memory_trace(
+    values: Vec<u128>,
+    mut mults: Vec<PackedM31>,
+) -> Vec<BaseColumn> {
     assert_eq!(values.len(), mults.len() * N_LANES);
     let column_length = values.len().next_power_of_two();
 

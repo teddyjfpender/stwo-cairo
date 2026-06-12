@@ -80,11 +80,14 @@ pub fn prove_cairo<B, MC: MerkleChannel>(
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+    B: BackendForChannel<MC>
+        + FrameworkBackend
+        + FromSimdColumns
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + crate::witness::memory_witness_backend::MemoryAddressToIdWitness
+        + crate::witness::memory_witness_backend::VerifyInstructionWitness
         + 'static,
     MC: 'static,
 {
@@ -150,7 +153,9 @@ where
         let map = guard.get_or_insert_with(HashMap::new);
         let ptr = *map.entry(key).or_insert_with(|| {
             let tree = B::precompute_twiddles(
-                CanonicCoset::new(max_domain_log_size).circle_domain().half_coset,
+                CanonicCoset::new(max_domain_log_size)
+                    .circle_domain()
+                    .half_coset,
             );
             Box::leak(Box::new(tree)) as *const _ as usize
         });
@@ -233,11 +238,14 @@ pub fn prove_cairo_with_precompute<'a, B, MC: MerkleChannel>(
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+    B: BackendForChannel<MC>
+        + FrameworkBackend
+        + FromSimdColumns
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + crate::witness::memory_witness_backend::MemoryAddressToIdWitness
+        + crate::witness::memory_witness_backend::VerifyInstructionWitness
         + 'static,
     MC: 'static,
 {
@@ -274,11 +282,14 @@ fn prove_cairo_common<'a, B, MC: MerkleChannel>(
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+    B: BackendForChannel<MC>
+        + FrameworkBackend
+        + FromSimdColumns
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + crate::witness::memory_witness_backend::MemoryAddressToIdWitness
+        + crate::witness::memory_witness_backend::VerifyInstructionWitness
         + 'static,
     MC: 'static,
 {
@@ -761,11 +772,9 @@ pub mod tests {
             verify_cairo::<Blake2sMerkleChannel>(cuda_proof.clone().into()).unwrap();
 
             // The decisive gate: byte-identical to the reference backend's proof.
-            let simd_proof = prove_cairo::<SimdBackend, Blake2sMerkleChannel>(
-                run_input(),
-                prover_params(),
-            )
-            .unwrap();
+            let simd_proof =
+                prove_cairo::<SimdBackend, Blake2sMerkleChannel>(run_input(), prover_params())
+                    .unwrap();
             let mut cuda_felts: Vec<starknet_ff::FieldElement> = Vec::new();
             CairoSerialize::serialize(&cuda_proof, &mut cuda_felts);
             let mut simd_felts: Vec<starknet_ff::FieldElement> = Vec::new();

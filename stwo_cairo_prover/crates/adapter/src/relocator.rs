@@ -62,8 +62,10 @@ impl Relocator {
                             let mut relocated_value = [0; 8];
                             match val {
                                 MaybeRelocatable::RelocatableValue(addr) => {
-                                    relocated_value[0] = self
-                                        .calc_relocated_addr(addr.segment_index as usize, addr.offset)
+                                    relocated_value[0] = self.calc_relocated_addr(
+                                        addr.segment_index as usize,
+                                        addr.offset,
+                                    )
                                 }
                                 MaybeRelocatable::Int(val) => {
                                     relocated_value = bytemuck::cast(val.to_bytes_le())

@@ -2,13 +2,13 @@
 
 #![allow(unused_parens)]
 use cairo_air::components::verify_instruction::{Claim, InteractionClaim, N_TRACE_COLUMNS};
+use stwo::core::fields::qm31::SecureField;
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 use crate::witness::components::{
     memory_address_to_id, memory_id_to_big, range_check_4_3, range_check_7_2_5,
 };
 use crate::witness::prelude::*;
-use stwo::core::fields::qm31::SecureField;
-use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 pub type InputType = (M31, [M31; 3], [M31; 2], M31);
 pub type PackedInputType = (PackedM31, [PackedM31; 3], [PackedM31; 2], PackedM31);
@@ -23,17 +23,9 @@ impl ClaimGenerator {
         Self::default()
     }
 
-    pub fn write_trace(
-        self,
-        range_check_7_2_5_state: &range_check_7_2_5::ClaimGenerator,
-        range_check_4_3_state: &range_check_4_3::ClaimGenerator,
-        memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
-        memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
-    ) -> (
-        ComponentTrace<N_TRACE_COLUMNS>,
-        Claim,
-        InteractionClaimGenerator,
-    ) {
+    /// The sorted, padded (inputs, mults) vectors the trace is written from —
+    /// shared by the host writer and the device path (which uploads them).
+    pub(crate) fn into_parts(self) -> (Vec<InputType>, Vec<M31>) {
         let mut inputs_mults = self
             .mults
             .iter()
@@ -47,10 +39,25 @@ impl ClaimGenerator {
         let n_rows = inputs.len();
         assert_ne!(n_rows, 0);
         let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
-        let log_size = size.ilog2();
 
         inputs.resize(size, *inputs.first().unwrap());
         mults.resize(size, M31::zero());
+        (inputs, mults)
+    }
+
+    pub fn write_trace(
+        self,
+        range_check_7_2_5_state: &range_check_7_2_5::ClaimGenerator,
+        range_check_4_3_state: &range_check_4_3::ClaimGenerator,
+        memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
+        memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
+    ) -> (
+        ComponentTrace<N_TRACE_COLUMNS>,
+        Claim,
+        InteractionClaimGenerator,
+    ) {
+        let (inputs, mults) = self.into_parts();
+        let log_size = inputs.len().ilog2();
 
         let packed_inputs = pack_values(&inputs);
         let packed_mults = pack_values(&mults);
@@ -127,7 +134,7 @@ impl AddInputs for ClaimGenerator {
 }
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
-struct SubComponentInputs {
+pub(crate) struct SubComponentInputs {
     range_check_7_2_5: [Vec<range_check_7_2_5::PackedInputType>; 1],
     range_check_4_3: [Vec<range_check_4_3::PackedInputType>; 1],
     memory_address_to_id: [Vec<memory_address_to_id::PackedInputType>; 1],
@@ -138,7 +145,7 @@ struct SubComponentInputs {
 #[allow(unused_variables)]
 #[allow(clippy::double_parens)]
 #[allow(non_snake_case)]
-fn write_trace_simd(
+pub(crate) fn write_trace_simd(
     inputs: Vec<PackedInputType>,
     mults: Vec<Vec<PackedM31>>,
     range_check_7_2_5_state: &range_check_7_2_5::ClaimGenerator,
@@ -324,7 +331,7 @@ fn write_trace_simd(
 }
 
 #[derive(Uninitialized, IterMut, ParIterMut)]
-struct LookupData {
+pub(crate) struct LookupData {
     range_check_7_2_5_0: Vec<[PackedM31; 4]>,
     range_check_4_3_1: Vec<[PackedM31; 3]>,
     memory_address_to_id_2: Vec<[PackedM31; 3]>,
@@ -335,8 +342,8 @@ struct LookupData {
 }
 
 pub struct InteractionClaimGenerator {
-    log_size: u32,
-    lookup_data: LookupData,
+    pub(crate) log_size: u32,
+    pub(crate) lookup_data: LookupData,
 }
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
@@ -392,6 +399,8 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }
