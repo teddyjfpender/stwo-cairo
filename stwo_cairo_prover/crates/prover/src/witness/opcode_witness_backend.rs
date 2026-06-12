@@ -38,9 +38,11 @@ use cairo_air::components::ret_opcode::{Claim as RetClaim, N_TRACE_COLUMNS as RE
 use cairo_air::relations::{
     CommonLookupElements, MEMORY_ADDRESS_TO_ID_RELATION_ID, MEMORY_ID_TO_BIG_RELATION_ID,
 };
+use rayon::prelude::*;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::circle::CanonicCoset;
+use stwo::prover::backend::simd::m31::PackedM31;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Column, FromSimdColumns};
 use stwo::prover::poly::circle::CircleEvaluation;
@@ -694,7 +696,7 @@ impl OpcodeWitness for CudaBackend {
         // so we reuse `decode_add_small_row`.
         let (big_values, small_values) = memory_id_to_big.value_tables();
         let m31 = M31::from;
-        for state in &inputs {
+        inputs.par_iter().for_each(|state| {
             let decoded =
                 decode_add_small_row(state, memory_address_to_id, big_values, small_values);
             AddInputs::add_input(
@@ -713,7 +715,7 @@ impl OpcodeWitness for CudaBackend {
             AddInputs::add_input(memory_id_to_big, &decoded.dst_id, 0);
             AddInputs::add_input(memory_id_to_big, &decoded.op0_id, 0);
             AddInputs::add_input(memory_id_to_big, &decoded.op1_id, 0);
-        }
+        });
 
         let verify_host = verify_inputs.map(|raw_inputs| {
             let mut padded = raw_inputs;
@@ -731,7 +733,6 @@ impl OpcodeWitness for CudaBackend {
             // Feed differential: the values this path fed host-side must match
             // the writer's sub_component_inputs buffers element-for-element.
             {
-                use stwo::prover::backend::simd::m31::PackedM31;
                 let unpack = |cols: &[PackedM31]| -> Vec<M31> {
                     cols.iter().flat_map(|p| p.to_array()).collect()
                 };
@@ -983,7 +984,7 @@ impl OpcodeWitness for CudaBackend {
         // the three small reads at the derived addresses.
         let (big_values, small_values) = memory_id_to_big.value_tables();
         let m31 = M31::from;
-        for state in &inputs {
+        inputs.par_iter().for_each(|state| {
             let decoded =
                 decode_add_small_row(state, memory_address_to_id, big_values, small_values);
             AddInputs::add_input(
@@ -1002,7 +1003,7 @@ impl OpcodeWitness for CudaBackend {
             AddInputs::add_input(memory_id_to_big, &decoded.dst_id, 0);
             AddInputs::add_input(memory_id_to_big, &decoded.op0_id, 0);
             AddInputs::add_input(memory_id_to_big, &decoded.op1_id, 0);
-        }
+        });
 
         let verify_host = verify_inputs.map(|raw_inputs| {
             let mut padded = raw_inputs;
@@ -1020,7 +1021,6 @@ impl OpcodeWitness for CudaBackend {
             // Feed differential: the values this path fed host-side must match
             // the writer's sub_component_inputs buffers element-for-element.
             {
-                use stwo::prover::backend::simd::m31::PackedM31;
                 let unpack = |cols: &[PackedM31]| -> Vec<M31> {
                     cols.iter().flat_map(|p| p.to_array()).collect()
                 };
@@ -1286,7 +1286,7 @@ impl OpcodeWitness for CudaBackend {
         // Sub-component feeds, host-side over the padded inputs — identical
         // values and counts to the writer's sub_component_inputs loops.
         let m31 = M31::from;
-        for state in &inputs {
+        inputs.par_iter().for_each(|state| {
             AddInputs::add_input(
                 verify_instruction,
                 &(
@@ -1305,7 +1305,7 @@ impl OpcodeWitness for CudaBackend {
             AddInputs::add_input(memory_address_to_id, &addr1, 0);
             AddInputs::add_input(memory_id_to_big, &id0, 0);
             AddInputs::add_input(memory_id_to_big, &id1, 0);
-        }
+        });
 
         let verify_host = verify_inputs.map(|raw_inputs| {
             let mut padded = raw_inputs;
@@ -1323,7 +1323,6 @@ impl OpcodeWitness for CudaBackend {
             // Feed differential: the values this path fed host-side must match
             // the writer's sub_component_inputs buffers element-for-element.
             {
-                use stwo::prover::backend::simd::m31::PackedM31;
                 let unpack = |cols: &[PackedM31]| -> Vec<M31> {
                     cols.iter().flat_map(|p| p.to_array()).collect()
                 };
@@ -1561,28 +1560,20 @@ impl OpcodeWitness for CudaBackend {
             column_length,
         );
 
-        // Per-row host decode of the instruction / dst / next_pc felts, mirroring
-        // the writer's `memory_id_to_big_state.deduce_output(...).get_m31(j)`.
-        use stwo::prover::backend::simd::m31::PackedM31;
+        // Per-row host decode of the instruction / dst / next_pc felts via the
+        // scalar raw-table reader (value-identical to deduce_output, without
+        // the 16-lane packed broadcast).
         let m31 = M31::from;
-        let decode_limb = |id: M31, j: usize| -> M31 {
-            memory_id_to_big
-                .deduce_output(PackedM31::broadcast(id))
-                .get_m31(j)
-                .to_array()[0]
-        };
+        let (big_values, small_values) = memory_id_to_big.value_tables();
 
         // Sub-component feeds, host-side over the padded inputs — identical
         // values and counts to the writer's sub_component_inputs loops.
-        for state in &inputs {
+        inputs.par_iter().for_each(|state| {
             // Decode Instruction at pc.
             let instr_id = memory_address_to_id.get_id(state.pc);
-            let il1 = decode_limb(instr_id, 1);
-            let il5 = decode_limb(instr_id, 5);
-            let il6 = decode_limb(instr_id, 6);
-            let il0 = decode_limb(instr_id, 0);
-            let offset0 = m31(il0.0 + ((il1.0 & 127) << 9));
-            let flags = (il5.0 >> 3) + (il6.0 << 6);
+            let il = id_to_limbs(instr_id, big_values, small_values);
+            let offset0 = m31(il[0].0 + ((il[1].0 & 127) << 9));
+            let flags = (il[5].0 >> 3) + (il[6].0 << 6);
             let dst_base_fp = m31((flags >> 0) & 1);
             let ap_update_add_1 = m31((flags >> 11) & 1);
             let vi_off1 = ((dst_base_fp * m31(8)) + m31(16)) + m31(32);
@@ -1610,7 +1601,7 @@ impl OpcodeWitness for CudaBackend {
             let next_pc_id = memory_address_to_id.get_id(next_pc_addr);
             AddInputs::add_input(memory_address_to_id, &next_pc_addr, 0);
             AddInputs::add_input(memory_id_to_big, &next_pc_id, 0);
-        }
+        });
 
         let verify_host = verify_inputs.map(|raw_inputs| {
             let mut padded = raw_inputs;
@@ -1641,12 +1632,9 @@ impl OpcodeWitness for CudaBackend {
                 let npc_id_feed = unpack(&host_feeds.memory_id_to_big[1]);
                 for (i, state) in padded.iter().enumerate() {
                     let instr_id = memory_address_to_id.get_id(state.pc);
-                    let il0 = decode_limb(instr_id, 0);
-                    let il1 = decode_limb(instr_id, 1);
-                    let il5 = decode_limb(instr_id, 5);
-                    let il6 = decode_limb(instr_id, 6);
-                    let offset0 = m31(il0.0 + ((il1.0 & 127) << 9));
-                    let flags = (il5.0 >> 3) + (il6.0 << 6);
+                    let il = id_to_limbs(instr_id, big_values, small_values);
+                    let offset0 = m31(il[0].0 + ((il[1].0 & 127) << 9));
+                    let flags = (il[5].0 >> 3) + (il[6].0 << 6);
                     let dst_base_fp = m31((flags >> 0) & 1);
                     let mem_dst_base =
                         (dst_base_fp * state.fp) + ((m31(1) - dst_base_fp) * state.ap);
@@ -1898,7 +1886,7 @@ impl OpcodeWitness for CudaBackend {
         // twice (dst / op1 reads); it does NOT feed memory_id_to_big.
         let (big_values, small_values) = memory_id_to_big.value_tables();
         let m31 = M31::from;
-        for state in &inputs {
+        inputs.par_iter().for_each(|state| {
             let decoded =
                 decode_assert_eq_row(state, memory_address_to_id, big_values, small_values);
             AddInputs::add_input(
@@ -1913,7 +1901,7 @@ impl OpcodeWitness for CudaBackend {
             );
             AddInputs::add_input(memory_address_to_id, &decoded.dst_addr, 0);
             AddInputs::add_input(memory_address_to_id, &decoded.op1_addr, 0);
-        }
+        });
 
         let verify_host = verify_inputs.map(|raw_inputs| {
             let mut padded = raw_inputs;
@@ -1931,7 +1919,6 @@ impl OpcodeWitness for CudaBackend {
             // Feed differential: the values this path fed host-side must match
             // the writer's sub_component_inputs buffers element-for-element.
             {
-                use stwo::prover::backend::simd::m31::PackedM31;
                 let unpack = |cols: &[PackedM31]| -> Vec<M31> {
                     cols.iter().flat_map(|p| p.to_array()).collect()
                 };
@@ -2146,7 +2133,7 @@ impl OpcodeWitness for CudaBackend {
         // instruction shape is fixed: the verify_instruction tuple is all
         // constants (except pc), and the three reads are at ap, ap+1, pc+1.
         let m31 = M31::from;
-        for state in &inputs {
+        inputs.par_iter().for_each(|state| {
             AddInputs::add_input(
                 verify_instruction,
                 &(
@@ -2169,7 +2156,7 @@ impl OpcodeWitness for CudaBackend {
             AddInputs::add_input(memory_id_to_big, &fp_id, 0);
             AddInputs::add_input(memory_id_to_big, &ret_pc_id, 0);
             AddInputs::add_input(memory_id_to_big, &dist_id, 0);
-        }
+        });
 
         let verify_host = verify_inputs.map(|raw_inputs| {
             let mut padded = raw_inputs;
@@ -2187,7 +2174,6 @@ impl OpcodeWitness for CudaBackend {
             // Feed differential: the values this path fed host-side must match
             // the writer's sub_component_inputs buffers element-for-element.
             {
-                use stwo::prover::backend::simd::m31::PackedM31;
                 let unpack = |cols: &[PackedM31]| -> Vec<M31> {
                     cols.iter().flat_map(|p| p.to_array()).collect()
                 };
