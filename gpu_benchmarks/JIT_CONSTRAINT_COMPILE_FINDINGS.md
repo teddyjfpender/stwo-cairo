@@ -132,6 +132,36 @@ without observability — this cost real diagnosis time. `STWO_JIT_LOG=1` exists
   v0.14 simple-bootloader path runs them unchanged. pie_bench at stwo-cairo
   7159d6ef; STWO_CUDA_JIT_SKIP at stwo 26a2fca4 (pinned at dae13425).
 
+## 4b. UPDATE (round 13e, H100 validation) — codegen is a SECOND bottleneck
+
+Implemented + validated the parallel pre-compile (stwo d807e7a4; prelude in
+`compute_composition_polynomial` + `stwo_cuda_jit_compile` FFI that compiles
+outside the cache mutex). Result: **the parallel COMPILE works — 28 of ~29
+kernels compiled in ~111 s vs ~60 min sequential**, and the full set (46 PTX,
+incl. partial_ec_mul) warmed in ~14 min. Complete sm_90 PTX seed harvested:
+`stwo-things/ptx-seed-sm90-complete-46.tar.gz` (the pre-bake artifact).
+
+BUT a warm-cache traced prove (cache hot, zero NVRTC) still spent ~15-30 min
+**single-threaded in composition before the eval loop even started** (lanes=0,
+1 running thread, GPU idle, only ~10 cache-hit "ready in" lines). So the
+residual cost is NOT compilation — it is the Rust-side **lowering/codegen**
+(`lower_framework_eval_to_v1_with_logup` + `compile_v1_to_cuda_source`), which:
+- is single-threaded and expensive for the constraint-heavy components
+  (partial_ec_mul / pedersen / poseidon: thousands of symbolic constraint ops);
+- runs **every prove** (it computes the semantic hash that keys the PTX cache),
+  so even pre-baked PTX does NOT avoid it;
+- was **doubled** by the always-on prelude (codegen in the prelude AND again in
+  the lazy eval lane). The prelude is now gated behind
+  `STWO_CUDA_PARALLEL_JIT_WARMUP` (default OFF, stwo 7232f49a) so the default
+  warm path is unregressed.
+
+**NEW #1 fix: cache the lowered program per component** (key on the component's
+type + structural params, stable across proves) so codegen runs ONCE — reused
+by both the prelude and the eval lane, and across all proves/PIEs. This is what
+actually makes warm SN-PIE proving fast; the parallel-compile + PTX-seed work
+only addressed the (separate) NVRTC cost. No warm SN-PIE MHz number yet — the
+codegen bottleneck blocks it; it is the immediate next task.
+
 ## 5. The plan from here
 
 1. Land a clean WARM-cache baseline number for the four PIEs (skip the
