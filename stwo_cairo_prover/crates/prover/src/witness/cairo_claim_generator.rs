@@ -7,6 +7,7 @@ use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
 use cairo_air::components::add_opcode::InteractionClaim as AddInteractionClaim;
 use cairo_air::components::add_opcode_small::InteractionClaim as AddSmallInteractionClaim;
 use cairo_air::components::assert_eq_opcode::InteractionClaim as AssertEqInteractionClaim;
+use cairo_air::components::assert_eq_opcode_imm::InteractionClaim as AssertEqImmInteractionClaim;
 use cairo_air::components::call_opcode_rel_imm::InteractionClaim as CallRelImmInteractionClaim;
 use cairo_air::components::jnz_opcode_taken::InteractionClaim as JnzTakenInteractionClaim;
 use cairo_air::components::memory_address_to_id::InteractionClaim as MemoryAddrInteractionClaim;
@@ -781,7 +782,8 @@ impl CairoClaimGenerator {
             || self.add_opcode_small.is_some()
             || self.jnz_opcode_taken.is_some()
             || self.call_opcode_rel_imm.is_some()
-            || self.assert_eq_opcode.is_some())
+            || self.assert_eq_opcode.is_some()
+            || self.assert_eq_opcode_imm.is_some())
         .then(|| {
             B::build_mem_tables(
                 self.memory_address_to_id.as_ref().unwrap(),
@@ -839,14 +841,13 @@ impl CairoClaimGenerator {
             }
             if let Some(gen) = self.assert_eq_opcode_imm {
                 s.spawn(|_| {
-                    assert_eq_opcode_imm_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                            self.memory_address_to_id.as_ref().unwrap(),
-                            self.memory_id_to_big.as_ref().unwrap(),
-                            self.verify_instruction.as_ref().unwrap(),
-                        );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
-                    });
+                    assert_eq_opcode_imm_result = Some(B::write_assert_eq_imm_trace(
+                        gen,
+                        opcode_mem_tables.as_ref().unwrap(),
+                        self.memory_address_to_id.as_ref().unwrap(),
+                        self.memory_id_to_big.as_ref().unwrap(),
+                        self.verify_instruction.as_ref().unwrap(),
+                    ));
                 });
             }
             if let Some(gen) = self.assert_eq_opcode_double_deref {
@@ -1835,7 +1836,7 @@ pub struct CairoInteractionClaimGenerator<
     pub add_opcode_small: Option<<B as OpcodeWitness>::AddSmallInteractionGen>,
     pub add_ap_opcode: Option<add_ap_opcode::InteractionClaimGenerator>,
     pub assert_eq_opcode: Option<<B as OpcodeWitness>::AssertEqInteractionGen>,
-    pub assert_eq_opcode_imm: Option<assert_eq_opcode_imm::InteractionClaimGenerator>,
+    pub assert_eq_opcode_imm: Option<<B as OpcodeWitness>::AssertEqImmInteractionGen>,
     pub assert_eq_opcode_double_deref:
         Option<assert_eq_opcode_double_deref::InteractionClaimGenerator>,
     pub blake_compress_opcode: Option<blake_compress_opcode::InteractionClaimGenerator>,
@@ -2035,9 +2036,8 @@ where
             }
             if let Some(gen) = self.assert_eq_opcode_imm {
                 s.spawn(|_| {
-                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
-                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                    assert_eq_opcode_imm_result = Some((trace, claimed_sum, build_claim));
+                    assert_eq_opcode_imm_result =
+                        Some(B::write_assert_eq_imm_interaction(gen, common_lookup_elements));
                 });
             }
             if let Some(gen) = self.assert_eq_opcode_double_deref {
@@ -2497,9 +2497,9 @@ where
                 AssertEqInteractionClaim { claimed_sum }
             });
         let assert_eq_opcode_imm_interaction_claim =
-            assert_eq_opcode_imm_result.map(|(trace, claimed_sum, build_claim)| {
+            assert_eq_opcode_imm_result.map(|(trace, claimed_sum)| {
                 evals.extend(trace);
-                build_claim(claimed_sum)
+                AssertEqImmInteractionClaim { claimed_sum }
             });
         let assert_eq_opcode_double_deref_interaction_claim = assert_eq_opcode_double_deref_result
             .map(|(trace, claimed_sum, build_claim)| {
