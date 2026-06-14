@@ -37,7 +37,7 @@ stwo-cairo-serialize = { path = "../cairo-serialize", version = "~1.2.2" }
 cairo-air = { path = "../cairo-air", version = "~1.2.2" }
 stwo = { workspace = true, features = ["parallel", "prover"] }
 stwo-backend-cuda.workspace = true
-stwo-backend-cuda-kernels = { git = "https://github.com/teddyjfpender/stwo", rev = "d52454fe6d1003082f284506e34aafd061d14f73" }
+stwo-backend-cuda-kernels = { git = "https://github.com/teddyjfpender/stwo", rev = "26a2fca4" }
 stwo-constraint-framework = { workspace = true, features = ["parallel", "prover"] }
 cairo-vm.workspace = true
 libc = "0.2"
@@ -57,7 +57,7 @@ getrandom_v2 = { version = "0.2", package = "getrandom", features = ["js"] }
 getrandom_v3 = { version = "0.3", package = "getrandom", features = ["wasm_js"] }
 
 [dev-dependencies]
-stwo-backend-cuda-kernels = { git = "https://github.com/teddyjfpender/stwo", rev = "d52454fe6d1003082f284506e34aafd061d14f73" }
+stwo-backend-cuda-kernels = { git = "https://github.com/teddyjfpender/stwo", rev = "26a2fca4" }
 stwo-cairo-dev-utils = { path = "../dev_utils" }
 generic-tests = "0.1.3"
 tempfile = "3.19.1"
