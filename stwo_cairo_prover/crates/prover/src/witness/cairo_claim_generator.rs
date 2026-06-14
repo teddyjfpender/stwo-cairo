@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use cairo_air::air::PublicData;
 use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
+use cairo_air::components::add_ap_opcode::InteractionClaim as AddApInteractionClaim;
 use cairo_air::components::add_opcode::InteractionClaim as AddInteractionClaim;
 use cairo_air::components::add_opcode_small::InteractionClaim as AddSmallInteractionClaim;
 use cairo_air::components::assert_eq_opcode::InteractionClaim as AssertEqInteractionClaim;
@@ -781,6 +782,7 @@ impl CairoClaimGenerator {
         let opcode_mem_tables = (self.ret_opcode.is_some()
             || self.add_opcode.is_some()
             || self.add_opcode_small.is_some()
+            || self.add_ap_opcode.is_some()
             || self.jnz_opcode_taken.is_some()
             || self.call_opcode_rel_imm.is_some()
             || self.assert_eq_opcode.is_some()
@@ -818,16 +820,15 @@ impl CairoClaimGenerator {
             }
             if let Some(gen) = self.add_ap_opcode {
                 s.spawn(|_| {
-                    add_ap_opcode_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                            self.memory_address_to_id.as_ref().unwrap(),
-                            self.memory_id_to_big.as_ref().unwrap(),
-                            self.verify_instruction.as_ref().unwrap(),
-                            self.range_check_18.as_ref().unwrap(),
-                            self.range_check_11.as_ref().unwrap(),
-                        );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
-                    });
+                    add_ap_opcode_result = Some(B::write_add_ap_trace(
+                        gen,
+                        opcode_mem_tables.as_ref().unwrap(),
+                        self.memory_address_to_id.as_ref().unwrap(),
+                        self.memory_id_to_big.as_ref().unwrap(),
+                        self.verify_instruction.as_ref().unwrap(),
+                        self.range_check_18.as_ref().unwrap(),
+                        self.range_check_11.as_ref().unwrap(),
+                    ));
                 });
             }
             if let Some(gen) = self.assert_eq_opcode {
@@ -1835,7 +1836,7 @@ pub struct CairoInteractionClaimGenerator<
 > {
     pub add_opcode: Option<<B as OpcodeWitness>::AddOpcodeInteractionGen>,
     pub add_opcode_small: Option<<B as OpcodeWitness>::AddSmallInteractionGen>,
-    pub add_ap_opcode: Option<add_ap_opcode::InteractionClaimGenerator>,
+    pub add_ap_opcode: Option<<B as OpcodeWitness>::AddApInteractionGen>,
     pub assert_eq_opcode: Option<<B as OpcodeWitness>::AssertEqInteractionGen>,
     pub assert_eq_opcode_imm: Option<<B as OpcodeWitness>::AssertEqImmInteractionGen>,
     pub assert_eq_opcode_double_deref:
@@ -2024,9 +2025,8 @@ where
             }
             if let Some(gen) = self.add_ap_opcode {
                 s.spawn(|_| {
-                    let (raw, build_claim) = gen.write_interaction_trace(common_lookup_elements);
-                    let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                    add_ap_opcode_result = Some((trace, claimed_sum, build_claim));
+                    add_ap_opcode_result =
+                        Some(B::write_add_ap_interaction(gen, common_lookup_elements));
                 });
             }
             if let Some(gen) = self.assert_eq_opcode {
@@ -2486,11 +2486,10 @@ where
                 evals.extend(trace);
                 AddSmallInteractionClaim { claimed_sum }
             });
-        let add_ap_opcode_interaction_claim =
-            add_ap_opcode_result.map(|(trace, claimed_sum, build_claim)| {
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let add_ap_opcode_interaction_claim = add_ap_opcode_result.map(|(trace, claimed_sum)| {
+            evals.extend(trace);
+            AddApInteractionClaim { claimed_sum }
+        });
         let assert_eq_opcode_interaction_claim =
             assert_eq_opcode_result.map(|(trace, claimed_sum)| {
                 evals.extend(trace);
