@@ -149,11 +149,16 @@ fn main() {
     } else {
         0.0
     };
+    // True high-water mark of reserved VRAM (peak, not end-of-run footprint).
+    // With low-memory mode ON this should drop relative to OFF; the trim at the
+    // spill point releases the spilled buffers back to the OS.
+    let peak_vram_gb = stwo_backend_cuda::gpu_peak_vram_bytes() as f64 / 1e9;
     println!(
         "{{\"pie\":\"{pie_path}\",\"backend\":\"{backend}\",\"cycle_count\":{cycle_count},\
          \"vm_s\":{vm_s:.3},\"adapt_s\":{adapt_s:.3},\"prove_s_cold\":{cold:.3},\
          \"prove_s_warm\":{warm:.3},\"verify_ms\":{verify_ms:.1},\"proof_kb\":{:.1},\
-         \"peak_rss_gb\":{:.2},\"vram_gb\":{vram_gb:.2},\"steps_per_s\":{:.0},\"mhz\":{:.3}}}",
+         \"peak_rss_gb\":{:.2},\"vram_gb\":{vram_gb:.2},\"peak_vram_gb\":{peak_vram_gb:.2},\
+         \"steps_per_s\":{:.0},\"mhz\":{:.3}}}",
         proof_size as f64 / 1024.0,
         peak_rss_gb(),
         cycle_count as f64 / warm,
