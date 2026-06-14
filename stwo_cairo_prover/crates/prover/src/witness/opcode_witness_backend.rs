@@ -1015,14 +1015,14 @@ fn add_opcode_device_path_enabled() -> bool {
         && std::env::var("STWO_CUDA_ADD_OPCODE_WITNESS").as_deref() != Ok("0")
 }
 
-/// DEFAULT-OFF (opt-in `== Ok("1")`), unlike the other ported opcodes: add_ap is
-/// the first port that feeds the range checks, so it ships behind an explicit
-/// kill switch until it is hardware-validated via the `STWO_CUDA_WITNESS_VERIFY`
-/// differential + the Cairo e2e byte-equality gate. Set
-/// `STWO_CUDA_ADD_AP_WITNESS=1` to enable the device path.
+/// Default-on (`!= Ok("0")`), like the other ported opcodes: validated on a 3090
+/// (sm_86) via `test_prove_verify_all_opcode_components_cuda` +
+/// `STWO_CUDA_WITNESS_VERIFY=1` — add_ap (the first port feeding the range checks)
+/// had trace + interaction columns + sums byte-identical to the host reference and
+/// the Cairo e2e proof verified. `STWO_CUDA_ADD_AP_WITNESS=0` disables it.
 fn add_ap_device_path_enabled() -> bool {
     stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT
-        && std::env::var("STWO_CUDA_ADD_AP_WITNESS").as_deref() == Ok("1")
+        && std::env::var("STWO_CUDA_ADD_AP_WITNESS").as_deref() != Ok("0")
 }
 
 fn jnz_taken_device_path_enabled() -> bool {
