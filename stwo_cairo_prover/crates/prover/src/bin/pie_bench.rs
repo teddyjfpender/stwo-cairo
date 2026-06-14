@@ -122,16 +122,14 @@ fn main() {
     let mut times = Vec::new();
     let mut proof_size = 0usize;
     let mut verify_ms = 0.0f64;
+    // rep 0 consumes the input already prepared above (NO clone — a multi-M-step
+    // ProverInput holds the whole memory table, several GB; cloning it serially
+    // is pure waste). Warm reps re-run the VM fresh.
+    let mut prepared = Some(input);
     for rep in 0..reps {
-        // Re-run the VM per rep like gpu_bench (keeps host memory bounded at
-        // PIE scale; the first run's input is reused for rep 0).
-        let input = if rep == 0 {
-            input.clone()
-        } else {
-            run_pie(&pie_path).0
-        };
+        let rep_input = prepared.take().unwrap_or_else(|| run_pie(&pie_path).0);
         let start = Instant::now();
-        let proof = prove_once(input);
+        let proof = prove_once(rep_input);
         let elapsed = start.elapsed().as_secs_f64();
         times.push(elapsed);
         if rep == 0 {
