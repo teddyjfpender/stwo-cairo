@@ -1,5 +1,50 @@
 # Round 13 specification — Starknet PIEs become the benchmark; the measured road from 4.5 to 10 MHz
 
+## REPRIORITIZED 2026-06-14 (measured on H100 with the 4 `stwo-things/SN_PIEs/`)
+
+The four SN_PIEs (Starknet OS, 7.7M–14.6M steps, keccak=ecdsa=0) run end-to-end
+on the existing simple-bootloader path; bootloader inflation is only ~+1.6%.
+A live span trace of the first GPU prove found the real bottleneck — and it is
+NOT what items A–C below assumed:
+
+1. **#1 — JIT constraint-kernel compile is the blocker.** Every one of the 29
+   components (all opcodes AND all builtins: pedersen, poseidon, range_check,
+   ec_op, partial_ec_mul, bitwise) evaluates constraints on the GPU **JIT lane**
+   (`backend-cuda/src/backend/jit/`); ZERO fall back to CPU. But the JIT
+   compiles one fused NVRTC kernel per component on first use, cached on disk at
+   `$HOME/.cache/stwo-jit/sm{arch}_{hash}.ptx` keyed by AIR-content hash. The
+   first prove on a cold cache stalls ~30 min single-threaded, GPU idle —
+   dominated by a FEW giant kernels (`partial_ec_mul_generic` alone = 20+ min
+   NVRTC; the EC double-and-add ladder is a huge straight-line program, and
+   NVRTC's optimizer is superlinear). NVRTC opts are bare (`runtime_jit.cu:102`,
+   no opt-level). fib never hit this (few simple components). The cache is shared
+   across all 4 PIEs and every Starknet block.
+   FIX (do first, it gates everything): (a) **pre-bake** the component PTX into
+   the pod image — compile the ~29 kernels once offline (a warmup run or a build
+   step), ship the `.ptx`, so production cold proves pay ZERO NVRTC; (b)
+   **parallelize** the NVRTC compiles (currently sequential); (c) shipped stopgap
+   `STWO_CUDA_JIT_SKIP=<names>` (stwo 26a2fca4) routes named giant/low-instance
+   components (e.g. partial_ec_mul_generic, 581 instances) to the cheap CPU lane
+   so a cold-cache prove completes in minutes. Consider also splitting the giant
+   components' kernels or lowering NVRTC opt for them.
+
+2. **#2 — host witness write is the steady-state lever.** With a warm cache the
+   PIE_2 prove is dominated by the ~38.6s "Write Base trace" (host witness gen
+   for the unported builtins + double_deref/imm/add_ap/mul opcodes). This is the
+   Item-C lane-port work, now ranked by SN-PIE counts (below). Interaction write
+   3.3s, all commits <1s each, composition (warm JIT) + FRI pending a warm-cache
+   measurement.
+
+3. Then items A–C below (A's bootloader is DONE; C is the witness ports, ranked
+   by the measured SN-PIE opcode/builtin counts in the memory note). Get a clean
+   warm-cache baseline number FIRST (deploy the skip-env or pre-bake), then port.
+
+Receipts: stwo-things/round13b_*.log. pie_bench clone fix at stwo-cairo 7159d6ef;
+skip-env at stwo 26a2fca4 (not yet pinned). Metal WIP parked in
+stwo-things/metal-wip-backup/.
+
+---
+
 *Authoritative work order. Process formalities unchanged (they have held for four
 rounds): local SIMD gates -> push + rev bump -> watchdogged pod round ->
 STWO_CUDA_WITNESS_VERIFY differential where applicable -> CUDA-vs-SIMD proof
