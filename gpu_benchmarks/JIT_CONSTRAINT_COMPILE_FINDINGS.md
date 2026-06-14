@@ -162,13 +162,70 @@ actually makes warm SN-PIE proving fast; the parallel-compile + PTX-seed work
 only addressed the (separate) NVRTC cost. No warm SN-PIE MHz number yet — the
 codegen bottleneck blocks it; it is the immediate next task.
 
+## 4c. UPDATE (round 13f, H100/sm_90) — the REAL bottleneck: load-time ptxas
+
+§4b's "codegen is the bottleneck" conclusion was **WRONG**, and this round's
+per-phase instrumentation proves it. I added a process-global codegen cache
+(stwo 930d3f02: cache CUDA source/name/PTX-key per (component, log_size); the
+eval lane reuses it, the prelude skips lowering on a hit) AND split timing for
+`lower` (recording + compaction) vs `source_gen` (`compile_v1_to_cuda_source`)
+vs module load. With a pre-seeded cache on SN_PIE_2 (STWO_JIT_LOG=1):
+
+- **Codegen is essentially free: `lower=0-2ms source_gen=0-2ms` for EVERY
+  component**, including the monsters (partial_ec_mul: 12625 base + 5503 ext
+  insts → still `lower=2ms source_gen=2ms`). So the codegen cache, while correct
+  and harmless, is NOT the fix. §4b mis-attributed the per-kernel "ready in" time
+  (which is the MODULE LOAD) to "codegen" because it had no phase split.
+
+- **The real cost is the CUDA driver assembling PTX→SASS (ptxas) inside
+  `cuModuleLoadDataEx`**, paid on EVERY cold process — even on a warm disk PTX
+  cache hit, because PTX is an IR and the driver JITs it at load. Measured
+  per-kernel `ready in` (SN_PIE_2, sm_90):
+
+  | kernel | load (ptxas) | source |
+  |---|---|---|
+  | (builtin) | **164 s** | disk PTX cache hit |
+  | (builtin) | 75 s | disk PTX |
+  | ec_op | 43 s | NVRTC |
+  | (builtin) | 37 s | disk PTX |
+  | (builtin) | 29 s | disk PTX |
+  | (next ~6 kernels) | 2.1 s → 0.5 s | mixed |
+  | **partial_ec_mul_generic** | **>24 min, never finished** | NVRTC |
+
+  ~350 s for the builtin family PLUS the partial_ec_mul marathon (>24 min of
+  ptxas for ONE kernel — the EC double-and-add ladder, 12625+5503 insts fully
+  inlined), GPU 100% idle throughout. THIS is the "15-30 min single-threaded
+  composition stall," and it is why a warm PTX seed did not help. After the top
+  5-6 monsters the load times fall off a cliff (~2 s and below).
+
+**partial_ec_mul is expensive on BOTH lanes** (round-13f, confirmed): routing it
+to CPU via `STWO_CUDA_JIT_SKIP=partial_ec_mul_generic` did not rescue the run —
+`accumulate_pointwise_cpu` then spent 8+ min on it (2^18-row blown-up domain ×
+the full ladder, even rayon-parallel). So a clean all-GPU warm SN-PIE number is
+**blocked on partial_ec_mul** until the cubin fix makes its (one-time) load fast;
+on CPU it dominates instead. No representative warm MHz this round — correctly
+deferred to the cubin-validation round (which bakes its cubin once anyway).
+
+**THE FIX (stwo b3d48fbb): cache CUBIN, not PTX.** Compile with a real arch
+(`--gpu-architecture=sm_XX`, not virtual `compute_XX`) and cache the final cubin
+via `nvrtcGetCUBIN`. `cuModuleLoadDataEx` on a cubin loads SASS directly — no
+JIT, milliseconds. The one-time ptxas cost moves into the (disk-cached, and
+prelude-parallelizable) compile. Cubins are arch-specific; the `sm%d%d` cache
+key already separates them per GPU. Implication: the pre-bake **seed must ship
+cubins** (per arch), not PTX — a PTX seed re-JITs on every load and is nearly
+worthless. The codegen cache (930d3f02) stays (cheap, helps long-running
+multi-prove processes) but is not load-bearing for the stall.
+
 ## 5. The plan from here
 
-1. Land a clean WARM-cache baseline number for the four PIEs (skip the
-   slow-compile EC/hash family to CPU, or finish one cold compile + harvest the
-   complete PTX seed). [round-13d, in flight]
-2. Implement fix #2 (parallel NVRTC) and/or #1 (pre-bake into image) — the
-   durable cold-start kill.
-3. Port the SN-PIE witness whales (fix #5, the round-12 lane recipe) to cut the
+1. **Validate the cubin cache on GPU** (next focused pod round): rebuild kernels
+   for sm_90 at b3d48fbb, compile once to populate cubins, then a fresh process
+   should load each monster in ms (vs 30-164s). Capture the cold-process
+   composition drop.
+2. **Re-bake the seed as CUBINs, per arch** (sm_86/89/90) and ship in the pod
+   image so cold production proves never pay ptxas. (Supersedes the PTX seed.)
+3. Land the first warm SN-PIE MHz number (rep1 = in-memory module cache; the
+   loader format does not affect it).
+4. Port the SN-PIE witness whales (fix #5, the round-12 lane recipe) to cut the
    38.6 s host write.
-4. Re-measure FRI/composition warm; THEN chase MHz on the real workload.
+5. Re-measure FRI/composition warm; THEN chase MHz on the real workload.
