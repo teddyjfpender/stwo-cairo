@@ -727,13 +727,14 @@ fn assert_eq_device_path_enabled() -> bool {
         && std::env::var("STWO_CUDA_ASSERT_EQ_WITNESS").as_deref() != Ok("0")
 }
 
-/// OPT-IN (`== Ok("1")`), unlike the other opcodes' default-on switches: the
-/// assert_eq_opcode_imm device path is freshly ported and not yet validated on
-/// real hardware, so it must not ship on by default. The differential
-/// (`STWO_CUDA_WITNESS_VERIFY`) + Cairo e2e byte-equality gate its promotion.
+/// Default-on (`!= Ok("0")`), like the other ported opcodes: validated on a
+/// 3090 (sm_86) via `test_prove_verify_all_opcode_components_cuda` with
+/// `STWO_CUDA_WITNESS_VERIFY=1` — device trace + interaction columns + sums were
+/// byte-identical to the host reference, and the Cairo e2e proof was byte-equal
+/// to SIMD. `STWO_CUDA_ASSERT_EQ_IMM_WITNESS=0` disables it (regression valve).
 fn assert_eq_imm_device_path_enabled() -> bool {
     stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT
-        && std::env::var("STWO_CUDA_ASSERT_EQ_IMM_WITNESS").as_deref() == Ok("1")
+        && std::env::var("STWO_CUDA_ASSERT_EQ_IMM_WITNESS").as_deref() != Ok("0")
 }
 
 fn call_rel_imm_device_path_enabled() -> bool {
