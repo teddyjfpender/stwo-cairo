@@ -886,14 +886,15 @@ fn assert_eq_imm_device_path_enabled() -> bool {
         && std::env::var("STWO_CUDA_ASSERT_EQ_IMM_WITNESS").as_deref() != Ok("0")
 }
 
-/// Default-OFF (opt-in `== Ok("1")`), unlike the validated opcodes: this is a
-/// freshly ported device path awaiting its hardware differential + e2e
-/// byte-equality gate. When disabled, `write_assert_eq_ddref_trace` falls back
-/// to the host SIMD writer (wrapped as the `Host` variant).
-/// `STWO_CUDA_ASSERT_EQ_DDEREF_WITNESS=1` opts in.
+/// Default-on (`!= Ok("0")`), like the other ported opcodes: validated on H100
+/// (sm_90) via `test_prove_verify_all_opcode_components_cuda` +
+/// `STWO_CUDA_WITNESS_VERIFY=1` — device trace + interaction columns + sums were
+/// byte-identical to the host reference, and the Cairo e2e proof verified. The
+/// 2-whale (imm+ddref) warm prove measured +9.6% vs both off on SN_PIE_2.
+/// `STWO_CUDA_ASSERT_EQ_DDEREF_WITNESS=0` disables it (regression valve).
 fn assert_eq_ddref_device_path_enabled() -> bool {
     stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT
-        && std::env::var("STWO_CUDA_ASSERT_EQ_DDEREF_WITNESS").as_deref() == Ok("1")
+        && std::env::var("STWO_CUDA_ASSERT_EQ_DDEREF_WITNESS").as_deref() != Ok("0")
 }
 
 fn call_rel_imm_device_path_enabled() -> bool {
