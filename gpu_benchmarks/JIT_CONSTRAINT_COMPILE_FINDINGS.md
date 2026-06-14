@@ -216,16 +216,42 @@ cubins** (per arch), not PTX — a PTX seed re-JITs on every load and is nearly
 worthless. The codegen cache (930d3f02) stays (cheap, helps long-running
 multi-prove processes) but is not load-bearing for the stall.
 
+## 4d. UPDATE (round 13g, H100/sm_90) — cubin fix VALIDATED + first warm number
+
+The cubin cache + ptxas opt control (stwo 5e27c30b: NVRTC->PTX + cuLink with
+`CU_JIT_OPTIMIZATION_LEVEL`, `-O1` for kernels with source >150KB, cached as
+`.cubin`) is validated end-to-end on SN_PIE_2 (7,833,306 cycles):
+
+- **ptxas opt control kills the bake blowup.** partial_ec_mul + 5 other EC/hash
+  kernels exceeded 150KB and baked at -O1; partial_ec_mul's cubin compiled in
+  ~2 min (vs >24 min, unbounded, at -O3). 6 of 50 kernels went -O1, the rest -O3.
+  Full cold bake of all 50 cubins: ~9.5 min (rep0 prove_s 575s includes it).
+- **cubin cache kills the load-time ptxas.** Fresh process with a warm disk cubin
+  cache: the kernels that took **164s / 75s / 37s as PTX now load in 3ms / 3ms /
+  2ms** (cuModuleLoadDataEx on a cubin = direct SASS load). ~50,000x. 50 cubins =
+  18 MB on disk (3.4 MB gzipped: `stwo-things/cubin-seed-sm90-complete.tar.gz`).
+- **Composition collapsed from 15-30 min to 1.9 s** ("Prove STARKs" span, incl.
+  FRI). The stall is GONE.
+
+**FIRST WARM SN-PIE NUMBERS (SN_PIE_2):**
+- warm (in-process repeat, all kernels on GPU): **18.4 s = 0.426 MHz**
+- cold process (warm disk cubin cache, production single-shot): **36.8 s = 0.213 MHz**
+- verify 16 ms, proof 2.99 MB, peak RSS ~30 GB, VRAM 44.5 GB.
+
+**The new bottleneck is the host witness write**, `Write Base trace = 28.8 s`
+(cold) / ~10 s (warm) — the unported builtins + opcodes (assert_eq_double_deref
+1.79M, assert_eq_imm, add_ap, mul_small, jump_rel_imm, mul, ...). Composition is
+no longer on the critical path. Item C (port the witness whales, the round-12
+lane recipe) is now THE lever toward higher MHz.
+
 ## 5. The plan from here
 
-1. **Validate the cubin cache on GPU** (next focused pod round): rebuild kernels
-   for sm_90 at b3d48fbb, compile once to populate cubins, then a fresh process
-   should load each monster in ms (vs 30-164s). Capture the cold-process
-   composition drop.
-2. **Re-bake the seed as CUBINs, per arch** (sm_86/89/90) and ship in the pod
-   image so cold production proves never pay ptxas. (Supersedes the PTX seed.)
-3. Land the first warm SN-PIE MHz number (rep1 = in-memory module cache; the
-   loader format does not affect it).
-4. Port the SN-PIE witness whales (fix #5, the round-12 lane recipe) to cut the
-   38.6 s host write.
-5. Re-measure FRI/composition warm; THEN chase MHz on the real workload.
+1. **Item C: port the SN-PIE witness whales** to cut the 28.8 s Write Base trace
+   — now the dominant cost. assert_eq_double_deref (1.79M, the new whale) first.
+2. **Re-bake the cubin seed per arch** (sm_86/89 in addition to sm_90) and ship
+   in the pod image so cold production proves load in ms with zero bake. The
+   sm_90 seed is harvested; sm_86/89 need a bake on those GPUs.
+3. Tune the 150KB opt-level threshold if any -O3 kernel still bakes slowly, and
+   consider feeding the instruction count from Rust instead of a source-size proxy.
+4. THEN chase MHz on the real workload (Item B device feeds / scheduler) once the
+   witness write is down.
