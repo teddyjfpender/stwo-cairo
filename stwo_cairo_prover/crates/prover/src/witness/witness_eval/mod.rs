@@ -192,6 +192,38 @@ pub trait WitnessEval {
         (id, value)
     }
 
+    // ---- Builtin-lane leaves (the fp256/EC family; opcode bodies never call these) --
+
+    /// The packed row index (`seq.packed_at(row_index)` — the iota column the builtin
+    /// writers read). SIMD: derived from `row_index` bit-identically to
+    /// `Seq::packed_at`. Recording: an `Input` read of the lane's designated iota slot
+    /// (the device lane feeds an iota column), or poison when no slot is configured.
+    fn iota(&mut self) -> Self::M31;
+
+    // ---- Computed deduces (G5 — the EC/blake deduce family) -----------------------
+    //
+    // Each hook mirrors ONE `witness/fast_deduction` signature exactly (host tuple
+    // shape), so emitted projections on the result compile natively on both
+    // evaluators. SIMD: the REAL fast_deduction call — byte-identical to the original
+    // writer by construction. Recording: an all-poison result + a `poison_ops` census
+    // entry — the honest, pinned manifest of what still needs a device implementation
+    // (a computed-deduce ISA op backed by `ec_ops.cuh`, or device-to-device feeding).
+
+    /// `PackedPartialEcMulWindowBits18::deduce_output` (fast_deduction/pedersen.rs):
+    /// one windowed EC-mul round; `(chain, round, ([window; 14], [accumulator; 2]))`.
+    #[allow(clippy::type_complexity)]
+    fn deduce_partial_ec_mul_w18(
+        &mut self,
+        chain: Self::M31,
+        round: Self::M31,
+        windows: [Self::M31; 14],
+        acc: [Self::Felt; 2],
+    ) -> (Self::M31, Self::M31, ([Self::M31; 14], [Self::Felt; 2]));
+
+    /// `PackedPedersenPointsTableWindowBits18::deduce_output` (fast_deduction/
+    /// pedersen.rs): the pedersen points-table row `[x, y]` for a window index.
+    fn deduce_pedersen_points_table_w18(&mut self, index: Self::M31) -> [Self::Felt; 2];
+
     // ---- Effects (flat-indexed) ------------------------------------------------
 
     /// Commit `value` to trace column `col`.
@@ -200,6 +232,7 @@ pub trait WitnessEval {
     /// declaration order).
     fn set_lookup_word(&mut self, word: usize, value: Self::M31);
     /// Emit sub-component-input word `word` (flat index across all `SubComponentInputs`
-    /// tuple/array scalars in declaration order).
+    /// tuple/array scalars in declaration order; a felt-valued sub-input occupies 28
+    /// consecutive words — its canonical 9-bit limbs).
     fn set_sub_input_word(&mut self, word: usize, value: Self::M31);
 }

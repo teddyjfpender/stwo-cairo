@@ -16,9 +16,35 @@
 //! [`Vec`]s that the driver reads back and reshapes. See
 //! [`SimdWitnessEval::lookup_scratch`] / [`SimdWitnessEval::sub_scratch`].
 
+use stwo_cairo_common::prover_types::simd::SIMD_ENUMERATION_0;
+
 use crate::witness::components::{memory_address_to_id, memory_id_to_big};
+use crate::witness::fast_deduction::pedersen::{
+    PackedPartialEcMulWindowBits18, PackedPedersenPointsTableWindowBits18,
+};
 use crate::witness::prelude::*;
 use crate::witness::witness_eval::{WitnessEval, FELT_N_LIMBS, SLOT_AP, SLOT_FP, SLOT_PC};
+
+/// This packed row's `input()` source: the opcode `PackedCasmState` (slots
+/// `SLOT_PC/AP/FP`), or a BUILTIN's flattened input words (slot `k` = the k-th M31
+/// leaf of the component's `PackedInputType`, depth-first — the same order the
+/// transformer's slot map assigns and the device lane feeds its input columns).
+pub enum SimdInputs {
+    Casm(PackedCasmState),
+    Flat(Vec<PackedM31>),
+}
+
+impl From<PackedCasmState> for SimdInputs {
+    fn from(input: PackedCasmState) -> Self {
+        Self::Casm(input)
+    }
+}
+
+impl From<Vec<PackedM31>> for SimdInputs {
+    fn from(words: Vec<PackedM31>) -> Self {
+        Self::Flat(words)
+    }
+}
 
 /// Passthrough [`WitnessEval`] holding the mutable handles for one packed row.
 ///
@@ -27,12 +53,13 @@ use crate::witness::witness_eval::{WitnessEval, FELT_N_LIMBS, SLOT_AP, SLOT_FP, 
 pub struct SimdWitnessEval<'a, 'trace, const N: usize> {
     /// Mutable handle to the current packed row's `N` trace columns (`set_col` target).
     row: Box<[&'trace mut PackedM31; N]>,
-    /// `memory_address_to_id.deduce_output` device/host table.
-    mem_addr_state: &'a memory_address_to_id::ClaimGenerator,
-    /// `memory_id_to_big.deduce_output` device/host table.
-    mem_big_state: &'a memory_id_to_big::ClaimGenerator,
-    /// This packed row's `(pc, ap, fp)` input (the `input()` leaves).
-    input: PackedCasmState,
+    /// `memory_address_to_id.deduce_output` device/host table (`None` for components
+    /// whose writer takes no such state — their bodies never call `mem_addr_to_id`).
+    mem_addr_state: Option<&'a memory_address_to_id::ClaimGenerator>,
+    /// `memory_id_to_big.deduce_output` device/host table (`None` when absent).
+    mem_big_state: Option<&'a memory_id_to_big::ClaimGenerator>,
+    /// This packed row's `input()` source (opcode CasmState or builtin flat words).
+    input: SimdInputs,
     /// This packed row's index (for the enabler column).
     row_index: usize,
     /// The enabler column (1 for real rows, 0 for padding).
@@ -52,9 +79,9 @@ impl<'a, 'trace, const N: usize> SimdWitnessEval<'a, 'trace, N> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         row: Box<[&'trace mut PackedM31; N]>,
-        mem_addr_state: &'a memory_address_to_id::ClaimGenerator,
-        mem_big_state: &'a memory_id_to_big::ClaimGenerator,
-        input: PackedCasmState,
+        mem_addr_state: impl Into<Option<&'a memory_address_to_id::ClaimGenerator>>,
+        mem_big_state: impl Into<Option<&'a memory_id_to_big::ClaimGenerator>>,
+        input: impl Into<SimdInputs>,
         row_index: usize,
         enabler: &'a Enabler,
         n_lookup_words: usize,
@@ -62,9 +89,9 @@ impl<'a, 'trace, const N: usize> SimdWitnessEval<'a, 'trace, N> {
     ) -> Self {
         Self {
             row,
-            mem_addr_state,
-            mem_big_state,
-            input,
+            mem_addr_state: mem_addr_state.into(),
+            mem_big_state: mem_big_state.into(),
+            input: input.into(),
             row_index,
             enabler,
             lookup_scratch: vec![PackedM31::zero(); n_lookup_words],
@@ -95,11 +122,14 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
 
     #[inline(always)]
     fn input(&mut self, slot: u32) -> PackedM31 {
-        match slot {
-            SLOT_PC => self.input.pc,
-            SLOT_AP => self.input.ap,
-            SLOT_FP => self.input.fp,
-            _ => panic!("SimdWitnessEval::input: unexpected slot {slot}"),
+        match &self.input {
+            SimdInputs::Casm(input) => match slot {
+                SLOT_PC => input.pc,
+                SLOT_AP => input.ap,
+                SLOT_FP => input.fp,
+                _ => panic!("SimdWitnessEval::input: unexpected CasmState slot {slot}"),
+            },
+            SimdInputs::Flat(words) => words[slot as usize],
         }
     }
 
@@ -207,11 +237,44 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
 
     #[inline(always)]
     fn mem_addr_to_id(&mut self, addr: PackedM31) -> PackedM31 {
-        self.mem_addr_state.deduce_output(addr)
+        self.mem_addr_state
+            .expect("component writer has no memory_address_to_id state")
+            .deduce_output(addr)
     }
     #[inline(always)]
     fn mem_id_to_value(&mut self, id: PackedM31) -> PackedFelt252 {
-        self.mem_big_state.deduce_output(id)
+        self.mem_big_state
+            .expect("component writer has no memory_id_to_big state")
+            .deduce_output(id)
+    }
+
+    // ---- Builtin-lane leaves ----------------------------------------------------
+
+    /// Bit-identical to `Seq::packed_at(self.row_index)` (common
+    /// `preprocessed_columns/preprocessed_trace.rs`): `broadcast(16 * vec_row) + [0..16)`.
+    #[inline(always)]
+    fn iota(&mut self) -> PackedM31 {
+        PackedM31::broadcast(M31::from(self.row_index * N_LANES))
+            + unsafe { PackedM31::from_simd_unchecked(SIMD_ENUMERATION_0) }
+    }
+
+    // ---- Computed deduces (the REAL fast_deduction calls — byte-identical to the
+    // ---- original writer, which calls these exact functions) ---------------------
+
+    #[inline(always)]
+    fn deduce_partial_ec_mul_w18(
+        &mut self,
+        chain: PackedM31,
+        round: PackedM31,
+        windows: [PackedM31; 14],
+        acc: [PackedFelt252; 2],
+    ) -> (PackedM31, PackedM31, ([PackedM31; 14], [PackedFelt252; 2])) {
+        PackedPartialEcMulWindowBits18::deduce_output((chain, round, (windows, acc)))
+    }
+
+    #[inline(always)]
+    fn deduce_pedersen_points_table_w18(&mut self, index: PackedM31) -> [PackedFelt252; 2] {
+        PackedPedersenPointsTableWindowBits18::deduce_output([index])
     }
 
     // ---- Effects ---------------------------------------------------------------

@@ -66,16 +66,31 @@ pub struct RecordingWitnessEval {
     poisoned_lookup_words: BTreeSet<usize>,
     poisoned_sub_words: BTreeSet<usize>,
     poison_ops: BTreeMap<&'static str, usize>,
+    /// `enabler()` input slot. Opcodes: `SLOT_ENABLER` (= 3, right after pc/ap/fp).
+    /// Builtins: the slot right after the flattened input words (the lane feeds the
+    /// enabler column there).
+    enabler_slot: u32,
+    /// `iota()` input slot (the row-index column the builtin lane feeds), or `None` —
+    /// opcode bodies never call `iota()`; if one somehow does, `None` poisons honestly.
+    iota_slot: Option<u32>,
 }
 
 impl RecordingWitnessEval {
     pub fn new(label: impl Into<String>) -> Self {
+        Self::with_slots(label, SLOT_ENABLER, None)
+    }
+
+    /// Builtin-lane constructor: the flattened input words occupy slots `0..K`, the
+    /// enabler and iota columns the slots the transformer assigned after them.
+    pub fn with_slots(label: impl Into<String>, enabler_slot: u32, iota_slot: Option<u32>) -> Self {
         Self {
             recorder: WitnessRecorder::new(label),
             poisoned_cols: BTreeSet::new(),
             poisoned_lookup_words: BTreeSet::new(),
             poisoned_sub_words: BTreeSet::new(),
             poison_ops: BTreeMap::new(),
+            enabler_slot,
+            iota_slot,
         }
     }
 
@@ -139,7 +154,52 @@ impl WitnessEval for RecordingWitnessEval {
     }
     #[inline]
     fn enabler(&mut self) -> RecVal {
-        RecVal::Ok(self.recorder.input(SLOT_ENABLER))
+        let slot = self.enabler_slot;
+        RecVal::Ok(self.recorder.input(slot))
+    }
+
+    // ---- Builtin-lane leaves ----------------------------------------------------
+
+    #[inline]
+    fn iota(&mut self) -> RecVal {
+        match self.iota_slot {
+            Some(slot) => RecVal::Ok(self.recorder.input(slot)),
+            // No iota column configured (opcode layout) — an honest poison, censused.
+            None => self.poison("iota (no slot configured)"),
+        }
+    }
+
+    // ---- Computed deduces: NOT recordable yet (need a computed-deduce ISA op backed
+    // ---- by the device EC functions, or device-to-device feeding — G5). All-poison
+    // ---- results + a poison_ops census entry = the pinned manifest. ---------------
+
+    fn deduce_partial_ec_mul_w18(
+        &mut self,
+        _chain: RecVal,
+        _round: RecVal,
+        _windows: [RecVal; 14],
+        _acc: [RecFelt; 2],
+    ) -> (RecVal, RecVal, ([RecVal; 14], [RecFelt; 2])) {
+        let p = self.poison("deduce_partial_ec_mul_w18");
+        (
+            p,
+            p,
+            (
+                [p; 14],
+                [
+                    RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
+                    RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
+                ],
+            ),
+        )
+    }
+
+    fn deduce_pedersen_points_table_w18(&mut self, _index: RecVal) -> [RecFelt; 2] {
+        let p = self.poison("deduce_pedersen_points_table_w18");
+        [
+            RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
+            RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
+        ]
     }
 
     // ---- M31 field ops (ISA-core) ----------------------------------------------

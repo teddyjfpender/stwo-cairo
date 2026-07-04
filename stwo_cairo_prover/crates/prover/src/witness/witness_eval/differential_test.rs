@@ -907,3 +907,143 @@ full_component_gates!(
     n_id = 2,
     require_padding = true
 );
+
+// ------------------------ pedersen_aggregator_window_bits_18 ------------------------
+
+/// The BUILTIN-lane pinned poison manifest (D', G5): recording the aggregator's
+/// generic body must poison EXACTLY at its 28 `deduce_partial_ec_mul_w18` calls —
+/// nothing else. A new poison op (or a vanished one) is a conscious-update failure,
+/// never a silent drift. The counts of poisoned effects are pinned too: they are the
+/// device backlog the deduce op family must clear (DEDUCE_DESIGN.md).
+#[test]
+fn pedersen_aggregator_recording_poison_manifest() {
+    use crate::witness::components::pedersen_aggregator_window_bits_18 as agg;
+    let rec = agg::record_pedersen_aggregator_window_bits_18();
+    assert_eq!(
+        rec.poison_ops,
+        std::collections::BTreeMap::from([("deduce_partial_ec_mul_w18", 28usize)]),
+        "poison manifest changed: {:?}",
+        rec.poison_ops
+    );
+    // Pinned effect poison counts (deduce-output cascades). Update CONSCIOUSLY, with
+    // the device deduce design in view.
+    assert_eq!(
+        (
+            rec.poisoned_cols.len(),
+            rec.poisoned_lookup_words.len(),
+            rec.poisoned_sub_words.len(),
+        ),
+        (POISONED_COLS, POISONED_LOOKUPS, POISONED_SUBS),
+        "cols={:?} lookups={:?} subs={:?}",
+        rec.poisoned_cols,
+        rec.poisoned_lookup_words,
+        rec.poisoned_sub_words
+    );
+}
+// Pinned 2026-07-05 (discover run): the aggregator's 206 cols / 396 lookup words /
+// 2023 sub words poison ONLY downstream of the 28 EC deduces — 140 cols (65..=204),
+// 224 lookup words, 1876 sub words. The device deduce op (DEDUCE_DESIGN.md) unlocks
+// exactly these; any OTHER change to these numbers is an unreviewed semantic drift.
+const POISONED_COLS: usize = 140;
+const POISONED_LOOKUPS: usize = 224;
+const POISONED_SUBS: usize = 1876;
+
+/// Gate (a) for the BUILTIN pilot `pedersen_aggregator_window_bits_18`: the generic
+/// body on `SimdWitnessEval` (flat input words + iota + mults columns + felt
+/// sub-words + the REAL `deduce_partial_ec_mul_w18` hook) is byte-identical to the
+/// original writer over the full fixture — every committed column, every lookup
+/// word, every sub-component input word.
+#[test]
+fn pedersen_aggregator_generic_simd_byte_identical() {
+    use cairo_vm::types::layout_name::LayoutName;
+    use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
+    use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
+
+    use crate::witness::components::pedersen_aggregator_window_bits_18 as agg;
+
+    // The opcode fixture has no pedersen rows; run the 15-instance pedersen builtin
+    // program through the VM (the same pipeline prover.rs's aggregator test uses).
+    let compiled = get_compiled_cairo_program_path("test_prove_verify_pedersen_builtin");
+    let input = run_and_adapt(
+        &compiled,
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .expect("run_and_adapt pedersen fixture");
+    let ProverInput {
+        state_transitions,
+        memory,
+        builtin_segments,
+        ..
+    } = input;
+    let mut cg = CairoClaimGenerator::default();
+    let mut set: IndexSet<&str> = IndexSet::new();
+    for c in [
+        "pedersen_aggregator_window_bits_18",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "range_check_8",
+        "partial_ec_mul_window_bits_18",
+        "pedersen_builtin",
+    ] {
+        set.insert(c);
+    }
+    let preprocessed_trace = Arc::new(PreProcessedTrace::canonical_without_pedersen());
+    cg.fill_components(
+        &set,
+        state_transitions.casm_states_by_opcode,
+        &builtin_segments,
+        Arc::new(memory),
+        preprocessed_trace,
+    );
+    // The aggregator's mults are FED by the pedersen builtin's write_trace — run it
+    // first, exactly as the production write_trace ordering does.
+    {
+        let pb = cg
+            .pedersen_builtin
+            .take()
+            .expect("pedersen_builtin populated");
+        let mem_addr = cg
+            .memory_address_to_id
+            .as_ref()
+            .expect("memory_address_to_id state");
+        let agg_state = cg
+            .pedersen_aggregator_window_bits_18
+            .as_ref()
+            .expect("aggregator state");
+        let _ = pb.write_trace(mem_addr, agg_state);
+    }
+    let gen = cg
+        .pedersen_aggregator_window_bits_18
+        .expect("pedersen_aggregator_window_bits_18 populated");
+    let mem_big = cg.memory_id_to_big.expect("memory_id_to_big populated");
+    let rc8 = cg.range_check_8.expect("range_check_8 populated");
+    let w18 = cg
+        .partial_ec_mul_window_bits_18
+        .expect("partial_ec_mul_window_bits_18 populated");
+
+    // Replicate the write_trace preamble exactly (sort by key, unzip, pad, pack).
+    let mut inputs_mults = gen
+        .mults
+        .iter()
+        .map(|entry| (*entry.key(), M31(entry.value().load(Ordering::Relaxed))))
+        .collect::<Vec<_>>();
+    inputs_mults.sort_by_key(|(input, _)| input.0);
+    let (mut inputs, mut mults) = inputs_mults.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+    let n_rows = inputs.len();
+    assert_ne!(n_rows, 0, "fixture has no pedersen_aggregator rows");
+    let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+    inputs.resize(size, *inputs.first().unwrap());
+    mults.resize(size, M31::zero());
+    let packed_inputs = pack_values(&inputs);
+    let packed_mults = pack_values(&mults);
+
+    assert_generic_diff_byte_identical!(agg::generic_simd_diff(
+        packed_inputs,
+        vec![packed_mults],
+        &mem_big,
+        &rc8,
+        &w18,
+    ));
+}

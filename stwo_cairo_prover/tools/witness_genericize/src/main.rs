@@ -89,6 +89,14 @@ enum Ty {
     ConstFelt252([u32; FELT252_LIMBS]),
     Tuple(Vec<Ty>),
     Array(Box<Ty>, usize),
+    /// A (projection of the) builtin input binder, carrying the FLAT SLOT BASE of this
+    /// subtree in the component's input-word layout (M31 leaf = 1 word, Felt252 leaf =
+    /// 28, FeltW27 = 10, aggregates = sum — [`Ty::flat_width`]). Projections descend
+    /// with the correct base; an M31 leaf lowers to the REAL `eval.input(<slot>)` read
+    /// (the builtin lane feeds the flattened words in this exact depth-first order).
+    /// Felt-typed leaves stay census-only (`input_sites`) until the lane feeds felt
+    /// limbs. Never originates anywhere but [`Lowerer::input_leaf`].
+    InputAt(Box<Ty>, usize),
     Unknown,
 }
 
@@ -115,6 +123,7 @@ impl std::fmt::Debug for Ty {
             Ty::ConstFelt252(_) => write!(f, "ConstFelt252"),
             Ty::Tuple(v) => f.debug_tuple("Tuple").field(v).finish(),
             Ty::Array(e, n) => write!(f, "Array({e:?}, {n})"),
+            Ty::InputAt(e, base) => write!(f, "InputAt({e:?}, {base})"),
             Ty::Unknown => write!(f, "Unknown"),
         }
     }
@@ -132,6 +141,22 @@ impl Ty {
     }
     fn is_mask(&self) -> bool {
         matches!(self, Ty::Mask)
+    }
+
+    /// FLAT INPUT-WORD width of this type in the builtin lane's input layout
+    /// (depth-first): M31/U16/U32 leaves = 1 word, Felt252 = 28 limb words, FeltW27 =
+    /// 10, aggregates = sum. This is the contract between the transformer's slot map,
+    /// the emitted SIMD driver's input flattening, and the device lane's input columns
+    /// — all three MUST agree or `input(slot)` reads the wrong word.
+    fn flat_width(&self) -> usize {
+        match self {
+            Ty::Tuple(v) => v.iter().map(Ty::flat_width).sum(),
+            Ty::Array(e, n) => e.flat_width() * n,
+            Ty::Felt252 | Ty::ConstFelt252(_) => FELT252_LIMBS,
+            Ty::FeltW27 | Ty::FeltW27Limbs => FELTW27_LIMBS,
+            Ty::InputAt(e, _) => e.flat_width(),
+            _ => 1,
+        }
     }
 }
 
@@ -153,6 +178,11 @@ struct ConstVal {
 #[derive(Clone, Debug, PartialEq)]
 enum Shape {
     Scalar,
+    /// A `PackedFelt252`-valued element: 28 flat limb words (canonical 9-bit limbs, the
+    /// same `felt_get_m31` decomposition everywhere else in the lane). The driver
+    /// reconstructs it with `PackedFelt252::from_limbs` — the exact inverse for
+    /// canonical limbs, so the receiving component sees the identical felt value.
+    Felt,
     Tuple(Vec<Shape>),
     Array(Vec<Shape>),
 }
@@ -161,6 +191,7 @@ impl Shape {
     fn scalar_count(&self) -> usize {
         match self {
             Shape::Scalar => 1,
+            Shape::Felt => FELT252_LIMBS,
             Shape::Tuple(v) | Shape::Array(v) => v.iter().map(Shape::scalar_count).sum(),
         }
     }
@@ -304,8 +335,9 @@ struct FileAnalysis {
     input_sites: usize,
     /// Census-only opaque-Width27 sites (see `Lowerer::w27_sites`).
     w27_sites: usize,
-    /// Census-only row-index (`seq.packed_at(row_index)`) sites (see `Lowerer::seq_sites`).
-    seq_sites: usize,
+    /// Whether the body reads the row-index iota (`seq.packed_at(row_index)` — a REAL
+    /// `eval.iota()` op; the record/driver assign it an input slot after the flat words).
+    uses_iota: bool,
     /// Census-only KNOWN-SIGNATURE deduce sites (see `Lowerer::deduce_sites`).
     deduce_sites: usize,
     n_cols: usize,
@@ -333,7 +365,7 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
         u32_sites: 0,
         input_sites: 0,
         w27_sites: 0,
-        seq_sites: 0,
+        uses_iota: false,
         deduce_sites: 0,
         n_cols: 0,
         n_lookup_words: 0,
@@ -473,9 +505,20 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
         }
     };
 
+    // Scan-time felt recognizer for the sub-input layout: a sub element is
+    // felt-valued when it is (a) a hoisted felt broadcast constant ident, or (b) a
+    // projection chain rooted at a `let x = PackedX::deduce_output(..)` binding whose
+    // KNOWN result type resolves to `Felt252` at that path. The flatten side re-checks
+    // the LOWERED type per leaf and skips loudly on any disagreement (fail-closed) —
+    // this recognizer only sets the flat WIDTH layout, never semantics.
+    let deduce_bound = scan_deduce_bindings(body_stmts);
+    let felt_consts_for_shape = felt_consts.clone();
+    let is_felt_expr =
+        move |e: &Expr| -> bool { sub_expr_is_felt(e, &felt_consts_for_shape, &deduce_bound) };
+
     // Derive the SubComponentInputs DECLARATION-ORDER flat layout: struct fields ×
     // array lengths × the value shape observed at this file's assignment sites.
-    let sub_slots = match build_sub_layout(&file, body_stmts, &sub_name) {
+    let sub_slots = match build_sub_layout(&file, body_stmts, &sub_name, &is_felt_expr) {
         Ok(l) => l,
         Err(s) => {
             fa.file_skip = Some(s);
@@ -509,7 +552,7 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
     fa.u32_sites = lw.u32_sites;
     fa.input_sites = lw.input_sites;
     fa.w27_sites = lw.w27_sites;
-    fa.seq_sites = lw.seq_sites;
+    fa.uses_iota = lw.uses_iota;
     fa.deduce_sites = lw.deduce_sites;
     fa.skips = lw.skips.clone();
     // Emittable only when there are no skips AND no census-only sites (u32 / builtin
@@ -521,7 +564,6 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
         && lw.u32_sites == 0
         && lw.input_sites == 0
         && lw.w27_sites == 0
-        && lw.seq_sites == 0
         && lw.deduce_sites == 0;
     fa.matched_u32 = fa.skeleton_ok && fa.skips.is_empty() && !fa.matched;
 
@@ -770,15 +812,128 @@ fn parse_sub_struct(file: &syn::File) -> Result<Vec<(String, usize)>, Skip> {
 
 /// Syntactic value shape of a sub-input assignment RHS (tuple/array nesting only —
 /// leaves are scalars; type-checking of the leaves happens during lowering).
-fn syntactic_shape(expr: &Expr) -> Shape {
+fn syntactic_shape(expr: &Expr, is_felt: &dyn Fn(&Expr) -> bool) -> Shape {
     match strip_parens(expr) {
         Expr::Tuple(ExprTuple { elems, .. }) => {
-            Shape::Tuple(elems.iter().map(syntactic_shape).collect())
+            Shape::Tuple(elems.iter().map(|e| syntactic_shape(e, is_felt)).collect())
         }
         Expr::Array(ExprArray { elems, .. }) => {
-            Shape::Array(elems.iter().map(syntactic_shape).collect())
+            Shape::Array(elems.iter().map(|e| syntactic_shape(e, is_felt)).collect())
         }
+        e if is_felt(e) => Shape::Felt,
         _ => Shape::Scalar,
+    }
+}
+
+/// Scan the closure body for `let x = PackedX::deduce_output(..);` bindings whose
+/// signature is in [`known_deduce_output_ty`], returning `x -> result Ty`. Used only to
+/// set the flat WIDTH of felt-valued sub-input elements at scan time (the lowering
+/// re-derives types independently and any disagreement skips loudly).
+fn scan_deduce_bindings(body_stmts: &[Stmt]) -> BTreeMap<String, Ty> {
+    let mut bound = BTreeMap::new();
+    for st in body_stmts {
+        let Stmt::Local(local) = st else { continue };
+        let Some(name) = local_ident(local) else {
+            continue;
+        };
+        let Some(init) = local.init.as_ref() else {
+            continue;
+        };
+        let Expr::Call(call) = strip_parens(&init.expr) else {
+            continue;
+        };
+        let Expr::Path(p) = &*call.func else { continue };
+        if let Some(ty) = known_deduce_output_ty(&tok_str(&p.path)) {
+            bound.insert(name, ty);
+        }
+    }
+    bound
+}
+
+/// Match the generated multiplicity-column read idiom
+/// `* mults [k] . get (row_index) . unwrap_or (& PackedM31 :: zero ())`,
+/// returning `k`. Anything that deviates (a different base ident, a non-literal
+/// index, a different default) does NOT match and falls through to the loud
+/// unsupported-expression skip — never a silent approximation.
+fn match_mults_read(expr: &Expr, row_index_name: &str) -> Option<usize> {
+    let Expr::Unary(ExprUnary {
+        op: UnOp::Deref(_),
+        expr: inner,
+        ..
+    }) = strip_parens(expr)
+    else {
+        return None;
+    };
+    // .unwrap_or(&PackedM31::zero())
+    let Expr::MethodCall(unwrap) = strip_parens(inner) else {
+        return None;
+    };
+    if unwrap.method != "unwrap_or" || unwrap.args.len() != 1 {
+        return None;
+    }
+    let default_ok = matches!(
+        strip_parens(unwrap.args.first().unwrap()),
+        Expr::Reference(r) if tok_str(&r.expr) == "PackedM31 :: zero ()"
+    );
+    if !default_ok {
+        return None;
+    }
+    // .get(row_index)
+    let Expr::MethodCall(get) = strip_parens(&unwrap.receiver) else {
+        return None;
+    };
+    if get.method != "get"
+        || get.args.len() != 1
+        || !is_path_named(get.args.first().unwrap(), row_index_name)
+    {
+        return None;
+    }
+    // mults[k]
+    let Expr::Index(ExprIndex {
+        expr: base, index, ..
+    }) = strip_parens(&get.receiver)
+    else {
+        return None;
+    };
+    if !is_path_named(base, "mults") {
+        return None;
+    }
+    expr_usize(index)
+}
+
+/// Is this sub-input element expression felt-valued? True for hoisted felt broadcast
+/// constant idents and for `.N`/`[i]` projection chains rooted at a known-deduce
+/// binding that resolve to `Felt252`.
+fn sub_expr_is_felt(
+    expr: &Expr,
+    felt_consts: &BTreeMap<String, [u32; FELT252_LIMBS]>,
+    deduce_bound: &BTreeMap<String, Ty>,
+) -> bool {
+    fn resolve<'t>(expr: &Expr, deduce_bound: &'t BTreeMap<String, Ty>) -> Option<&'t Ty> {
+        // Returns the Ty of a projection chain rooted at a deduce binding.
+        fn walk<'t>(expr: &Expr, deduce_bound: &'t BTreeMap<String, Ty>) -> Option<&'t Ty> {
+            match strip_parens(expr) {
+                Expr::Path(p) => deduce_bound.get(&tok_str(&p.path)),
+                Expr::Field(ExprField {
+                    base,
+                    member: Member::Unnamed(idx),
+                    ..
+                }) => match walk(base, deduce_bound)? {
+                    Ty::Tuple(v) => v.get(idx.index as usize),
+                    _ => None,
+                },
+                Expr::Index(ExprIndex { expr: base, .. }) => match walk(base, deduce_bound)? {
+                    Ty::Array(e, _) => Some(e),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        walk(expr, deduce_bound)
+    }
+    match strip_parens(expr) {
+        Expr::Path(p) => felt_consts.contains_key(&tok_str(&p.path)),
+        e => matches!(resolve(e, deduce_bound), Some(Ty::Felt252)),
     }
 }
 
@@ -788,6 +943,7 @@ fn build_sub_layout(
     file: &syn::File,
     body_stmts: &[Stmt],
     sub_name: &str,
+    is_felt: &dyn Fn(&Expr) -> bool,
 ) -> Result<Vec<SubSlot>, Skip> {
     // Collect (field, k, shape) at every assignment site (file order).
     let mut seen: BTreeMap<(String, usize), Shape> = BTreeMap::new();
@@ -827,7 +983,7 @@ fn build_sub_layout(
                 detail: format!("sub-input index not a literal: `{}`", tok_str(index)),
             });
         };
-        let shape = syntactic_shape(&a.right);
+        let shape = syntactic_shape(&a.right, is_felt);
         if seen.insert((field.clone(), k), shape).is_some() {
             return Err(Skip {
                 category: "effect",
@@ -967,9 +1123,14 @@ struct Lowerer {
     /// The recording layer models only 28x9 felts (`FELT_N_LIMBS`), so these are typed
     /// correctly but never emitted. Any site > 0 blocks emission.
     w27_sites: usize,
-    /// Census-only row-index sites (`seq.packed_at(row_index)` — an iota, typed M31;
-    /// becomes an extra input word in the builtin lane, G4). Blocks emission.
-    seq_sites: usize,
+    /// Whether the body reads the row-index iota (`seq.packed_at(row_index)`) — a REAL
+    /// `eval.iota()` op (G4); the builtin record/driver assign it an input slot.
+    uses_iota: bool,
+    /// Multiplicity-column reads (`*mults[k].get(row_index).unwrap_or(&zero)`): REAL
+    /// `eval.input(K + 2 + k)` reads — the builtin lane feeds `mults[k]` as an input
+    /// column after the flat input words, the enabler and the iota. The set records
+    /// which `k` the body reads (the driver emits exactly those columns).
+    mults_reads: BTreeSet<usize>,
     /// Census-only KNOWN-SIGNATURE deduce sites (G5): `PackedX::deduce_output(..)` calls
     /// whose RESULT type is in [`known_deduce_output_ty`]'s table. Typing the result lets
     /// every downstream projection (`.N` / `[i]` / `.get_m31(i)`) resolve — collapsing the
@@ -1026,7 +1187,8 @@ impl Lowerer {
             u32_sites: 0,
             input_sites: 0,
             w27_sites: 0,
-            seq_sites: 0,
+            uses_iota: false,
+            mults_reads: BTreeSet::new(),
             deduce_sites: 0,
             counter: 0,
             max_col: None,
@@ -1052,18 +1214,121 @@ impl Lowerer {
         (ty, quote! { WG_W27_CENSUS_ONLY })
     }
 
-    /// Census-only row-index site (`seq.packed_at(row_index)` — the packed iota, G4).
-    fn seq_site(&mut self) -> (Ty, TokenStream) {
-        self.seq_sites += 1;
-        (Ty::M31, quote! { WG_SEQ_CENSUS_ONLY })
-    }
-
     /// Census-only KNOWN-SIGNATURE deduce site (G5): the call's RESULT is typed from
     /// [`known_deduce_output_ty`] so downstream projections resolve, but the deduce
     /// itself has no backend op yet (device EC/blake function or device-to-device feed).
     fn deduce_site(&mut self, ty: Ty) -> (Ty, TokenStream) {
         self.deduce_sites += 1;
         (ty, quote! { WG_DEDUCE_CENSUS_ONLY })
+    }
+
+    /// Lower one expression expected to produce an `E::Felt` value: a felt-typed
+    /// expression as-is, or a hoisted felt constant materialized via
+    /// `felt_from_limbs` over its 28 const limbs. `None` = not a felt here.
+    fn lower_felt_value(&mut self, e: &Expr) -> Option<TokenStream> {
+        if let Some(limbs) = self.peek_felt_const(e) {
+            let (_t, tok) = self.felt_const_value(Target::Temp, limbs);
+            return Some(tok);
+        }
+        let (ty, tok) = self.lower_node(strip_parens(e), Target::Temp);
+        match ty {
+            Ty::Felt252 => Some(tok),
+            Ty::ConstFelt252(limbs) => {
+                let (_t, tok) = self.felt_const_value(Target::Temp, limbs);
+                Some(tok)
+            }
+            _ => None,
+        }
+    }
+
+    /// `PackedPartialEcMulWindowBits18::deduce_output((chain, round, ([w; 14],
+    /// [acc; 2])))` — the generated literal shape — as a REAL
+    /// `eval.deduce_partial_ec_mul_w18(chain, round, [w; 14], [acc0, acc1])` call.
+    /// `None` when the argument is not the literal tuple shape (caller falls back to
+    /// the census-only site; nothing is emitted before the shape checks pass).
+    fn lower_w18_deduce(&mut self, call: &syn::ExprCall, target: Target) -> Option<TokenStream> {
+        let arg = strip_parens(call.args.first()?);
+        let Expr::Tuple(ExprTuple { elems, .. }) = arg else {
+            return None;
+        };
+        let [chain_e, round_e, state_e] = elems.iter().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let Expr::Tuple(ExprTuple { elems: st, .. }) = strip_parens(state_e) else {
+            return None;
+        };
+        let [wins_e, acc_e] = st.iter().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let Expr::Array(ExprArray { elems: wins, .. }) = strip_parens(wins_e) else {
+            return None;
+        };
+        let Expr::Array(ExprArray { elems: accs, .. }) = strip_parens(acc_e) else {
+            return None;
+        };
+        if wins.len() != 14 || accs.len() != 2 {
+            return None;
+        }
+        // Shape checks passed — lower the pieces (any inner mismatch is a loud skip
+        // from the piece's own lowering; the call still emits so the census stays 1:1
+        // with the source, and the skip blocks emission).
+        let chain = {
+            let (ty, tok) = self.lower_node(strip_parens(chain_e), Target::Temp);
+            self.require_m31(&ty, "w18 deduce chain", chain_e);
+            tok
+        };
+        let round = {
+            let (ty, tok) = self.lower_node(strip_parens(round_e), Target::Temp);
+            self.require_m31(&ty, "w18 deduce round", round_e);
+            tok
+        };
+        let win_toks: Vec<TokenStream> = wins
+            .iter()
+            .map(|w| {
+                let (ty, tok) = self.lower_node(strip_parens(w), Target::Temp);
+                self.require_m31(&ty, "w18 deduce window", w);
+                tok
+            })
+            .collect();
+        let acc_toks: Vec<TokenStream> = accs
+            .iter()
+            .map(|a| match self.lower_felt_value(a) {
+                Some(tok) => tok,
+                None => {
+                    self.skip(
+                        "deduce_output",
+                        format!("w18 deduce accumulator is not a felt: `{}`", tok_str(a)),
+                    );
+                    quote! { WG_SKIP }
+                }
+            })
+            .collect();
+        Some(self.bind(
+            target,
+            quote! { eval.deduce_partial_ec_mul_w18(#chain, #round, [ #(#win_toks),* ], [ #(#acc_toks),* ]) },
+        ))
+    }
+
+    /// `PackedPedersenPointsTableWindowBits18::deduce_output([index])` as a REAL
+    /// `eval.deduce_pedersen_points_table_w18(index)` call.
+    fn lower_points_table_deduce(
+        &mut self,
+        call: &syn::ExprCall,
+        target: Target,
+    ) -> Option<TokenStream> {
+        let arg = strip_parens(call.args.first()?);
+        let Expr::Array(ExprArray { elems, .. }) = arg else {
+            return None;
+        };
+        if elems.len() != 1 {
+            return None;
+        }
+        let (ty, idx) = self.lower_node(strip_parens(&elems[0]), Target::Temp);
+        self.require_m31(&ty, "points-table deduce index", &elems[0]);
+        Some(self.bind(
+            target,
+            quote! { eval.deduce_pedersen_points_table_w18(#idx) },
+        ))
     }
 
     /// A hoisted felt broadcast constant used as a bare VALUE (not via `.get_m31(i)`,
@@ -1106,12 +1371,12 @@ impl Lowerer {
         self.leaf(target, Ty::ConstM31(v), quote! { #id })
     }
 
-    /// Census-only builtin-input leaf. Returns the parsed `PackedInputType` type so that
-    /// `.N` / `[i]` / `.get_m31(i)` projections resolve to the CORRECT `Ty` (M31 / Felt /
-    /// Tuple / Array) instead of `Ty::Unknown` — but emits a placeholder token and counts
-    /// an input site, because there is no `WitnessEval` read op for a felt-tuple input yet
-    /// (only the opcode `input(SLOT_*)` path). A site > 0 forbids emission. If the alias
-    /// did not resolve to a projectable type, this is still an honest bare-use skip.
+    /// Builtin-input leaf: the parsed `PackedInputType`, wrapped in [`Ty::InputAt`]
+    /// with flat slot base 0. Projections descend the wrapper with the correct base;
+    /// an M31 leaf lowers to the REAL `eval.input(<slot>)` read ([`Self::input_slot_leaf`]).
+    /// Felt-typed leaves stay census-only (`input_sites`) — the lane does not feed felt
+    /// limbs yet. A bare (unprojected) use of a tuple-typed input, or an unparseable
+    /// alias (opcode `PackedCasmState`), is an honest skip exactly as before.
     fn input_leaf(&mut self, target: Target) -> (Ty, TokenStream) {
         if matches!(self.input_ty, Ty::Unknown) {
             self.skip(
@@ -1120,9 +1385,31 @@ impl Lowerer {
             );
             return (Ty::Unknown, quote! { WG_SKIP });
         }
-        self.input_sites += 1;
-        let ty = self.input_ty.clone();
-        self.leaf(target, ty, quote! { WG_INPUT_CENSUS_ONLY })
+        let ty = Ty::InputAt(Box::new(self.input_ty.clone()), 0);
+        self.input_projection(target, ty, "bare input binder")
+    }
+
+    /// Resolve an [`Ty::InputAt`]-typed value: M31 leaf → the REAL `eval.input(<slot>)`
+    /// read; aggregate → pass the wrapper through for further projection (placeholder
+    /// token — a bare aggregate use that reaches an op is a skip downstream); felt/other
+    /// leaf → census-only `input_sites` (typed, not yet fed by the lane).
+    fn input_projection(&mut self, target: Target, ty: Ty, what: &str) -> (Ty, TokenStream) {
+        let Ty::InputAt(inner, base) = &ty else {
+            unreachable!("input_projection on non-InputAt");
+        };
+        match &**inner {
+            Ty::M31 => {
+                let slot = u32_lit(*base as u32);
+                self.emit_op(target, Ty::M31, quote! { eval.input(#slot) })
+            }
+            Ty::Tuple(_) | Ty::Array(..) => self.leaf(target, ty.clone(), quote! { WG_INPUT_AGG }),
+            _ => {
+                // Felt / U16 / U32 input leaves: typed but not yet fed by the lane.
+                let _ = what;
+                self.input_sites += 1;
+                self.leaf(target, (**inner).clone(), quote! { WG_INPUT_CENSUS_ONLY })
+            }
+        }
     }
 
     fn fresh(&mut self) -> Ident {
@@ -1264,6 +1551,26 @@ impl Lowerer {
                     return;
                 };
                 let leaves = self.flatten_sub(strip_parens(&a.right));
+                // Fail-closed width guard: the scan-time shape fixed this slot's flat
+                // word count (and every later slot's base). A lowered width that
+                // disagrees (e.g. a felt the scan recognizer missed) would silently
+                // corrupt the whole layout — skip loudly instead.
+                let expected = self
+                    .sub_slots
+                    .iter()
+                    .find(|s| s.field == field && s.index == k)
+                    .map(|s| s.shape.scalar_count());
+                if expected != Some(leaves.len()) {
+                    self.skip(
+                        "effect",
+                        format!(
+                            "sub-input `{field}[{k}]` flat width {} != scan layout {:?}",
+                            leaves.len(),
+                            expected
+                        ),
+                    );
+                    return;
+                }
                 for (j, leaf) in leaves.iter().enumerate() {
                     let w = usize_lit(base_idx + j);
                     self.out
@@ -1387,6 +1694,23 @@ impl Lowerer {
     /// SIMPLE token (ident / literal / projection) naming the value.
     fn lower_node(&mut self, expr: &Expr, target: Target) -> (Ty, TokenStream) {
         let expr = strip_parens(expr);
+        // Multiplicity-column read (`*mults[k].get(row_index).unwrap_or(&zero)`): a
+        // REAL per-row input read — the builtin lane feeds `mults[k]` as the input
+        // column at slot K + 2 + k (after the flat inputs, the enabler and the iota;
+        // the SIMD driver appends the same reads to its flat words, with placeholders
+        // in the enabler/iota positions so the slot arithmetic is uniform).
+        if let Some(k) = match_mults_read(expr, &self.row_index_name) {
+            if matches!(self.input_ty, Ty::Unknown) {
+                self.skip(
+                    "expr",
+                    format!("mults read outside a typed builtin: `{}`", tok_str(expr)),
+                );
+                return (Ty::Unknown, quote! { WG_SKIP });
+            }
+            self.mults_reads.insert(k);
+            let slot = u32_lit((self.input_ty.flat_width() + 2 + k) as u32);
+            return self.emit_op(target, Ty::M31, quote! { eval.input(#slot) });
+        }
         match expr {
             Expr::Path(p) => self.lower_path(p, target),
             Expr::Field(f) => self.lower_field(f, target),
@@ -1482,6 +1806,23 @@ impl Lowerer {
                 // Tuple projection x.0 / x.1 ...
                 let (bt, btok) = self.lower_node(&f.base, Target::Temp);
                 let i = idx.index as usize;
+                // Input-rooted projection: descend the wrapper with the flat slot base
+                // advanced past the preceding elements' widths.
+                if let Ty::InputAt(inner, base) = &bt {
+                    if let Ty::Tuple(v) = &**inner {
+                        if i < v.len() {
+                            let child_base =
+                                base + v[..i].iter().map(Ty::flat_width).sum::<usize>();
+                            let child = Ty::InputAt(Box::new(v[i].clone()), child_base);
+                            return self.input_projection(target, child, "input tuple elem");
+                        }
+                    }
+                    self.skip(
+                        "expr",
+                        format!("tuple projection .{i} on input `{}`", tok_str(&f.base)),
+                    );
+                    return (Ty::Unknown, quote! { WG_SKIP });
+                }
                 let elem_ty = match &bt {
                     Ty::Tuple(v) if i < v.len() => v[i].clone(),
                     _ => {
@@ -1493,6 +1834,11 @@ impl Lowerer {
                     }
                 };
                 let lit = Literal::usize_unsuffixed(i);
+                // `E::Felt` is Clone (not Copy): reading a felt element out of a
+                // runtime tuple must clone, or the emitted code moves out of the value.
+                if matches!(elem_ty, Ty::Felt252) {
+                    return self.leaf(target, elem_ty, quote! { #btok.#lit.clone() });
+                }
                 self.leaf(target, elem_ty, quote! { #btok.#lit })
             }
         }
@@ -1507,6 +1853,21 @@ impl Lowerer {
             );
             return (Ty::Unknown, quote! { WG_SKIP });
         };
+        // Input-rooted projection: descend the wrapper, base advanced by whole elements.
+        if let Ty::InputAt(inner, base) = &bt {
+            if let Ty::Array(e, n) = &**inner {
+                if i < *n {
+                    let child_base = base + e.flat_width() * i;
+                    let child = Ty::InputAt(Box::new((**e).clone()), child_base);
+                    return self.input_projection(target, child, "input array elem");
+                }
+            }
+            self.skip(
+                "expr",
+                format!("index [{i}] on input `{}`", tok_str(&ix.expr)),
+            );
+            return (Ty::Unknown, quote! { WG_SKIP });
+        }
         let elem_ty = match &bt {
             Ty::Array(e, _) => (**e).clone(),
             _ => {
@@ -1518,6 +1879,10 @@ impl Lowerer {
             }
         };
         let lit = usize_lit(i);
+        // `E::Felt` is Clone (not Copy): see the tuple-projection note.
+        if matches!(elem_ty, Ty::Felt252) {
+            return self.leaf(target, elem_ty, quote! { #btok[#lit].clone() });
+        }
         self.leaf(target, elem_ty, quote! { #btok[#lit] })
     }
 
@@ -1682,9 +2047,11 @@ impl Lowerer {
                         .unwrap_or(false)
                 {
                     // `seq.packed_at(row_index)` — the packed row index (Seq is the
-                    // identity sequence). An M31 iota; census-only until the builtin
-                    // lane feeds it as an extra input word (G4).
-                    self.seq_site()
+                    // identity sequence). A REAL trait op now: the SIMD evaluator
+                    // derives it from `row_index` bit-identically to `Seq::packed_at`;
+                    // the recording lane reads the designated iota input slot (G4).
+                    self.uses_iota = true;
+                    self.emit_op(target, Ty::M31, quote! { eval.iota() })
                 } else {
                     // preprocessed column .packed_at(row_index) etc.
                     self.skip(
@@ -1890,8 +2257,36 @@ impl Lowerer {
                 self.u32_site(Ty::U32)
             }
             p if p.ends_with(":: deduce_output") => {
-                // Lower the args for REAL (tuple/array shapes route through
-                // lower_aggregate, so their M31/felt leaves record cleanly).
+                // HOOKED deduces: a REAL `WitnessEval` trait call (SIMD = the exact
+                // fast_deduction function the original writer calls — byte-identical;
+                // recording = an all-poison result + poison_ops census = the pinned
+                // manifest). Result is the KNOWN tuple type, so projections compile
+                // natively on both evaluators. Falls back to the census-only site if
+                // the call's argument does not match the generated literal shape.
+                if p == "PackedPartialEcMulWindowBits18 :: deduce_output" {
+                    if let Some(tok) = self.lower_w18_deduce(call, target) {
+                        return (known_deduce_output_ty(p).expect("W18 is in the table"), tok);
+                    }
+                    for a in &call.args {
+                        let _ = self.lower_aggregate(a);
+                    }
+                    return self.deduce_site(known_deduce_output_ty(p).expect("in table"));
+                }
+                if p == "PackedPedersenPointsTableWindowBits18 :: deduce_output" {
+                    if let Some(tok) = self.lower_points_table_deduce(call, target) {
+                        return (
+                            known_deduce_output_ty(p).expect("PT18 is in the table"),
+                            tok,
+                        );
+                    }
+                    for a in &call.args {
+                        let _ = self.lower_aggregate(a);
+                    }
+                    return self.deduce_site(known_deduce_output_ty(p).expect("in table"));
+                }
+                // Census-only / unknown deduces: lower the args for REAL first
+                // (tuple/array shapes route through lower_aggregate, so their
+                // M31/felt leaves record cleanly).
                 for a in &call.args {
                     let _ = self.lower_aggregate(a);
                 }
@@ -2133,8 +2528,30 @@ impl Lowerer {
             }
             other => {
                 let (ty, tok) = self.lower_node(other, Target::Temp);
-                self.require_m31(&ty, "sub-input word", other);
-                vec![tok]
+                match ty {
+                    // Felt-valued sub element: 28 flat limb words (the canonical
+                    // decomposition; the driver's `from_limbs` reconstruction is the
+                    // exact inverse, so the receiver sees the identical felt).
+                    Ty::Felt252 => {
+                        let felt = self.bind(Target::Temp, quote! { #tok });
+                        (0..FELT252_LIMBS)
+                            .map(|j| {
+                                let jl = usize_lit(j);
+                                self.bind(Target::Temp, quote! { eval.felt_get_m31(&#felt, #jl) })
+                            })
+                            .collect()
+                    }
+                    Ty::ConstFelt252(limbs) => (0..FELT252_LIMBS)
+                        .map(|j| {
+                            let (_t, tok) = self.const_m31_leaf(Target::Temp, limbs[j]);
+                            tok
+                        })
+                        .collect(),
+                    _ => {
+                        self.require_m31(&ty, "sub-input word", other);
+                        vec![tok]
+                    }
+                }
             }
         }
     }
@@ -2264,10 +2681,24 @@ fn build_marked_block(
          /// (statement-independent — recorded once). EXTENDED ops (if any) surface in\n\
          /// `RecordingOutput::poison_ops` — the honest ISA-V2 census, not a failure."
     ));
+    let record_ctor: TokenStream = if matches!(lw.input_ty, Ty::Unknown) {
+        quote! { RecordingWitnessEval::new(#component) }
+    } else {
+        // Builtin slot layout: flat input words 0..K, enabler = K, iota = K+1 (when
+        // the body reads it). The device lane MUST feed its input columns in this
+        // exact order.
+        // Slot layout (uniform for every builtin): flat inputs 0..K, enabler K,
+        // iota K+1 (reserved even when unused — no Input op records for it then),
+        // multiplicity columns K+2+k. The device lane MUST feed its input columns in
+        // this exact order.
+        let k = u32_lit(lw.input_ty.flat_width() as u32);
+        let ki = u32_lit(lw.input_ty.flat_width() as u32 + 1);
+        quote! { RecordingWitnessEval::with_slots(#component, #k, Some(#ki)) }
+    };
     seg.push(render(&quote! {
         #[allow(dead_code)]
         pub(crate) fn #record_fn() -> RecordingOutput {
-            let mut eval = RecordingWitnessEval::new(#component);
+            let mut eval = #record_ctor;
             #row_body_fn(&mut eval);
             eval.finish()
         }
@@ -2397,17 +2828,54 @@ fn generic_simd_tokens(component: &str, lw: &Lowerer, writer: &ItemFn) -> TokenS
         }
     }
 
-    let addr = lw
-        .addr_state
-        .clone()
-        .unwrap_or_else(|| "memory_address_to_id_state".to_string());
-    let big = lw
-        .big_state
-        .clone()
-        .unwrap_or_else(|| "memory_id_to_big_state".to_string());
-    let addr_id = Ident::new(&addr, Span::call_site());
-    let big_id = Ident::new(&big, Span::call_site());
+    // Writers without a mem-state param pass `None` (`impl Into<Option<..>>` on the
+    // eval constructor keeps the opcode emitted text unchanged for present states).
+    let addr_id: TokenStream = match &lw.addr_state {
+        Some(name) => {
+            let id = Ident::new(name, Span::call_site());
+            quote! { #id }
+        }
+        None => quote! { None },
+    };
+    let big_id: TokenStream = match &lw.big_state {
+        Some(name) => {
+            let id = Ident::new(name, Span::call_site());
+            quote! { #id }
+        }
+        None => quote! { None },
+    };
     let input_id = Ident::new(&lw.input_name, Span::call_site());
+    // Opcode writers pass their `PackedCasmState` binder straight through
+    // (`impl Into<SimdInputs>` — the emitted text is unchanged from the pre-builtin
+    // lane). Builtin writers flatten their typed input tuple into the flat input
+    // words IN SLOT ORDER — the exact depth-first order the transformer's
+    // `Ty::InputAt` slot map assigned, so `eval.input(k)` reads word k.
+    let eval_input: TokenStream = if matches!(lw.input_ty, Ty::Unknown) {
+        quote! { #input_id }
+    } else {
+        // Builtin flat input words, IN SLOT ORDER: [flattened inputs (0..K), a zero
+        // placeholder at the enabler slot (K) and the iota slot (K+1) — `enabler()` /
+        // `iota()` never route through `input()` on the SIMD side, but keeping the
+        // positions makes the slot arithmetic identical to the recording/device
+        // layout — then the multiplicity columns (K+2+k).]
+        let mut words = input_flatten_tokens(&lw.input_ty, quote! { #input_id });
+        if !lw.mults_reads.is_empty() {
+            words.push(quote! { PackedM31::zero() });
+            words.push(quote! { PackedM31::zero() });
+            let max_k = *lw.mults_reads.iter().max().unwrap();
+            for k in 0..=max_k {
+                if lw.mults_reads.contains(&k) {
+                    let kl = usize_lit(k);
+                    words.push(quote! {
+                        *mults[#kl].get(row_index).unwrap_or(&PackedM31::zero())
+                    });
+                } else {
+                    words.push(quote! { PackedM31::zero() });
+                }
+            }
+        }
+        quote! { vec![ #(#words),* ] }
+    };
     let row_id = Ident::new(&lw.row_name, Span::call_site());
     let lookup_id = Ident::new(&lw.lookup_name, Span::call_site());
     let sub_id = Ident::new(&lw.sub_name, Span::call_site());
@@ -2415,12 +2883,29 @@ fn generic_simd_tokens(component: &str, lw: &Lowerer, writer: &ItemFn) -> TokenS
     let reconstruct_lookup = reconstruct_lookup(lw, &lookup_id);
     let reconstruct_sub = reconstruct_sub(lw, &sub_id);
 
+    // Writers that never multiply by the enabler (padding handled via their mults
+    // column, e.g. pedersen_aggregator) have no `enabler_col` in the preamble; the
+    // eval constructor still takes one. `Enabler::new` is pure, so materializing an
+    // unused one is semantics-free.
+    let has_enabler = preamble
+        .iter()
+        .any(|t| t.to_string().contains("let enabler_col"));
+    let enabler_fallback: TokenStream = if has_enabler {
+        quote! {}
+    } else {
+        // A body can only reach `eval.enabler()` through the `enabler_col.packed_at`
+        // idiom, which requires the preamble binding — so when it is absent the value
+        // is genuinely unused and the arity-0 construction is semantics-free.
+        quote! { let enabler_col = Enabler::new(0); }
+    };
+
     quote! {
         #[allow(clippy::type_complexity)]
         #[allow(unused_variables)]
         #[allow(dead_code)]
         fn write_trace_generic_simd(#inputs) #output {
             #(#preamble)*
+            #enabler_fallback
 
             (
                 trace.par_iter_mut(),
@@ -2435,7 +2920,7 @@ fn generic_simd_tokens(component: &str, lw: &Lowerer, writer: &ItemFn) -> TokenS
                         #row_id,
                         #addr_id,
                         #big_id,
-                        #input_id,
+                        #eval_input,
                         row_index,
                         &enabler_col,
                         N_LOOKUP_WORDS,
@@ -2487,12 +2972,54 @@ fn reconstruct_sub(lw: &Lowerer, sub_id: &Ident) -> Vec<TokenStream> {
     out
 }
 
+/// Flatten a typed builtin input value into its flat input words, IN SLOT ORDER
+/// (depth-first over the `PackedInputType` tree — the same order [`Ty::InputAt`]
+/// assigns slot bases, so `eval.input(k)` reads exactly word k). Only M31 leaves are
+/// emitted; a file with felt/u16/u32 input leaves has `input_sites > 0` and is never
+/// emitted, so this is unreachable for those (the unreachable!() is the guard).
+fn input_flatten_tokens(ty: &Ty, base: TokenStream) -> Vec<TokenStream> {
+    match ty {
+        Ty::M31 => vec![base],
+        Ty::Tuple(v) => {
+            let mut out = Vec::new();
+            for (i, e) in v.iter().enumerate() {
+                let lit = Literal::usize_unsuffixed(i);
+                out.extend(input_flatten_tokens(e, quote! { #base.#lit }));
+            }
+            out
+        }
+        Ty::Array(e, n) => {
+            let mut out = Vec::new();
+            for j in 0..*n {
+                let lit = usize_lit(j);
+                out.extend(input_flatten_tokens(e, quote! { #base[#lit] }));
+            }
+            out
+        }
+        other => unreachable!(
+            "input_flatten_tokens on non-emittable input leaf {other:?} (input_sites gate)"
+        ),
+    }
+}
+
 fn rebuild_shape(shape: &Shape, idx: &mut usize) -> TokenStream {
     match shape {
         Shape::Scalar => {
             let i = usize_lit(*idx);
             *idx += 1;
             quote! { sw[#i] }
+        }
+        Shape::Felt => {
+            // 28 consecutive limb words -> the felt value (exact inverse of the
+            // canonical `felt_get_m31` decomposition the flatten side emitted).
+            let limbs: Vec<TokenStream> = (0..FELT252_LIMBS)
+                .map(|_| {
+                    let i = usize_lit(*idx);
+                    *idx += 1;
+                    quote! { sw[#i] }
+                })
+                .collect();
+            quote! { PackedFelt252::from_limbs([ #(#limbs),* ]) }
         }
         Shape::Tuple(v) => {
             let parts: Vec<TokenStream> = v.iter().map(|s| rebuild_shape(s, idx)).collect();
@@ -2543,7 +3070,6 @@ fn lookup_flat_tokens(lw: &Lowerer) -> TokenStream {
         }
     }
     quote! {
-        #[cfg(test)]
         fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
             vec![ #(#parts),* ]
         }
@@ -2570,7 +3096,6 @@ fn sub_flat_tokens(lw: &Lowerer) -> TokenStream {
         }
     }
     quote! {
-        #[cfg(test)]
         fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<PackedM31>> {
             vec![ #(#parts),* ]
         }
@@ -2582,6 +3107,12 @@ fn sub_flat_tokens(lw: &Lowerer) -> TokenStream {
 fn shape_projection(shape: &Shape, base: TokenStream) -> Vec<TokenStream> {
     match shape {
         Shape::Scalar => vec![quote! { #base }],
+        Shape::Felt => (0..FELT252_LIMBS)
+            .map(|j| {
+                let lit = usize_lit(j);
+                quote! { #base.get_m31(#lit) }
+            })
+            .collect(),
         Shape::Tuple(v) => {
             let mut out = Vec::new();
             for (i, s) in v.iter().enumerate() {
@@ -2625,20 +3156,35 @@ fn generic_simd_diff_struct_tokens() -> TokenStream {
 /// packages the compare bundle (verbatim body from the shape-spec).
 fn generic_simd_diff_fn_tokens(writer: &ItemFn) -> TokenStream {
     let inputs = &writer.sig.inputs;
-    // Argument names in order; the first must be `inputs` (cloned into the first call).
+    // Argument names in order; the first must be `inputs`. BY-VALUE params (no `&` in
+    // the type — e.g. the aggregator's `mults: Vec<Vec<PackedM31>>`) are cloned into
+    // the FIRST call so the second still owns them; references pass through twice.
     let mut names: Vec<Ident> = Vec::new();
+    let mut by_value: Vec<bool> = Vec::new();
     for arg in inputs {
         if let FnArg::Typed(pt) = arg {
             if let Pat::Ident(pi) = &*pt.pat {
                 names.push(pi.ident.clone());
+                by_value.push(!matches!(&*pt.ty, Type::Reference(_)));
             }
         }
     }
     let rest = &names[1..];
+    let rest_first: Vec<TokenStream> = names[1..]
+        .iter()
+        .zip(&by_value[1..])
+        .map(|(n, bv)| {
+            if *bv {
+                quote! { #n.clone() }
+            } else {
+                quote! { #n }
+            }
+        })
+        .collect();
     quote! {
         #[cfg(test)]
         pub(crate) fn generic_simd_diff(#inputs) -> GenericSimdDiff {
-            let (trace_o, ld_o, sci_o) = write_trace_simd(inputs.clone(), #(#rest),*);
+            let (trace_o, ld_o, sci_o) = write_trace_simd(inputs.clone(), #(#rest_first),*);
             let (trace_g, ld_g, sci_g) = write_trace_generic_simd(inputs, #(#rest),*);
 
             let log_size = trace_o.log_size();
@@ -3046,12 +3592,12 @@ fn run_census(files: &[PathBuf]) -> ExitCode {
     println!();
 
     println!(
-        "--- MATCHED files (needs trait extension: u32/input/w27/seq/deduce; census-only, NOT emitted) ---"
+        "--- MATCHED files (needs trait extension: u32/input/w27/deduce; census-only, NOT emitted) ---"
     );
     for (_p, a) in &matched_u32 {
         println!(
             "  {:<34} cols={:<4} lookup_words={:<4} sub_words={:<4} u32_sites={:<4} \
-             input_sites={:<4} w27_sites={:<4} seq_sites={:<4} deduce_sites={}",
+             input_sites={:<4} w27_sites={:<4} deduce_sites={}",
             a.component,
             a.n_cols,
             a.n_lookup_words,
@@ -3059,7 +3605,6 @@ fn run_census(files: &[PathBuf]) -> ExitCode {
             a.u32_sites,
             a.input_sites,
             a.w27_sites,
-            a.seq_sites,
             a.deduce_sites
         );
     }
@@ -3223,7 +3768,6 @@ fn census_site_suffix(a: &FileAnalysis) -> String {
         (a.u32_sites, "u32"),
         (a.input_sites, "input"),
         (a.w27_sites, "w27"),
-        (a.seq_sites, "seq"),
         (a.deduce_sites, "deduce"),
     ] {
         if n > 0 {
@@ -3244,9 +3788,9 @@ fn distinct_skips(skips: &[Skip]) -> usize {
 fn not_emittable_reason(a: &FileAnalysis) -> String {
     if a.matched_u32 {
         return format!(
-            "matched via census-only rules ({} u32 / {} input / {} w27 / {} seq / {} deduce \
-             sites) — needs trait/lane extension; not emitted",
-            a.u32_sites, a.input_sites, a.w27_sites, a.seq_sites, a.deduce_sites
+            "matched via census-only rules ({} u32 / {} input / {} w27 / {} deduce sites) — \
+             needs trait/lane extension; not emitted",
+            a.u32_sites, a.input_sites, a.w27_sites, a.deduce_sites
         );
     }
     a.file_skip
@@ -3569,9 +4113,10 @@ mod tests {
              let ptl = pt[1].get_m31(27);",
         );
         let lw = lower_snippet(&[], &body);
+        // W18 + points-table are HOOKED: real trait calls, zero census-only sites.
         assert_eq!(
-            lw.deduce_sites, 2,
-            "two known deduce sites (W18 + points table); skips: {:?}",
+            lw.deduce_sites, 0,
+            "hooked deduces are real ops; skips: {:?}",
             lw.skips
         );
         assert!(
@@ -3579,6 +4124,33 @@ mod tests {
             "projections off a typed deduce result must not skip: {:?}",
             lw.skips
         );
+        let body = lw.out.iter().map(|t| t.to_string()).collect::<String>();
+        assert!(
+            body.contains("eval . deduce_partial_ec_mul_w18 ("),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("eval . deduce_pedersen_points_table_w18 ("),
+            "body: {body}"
+        );
+    }
+
+    /// An UNHOOKED known-signature deduce (W9) stays census-only: result typed (so
+    /// projections resolve skip-free) but `deduce_sites` counts it and blocks emission.
+    #[test]
+    fn unhooked_known_deduce_is_census_only() {
+        let p = "add_opcode_input.pc";
+        let windows = vec![p; 28].join(", ");
+        let body = format!(
+            "let f = memory_id_to_big_state.deduce_output(\
+                 memory_address_to_id_state.deduce_output(add_opcode_input.pc)); \
+             let out = PackedPartialEcMulWindowBits9::deduce_output((add_opcode_input.pc, \
+             add_opcode_input.ap, ([{windows}], [f, f]))); \
+             let chain = out.0;",
+        );
+        let lw = lower_snippet(&[], &body);
+        assert_eq!(lw.deduce_sites, 1, "skips: {:?}", lw.skips);
+        assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
     }
 
     #[test]
@@ -3649,7 +4221,10 @@ mod tests {
              }",
         )
         .unwrap();
-        let slots = build_sub_layout(&file, &body.stmts, "sub_component_inputs").unwrap();
+        let slots = build_sub_layout(&file, &body.stmts, "sub_component_inputs", &|_: &Expr| {
+            false
+        })
+        .unwrap();
         let got: Vec<(String, usize, usize)> = slots
             .iter()
             .map(|s| (s.field.clone(), s.index, s.base))
@@ -3677,7 +4252,10 @@ mod tests {
                 .unwrap();
         let body: syn::Block =
             syn::parse_str("{ *sub_component_inputs.memory_address_to_id[0] = x0; }").unwrap();
-        let err = build_sub_layout(&file, &body.stmts, "sub_component_inputs").unwrap_err();
+        let err = build_sub_layout(&file, &body.stmts, "sub_component_inputs", &|_: &Expr| {
+            false
+        })
+        .unwrap_err();
         assert!(err.detail.contains("never assigned"), "{}", err.detail);
     }
 
@@ -3694,7 +4272,10 @@ mod tests {
         let body_src = "*sub_component_inputs.memory_id_to_big[0] = add_opcode_input.pc;\n\
                         *sub_component_inputs.memory_address_to_id[0] = add_opcode_input.ap;";
         let block: syn::Block = syn::parse_str(&format!("{{ {body_src} }}")).unwrap();
-        let slots = build_sub_layout(&file, &block.stmts, "sub_component_inputs").unwrap();
+        let slots = build_sub_layout(&file, &block.stmts, "sub_component_inputs", &|_: &Expr| {
+            false
+        })
+        .unwrap();
         let lw = lower_snippet_with_slots(&[], body_src, slots);
         assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
         let s = lw
@@ -3885,14 +4466,17 @@ mod tests {
         assert_eq!(lw.w27_sites, 1);
     }
 
-    /// `seq.packed_at(row_index)` is the packed row index — census-only M31 (G4).
+    /// `seq.packed_at(row_index)` is the packed row index — a REAL `eval.iota()` op
+    /// (G4); the record/driver assign its input slot after the flattened input words.
     #[test]
-    fn seq_packed_at_is_census_only_m31() {
+    fn seq_packed_at_is_real_iota() {
         let lw = lower_snippet(&[], "let s = seq.packed_at(row_index); let t = (s) * (s);");
         assert_eq!(lw.env["s"], Ty::M31);
         assert_eq!(lw.env["t"], Ty::M31);
         assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
-        assert_eq!(lw.seq_sites, 1);
+        assert!(lw.uses_iota);
+        let s = lw.out.iter().map(|t| t.to_string()).collect::<String>();
+        assert!(s.contains("eval . iota ()"), "body: {s}");
     }
 
     /// from_limbs with the wrong arity is a loud skip (the trait op is `[M31; 28]`).
