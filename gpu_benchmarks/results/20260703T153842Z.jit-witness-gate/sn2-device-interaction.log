@@ -1,0 +1,19 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export TENT=/workspace/stwo-cairo/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip; export OUT=/workspace/out; STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_DEVICE_INTERACTION=1 STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/sn2_di.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 2 --reuse-input > $OUT/sn2_di.json 2> $OUT/sn2_di.err; rc=$?
+grep -E 'jit_interaction' $OUT/sn2_di.err | head -8
+tail -1 $OUT/sn2_di.json
+a=$(head -c 1048576 $OUT/sn2_off.proof | sha256sum | cut -d' ' -f1)
+b=$(head -c 1048576 $OUT/sn2_di.proof  | sha256sum | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo DI_PREFIX_MATCH; else echo DI_PREFIX_DIVERGED; fi
+exit $rc
+--8<-- output --8<--
+jit_interaction[add_opcode]: device logup 1048576 rows x 5 cols in 2.0 ms
+jit_interaction[add_opcode_small]: device logup 2097152 rows x 5 cols in 3.0 ms
+jit_interaction[assert_eq_opcode]: device logup 1048576 rows x 3 cols in 1.0 ms
+jit_interaction[assert_eq_opcode_imm]: device logup 524288 rows x 3 cols in 0.8 ms
+jit_interaction[assert_eq_opcode_double_deref]: device logup 2097152 rows x 4 cols in 2.1 ms
+jit_interaction[call_opcode_abs]: device logup 512 rows x 5 cols in 0.4 ms
+jit_interaction[call_opcode_rel_imm]: device logup 262144 rows x 5 cols in 0.7 ms
+jit_interaction[jnz_opcode_non_taken]: device logup 131072 rows x 3 cols in 0.5 ms
+{"adapt_s":1.06,"backend":"cuda","bootloader_overhead_pct":3.51,"cycle_count":7977397,"fold_step":3,"gpu":"NVIDIA H100 NVL","host_mem_gb":1511.351,"mhz":0.493,"n":1,"n_queries":70,"nproc":16,"peak_rss_gb":20.55,"pie_n_steps":7706864,"pool_reserved_high_gb":36.776,"pool_used_high_gb":35.495,"pow_bits":26,"program":"SN_PIE_2.zip","proof_kb":3006.636,"prove_s_cold":19.758,"prove_s_warm":16.17,"security_bits":96,"steps_per_s":493346.0,"useful_mhz":0.477,"verify_ms":16.939,"vm_s":5.349,"vram_end_gb":37.448,"vram_peak_gb":37.448}
+DI_PREFIX_MATCH

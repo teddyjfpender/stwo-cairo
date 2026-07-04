@@ -1,0 +1,35 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export TENT=/workspace/stwo-cairo/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip; export OUT=/workspace/out; STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/sn2_on.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 2 --reuse-input > $OUT/sn2_on.json 2> $OUT/sn2_on.err; rc=$?
+grep -o '"phase_totals":{.*}' $OUT/sn2_on.json | tail -1 > $OUT/sn2_on_phases.json || true
+grep -E 'jit_prove' $OUT/sn2_on.err | head -20
+tail -1 $OUT/sn2_on.json
+a=$(head -c 1048576 $OUT/sn2_off.proof | sha256sum | cut -d' ' -f1)
+b=$(head -c 1048576 $OUT/sn2_on.proof  | sha256sum | cut -d' ' -f1)
+echo "prefix_off=$a"; echo "prefix_on=$b"
+if [ "$a" = "$b" ]; then echo PREFIX_MATCH; else echo PREFIX_DIVERGED; fi
+exit $rc
+--8<-- output --8<--
+jit_prove[call_opcode_abs]: device witness 359 real rows (log_size 9) in 85.7 ms
+jit_prove[jump_opcode_rel]: device witness 903 real rows (log_size 10) in 90.5 ms
+jit_prove[jump_opcode_double_deref]: device witness 358 real rows (log_size 9) in 94.7 ms
+jit_prove[jnz_opcode_non_taken]: device witness 115005 real rows (log_size 17) in 135.9 ms
+jit_prove[assert_eq_opcode_imm]: device witness 478552 real rows (log_size 19) in 164.0 ms
+jit_prove[ret_opcode]: device witness 258366 real rows (log_size 18) in 192.3 ms
+jit_prove[jump_opcode_rel_imm]: device witness 356937 real rows (log_size 19) in 209.5 ms
+jit_prove[call_opcode_rel_imm]: device witness 258007 real rows (log_size 18) in 220.6 ms
+jit_prove[assert_eq_opcode]: device witness 957056 real rows (log_size 20) in 224.4 ms
+jit_prove[jnz_opcode_taken]: device witness 569029 real rows (log_size 20) in 456.6 ms
+jit_prove[assert_eq_opcode_double_deref]: device witness 1798509 real rows (log_size 21) in 482.9 ms
+jit_prove[add_opcode]: device witness 651967 real rows (log_size 20) in 486.8 ms
+jit_prove[add_opcode_small]: device witness 1579491 real rows (log_size 21) in 762.5 ms
+jit_prove[call_opcode_abs]: device witness 359 real rows (log_size 9) in 26.9 ms
+jit_prove[jump_opcode_rel]: device witness 903 real rows (log_size 10) in 27.7 ms
+jit_prove[jump_opcode_double_deref]: device witness 358 real rows (log_size 9) in 29.1 ms
+jit_prove[jnz_opcode_non_taken]: device witness 115005 real rows (log_size 17) in 54.5 ms
+jit_prove[assert_eq_opcode_imm]: device witness 478552 real rows (log_size 19) in 85.1 ms
+jit_prove[ret_opcode]: device witness 258366 real rows (log_size 18) in 107.3 ms
+jit_prove[jump_opcode_rel_imm]: device witness 356937 real rows (log_size 19) in 120.4 ms
+{"adapt_s":1.044,"backend":"cuda","bootloader_overhead_pct":3.51,"cycle_count":7977397,"fold_step":3,"gpu":"NVIDIA H100 NVL","host_mem_gb":1511.351,"mhz":0.481,"n":1,"n_queries":70,"nproc":16,"peak_rss_gb":23.823,"pie_n_steps":7706864,"pool_reserved_high_gb":35.501,"pool_used_high_gb":35.495,"pow_bits":26,"program":"SN_PIE_2.zip","proof_kb":3006.636,"prove_s_cold":20.826,"prove_s_warm":16.573,"security_bits":96,"steps_per_s":481350.0,"useful_mhz":0.465,"verify_ms":17.364,"vm_s":5.29,"vram_end_gb":36.173,"vram_peak_gb":36.173}
+prefix_off=a3ebd2f333d2f56492593393cbcc822edf1d4a8ee6e12a535fdcfbc28c228976
+prefix_on=a3ebd2f333d2f56492593393cbcc822edf1d4a8ee6e12a535fdcfbc28c228976
+PREFIX_MATCH

@@ -4,10 +4,16 @@ use std::sync::Arc;
 
 use cairo_air::air::PublicData;
 use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
+use cairo_air::components::blake_g::InteractionClaim as BlakeGInteractionClaim;
+use cairo_air::components::memory_id_to_big::InteractionClaim as MemoryBigInteractionClaim;
+use cairo_air::components::memory_id_to_small::InteractionClaim as MemorySmallInteractionClaim;
 use cairo_air::relations::CommonLookupElements;
 use indexmap::IndexSet;
 use rayon::scope;
+use stwo::core::fields::qm31::SecureField;
 pub use stwo::prover::backend::simd::SimdBackend;
+use stwo::prover::poly::circle::{CircleCoefficients, PolyOps};
+use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::poly::BitReversedOrder;
 use stwo_cairo_adapter::builtins::BuiltinSegments;
 use stwo_cairo_adapter::memory::Memory;
@@ -18,12 +24,29 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
 };
 use stwo_cairo_common::preprocessed_columns::simd_prelude::{BaseField, CircleEvaluation};
 
+use crate::witness::base_trace::BaseTrace;
+use crate::witness::blake_g_witness_backend::BlakeGWitness;
+use crate::witness::blake_round_witness_backend::BlakeRoundWitness;
 use crate::witness::components::*;
+use crate::witness::jit_prove_backend::{
+    AddOpcodeLane, AddOpcodeSmallLane, AssertEqOpcodeDoubleDerefLane, AssertEqOpcodeImmLane,
+    AssertEqOpcodeLane, CallOpcodeAbsLane, CallOpcodeRelImmLane, JnzOpcodeNonTakenLane,
+    JnzOpcodeTakenLane, JumpOpcodeAbsLane, JumpOpcodeDoubleDerefLane, JumpOpcodeRelImmLane,
+    JumpOpcodeRelLane, OpcodeJitBackend, RetOpcodeLane,
+};
+use crate::witness::memory_witness_backend::MemoryIdToBigWitness;
+use crate::witness::pedersen_witness_backend::{
+    PartialEcMulGenericWitness, PartialEcMulWindowBits18Witness,
+    PedersenAggregatorWindowBits18Witness,
+};
 
 #[derive(Default)]
 pub struct CairoClaimGenerator {
     pub public_data: PublicData,
     pub add_opcode: Option<add_opcode::ClaimGenerator>,
+    /// Adapter memory retained for the JIT-witness prove lane (set in
+    /// `fill_components` when `STWO_CUDA_WITNESS_JIT_PROVE=1`; None otherwise).
+    pub jit_memory: Option<Arc<Memory>>,
     pub add_opcode_small: Option<add_opcode_small::ClaimGenerator>,
     pub add_ap_opcode: Option<add_ap_opcode::ClaimGenerator>,
     pub assert_eq_opcode: Option<assert_eq_opcode::ClaimGenerator>,
@@ -106,7 +129,14 @@ impl CairoClaimGenerator {
         memory: Arc<Memory>,
         preprocessed_trace: Arc<PreProcessedTrace>,
     ) {
+        // Retain the adapter memory for the JIT-witness prove lane (device execution
+        // tables are built from it at write_trace time). Opt-in only — the Arc is
+        // cheap, but keeping the reference alive past adapt is a deliberate choice.
+        if std::env::var("STWO_CUDA_WITNESS_JIT_PROVE").as_deref() == Ok("1") {
+            self.jit_memory = Some(memory.clone());
+        }
         let Self {
+            jit_memory: _,
             add_opcode: add_opcode_ref,
             add_opcode_small: add_opcode_small_ref,
             add_ap_opcode: add_ap_opcode_ref,
@@ -722,14 +752,30 @@ impl CairoClaimGenerator {
     /// spawned task (`from_simd_evals` — the device upload, for GPU backends), so
     /// transfers overlap the generation of later components; collection order is
     /// unchanged, so the committed column order is identical.
-    pub fn write_trace<B: stwo::prover::backend::FromSimdColumns>(
+    /// `memory_id_to_big` goes through the [`MemoryIdToBigWitness`] backend hook:
+    /// on GPU backends its columns are born on device (witness-on-GPU P1).
+    pub fn write_trace<
+        B: MemoryIdToBigWitness
+            + BlakeGWitness
+            + OpcodeJitBackend
+            + BlakeRoundWitness
+            + PartialEcMulGenericWitness
+            + PartialEcMulWindowBits18Witness
+            + PedersenAggregatorWindowBits18Witness
+            + PolyOps,
+    >(
         self,
         opt_n_id_to_big_components: Option<usize>,
-    ) -> (
-        Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
-        CairoClaim,
-        CairoInteractionClaimGenerator,
-    ) {
+        // Stage A″ (pipelined commit): when `Some`, the opcode-prefix columns are
+        // interpolated on a committer thread with this twiddle tree WHILE the serial
+        // host-heavy components below generate, and the whole base trace is returned
+        // already interpolated (`BaseTrace::Polys`). `None` = default byte-identical
+        // path (`BaseTrace::Evals`, interpolated at commit time). The tree must be
+        // `'static` (it comes from the process-wide leaked twiddle cache) so the
+        // committer thread can borrow it; its identity is verified against the
+        // commitment tree at the call site (fail-closed on a trace-size change).
+        pipeline_twiddles: Option<&'static TwiddleTree<B>>,
+    ) -> (BaseTrace<B>, CairoClaim, CairoInteractionClaimGenerator<B>) {
         let mut evals = Vec::new();
         let mut add_opcode_result = None;
         let mut add_opcode_small_result = None;
@@ -754,216 +800,259 @@ impl CairoClaimGenerator {
 
         scope(|s| {
             if let Some(gen) = self.add_opcode {
-                s.spawn(|_| {
-                    add_opcode_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut add_opcode_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:add_opcode").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<AddOpcodeLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.add_opcode_small {
-                s.spawn(|_| {
-                    add_opcode_small_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut add_opcode_small_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:add_opcode_small").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<AddOpcodeSmallLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.add_ap_opcode {
                 s.spawn(|_| {
                     add_ap_opcode_result = Some({
+                        let _wt = tracing::info_span!("wt:add_ap_opcode").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_18.as_ref().unwrap(),
-                        self.range_check_11.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_18.as_ref().unwrap(),
+                            self.range_check_11.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
             }
             if let Some(gen) = self.assert_eq_opcode {
-                s.spawn(|_| {
-                    assert_eq_opcode_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut assert_eq_opcode_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:assert_eq_opcode").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<AssertEqOpcodeLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.assert_eq_opcode_imm {
-                s.spawn(|_| {
-                    assert_eq_opcode_imm_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut assert_eq_opcode_imm_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:assert_eq_opcode_imm").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<AssertEqOpcodeImmLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.assert_eq_opcode_double_deref {
-                s.spawn(|_| {
-                    assert_eq_opcode_double_deref_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut assert_eq_opcode_double_deref_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:assert_eq_opcode_double_deref").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<AssertEqOpcodeDoubleDerefLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.blake_compress_opcode {
                 s.spawn(|_| {
                     blake_compress_opcode_result = Some({
+                        let _wt = tracing::info_span!("wt:blake_compress_opcode").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_7_2_5.as_ref().unwrap(),
-                        self.verify_bitwise_xor_8.as_ref().unwrap(),
-                        self.blake_round.as_ref().unwrap(),
-                        self.triple_xor_32.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_7_2_5.as_ref().unwrap(),
+                            self.verify_bitwise_xor_8.as_ref().unwrap(),
+                            self.blake_round.as_ref().unwrap(),
+                            self.triple_xor_32.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
             }
             if let Some(gen) = self.call_opcode_abs {
-                s.spawn(|_| {
-                    call_opcode_abs_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut call_opcode_abs_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:call_opcode_abs").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<CallOpcodeAbsLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.call_opcode_rel_imm {
-                s.spawn(|_| {
-                    call_opcode_rel_imm_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut call_opcode_rel_imm_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:call_opcode_rel_imm").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<CallOpcodeRelImmLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.generic_opcode {
                 s.spawn(|_| {
                     generic_opcode_result = Some({
+                        let _wt = tracing::info_span!("wt:generic_opcode").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_9_9.as_ref().unwrap(),
-                        self.range_check_20.as_ref().unwrap(),
-                        self.range_check_18.as_ref().unwrap(),
-                        self.range_check_11.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_9_9.as_ref().unwrap(),
+                            self.range_check_20.as_ref().unwrap(),
+                            self.range_check_18.as_ref().unwrap(),
+                            self.range_check_11.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
             }
             if let Some(gen) = self.jnz_opcode_non_taken {
-                s.spawn(|_| {
-                    jnz_opcode_non_taken_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut jnz_opcode_non_taken_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:jnz_opcode_non_taken").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<JnzOpcodeNonTakenLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.jnz_opcode_taken {
-                s.spawn(|_| {
-                    jnz_opcode_taken_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut jnz_opcode_taken_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:jnz_opcode_taken").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<JnzOpcodeTakenLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.jump_opcode_abs {
-                s.spawn(|_| {
-                    jump_opcode_abs_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut jump_opcode_abs_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:jump_opcode_abs").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeAbsLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.jump_opcode_double_deref {
-                s.spawn(|_| {
-                    jump_opcode_double_deref_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut jump_opcode_double_deref_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:jump_opcode_double_deref").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeDoubleDerefLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.jump_opcode_rel {
-                s.spawn(|_| {
-                    jump_opcode_rel_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut jump_opcode_rel_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:jump_opcode_rel").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeRelLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.jump_opcode_rel_imm {
-                s.spawn(|_| {
-                    jump_opcode_rel_imm_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut jump_opcode_rel_imm_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:jump_opcode_rel_imm").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeRelImmLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.mul_opcode {
                 s.spawn(|_| {
                     mul_opcode_result = Some({
+                        let _wt = tracing::info_span!("wt:mul_opcode").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_20.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_20.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -971,12 +1060,13 @@ impl CairoClaimGenerator {
             if let Some(gen) = self.mul_opcode_small {
                 s.spawn(|_| {
                     mul_opcode_small_result = Some({
+                        let _wt = tracing::info_span!("wt:mul_opcode_small").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_11.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_11.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
@@ -984,25 +1074,29 @@ impl CairoClaimGenerator {
             if let Some(gen) = self.qm_31_add_mul_opcode {
                 s.spawn(|_| {
                     qm_31_add_mul_opcode_result = Some({
+                        let _wt = tracing::info_span!("wt:qm_31_add_mul_opcode").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                        self.range_check_4_4_4_4.as_ref().unwrap(),
-                    );
+                            self.memory_address_to_id.as_ref().unwrap(),
+                            self.memory_id_to_big.as_ref().unwrap(),
+                            self.verify_instruction.as_ref().unwrap(),
+                            self.range_check_4_4_4_4.as_ref().unwrap(),
+                        );
                         (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
                     });
                 });
             }
             if let Some(gen) = self.ret_opcode {
-                s.spawn(|_| {
-                    ret_opcode_result = Some({
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.memory_address_to_id.as_ref().unwrap(),
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.verify_instruction.as_ref().unwrap(),
-                    );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let result_slot = &mut ret_opcode_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
+                        let _wt = tracing::info_span!("wt:ret_opcode").entered();
+                        <B as OpcodeJitBackend>::lane_write_trace::<RetOpcodeLane>(
+                            gen, addr_state, id_state, vi_state, jit_memory,
+                        )
                     });
                 });
             }
@@ -1137,9 +1231,39 @@ impl CairoClaimGenerator {
             })
             .unzip();
 
+        // Stage A″: the 20 opcode components above ran in the parallel scope and are
+        // done + device-resident. If pipelined commit is on, hand their columns (the
+        // canonical prefix of `evals`) to a committer thread that interpolates them
+        // with the caller's twiddle tree WHILE the serial host-heavy components below
+        // (verify_instruction, blake_round, partial_ec_mul, pedersen_aggregator, ...)
+        // generate — hiding the opcode iFFTs under the ~2.8s host block. `evals` is
+        // emptied here so the rest of the assembly refills it with the suffix columns.
+        let opcode_committer: Option<(std::thread::JoinHandle<Vec<CircleCoefficients<B>>>, usize)> =
+            pipeline_twiddles.map(|tree| {
+                let opcode_evals = std::mem::take(&mut evals);
+                let tree_ptr = tree as *const TwiddleTree<B> as usize;
+                // One-time engage marker so the gate can confirm the ON path actually ran
+                // (rather than silently falling back to Evals on a cold twiddle cache).
+                {
+                    use std::sync::Once;
+                    static ENGAGED: Once = Once::new();
+                    ENGAGED.call_once(|| {
+                        eprintln!(
+                            "STWO_CUDA_PIPELINED_COMMIT: A\u{2033} engaged — {} opcode-prefix \
+                         columns interpolating on a committer thread under the host-heavy witness \
+                         components",
+                            opcode_evals.len()
+                        );
+                    });
+                }
+                let handle = std::thread::spawn(move || B::interpolate_columns(opcode_evals, tree));
+                (handle, tree_ptr)
+            });
+
         let (verify_instruction_claim, verify_instruction_interaction_gen) = self
             .verify_instruction
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:verify_instruction").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.range_check_7_2_5.as_ref().unwrap(),
                     self.range_check_4_3.as_ref().unwrap(),
@@ -1153,34 +1277,42 @@ impl CairoClaimGenerator {
         let (blake_round_claim, blake_round_interaction_gen) = self
             .blake_round
             .map(|gen| {
-                let (trace, claim, interaction_gen) = gen.write_trace(
+                let _wt = tracing::info_span!("wt:blake_round").entered();
+                // blake_round goes through the [`BlakeRoundWitness`] backend hook:
+                // SimdBackend runs the host writer; CudaBackend's device lane
+                // (pod-gated) is born on device and feeds blake_g device-to-device.
+                let (trace, claim, interaction_gen) = <B as BlakeRoundWitness>::write_trace(
+                    gen,
                     self.blake_round_sigma.as_ref().unwrap(),
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.range_check_7_2_5.as_ref().unwrap(),
                     self.blake_g.as_ref().unwrap(),
                 );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (blake_g_claim, blake_g_interaction_gen) = self
             .blake_g
             .map(|gen| {
-                let (trace, claim, interaction_gen) = gen.write_trace(
+                let _wt = tracing::info_span!("wt:blake_g").entered();
+                let (trace, claim, interaction_gen) = <B as BlakeGWitness>::write_trace(
+                    gen,
                     self.verify_bitwise_xor_8.as_ref().unwrap(),
                     self.verify_bitwise_xor_12.as_ref().unwrap(),
                     self.verify_bitwise_xor_4.as_ref().unwrap(),
                     self.verify_bitwise_xor_7.as_ref().unwrap(),
                     self.verify_bitwise_xor_9.as_ref().unwrap(),
                 );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (blake_round_sigma_claim, blake_round_sigma_interaction_gen) = self
             .blake_round_sigma
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:blake_round_sigma").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1189,6 +1321,7 @@ impl CairoClaimGenerator {
         let (triple_xor_32_claim, triple_xor_32_interaction_gen) = self
             .triple_xor_32
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:triple_xor_32").entered();
                 let (trace, claim, interaction_gen) =
                     gen.write_trace(self.verify_bitwise_xor_8.as_ref().unwrap());
                 evals.extend(B::from_simd_evals(trace.to_evals()));
@@ -1198,6 +1331,7 @@ impl CairoClaimGenerator {
         let (verify_bitwise_xor_12_claim, verify_bitwise_xor_12_interaction_gen) = self
             .verify_bitwise_xor_12
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:verify_bitwise_xor_12").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace));
                 (claim, interaction_gen)
@@ -1206,6 +1340,7 @@ impl CairoClaimGenerator {
         let (add_mod_builtin_claim, add_mod_builtin_interaction_gen) = self
             .add_mod_builtin
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:add_mod_builtin").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
@@ -1217,6 +1352,7 @@ impl CairoClaimGenerator {
         let (bitwise_builtin_claim, bitwise_builtin_interaction_gen) = self
             .bitwise_builtin
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:bitwise_builtin").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
@@ -1230,6 +1366,7 @@ impl CairoClaimGenerator {
         let (mul_mod_builtin_claim, mul_mod_builtin_interaction_gen) = self
             .mul_mod_builtin
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:mul_mod_builtin").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
@@ -1244,6 +1381,7 @@ impl CairoClaimGenerator {
         let (pedersen_builtin_claim, pedersen_builtin_interaction_gen) = self
             .pedersen_builtin
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:pedersen_builtin").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.pedersen_aggregator_window_bits_18.as_ref().unwrap(),
@@ -1258,6 +1396,7 @@ impl CairoClaimGenerator {
         ) = self
             .pedersen_builtin_narrow_windows
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:pedersen_builtin_narrow_windows").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.pedersen_aggregator_window_bits_9.as_ref().unwrap(),
@@ -1269,6 +1408,7 @@ impl CairoClaimGenerator {
         let (poseidon_builtin_claim, poseidon_builtin_interaction_gen) = self
             .poseidon_builtin
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:poseidon_builtin").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.poseidon_aggregator.as_ref().unwrap(),
@@ -1280,6 +1420,7 @@ impl CairoClaimGenerator {
         let (range_check96_builtin_claim, range_check96_builtin_interaction_gen) = self
             .range_check96_builtin
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check96_builtin").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
@@ -1292,6 +1433,7 @@ impl CairoClaimGenerator {
         let (range_check_builtin_claim, range_check_builtin_interaction_gen) = self
             .range_check_builtin
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_builtin").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
@@ -1303,6 +1445,7 @@ impl CairoClaimGenerator {
         let (ec_op_builtin_claim, ec_op_builtin_interaction_gen) = self
             .ec_op_builtin
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:ec_op_builtin").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_address_to_id.as_ref().unwrap(),
                     self.memory_id_to_big.as_ref().unwrap(),
@@ -1316,12 +1459,15 @@ impl CairoClaimGenerator {
         let (partial_ec_mul_generic_claim, partial_ec_mul_generic_interaction_gen) = self
             .partial_ec_mul_generic
             .map(|gen| {
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.range_check_8.as_ref().unwrap(),
-                    self.range_check_9_9.as_ref().unwrap(),
-                    self.range_check_20.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
+                let _wt = tracing::info_span!("wt:partial_ec_mul_generic").entered();
+                let (trace, claim, interaction_gen) =
+                    <B as PartialEcMulGenericWitness>::write_trace(
+                        gen,
+                        self.range_check_8.as_ref().unwrap(),
+                        self.range_check_9_9.as_ref().unwrap(),
+                        self.range_check_20.as_ref().unwrap(),
+                    );
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
@@ -1331,24 +1477,30 @@ impl CairoClaimGenerator {
         ) = self
             .pedersen_aggregator_window_bits_18
             .map(|gen| {
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_id_to_big.as_ref().unwrap(),
-                    self.range_check_8.as_ref().unwrap(),
-                    self.partial_ec_mul_window_bits_18.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
+                let _wt = tracing::info_span!("wt:pedersen_aggregator_window_bits_18").entered();
+                let (trace, claim, interaction_gen) =
+                    <B as PedersenAggregatorWindowBits18Witness>::write_trace(
+                        gen,
+                        self.memory_id_to_big.as_ref().unwrap(),
+                        self.range_check_8.as_ref().unwrap(),
+                        self.partial_ec_mul_window_bits_18.as_ref().unwrap(),
+                    );
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (partial_ec_mul_window_bits_18_claim, partial_ec_mul_window_bits_18_interaction_gen) =
             self.partial_ec_mul_window_bits_18
                 .map(|gen| {
-                    let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.pedersen_points_table_window_bits_18.as_ref().unwrap(),
-                        self.range_check_9_9.as_ref().unwrap(),
-                        self.range_check_20.as_ref().unwrap(),
-                    );
-                    evals.extend(B::from_simd_evals(trace.to_evals()));
+                    let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_18").entered();
+                    let (trace, claim, interaction_gen) =
+                        <B as PartialEcMulWindowBits18Witness>::write_trace(
+                            gen,
+                            self.pedersen_points_table_window_bits_18.as_ref().unwrap(),
+                            self.range_check_9_9.as_ref().unwrap(),
+                            self.range_check_20.as_ref().unwrap(),
+                        );
+                    evals.extend(trace);
                     (claim, interaction_gen)
                 })
                 .unzip();
@@ -1358,6 +1510,7 @@ impl CairoClaimGenerator {
         ) = self
             .pedersen_points_table_window_bits_18
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:pedersen_points_table_window_bits_18").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1369,6 +1522,7 @@ impl CairoClaimGenerator {
         ) = self
             .pedersen_aggregator_window_bits_9
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:pedersen_aggregator_window_bits_9").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.range_check_8.as_ref().unwrap(),
@@ -1381,6 +1535,7 @@ impl CairoClaimGenerator {
         let (partial_ec_mul_window_bits_9_claim, partial_ec_mul_window_bits_9_interaction_gen) =
             self.partial_ec_mul_window_bits_9
                 .map(|gen| {
+                    let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_9").entered();
                     let (trace, claim, interaction_gen) = gen.write_trace(
                         self.pedersen_points_table_window_bits_9.as_ref().unwrap(),
                         self.range_check_9_9.as_ref().unwrap(),
@@ -1396,6 +1551,7 @@ impl CairoClaimGenerator {
         ) = self
             .pedersen_points_table_window_bits_9
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:pedersen_points_table_window_bits_9").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1404,6 +1560,7 @@ impl CairoClaimGenerator {
         let (poseidon_aggregator_claim, poseidon_aggregator_interaction_gen) = self
             .poseidon_aggregator
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:poseidon_aggregator").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.poseidon_full_round_chain.as_ref().unwrap(),
@@ -1424,6 +1581,7 @@ impl CairoClaimGenerator {
         ) = self
             .poseidon_3_partial_rounds_chain
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:poseidon_3_partial_rounds_chain").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.poseidon_round_keys.as_ref().unwrap(),
                     self.cube_252.as_ref().unwrap(),
@@ -1438,6 +1596,7 @@ impl CairoClaimGenerator {
         let (poseidon_full_round_chain_claim, poseidon_full_round_chain_interaction_gen) = self
             .poseidon_full_round_chain
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:poseidon_full_round_chain").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.cube_252.as_ref().unwrap(),
                     self.poseidon_round_keys.as_ref().unwrap(),
@@ -1450,6 +1609,7 @@ impl CairoClaimGenerator {
         let (cube_252_claim, cube_252_interaction_gen) = self
             .cube_252
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:cube_252").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.range_check_9_9.as_ref().unwrap(),
                     self.range_check_20.as_ref().unwrap(),
@@ -1461,6 +1621,7 @@ impl CairoClaimGenerator {
         let (poseidon_round_keys_claim, poseidon_round_keys_interaction_gen) = self
             .poseidon_round_keys
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:poseidon_round_keys").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1469,6 +1630,7 @@ impl CairoClaimGenerator {
         let (range_check_252_width_27_claim, range_check_252_width_27_interaction_gen) = self
             .range_check_252_width_27
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_252_width_27").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace(
                     self.range_check_9_9.as_ref().unwrap(),
                     self.range_check_18.as_ref().unwrap(),
@@ -1480,6 +1642,7 @@ impl CairoClaimGenerator {
         let (memory_address_to_id_claim, memory_address_to_id_interaction_gen) = self
             .memory_address_to_id
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:memory_address_to_id").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace));
                 (claim, interaction_gen)
@@ -1488,22 +1651,29 @@ impl CairoClaimGenerator {
         let (memory_id_to_big_claim, memory_id_to_big_interaction_gen) = self
             .memory_id_to_big
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:memory_id_to_big").entered();
                 const LOG_MAX_BIG_SIZE: u32 = MAX_SEQUENCE_LOG_SIZE;
-                let (big_traces, small_trace, claim, interaction_gen) = gen.write_trace(
-                    self.range_check_9_9.as_ref().unwrap(),
-                    LOG_MAX_BIG_SIZE,
-                    opt_n_id_to_big_components,
-                );
+                // The backend hook: SimdBackend runs the existing host writer;
+                // CudaBackend generates the columns on device and merges the
+                // rc_9_9 counts BEFORE range_check_9_9 writes its trace below.
+                let (big_traces, small_trace, claim, interaction_gen) =
+                    <B as MemoryIdToBigWitness>::write_trace(
+                        gen,
+                        self.range_check_9_9.as_ref().unwrap(),
+                        LOG_MAX_BIG_SIZE,
+                        opt_n_id_to_big_components,
+                    );
                 for big_trace in big_traces {
-                    evals.extend(B::from_simd_evals(big_trace));
+                    evals.extend(big_trace);
                 }
-                evals.extend(B::from_simd_evals(small_trace));
+                evals.extend(small_trace);
                 (claim, interaction_gen)
             })
             .unzip();
         let (range_check_6_claim, range_check_6_interaction_gen) = self
             .range_check_6
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_6").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1512,6 +1682,7 @@ impl CairoClaimGenerator {
         let (range_check_8_claim, range_check_8_interaction_gen) = self
             .range_check_8
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_8").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1520,6 +1691,7 @@ impl CairoClaimGenerator {
         let (range_check_11_claim, range_check_11_interaction_gen) = self
             .range_check_11
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_11").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1528,6 +1700,7 @@ impl CairoClaimGenerator {
         let (range_check_12_claim, range_check_12_interaction_gen) = self
             .range_check_12
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_12").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1536,6 +1709,7 @@ impl CairoClaimGenerator {
         let (range_check_18_claim, range_check_18_interaction_gen) = self
             .range_check_18
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_18").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1544,6 +1718,7 @@ impl CairoClaimGenerator {
         let (range_check_20_claim, range_check_20_interaction_gen) = self
             .range_check_20
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_20").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1552,6 +1727,7 @@ impl CairoClaimGenerator {
         let (range_check_4_3_claim, range_check_4_3_interaction_gen) = self
             .range_check_4_3
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_4_3").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1560,6 +1736,7 @@ impl CairoClaimGenerator {
         let (range_check_4_4_claim, range_check_4_4_interaction_gen) = self
             .range_check_4_4
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_4_4").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1568,6 +1745,7 @@ impl CairoClaimGenerator {
         let (range_check_9_9_claim, range_check_9_9_interaction_gen) = self
             .range_check_9_9
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_9_9").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1576,6 +1754,7 @@ impl CairoClaimGenerator {
         let (range_check_7_2_5_claim, range_check_7_2_5_interaction_gen) = self
             .range_check_7_2_5
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_7_2_5").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1584,6 +1763,7 @@ impl CairoClaimGenerator {
         let (range_check_3_6_6_3_claim, range_check_3_6_6_3_interaction_gen) = self
             .range_check_3_6_6_3
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_3_6_6_3").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1592,6 +1772,7 @@ impl CairoClaimGenerator {
         let (range_check_4_4_4_4_claim, range_check_4_4_4_4_interaction_gen) = self
             .range_check_4_4_4_4
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_4_4_4_4").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1600,6 +1781,7 @@ impl CairoClaimGenerator {
         let (range_check_3_3_3_3_3_claim, range_check_3_3_3_3_3_interaction_gen) = self
             .range_check_3_3_3_3_3
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:range_check_3_3_3_3_3").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1608,6 +1790,7 @@ impl CairoClaimGenerator {
         let (verify_bitwise_xor_4_claim, verify_bitwise_xor_4_interaction_gen) = self
             .verify_bitwise_xor_4
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:verify_bitwise_xor_4").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1616,6 +1799,7 @@ impl CairoClaimGenerator {
         let (verify_bitwise_xor_7_claim, verify_bitwise_xor_7_interaction_gen) = self
             .verify_bitwise_xor_7
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:verify_bitwise_xor_7").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1624,6 +1808,7 @@ impl CairoClaimGenerator {
         let (verify_bitwise_xor_8_claim, verify_bitwise_xor_8_interaction_gen) = self
             .verify_bitwise_xor_8
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:verify_bitwise_xor_8").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1632,6 +1817,7 @@ impl CairoClaimGenerator {
         let (verify_bitwise_xor_9_claim, verify_bitwise_xor_9_interaction_gen) = self
             .verify_bitwise_xor_9
             .map(|gen| {
+                let _wt = tracing::info_span!("wt:verify_bitwise_xor_9").entered();
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -1639,8 +1825,25 @@ impl CairoClaimGenerator {
             .unzip();
 
         let (memory_id_to_big_claim, memory_id_to_small_claim) = memory_id_to_big_claim.unzip();
+
+        // Stage A″: assemble the base trace in canonical column order. With a
+        // committer, `evals` now holds only the suffix (non-opcode) columns; join the
+        // opcode polys and interpolate the suffix with the SAME tree, so the whole
+        // trace is coefficients in canonical order — byte-identical to interpolating
+        // the full `evals` at once (`interpolate_columns` is per-column independent).
+        // Without a committer, `evals` is the full trace and the caller interpolates
+        // it at commit time exactly as before (byte-identical to the pre-A″ flow).
+        let base_trace = match opcode_committer {
+            Some((handle, tree_ptr)) => {
+                let tree = pipeline_twiddles.expect("committer implies pipeline_twiddles");
+                let mut polys = handle.join().expect("A″ opcode committer thread panicked");
+                polys.extend(B::interpolate_columns(evals, tree));
+                BaseTrace::Polys { polys, tree_ptr }
+            }
+            None => BaseTrace::Evals(evals),
+        };
         (
-            evals,
+            base_trace,
             CairoClaim {
                 public_data: self.public_data,
                 add_opcode: add_opcode_claim,
@@ -1789,8 +1992,7 @@ impl CairoClaimGenerator {
     }
 }
 
-#[derive(Default)]
-pub struct CairoInteractionClaimGenerator {
+pub struct CairoInteractionClaimGenerator<B: MemoryIdToBigWitness + BlakeGWitness> {
     pub add_opcode: Option<add_opcode::InteractionClaimGenerator>,
     pub add_opcode_small: Option<add_opcode_small::InteractionClaimGenerator>,
     pub add_ap_opcode: Option<add_ap_opcode::InteractionClaimGenerator>,
@@ -1814,7 +2016,7 @@ pub struct CairoInteractionClaimGenerator {
     pub ret_opcode: Option<ret_opcode::InteractionClaimGenerator>,
     pub verify_instruction: Option<verify_instruction::InteractionClaimGenerator>,
     pub blake_round: Option<blake_round::InteractionClaimGenerator>,
-    pub blake_g: Option<blake_g::InteractionClaimGenerator>,
+    pub blake_g: Option<<B as BlakeGWitness>::InteractionGen>,
     pub blake_round_sigma: Option<blake_round_sigma::InteractionClaimGenerator>,
     pub triple_xor_32: Option<triple_xor_32::InteractionClaimGenerator>,
     pub verify_bitwise_xor_12: Option<verify_bitwise_xor_12::InteractionClaimGenerator>,
@@ -1849,7 +2051,7 @@ pub struct CairoInteractionClaimGenerator {
     pub poseidon_round_keys: Option<poseidon_round_keys::InteractionClaimGenerator>,
     pub range_check_252_width_27: Option<range_check_252_width_27::InteractionClaimGenerator>,
     pub memory_address_to_id: Option<memory_address_to_id::InteractionClaimGenerator>,
-    pub memory_id_to_big: Option<memory_id_to_big::InteractionClaimGenerator>,
+    pub memory_id_to_big: Option<<B as MemoryIdToBigWitness>::InteractionGen>,
     pub range_check_6: Option<range_check_6::InteractionClaimGenerator>,
     pub range_check_8: Option<range_check_8::InteractionClaimGenerator>,
     pub range_check_11: Option<range_check_11::InteractionClaimGenerator>,
@@ -1869,25 +2071,21 @@ pub struct CairoInteractionClaimGenerator {
     pub verify_bitwise_xor_9: Option<verify_bitwise_xor_9::InteractionClaimGenerator>,
 }
 
-impl CairoInteractionClaimGenerator {
+impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractionClaimGenerator<B> {
     /// Writes the raw interaction fractions on the host (parallel across
     /// components), then finalizes each component's logup trace on `B` — the
     /// device, for GPU backends — in the same fixed component order as before.
     /// Claims are constructed from the finalized sums, so the Fiat-Shamir
-    /// transcript is unchanged. `memory_id_to_big` still finalizes eagerly on
-    /// SIMD (its multi-segment writer is structurally different) and bridges via
-    /// `from_simd_evals`.
-    pub fn write_interaction_trace<B>(
+    /// transcript is unchanged. `memory_id_to_big` goes through the
+    /// [`MemoryIdToBigWitness`] hook: on the device path its denominators are
+    /// computed from the device-resident limb columns (witness-on-GPU P1).
+    pub fn write_interaction_trace(
         self,
         common_lookup_elements: &CommonLookupElements,
     ) -> (
         Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
         CairoInteractionClaim,
-    )
-    where
-        B: stwo_constraint_framework::LogupFinalizeBackend
-            + stwo::prover::backend::FromSimdColumns,
-    {
+    ) {
         let mut evals = Vec::new();
         let mut add_opcode_result = None;
         let mut add_opcode_small_result = None;
@@ -1959,15 +2157,24 @@ impl CairoInteractionClaimGenerator {
 
         scope(|s| {
             if let Some(gen) = self.add_opcode {
-                s.spawn(|_| {
-                    add_opcode_result = Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<AddOpcodeLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        add_opcode_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.add_opcode_small {
-                s.spawn(|_| {
-                    add_opcode_small_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<AddOpcodeSmallLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        add_opcode_small_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.add_ap_opcode {
                 s.spawn(|_| {
@@ -1976,22 +2183,36 @@ impl CairoInteractionClaimGenerator {
                 });
             }
             if let Some(gen) = self.assert_eq_opcode {
-                s.spawn(|_| {
-                    assert_eq_opcode_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<AssertEqOpcodeLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        assert_eq_opcode_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.assert_eq_opcode_imm {
-                s.spawn(|_| {
-                    assert_eq_opcode_imm_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<AssertEqOpcodeImmLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        assert_eq_opcode_imm_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.assert_eq_opcode_double_deref {
-                s.spawn(|_| {
-                    assert_eq_opcode_double_deref_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<
+                    AssertEqOpcodeDoubleDerefLane,
+                >() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        assert_eq_opcode_double_deref_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.blake_compress_opcode {
                 s.spawn(|_| {
@@ -2000,16 +2221,24 @@ impl CairoInteractionClaimGenerator {
                 });
             }
             if let Some(gen) = self.call_opcode_abs {
-                s.spawn(|_| {
-                    call_opcode_abs_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<CallOpcodeAbsLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        call_opcode_abs_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.call_opcode_rel_imm {
-                s.spawn(|_| {
-                    call_opcode_rel_imm_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<CallOpcodeRelImmLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        call_opcode_rel_imm_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.generic_opcode {
                 s.spawn(|_| {
@@ -2018,40 +2247,65 @@ impl CairoInteractionClaimGenerator {
                 });
             }
             if let Some(gen) = self.jnz_opcode_non_taken {
-                s.spawn(|_| {
-                    jnz_opcode_non_taken_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JnzOpcodeNonTakenLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        jnz_opcode_non_taken_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.jnz_opcode_taken {
-                s.spawn(|_| {
-                    jnz_opcode_taken_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JnzOpcodeTakenLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        jnz_opcode_taken_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.jump_opcode_abs {
-                s.spawn(|_| {
-                    jump_opcode_abs_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeAbsLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        jump_opcode_abs_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.jump_opcode_double_deref {
-                s.spawn(|_| {
-                    jump_opcode_double_deref_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeDoubleDerefLane>(
+                ) {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        jump_opcode_double_deref_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.jump_opcode_rel {
-                s.spawn(|_| {
-                    jump_opcode_rel_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeRelLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        jump_opcode_rel_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.jump_opcode_rel_imm {
-                s.spawn(|_| {
-                    jump_opcode_rel_imm_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeRelImmLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        jump_opcode_rel_imm_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.mul_opcode {
                 s.spawn(|_| {
@@ -2071,9 +2325,14 @@ impl CairoInteractionClaimGenerator {
                 });
             }
             if let Some(gen) = self.ret_opcode {
-                s.spawn(|_| {
-                    ret_opcode_result = Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::device_interaction_pending::<RetOpcodeLane>() {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        ret_opcode_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.verify_instruction {
                 s.spawn(|_| {
@@ -2088,7 +2347,10 @@ impl CairoInteractionClaimGenerator {
             }
             if let Some(gen) = self.blake_g {
                 s.spawn(|_| {
-                    blake_g_result = Some(gen.write_interaction_trace(common_lookup_elements));
+                    blake_g_result = Some(<B as BlakeGWitness>::write_interaction(
+                        gen,
+                        common_lookup_elements,
+                    ));
                 });
             }
             if let Some(gen) = self.blake_round_sigma {
@@ -2248,8 +2510,10 @@ impl CairoInteractionClaimGenerator {
             }
             if let Some(gen) = self.memory_id_to_big {
                 s.spawn(|_| {
-                    memory_id_to_big_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
+                    memory_id_to_big_result = Some(<B as MemoryIdToBigWitness>::write_interaction(
+                        gen,
+                        common_lookup_elements,
+                    ));
                 });
             }
             if let Some(gen) = self.range_check_6 {
@@ -2356,106 +2620,196 @@ impl CairoInteractionClaimGenerator {
             }
         });
 
-        let add_opcode_interaction_claim = add_opcode_result.map(|(raw, build_claim)| {
+        let add_opcode_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<AddOpcodeLane>(common_lookup_elements)
+        {
+            evals.extend(trace);
+            Some(cairo_air::components::add_opcode::InteractionClaim { claimed_sum })
+        } else {
+            add_opcode_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let add_opcode_small_interaction_claim =
+            })
+        };
+        let add_opcode_small_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<AddOpcodeSmallLane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::add_opcode_small::InteractionClaim { claimed_sum })
+        } else {
             add_opcode_small_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let add_ap_opcode_interaction_claim =
-            add_ap_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let assert_eq_opcode_interaction_claim =
+            })
+        };
+        let add_ap_opcode_interaction_claim = add_ap_opcode_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let assert_eq_opcode_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<AssertEqOpcodeLane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::assert_eq_opcode::InteractionClaim { claimed_sum })
+        } else {
             assert_eq_opcode_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let assert_eq_opcode_imm_interaction_claim =
+            })
+        };
+        let assert_eq_opcode_imm_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<AssertEqOpcodeImmLane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::assert_eq_opcode_imm::InteractionClaim { claimed_sum })
+        } else {
             assert_eq_opcode_imm_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let assert_eq_opcode_double_deref_interaction_claim = assert_eq_opcode_double_deref_result
-            .map(|(raw, build_claim)| {
+            })
+        };
+        let assert_eq_opcode_double_deref_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<AssertEqOpcodeDoubleDerefLane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(
+                cairo_air::components::assert_eq_opcode_double_deref::InteractionClaim {
+                    claimed_sum,
+                },
+            )
+        } else {
+            assert_eq_opcode_double_deref_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
+            })
+        };
         let blake_compress_opcode_interaction_claim =
             blake_compress_opcode_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let call_opcode_abs_interaction_claim =
+        let call_opcode_abs_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<CallOpcodeAbsLane>(common_lookup_elements)
+        {
+            evals.extend(trace);
+            Some(cairo_air::components::call_opcode_abs::InteractionClaim { claimed_sum })
+        } else {
             call_opcode_abs_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let call_opcode_rel_imm_interaction_claim =
+            })
+        };
+        let call_opcode_rel_imm_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<CallOpcodeRelImmLane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::call_opcode_rel_imm::InteractionClaim { claimed_sum })
+        } else {
             call_opcode_rel_imm_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let generic_opcode_interaction_claim =
-            generic_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let jnz_opcode_non_taken_interaction_claim =
+            })
+        };
+        let generic_opcode_interaction_claim = generic_opcode_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let jnz_opcode_non_taken_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<JnzOpcodeNonTakenLane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::jnz_opcode_non_taken::InteractionClaim { claimed_sum })
+        } else {
             jnz_opcode_non_taken_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let jnz_opcode_taken_interaction_claim =
+            })
+        };
+        let jnz_opcode_taken_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<JnzOpcodeTakenLane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::jnz_opcode_taken::InteractionClaim { claimed_sum })
+        } else {
             jnz_opcode_taken_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let jump_opcode_abs_interaction_claim =
+            })
+        };
+        let jump_opcode_abs_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<JumpOpcodeAbsLane>(common_lookup_elements)
+        {
+            evals.extend(trace);
+            Some(cairo_air::components::jump_opcode_abs::InteractionClaim { claimed_sum })
+        } else {
             jump_opcode_abs_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let jump_opcode_double_deref_interaction_claim =
+            })
+        };
+        let jump_opcode_double_deref_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<JumpOpcodeDoubleDerefLane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::jump_opcode_double_deref::InteractionClaim { claimed_sum })
+        } else {
             jump_opcode_double_deref_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let jump_opcode_rel_interaction_claim =
+            })
+        };
+        let jump_opcode_rel_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<JumpOpcodeRelLane>(common_lookup_elements)
+        {
+            evals.extend(trace);
+            Some(cairo_air::components::jump_opcode_rel::InteractionClaim { claimed_sum })
+        } else {
             jump_opcode_rel_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let jump_opcode_rel_imm_interaction_claim =
+            })
+        };
+        let jump_opcode_rel_imm_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<JumpOpcodeRelImmLane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::jump_opcode_rel_imm::InteractionClaim { claimed_sum })
+        } else {
             jump_opcode_rel_imm_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
+            })
+        };
         let mul_opcode_interaction_claim = mul_opcode_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let mul_opcode_small_interaction_claim =
             mul_opcode_small_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2468,11 +2822,18 @@ impl CairoInteractionClaimGenerator {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let ret_opcode_interaction_claim = ret_opcode_result.map(|(raw, build_claim)| {
+        let ret_opcode_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::device_interaction::<RetOpcodeLane>(common_lookup_elements)
+        {
+            evals.extend(trace);
+            Some(cairo_air::components::ret_opcode::InteractionClaim { claimed_sum })
+        } else {
+            ret_opcode_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
+            })
+        };
         let verify_instruction_interaction_claim =
             verify_instruction_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2480,51 +2841,46 @@ impl CairoInteractionClaimGenerator {
                 build_claim(claimed_sum)
             });
         let blake_round_interaction_claim = blake_round_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let blake_g_interaction_claim = blake_g_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let blake_g_interaction_claim = blake_g_result.map(|(trace, claimed_sum)| {
+            evals.extend(trace);
+            BlakeGInteractionClaim { claimed_sum }
+        });
         let blake_round_sigma_interaction_claim =
             blake_round_sigma_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let triple_xor_32_interaction_claim =
-            triple_xor_32_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let triple_xor_32_interaction_claim = triple_xor_32_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let verify_bitwise_xor_12_interaction_claim =
             verify_bitwise_xor_12_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let add_mod_builtin_interaction_claim =
-            add_mod_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let bitwise_builtin_interaction_claim =
-            bitwise_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let mul_mod_builtin_interaction_claim =
-            mul_mod_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let add_mod_builtin_interaction_claim = add_mod_builtin_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let bitwise_builtin_interaction_claim = bitwise_builtin_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let mul_mod_builtin_interaction_claim = mul_mod_builtin_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let pedersen_builtin_interaction_claim =
             pedersen_builtin_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2555,12 +2911,11 @@ impl CairoInteractionClaimGenerator {
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let ec_op_builtin_interaction_claim =
-            ec_op_builtin_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let ec_op_builtin_interaction_claim = ec_op_builtin_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let partial_ec_mul_generic_interaction_claim =
             partial_ec_mul_generic_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2622,10 +2977,10 @@ impl CairoInteractionClaimGenerator {
                 build_claim(claimed_sum)
             });
         let cube_252_interaction_claim = cube_252_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let poseidon_round_keys_interaction_claim =
             poseidon_round_keys_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2646,77 +3001,75 @@ impl CairoInteractionClaimGenerator {
             });
         let (memory_id_to_big_interaction_claim, memory_id_to_small_interaction_claim) =
             memory_id_to_big_result
-                .map(|(big_raws, small_raw, build_big_claim, build_small_claim)| {
-                    // Finalize each big segment then the small table on B, in the
-                    // same order the eager path extended the traces.
-                    let mut big_claimed_sums = Vec::with_capacity(big_raws.len());
-                    for raw in big_raws {
-                        let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                        evals.extend(trace);
-                        big_claimed_sums.push(claimed_sum);
-                    }
-                    let (small_trace, small_claimed_sum) = B::finalize_raw_logup(small_raw);
-                    evals.extend(small_trace);
-                    (
-                        build_big_claim(big_claimed_sums),
-                        build_small_claim(small_claimed_sum),
-                    )
-                })
+                .map(
+                    |(big_traces, small_trace, big_claimed_sums, small_claimed_sum)| {
+                        // Extend each big segment's finalized trace then the small
+                        // table's, in the same order the eager path extended them.
+                        for trace in big_traces {
+                            evals.extend(trace);
+                        }
+                        evals.extend(small_trace);
+                        // The big claim's total is the field sum of the per-segment
+                        // sums — associative/commutative, so identical to the eager
+                        // computation.
+                        let claimed_sum = big_claimed_sums.iter().sum::<SecureField>();
+                        (
+                            MemoryBigInteractionClaim {
+                                big_claimed_sums,
+                                claimed_sum,
+                            },
+                            MemorySmallInteractionClaim {
+                                claimed_sum: small_claimed_sum,
+                            },
+                        )
+                    },
+                )
                 .unzip();
-        let range_check_6_interaction_claim =
-            range_check_6_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_8_interaction_claim =
-            range_check_8_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_11_interaction_claim =
-            range_check_11_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_12_interaction_claim =
-            range_check_12_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_18_interaction_claim =
-            range_check_18_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_20_interaction_claim =
-            range_check_20_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_4_3_interaction_claim =
-            range_check_4_3_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_4_4_interaction_claim =
-            range_check_4_4_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
-        let range_check_9_9_interaction_claim =
-            range_check_9_9_result.map(|(raw, build_claim)| {
-                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
-                evals.extend(trace);
-                build_claim(claimed_sum)
-            });
+        let range_check_6_interaction_claim = range_check_6_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_8_interaction_claim = range_check_8_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_11_interaction_claim = range_check_11_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_12_interaction_claim = range_check_12_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_18_interaction_claim = range_check_18_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_20_interaction_claim = range_check_20_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_4_3_interaction_claim = range_check_4_3_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_4_4_interaction_claim = range_check_4_4_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
+        let range_check_9_9_interaction_claim = range_check_9_9_result.map(|(raw, build_claim)| {
+            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+            evals.extend(trace);
+            build_claim(claimed_sum)
+        });
         let range_check_7_2_5_interaction_claim =
             range_check_7_2_5_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);

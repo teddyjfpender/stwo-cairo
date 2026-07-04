@@ -4,11 +4,11 @@
 use cairo_air::components::pedersen_builtin_narrow_windows::{
     Claim, InteractionClaim, N_TRACE_COLUMNS,
 };
+use stwo::core::fields::qm31::SecureField;
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 use crate::witness::components::{memory_address_to_id, pedersen_aggregator_window_bits_9};
 use crate::witness::prelude::*;
-use stwo::core::fields::qm31::SecureField;
-use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 #[derive(Default)]
 pub struct ClaimGenerator {
@@ -226,6 +226,8 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }

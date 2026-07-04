@@ -2,10 +2,10 @@
 
 #![allow(unused_parens)]
 use cairo_air::components::range_check_9_9::{Claim, InteractionClaim, LOG_SIZE, N_TRACE_COLUMNS};
-
-use crate::witness::prelude::*;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
+
+use crate::witness::prelude::*;
 
 pub type InputType = [M31; 2];
 pub type PackedInputType = [PackedM31; 2];
@@ -32,6 +32,40 @@ impl ClaimGenerator {
             mults,
             input_to_row: make_input_to_row(&preprocessed_trace, column_ids),
             preprocessed_trace,
+        }
+    }
+
+    /// Dense input -> row lookup table for the device rc_9_9 multiplicity feed
+    /// (witness-on-GPU P1): index `(v0 << 9) | v1`, length `1 << 18`. The content
+    /// is the inversion of THIS generator's `input_to_row` map — i.e. the actual
+    /// preprocessed-table layout — never a closed form.
+    pub fn input_to_row_lut(&self) -> Vec<u32> {
+        const LUT_SIZE: usize = 1 << (2 * 9);
+        assert_eq!(
+            self.input_to_row.len(),
+            LUT_SIZE,
+            "rc_9_9 input_to_row map does not cover all 9-bit pairs"
+        );
+        let mut lut = vec![0u32; LUT_SIZE];
+        for ([v0, v1], &row) in &self.input_to_row {
+            lut[((v0.0 as usize) << 9) | v1.0 as usize] = row as u32;
+        }
+        lut
+    }
+
+    /// Merges 8 relation-indexed count tables (e.g. downloaded from the device
+    /// rc_9_9 count kernel; layout `counts[relation_index * (1 << LOG_SIZE) + row]`)
+    /// into the multiplicity columns. Zero counts are skipped. Counts add with u32
+    /// wrap-around — identical to the same number of `increase_at` calls.
+    pub fn add_count_tables(&self, counts: &[u32]) {
+        let table_size = 1usize << LOG_SIZE;
+        assert_eq!(counts.len(), 8 * table_size);
+        for (relation_index, table) in counts.chunks_exact(table_size).enumerate() {
+            for (row, &count) in table.iter().enumerate() {
+                if count != 0 {
+                    self.mults[relation_index].add_at(row as u32, count);
+                }
+            }
         }
     }
 
@@ -272,6 +306,8 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }

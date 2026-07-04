@@ -2,11 +2,11 @@
 
 #![allow(unused_parens)]
 use cairo_air::components::range_check_builtin::{Claim, InteractionClaim, N_TRACE_COLUMNS};
+use stwo::core::fields::qm31::SecureField;
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 use crate::witness::components::{memory_address_to_id, memory_id_to_big};
 use crate::witness::prelude::*;
-use stwo::core::fields::qm31::SecureField;
-use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 #[derive(Default)]
 pub struct ClaimGenerator {
@@ -282,6 +282,8 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }

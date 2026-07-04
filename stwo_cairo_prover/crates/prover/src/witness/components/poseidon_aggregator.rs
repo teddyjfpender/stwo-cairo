@@ -2,14 +2,14 @@
 
 #![allow(unused_parens)]
 use cairo_air::components::poseidon_aggregator::{Claim, InteractionClaim, N_TRACE_COLUMNS};
+use stwo::core::fields::qm31::SecureField;
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 use crate::witness::components::{
     cube_252, memory_id_to_big, poseidon_3_partial_rounds_chain, poseidon_full_round_chain,
     range_check_252_width_27, range_check_3_3_3_3_3, range_check_4_4, range_check_4_4_4_4,
 };
 use crate::witness::prelude::*;
-use stwo::core::fields::qm31::SecureField;
-use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 pub type InputType = ([M31; 3], [M31; 3]);
 pub type PackedInputType = ([PackedM31; 3], [PackedM31; 3]);
@@ -1188,6 +1188,8 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }

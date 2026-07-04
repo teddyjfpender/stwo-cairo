@@ -1,0 +1,331 @@
+# THE next GPU session: hardware-validate the JIT-witness prove lane end to end.
+# (ENDGAME_ARCHITECTURE.md §9 run-list, encoded.) Every criterion is machine-checked;
+# the pod stops itself when this completes (gpufleet run default).
+#
+#   gpufleet run manifests/jit_witness_gate.toml --auto 4090 --push --purpose jit-witness-gate
+#
+# Prereqs handled elsewhere: `gpufleet pregate` green locally (enforced by `run`);
+# build_and_push.sh puts gpu_bench + repos under /workspace (--push).
+# The 10-transfer PIE ships with the repo sync; SN_PIE_2.zip must already be in
+# /workspace/stwo-cairo/gpu_benchmarks/pie/sn/ (step 0 verifies, fails fast if not).
+
+[meta]
+name = "jit-witness-gate"
+stop_on_failure = true
+
+[env]
+RUST_MIN_STACK = "4194304"
+# sm_90 driver-JIT chokes on 2048-instr fused kernels (module_load 240-290s EACH,
+# measured this pod); 512 splits them small enough that ptxas stays linear.
+STWO_JIT_MAX_KERNEL_INSTRS = "512"
+GB = "/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench"
+SN = "/workspace/stwo-cairo/gpu_benchmarks/pie/sn"
+TENT = "/workspace/stwo-cairo/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip"
+OUT = "/workspace/out"
+
+# --- 0. fail fast on missing prerequisites (seconds, not minutes) -------------------
+[[step]]
+name = "prereqs"
+cmd = "mkdir -p $OUT && test -x $GB && test -f $SN/SN_PIE_2.zip && test -f $TENT && nvidia-smi -L"
+timeout_s = 60
+
+
+# --- 0b. DETERMINISM: two lane-OFF proves must be byte-identical (Stage 0 canonical
+# serialization; the whole-proof gate below relies on this). ---------------------------
+[[step]]
+name = "sn2-determinism"
+cmd = """
+$GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 1 --reuse-input \
+  > /dev/null 2> /dev/null || true
+STWO_DUMP_PROOF=$OUT/det_a.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 1 --reuse-input > /dev/null 2>&1
+STWO_DUMP_PROOF=$OUT/det_b.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 1 --reuse-input > /dev/null 2>&1
+a=$(sha256sum $OUT/det_a.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/det_b.proof | cut -d' ' -f1)
+echo "det_a=$a"; echo "det_b=$b"
+if [ "$a" = "$b" ]; then echo DETERMINISTIC; else echo NONDETERMINISTIC; fi"""
+timeout_s = 3600
+gpu_bound = true
+must_match = ['DETERMINISTIC']
+must_not_match = ['NONDETERMINISTIC']
+
+# --- 1. hardware selftest: kernel == interpreter on cols + lookup + sub words -------
+# (The upgraded contract: lookup/sub flats were previously never read back.)
+[[step]]
+name = "selftest-emitted"
+cmd = """
+STWO_WITNESS_JIT_SELFTEST=1 STWO_WITNESS_JIT_SOURCE=emitted \
+STWO_WITNESS_JIT_SAMPLES=200000 $GB --pie $TENT --backend cuda 2>&1"""
+timeout_s = 1800
+gpu_bound = true
+must_match = ['=== SELFTEST PASS']
+must_not_match = ['mismatch: ', '=== SELFTEST FAIL']
+
+# --- 1b. §6a differential: device interaction == host interaction, same words -------
+[[step]]
+name = "device-interaction-selftest"
+cmd = """
+STWO_DEVICE_INTERACTION_SELFTEST=1 STWO_JIT_MAX_KERNEL_INSTRS=512 \
+$GB --pie $TENT --backend cuda 2>&1"""
+timeout_s = 1800
+gpu_bound = true
+must_match = ['=== DEVICE_INTERACTION PASS']
+must_not_match = ['DEVICE_INTERACTION FAIL', 'mismatch=[1-9]']
+
+# --- 2. SN_PIE_2 baseline, lane OFF: dump proof + record --------------------------
+[[step]]
+name = "sn2-lane-off"
+cmd = """
+STWO_DUMP_PROOF=$OUT/sn2_off.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 2 --reuse-input > $OUT/sn2_off.json 2> $OUT/sn2_off.err; rc=$?
+tail -3 $OUT/sn2_off.err; tail -1 $OUT/sn2_off.json; exit $rc"""
+timeout_s = 3600
+gpu_bound = true
+artifacts = ["/workspace/out/sn2_off.json"]
+[[step.assert]]
+file = "sn2_off.json"
+path = "useful_mhz"
+op = "ge"
+value = 0.1
+[[step.assert]]
+file = "sn2_off.json"
+path = "security_bits"
+op = "eq"
+value = 96
+
+# --- 3. SN_PIE_2 lane ON: identical proof prefix, verify passes, lane engaged -------
+# Prefix compare (first 1 MiB) instead of full cmp: the proof TAIL is a known
+# serialization-order nondeterminism (same u32 multiset, reordered — KNOWN_ISSUES 4);
+# the prefix covers commitments/openings and pins value identity.
+[[step]]
+name = "sn2-lane-on"
+cmd = """
+STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/sn2_on.proof \
+$GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 2 --reuse-input \
+  > $OUT/sn2_on.json 2> $OUT/sn2_on.err; rc=$?
+grep -o '"phase_totals":{.*}' $OUT/sn2_on.json | tail -1 > $OUT/sn2_on_phases.json || true
+grep -E 'jit_prove' $OUT/sn2_on.err | head -20
+tail -1 $OUT/sn2_on.json
+a=$(sha256sum $OUT/sn2_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/sn2_on.proof | cut -d' ' -f1)
+echo "prefix_off=$a"; echo "prefix_on=$b"
+if [ "$a" = "$b" ]; then echo PROOF_MATCH; else echo PROOF_DIVERGED; fi
+exit $rc"""
+timeout_s = 3600
+gpu_bound = true
+artifacts = ["/workspace/out/sn2_on.json"]
+must_match = ['PROOF_MATCH', 'jit_prove\[add_opcode\]: device witness']
+must_not_match = ['PROOF_DIVERGED', 'falling back']
+[[step.assert]]
+file = "sn2_on.json"
+path = "verify_ms"
+op = "ge"
+value = 0.1
+
+# --- 4. repeated-prove stability with the lane ON (the once-observed rep hang) ------
+[[step]]
+name = "sn2-lane-on-reps"
+cmd = """
+STWO_CUDA_WITNESS_JIT_PROVE=1 $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 3 --reuse-input > $OUT/sn2_on_reps.json 2> $OUT/sn2_on_reps.err; rc=$?
+tail -3 $OUT/sn2_on_reps.err; tail -1 $OUT/sn2_on_reps.json; exit $rc"""
+timeout_s = 5400
+gpu_bound = true
+artifacts = ["/workspace/out/sn2_on_reps.json"]
+must_not_match = ['panicked', 'ConstraintsNotSatisfied']
+# `n` in the record is the PIE count, not reps; repeated-prove evidence is the
+# cold/warm split plus the identical proof size and a real verify.
+[[step.assert]]
+file = "sn2_on_reps.json"
+path = "proof_kb"
+op = "eq"
+value = 3006.636
+[[step.assert]]
+file = "sn2_on_reps.json"
+path = "verify_ms"
+op = "ge"
+value = 0.1
+
+# --- 5. span accounting: what did the lane actually buy ------------------------------
+[[step]]
+name = "sn2-span-delta"
+cmd = """
+STWO_BENCH_TRACE=json STWO_CUDA_WITNESS_JIT_PROVE=1 $GB --pie $SN/SN_PIE_2.zip \
+  --backend cuda --reps 1 --reuse-input 2>&1 | grep -o '"wt:add_opcode":{[^}]*}' || true
+echo span-delta-recorded"""
+timeout_s = 3600
+gpu_bound = true
+must_match = ['span-delta-recorded']
+
+# --- 6. fused-commit A/B (§3 lanes, built in an earlier round, never validated):
+# same prove, STWO_CUDA_FUSED_COMMIT=1 — prefix must MATCH baseline (byte-identical
+# by construction) while commit spans shrink. Bisect lanes via the per-lane vars on
+# failure.
+[[step]]
+name = "sn2-fused-commit"
+cmd = """
+STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_FUSED_COMMIT=1 \
+STWO_DUMP_PROOF=$OUT/sn2_fused.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 2 --reuse-input > $OUT/sn2_fused.json 2> $OUT/sn2_fused.err; rc=$?
+tail -1 $OUT/sn2_fused.json
+a=$(sha256sum $OUT/sn2_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/sn2_fused.proof | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo FUSED_PROOF_MATCH; else echo FUSED_PROOF_DIVERGED; fi
+exit $rc"""
+timeout_s = 3600
+gpu_bound = true
+artifacts = ["/workspace/out/sn2_fused.json"]
+must_match = ['FUSED_PROOF_MATCH']
+must_not_match = ['FUSED_PROOF_DIVERGED']
+[[step.assert]]
+file = "sn2_fused.json"
+path = "verify_ms"
+op = "ge"
+value = 0.1
+
+# --- 7. §6a IN THE PROVE: device interaction replaces the host write wholesale ------
+[[step]]
+name = "sn2-device-interaction"
+cmd = """
+STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_DEVICE_INTERACTION=1 STWO_BENCH_TRACE=json \
+STWO_DUMP_PROOF=$OUT/sn2_di.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 2 --reuse-input > $OUT/sn2_di.json 2> $OUT/sn2_di.err; rc=$?
+grep -E 'jit_interaction' $OUT/sn2_di.err | head -8
+tail -1 $OUT/sn2_di.json
+a=$(sha256sum $OUT/sn2_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/sn2_di.proof | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo DI_PROOF_MATCH; else echo DI_PROOF_DIVERGED; fi
+exit $rc"""
+timeout_s = 3600
+gpu_bound = true
+artifacts = ["/workspace/out/sn2_di.json"]
+must_match = ['DI_PROOF_MATCH', 'jit_interaction.add_opcode.: device logup']
+must_not_match = ['DI_PROOF_DIVERGED', 'panicked']
+[[step.assert]]
+file = "sn2_di.json"
+path = "verify_ms"
+op = "ge"
+value = 0.1
+
+# --- 8. force-relax A/B: 2048-instr fused kernels at -O0 (launch count / 4) ---------
+[[step]]
+name = "sn2-force-relax"
+cmd = """
+STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_DEVICE_INTERACTION=1 \
+STWO_JIT_MAX_KERNEL_INSTRS=2048 STWO_JIT_FORCE_RELAX=1 STWO_BENCH_TRACE=json \
+STWO_DUMP_PROOF=$OUT/sn2_rx.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 2 --reuse-input > $OUT/sn2_rx.json 2> $OUT/sn2_rx.err; rc=$?
+tail -1 $OUT/sn2_rx.json
+a=$(sha256sum $OUT/sn2_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/sn2_rx.proof | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo RX_PROOF_MATCH; else echo RX_PROOF_DIVERGED; fi
+exit $rc"""
+timeout_s = 3600
+gpu_bound = true
+artifacts = ["/workspace/out/sn2_rx.json"]
+must_match = ['RX_PROOF_MATCH']
+must_not_match = ['RX_PROOF_DIVERGED', 'panicked']
+
+# --- A′: async spine — staging H2D async + one fence/batch (STWO_CUDA_ASYNC_SPINE).
+# Byte-identical (same stream-0 order); measures the ~2,500-drain collapse. Device
+# interaction ON (best config). Full-proof compare (Stage 0 made proofs canonical).
+[[step]]
+name = "sn2-async-spine"
+cmd = """
+STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_DEVICE_INTERACTION=1 STWO_CUDA_ASYNC_SPINE=1 \
+STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/sn2_as.proof $GB --pie $SN/SN_PIE_2.zip \
+  --backend cuda --reps 2 --reuse-input > $OUT/sn2_as.json 2> $OUT/sn2_as.err; rc=$?
+tail -1 $OUT/sn2_as.json
+a=$(sha256sum $OUT/sn2_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/sn2_as.proof  | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo AS_PROOF_MATCH; else echo AS_PROOF_DIVERGED; fi
+exit $rc"""
+timeout_s = 3600
+gpu_bound = true
+artifacts = ["/workspace/out/sn2_as.json"]
+must_match = ['AS_PROOF_MATCH']
+must_not_match = ['AS_PROOF_DIVERGED', 'panicked']
+[[step.assert]]
+file = "sn2_as.json"
+path = "verify_ms"
+op = "ge"
+value = 0.1
+
+# --- A″: pipelined commit under witness (STWO_CUDA_PIPELINED_COMMIT). The opcode-prefix
+# columns interpolate on a committer thread while the host-heavy components (blake_round /
+# partial_ec_mul / pedersen) generate. Byte-identical (interpolate_columns is per-column
+# independent; the committer's tree identity is verified == the commitment tree, fail-closed).
+# --reps 2: rep 1 is cold (no cached tree → Evals path); rep 2 is warm and engages the
+# committer — so the dumped (rep-2) proof MUST equal baseline AND the engage line MUST appear.
+[[step]]
+name = "sn2-pipelined-commit"
+cmd = """
+STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_DEVICE_INTERACTION=1 STWO_CUDA_PIPELINED_COMMIT=1 \
+STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/sn2_pc.proof $GB --pie $SN/SN_PIE_2.zip \
+  --backend cuda --reps 2 --reuse-input > $OUT/sn2_pc.json 2> $OUT/sn2_pc.err; rc=$?
+tail -1 $OUT/sn2_pc.json
+grep -q 'A. engaged' $OUT/sn2_pc.err && echo PC_ENGAGED || echo PC_NOT_ENGAGED
+a=$(sha256sum $OUT/sn2_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/sn2_pc.proof  | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo PC_PROOF_MATCH; else echo PC_PROOF_DIVERGED; fi
+exit $rc"""
+timeout_s = 3600
+gpu_bound = true
+artifacts = ["/workspace/out/sn2_pc.json"]
+must_match = ['PC_PROOF_MATCH', 'PC_ENGAGED']
+must_not_match = ['PC_PROOF_DIVERGED', 'PC_NOT_ENGAGED', 'panicked']
+[[step.assert]]
+file = "sn2_pc.json"
+path = "verify_ms"
+op = "ge"
+value = 0.1
+
+# --- B′: witness-lane stream fan-out (STWO_CUDA_STREAM_FANOUT). The concurrent (rayon)
+# witness lanes launch on round-robin pool streams instead of all serializing on the
+# legacy stream; each lane forks from legacy before its kernel and joins back before its
+# D2H (thread-safe per-call events). Byte-identical (only independent lanes reorder; every
+# data dependency is bridged). NOTE: expected perf is MODEST — the device witness kernels
+# are already ms; the Write-Base wall is host compute (partial_ec_mul/blake_round = D′).
+# This gate proves correctness + that the path engages; the phase ledger measures the delta.
+[[step]]
+name = "sn2-stream-fanout"
+cmd = """
+STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_DEVICE_INTERACTION=1 STWO_CUDA_STREAM_FANOUT=1 \
+STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/sn2_sf.proof $GB --pie $SN/SN_PIE_2.zip \
+  --backend cuda --reps 2 --reuse-input > $OUT/sn2_sf.json 2> $OUT/sn2_sf.err; rc=$?
+tail -1 $OUT/sn2_sf.json
+grep -q 'B. engaged' $OUT/sn2_sf.err && echo SF_ENGAGED || echo SF_NOT_ENGAGED
+a=$(sha256sum $OUT/sn2_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/sn2_sf.proof  | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo SF_PROOF_MATCH; else echo SF_PROOF_DIVERGED; fi
+exit $rc"""
+timeout_s = 3600
+gpu_bound = true
+artifacts = ["/workspace/out/sn2_sf.json"]
+must_match = ['SF_PROOF_MATCH', 'SF_ENGAGED']
+must_not_match = ['SF_PROOF_DIVERGED', 'SF_NOT_ENGAGED', 'panicked']
+[[step.assert]]
+file = "sn2_sf.json"
+path = "verify_ms"
+op = "ge"
+value = 0.1
+
+# --- 11. 14M-step PIEs: amortization-true numbers + memory-fit reality check --------
+# Fail-soft: an OOM here is a RECORDED result (the fit is a hypothesis), not a gate fail.
+[[step]]
+name = "sn-14m-scale"
+cmd = """
+for n in 1 3 4; do
+  f=$SN/SN_PIE_$n.zip
+  [ -f "$f" ] || { echo "SN_PIE_$n absent — skipped"; continue; }
+  echo "=== SN_PIE_$n ==="
+  STWO_BENCH_TRACE=json $GB --pie $f --backend cuda --reps 1 --reuse-input \
+    > $OUT/sn${n}.json 2> $OUT/sn${n}.err
+  rc=$?
+  if [ $rc -eq 0 ]; then tail -1 $OUT/sn${n}.json; else echo "SN_PIE_$n rc=$rc"; tail -3 $OUT/sn${n}.err; fi
+done
+echo scale-sweep-done"""
+timeout_s = 5400
+gpu_bound = true
+must_match = ['scale-sweep-done']

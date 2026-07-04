@@ -1,0 +1,14 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export TENT=/workspace/stwo-cairo/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip; export OUT=/workspace/out; STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_DUMP_PROOF=$OUT/sn2_on.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 2 --reuse-input > $OUT/sn2_on.json 2> $OUT/sn2_on.err; rc=$?
+grep -E 'jit_prove' $OUT/sn2_on.err | head -20
+tail -1 $OUT/sn2_on.json
+a=$(head -c 1048576 $OUT/sn2_off.proof | sha256sum | cut -d' ' -f1)
+b=$(head -c 1048576 $OUT/sn2_on.proof  | sha256sum | cut -d' ' -f1)
+echo "prefix_off=$a"; echo "prefix_on=$b"
+if [ "$a" = "$b" ]; then echo PREFIX_MATCH; else echo PREFIX_DIVERGED; fi
+exit $rc
+jit_prove[add_opcode]: device witness 651967 real rows (log_size 20) in 372.4 ms
+head: cannot open '/workspace/out/sn2_on.proof' for reading: No such file or directory
+prefix_off=a3ebd2f333d2f56492593393cbcc822edf1d4a8ee6e12a535fdcfbc28c228976
+prefix_on=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+PREFIX_DIVERGED

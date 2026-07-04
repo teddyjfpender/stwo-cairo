@@ -1,13 +1,13 @@
 #![allow(unused_parens)]
 use cairo_air::components::blake_round::{Claim, InteractionClaim, N_TRACE_COLUMNS};
+use stwo::core::fields::qm31::SecureField;
 use stwo_cairo_adapter::memory::Memory;
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 use crate::witness::components::{
     blake_g, blake_round_sigma, memory_address_to_id, memory_id_to_big, range_check_7_2_5,
 };
 use crate::witness::prelude::*;
-use stwo::core::fields::qm31::SecureField;
-use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 pub type InputType = (M31, M31, ([UInt32; 16], M31));
 pub type PackedInputType = (PackedM31, PackedM31, ([PackedUInt32; 16], PackedM31));
@@ -3001,6 +3001,8 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }

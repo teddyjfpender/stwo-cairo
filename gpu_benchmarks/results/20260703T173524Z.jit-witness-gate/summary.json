@@ -1,0 +1,46 @@
+{
+  "run_id": "20260703T173524Z.jit-witness-gate",
+  "manifest": "jit-witness-gate",
+  "pod": {
+    "id": "kkogzcvy29ixbb",
+    "gpu": "H100 NVL",
+    "usd_hr": 2.59
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "d9db63fcfdf2",
+      "diff_sha256": "d0dc74be1f219fc6",
+      "dirty": true
+    },
+    "stwo-cairo": {
+      "rev": "cd4bf24d3899",
+      "diff_sha256": "4e245195c3bfb7e8",
+      "dirty": true
+    }
+  },
+  "steps": [
+    {
+      "name": "prereqs",
+      "rc": 0,
+      "seconds": 1.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-determinism",
+      "rc": 0,
+      "seconds": 265.3,
+      "passed": false,
+      "reasons": [
+        "must_not_match hit: 'NONDETERMINISTIC'",
+        "GPU idle alarm during gpu_bound step"
+      ],
+      "artifacts": [],
+      "gpu_idle_alarm": true
+    }
+  ],
+  "passed": false,
+  "wall_s": 273.6
+}

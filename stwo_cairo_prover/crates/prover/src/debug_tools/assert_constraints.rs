@@ -7,6 +7,7 @@ use itertools::Itertools;
 use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::M31;
 use stwo::core::pcs::TreeVec;
+use stwo::prover::backend::simd::SimdBackend;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_constraint_framework::{
@@ -16,7 +17,6 @@ use stwo_constraint_framework::{
 use crate::debug_tools::mock_tree_builder::MockCommitmentScheme;
 use crate::witness::cairo::create_cairo_claim_generator;
 use crate::witness::preprocessed_trace::gen_trace;
-use stwo::prover::backend::simd::SimdBackend;
 
 pub fn assert_component<E: FrameworkEval + Sync>(
     component: &FrameworkComponent<E>,
@@ -268,16 +268,25 @@ pub fn assert_cairo_constraints(input: ProverInput, preprocessed_trace: Arc<PreP
     // Base trace.
     let cairo_claim_generator = create_cairo_claim_generator(input, preprocessed_trace.clone());
     let mut tree_builder = commitment_scheme.tree_builder();
-    let (trace_evals, claim, interaction_generator) = cairo_claim_generator.write_trace::<SimdBackend>(None);
-    tree_builder.extend_evals(trace_evals);
+    // `None` pipeline twiddles → always the `BaseTrace::Evals` path (no A″ committer).
+    let (trace, claim, interaction_generator) =
+        cairo_claim_generator.write_trace::<SimdBackend>(None, None);
+    match trace {
+        crate::witness::base_trace::BaseTrace::Evals(evals) => tree_builder.extend_evals(evals),
+        crate::witness::base_trace::BaseTrace::Polys { .. } => {
+            unreachable!("assert_constraints passes no pipeline twiddles")
+        }
+    };
     tree_builder.finalize_interaction();
 
     // Interaction trace.
     let mut dummy_channel = Blake2sChannel::default();
     let interaction_elements = CommonLookupElements::draw(&mut dummy_channel);
     let mut tree_builder = commitment_scheme.tree_builder();
+    // `interaction_generator` is already pinned to SimdBackend by the
+    // `write_trace::<SimdBackend>` above.
     let (interaction_trace_evals, interaction_claim) =
-        interaction_generator.write_interaction_trace::<SimdBackend>(&interaction_elements);
+        interaction_generator.write_interaction_trace(&interaction_elements);
     tree_builder.extend_evals(interaction_trace_evals);
     tree_builder.finalize_interaction();
 

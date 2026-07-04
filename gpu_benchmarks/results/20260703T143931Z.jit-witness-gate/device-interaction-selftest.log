@@ -1,0 +1,17 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export TENT=/workspace/stwo-cairo/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip; export OUT=/workspace/out; STWO_DEVICE_INTERACTION_SELFTEST=1 STWO_JIT_MAX_KERNEL_INSTRS=512 $GB --pie $TENT --backend cuda 2>&1
+--8<-- output --8<--
+=== DEVICE_INTERACTION_SELFTEST ===
+stwo witness-JIT: registered dynamic program component=add_opcode instrs=483
+stwo JIT: module load start kernel=stwo_jit_witness_1535458b582bc8dc ptx_bytes=88764 relax_opt=0
+stwo JIT: stwo_jit_witness_1535458b582bc8dc ready in 1 ms (module_load_ms=0, disk PTX cache)
+LEG di:add_opcode : checked=1310721 mismatch=0                                      [0.039s] 65536 rows x 5 logup cols
+stwo witness-JIT: registered dynamic program component=assert_eq_opcode instrs=151
+stwo JIT: module load start kernel=stwo_jit_witness_c4b01b327c2ce2a3 ptx_bytes=17299 relax_opt=0
+stwo JIT: stwo_jit_witness_c4b01b327c2ce2a3 ready in 1 ms (module_load_ms=0, disk PTX cache)
+LEG di:assert_eq_opcode : checked=786433 mismatch=0                                      [0.015s] 65536 rows x 3 logup cols
+stwo witness-JIT: registered dynamic program component=ret_opcode instrs=168
+stwo JIT: module load start kernel=stwo_jit_witness_a290ddc144ee416a ptx_bytes=28020 relax_opt=0
+stwo JIT: stwo_jit_witness_a290ddc144ee416a ready in 1 ms (module_load_ms=0, disk PTX cache)
+LEG di:ret_opcode : checked=262145 mismatch=0                                      [0.009s] 16384 rows x 4 logup cols
+=== DEVICE_INTERACTION PASS ===

@@ -1,11 +1,21 @@
+pub mod base_trace;
+pub mod blake_g_witness_backend;
+pub mod blake_round_witness_backend;
 pub mod builtins;
 pub mod cairo;
 pub mod cairo_claim_generator;
 pub mod components;
 pub mod fast_deduction;
+#[macro_use]
+mod jit_flat_macros;
+pub mod jit_prove_backend;
+pub mod jit_witness_hook;
+pub mod memory_witness_backend;
 pub mod opcodes;
+pub mod pedersen_witness_backend;
 pub mod prelude;
 pub mod preprocessed_trace;
 pub mod preprocessed_trace_backend;
 pub mod range_checks;
 pub mod utils;
+pub mod witness_eval;

@@ -1,0 +1,397 @@
+STWO_CUDA_BLAKE_ROUND_WITNESS: device lane requested but the blake_round device kernel is pod-validation-gated; falling back to the host writer (byte-identical). Set STWO_CUDA_BLAKE_ROUND_WITNESS=0 to silence.
+stwo JIT: codegen start component=cairo_air::components::add_opcode::Eval ts_ms=1783038621469
+stwo JIT: codegen end component=cairo_air::components::add_opcode::Eval kernels=1 total_instrs=906 elapsed_ms=0 ts_ms=1783038621469
+stwo JIT: compile start component=cairo_air::components::add_opcode::Eval kernel=stwo_jit_fused_c4fc2550c1ac56b8 semantic_hash=c4fc2550c1ac56b8 cache_key=fed62507369c1c00 instrs=906 source_bytes=52115 rc_base=0 relax_opt=false ts_ms=1783038621469
+stwo JIT: module load start kernel=stwo_jit_fused_c4fc2550c1ac56b8 ptx_bytes=568178 relax_opt=0
+stwo JIT: stwo_jit_fused_c4fc2550c1ac56b8 ready in 1 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::add_opcode::Eval kernels=1 elapsed_ms=1 ts_ms=1783038621470
+stwo JIT: codegen start component=cairo_air::components::add_opcode_small::Eval ts_ms=1783038621471
+stwo JIT: codegen end component=cairo_air::components::add_opcode_small::Eval kernels=1 total_instrs=771 elapsed_ms=0 ts_ms=1783038621471
+stwo JIT: compile start component=cairo_air::components::add_opcode_small::Eval kernel=stwo_jit_fused_f2af531532ff03c4 semantic_hash=f2af531532ff03c4 cache_key=8668572a11b345db instrs=771 source_bytes=42620 rc_base=0 relax_opt=false ts_ms=1783038621471
+stwo JIT: module load start kernel=stwo_jit_fused_f2af531532ff03c4 ptx_bytes=526226 relax_opt=0
+stwo JIT: stwo_jit_fused_f2af531532ff03c4 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::add_opcode_small::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621472
+stwo JIT: codegen start component=cairo_air::components::add_ap_opcode::Eval ts_ms=1783038621473
+stwo JIT: codegen end component=cairo_air::components::add_ap_opcode::Eval kernels=1 total_instrs=361 elapsed_ms=0 ts_ms=1783038621473
+stwo JIT: compile start component=cairo_air::components::add_ap_opcode::Eval kernel=stwo_jit_fused_38f2f1291bb6bc30 semantic_hash=38f2f1291bb6bc30 cache_key=a8a79235f2296029 instrs=361 source_bytes=24010 rc_base=0 relax_opt=false ts_ms=1783038621473
+stwo JIT: module load start kernel=stwo_jit_fused_38f2f1291bb6bc30 ptx_bytes=284524 relax_opt=0
+stwo JIT: stwo_jit_fused_38f2f1291bb6bc30 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::add_ap_opcode::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621473
+stwo JIT: codegen start component=cairo_air::components::assert_eq_opcode::Eval ts_ms=1783038621473
+stwo JIT: codegen end component=cairo_air::components::assert_eq_opcode::Eval kernels=1 total_instrs=189 elapsed_ms=0 ts_ms=1783038621474
+stwo JIT: compile start component=cairo_air::components::assert_eq_opcode::Eval kernel=stwo_jit_fused_3f818d142612918f semantic_hash=3f818d142612918f cache_key=705ffc197ad8a3cd instrs=189 source_bytes=16251 rc_base=0 relax_opt=false ts_ms=1783038621474
+stwo JIT: module load start kernel=stwo_jit_fused_3f818d142612918f ptx_bytes=158133 relax_opt=0
+stwo JIT: stwo_jit_fused_3f818d142612918f ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::assert_eq_opcode::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621474
+stwo JIT: codegen start component=cairo_air::components::assert_eq_opcode_imm::Eval ts_ms=1783038621474
+stwo JIT: codegen end component=cairo_air::components::assert_eq_opcode_imm::Eval kernels=1 total_instrs=166 elapsed_ms=0 ts_ms=1783038621474
+stwo JIT: compile start component=cairo_air::components::assert_eq_opcode_imm::Eval kernel=stwo_jit_fused_d5393c25fbb2874d semantic_hash=d5393c25fbb2874d cache_key=5212ad8933e14a8a instrs=166 source_bytes=15062 rc_base=0 relax_opt=false ts_ms=1783038621474
+stwo JIT: module load start kernel=stwo_jit_fused_d5393c25fbb2874d ptx_bytes=147989 relax_opt=0
+stwo JIT: stwo_jit_fused_d5393c25fbb2874d ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::assert_eq_opcode_imm::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621474
+stwo JIT: codegen start component=cairo_air::components::assert_eq_opcode_double_deref::Eval ts_ms=1783038621474
+stwo JIT: codegen end component=cairo_air::components::assert_eq_opcode_double_deref::Eval kernels=1 total_instrs=266 elapsed_ms=0 ts_ms=1783038621474
+stwo JIT: compile start component=cairo_air::components::assert_eq_opcode_double_deref::Eval kernel=stwo_jit_fused_e76fc7d452b58068 semantic_hash=e76fc7d452b58068 cache_key=81ae81db7a3e5faa instrs=266 source_bytes=20187 rc_base=0 relax_opt=false ts_ms=1783038621474
+stwo JIT: module load start kernel=stwo_jit_fused_e76fc7d452b58068 ptx_bytes=227888 relax_opt=0
+stwo JIT: stwo_jit_fused_e76fc7d452b58068 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::assert_eq_opcode_double_deref::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621475
+stwo JIT: codegen start component=cairo_air::components::blake_compress_opcode::Eval ts_ms=1783038621475
+stwo JIT: codegen end component=cairo_air::components::blake_compress_opcode::Eval kernels=2 total_instrs=3572 elapsed_ms=0 ts_ms=1783038621476
+stwo JIT: compile start component=cairo_air::components::blake_compress_opcode::Eval kernel=stwo_jit_fused_5ac117800a3f6cd0 semantic_hash=5ac117800a3f6cd0 cache_key=971352f32bfae829 instrs=2006 source_bytes=101277 rc_base=0 relax_opt=false ts_ms=1783038621476
+stwo JIT: compile start component=cairo_air::components::blake_compress_opcode::Eval kernel=stwo_jit_fused_9fc7a29ec077c2f0 semantic_hash=9fc7a29ec077c2f0 cache_key=2986e57f8d528c25 instrs=1566 source_bytes=80940 rc_base=35 relax_opt=false ts_ms=1783038621476
+stwo JIT: module load start kernel=stwo_jit_fused_9fc7a29ec077c2f0 ptx_bytes=1257356 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_5ac117800a3f6cd0 ptx_bytes=1579380 relax_opt=0
+stwo JIT: stwo_jit_fused_9fc7a29ec077c2f0 ready in 5 ms (module_load_ms=4, disk PTX cache)
+stwo JIT: stwo_jit_fused_5ac117800a3f6cd0 ready in 8 ms (module_load_ms=7, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::blake_compress_opcode::Eval kernels=2 elapsed_ms=11 ts_ms=1783038621487
+stwo JIT: codegen start component=cairo_air::components::call_opcode_abs::Eval ts_ms=1783038621487
+stwo JIT: codegen end component=cairo_air::components::call_opcode_abs::Eval kernels=1 total_instrs=360 elapsed_ms=0 ts_ms=1783038621488
+stwo JIT: compile start component=cairo_air::components::call_opcode_abs::Eval kernel=stwo_jit_fused_aaec7bbec10eedef semantic_hash=aaec7bbec10eedef cache_key=7d894a40fc4241f2 instrs=360 source_bytes=24610 rc_base=0 relax_opt=false ts_ms=1783038621488
+stwo JIT: module load start kernel=stwo_jit_fused_aaec7bbec10eedef ptx_bytes=305116 relax_opt=0
+stwo JIT: stwo_jit_fused_aaec7bbec10eedef ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::call_opcode_abs::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621488
+stwo JIT: codegen start component=cairo_air::components::call_opcode_rel_imm::Eval ts_ms=1783038621489
+stwo JIT: codegen end component=cairo_air::components::call_opcode_rel_imm::Eval kernels=1 total_instrs=449 elapsed_ms=0 ts_ms=1783038621489
+stwo JIT: compile start component=cairo_air::components::call_opcode_rel_imm::Eval kernel=stwo_jit_fused_f3770d28731e9baf semantic_hash=f3770d28731e9baf cache_key=d2d25df5e625d8a2 instrs=449 source_bytes=28120 rc_base=0 relax_opt=false ts_ms=1783038621489
+stwo JIT: module load start kernel=stwo_jit_fused_f3770d28731e9baf ptx_bytes=358272 relax_opt=0
+stwo JIT: stwo_jit_fused_f3770d28731e9baf ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::call_opcode_rel_imm::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621490
+stwo JIT: codegen start component=cairo_air::components::jnz_opcode_non_taken::Eval ts_ms=1783038621490
+stwo JIT: codegen end component=cairo_air::components::jnz_opcode_non_taken::Eval kernels=1 total_instrs=216 elapsed_ms=0 ts_ms=1783038621490
+stwo JIT: compile start component=cairo_air::components::jnz_opcode_non_taken::Eval kernel=stwo_jit_fused_ccbb8d139930365e semantic_hash=ccbb8d139930365e cache_key=3013fa5230eaf1ee instrs=216 source_bytes=16928 rc_base=0 relax_opt=false ts_ms=1783038621490
+stwo JIT: module load start kernel=stwo_jit_fused_ccbb8d139930365e ptx_bytes=164909 relax_opt=0
+stwo JIT: stwo_jit_fused_ccbb8d139930365e ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::jnz_opcode_non_taken::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621491
+stwo JIT: codegen start component=cairo_air::components::jnz_opcode_taken::Eval ts_ms=1783038621491
+stwo JIT: codegen end component=cairo_air::components::jnz_opcode_taken::Eval kernels=1 total_instrs=542 elapsed_ms=0 ts_ms=1783038621491
+stwo JIT: compile start component=cairo_air::components::jnz_opcode_taken::Eval kernel=stwo_jit_fused_bc762e9e3f2cfaf7 semantic_hash=bc762e9e3f2cfaf7 cache_key=7f00fb95f868ccf4 instrs=542 source_bytes=32590 rc_base=0 relax_opt=false ts_ms=1783038621491
+stwo JIT: module load start kernel=stwo_jit_fused_bc762e9e3f2cfaf7 ptx_bytes=371766 relax_opt=0
+stwo JIT: stwo_jit_fused_bc762e9e3f2cfaf7 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::jnz_opcode_taken::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621492
+stwo JIT: codegen start component=cairo_air::components::jump_opcode_double_deref::Eval ts_ms=1783038621492
+stwo JIT: codegen end component=cairo_air::components::jump_opcode_double_deref::Eval kernels=1 total_instrs=285 elapsed_ms=0 ts_ms=1783038621492
+stwo JIT: compile start component=cairo_air::components::jump_opcode_double_deref::Eval kernel=stwo_jit_fused_f11bb80fb8ef9dac semantic_hash=f11bb80fb8ef9dac cache_key=77297d9ebda26715 instrs=285 source_bytes=20906 rc_base=0 relax_opt=false ts_ms=1783038621492
+stwo JIT: module load start kernel=stwo_jit_fused_f11bb80fb8ef9dac ptx_bytes=236805 relax_opt=0
+stwo JIT: stwo_jit_fused_f11bb80fb8ef9dac ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::jump_opcode_double_deref::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621493
+stwo JIT: codegen start component=cairo_air::components::jump_opcode_rel::Eval ts_ms=1783038621493
+stwo JIT: codegen end component=cairo_air::components::jump_opcode_rel::Eval kernels=1 total_instrs=321 elapsed_ms=0 ts_ms=1783038621493
+stwo JIT: compile start component=cairo_air::components::jump_opcode_rel::Eval kernel=stwo_jit_fused_80d573ea5cb70558 semantic_hash=80d573ea5cb70558 cache_key=1c70181a9a16680c instrs=321 source_bytes=21839 rc_base=0 relax_opt=false ts_ms=1783038621493
+stwo JIT: module load start kernel=stwo_jit_fused_80d573ea5cb70558 ptx_bytes=232047 relax_opt=0
+stwo JIT: stwo_jit_fused_80d573ea5cb70558 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::jump_opcode_rel::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621493
+stwo JIT: codegen start component=cairo_air::components::jump_opcode_rel_imm::Eval ts_ms=1783038621493
+stwo JIT: codegen end component=cairo_air::components::jump_opcode_rel_imm::Eval kernels=1 total_instrs=293 elapsed_ms=0 ts_ms=1783038621493
+stwo JIT: compile start component=cairo_air::components::jump_opcode_rel_imm::Eval kernel=stwo_jit_fused_23630e2413ed4300 semantic_hash=23630e2413ed4300 cache_key=eeb49ef87a4c7c9f instrs=293 source_bytes=20371 rc_base=0 relax_opt=false ts_ms=1783038621493
+stwo JIT: module load start kernel=stwo_jit_fused_23630e2413ed4300 ptx_bytes=220214 relax_opt=0
+stwo JIT: stwo_jit_fused_23630e2413ed4300 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::jump_opcode_rel_imm::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621494
+stwo JIT: codegen start component=cairo_air::components::mul_opcode::Eval ts_ms=1783038621494
+stwo JIT: codegen end component=cairo_air::components::mul_opcode::Eval kernels=2 total_instrs=2713 elapsed_ms=0 ts_ms=1783038621494
+stwo JIT: compile start component=cairo_air::components::mul_opcode::Eval kernel=stwo_jit_fused_330b6ac3795548e2 semantic_hash=330b6ac3795548e2 cache_key=566e541878630fa5 instrs=2011 source_bytes=92497 rc_base=0 relax_opt=false ts_ms=1783038621494
+stwo JIT: compile start component=cairo_air::components::mul_opcode::Eval kernel=stwo_jit_fused_6a86368213950a80 semantic_hash=6a86368213950a80 cache_key=fbe0ec35d7227d64 instrs=702 source_bytes=43559 rc_base=42 relax_opt=false ts_ms=1783038621494
+stwo JIT: module load start kernel=stwo_jit_fused_330b6ac3795548e2 ptx_bytes=723853 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_6a86368213950a80 ptx_bytes=817999 relax_opt=0
+stwo JIT: stwo_jit_fused_330b6ac3795548e2 ready in 2 ms (module_load_ms=1, disk PTX cache)
+stwo JIT: stwo_jit_fused_6a86368213950a80 ready in 3 ms (module_load_ms=3, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::mul_opcode::Eval kernels=2 elapsed_ms=3 ts_ms=1783038621498
+stwo JIT: codegen start component=cairo_air::components::mul_opcode_small::Eval ts_ms=1783038621499
+stwo JIT: codegen end component=cairo_air::components::mul_opcode_small::Eval kernels=1 total_instrs=474 elapsed_ms=0 ts_ms=1783038621499
+stwo JIT: compile start component=cairo_air::components::mul_opcode_small::Eval kernel=stwo_jit_fused_df7268f8d131b2aa semantic_hash=df7268f8d131b2aa cache_key=0e5d5e4ce6ec6b93 instrs=474 source_bytes=30690 rc_base=0 relax_opt=false ts_ms=1783038621499
+stwo JIT: module load start kernel=stwo_jit_fused_df7268f8d131b2aa ptx_bytes=409774 relax_opt=0
+stwo JIT: stwo_jit_fused_df7268f8d131b2aa ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::mul_opcode_small::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621499
+stwo JIT: codegen start component=cairo_air::components::ret_opcode::Eval ts_ms=1783038621500
+stwo JIT: codegen end component=cairo_air::components::ret_opcode::Eval kernels=1 total_instrs=246 elapsed_ms=0 ts_ms=1783038621500
+stwo JIT: compile start component=cairo_air::components::ret_opcode::Eval kernel=stwo_jit_fused_4a840241ace6b1ce semantic_hash=4a840241ace6b1ce cache_key=cad46594598ea494 instrs=246 source_bytes=18919 rc_base=0 relax_opt=false ts_ms=1783038621500
+stwo JIT: module load start kernel=stwo_jit_fused_4a840241ace6b1ce ptx_bytes=217511 relax_opt=0
+stwo JIT: stwo_jit_fused_4a840241ace6b1ce ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::ret_opcode::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621500
+stwo JIT: codegen start component=cairo_air::components::verify_instruction::Eval ts_ms=1783038621500
+stwo JIT: codegen end component=cairo_air::components::verify_instruction::Eval kernels=1 total_instrs=238 elapsed_ms=0 ts_ms=1783038621500
+stwo JIT: compile start component=cairo_air::components::verify_instruction::Eval kernel=stwo_jit_fused_598b3f5cd7a508ff semantic_hash=598b3f5cd7a508ff cache_key=3d4047fe93d01090 instrs=238 source_bytes=18266 rc_base=0 relax_opt=false ts_ms=1783038621500
+stwo JIT: module load start kernel=stwo_jit_fused_598b3f5cd7a508ff ptx_bytes=191278 relax_opt=0
+stwo JIT: stwo_jit_fused_598b3f5cd7a508ff ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::verify_instruction::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621501
+stwo JIT: codegen start component=cairo_air::components::blake_round::Eval ts_ms=1783038621501
+stwo JIT: codegen end component=cairo_air::components::blake_round::Eval kernels=2 total_instrs=3468 elapsed_ms=0 ts_ms=1783038621501
+stwo JIT: compile start component=cairo_air::components::blake_round::Eval kernel=stwo_jit_fused_e327583d108f9be2 semantic_hash=e327583d108f9be2 cache_key=0cc121e2d56bda89 instrs=2047 source_bytes=100621 rc_base=0 relax_opt=false ts_ms=1783038621501
+stwo JIT: compile start component=cairo_air::components::blake_round::Eval kernel=stwo_jit_fused_d8c01f1a61a70266 semantic_hash=d8c01f1a61a70266 cache_key=eac25c9e774849d9 instrs=1421 source_bytes=74752 rc_base=23 relax_opt=false ts_ms=1783038621501
+stwo JIT: module load start kernel=stwo_jit_fused_d8c01f1a61a70266 ptx_bytes=996573 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_e327583d108f9be2 ptx_bytes=1620315 relax_opt=0
+stwo JIT: stwo_jit_fused_d8c01f1a61a70266 ready in 2 ms (module_load_ms=2, disk PTX cache)
+stwo JIT: stwo_jit_fused_e327583d108f9be2 ready in 7 ms (module_load_ms=7, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::blake_round::Eval kernels=2 elapsed_ms=7 ts_ms=1783038621509
+stwo JIT: codegen start component=cairo_air::components::blake_g::Eval ts_ms=1783038621512
+stwo JIT: codegen end component=cairo_air::components::blake_g::Eval kernels=1 total_instrs=685 elapsed_ms=0 ts_ms=1783038621513
+stwo JIT: compile start component=cairo_air::components::blake_g::Eval kernel=stwo_jit_fused_85bc7442abcf3b0a semantic_hash=85bc7442abcf3b0a cache_key=beb87a7bcb35fdfe instrs=685 source_bytes=39888 rc_base=0 relax_opt=false ts_ms=1783038621513
+stwo JIT: module load start kernel=stwo_jit_fused_85bc7442abcf3b0a ptx_bytes=586474 relax_opt=0
+stwo JIT: stwo_jit_fused_85bc7442abcf3b0a ready in 1 ms (module_load_ms=1, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::blake_g::Eval kernels=1 elapsed_ms=1 ts_ms=1783038621514
+stwo JIT: codegen start component=cairo_air::components::blake_round_sigma::Eval ts_ms=1783038621519
+stwo JIT: codegen end component=cairo_air::components::blake_round_sigma::Eval kernels=1 total_instrs=107 elapsed_ms=0 ts_ms=1783038621519
+stwo JIT: compile start component=cairo_air::components::blake_round_sigma::Eval kernel=stwo_jit_fused_dc512e9aef7f81c9 semantic_hash=dc512e9aef7f81c9 cache_key=35fe95ac7e0206d7 instrs=107 source_bytes=12477 rc_base=0 relax_opt=false ts_ms=1783038621519
+stwo JIT: module load start kernel=stwo_jit_fused_dc512e9aef7f81c9 ptx_bytes=72253 relax_opt=0
+stwo JIT: stwo_jit_fused_dc512e9aef7f81c9 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::blake_round_sigma::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621519
+stwo JIT: codegen start component=cairo_air::components::triple_xor_32::Eval ts_ms=1783038621519
+stwo JIT: codegen end component=cairo_air::components::triple_xor_32::Eval kernels=1 total_instrs=277 elapsed_ms=0 ts_ms=1783038621519
+stwo JIT: compile start component=cairo_air::components::triple_xor_32::Eval kernel=stwo_jit_fused_604bf5992fe4faf1 semantic_hash=604bf5992fe4faf1 cache_key=4edcbfbe690d89f5 instrs=277 source_bytes=20572 rc_base=0 relax_opt=false ts_ms=1783038621519
+stwo JIT: module load start kernel=stwo_jit_fused_604bf5992fe4faf1 ptx_bytes=279089 relax_opt=0
+stwo JIT: stwo_jit_fused_604bf5992fe4faf1 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::triple_xor_32::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621520
+stwo JIT: codegen start component=cairo_air::components::verify_bitwise_xor_12::Eval ts_ms=1783038621520
+stwo JIT: codegen end component=cairo_air::components::verify_bitwise_xor_12::Eval kernels=1 total_instrs=490 elapsed_ms=0 ts_ms=1783038621520
+stwo JIT: compile start component=cairo_air::components::verify_bitwise_xor_12::Eval kernel=stwo_jit_fused_73ad4f300b5c03b9 semantic_hash=73ad4f300b5c03b9 cache_key=c27640c48e579b6a instrs=490 source_bytes=29507 rc_base=0 relax_opt=false ts_ms=1783038621520
+stwo JIT: module load start kernel=stwo_jit_fused_73ad4f300b5c03b9 ptx_bytes=299634 relax_opt=0
+stwo JIT: stwo_jit_fused_73ad4f300b5c03b9 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::verify_bitwise_xor_12::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621521
+stwo JIT: codegen start component=cairo_air::components::pedersen_builtin::Eval ts_ms=1783038621523
+stwo JIT: codegen end component=cairo_air::components::pedersen_builtin::Eval kernels=1 total_instrs=96 elapsed_ms=0 ts_ms=1783038621523
+stwo JIT: compile start component=cairo_air::components::pedersen_builtin::Eval kernel=stwo_jit_fused_d0a69f2a366e3505 semantic_hash=d0a69f2a366e3505 cache_key=459f62769dff0175 instrs=96 source_bytes=11331 rc_base=0 relax_opt=false ts_ms=1783038621523
+stwo JIT: module load start kernel=stwo_jit_fused_d0a69f2a366e3505 ptx_bytes=109764 relax_opt=0
+stwo JIT: stwo_jit_fused_d0a69f2a366e3505 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::pedersen_builtin::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621523
+stwo JIT: codegen start component=cairo_air::components::poseidon_builtin::Eval ts_ms=1783038621523
+stwo JIT: codegen end component=cairo_air::components::poseidon_builtin::Eval kernels=1 total_instrs=173 elapsed_ms=0 ts_ms=1783038621523
+stwo JIT: compile start component=cairo_air::components::poseidon_builtin::Eval kernel=stwo_jit_fused_e1a33c81b604ac1c semantic_hash=e1a33c81b604ac1c cache_key=6769297878640495 instrs=173 source_bytes=15071 rc_base=0 relax_opt=false ts_ms=1783038621523
+stwo JIT: module load start kernel=stwo_jit_fused_e1a33c81b604ac1c ptx_bytes=192556 relax_opt=0
+stwo JIT: stwo_jit_fused_e1a33c81b604ac1c ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::poseidon_builtin::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621524
+stwo JIT: codegen start component=cairo_air::components::range_check_builtin::Eval ts_ms=1783038621524
+stwo JIT: codegen end component=cairo_air::components::range_check_builtin::Eval kernels=1 total_instrs=135 elapsed_ms=0 ts_ms=1783038621524
+stwo JIT: compile start component=cairo_air::components::range_check_builtin::Eval kernel=stwo_jit_fused_6b019cc0123ea793 semantic_hash=6b019cc0123ea793 cache_key=b6f75e222f1ee550 instrs=135 source_bytes=13560 rc_base=0 relax_opt=false ts_ms=1783038621524
+stwo JIT: module load start kernel=stwo_jit_fused_6b019cc0123ea793 ptx_bytes=104674 relax_opt=0
+stwo JIT: stwo_jit_fused_6b019cc0123ea793 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::range_check_builtin::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621524
+stwo JIT: codegen start component=cairo_air::components::ec_op_builtin::Eval ts_ms=1783038621524
+stwo JIT: codegen end component=cairo_air::components::ec_op_builtin::Eval kernels=2 total_instrs=2598 elapsed_ms=0 ts_ms=1783038621525
+stwo JIT: compile start component=cairo_air::components::ec_op_builtin::Eval kernel=stwo_jit_fused_56203c4abb4aca34 semantic_hash=56203c4abb4aca34 cache_key=15a4d8ea03df41e7 instrs=954 source_bytes=56289 rc_base=0 relax_opt=false ts_ms=1783038621525
+stwo JIT: compile start component=cairo_air::components::ec_op_builtin::Eval kernel=stwo_jit_fused_ff6e3dcc069ff577 semantic_hash=ff6e3dcc069ff577 cache_key=242d9d3f276f39ef instrs=1644 source_bytes=88849 rc_base=12 relax_opt=false ts_ms=1783038621525
+stwo JIT: module load start kernel=stwo_jit_fused_56203c4abb4aca34 ptx_bytes=699707 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_ff6e3dcc069ff577 ptx_bytes=1004319 relax_opt=0
+stwo JIT: stwo_jit_fused_56203c4abb4aca34 ready in 2 ms (module_load_ms=1, disk PTX cache)
+stwo JIT: stwo_jit_fused_ff6e3dcc069ff577 ready in 5 ms (module_load_ms=5, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::ec_op_builtin::Eval kernels=2 elapsed_ms=8 ts_ms=1783038621533
+stwo JIT: codegen start component=cairo_air::components::partial_ec_mul_generic::Eval ts_ms=1783038621534
+stwo JIT: codegen end component=cairo_air::components::partial_ec_mul_generic::Eval kernels=11 total_instrs=20334 elapsed_ms=5 ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_a825a049ba6a952f semantic_hash=a825a049ba6a952f cache_key=938d4c6c79c6c68e instrs=1963 source_bytes=94180 rc_base=0 relax_opt=false ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_a5a22a904ae7719a semantic_hash=a5a22a904ae7719a cache_key=0d85e62852e65bf1 instrs=2041 source_bytes=93357 rc_base=55 relax_opt=false ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_fd5f6abc639c7ad3 semantic_hash=fd5f6abc639c7ad3 cache_key=00f8a89b9d11ef90 instrs=1943 source_bytes=101819 rc_base=86 relax_opt=false ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_49565bc27a55d074 semantic_hash=49565bc27a55d074 cache_key=ef130c4b88f1d0bf instrs=1942 source_bytes=89769 rc_base=167 relax_opt=false ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_3a940a524062d0a6 semantic_hash=3a940a524062d0a6 cache_key=95cbc777b66614e4 instrs=1969 source_bytes=86758 rc_base=207 relax_opt=false ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_9927162c86fc449f semantic_hash=9927162c86fc449f cache_key=b52eac7ce08c782d instrs=1934 source_bytes=87320 rc_base=237 relax_opt=false ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_a80c5d6eff945be0 semantic_hash=a80c5d6eff945be0 cache_key=55e5013d1c80a943 instrs=2048 source_bytes=100081 rc_base=265 relax_opt=false ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_342c812094c790bf semantic_hash=342c812094c790bf cache_key=eca6e39dfa7fda85 instrs=2012 source_bytes=115751 rc_base=303 relax_opt=false ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_f72f80a3f2b92cfe semantic_hash=f72f80a3f2b92cfe cache_key=ba7e655bf934f6ca instrs=2026 source_bytes=117395 rc_base=359 relax_opt=false ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_229943774e0da851 semantic_hash=229943774e0da851 cache_key=522e1e85e10cfb65 instrs=1170 source_bytes=69007 rc_base=414 relax_opt=false ts_ms=1783038621539
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_generic::Eval kernel=stwo_jit_fused_30f739c2d3c73514 semantic_hash=30f739c2d3c73514 cache_key=9e4eeea66a271785 instrs=1286 source_bytes=73881 rc_base=447 relax_opt=false ts_ms=1783038621539
+stwo JIT: module load start kernel=stwo_jit_fused_3a940a524062d0a6 ptx_bytes=439622 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_a80c5d6eff945be0 ptx_bytes=994945 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_49565bc27a55d074 ptx_bytes=417207 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_a825a049ba6a952f ptx_bytes=515215 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_a5a22a904ae7719a ptx_bytes=416589 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_fd5f6abc639c7ad3 ptx_bytes=587687 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_9927162c86fc449f ptx_bytes=389426 relax_opt=0
+stwo JIT: stwo_jit_fused_3a940a524062d0a6 ready in 1 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: module load start kernel=stwo_jit_fused_342c812094c790bf ptx_bytes=2839638 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_f72f80a3f2b92cfe ptx_bytes=2833391 relax_opt=0
+stwo JIT: stwo_jit_fused_a80c5d6eff945be0 ready in 3 ms (module_load_ms=2, disk PTX cache)
+stwo JIT: module load start kernel=stwo_jit_fused_229943774e0da851 ptx_bytes=1637468 relax_opt=0
+stwo JIT: stwo_jit_fused_a825a049ba6a952f ready in 3 ms (module_load_ms=3, disk PTX cache)
+stwo JIT: module load start kernel=stwo_jit_fused_30f739c2d3c73514 ptx_bytes=735994 relax_opt=0
+stwo JIT: stwo_jit_fused_a5a22a904ae7719a ready in 5 ms (module_load_ms=4, disk PTX cache)
+stwo JIT: stwo_jit_fused_9927162c86fc449f ready in 5 ms (module_load_ms=4, disk PTX cache)
+stwo JIT: stwo_jit_fused_342c812094c790bf ready in 12 ms (module_load_ms=10, disk PTX cache)
+stwo JIT: stwo_jit_fused_49565bc27a55d074 ready in 12 ms (module_load_ms=12, disk PTX cache)
+stwo JIT: stwo_jit_fused_229943774e0da851 ready in 13 ms (module_load_ms=13, disk PTX cache)
+stwo JIT: stwo_jit_fused_fd5f6abc639c7ad3 ready in 19 ms (module_load_ms=18, disk PTX cache)
+stwo JIT: stwo_jit_fused_30f739c2d3c73514 ready in 17 ms (module_load_ms=17, disk PTX cache)
+stwo JIT: stwo_jit_fused_f72f80a3f2b92cfe ready in 33 ms (module_load_ms=32, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::partial_ec_mul_generic::Eval kernels=11 elapsed_ms=37 ts_ms=1783038621577
+stwo JIT: codegen start component=cairo_air::components::pedersen_aggregator_window_bits_18::Eval ts_ms=1783038621579
+stwo JIT: codegen end component=cairo_air::components::pedersen_aggregator_window_bits_18::Eval kernels=1 total_instrs=1918 elapsed_ms=1 ts_ms=1783038621580
+stwo JIT: compile start component=cairo_air::components::pedersen_aggregator_window_bits_18::Eval kernel=stwo_jit_fused_38d89578fcdc1c7c semantic_hash=38d89578fcdc1c7c cache_key=43130551ff46c455 instrs=1918 source_bytes=99637 rc_base=0 relax_opt=false ts_ms=1783038621580
+stwo JIT: module load start kernel=stwo_jit_fused_38d89578fcdc1c7c ptx_bytes=1117344 relax_opt=0
+stwo JIT: stwo_jit_fused_38d89578fcdc1c7c ready in 2 ms (module_load_ms=1, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::pedersen_aggregator_window_bits_18::Eval kernels=1 elapsed_ms=2 ts_ms=1783038621583
+stwo JIT: codegen start component=cairo_air::components::partial_ec_mul_window_bits_18::Eval ts_ms=1783038621584
+stwo JIT: codegen end component=cairo_air::components::partial_ec_mul_window_bits_18::Eval kernels=5 total_instrs=8904 elapsed_ms=1 ts_ms=1783038621586
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_window_bits_18::Eval kernel=stwo_jit_fused_86a901b804923a10 semantic_hash=86a901b804923a10 cache_key=1ab049f2a1c4ff32 instrs=2041 source_bytes=92272 rc_base=0 relax_opt=false ts_ms=1783038621586
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_window_bits_18::Eval kernel=stwo_jit_fused_88abad321f9b225e semantic_hash=88abad321f9b225e cache_key=bdfea75f60bf42ca instrs=1959 source_bytes=89916 rc_base=31 relax_opt=false ts_ms=1783038621586
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_window_bits_18::Eval kernel=stwo_jit_fused_fafdbb942f7afd88 semantic_hash=fafdbb942f7afd88 cache_key=c2631bd0d61a0e70 instrs=2028 source_bytes=97821 rc_base=59 relax_opt=false ts_ms=1783038621586
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_window_bits_18::Eval kernel=stwo_jit_fused_73dba529a778dc70 semantic_hash=73dba529a778dc70 cache_key=59261525ff27b3f7 instrs=2015 source_bytes=115775 rc_base=89 relax_opt=false ts_ms=1783038621586
+stwo JIT: compile start component=cairo_air::components::partial_ec_mul_window_bits_18::Eval kernel=stwo_jit_fused_13b40cb8bc3f2903 semantic_hash=13b40cb8bc3f2903 cache_key=37fde1600beee62c instrs=861 source_bytes=51619 rc_base=145 relax_opt=false ts_ms=1783038621586
+stwo JIT: module load start kernel=stwo_jit_fused_86a901b804923a10 ptx_bytes=458812 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_fafdbb942f7afd88 ptx_bytes=746898 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_13b40cb8bc3f2903 ptx_bytes=600159 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_88abad321f9b225e ptx_bytes=395731 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_73dba529a778dc70 ptx_bytes=2842492 relax_opt=0
+stwo JIT: stwo_jit_fused_86a901b804923a10 ready in 1 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: stwo_jit_fused_fafdbb942f7afd88 ready in 4 ms (module_load_ms=3, disk PTX cache)
+stwo JIT: stwo_jit_fused_88abad321f9b225e ready in 5 ms (module_load_ms=5, disk PTX cache)
+stwo JIT: stwo_jit_fused_73dba529a778dc70 ready in 16 ms (module_load_ms=15, disk PTX cache)
+stwo JIT: stwo_jit_fused_13b40cb8bc3f2903 ready in 18 ms (module_load_ms=18, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::partial_ec_mul_window_bits_18::Eval kernels=5 elapsed_ms=18 ts_ms=1783038621605
+stwo JIT: codegen start component=cairo_air::components::pedersen_points_table_window_bits_18::Eval ts_ms=1783038621606
+stwo JIT: codegen end component=cairo_air::components::pedersen_points_table_window_bits_18::Eval kernels=1 total_instrs=307 elapsed_ms=0 ts_ms=1783038621606
+stwo JIT: compile start component=cairo_air::components::pedersen_points_table_window_bits_18::Eval kernel=stwo_jit_fused_6d15c44abe421789 semantic_hash=6d15c44abe421789 cache_key=2e3eccbf87dcd53e instrs=307 source_bytes=22677 rc_base=0 relax_opt=false ts_ms=1783038621606
+stwo JIT: module load start kernel=stwo_jit_fused_6d15c44abe421789 ptx_bytes=186389 relax_opt=0
+stwo JIT: stwo_jit_fused_6d15c44abe421789 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::pedersen_points_table_window_bits_18::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621607
+stwo JIT: codegen start component=cairo_air::components::poseidon_aggregator::Eval ts_ms=1783038621614
+stwo JIT: codegen end component=cairo_air::components::poseidon_aggregator::Eval kernels=3 total_instrs=4436 elapsed_ms=1 ts_ms=1783038621616
+stwo JIT: compile start component=cairo_air::components::poseidon_aggregator::Eval kernel=stwo_jit_fused_3b6a2b9af05716bc semantic_hash=3b6a2b9af05716bc cache_key=3d482973d4d2ba8f instrs=1934 source_bytes=97650 rc_base=0 relax_opt=false ts_ms=1783038621616
+stwo JIT: compile start component=cairo_air::components::poseidon_aggregator::Eval kernel=stwo_jit_fused_b6cc3b9a735492be semantic_hash=b6cc3b9a735492be cache_key=ff2c767739af6bea instrs=1822 source_bytes=87503 rc_base=40 relax_opt=false ts_ms=1783038621616
+stwo JIT: compile start component=cairo_air::components::poseidon_aggregator::Eval kernel=stwo_jit_fused_c9c647c15f2d8884 semantic_hash=c9c647c15f2d8884 cache_key=2b7ba77c434ef9f3 instrs=680 source_bytes=38064 rc_base=49 relax_opt=false ts_ms=1783038621616
+stwo JIT: module load start kernel=stwo_jit_fused_c9c647c15f2d8884 ptx_bytes=364131 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_3b6a2b9af05716bc ptx_bytes=824349 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_b6cc3b9a735492be ptx_bytes=1077720 relax_opt=0
+stwo JIT: stwo_jit_fused_c9c647c15f2d8884 ready in 1 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: stwo_jit_fused_3b6a2b9af05716bc ready in 6 ms (module_load_ms=6, disk PTX cache)
+stwo JIT: stwo_jit_fused_b6cc3b9a735492be ready in 13 ms (module_load_ms=12, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::poseidon_aggregator::Eval kernels=3 elapsed_ms=14 ts_ms=1783038621630
+stwo JIT: codegen start component=cairo_air::components::poseidon_3_partial_rounds_chain::Eval ts_ms=1783038621631
+stwo JIT: codegen end component=cairo_air::components::poseidon_3_partial_rounds_chain::Eval kernels=2 total_instrs=2231 elapsed_ms=1 ts_ms=1783038621632
+stwo JIT: compile start component=cairo_air::components::poseidon_3_partial_rounds_chain::Eval kernel=stwo_jit_fused_9bd43e62338a819d semantic_hash=9bd43e62338a819d cache_key=99235b4e75c03b7e instrs=1775 source_bytes=87153 rc_base=0 relax_opt=false ts_ms=1783038621632
+stwo JIT: compile start component=cairo_air::components::poseidon_3_partial_rounds_chain::Eval kernel=stwo_jit_fused_2a2157ac10240c20 semantic_hash=2a2157ac10240c20 cache_key=41f19eb13bc4275c instrs=456 source_bytes=30246 rc_base=45 relax_opt=false ts_ms=1783038621632
+stwo JIT: module load start kernel=stwo_jit_fused_2a2157ac10240c20 ptx_bytes=268672 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_9bd43e62338a819d ptx_bytes=985931 relax_opt=0
+stwo JIT: stwo_jit_fused_2a2157ac10240c20 ready in 3 ms (module_load_ms=2, disk PTX cache)
+stwo JIT: stwo_jit_fused_9bd43e62338a819d ready in 13 ms (module_load_ms=12, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::poseidon_3_partial_rounds_chain::Eval kernels=2 elapsed_ms=13 ts_ms=1783038621646
+stwo JIT: codegen start component=cairo_air::components::poseidon_full_round_chain::Eval ts_ms=1783038621646
+stwo JIT: codegen end component=cairo_air::components::poseidon_full_round_chain::Eval kernels=1 total_instrs=1325 elapsed_ms=1 ts_ms=1783038621647
+stwo JIT: compile start component=cairo_air::components::poseidon_full_round_chain::Eval kernel=stwo_jit_fused_216f562d8a710df7 semantic_hash=216f562d8a710df7 cache_key=5778c9f6db5cf1d6 instrs=1325 source_bytes=67425 rc_base=0 relax_opt=false ts_ms=1783038621647
+stwo JIT: module load start kernel=stwo_jit_fused_216f562d8a710df7 ptx_bytes=791750 relax_opt=0
+stwo JIT: stwo_jit_fused_216f562d8a710df7 ready in 5 ms (module_load_ms=4, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::poseidon_full_round_chain::Eval kernels=1 elapsed_ms=5 ts_ms=1783038621653
+stwo JIT: codegen start component=cairo_air::components::cube_252::Eval ts_ms=1783038621653
+stwo JIT: codegen end component=cairo_air::components::cube_252::Eval kernels=3 total_instrs=5406 elapsed_ms=5 ts_ms=1783038621658
+stwo JIT: compile start component=cairo_air::components::cube_252::Eval kernel=stwo_jit_fused_236ecb1645901ac0 semantic_hash=236ecb1645901ac0 cache_key=c687f168b5760e1f instrs=1943 source_bytes=84152 rc_base=0 relax_opt=false ts_ms=1783038621658
+stwo JIT: compile start component=cairo_air::components::cube_252::Eval kernel=stwo_jit_fused_f98780e88d7e4690 semantic_hash=f98780e88d7e4690 cache_key=7c0e5e9ed1f1e625 instrs=2019 source_bytes=93964 rc_base=31 relax_opt=false ts_ms=1783038621658
+stwo JIT: compile start component=cairo_air::components::cube_252::Eval kernel=stwo_jit_fused_898f5baace96c569 semantic_hash=898f5baace96c569 cache_key=c91808b47dc924cf instrs=1444 source_bytes=82329 rc_base=70 relax_opt=false ts_ms=1783038621658
+stwo JIT: module load start kernel=stwo_jit_fused_236ecb1645901ac0 ptx_bytes=395457 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_f98780e88d7e4690 ptx_bytes=1049118 relax_opt=0
+stwo JIT: module load start kernel=stwo_jit_fused_898f5baace96c569 ptx_bytes=1885479 relax_opt=0
+stwo JIT: stwo_jit_fused_236ecb1645901ac0 ready in 6 ms (module_load_ms=5, disk PTX cache)
+stwo JIT: stwo_jit_fused_898f5baace96c569 ready in 22 ms (module_load_ms=19, disk PTX cache)
+stwo JIT: stwo_jit_fused_f98780e88d7e4690 ready in 32 ms (module_load_ms=30, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::cube_252::Eval kernels=3 elapsed_ms=32 ts_ms=1783038621691
+stwo JIT: codegen start component=cairo_air::components::poseidon_round_keys::Eval ts_ms=1783038621692
+stwo JIT: codegen end component=cairo_air::components::poseidon_round_keys::Eval kernels=1 total_instrs=177 elapsed_ms=0 ts_ms=1783038621692
+stwo JIT: compile start component=cairo_air::components::poseidon_round_keys::Eval kernel=stwo_jit_fused_6eec0240134c359d semantic_hash=6eec0240134c359d cache_key=72234bdb224e728d instrs=177 source_bytes=16047 rc_base=0 relax_opt=false ts_ms=1783038621692
+stwo JIT: module load start kernel=stwo_jit_fused_6eec0240134c359d ptx_bytes=111909 relax_opt=0
+stwo JIT: stwo_jit_fused_6eec0240134c359d ready in 1 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::poseidon_round_keys::Eval kernels=1 elapsed_ms=1 ts_ms=1783038621693
+stwo JIT: codegen start component=cairo_air::components::range_check_252_width_27::Eval ts_ms=1783038621693
+stwo JIT: codegen end component=cairo_air::components::range_check_252_width_27::Eval kernels=1 total_instrs=327 elapsed_ms=0 ts_ms=1783038621694
+stwo JIT: compile start component=cairo_air::components::range_check_252_width_27::Eval kernel=stwo_jit_fused_f546a8bace1705fa semantic_hash=f546a8bace1705fa cache_key=c2a3991180dc0c6d instrs=327 source_bytes=23693 rc_base=0 relax_opt=false ts_ms=1783038621694
+stwo JIT: module load start kernel=stwo_jit_fused_f546a8bace1705fa ptx_bytes=396076 relax_opt=0
+stwo JIT: stwo_jit_fused_f546a8bace1705fa ready in 2 ms (module_load_ms=2, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::range_check_252_width_27::Eval kernels=1 elapsed_ms=2 ts_ms=1783038621697
+stwo JIT: codegen start component=cairo_air::components::memory_address_to_id::Eval ts_ms=1783038621697
+stwo JIT: codegen end component=cairo_air::components::memory_address_to_id::Eval kernels=1 total_instrs=378 elapsed_ms=0 ts_ms=1783038621697
+stwo JIT: compile start component=cairo_air::components::memory_address_to_id::Eval kernel=stwo_jit_fused_ce4438a81b3ed2ad semantic_hash=ce4438a81b3ed2ad cache_key=f2c942cc8b379c98 instrs=378 source_bytes=25901 rc_base=0 relax_opt=false ts_ms=1783038621697
+stwo JIT: module load start kernel=stwo_jit_fused_ce4438a81b3ed2ad ptx_bytes=338325 relax_opt=0
+stwo JIT: stwo_jit_fused_ce4438a81b3ed2ad ready in 2 ms (module_load_ms=2, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::memory_address_to_id::Eval kernels=1 elapsed_ms=2 ts_ms=1783038621700
+stwo JIT: codegen start component=cairo_air::components::memory_id_to_big::BigEval ts_ms=1783038621700
+stwo JIT: codegen end component=cairo_air::components::memory_id_to_big::BigEval kernels=1 total_instrs=423 elapsed_ms=0 ts_ms=1783038621701
+stwo JIT: compile start component=cairo_air::components::memory_id_to_big::BigEval kernel=stwo_jit_fused_d0a2396eb5e8e845 semantic_hash=d0a2396eb5e8e845 cache_key=8e3c0eaec20fdd9f instrs=423 source_bytes=28033 rc_base=0 relax_opt=false ts_ms=1783038621701
+stwo JIT: module load start kernel=stwo_jit_fused_d0a2396eb5e8e845 ptx_bytes=464064 relax_opt=0
+stwo JIT: stwo_jit_fused_d0a2396eb5e8e845 ready in 3 ms (module_load_ms=2, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::memory_id_to_big::BigEval kernels=1 elapsed_ms=3 ts_ms=1783038621704
+stwo JIT: codegen start component=cairo_air::components::memory_id_to_small::Eval ts_ms=1783038621704
+stwo JIT: codegen end component=cairo_air::components::memory_id_to_small::Eval kernels=1 total_instrs=139 elapsed_ms=0 ts_ms=1783038621704
+stwo JIT: compile start component=cairo_air::components::memory_id_to_small::Eval kernel=stwo_jit_fused_509c4d39b553946d semantic_hash=509c4d39b553946d cache_key=c1687d6fa328bb5d instrs=139 source_bytes=13876 rc_base=0 relax_opt=false ts_ms=1783038621704
+stwo JIT: module load start kernel=stwo_jit_fused_509c4d39b553946d ptx_bytes=151167 relax_opt=0
+stwo JIT: stwo_jit_fused_509c4d39b553946d ready in 1 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::memory_id_to_small::Eval kernels=1 elapsed_ms=1 ts_ms=1783038621705
+stwo JIT: codegen start component=cairo_air::components::range_check_6::Eval ts_ms=1783038621706
+stwo JIT: codegen end component=cairo_air::components::range_check_6::Eval kernels=1 total_instrs=27 elapsed_ms=0 ts_ms=1783038621706
+stwo JIT: compile start component=cairo_air::components::range_check_6::Eval kernel=stwo_jit_fused_b455671faf7e7149 semantic_hash=b455671faf7e7149 cache_key=5754f8a873a52740 instrs=27 source_bytes=8407 rc_base=0 relax_opt=false ts_ms=1783038621706
+stwo JIT: module load start kernel=stwo_jit_fused_b455671faf7e7149 ptx_bytes=28711 relax_opt=0
+stwo JIT: stwo_jit_fused_b455671faf7e7149 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::range_check_6::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621706
+stwo JIT: codegen start component=cairo_air::components::range_check_8::Eval ts_ms=1783038621706
+stwo JIT: codegen end component=cairo_air::components::range_check_8::Eval kernels=1 total_instrs=27 elapsed_ms=0 ts_ms=1783038621706
+stwo JIT: compile start component=cairo_air::components::range_check_8::Eval kernel=stwo_jit_fused_b455671faf7e7149 semantic_hash=b455671faf7e7149 cache_key=5754f8a873a52740 instrs=27 source_bytes=8407 rc_base=0 relax_opt=false ts_ms=1783038621706
+stwo JIT: compile+launch end component=cairo_air::components::range_check_8::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621706
+stwo JIT: codegen start component=cairo_air::components::range_check_11::Eval ts_ms=1783038621706
+stwo JIT: codegen end component=cairo_air::components::range_check_11::Eval kernels=1 total_instrs=27 elapsed_ms=0 ts_ms=1783038621706
+stwo JIT: compile start component=cairo_air::components::range_check_11::Eval kernel=stwo_jit_fused_b455671faf7e7149 semantic_hash=b455671faf7e7149 cache_key=5754f8a873a52740 instrs=27 source_bytes=8407 rc_base=0 relax_opt=false ts_ms=1783038621706
+stwo JIT: compile+launch end component=cairo_air::components::range_check_11::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621706
+stwo JIT: codegen start component=cairo_air::components::range_check_12::Eval ts_ms=1783038621706
+stwo JIT: codegen end component=cairo_air::components::range_check_12::Eval kernels=1 total_instrs=27 elapsed_ms=0 ts_ms=1783038621706
+stwo JIT: compile start component=cairo_air::components::range_check_12::Eval kernel=stwo_jit_fused_b455671faf7e7149 semantic_hash=b455671faf7e7149 cache_key=5754f8a873a52740 instrs=27 source_bytes=8407 rc_base=0 relax_opt=false ts_ms=1783038621706
+stwo JIT: compile+launch end component=cairo_air::components::range_check_12::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621706
+stwo JIT: codegen start component=cairo_air::components::range_check_18::Eval ts_ms=1783038621706
+stwo JIT: codegen end component=cairo_air::components::range_check_18::Eval kernels=1 total_instrs=41 elapsed_ms=0 ts_ms=1783038621707
+stwo JIT: compile start component=cairo_air::components::range_check_18::Eval kernel=stwo_jit_fused_5110e647be737a71 semantic_hash=5110e647be737a71 cache_key=60f1edbf38c46846 instrs=41 source_bytes=9008 rc_base=0 relax_opt=false ts_ms=1783038621707
+stwo JIT: module load start kernel=stwo_jit_fused_5110e647be737a71 ptx_bytes=41434 relax_opt=0
+stwo JIT: stwo_jit_fused_5110e647be737a71 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::range_check_18::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621707
+stwo JIT: codegen start component=cairo_air::components::range_check_20::Eval ts_ms=1783038621707
+stwo JIT: codegen end component=cairo_air::components::range_check_20::Eval kernels=1 total_instrs=137 elapsed_ms=0 ts_ms=1783038621707
+stwo JIT: compile start component=cairo_air::components::range_check_20::Eval kernel=stwo_jit_fused_f3c5592c25df0a2b semantic_hash=f3c5592c25df0a2b cache_key=fde450a0c79effe4 instrs=137 source_bytes=14375 rc_base=0 relax_opt=false ts_ms=1783038621707
+stwo JIT: module load start kernel=stwo_jit_fused_f3c5592c25df0a2b ptx_bytes=137018 relax_opt=0
+stwo JIT: stwo_jit_fused_f3c5592c25df0a2b ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::range_check_20::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621708
+stwo JIT: codegen start component=cairo_air::components::range_check_4_3::Eval ts_ms=1783038621709
+stwo JIT: codegen end component=cairo_air::components::range_check_4_3::Eval kernels=1 total_instrs=32 elapsed_ms=0 ts_ms=1783038621709
+stwo JIT: compile start component=cairo_air::components::range_check_4_3::Eval kernel=stwo_jit_fused_bfbf5a8a40591289 semantic_hash=bfbf5a8a40591289 cache_key=785f1d2fda1ea922 instrs=32 source_bytes=8657 rc_base=0 relax_opt=false ts_ms=1783038621709
+stwo JIT: module load start kernel=stwo_jit_fused_bfbf5a8a40591289 ptx_bytes=31606 relax_opt=0
+stwo JIT: stwo_jit_fused_bfbf5a8a40591289 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::range_check_4_3::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621709
+stwo JIT: codegen start component=cairo_air::components::range_check_4_4::Eval ts_ms=1783038621709
+stwo JIT: codegen end component=cairo_air::components::range_check_4_4::Eval kernels=1 total_instrs=32 elapsed_ms=0 ts_ms=1783038621709
+stwo JIT: compile start component=cairo_air::components::range_check_4_4::Eval kernel=stwo_jit_fused_bfbf5a8a40591289 semantic_hash=bfbf5a8a40591289 cache_key=785f1d2fda1ea922 instrs=32 source_bytes=8657 rc_base=0 relax_opt=false ts_ms=1783038621709
+stwo JIT: compile+launch end component=cairo_air::components::range_check_4_4::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621709
+stwo JIT: codegen start component=cairo_air::components::range_check_9_9::Eval ts_ms=1783038621709
+stwo JIT: codegen end component=cairo_air::components::range_check_9_9::Eval kernels=1 total_instrs=170 elapsed_ms=0 ts_ms=1783038621709
+stwo JIT: compile start component=cairo_air::components::range_check_9_9::Eval kernel=stwo_jit_fused_90ffbc48bba4e133 semantic_hash=90ffbc48bba4e133 cache_key=49615d8c7e35be8c instrs=170 source_bytes=15758 rc_base=0 relax_opt=false ts_ms=1783038621709
+stwo JIT: module load start kernel=stwo_jit_fused_90ffbc48bba4e133 ptx_bytes=144217 relax_opt=0
+stwo JIT: stwo_jit_fused_90ffbc48bba4e133 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::range_check_9_9::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621710
+stwo JIT: codegen start component=cairo_air::components::range_check_7_2_5::Eval ts_ms=1783038621710
+stwo JIT: codegen end component=cairo_air::components::range_check_7_2_5::Eval kernels=1 total_instrs=37 elapsed_ms=0 ts_ms=1783038621710
+stwo JIT: compile start component=cairo_air::components::range_check_7_2_5::Eval kernel=stwo_jit_fused_b6da13dc52c21465 semantic_hash=b6da13dc52c21465 cache_key=7e0b6c8348014c9a instrs=37 source_bytes=8907 rc_base=0 relax_opt=false ts_ms=1783038621710
+stwo JIT: module load start kernel=stwo_jit_fused_b6da13dc52c21465 ptx_bytes=33987 relax_opt=0
+stwo JIT: stwo_jit_fused_b6da13dc52c21465 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::range_check_7_2_5::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621710
+stwo JIT: codegen start component=cairo_air::components::range_check_3_6_6_3::Eval ts_ms=1783038621710
+stwo JIT: codegen end component=cairo_air::components::range_check_3_6_6_3::Eval kernels=1 total_instrs=42 elapsed_ms=0 ts_ms=1783038621710
+stwo JIT: compile start component=cairo_air::components::range_check_3_6_6_3::Eval kernel=stwo_jit_fused_8bfe46e1447d7e33 semantic_hash=8bfe46e1447d7e33 cache_key=7427d3ae2749288a instrs=42 source_bytes=9157 rc_base=0 relax_opt=false ts_ms=1783038621710
+stwo JIT: module load start kernel=stwo_jit_fused_8bfe46e1447d7e33 ptx_bytes=36880 relax_opt=0
+stwo JIT: stwo_jit_fused_8bfe46e1447d7e33 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::range_check_3_6_6_3::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621711
+stwo JIT: codegen start component=cairo_air::components::range_check_4_4_4_4::Eval ts_ms=1783038621711
+stwo JIT: codegen end component=cairo_air::components::range_check_4_4_4_4::Eval kernels=1 total_instrs=42 elapsed_ms=0 ts_ms=1783038621711
+stwo JIT: compile start component=cairo_air::components::range_check_4_4_4_4::Eval kernel=stwo_jit_fused_8bfe46e1447d7e33 semantic_hash=8bfe46e1447d7e33 cache_key=7427d3ae2749288a instrs=42 source_bytes=9157 rc_base=0 relax_opt=false ts_ms=1783038621711
+stwo JIT: compile+launch end component=cairo_air::components::range_check_4_4_4_4::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621711
+stwo JIT: codegen start component=cairo_air::components::range_check_3_3_3_3_3::Eval ts_ms=1783038621711
+stwo JIT: codegen end component=cairo_air::components::range_check_3_3_3_3_3::Eval kernels=1 total_instrs=47 elapsed_ms=0 ts_ms=1783038621711
+stwo JIT: compile start component=cairo_air::components::range_check_3_3_3_3_3::Eval kernel=stwo_jit_fused_264153f324dfa389 semantic_hash=264153f324dfa389 cache_key=08e5448d4cd611c0 instrs=47 source_bytes=9407 rc_base=0 relax_opt=false ts_ms=1783038621711
+stwo JIT: module load start kernel=stwo_jit_fused_264153f324dfa389 ptx_bytes=39419 relax_opt=0
+stwo JIT: stwo_jit_fused_264153f324dfa389 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::range_check_3_3_3_3_3::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621711
+stwo JIT: codegen start component=cairo_air::components::verify_bitwise_xor_4::Eval ts_ms=1783038621711
+stwo JIT: codegen end component=cairo_air::components::verify_bitwise_xor_4::Eval kernels=1 total_instrs=37 elapsed_ms=0 ts_ms=1783038621711
+stwo JIT: compile start component=cairo_air::components::verify_bitwise_xor_4::Eval kernel=stwo_jit_fused_b6da13dc52c21465 semantic_hash=b6da13dc52c21465 cache_key=7e0b6c8348014c9a instrs=37 source_bytes=8907 rc_base=0 relax_opt=false ts_ms=1783038621711
+stwo JIT: compile+launch end component=cairo_air::components::verify_bitwise_xor_4::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621711
+stwo JIT: codegen start component=cairo_air::components::verify_bitwise_xor_7::Eval ts_ms=1783038621711
+stwo JIT: codegen end component=cairo_air::components::verify_bitwise_xor_7::Eval kernels=1 total_instrs=37 elapsed_ms=0 ts_ms=1783038621711
+stwo JIT: compile start component=cairo_air::components::verify_bitwise_xor_7::Eval kernel=stwo_jit_fused_b6da13dc52c21465 semantic_hash=b6da13dc52c21465 cache_key=7e0b6c8348014c9a instrs=37 source_bytes=8907 rc_base=0 relax_opt=false ts_ms=1783038621711
+stwo JIT: compile+launch end component=cairo_air::components::verify_bitwise_xor_7::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621711
+stwo JIT: codegen start component=cairo_air::components::verify_bitwise_xor_8::Eval ts_ms=1783038621711
+stwo JIT: codegen end component=cairo_air::components::verify_bitwise_xor_8::Eval kernels=1 total_instrs=59 elapsed_ms=0 ts_ms=1783038621711
+stwo JIT: compile start component=cairo_air::components::verify_bitwise_xor_8::Eval kernel=stwo_jit_fused_ad13f4b2c221bfc7 semantic_hash=ad13f4b2c221bfc7 cache_key=2d7a146fd5a09609 instrs=59 source_bytes=9813 rc_base=0 relax_opt=false ts_ms=1783038621711
+stwo JIT: module load start kernel=stwo_jit_fused_ad13f4b2c221bfc7 ptx_bytes=48293 relax_opt=0
+stwo JIT: stwo_jit_fused_ad13f4b2c221bfc7 ready in 0 ms (module_load_ms=0, disk PTX cache)
+stwo JIT: compile+launch end component=cairo_air::components::verify_bitwise_xor_8::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621712
+stwo JIT: codegen start component=cairo_air::components::verify_bitwise_xor_9::Eval ts_ms=1783038621712
+stwo JIT: codegen end component=cairo_air::components::verify_bitwise_xor_9::Eval kernels=1 total_instrs=37 elapsed_ms=0 ts_ms=1783038621712
+stwo JIT: compile start component=cairo_air::components::verify_bitwise_xor_9::Eval kernel=stwo_jit_fused_b6da13dc52c21465 semantic_hash=b6da13dc52c21465 cache_key=7e0b6c8348014c9a instrs=37 source_bytes=8907 rc_base=0 relax_opt=false ts_ms=1783038621712
+stwo JIT: compile+launch end component=cairo_air::components::verify_bitwise_xor_9::Eval kernels=1 elapsed_ms=0 ts_ms=1783038621712
+rep=0 prove_s=7.480

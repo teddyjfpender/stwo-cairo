@@ -6,9 +6,22 @@ license.workspace = true
 repository.workspace = true
 description = "STARK prover for Cairo programs using the Stwo proving system"
 
+# NOTE on gpu_bench + pie-bench gating:
+# The CairoPie ingestion path in `src/bin/gpu_bench.rs` (and its cairo-program-runner-lib
+# dependency) is fully `#[cfg(feature = "pie-bench")]`-gated. We deliberately do NOT set
+# `required-features = ["pie-bench"]` on the bin: cargo errors when an explicitly requested
+# target (`cargo build --bin gpu_bench`) has unmet required-features, which would break the
+# feature-off build. The optional dependency + cfg gating already keep default/wasm builds
+# free of the git dependency, so the gating holds without required-features.
+
 [features]
 slow-tests = []
 relation-tracker = []
+
+# Enables the CairoPie bootloader ingestion path in the gpu_bench binary.
+# Kept out of default features so wasm CI checks (wasm64 prover, wasm32 cairo-air)
+# are unaffected by the non-wasm cairo-program-runner-lib dependency.
+pie-bench = ["dep:cairo-program-runner-lib"]
 
 # Define Nightly features in order to allow selective tests
 # Use the following #[cfg(feature = "nightly")]
@@ -47,6 +60,11 @@ dashmap.workspace = true
 indexmap.workspace = true
 bytemuck.workspace = true
 
+# Optional: CairoPie bootloader ingestion for gpu_bench (--pie). This rev pins
+# cairo-vm =3.2.0 (matching ours) and cairo-lang =2.17.0-rc.4. Gated behind the
+# `pie-bench` feature so default/wasm builds do not pull it in.
+cairo-program-runner-lib = { git = "https://github.com/starkware-libs/proving-utils", rev = "14490bfd", optional = true }
+
 [target.'cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))'.dependencies]
 sonic-rs.workspace = true
 
@@ -54,6 +72,11 @@ sonic-rs.workspace = true
 [target.'cfg(any(target_arch = "wasm32", target_arch = "wasm64"))'.dependencies]
 getrandom_v2 = { version = "0.2", package = "getrandom", features = ["js"] }
 getrandom_v3 = { version = "0.3", package = "getrandom", features = ["wasm_js"] }
+
+# Used by build.rs (only when the pie-bench feature is enabled) to locate the
+# bootloader JSON shipped inside cairo-program-runner-lib via `cargo metadata`.
+[build-dependencies]
+serde_json.workspace = true
 
 [dev-dependencies]
 stwo-backend-cuda-kernels = { git = "https://github.com/teddyjfpender/stwo", rev = "9d7e3d6fa0fc64a0d143a8b2fcb8ee952f4de8f2" }

@@ -1,0 +1,18 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export TENT=/workspace/stwo-cairo/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip; export OUT=/workspace/out; for n in 1 3 4; do
+  f=$SN/SN_PIE_$n.zip
+  [ -f "$f" ] || { echo "SN_PIE_$n absent — skipped"; continue; }
+  echo "=== SN_PIE_$n ==="
+  STWO_BENCH_TRACE=json $GB --pie $f --backend cuda --reps 1 --reuse-input > $OUT/sn${n}.json 2> $OUT/sn${n}.err
+  rc=$?
+  if [ $rc -eq 0 ]; then tail -1 $OUT/sn${n}.json; else echo "SN_PIE_$n rc=$rc"; tail -3 $OUT/sn${n}.err; fi
+done
+echo scale-sweep-done
+--8<-- output --8<--
+=== SN_PIE_1 ===
+{"adapt_s":1.974,"backend":"cuda","bootloader_overhead_pct":1.847,"cycle_count":14915645,"fold_step":3,"gpu":"NVIDIA H100 NVL","host_mem_gb":1511.351,"mhz":0.385,"n":1,"n_queries":70,"nproc":16,"peak_rss_gb":38.617,"pie_n_steps":14645112,"pool_reserved_high_gb":63.351,"pool_used_high_gb":63.349,"pow_bits":26,"program":"SN_PIE_1.zip","proof_kb":3124.124,"prove_s_cold":38.745,"prove_s_warm":38.745,"security_bits":96,"steps_per_s":384968.0,"useful_mhz":0.378,"verify_ms":18.118,"vm_s":10.358,"vram_end_gb":64.023,"vram_peak_gb":64.023}
+=== SN_PIE_3 ===
+{"adapt_s":1.919,"backend":"cuda","bootloader_overhead_pct":1.922,"cycle_count":14345552,"fold_step":3,"gpu":"NVIDIA H100 NVL","host_mem_gb":1511.351,"mhz":0.399,"n":1,"n_queries":70,"nproc":16,"peak_rss_gb":35.552,"pie_n_steps":14075019,"pool_reserved_high_gb":52.177,"pool_used_high_gb":52.171,"pow_bits":26,"program":"SN_PIE_3.zip","proof_kb":3044.538,"prove_s_cold":35.98,"prove_s_warm":35.98,"security_bits":96,"steps_per_s":398711.0,"useful_mhz":0.391,"verify_ms":17.883,"vm_s":9.778,"vram_end_gb":52.849,"vram_peak_gb":52.849}
+=== SN_PIE_4 ===
+{"adapt_s":1.916,"backend":"cuda","bootloader_overhead_pct":1.924,"cycle_count":14328780,"fold_step":3,"gpu":"NVIDIA H100 NVL","host_mem_gb":1511.351,"mhz":0.489,"n":1,"n_queries":70,"nproc":16,"peak_rss_gb":28.975,"pie_n_steps":14058247,"pool_reserved_high_gb":50.097,"pool_used_high_gb":50.083,"pow_bits":26,"program":"SN_PIE_4.zip","proof_kb":3076.62,"prove_s_cold":29.287,"prove_s_warm":29.287,"security_bits":96,"steps_per_s":489246.0,"useful_mhz":0.48,"verify_ms":17.478,"vm_s":9.394,"vram_end_gb":50.769,"vram_peak_gb":50.769}
+scale-sweep-done

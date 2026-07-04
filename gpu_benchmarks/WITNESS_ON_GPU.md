@@ -211,3 +211,18 @@ Extracted from the generated code so the port is mechanical:
 Estimated surface: one kernel file (4 kernels), FFI x4 layers, the component's two
 writers restructured behind the hook, claim plumbing unchanged (sums still arrive
 in order). One focused session.
+
+## Round-8 addendum: measured per-component base-write ranking (SN_PIE_2, A40)
+
+`wt:*` spans (STWO_BENCH_TRACE=json), 57 components, 24.7s summed span time
+(parallel spawns overlap wall-clock; shares are the ranking signal):
+blake_g 12.4% | partial_ec_mul_w18 12.3% | blake_round 9.9% |
+pedersen_aggregator_w18 8.3% | assert_eq_dd 7.9% | add_opcode 6.9% |
+partial_ec_mul_generic 6.5% | add_opcode_small 5.6% | ec_op 4.0% | tail <4% each.
+
+W3 port order (family-level): (1) blake_g+blake_round (~23%, 32-bit ops — most
+GPU-natural, lowest-risk first port); (2) pedersen partial_ec_mul family (~27%,
+fp256 EC via existing ec_ops.cuh/pedersen_table_init.cu precedents);
+(3) opcode tail by measured share. memory_id_to_big device lane already complete (W3
+phase-1). Gates per component: STWO_CUDA_WITNESS_VERIFY differential + kill switch +
+SIMD fallback + e2e byte-equality.

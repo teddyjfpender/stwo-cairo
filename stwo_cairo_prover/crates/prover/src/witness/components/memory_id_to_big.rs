@@ -24,11 +24,11 @@ use stwo_cairo_common::memory::{LARGE_MEMORY_VALUE_ID_BASE, N_M31_IN_SMALL_FELT2
 use stwo_cairo_common::prover_types::cpu::FELT252_N_WORDS;
 use stwo_cairo_common::prover_types::felt::split_f252_simd;
 use stwo_cairo_common::prover_types::simd::{PackedFelt252, SIMD_ENUMERATION_0};
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 use crate::witness::components::range_check_9_9;
 use crate::witness::prelude::*;
 use crate::witness::utils::AtomicMultiplicityColumn;
-use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 pub type InputType = M31;
 pub type PackedInputType = PackedM31;
@@ -103,6 +103,19 @@ impl ClaimGenerator {
         for memory_id in memory_ids {
             self.add_input(&memory_id, 0);
         }
+    }
+
+    /// Decomposes into `(big values, big multiplicities, small values, small
+    /// multiplicities)` for backend-specific witness generation (the
+    /// `MemoryIdToBigWitness` device path, which generates the limb columns from
+    /// the raw value tables on device).
+    pub(crate) fn into_parts(self) -> (Vec<[u32; 8]>, Vec<PackedM31>, Vec<u128>, Vec<PackedM31>) {
+        (
+            self.big_values,
+            self.big_mults.into_simd_vec(),
+            self.small_values,
+            self.small_mults.into_simd_vec(),
+        )
     }
 
     pub fn write_trace(
@@ -301,7 +314,7 @@ impl AddInputs for ClaimGenerator {
 /// Generates the trace for the id -> f252 `big` tables. Splits the table to multiple traces
 /// according to `log_max_big_size`.
 /// If `opt_n_components` is provided, the function will pad the traces to the number of components.
-fn gen_big_memory_traces(
+pub(crate) fn gen_big_memory_traces(
     values: Vec<[u32; 8]>,
     mults: Vec<PackedM31>,
     log_max_big_size: u32,
@@ -370,7 +383,10 @@ fn gen_single_big_memory_trace(values: &[[u32; 8]], mults: &[PackedM31]) -> Vec<
 }
 
 // Generates the trace of the small value memory table.
-fn gen_small_memory_trace(values: Vec<u128>, mut mults: Vec<PackedM31>) -> Vec<BaseColumn> {
+pub(crate) fn gen_small_memory_trace(
+    values: Vec<u128>,
+    mut mults: Vec<PackedM31>,
+) -> Vec<BaseColumn> {
     assert_eq!(values.len(), mults.len() * N_LANES);
     let column_length = values.len().next_power_of_two();
 
@@ -419,6 +435,7 @@ pub struct InteractionClaimGenerator {
     pub small_multiplicities: Vec<PackedM31>,
 }
 impl InteractionClaimGenerator {
+    #[allow(clippy::type_complexity)]
     pub fn write_interaction_trace(
         self,
         common_lookup_elements: &relations::CommonLookupElements,

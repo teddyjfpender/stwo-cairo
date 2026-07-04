@@ -4,11 +4,11 @@
 use cairo_air::components::pedersen_aggregator_window_bits_9::{
     Claim, InteractionClaim, N_TRACE_COLUMNS,
 };
+use stwo::core::fields::qm31::SecureField;
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 use crate::witness::components::{memory_id_to_big, partial_ec_mul_window_bits_9, range_check_8};
 use crate::witness::prelude::*;
-use stwo::core::fields::qm31::SecureField;
-use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
 
 pub type InputType = ([M31; 2], M31);
 pub type PackedInputType = ([PackedM31; 2], PackedM31);
@@ -795,6 +795,8 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }

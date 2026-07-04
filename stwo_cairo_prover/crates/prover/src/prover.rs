@@ -12,36 +12,30 @@ use cairo_air::CairoProof;
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use stwo::core::channel::{Channel, MerkleChannel};
-use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::utils::InvalidLiftingLogSizeError;
 use stwo::core::pcs::PcsConfig;
-use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::proof_of_work::GrindOps;
 use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{BackendForChannel, FromSimdColumns};
 use stwo::prover::mempool::BaseColumnPool;
-use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
-use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::{prove_ex, CommitmentSchemeProver, CommitmentTreeProver, ProvingError};
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
     PreProcessedTrace, PreProcessedTraceVariant,
 };
-use stwo_cairo_common::preprocessed_columns::simd_prelude::CircleEvaluation;
 use stwo_cairo_serialize::CairoSerialize;
 use stwo_constraint_framework::FrameworkBackend;
 use tracing::{event, span, Level};
 
 use crate::utils::cairo_provers;
+use crate::witness::base_trace::BaseTrace;
 use crate::witness::cairo::create_cairo_claim_generator;
 use crate::witness::cairo_claim_generator::CairoInteractionClaimGenerator;
-use crate::witness::preprocessed_trace_backend::GenPreprocessedTrace;
 use crate::witness::utils::witness_trace_cells;
 
 mod json {
@@ -51,7 +45,75 @@ mod json {
     pub use sonic_rs::from_str;
 }
 
-fn prove_verify_serialize<MC: MerkleChannel>(
+/// Process-wide twiddle-tree cache, keyed by (backend `TypeId`, `max_domain_log_size`).
+/// Trees are leaked (`&'static`): bounded by the number of distinct domain sizes per
+/// process and shared read-only across proves. Keyed by type + size EXPLICITLY —
+/// never by pointer or implicit scope.
+mod twiddle_cache {
+    use std::any::TypeId;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use stwo::core::poly::circle::CanonicCoset;
+    use stwo::prover::poly::circle::PolyOps;
+    use stwo::prover::poly::twiddles::TwiddleTree;
+
+    static CACHE: Mutex<Option<HashMap<(TypeId, u32), usize>>> = Mutex::new(None);
+
+    /// Fetch (building + caching on first use) the twiddle tree for `log_size`.
+    pub fn get_or_build<B: PolyOps + 'static>(log_size: u32) -> &'static TwiddleTree<B> {
+        let key = (TypeId::of::<B>(), log_size);
+        let mut guard = CACHE.lock().unwrap();
+        let map = guard.get_or_insert_with(HashMap::new);
+        let ptr = *map.entry(key).or_insert_with(|| {
+            let tree =
+                B::precompute_twiddles(CanonicCoset::new(log_size).circle_domain().half_coset);
+            Box::leak(Box::new(tree)) as *const _ as usize
+        });
+        // Safety: the leaked tree is 'static, read-only after construction, and the
+        // key includes the backend type, so the cast type always matches.
+        unsafe { &*(ptr as *const TwiddleTree<B>) }
+    }
+
+    /// The largest-`log_size` tree already cached for `B`, if any.
+    ///
+    /// Stage A″ needs a twiddle tree BEFORE this prove's `max_domain_log_size` is
+    /// known (the committer starts as soon as the opcode scope finishes). On a warm
+    /// process the previous prove of the same PIE already cached the right tree; this
+    /// returns it. The caller verifies the returned tree's identity against the
+    /// commitment tree (built later via [`get_or_build`]); a mismatch (trace size
+    /// changed mid-process) is fail-closed, never a silent wrong proof. Returns `None`
+    /// on the first prove (nothing cached yet), which disables pipelining that prove.
+    pub fn largest_cached<B: PolyOps + 'static>() -> Option<&'static TwiddleTree<B>> {
+        let tid = TypeId::of::<B>();
+        let guard = CACHE.lock().unwrap();
+        let map = guard.as_ref()?;
+        let &ptr = map
+            .iter()
+            .filter(|((t, _), _)| *t == tid)
+            .max_by_key(|((_, log), _)| *log)
+            .map(|(_, ptr)| ptr)?;
+        // Safety: as in `get_or_build`.
+        Some(unsafe { &*(ptr as *const TwiddleTree<B>) })
+    }
+}
+
+/// Stage A″ pipelined-commit gate. When `STWO_CUDA_PIPELINED_COMMIT=1` and a twiddle
+/// tree is already cached (warm process), returns it for `write_trace` to interpolate
+/// the opcode prefix on a committer thread. Default (off, or first/cold prove) is
+/// `None` → the byte-identical `BaseTrace::Evals` path.
+fn pipelined_commit_twiddles<B>() -> Option<&'static TwiddleTree<B>>
+where
+    B: stwo::prover::poly::circle::PolyOps + 'static,
+{
+    if std::env::var("STWO_CUDA_PIPELINED_COMMIT").as_deref() == Ok("1") {
+        twiddle_cache::largest_cached::<B>()
+    } else {
+        None
+    }
+}
+
+fn prove_verify_serialize<MC>(
     input: ProverInput,
     verify: bool,
     proof_path: &Path,
@@ -60,7 +122,7 @@ fn prove_verify_serialize<MC: MerkleChannel>(
 ) -> Result<()>
 where
     SimdBackend: BackendForChannel<MC>,
-    MC: 'static,
+    MC: MerkleChannel + 'static,
     MC::H: MerkleHasherLifted + Serialize,
     <MC::H as MerkleHasherLifted>::Hash: CairoSerialize,
 {
@@ -75,16 +137,25 @@ where
     Ok(())
 }
 
-pub fn prove_cairo<B, MC: MerkleChannel>(
+pub fn prove_cairo<B, MC>(
     input: ProverInput,
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+    B: BackendForChannel<MC>
+        + FrameworkBackend
+        + FromSimdColumns
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + crate::witness::memory_witness_backend::MemoryIdToBigWitness
+        + crate::witness::blake_g_witness_backend::BlakeGWitness
+        + crate::witness::jit_prove_backend::OpcodeJitBackend
+        + crate::witness::blake_round_witness_backend::BlakeRoundWitness
+        + crate::witness::pedersen_witness_backend::PartialEcMulGenericWitness
+        + crate::witness::pedersen_witness_backend::PartialEcMulWindowBits18Witness
+        + crate::witness::pedersen_witness_backend::PedersenAggregatorWindowBits18Witness
         + 'static,
-    MC: 'static,
+    MC: MerkleChannel + 'static,
 {
     let _span = span!(Level::INFO, "prove_cairo").entered();
     let ProverParameters {
@@ -105,8 +176,11 @@ where
     let cairo_claim_generator = create_cairo_claim_generator(input, preprocessed_trace.clone());
     // Base trace.
     let span = span!(Level::INFO, "Write Base trace").entered();
-    let (trace_evals, claim, interaction_generator) =
-        cairo_claim_generator.write_trace::<B>(opt_n_id_to_big_components);
+    // Stage A″: on a warm process this is the twiddle tree the previous prove cached
+    // (None on the first prove or when the gate is off) — see `pipelined_commit_twiddles`.
+    let pipeline_twiddles = pipelined_commit_twiddles::<B>();
+    let (trace, claim, interaction_generator) =
+        cairo_claim_generator.write_trace::<B>(opt_n_id_to_big_components, pipeline_twiddles);
     span.exit();
 
     // The maximal log trace size (without blowup factor) is the maximum over preprocessed trace
@@ -135,27 +209,10 @@ where
         max_domain_log_size = lifting_log_size;
     }
     let span = span!(Level::INFO, "Precompute Twiddles").entered();
-    // Prove-cycle twiddle cache, EXPLICITLY keyed by (backend type, log size) —
-    // never by pointers or implicit scope. Cached trees are leaked (bounded by the
-    // number of distinct sizes per process) and shared read-only across proves.
-    let twiddles: &'static _ = {
-        use std::any::TypeId;
-        use std::collections::HashMap;
-        use std::sync::Mutex;
-        static CACHE: Mutex<Option<HashMap<(TypeId, u32), usize>>> = Mutex::new(None);
-        let key = (TypeId::of::<B>(), max_domain_log_size);
-        let mut guard = CACHE.lock().unwrap();
-        let map = guard.get_or_insert_with(HashMap::new);
-        let ptr = *map.entry(key).or_insert_with(|| {
-            let tree = B::precompute_twiddles(
-                CanonicCoset::new(max_domain_log_size).circle_domain().half_coset,
-            );
-            Box::leak(Box::new(tree)) as *const _ as usize
-        });
-        // Safety: the leaked tree is 'static, read-only after construction, and the
-        // key includes the backend type, so the cast type always matches.
-        unsafe { &*(ptr as *const stwo::prover::poly::twiddles::TwiddleTree<B>) }
-    };
+    // Shared process-wide twiddle cache (see `twiddle_cache`), keyed by (backend type,
+    // size). Building it here also makes it visible to the NEXT prove's Stage A″
+    // committer via `largest_cached`.
+    let twiddles: &'static _ = twiddle_cache::get_or_build::<B>(max_domain_log_size);
     span.exit();
 
     let span = span!(Level::INFO, "Compute preprocessed trace commitment").entered();
@@ -196,7 +253,13 @@ where
                 &base_column_pool,
             )
         };
-        if low_memory {
+        // Streamed-LDE mode also skips the cache: a cached tree is Borrowed, so its
+        // full-domain evaluations (+7.6GB measured on SN_PIE_2's Canonical set) stay
+        // resident for the whole prove; an Owned tree releases them at commit_tree.
+        // Cost: preprocessed tree rebuild per prove (~1.2s measured) — for VRAM-bound
+        // consumer cards that trade is mandatory, for 80GB cards leave streaming off.
+        let stream_lde = std::env::var("STWO_CAIRO_STREAM_LDE").as_deref() == Ok("1");
+        if low_memory || stream_lde {
             MaybeOwned::Owned(build())
         } else {
             let mut guard = CACHE.lock().unwrap();
@@ -211,18 +274,18 @@ where
     span.exit();
 
     prove_cairo_common::<B, MC>(
-        &twiddles,
+        twiddles,
         &base_column_pool,
         preprocessed_trace,
         preprocessed_tree,
-        trace_evals,
+        trace,
         claim,
         interaction_generator,
         prover_params,
     )
 }
 
-pub fn prove_cairo_with_precompute<'a, B, MC: MerkleChannel>(
+pub fn prove_cairo_with_precompute<'a, B, MC>(
     base_column_pool: &BaseColumnPool<B>,
     twiddles: &TwiddleTree<B>,
     preprocessed_trace: Arc<PreProcessedTrace>,
@@ -231,11 +294,20 @@ pub fn prove_cairo_with_precompute<'a, B, MC: MerkleChannel>(
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+    B: BackendForChannel<MC>
+        + FrameworkBackend
+        + FromSimdColumns
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + crate::witness::memory_witness_backend::MemoryIdToBigWitness
+        + crate::witness::blake_g_witness_backend::BlakeGWitness
+        + crate::witness::jit_prove_backend::OpcodeJitBackend
+        + crate::witness::blake_round_witness_backend::BlakeRoundWitness
+        + crate::witness::pedersen_witness_backend::PartialEcMulGenericWitness
+        + crate::witness::pedersen_witness_backend::PartialEcMulWindowBits18Witness
+        + crate::witness::pedersen_witness_backend::PedersenAggregatorWindowBits18Witness
         + 'static,
-    MC: 'static,
+    MC: MerkleChannel + 'static,
 {
     let _span = span!(Level::INFO, "prove_cairo").entered();
 
@@ -243,8 +315,11 @@ where
     let cairo_claim_generator = create_cairo_claim_generator(input, preprocessed_trace.clone());
     // Base trace.
     let span = span!(Level::INFO, "Write Base trace").entered();
-    let (trace_evals, claim, interaction_generator) =
-        cairo_claim_generator.write_trace::<B>(prover_params.opt_n_id_to_big_components);
+    // The caller-supplied `twiddles` here is not `'static`, so it can't back the
+    // Stage A″ committer thread; this precompute variant always uses the byte-identical
+    // `BaseTrace::Evals` path. (It also currently has no callers.)
+    let (trace, claim, interaction_generator) =
+        cairo_claim_generator.write_trace::<B>(prover_params.opt_n_id_to_big_components, None);
     span.exit();
 
     prove_cairo_common::<B, MC>(
@@ -252,29 +327,38 @@ where
         base_column_pool,
         preprocessed_trace,
         preprocessed_tree,
-        trace_evals,
+        trace,
         claim,
         interaction_generator,
         prover_params,
     )
 }
 
-fn prove_cairo_common<'a, B, MC: MerkleChannel>(
+fn prove_cairo_common<'a, B, MC>(
     twiddles: &TwiddleTree<B>,
     base_column_pool: &BaseColumnPool<B>,
     preprocessed_trace: Arc<PreProcessedTrace>,
     preprocessed_tree: MaybeOwned<'a, CommitmentTreeProver<B, MC>>,
-    trace_evals: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
+    trace: BaseTrace<B>,
     claim: CairoClaim,
-    interaction_generator: CairoInteractionClaimGenerator,
+    interaction_generator: CairoInteractionClaimGenerator<B>,
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
-    B: BackendForChannel<MC> + FrameworkBackend + FromSimdColumns
+    B: BackendForChannel<MC>
+        + FrameworkBackend
+        + FromSimdColumns
         + stwo_constraint_framework::LogupFinalizeBackend
         + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + crate::witness::memory_witness_backend::MemoryIdToBigWitness
+        + crate::witness::blake_g_witness_backend::BlakeGWitness
+        + crate::witness::jit_prove_backend::OpcodeJitBackend
+        + crate::witness::blake_round_witness_backend::BlakeRoundWitness
+        + crate::witness::pedersen_witness_backend::PartialEcMulGenericWitness
+        + crate::witness::pedersen_witness_backend::PartialEcMulWindowBits18Witness
+        + crate::witness::pedersen_witness_backend::PedersenAggregatorWindowBits18Witness
         + 'static,
-    MC: 'static,
+    MC: MerkleChannel + 'static,
 {
     let ProverParameters {
         channel_hash: _,
@@ -303,6 +387,13 @@ where
     if store_polynomials_coefficients {
         commitment_scheme.set_store_polynomials_coefficients();
     }
+    // Streamed-LDE mode (VRAM diet): evaluations released per tree at commit; all
+    // later phases run from coefficients. Requires store_polynomials_coefficients
+    // (asserted) and STWO_FORCE_EXTEND_EVAL_MODE=1 for composition — the harness's
+    // STWO_CAIRO_STREAM_LDE switch sets all three together.
+    if std::env::var("STWO_CAIRO_STREAM_LDE").as_deref() == Ok("1") {
+        commitment_scheme.set_stream_lde();
+    }
 
     // Add the preprocessed trace commitment that was computed earlier to the commitment scheme.
     commitment_scheme.commit_tree(preprocessed_tree, channel);
@@ -313,7 +404,26 @@ where
     let mut tree_builder = commitment_scheme.tree_builder();
     // The witness columns arrive already on B: each component's task converted
     // (uploaded, for GPU backends) as it finished, overlapped with generation.
-    tree_builder.extend_evals(trace_evals);
+    match trace {
+        // Default path: interpolate the raw columns now (byte-identical to pre-A″).
+        BaseTrace::Evals(evals) => {
+            tree_builder.extend_evals(evals);
+        }
+        // Stage A″: the opcode prefix was already interpolated on a committer thread
+        // (overlapping the host-heavy witness components). Byte-identity requires the
+        // committer to have used THIS exact commitment tree — verify by identity, and
+        // fail closed if the trace size changed mid-process (a stale cached tree would
+        // interpolate to different coefficients, silently forking the proof).
+        BaseTrace::Polys { polys, tree_ptr } => {
+            assert_eq!(
+                tree_ptr, twiddles as *const TwiddleTree<B> as usize,
+                "STWO_CUDA_PIPELINED_COMMIT: the committer's twiddle tree is not the \
+                 commitment tree (trace size changed mid-process). Disable the gate for \
+                 mixed-size workloads; it is safe for repeated same-configuration proves."
+            );
+            tree_builder.extend_polys(polys);
+        }
+    }
     tree_builder.commit(channel);
     span.exit();
 
@@ -325,7 +435,7 @@ where
     // Interaction trace.
     let span = span!(Level::INFO, "Write interaction trace").entered();
     let (interaction_trace_evals, interaction_claim) =
-        interaction_generator.write_interaction_trace::<B>(&interaction_elements);
+        interaction_generator.write_interaction_trace(&interaction_elements);
     span.exit();
 
     tracing::info!(
@@ -755,11 +865,9 @@ pub mod tests {
             verify_cairo::<Blake2sMerkleChannel>(cuda_proof.clone().into()).unwrap();
 
             // The decisive gate: byte-identical to the reference backend's proof.
-            let simd_proof = prove_cairo::<SimdBackend, Blake2sMerkleChannel>(
-                run_input(),
-                prover_params(),
-            )
-            .unwrap();
+            let simd_proof =
+                prove_cairo::<SimdBackend, Blake2sMerkleChannel>(run_input(), prover_params())
+                    .unwrap();
             let mut cuda_felts: Vec<starknet_ff::FieldElement> = Vec::new();
             CairoSerialize::serialize(&cuda_proof, &mut cuda_felts);
             let mut simd_felts: Vec<starknet_ff::FieldElement> = Vec::new();

@@ -7,10 +7,10 @@ use cairo_air::components::verify_bitwise_xor_12::{
 };
 use cairo_air::relations::VERIFY_BITWISE_XOR_12_RELATION_ID;
 use itertools::{chain, Itertools};
-
-use crate::witness::prelude::*;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
+
+use crate::witness::prelude::*;
 
 pub type InputType = [M31; 3];
 pub type PackedInputType = [PackedM31; 3];
@@ -45,6 +45,24 @@ impl ClaimGenerator {
         let lookup_data = LookupData { mults };
 
         (trace, Claim {}, InteractionClaimGenerator { lookup_data })
+    }
+}
+
+// witness-on-GPU W3: device xor multiplicity feed. xor_12 uses the EXPANDED
+// table, so the device count kernel replicates `add_input`'s closed-form
+// `column_index = (ah << EXPAND_BITS) + bh`, `row_index = (al << LIMB_BITS) + bl`
+// (no LUT). This merges the per-column count tables into the multiplicities.
+impl ClaimGenerator {
+    pub fn add_count_tables(&self, counts: &[u32]) {
+        let table_size = 1usize << LOG_SIZE;
+        assert_eq!(counts.len(), N_MULT_COLUMNS * table_size);
+        for (column_index, table) in counts.chunks_exact(table_size).enumerate() {
+            for (row, &count) in table.iter().enumerate() {
+                if count != 0 {
+                    self.mults[column_index].add_at(row as u32, count);
+                }
+            }
+        }
     }
 }
 
@@ -144,6 +162,8 @@ impl InteractionClaimGenerator {
             col_gen.finalize_col();
         }
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }

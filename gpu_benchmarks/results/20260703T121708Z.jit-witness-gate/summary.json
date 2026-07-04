@@ -1,0 +1,85 @@
+{
+  "run_id": "20260703T121708Z.jit-witness-gate",
+  "manifest": "jit-witness-gate",
+  "pod": {
+    "id": "kkogzcvy29ixbb",
+    "gpu": "H100 NVL",
+    "usd_hr": 2.59
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "d9db63fcfdf2",
+      "diff_sha256": "1f2823f4e5302278",
+      "dirty": true
+    },
+    "stwo-cairo": {
+      "rev": "cd4bf24d3899",
+      "diff_sha256": "22bc4270b170b9cc",
+      "dirty": true
+    }
+  },
+  "steps": [
+    {
+      "name": "prereqs",
+      "rc": 0,
+      "seconds": 1.8,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "selftest-emitted",
+      "rc": 0,
+      "seconds": 3.0,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-lane-off",
+      "rc": 0,
+      "seconds": 46.8,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [
+        "sn2_off.json"
+      ],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-lane-on",
+      "rc": 0,
+      "seconds": 48.1,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [
+        "sn2_on.json"
+      ],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-lane-on-reps",
+      "rc": 0,
+      "seconds": 64.1,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [
+        "sn2_on_reps.json"
+      ],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-span-delta",
+      "rc": 0,
+      "seconds": 31.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": true,
+  "wall_s": 225.0
+}

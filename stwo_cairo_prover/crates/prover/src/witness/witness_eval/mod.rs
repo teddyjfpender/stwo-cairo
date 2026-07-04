@@ -1,0 +1,205 @@
+//! `WitnessEval` — the abstraction the (transformer-generated) generic per-row
+//! base-trace witness bodies are written against, so that ONE generic body instantiates
+//! as multiple backends. This is the witness-side analogue of the constraint framework's
+//! `EvalAtRow` (which already has a SIMD impl and a JIT-recording impl); it is the
+//! keystone seam for witness-on-GPU (see `gpu_benchmarks/WITNESS_ON_GPU.md` §3 W3 and
+//! `ENDGAME_ARCHITECTURE.md` §2).
+//!
+//! # Why a trait
+//!
+//! Today the 57 `write_trace_simd` writers are monomorphic over `PackedM31` /
+//! `PackedUInt16` host SIMD code. That monomorphism is the blocker: the same per-row
+//! arithmetic cannot be re-targeted to a JIT recorder (→ CUDA) without a generic seam.
+//! `WitnessEval` is that seam. A per-row body written against it instantiates as:
+//!   * [`simd::SimdWitnessEval`] — a `#[inline(always)]` zero-cost passthrough to the exact
+//!     `PackedM31`/`PackedUInt16` ops + real column / lookup / sub-input writes. ZERO-COST PROOF
+//!     OBLIGATIONS: every method is an `#[inline(always)]` newtype passthrough; no state mutation
+//!     beyond what the original writer had. The arbiter is the per-pilot byte-equality `#[test]`
+//!     (original monomorphic writer vs transformed generic writer on the same adapted fixture
+//!     inputs — every output column, every `lookup_data` array, every multiplicity/sub-input table,
+//!     zero tolerance). Those tests are the PERMANENT regression fence for every future transformer
+//!     re-run after upstream regeneration.
+//!   * [`recording::RecordingWitnessEval`] — wraps
+//!     `stwo_backend_cuda::jit_witness::recording::WitnessRecorder`, emitting the per-row
+//!     scalar-SSA `WitnessProgram` bytecode "for free" (the same record→codegen recipe the
+//!     constraint JIT lane uses). This replaces the hand-authored programs in
+//!     `jit_witness::programs`, which can drift from the generated writers.
+//!   * (later) a CUDA lowering of that recording.
+//!
+//! # Value model — masks, not branches
+//!
+//! SimdBackend values are PACKED (16 lanes per value): a scalar Rust branch cannot
+//! represent per-lane divergence. The generated writers therefore contain NO
+//! data-dependent control flow in their per-row bodies (verified for the pilot cohort;
+//! the adapter pre-classifies rows into components) — all data-dependence is expressed
+//! as MASKED ARITHMETIC: `.eq()` produces a lane-mask which flows through `&` /
+//! `.as_m31()` into 0/1 field factors. The trait mirrors exactly that: comparisons
+//! return an opaque [`WitnessEval::Mask`] (never a host `bool`), and the lane-wise
+//! [`WitnessEval::select`] is the only conditional combinator. A writer containing a
+//! genuine Rust `if`/`match` on row data is NOT expressible against this trait and must
+//! be a loud transformer skip — never lowered to a scalar branch.
+//!
+//! The witness ISA (`stwo_backend_cuda::jit_witness::isa`) is a **per-row scalar u32
+//! SSA** machine; trait methods are 1:1 with `WitnessRecorder` builder methods for the
+//! ISA-core ops (the recording impl appends exactly one instruction per call, preserving
+//! the SSA / `semantic_hash` invariant). EXTENDED ops (`m31_inverse`, `m31_eq`,
+//! `mask_*`, `select`) are NOT in the 32-bit ISA today: the SIMD impl supports them
+//! (passthrough) and the recording impl POISONS their results (see `recording`) so the
+//! recordable prefix of every writer is captured losslessly and honestly. The poison
+//! census across writers is exactly the ISA-V2 backlog.
+//!
+//! # Memory ops — bound to the keystone (device-resident execution tables)
+//!
+//! The `mem_*` methods ARE the `deduce_output` vocabulary, mirroring the adapter /
+//! keystone semantics exactly (`stwo_cairo_adapter::memory::EncodedMemoryValueId::decode`
+//! and `stwo_backend_cuda`'s `exec_tables::DeviceExecutionTables`, hardware-proven):
+//!   * [`WitnessEval::mem_addr_to_id`]: dense-array read `address_to_raw_id[addr]` → encoded id.
+//!   * [`WitnessEval::mem_id_to_value`]: decode `tag = id >> 30`, `val = id & 0x3FFF_FFFF` — tag 0
+//!     → Small(val): 4 u32 words, split limbs 8..28 ZERO; tag 1 → F252(val): 8 u32 words; encoded
+//!     `0x3FFF_FFFF` (`DEFAULT_ID`) → Empty (host panics; never reached for valid traces). Words
+//!     split into 28 nine-bit limbs (`split_f252`).
+//!   * [`WitnessEval::mem_read`]: the composed op — 1:1 with
+//!     `DeviceExecutionTables::deduce_output_device(addresses) -> (ids, [u32;28])`. Default impl
+//!     chains the two fine-grained ops (what the generated writers call today; the composed form is
+//!     the device fast path).
+//!
+//! # Immediates
+//!
+//! `u16_shl`/`u16_shr`/`u16_and` take a `u32` immediate (shift amount / mask), matching
+//! the ISA (`U16Shl`/`U16Shr`/`U16And` carry `imm`, not a register). In the source
+//! writers these come from broadcast constants
+//! (`PackedUInt16::broadcast(UInt16::from(k))`); the transformer resolves the constant
+//! binding to the literal `k`.
+
+pub mod recording;
+pub mod simd;
+
+#[cfg(test)]
+mod differential_test;
+
+/// Input-field slot ordering for the opcode family (`PackedCasmState`).
+pub const SLOT_PC: u32 = 0;
+pub const SLOT_AP: u32 = 1;
+pub const SLOT_FP: u32 = 2;
+/// The per-row enabler value (1 for real rows, 0 for padding) is fed as an extra input
+/// slot in the recording lane.
+pub const SLOT_ENABLER: u32 = 3;
+
+/// Table ids for the memory ops, matching `jit_witness::programs`
+/// (`TABLE_ADDR_TO_ID` / `TABLE_ID_TO_BIG`). Behind `TABLE_ID_TO_BIG` the oracle/kernel
+/// implements the encoded-id dispatch documented on [`WitnessEval::mem_id_to_value`].
+pub const TABLE_ADDR_TO_ID: u32 = 0;
+pub const TABLE_ID_TO_BIG: u32 = 1;
+
+/// Number of 9-bit limbs a `memory_id_to_big` value decodes to (`FELT252_N_WORDS`).
+pub const FELT_N_LIMBS: usize = 28;
+
+/// The abstraction a generic per-row witness body is written against.
+///
+/// A body is a straight-line sequence of method calls on `&mut impl WitnessEval` — no
+/// data-dependent Rust control flow (see module docs: masks + `select`, never
+/// branches). All arithmetic is routed through methods (the witness ISA uses explicit
+/// builder calls, not operator overloading). Effects (`set_col` / `set_lookup_word` /
+/// `set_sub_input_word`) are addressed by *flat index*; the SIMD driver reconstructs
+/// the concrete typed `LookupData` / `SubComponentInputs` from those flat slots, and
+/// the recorder maps them to `col_write` / `lookup_word` / `mult_push`.
+pub trait WitnessEval {
+    /// Arithmetic-domain value (SIMD: `PackedM31`; recording: SSA register).
+    type M31: Copy;
+    /// 16-bit integer / bit-domain value (SIMD: `PackedUInt16`; recording: SSA register).
+    type U16: Copy;
+    /// Per-lane comparison mask (SIMD: `PackedBool` — 16 lanes; recording: poisoned —
+    /// no ISA support yet). NEVER a host `bool`: masks combine via `mask_*`/`select`,
+    /// they are not branch conditions.
+    type Mask: Copy;
+    /// felt252 value — a bundle of 28 M31 limbs. Bodies only construct/extract limbs
+    /// (no felt arithmetic), so this is pure bookkeeping (SIMD: `PackedFelt252`).
+    type Felt: Clone;
+
+    // ---- Leaves ----------------------------------------------------------------
+
+    /// Read packed input field `slot` for this row (`SLOT_PC`/`AP`/`FP`).
+    fn input(&mut self, slot: u32) -> Self::M31;
+    /// Materialize a canonical M31 constant.
+    fn m31_const(&mut self, value: u32) -> Self::M31;
+    /// The per-row enabler (1 real / 0 padding).
+    fn enabler(&mut self) -> Self::M31;
+
+    // ---- M31 field ops (ISA-core) ----------------------------------------------
+
+    fn m31_add(&mut self, a: Self::M31, b: Self::M31) -> Self::M31;
+    fn m31_sub(&mut self, a: Self::M31, b: Self::M31) -> Self::M31;
+    fn m31_mul(&mut self, a: Self::M31, b: Self::M31) -> Self::M31;
+
+    // ---- M31 field ops (EXTENDED — not in the 32-bit witness ISA; poisoned when
+    // ---- recording; each use is an ISA-V2 backlog datum) -------------------------
+
+    /// Multiplicative inverse (`FieldExpOps::inverse`).
+    fn m31_inverse(&mut self, a: Self::M31) -> Self::M31;
+    /// Lane-wise equality → mask (`PackedM31::eq`).
+    fn m31_eq(&mut self, a: Self::M31, b: Self::M31) -> Self::Mask;
+
+    // ---- Masks + lane-wise select (EXTENDED) -------------------------------------
+
+    /// Lane-wise AND of masks.
+    fn mask_and(&mut self, a: Self::Mask, b: Self::Mask) -> Self::Mask;
+    /// Mask → 0/1 M31 factor (`PackedBool::as_m31`).
+    fn mask_as_m31(&mut self, a: Self::Mask) -> Self::M31;
+    /// 0/1 M31 factor → mask (`PackedBool::from_m31`; used by `blake_compress_opcode`).
+    fn mask_from_m31(&mut self, a: Self::M31) -> Self::Mask;
+    /// Lane-wise conditional: per lane, `m ? a : b`. The ONLY conditional combinator —
+    /// transformed writers never branch on row data. (No pilot writer exercises it
+    /// today; the generated code expresses selection as masked arithmetic, which the
+    /// transformer preserves verbatim. `select` exists so future idioms have a lane-safe
+    /// target, never a scalar branch.)
+    fn select(&mut self, m: Self::Mask, a: Self::M31, b: Self::M31) -> Self::M31;
+
+    // ---- u16 integer / bit ops (ISA-core) --------------------------------------
+
+    fn u16_from_m31(&mut self, a: Self::M31) -> Self::U16;
+    fn u16_as_m31(&mut self, a: Self::U16) -> Self::M31;
+    fn u16_add(&mut self, a: Self::U16, b: Self::U16) -> Self::U16;
+    fn u16_shl(&mut self, a: Self::U16, imm: u32) -> Self::U16;
+    fn u16_shr(&mut self, a: Self::U16, imm: u32) -> Self::U16;
+    fn u16_and(&mut self, a: Self::U16, mask: u32) -> Self::U16;
+    /// Recording lane lowers this to `U32Xor` — bit-identical because both operands are
+    /// `< 2^16` (the ISA has no dedicated `U16Xor`).
+    fn u16_xor(&mut self, a: Self::U16, b: Self::U16) -> Self::U16;
+
+    // ---- Felt (bookkeeping) ----------------------------------------------------
+
+    fn felt_from_limbs(&mut self, limbs: [Self::M31; FELT_N_LIMBS]) -> Self::Felt;
+    fn felt_get_m31(&mut self, felt: &Self::Felt, i: usize) -> Self::M31;
+
+    // ---- Memory ops (the keystone binding — see module docs) --------------------
+
+    /// `memory_address_to_id.deduce_output(addr)` → encoded id.
+    /// Host: dense `address_to_raw_id[addr]` read. Device/recording:
+    /// `table_limb(TABLE_ADDR_TO_ID, addr, 0)` — the exec-tables addr→id column.
+    fn mem_addr_to_id(&mut self, addr: Self::M31) -> Self::M31;
+    /// `memory_id_to_big.deduce_output(id)` → felt (28 nine-bit limbs).
+    /// Host: `EncodedMemoryValueId(id).decode()` — tag `id >> 30`: 0 → Small (4 u32
+    /// words; split limbs 8..28 are ZERO), 1 → F252 (8 u32 words), `0x3FFF_FFFF` →
+    /// Empty (panic); then `split_f252`. Device/recording: `felt_get_m31(_, i)` on the
+    /// result is `table_limb(TABLE_ID_TO_BIG, id, i)`; the composed device kernel
+    /// (`DeviceExecutionTables`) implements the same dispatch in-kernel.
+    fn mem_id_to_value(&mut self, id: Self::M31) -> Self::Felt;
+    /// Composed read: `(id, value)` — 1:1 with the hardware-proven
+    /// `DeviceExecutionTables::deduce_output_device`. Default: chain the two ops.
+    fn mem_read(&mut self, addr: Self::M31) -> (Self::M31, Self::Felt) {
+        let id = self.mem_addr_to_id(addr);
+        let value = self.mem_id_to_value(id);
+        (id, value)
+    }
+
+    // ---- Effects (flat-indexed) ------------------------------------------------
+
+    /// Commit `value` to trace column `col`.
+    fn set_col(&mut self, col: usize, value: Self::M31);
+    /// Emit lookup-tuple word `word` (flat index across all `LookupData` fields in
+    /// declaration order).
+    fn set_lookup_word(&mut self, word: usize, value: Self::M31);
+    /// Emit sub-component-input word `word` (flat index across all `SubComponentInputs`
+    /// tuple/array scalars in declaration order).
+    fn set_sub_input_word(&mut self, word: usize, value: Self::M31);
+}

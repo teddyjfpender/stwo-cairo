@@ -2,10 +2,10 @@
 
 #![allow(unused_parens)]
 use cairo_air::components::range_check_11::{Claim, InteractionClaim, LOG_SIZE, N_TRACE_COLUMNS};
-
-use crate::witness::prelude::*;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
+
+use crate::witness::prelude::*;
 
 pub type InputType = [M31; 1];
 pub type PackedInputType = [PackedM31; 1];
@@ -124,6 +124,8 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }

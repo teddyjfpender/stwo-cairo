@@ -87,3 +87,15 @@ package = { "stwo-cairo-prover" = { opt-level = 1 }, "stwo" = { opt-level = 1 } 
 inherits = "dev"
 package = { "stwo-cairo-adapter" = { opt-level = 3 } }
 debug-assertions = false
+
+# LOCAL-ONLY: iterate against the local stwo checkout (branch perf-optimizations,
+# which carries the memory_witness device lane). Replace this whole section with a
+# rev bump of ALL stwo git deps (root Cargo.toml AND crates/prover/Cargo.toml
+# together) before pushing.
+[patch."https://github.com/teddyjfpender/stwo"]
+stwo = { path = "/Users/theodorepender/code/personal/stwo/crates/stwo" }
+stwo-backend-cuda = { path = "/Users/theodorepender/code/personal/stwo/crates/backend-cuda" }
+stwo-backend-cuda-kernels = { path = "/Users/theodorepender/code/personal/stwo/crates/backend-cuda-kernels" }
+stwo-constraint-framework = { path = "/Users/theodorepender/code/personal/stwo/crates/constraint-framework" }
+stwo-air-utils = { path = "/Users/theodorepender/code/personal/stwo/crates/air-utils" }
+stwo-air-utils-derive = { path = "/Users/theodorepender/code/personal/stwo/crates/air-utils-derive" }

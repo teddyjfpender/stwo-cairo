@@ -4,10 +4,10 @@
 use cairo_air::components::verify_bitwise_xor_9::{
     Claim, InteractionClaim, LOG_SIZE, N_TRACE_COLUMNS,
 };
-
-use crate::witness::prelude::*;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
+
+use crate::witness::prelude::*;
 
 pub type InputType = [M31; 3];
 pub type PackedInputType = [PackedM31; 3];
@@ -56,6 +56,38 @@ impl ClaimGenerator {
         let (trace, lookup_data) = write_trace_simd(&self.preprocessed_trace, mults);
 
         (trace, Claim {}, InteractionClaimGenerator { lookup_data })
+    }
+}
+
+// witness-on-GPU W3: device xor multiplicity feed (mirrors range_check_9_9).
+impl ClaimGenerator {
+    /// Dense `(a << 9) | b -> row` LUT (length `1 << 18`), the inversion of this
+    /// generator's `input_to_row` map. Consumed by the device count kernel.
+    pub fn input_to_row_lut(&self) -> Vec<u32> {
+        const LUT_SIZE: usize = 1 << 18;
+        assert_eq!(
+            self.input_to_row.len(),
+            LUT_SIZE,
+            "bitwise_xor_9 input_to_row map does not cover all 9-bit pairs"
+        );
+        let mut lut = vec![0u32; LUT_SIZE];
+        for ([a, b, _xor], &row) in &self.input_to_row {
+            lut[((a.0 as usize) << 9) | b.0 as usize] = row as u32;
+        }
+        lut
+    }
+
+    /// Merges relation-indexed device count tables into the multiplicity columns.
+    pub fn add_count_tables(&self, counts: &[u32]) {
+        let table_size = 1usize << LOG_SIZE;
+        assert_eq!(counts.len(), self.mults.len() * table_size);
+        for (relation_index, table) in counts.chunks_exact(table_size).enumerate() {
+            for (row, &count) in table.iter().enumerate() {
+                if count != 0 {
+                    self.mults[relation_index].add_at(row as u32, count);
+                }
+            }
+        }
     }
 }
 
@@ -154,6 +186,8 @@ impl InteractionClaimGenerator {
             });
         col_gen.finalize_col();
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }

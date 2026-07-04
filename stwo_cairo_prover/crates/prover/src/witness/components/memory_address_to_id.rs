@@ -11,6 +11,7 @@ use cairo_air::relations::{self, MEMORY_ADDRESS_TO_ID_RELATION_ID};
 use itertools::{izip, Itertools};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use stwo::core::fields::m31::{BaseField, M31};
+use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::backend::simd::m31::{PackedBaseField, PackedM31, LOG_N_LANES, N_LANES};
 use stwo::prover::backend::simd::qm31::PackedQM31;
@@ -20,12 +21,10 @@ use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo_cairo_adapter::memory::Memory;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{PreProcessedColumn, Seq};
-use stwo_constraint_framework::{LogupTraceGenerator, Relation};
+use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator, Relation};
 
 use crate::witness::prelude::AddInputs;
 use crate::witness::utils::AtomicMultiplicityColumn;
-use stwo_constraint_framework::{RawLogupTrace, RawLogupTraceGenerator};
-use stwo::core::fields::qm31::SecureField;
 
 pub type InputType = M31;
 pub type PackedInputType = PackedM31;
@@ -230,7 +229,9 @@ impl InteractionClaimGenerator {
             col_gen.finalize_col();
         }
 
-        (logup_gen.into_raw(), |claimed_sum| InteractionClaim { claimed_sum })
+        (logup_gen.into_raw(), |claimed_sum| InteractionClaim {
+            claimed_sum,
+        })
     }
 }
 

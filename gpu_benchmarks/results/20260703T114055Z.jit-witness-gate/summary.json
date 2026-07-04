@@ -1,0 +1,71 @@
+{
+  "run_id": "20260703T114055Z.jit-witness-gate",
+  "manifest": "jit-witness-gate",
+  "pod": {
+    "id": "kkogzcvy29ixbb",
+    "gpu": "H100 NVL",
+    "usd_hr": 2.59
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "d9db63fcfdf2",
+      "diff_sha256": "1f2823f4e5302278",
+      "dirty": true
+    },
+    "stwo-cairo": {
+      "rev": "cd4bf24d3899",
+      "diff_sha256": "be472989ae9e9c22",
+      "dirty": true
+    }
+  },
+  "steps": [
+    {
+      "name": "prereqs",
+      "rc": 0,
+      "seconds": 1.8,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "selftest-emitted",
+      "rc": 0,
+      "seconds": 3.3,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-lane-off",
+      "rc": 0,
+      "seconds": 217.8,
+      "passed": true,
+      "reasons": [
+        "GPU idle alarm during gpu_bound step"
+      ],
+      "artifacts": [
+        "sn2_off.json"
+      ],
+      "gpu_idle_alarm": true
+    },
+    {
+      "name": "sn2-lane-on",
+      "rc": 101,
+      "seconds": 31.4,
+      "passed": false,
+      "reasons": [
+        "rc=101",
+        "must_not_match hit: 'PREFIX_DIVERGED'",
+        "assert sn2_on.json:verify_ms: unreadable (Expecting value: line 1 column 1 (char 0))"
+      ],
+      "artifacts": [
+        "sn2_on.json"
+      ],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": false,
+  "wall_s": 273.8
+}

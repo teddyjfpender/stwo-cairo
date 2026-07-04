@@ -5,7 +5,11 @@ stwo runner (the source of the [stwo-book benchmark tables](https://zksecurity.g
 same Cairo programs and `program_input` hint, Cairo VM in proof mode, secure prover
 configuration (`pow_bits=26`, blowup 1, 70 FRI queries — ~96 bits), preprocessed trace
 `CanonicalWithoutPedersen`, proof size via bincode, cycle count = sum of opcode counts.
-Harness: `crates/prover/src/bin/gpu_bench.rs`.
+Harness: `crates/prover/src/bin/gpu_bench.rs`. As of round 8 the harness also has a
+bootloader PIE-ingestion lane (`--pie`, multi-PIE lists, `--pie-copies`, `--pie-mode
+aggregate|rotate`, `--pipeline`/`--producers`, `--reuse-input`, `--adapt-only`) that
+proves real Starknet OS PIEs and reports `useful_mhz` (PIE `n_steps` basis) alongside
+`mhz` (proved cycles, incl. bootloader overhead).
 
 **Hardware**: RunPod secure-cloud **H100 SXM 80 GB**, 208-vCPU host, CUDA 11.8.
 **Warm** times exclude the per-process NVRTC compile of the JIT constraint kernels
@@ -354,3 +358,88 @@ Gap analysis to 10 MHz (0.1 us/step):
 H100 vs 4090 at 1M: 3.86 vs 5.15 s — the bigger card helps the GPU phases and the
 better host helps the witness, but neither changes the plateau; only removing
 per-step work does.
+
+## Round 8: first CUDA proofs of real Starknet OS PIEs (the bootloader lane)
+
+The landmark: **the first CUDA proofs of real Starknet OS execution**, not fib. Four
+new SN PIEs (`cairo_pie` v1.1, bootloaded — NOT the old sepolia fixtures) run end to
+end through the new `gpu_bench` PIE lane (`--pie`, multi-PIE lists, `--pie-copies`,
+`--pie-mode aggregate|rotate`, `--pipeline`/`--producers`, `--reuse-input`,
+`--adapt-only`, self-describing 96-bit JSON records, a VRAM high-water sampler,
+`useful_mhz` vs `mhz`, `STWO_BENCH_TRACE=json` phase totals). Getting here took three
+pre-existing bug fixes that no fib-era run could surface — the pedersen `LazyLock`×rayon
+deadlock, the JIT fused-kernel NVRTC/ptxas blowup, and the batched-NTT grid-axis
+overflow (full postmortems in `KNOWN_ISSUES.md`). Correctness state, stated exactly:
+every completing run passes in-harness `verify_cairo`, and the CUDA proof byte-SIZE
+equals the SIMD-proven baseline's (3,006,636 B on SN_PIE_2; 2,897,542 B on the
+10-transfer fixture) — but the formal **CUDA-vs-SIMD proof byte-equality diff has not
+yet been run on the PIE lane** (it was the gate for rounds 1–7 workloads). It is the
+first item of the round-9 gate list, together with a repeated-prove check for the
+once-observed nondeterministic rep hang.
+
+The programs (PIE `n_steps`):
+
+| PIE | n_steps | status on A40 46 GB |
+|---|---|---|
+| SN_PIE_2 | 7,706,864 | **proves** — warm/sustained numbers below |
+| SN_PIE_1 | 14,645,112 | OOM (>46 GB, quotient/FRI peak) |
+| SN_PIE_3 | 14,075,019 | OOM (>46 GB) |
+| SN_PIE_4 | 14,058,247 | OOM (>46 GB) |
+
+**SN_PIE_2 on an A40 46 GB** (RunPod secure, $0.44/hr, ~7 effective vCPU): warm
+**31.6–33.9 s**, `useful_mhz` **0.227–0.244** (`mhz` 0.235–0.252 incl. the measured
+**3.51 % bootloader overhead**), verify 22–30 ms, proof **3,006.6 KB**, `vram_peak`
+**36.1–36.4 GB**, host RSS ~29 GB. Cost-model warm split (`sn2_cuda_jit` rep 1,
+`prove_cairo` 36.09 s):
+
+| phase | time | share | note |
+|---|---|---|---|
+| Write Base trace + Write interaction | 17.25 + 6.72 = 23.97 s | **66 %** | host witness write — W3's target |
+| Commitments (NTT + Merkle) | 10.43 s | **29 %** | fusion + bandwidth headroom |
+| Prove STARKs core | 3.14 s | **8.7 %** | Composition 0.61 s (split JIT kernels), OODS 0.73 s |
+
+**The cost model re-ranks the programs for real Cairo, exactly opposite the fib
+plateau of round 7**: on a builtin-heavy PIE the host witness write dominates (66 %,
+not ~40 %), commits are second (29 %), and the STARK core is already cheap (8.7 % — the
+JIT kernel-splitting fix works). W3 witness-on-GPU is the single dominant lever here.
+
+**Sustained throughput** (pipeline 2, 3 producers, 6 reps, `--pie-mode rotate`):
+`sustained_useful_mhz` **0.228**, `feed_starved_s` **0.0** (producers kept the GPU fed),
+total 202.8 s — i.e. the warm single-prove rate holds under a continuous feed, no
+pipeline stall.
+
+**Cold start is the story to fix next.** Cold rep 0 was **1,796 s**: the JIT lane
+codegen'd **116 per-component kernels**, of which **66 hit the disk PTX cache** (1–3 ms
+each) and **7 recompiled via NVRTC** — but one module's driver **PTX→SASS load alone was
+56.4 s**. PTX is cached; SASS is not, so a cold process pays the driver's per-kernel
+assembly. Diagnosis: cubin (SASS) caching is queued; warm reuse is already there.
+
+**The 14M-step PIEs are now a memory problem, not a launch-geometry one.** After the
+NTT grid-axis fix, sn1/sn3/sn4 no longer error at `rfft.cu:667` (the old grid overflow);
+they progress until the allocator pool is exhausted and fail as genuine OOM (`sn3`:
+`cudaErrorMemoryAllocation`; `sn1`/`sn4`: pool-exhaustion → invalid downstream memcpy),
+including with `STWO_CAIRO_LOW_MEMORY=1` — the quotient/FRI peak is not covered by that
+mode (same shape as round 2's fib-4M-on-24 GB note). They are gated on the VRAM diet or
+≥80 GB cards.
+
+Honest caveats:
+- A40 numbers ran with **`STWO_CUDA_DISABLE_STREAMS=1`** (P3 overlap was off during the
+  JIT-hang bisect) — the stream-overlap upside is still pending, so these are a floor.
+- The **~7-core container inflates the host-write share**: the 66 % is partly a
+  thin-host artifact, not purely algorithmic. Only same-pod comparisons are meaningful.
+- The same-pod A40 SIMD baseline is incomplete (7-vCPU host, one rep 77 s before the
+  multi-rep run was killed) — CUDA clearly wins there, but it is not a fair CPU. A 3090
+  pod's 20-vCPU SIMD did SN_PIE_2 in 28.3 s / 0.273 `useful_mhz` / 49 GB RSS (a
+  different host — do not cross-rank), and the 14M PIEs OOM'd that CPU above 125 GB RAM.
+  The 3090 CUDA lane proves a 10-transfer PIE warm in 6.1 s post-JIT-fix, but every SN
+  PIE exceeds its 24 GB (peaked 24.99 GB on even the small PIE with Canonical
+  preprocessed).
+- NitrooZK's published PIE numbers use `n_queries=3`; ours are the 96-bit
+  `n_queries=70` config. Never compare the raw figures.
+
+**Verdict.** First real-workload CUDA proofs land, correctness-gated, and the cost
+model gives a clean fleet math: per-GPU `useful_mhz` **0.23 today → ~1.1** with W3 +
+P2 stream overlap on A40-class → **~2–2.5** on 4090/5090 after the VRAM diet. An
+aggregate 10–20 MHz is then 5–8 consumer cards at ~$0.15–0.35/MHz-hr versus ~$0.7 on
+H100. The per-component `wt:*` instrumentation shipped this round is the measured next
+step; W3 witness-on-GPU (builtin-first) is the dominant lever the trace now names.

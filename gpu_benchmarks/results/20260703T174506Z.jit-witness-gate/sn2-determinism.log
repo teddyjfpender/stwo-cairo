@@ -1,0 +1,12 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export TENT=/workspace/stwo-cairo/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip; export OUT=/workspace/out; $GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 1 --reuse-input > /dev/null 2> /dev/null || true
+STWO_DUMP_PROOF=$OUT/det_a.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 1 --reuse-input > /dev/null 2>&1
+STWO_DUMP_PROOF=$OUT/det_b.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 1 --reuse-input > /dev/null 2>&1
+a=$(sha256sum $OUT/det_a.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/det_b.proof | cut -d' ' -f1)
+echo "det_a=$a"; echo "det_b=$b"
+if [ "$a" = "$b" ]; then echo DETERMINISTIC; else echo NONDETERMINISTIC; fi
+--8<-- output --8<--
+det_a=99bf0cd0863658742ada152caee238d888f5c901dc7e4df66f2748d49cea98da
+det_b=99bf0cd0863658742ada152caee238d888f5c901dc7e4df66f2748d49cea98da
+DETERMINISTIC
