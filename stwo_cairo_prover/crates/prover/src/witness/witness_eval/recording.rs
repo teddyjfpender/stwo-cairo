@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use stwo_backend_cuda::jit_witness::isa::WitnessProgram;
+use stwo_backend_cuda::jit_witness::isa::{DeduceKind, WitnessProgram};
 use stwo_backend_cuda::jit_witness::recording::{Val, WitnessRecorder};
 
 use crate::witness::witness_eval::{
@@ -121,6 +121,37 @@ impl RecordingWitnessEval {
         }
     }
 
+    /// Flatten a felt handle to 28 limb registers for a deduce argument: `Limbs` uses
+    /// the handles directly; `Deduced` materializes each limb as a `TableLimb` read
+    /// (the same op `felt_get_m31` emits). `None` if any limb is poisoned.
+    fn felt_arg_limbs(&mut self, f: &RecFelt) -> Option<Vec<Val>> {
+        match f {
+            RecFelt::Deduced { key } => Some(
+                (0..FELT_N_LIMBS)
+                    .map(|i| self.recorder.table_limb(TABLE_ID_TO_BIG, *key, i as u32))
+                    .collect(),
+            ),
+            RecFelt::Limbs(v) => v
+                .iter()
+                .map(|r| match r {
+                    RecVal::Ok(x) => Some(*x),
+                    RecVal::Poison => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Unwrap plain deduce args; `None` on any poison (the caller falls back to the
+    /// poisoned result, keeping poison-propagation semantics).
+    fn plain_args(args: &[RecVal]) -> Option<Vec<Val>> {
+        args.iter()
+            .map(|r| match r {
+                RecVal::Ok(x) => Some(*x),
+                RecVal::Poison => None,
+            })
+            .collect()
+    }
+
     /// Poison-propagating binary ISA-core op.
     #[inline]
     fn bin(
@@ -201,41 +232,84 @@ impl WitnessEval for RecordingWitnessEval {
 
     fn deduce_partial_ec_mul_w18(
         &mut self,
-        _chain: RecVal,
-        _round: RecVal,
-        _windows: [RecVal; 14],
-        _acc: [RecFelt; 2],
+        chain: RecVal,
+        round: RecVal,
+        windows: [RecVal; 14],
+        acc: [RecFelt; 2],
     ) -> (RecVal, RecVal, ([RecVal; 14], [RecFelt; 2])) {
-        let p = self.poison("deduce_partial_ec_mul_w18");
+        let args = (|| {
+            let mut args = Self::plain_args(&[chain, round])?;
+            args.extend(Self::plain_args(&windows)?);
+            args.extend(self.felt_arg_limbs(&acc[0])?);
+            args.extend(self.felt_arg_limbs(&acc[1])?);
+            Some(args)
+        })();
+        let Some(args) = args else {
+            let p = self.poison("deduce_partial_ec_mul_w18");
+            return (
+                p,
+                p,
+                (
+                    [p; 14],
+                    [
+                        RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
+                        RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
+                    ],
+                ),
+            );
+        };
+        let outs = self.recorder.deduce(DeduceKind::PartialEcMulW18, &args);
+        let ok = |i: usize| RecVal::Ok(outs[i]);
         (
-            p,
-            p,
+            ok(0),
+            ok(1),
             (
-                [p; 14],
+                std::array::from_fn(|i| ok(2 + i)),
                 [
-                    RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
-                    RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
+                    RecFelt::Limbs((0..FELT_N_LIMBS).map(|i| ok(16 + i)).collect()),
+                    RecFelt::Limbs((0..FELT_N_LIMBS).map(|i| ok(44 + i)).collect()),
                 ],
             ),
         )
     }
 
-    fn deduce_pedersen_points_table_w18(&mut self, _index: RecVal) -> [RecFelt; 2] {
-        let p = self.poison("deduce_pedersen_points_table_w18");
+    fn deduce_pedersen_points_table_w18(&mut self, index: RecVal) -> [RecFelt; 2] {
+        let RecVal::Ok(idx) = index else {
+            let p = self.poison("deduce_pedersen_points_table_w18");
+            return [
+                RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
+                RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
+            ];
+        };
+        let outs = self
+            .recorder
+            .deduce(DeduceKind::PedersenPointsTableW18, &[idx]);
         [
-            RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
-            RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
+            RecFelt::Limbs((0..FELT_N_LIMBS).map(|i| RecVal::Ok(outs[i])).collect()),
+            RecFelt::Limbs(
+                (0..FELT_N_LIMBS)
+                    .map(|i| RecVal::Ok(outs[FELT_N_LIMBS + i]))
+                    .collect(),
+            ),
         ]
     }
 
-    fn deduce_blake_g(&mut self, _input: [RecVal; 6]) -> [RecVal; 4] {
-        let p = self.poison("deduce_blake_g");
-        [p; 4]
+    fn deduce_blake_g(&mut self, input: [RecVal; 6]) -> [RecVal; 4] {
+        let Some(args) = Self::plain_args(&input) else {
+            let p = self.poison("deduce_blake_g");
+            return [p; 4];
+        };
+        let outs = self.recorder.deduce(DeduceKind::BlakeG, &args);
+        std::array::from_fn(|i| RecVal::Ok(outs[i]))
     }
 
-    fn deduce_blake_round_sigma(&mut self, _round: RecVal) -> [RecVal; 16] {
-        let p = self.poison("deduce_blake_round_sigma");
-        [p; 16]
+    fn deduce_blake_round_sigma(&mut self, round: RecVal) -> [RecVal; 16] {
+        let RecVal::Ok(r) = round else {
+            let p = self.poison("deduce_blake_round_sigma");
+            return [p; 16];
+        };
+        let outs = self.recorder.deduce(DeduceKind::BlakeRoundSigma, &[r]);
+        std::array::from_fn(|i| RecVal::Ok(outs[i]))
     }
 
     // ---- M31 field ops (ISA-core) ----------------------------------------------

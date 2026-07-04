@@ -926,43 +926,29 @@ full_component_gates!(
 
 // ------------------------ pedersen_aggregator_window_bits_18 ------------------------
 
-/// The BUILTIN-lane pinned poison manifest (D', G5): recording the aggregator's
-/// generic body must poison EXACTLY at its 28 `deduce_partial_ec_mul_w18` calls —
-/// nothing else. A new poison op (or a vanished one) is a conscious-update failure,
-/// never a silent drift. The counts of poisoned effects are pinned too: they are the
-/// device backlog the deduce op family must clear (DEDUCE_DESIGN.md).
+/// The BUILTIN-lane recording manifest (ISA-V3): the aggregator's generic body now
+/// records COMPLETELY — zero poisons; its 28 EC deduces are real `DeduceCall(kind=2)`
+/// instructions the kernel lowers to the fp256 device function. Any poison
+/// reappearing is a regression; a change in the deduce count is unreviewed drift.
 #[test]
 fn pedersen_aggregator_recording_poison_manifest() {
+    use stwo_backend_cuda::jit_witness::isa::{DeduceKind, WitnessOp};
+
     use crate::witness::components::pedersen_aggregator_window_bits_18 as agg;
     let rec = agg::record_pedersen_aggregator_window_bits_18();
-    assert_eq!(
-        rec.poison_ops,
-        std::collections::BTreeMap::from([("deduce_partial_ec_mul_w18", 28usize)]),
-        "poison manifest changed: {:?}",
-        rec.poison_ops
-    );
-    // Pinned effect poison counts (deduce-output cascades). Update CONSCIOUSLY, with
-    // the device deduce design in view.
-    assert_eq!(
-        (
-            rec.poisoned_cols.len(),
-            rec.poisoned_lookup_words.len(),
-            rec.poisoned_sub_words.len(),
-        ),
-        (POISONED_COLS, POISONED_LOOKUPS, POISONED_SUBS),
-        "cols={:?} lookups={:?} subs={:?}",
-        rec.poisoned_cols,
-        rec.poisoned_lookup_words,
-        rec.poisoned_sub_words
-    );
+    assert!(rec.poison_ops.is_empty(), "poisons: {:?}", rec.poison_ops);
+    assert!(rec.poisoned_cols.is_empty() && rec.poisoned_lookup_words.is_empty());
+    assert!(rec.poisoned_sub_words.is_empty());
+    let deduces = rec
+        .program
+        .insts
+        .iter()
+        .filter(|i| {
+            i.op == WitnessOp::DeduceCall as u8 && i.imm == DeduceKind::PartialEcMulW18 as u32
+        })
+        .count();
+    assert_eq!(deduces, 28, "EC deduce count drifted");
 }
-// Pinned 2026-07-05 (discover run): the aggregator's 206 cols / 396 lookup words /
-// 2023 sub words poison ONLY downstream of the 28 EC deduces — 140 cols (65..=204),
-// 224 lookup words, 1876 sub words. The device deduce op (DEDUCE_DESIGN.md) unlocks
-// exactly these; any OTHER change to these numbers is an unreviewed semantic drift.
-const POISONED_COLS: usize = 140;
-const POISONED_LOOKUPS: usize = 224;
-const POISONED_SUBS: usize = 1876;
 
 /// Gate (a) for the BUILTIN pilot `pedersen_aggregator_window_bits_18`: the generic
 /// body on `SimdWitnessEval` (flat input words + iota + mults columns + felt
@@ -1212,19 +1198,315 @@ fn blake_round_generic_simd_byte_identical() {
     ));
 }
 
-/// The blake_round pinned poison manifest: poisons ONLY at its 8 `deduce_blake_g`
-/// and 1 `deduce_blake_round_sigma` calls.
+/// The blake_round recording manifest (ISA-V3): fully recorded — zero poisons; 8
+/// `DeduceCall(BlakeG)` + 1 `DeduceCall(BlakeRoundSigma)` instructions.
 #[test]
 fn blake_round_recording_poison_manifest() {
+    use stwo_backend_cuda::jit_witness::isa::{DeduceKind, WitnessOp};
+
     use crate::witness::components::blake_round as m;
     let rec = m::record_blake_round();
-    assert_eq!(
-        rec.poison_ops,
-        std::collections::BTreeMap::from([
-            ("deduce_blake_g", 8usize),
-            ("deduce_blake_round_sigma", 1usize),
-        ]),
-        "poison manifest changed: {:?}",
-        rec.poison_ops
+    assert!(rec.poison_ops.is_empty(), "poisons: {:?}", rec.poison_ops);
+    let count = |k: DeduceKind| {
+        rec.program
+            .insts
+            .iter()
+            .filter(|i| i.op == WitnessOp::DeduceCall as u8 && i.imm == k as u32)
+            .count()
+    };
+    assert_eq!(count(DeduceKind::BlakeG), 8);
+    assert_eq!(count(DeduceKind::BlakeRoundSigma), 1);
+}
+
+// ---------------- ISA-V3: builtin recordings through the interpreter ----------------
+
+/// The shared `DeduceHost`: kinds delegate to the REAL host `fast_deduction`
+/// functions (broadcast one scalar row through the packed API, read lane 0) — the
+/// reference is the host's own implementation, never a duplicate.
+struct FastDeductionHost;
+impl stwo_backend_cuda::jit_witness::interp::DeduceHost for FastDeductionHost {
+    fn deduce(&mut self, kind: u32, args: &[u32]) -> Vec<u32> {
+        use stwo_cairo_common::prover_types::cpu::UInt32;
+        use stwo_cairo_common::prover_types::simd::{PackedFelt252, PackedUInt32};
+
+        use crate::witness::fast_deduction::blake::{PackedBlakeG, PackedBlakeRoundSigma};
+        use crate::witness::fast_deduction::pedersen::PackedPartialEcMulWindowBits18;
+        let m31 = |v: u32| PackedM31::broadcast(M31(v));
+        let felt =
+            |limbs: &[u32]| PackedFelt252::from_limbs(std::array::from_fn(|i| m31(limbs[i])));
+        match kind {
+            0 => {
+                let words: [PackedUInt32; 6] =
+                    std::array::from_fn(|i| PackedUInt32::broadcast(UInt32::from(args[i])));
+                PackedBlakeG::deduce_output(words)
+                    .iter()
+                    .map(|w| w.simd.as_array()[0])
+                    .collect()
+            }
+            1 => PackedBlakeRoundSigma::deduce_output(m31(args[0]))
+                .iter()
+                .map(|v| v.to_array()[0].0)
+                .collect(),
+            2 => {
+                let windows: [PackedM31; 14] = std::array::from_fn(|i| m31(args[2 + i]));
+                let acc = [felt(&args[16..44]), felt(&args[44..72])];
+                let (chain, round, (wins, accs)) = PackedPartialEcMulWindowBits18::deduce_output((
+                    m31(args[0]),
+                    m31(args[1]),
+                    (windows, acc),
+                ));
+                let mut out = vec![chain.to_array()[0].0, round.to_array()[0].0];
+                out.extend(wins.iter().map(|w| w.to_array()[0].0));
+                for f in &accs {
+                    out.extend((0..28).map(|i| f.get_m31(i).to_array()[0].0));
+                }
+                out
+            }
+            k => panic!("unexpected deduce kind {k}"),
+        }
+    }
+}
+
+/// GATE (b) for `blake_round` (ISA-V3): the RECORDED PROGRAM — the exact bytecode the
+/// CUDA kernel will replay — interpreted with the fast_deduction reference host is
+/// byte-identical to the host writer on every committed column, lookup word and sub
+/// word, over all padded rows. This is the strongest pre-hardware validation the
+/// witness lane has.
+#[test]
+fn blake_round_recording_interpreter_matches_host() {
+    use stwo_backend_cuda::jit_witness::interp::interpret_row_with;
+    use stwo_cairo_common::prover_types::cpu::UInt32;
+
+    use crate::witness::components::blake_round as m;
+    let cg = fill_fixture(&[
+        "blake_round",
+        "blake_round_sigma",
+        "blake_g",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "range_check_7_2_5",
+    ]);
+    let sigma = cg.blake_round_sigma.expect("sigma");
+    let mem_addr = cg.memory_address_to_id.expect("mem addr");
+    let mem_big = cg.memory_id_to_big.expect("mem big");
+    let rc725 = cg.range_check_7_2_5.expect("rc725");
+    let blake_g = cg.blake_g.expect("blake_g");
+
+    let inputs: Vec<m::InputType> = (0..24u32)
+        .map(|i| {
+            let words: [UInt32; 16] =
+                std::array::from_fn(|j| UInt32::from(0x9E37_79B9u32.wrapping_mul(j as u32 + i)));
+            (M31(i + 1), M31(i % 10), (words, M31(1 + (i % 4))))
+        })
+        .collect();
+    let n_rows = inputs.len();
+    let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+    let mut padded = inputs;
+    padded.resize(size, *padded.first().unwrap());
+    let packed = pack_values(&padded);
+    let diff = m::generic_simd_diff(
+        packed, n_rows, &sigma, &mem_addr, &mem_big, &rc725, &blake_g,
     );
+
+    let out = m::record_blake_round();
+    assert!(out.poison_ops.is_empty(), "poisons: {:?}", out.poison_ops);
+
+    let oracle = |table: u32, key: u32, limb: u32| -> u32 {
+        match table {
+            TABLE_ADDR_TO_ID => {
+                mem_addr
+                    .deduce_output(PackedM31::broadcast(M31::from(key)))
+                    .to_array()[0]
+                    .0
+            }
+            TABLE_ID_TO_BIG => {
+                mem_big
+                    .deduce_output(PackedM31::broadcast(M31::from(key)))
+                    .get_m31(limb as usize)
+                    .to_array()[0]
+                    .0
+            }
+            t => panic!("unexpected table id {t}"),
+        }
+    };
+
+    let n_packed_rows = 1usize << (diff.log_size - LOG_N_LANES);
+    for r in 0..(1usize << diff.log_size) {
+        // Slot layout: flat input words 0..19 (m31, m31, 16 raw u32 words, m31),
+        // enabler 19, iota 20.
+        let src = &padded[r];
+        let mut row_inputs: Vec<u32> = vec![src.0 .0, src.1 .0];
+        row_inputs.extend(src.2 .0.iter().map(|w| w.value));
+        row_inputs.push(src.2 .1 .0);
+        row_inputs.push(u32::from(r < n_rows)); // enabler
+        row_inputs.push(r as u32); // iota (unused by this body)
+        let ro = interpret_row_with(&out.program, &row_inputs, &oracle, &mut FastDeductionHost);
+
+        for (c, hv) in diff.orig_rows[r].iter().enumerate() {
+            assert_eq!(ro.columns[c], hv.0, "row {r} column {c}");
+        }
+        let (pr, lane) = (r / N_LANES, r % N_LANES);
+        let mut w = 0usize;
+        for field in diff.orig_lookup.iter() {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                let hv = field[pr * width + k].to_array()[lane].0;
+                assert_eq!(ro.lookup_words[w], hv, "row {r} lookup word {w} (+{k})");
+                w += 1;
+            }
+        }
+        let mut w = 0usize;
+        for field in diff.orig_sub.iter() {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                let hv = field[pr * width + k].as_array()[lane];
+                assert_eq!(ro.sub_words[w], hv, "row {r} sub word {w} (+{k})");
+                w += 1;
+            }
+        }
+    }
+}
+
+/// GATE (b) for `pedersen_aggregator_window_bits_18` (ISA-V3): the recorded program —
+/// 28 real EC-round `DeduceCall`s included — interpreted with the fast_deduction
+/// reference host is byte-identical to the host writer everywhere.
+#[test]
+fn pedersen_aggregator_recording_interpreter_matches_host() {
+    use cairo_vm::types::layout_name::LayoutName;
+    use stwo_backend_cuda::jit_witness::interp::interpret_row_with;
+    use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
+    use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
+
+    use crate::witness::components::pedersen_aggregator_window_bits_18 as agg;
+
+    let compiled = get_compiled_cairo_program_path("test_prove_verify_pedersen_builtin");
+    let input = run_and_adapt(
+        &compiled,
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .expect("run_and_adapt pedersen fixture");
+    let ProverInput {
+        state_transitions,
+        memory,
+        builtin_segments,
+        ..
+    } = input;
+    let mut cg = CairoClaimGenerator::default();
+    let mut set: IndexSet<&str> = IndexSet::new();
+    for c in [
+        "pedersen_aggregator_window_bits_18",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "range_check_8",
+        "partial_ec_mul_window_bits_18",
+        "pedersen_builtin",
+    ] {
+        set.insert(c);
+    }
+    let preprocessed_trace = Arc::new(PreProcessedTrace::canonical_without_pedersen());
+    cg.fill_components(
+        &set,
+        state_transitions.casm_states_by_opcode,
+        &builtin_segments,
+        Arc::new(memory),
+        preprocessed_trace,
+    );
+    {
+        let pb = cg
+            .pedersen_builtin
+            .take()
+            .expect("pedersen_builtin populated");
+        let mem_addr = cg.memory_address_to_id.as_ref().expect("mem addr");
+        let agg_state = cg
+            .pedersen_aggregator_window_bits_18
+            .as_ref()
+            .expect("aggregator state");
+        let _ = pb.write_trace(mem_addr, agg_state);
+    }
+    let gen = cg
+        .pedersen_aggregator_window_bits_18
+        .expect("aggregator populated");
+    let mem_addr = cg.memory_address_to_id.expect("mem addr");
+    let mem_big = cg.memory_id_to_big.expect("mem big");
+    let rc8 = cg.range_check_8.expect("range_check_8");
+    let w18 = cg.partial_ec_mul_window_bits_18.expect("w18");
+
+    let mut inputs_mults = gen
+        .mults
+        .iter()
+        .map(|entry| (*entry.key(), M31(entry.value().load(Ordering::Relaxed))))
+        .collect::<Vec<_>>();
+    inputs_mults.sort_by_key(|(input, _)| input.0);
+    let (mut inputs, mut mults) = inputs_mults.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+    let n_rows = inputs.len();
+    assert_ne!(n_rows, 0);
+    let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+    inputs.resize(size, *inputs.first().unwrap());
+    mults.resize(size, M31::zero());
+    let packed_inputs = pack_values(&inputs);
+    let packed_mults = pack_values(&mults);
+    let diff = agg::generic_simd_diff(packed_inputs, vec![packed_mults], &mem_big, &rc8, &w18);
+
+    let out = agg::record_pedersen_aggregator_window_bits_18();
+    assert!(out.poison_ops.is_empty(), "poisons: {:?}", out.poison_ops);
+
+    let oracle = |table: u32, key: u32, limb: u32| -> u32 {
+        match table {
+            TABLE_ADDR_TO_ID => {
+                mem_addr
+                    .deduce_output(PackedM31::broadcast(M31::from(key)))
+                    .to_array()[0]
+                    .0
+            }
+            TABLE_ID_TO_BIG => {
+                mem_big
+                    .deduce_output(PackedM31::broadcast(M31::from(key)))
+                    .get_m31(limb as usize)
+                    .to_array()[0]
+                    .0
+            }
+            t => panic!("unexpected table id {t}"),
+        }
+    };
+
+    let n_packed_rows = 1usize << (diff.log_size - LOG_N_LANES);
+    for r in 0..(1usize << diff.log_size) {
+        // Slot layout: inputs 0..3 (in.0[0], in.0[1], in.1), enabler 3, iota 4,
+        // mults[0] 5.
+        let src = &inputs[r];
+        let row_inputs: Vec<u32> = vec![
+            src.0[0].0,
+            src.0[1].0,
+            src.1 .0,
+            u32::from(r < n_rows),
+            r as u32,
+            mults[r].0,
+        ];
+        let ro = interpret_row_with(&out.program, &row_inputs, &oracle, &mut FastDeductionHost);
+
+        for (c, hv) in diff.orig_rows[r].iter().enumerate() {
+            assert_eq!(ro.columns[c], hv.0, "row {r} column {c}");
+        }
+        let (pr, lane) = (r / N_LANES, r % N_LANES);
+        let mut w = 0usize;
+        for field in diff.orig_lookup.iter() {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                let hv = field[pr * width + k].to_array()[lane].0;
+                assert_eq!(ro.lookup_words[w], hv, "row {r} lookup word {w} (+{k})");
+                w += 1;
+            }
+        }
+        let mut w = 0usize;
+        for field in diff.orig_sub.iter() {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                let hv = field[pr * width + k].as_array()[lane];
+                assert_eq!(ro.sub_words[w], hv, "row {r} sub word {w} (+{k})");
+                w += 1;
+            }
+        }
+    }
 }
