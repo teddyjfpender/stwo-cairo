@@ -18,8 +18,8 @@
 //!   * module-private `fn write_trace_generic_simd(...)` — same signature as the writer.
 //!   * `impl ClaimGenerator { pub(crate) fn write_trace_generic(...) }`.
 //!   * `pub(crate) fn record_<comp>() -> RecordingOutput`.
-//!   * `#[cfg(test)]` private `lookup_data_flat` / `sub_inputs_flat` +
-//!     `pub(crate) struct GenericSimdDiff` + `pub(crate) fn generic_simd_diff(...)`.
+//!   * `#[cfg(test)]` private `lookup_data_flat` / `sub_inputs_flat` + `pub(crate) struct
+//!     GenericSimdDiff` + `pub(crate) fn generic_simd_diff(...)`.
 //!
 //! Flat-word layouts are DECLARATION ORDER (LookupData field order × widths;
 //! SubComponentInputs field order × array lengths × per-field scalar shape).
@@ -40,9 +40,9 @@ use std::process::ExitCode;
 use proc_macro2::{Literal, Span, TokenStream};
 use quote::quote;
 use syn::{
-    BinOp, Expr, ExprArray, ExprAssign, ExprBinary, ExprCall, ExprField, ExprIndex,
-    ExprMethodCall, ExprParen, ExprPath, ExprTuple, ExprUnary, Fields, FnArg, Ident, Item,
-    ItemFn, Lit, Local, Member, Pat, Stmt, Type, UnOp,
+    BinOp, Expr, ExprArray, ExprAssign, ExprBinary, ExprCall, ExprField, ExprIndex, ExprMethodCall,
+    ExprParen, ExprPath, ExprTuple, ExprUnary, Fields, FnArg, Ident, Item, ItemFn, Lit, Local,
+    Member, Pat, Stmt, Type, UnOp,
 };
 
 /// Marker delimiting the generated block inside a component file (for idempotent re-run).
@@ -54,7 +54,20 @@ pub const END_MARKER: &str = "// === END witness_genericize ===";
 // ======================================================================================
 
 /// Bottom-up inferred type of a value in the per-row body's single-assignment let graph.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// TWO felt types with DIFFERENT limb layouts exist in the generated writers and must
+/// NEVER be conflated (a wrong width silently mis-lowers `get_m31`):
+///   * `Felt252` — 28 limbs x 9 bits (`FELT252_N_WORDS`/`FELT252_BITS_PER_WORD`, common
+///     `prover_types/cpu.rs`); this is the ONLY width the recording layer models (`FELT_N_LIMBS =
+///     28`, `witness_eval/mod.rs`).
+///   * `FeltW27` — `Felt252Width27`: 10 limbs x 27 bits (`FELT252WIDTH27_N_WORDS`); NOT
+///     representable as a `WitnessEval::Felt` today, so opaque W27 values are census-only
+///     (`w27_sites`).
+///   * `FeltW27Limbs` — a W27 value the transformer itself assembled from 10 known M31 limb tokens
+///     (bound as a `[E::M31; 10]` array); `get_m31(i)` projects `tok[i]`. Same canonical-limb
+///     contract as the recording layer's `felt_from_limbs` (limbs assumed < 2^27; the per-component
+///     byte-equality gate is the arbiter).
+#[derive(Clone, PartialEq)]
 enum Ty {
     M31,
     U16,
@@ -62,14 +75,49 @@ enum Ty {
     /// u32 trait extension)"; they are never emitted.
     U32,
     Mask,
-    Felt,
+    /// felt252, 28 x 9-bit limbs (the recording layer's `Felt`).
+    Felt252,
+    /// `Felt252Width27`, 10 x 27-bit limbs — OPAQUE (from input / deduce); census-only.
+    FeltW27,
+    /// `Felt252Width27` whose 10 M31 limb values are transformer-known SSA tokens.
+    FeltW27Limbs,
     ConstM31(u32),
     ConstU16(u32),
     ConstU32(u32),
+    /// Hoisted `PackedFelt252::broadcast(Felt252::from([A,B,C,D]))` constant, decomposed
+    /// at transform time into its 28 canonical 9-bit limbs (G3).
+    ConstFelt252([u32; FELT252_LIMBS]),
     Tuple(Vec<Ty>),
     Array(Box<Ty>, usize),
-    Input,
     Unknown,
+}
+
+/// Felt252 limb shape: 28 limbs x 9 bits (see common `prover_types/cpu.rs`).
+const FELT252_LIMBS: usize = 28;
+const FELT252_LIMB_BITS: usize = 9;
+/// Felt252Width27 limb shape: 10 limbs x 27 bits.
+const FELTW27_LIMBS: usize = 10;
+
+impl std::fmt::Debug for Ty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ty::M31 => write!(f, "M31"),
+            Ty::U16 => write!(f, "U16"),
+            Ty::U32 => write!(f, "U32"),
+            Ty::Mask => write!(f, "Mask"),
+            Ty::Felt252 => write!(f, "Felt252"),
+            Ty::FeltW27 => write!(f, "FeltW27"),
+            Ty::FeltW27Limbs => write!(f, "FeltW27Limbs"),
+            Ty::ConstM31(v) => write!(f, "ConstM31({v})"),
+            Ty::ConstU16(v) => write!(f, "ConstU16({v})"),
+            Ty::ConstU32(v) => write!(f, "ConstU32({v})"),
+            // Payload elided: 28 limb values would flood the skip census keys.
+            Ty::ConstFelt252(_) => write!(f, "ConstFelt252"),
+            Ty::Tuple(v) => f.debug_tuple("Tuple").field(v).finish(),
+            Ty::Array(e, n) => write!(f, "Array({e:?}, {n})"),
+            Ty::Unknown => write!(f, "Unknown"),
+        }
+    }
 }
 
 impl Ty {
@@ -252,6 +300,14 @@ struct FileAnalysis {
     /// extension before it can be emitted.
     matched_u32: bool,
     u32_sites: usize,
+    /// Census-only builtin-input access sites (see `Lowerer::input_sites`).
+    input_sites: usize,
+    /// Census-only opaque-Width27 sites (see `Lowerer::w27_sites`).
+    w27_sites: usize,
+    /// Census-only row-index (`seq.packed_at(row_index)`) sites (see `Lowerer::seq_sites`).
+    seq_sites: usize,
+    /// Census-only KNOWN-SIGNATURE deduce sites (see `Lowerer::deduce_sites`).
+    deduce_sites: usize,
     n_cols: usize,
     n_lookup_words: usize,
     n_sub_words: usize,
@@ -275,6 +331,10 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
         matched: false,
         matched_u32: false,
         u32_sites: 0,
+        input_sites: 0,
+        w27_sites: 0,
+        seq_sites: 0,
+        deduce_sites: 0,
         n_cols: 0,
         n_lookup_words: 0,
         n_sub_words: 0,
@@ -328,12 +388,20 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
     // The mem-state param idents (for deduce_output receiver matching).
     let (addr_state, big_state) = mem_state_param_names(writer);
 
-    // Collect hoisted constants + locate the `for_each` closure.
+    // Collect hoisted constants (scalar broadcast + felt broadcast + Seq) + locate the
+    // `for_each` closure.
     let mut consts: BTreeMap<String, ConstVal> = BTreeMap::new();
+    let mut felt_consts: BTreeMap<String, [u32; FELT252_LIMBS]> = BTreeMap::new();
+    let mut seq_idents: BTreeSet<String> = BTreeSet::new();
     for st in &writer.block.stmts {
         if let Stmt::Local(local) = st {
             if let (Some(name), Some(cv)) = (local_ident(local), local_const(local)) {
                 consts.insert(name, cv);
+            } else if let (Some(name), Some(words)) = (local_ident(local), local_felt_const(local))
+            {
+                felt_consts.insert(name, felt252_const_limbs(words));
+            } else if let Some(name) = local_seq_ident(local) {
+                seq_idents.insert(name);
             }
         }
     }
@@ -345,12 +413,15 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
         });
         return fa;
     };
-    let binders = match closure_binders(&closure.inputs) {
+    let (row_index_name, binders) = match closure_binders(&closure.inputs) {
         Some(b) => b,
         None => {
             fa.file_skip = Some(Skip {
                 category: "skeleton",
-                detail: format!("unrecognized closure binder: `{}`", tok_str(&closure.inputs[0])),
+                detail: format!(
+                    "unrecognized closure binder: `{}`",
+                    tok_str(&closure.inputs[0])
+                ),
             });
             return fa;
         }
@@ -413,12 +484,19 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
     };
     fa.n_sub_words = sub_slots.iter().map(|s| s.shape.scalar_count()).sum();
 
+    // Parse the packed-input type alias so the input binder's projections can be typed.
+    let input_ty = parse_input_type(&file);
+
     // Run the lowering (collects skips + builds SSA).
     let mut lw = Lowerer::new(
         consts,
+        felt_consts,
+        seq_idents,
         addr_state,
         big_state,
         input_name.clone(),
+        input_ty,
+        row_index_name,
         row_name,
         lookup_name,
         sub_name,
@@ -429,9 +507,23 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
 
     fa.n_cols = lw.max_col.map(|m| m + 1).unwrap_or(0);
     fa.u32_sites = lw.u32_sites;
+    fa.input_sites = lw.input_sites;
+    fa.w27_sites = lw.w27_sites;
+    fa.seq_sites = lw.seq_sites;
+    fa.deduce_sites = lw.deduce_sites;
     fa.skips = lw.skips.clone();
-    fa.matched = fa.skeleton_ok && fa.skips.is_empty() && lw.u32_sites == 0;
-    fa.matched_u32 = fa.skeleton_ok && fa.skips.is_empty() && lw.u32_sites > 0;
+    // Emittable only when there are no skips AND no census-only sites (u32 / builtin
+    // input / opaque Width27 / row-index / known-signature deduce). A census-only site is
+    // typed correctly but has no backend op yet, so it must NEVER be emitted — an honest
+    // "needs trait extension" classification.
+    fa.matched = fa.skeleton_ok
+        && fa.skips.is_empty()
+        && lw.u32_sites == 0
+        && lw.input_sites == 0
+        && lw.w27_sites == 0
+        && lw.seq_sites == 0
+        && lw.deduce_sites == 0;
+    fa.matched_u32 = fa.skeleton_ok && fa.skips.is_empty() && !fa.matched;
 
     if fa.matched && build_block {
         let block = build_marked_block(&component, &fa, &lw, writer, &file);
@@ -492,8 +584,11 @@ fn search_for_each(expr: &Expr) -> Option<syn::ExprClosure> {
     None
 }
 
-/// Match `|(row_index, (a, b, c, d))|` → returns the inner binder names [a, b, c, d].
-fn closure_binders(inputs: &syn::punctuated::Punctuated<Pat, syn::token::Comma>) -> Option<Vec<String>> {
+/// Match `|(row_index, (a, b, c, d))|` → returns (row-index binder name, inner binder
+/// names [a, b, c, d]).
+fn closure_binders(
+    inputs: &syn::punctuated::Punctuated<Pat, syn::token::Comma>,
+) -> Option<(String, Vec<String>)> {
     let first = inputs.first()?;
     let outer = match first {
         Pat::Tuple(t) => t,
@@ -503,6 +598,10 @@ fn closure_binders(inputs: &syn::punctuated::Punctuated<Pat, syn::token::Comma>)
         return None;
     }
     // outer.elems[0] is row_index; outer.elems[1] is the inner tuple.
+    let row_index = match &outer.elems[0] {
+        Pat::Ident(pi) => pi.ident.to_string(),
+        _ => return None,
+    };
     let inner = match &outer.elems[1] {
         Pat::Tuple(t) => t,
         _ => return None,
@@ -514,7 +613,7 @@ fn closure_binders(inputs: &syn::punctuated::Punctuated<Pat, syn::token::Comma>)
             _ => return None,
         }
     }
-    Some(names)
+    Some((row_index, names))
 }
 
 fn parse_lookup_data(file: &syn::File) -> Result<Vec<LookupField>, Skip> {
@@ -543,7 +642,10 @@ fn parse_lookup_data(file: &syn::File) -> Result<Vec<LookupField>, Skip> {
         let name = f.ident.as_ref().unwrap().to_string();
         let (width, scalar) = lookup_field_width(&f.ty).ok_or_else(|| Skip {
             category: "skeleton",
-            detail: format!("LookupData.{name}: unrecognized field type `{}`", tok_str(&f.ty)),
+            detail: format!(
+                "LookupData.{name}: unrecognized field type `{}`",
+                tok_str(&f.ty)
+            ),
         })?;
         fields.push(LookupField {
             name,
@@ -567,6 +669,58 @@ fn lookup_field_width(ty: &Type) -> Option<(usize, bool)> {
         return Some((1, true));
     }
     None
+}
+
+/// Parse the component's `pub type PackedInputType = <ty>;` alias into a `Ty` tree, so the
+/// 4th closure binder (`<comp>_input`) can be typed and its `.N` / `[i]` / `.get_m31(i)`
+/// projections resolved. Unrecognized leaves (e.g. the opcode `PackedCasmState` struct,
+/// whose fields are read via the named `input(SLOT_*)` path, not projections) map to
+/// `Ty::Unknown` — an honest fallthrough, never a fabricated type.
+fn parse_input_type(file: &syn::File) -> Ty {
+    let alias = file.items.iter().find_map(|it| match it {
+        Item::Type(t) if t.ident == "PackedInputType" => Some(&*t.ty),
+        _ => None,
+    });
+    match alias {
+        Some(ty) => syn_type_to_ty(ty),
+        None => Ty::Unknown,
+    }
+}
+
+/// Map a packed-input `syn::Type` to the inferred `Ty`. Only the shapes the generated
+/// builtin inputs use are recognized; everything else is `Ty::Unknown` (honest skip).
+fn syn_type_to_ty(ty: &Type) -> Ty {
+    match ty {
+        Type::Paren(p) => syn_type_to_ty(&p.elem),
+        Type::Group(g) => syn_type_to_ty(&g.elem),
+        Type::Tuple(t) => Ty::Tuple(t.elems.iter().map(syn_type_to_ty).collect()),
+        Type::Array(a) => match expr_usize(&a.len) {
+            Some(n) => Ty::Array(Box::new(syn_type_to_ty(&a.elem)), n),
+            None => Ty::Unknown,
+        },
+        Type::Path(p) => match p.path.segments.last() {
+            Some(seg) => {
+                let name = seg.ident.to_string();
+                if name == "PackedM31" {
+                    Ty::M31
+                } else if name == "PackedUInt16" {
+                    Ty::U16
+                } else if name == "PackedUInt32" {
+                    Ty::U32
+                } else if name == "PackedFelt252" {
+                    // 28 x 9-bit limbs.
+                    Ty::Felt252
+                } else if name == "PackedFelt252Width27" {
+                    // 10 x 27-bit limbs — a DIFFERENT layout; never conflate (G1).
+                    Ty::FeltW27
+                } else {
+                    Ty::Unknown
+                }
+            }
+            None => Ty::Unknown,
+        },
+        _ => Ty::Unknown,
+    }
 }
 
 /// Parse `struct SubComponentInputs` field declarations: (name, array_len) in order.
@@ -649,7 +803,10 @@ fn build_sub_layout(
         else {
             continue;
         };
-        let Expr::Index(ExprIndex { expr: base, index, .. }) = strip_parens(place) else {
+        let Expr::Index(ExprIndex {
+            expr: base, index, ..
+        }) = strip_parens(place)
+        else {
             continue;
         };
         let Expr::Field(ExprField {
@@ -744,7 +901,8 @@ impl<'ast> syn::visit::Visit<'ast> for DeduceVisitor {
                         .take(p.path.segments.len() - 1)
                         .map(|s| s.ident.to_string())
                         .collect();
-                    self.hits.push(format!("{}::deduce_output", segs.join("::")));
+                    self.hits
+                        .push(format!("{}::deduce_output", segs.join("::")));
                 }
             }
         }
@@ -770,9 +928,20 @@ enum Target {
 
 struct Lowerer {
     consts: BTreeMap<String, ConstVal>,
+    /// Hoisted felt broadcast constants (G3), pre-decomposed into 28 canonical 9-bit
+    /// limbs at transform time.
+    felt_consts: BTreeMap<String, [u32; FELT252_LIMBS]>,
+    /// Preamble `let <name> = Seq::new(..)` idents; `<name>.packed_at(row_index)` is the
+    /// packed row index (census-only until the lane feeds it as an input word, G4).
+    seq_idents: BTreeSet<String>,
     addr_state: Option<String>,
     big_state: Option<String>,
     input_name: String,
+    /// Type of the 4th closure binder (`<comp>_input`), parsed from `PackedInputType`.
+    /// Seeds input-projection typing (`.N` / `[i]` / `.get_m31(i)`).
+    input_ty: Ty,
+    /// The closure's outer row-index binder name (`row_index`).
+    row_index_name: String,
     row_name: String,
     lookup_name: String,
     sub_name: String,
@@ -787,6 +956,27 @@ struct Lowerer {
     used_slots: BTreeSet<&'static str>,
     skips: Vec<Skip>,
     u32_sites: usize,
+    /// Census-only builtin-input access sites (`<comp>_input.N` / `[i]` / `.get_m31(i)`).
+    /// Typed correctly but NOT emittable: `SimdWitnessEval`/recording model only the
+    /// opcode `PackedCasmState` input (`input(SLOT_PC/AP/FP)`), so a builtin felt-tuple
+    /// input has no read op yet. Any site > 0 blocks emission (like `u32_sites`).
+    input_sites: usize,
+    /// Census-only OPAQUE `Felt252Width27` sites: `get_m31(i)` on a W27 whose limbs the
+    /// transformer does not hold (input/deduce-sourced), and the W27→Felt252 width
+    /// conversion (needs `U32Shr`/`U32And` — 27-bit limbs exceed the u16 trait ops).
+    /// The recording layer models only 28x9 felts (`FELT_N_LIMBS`), so these are typed
+    /// correctly but never emitted. Any site > 0 blocks emission.
+    w27_sites: usize,
+    /// Census-only row-index sites (`seq.packed_at(row_index)` — an iota, typed M31;
+    /// becomes an extra input word in the builtin lane, G4). Blocks emission.
+    seq_sites: usize,
+    /// Census-only KNOWN-SIGNATURE deduce sites (G5): `PackedX::deduce_output(..)` calls
+    /// whose RESULT type is in [`known_deduce_output_ty`]'s table. Typing the result lets
+    /// every downstream projection (`.N` / `[i]` / `.get_m31(i)`) resolve — collapsing the
+    /// cascade of Unknown skips to the honest per-call deduce count — while the call
+    /// itself stays census-only: it needs either a computed-deduce ISA op backed by a
+    /// device function (ec_ops.cuh) or device-to-device component feeding. Blocks emission.
+    deduce_sites: usize,
     counter: usize,
 
     max_col: Option<usize>,
@@ -796,9 +986,13 @@ impl Lowerer {
     #[allow(clippy::too_many_arguments)]
     fn new(
         consts: BTreeMap<String, ConstVal>,
+        felt_consts: BTreeMap<String, [u32; FELT252_LIMBS]>,
+        seq_idents: BTreeSet<String>,
         addr_state: Option<String>,
         big_state: Option<String>,
         input_name: String,
+        input_ty: Ty,
+        row_index_name: String,
         row_name: String,
         lookup_name: String,
         sub_name: String,
@@ -811,9 +1005,13 @@ impl Lowerer {
             .collect();
         Self {
             consts,
+            felt_consts,
+            seq_idents,
             addr_state,
             big_state,
             input_name,
+            input_ty,
+            row_index_name,
             row_name,
             lookup_name,
             sub_name,
@@ -826,6 +1024,10 @@ impl Lowerer {
             used_slots: BTreeSet::new(),
             skips: Vec::new(),
             u32_sites: 0,
+            input_sites: 0,
+            w27_sites: 0,
+            seq_sites: 0,
+            deduce_sites: 0,
             counter: 0,
             max_col: None,
         }
@@ -840,6 +1042,87 @@ impl Lowerer {
     fn u32_site(&mut self, ty: Ty) -> (Ty, TokenStream) {
         self.u32_sites += 1;
         (ty, quote! { WG_U32_CENSUS_ONLY })
+    }
+
+    /// Census-only OPAQUE-Width27 site (see `w27_sites`): typing proceeds, emission is
+    /// blocked. NEVER lowered to `felt_get_m31` — that op is 28x9 semantics and using it
+    /// on a 10x27 value would be a silent miscompile if it ever reached emission.
+    fn w27_site(&mut self, ty: Ty) -> (Ty, TokenStream) {
+        self.w27_sites += 1;
+        (ty, quote! { WG_W27_CENSUS_ONLY })
+    }
+
+    /// Census-only row-index site (`seq.packed_at(row_index)` — the packed iota, G4).
+    fn seq_site(&mut self) -> (Ty, TokenStream) {
+        self.seq_sites += 1;
+        (Ty::M31, quote! { WG_SEQ_CENSUS_ONLY })
+    }
+
+    /// Census-only KNOWN-SIGNATURE deduce site (G5): the call's RESULT is typed from
+    /// [`known_deduce_output_ty`] so downstream projections resolve, but the deduce
+    /// itself has no backend op yet (device EC/blake function or device-to-device feed).
+    fn deduce_site(&mut self, ty: Ty) -> (Ty, TokenStream) {
+        self.deduce_sites += 1;
+        (ty, quote! { WG_DEDUCE_CENSUS_ONLY })
+    }
+
+    /// A hoisted felt broadcast constant used as a bare VALUE (not via `.get_m31(i)`,
+    /// which short-circuits to the const limb): materialize it through the REAL
+    /// `felt_from_limbs` op over 28 M31 constants (RecFelt::Limbs of consts — no ISA
+    /// change, G3). Byte-correct: the limbs are the canonical 9-bit windows, so the SIMD
+    /// impl's `from_limbs` repacks exactly the broadcast value.
+    fn felt_const_value(
+        &mut self,
+        target: Target,
+        limbs: [u32; FELT252_LIMBS],
+    ) -> (Ty, TokenStream) {
+        let ids: Vec<Ident> = limbs
+            .iter()
+            .map(|v| {
+                self.referenced_m31.insert(*v);
+                Ident::new(&format!("m31_{v}"), Span::call_site())
+            })
+            .collect();
+        self.emit_op(
+            target,
+            Ty::ConstFelt252(limbs),
+            quote! { eval.felt_from_limbs([ #(#ids),* ]) },
+        )
+    }
+
+    /// Peek: is `expr` a bare path naming a hoisted felt constant? (Used by `get_m31` to
+    /// avoid materializing the whole felt when only one const limb is read.)
+    fn peek_felt_const(&self, expr: &Expr) -> Option<[u32; FELT252_LIMBS]> {
+        match strip_parens(expr) {
+            Expr::Path(p) => self.felt_consts.get(&tok_str(&p.path)).copied(),
+            _ => None,
+        }
+    }
+
+    /// A single known-const M31 limb value as a leaf.
+    fn const_m31_leaf(&mut self, target: Target, v: u32) -> (Ty, TokenStream) {
+        self.referenced_m31.insert(v);
+        let id = Ident::new(&format!("m31_{v}"), Span::call_site());
+        self.leaf(target, Ty::ConstM31(v), quote! { #id })
+    }
+
+    /// Census-only builtin-input leaf. Returns the parsed `PackedInputType` type so that
+    /// `.N` / `[i]` / `.get_m31(i)` projections resolve to the CORRECT `Ty` (M31 / Felt /
+    /// Tuple / Array) instead of `Ty::Unknown` — but emits a placeholder token and counts
+    /// an input site, because there is no `WitnessEval` read op for a felt-tuple input yet
+    /// (only the opcode `input(SLOT_*)` path). A site > 0 forbids emission. If the alias
+    /// did not resolve to a projectable type, this is still an honest bare-use skip.
+    fn input_leaf(&mut self, target: Target) -> (Ty, TokenStream) {
+        if matches!(self.input_ty, Ty::Unknown) {
+            self.skip(
+                "expr",
+                format!("bare use of input struct `{}`", self.input_name),
+            );
+            return (Ty::Unknown, quote! { WG_SKIP });
+        }
+        self.input_sites += 1;
+        let ty = self.input_ty.clone();
+        self.leaf(target, ty, quote! { WG_INPUT_CENSUS_ONLY })
     }
 
     fn fresh(&mut self) -> Ident {
@@ -871,10 +1154,16 @@ impl Lowerer {
             Stmt::Local(local) => self.lower_local(local),
             Stmt::Expr(Expr::Assign(a), _) => self.lower_assign(a),
             Stmt::Expr(e, _) => {
-                self.skip("stmt", format!("unexpected expression statement: `{}`", tok_str(e)));
+                self.skip(
+                    "stmt",
+                    format!("unexpected expression statement: `{}`", tok_str(e)),
+                );
             }
             Stmt::Macro(m) => {
-                self.skip("macro", format!("macro in body: `{}`", tok_str(&m.mac.path)));
+                self.skip(
+                    "macro",
+                    format!("macro in body: `{}`", tok_str(&m.mac.path)),
+                );
             }
             Stmt::Item(_) => self.skip("stmt", "nested item in body".to_string()),
         }
@@ -882,7 +1171,10 @@ impl Lowerer {
 
     fn lower_local(&mut self, local: &Local) {
         let Some(name) = local_ident(local) else {
-            self.skip("stmt", format!("unsupported `let` pattern: `{}`", tok_str(&local.pat)));
+            self.skip(
+                "stmt",
+                format!("unsupported `let` pattern: `{}`", tok_str(&local.pat)),
+            );
             return;
         };
         let Some(init) = &local.init else {
@@ -914,17 +1206,23 @@ impl Lowerer {
                 ..
             }) => strip_parens(expr),
             other => {
-                self.skip("effect", format!("assignment to non-deref place: `{}`", tok_str(other)));
+                self.skip(
+                    "effect",
+                    format!("assignment to non-deref place: `{}`", tok_str(other)),
+                );
                 return;
             }
         };
         match deref {
             // *row[i] = v;
-            Expr::Index(ExprIndex { expr: base, index, .. })
-                if is_path_named(base, &self.row_name) =>
-            {
+            Expr::Index(ExprIndex {
+                expr: base, index, ..
+            }) if is_path_named(base, &self.row_name) => {
                 let Some(col) = expr_usize(index) else {
-                    self.skip("effect", format!("row index not a literal: `{}`", tok_str(index)));
+                    self.skip(
+                        "effect",
+                        format!("row index not a literal: `{}`", tok_str(index)),
+                    );
                     return;
                 };
                 let (ty, v) = self.lower_node(strip_parens(&a.right), Target::Temp);
@@ -934,7 +1232,9 @@ impl Lowerer {
                 self.max_col = Some(self.max_col.map_or(col, |m| m.max(col)));
             }
             // *sub_component_inputs.field[k] = <tuple/array/scalar>;
-            Expr::Index(ExprIndex { expr: base, index, .. }) => {
+            Expr::Index(ExprIndex {
+                expr: base, index, ..
+            }) => {
                 let field = match strip_parens(base) {
                     Expr::Field(ExprField {
                         base: fb,
@@ -942,22 +1242,32 @@ impl Lowerer {
                         ..
                     }) if is_path_named(fb, &self.sub_name) => m.to_string(),
                     _ => {
-                        self.skip("effect", format!("unrecognized sub-input place: `{}`", tok_str(deref)));
+                        self.skip(
+                            "effect",
+                            format!("unrecognized sub-input place: `{}`", tok_str(deref)),
+                        );
                         return;
                     }
                 };
                 let Some(k) = expr_usize(index) else {
-                    self.skip("effect", format!("sub-input index not a literal: `{}`", tok_str(index)));
+                    self.skip(
+                        "effect",
+                        format!("sub-input index not a literal: `{}`", tok_str(index)),
+                    );
                     return;
                 };
                 let Some(base_idx) = self.sub_base.get(&(field.clone(), k)).copied() else {
-                    self.skip("effect", format!("sub-input `{field}[{k}]` missing from layout"));
+                    self.skip(
+                        "effect",
+                        format!("sub-input `{field}[{k}]` missing from layout"),
+                    );
                     return;
                 };
                 let leaves = self.flatten_sub(strip_parens(&a.right));
                 for (j, leaf) in leaves.iter().enumerate() {
                     let w = usize_lit(base_idx + j);
-                    self.out.push(quote! { eval.set_sub_input_word(#w, #leaf); });
+                    self.out
+                        .push(quote! { eval.set_sub_input_word(#w, #leaf); });
                 }
             }
             // *lookup_data.field = <array or scalar>;
@@ -968,7 +1278,10 @@ impl Lowerer {
             }) if is_path_named(base, &self.lookup_name) => {
                 let field = m.to_string();
                 let Some(lf) = self.lookup_fields.iter().find(|f| f.name == field).cloned() else {
-                    self.skip("effect", format!("lookup field not in LookupData: `{field}`"));
+                    self.skip(
+                        "effect",
+                        format!("lookup field not in LookupData: `{field}`"),
+                    );
                     return;
                 };
                 let rhs = strip_parens(&a.right);
@@ -983,7 +1296,10 @@ impl Lowerer {
                         _ => {
                             self.skip(
                                 "effect",
-                                format!("lookup field `{field}` RHS not an array: `{}`", tok_str(rhs)),
+                                format!(
+                                    "lookup field `{field}` RHS not an array: `{}`",
+                                    tok_str(rhs)
+                                ),
                             );
                             return;
                         }
@@ -1008,7 +1324,10 @@ impl Lowerer {
                 }
             }
             other => {
-                self.skip("effect", format!("unrecognized effect place: `{}`", tok_str(other)));
+                self.skip(
+                    "effect",
+                    format!("unrecognized effect place: `{}`", tok_str(other)),
+                );
             }
         }
     }
@@ -1016,7 +1335,10 @@ impl Lowerer {
     /// Effect values must be M31-typed (Unknown means an inner skip already fired).
     fn require_m31(&mut self, ty: &Ty, what: &str, expr: &Expr) {
         if !ty.is_m31() && *ty != Ty::Unknown {
-            self.skip("effect", format!("{what} is {ty:?}, not M31: `{}`", tok_str(expr)));
+            self.skip(
+                "effect",
+                format!("{what} is {ty:?}, not M31: `{}`", tok_str(expr)),
+            );
         }
     }
 
@@ -1043,7 +1365,10 @@ impl Lowerer {
                     toks.push(k);
                 }
                 let et = tys.first().cloned().unwrap_or(Ty::Unknown);
-                (Ty::Array(Box::new(et), toks.len()), quote! { [ #(#toks),* ] })
+                (
+                    Ty::Array(Box::new(et), toks.len()),
+                    quote! { [ #(#toks),* ] },
+                )
             }
             other => self.lower_node(other, Target::Temp),
         }
@@ -1070,7 +1395,10 @@ impl Lowerer {
             Expr::Call(call) => self.lower_call(call, target),
             Expr::Binary(b) => self.lower_binary(b, target),
             other => {
-                self.skip("expr", format!("unsupported expression: `{}`", tok_str(other)));
+                self.skip(
+                    "expr",
+                    format!("unsupported expression: `{}`", tok_str(other)),
+                );
                 (Ty::Unknown, quote! { WG_SKIP })
             }
         }
@@ -1106,9 +1434,11 @@ impl Lowerer {
                 }
             }
         }
+        if let Some(limbs) = self.felt_consts.get(&name).copied() {
+            return self.felt_const_value(target, limbs);
+        }
         if name == self.input_name {
-            self.skip("expr", format!("bare use of input struct `{name}`"));
-            return (Ty::Input, quote! { WG_SKIP });
+            return self.input_leaf(target);
         }
         if let Some(ty) = self.env.get(&name).cloned() {
             let id = Ident::new(&name, Span::call_site());
@@ -1128,7 +1458,10 @@ impl Lowerer {
                         "ap" => "SLOT_AP",
                         "fp" => "SLOT_FP",
                         other => {
-                            self.skip("input_field", format!("input.{other} (unsupported input field)"));
+                            self.skip(
+                                "input_field",
+                                format!("input.{other} (unsupported input field)"),
+                            );
                             return (Ty::Unknown, quote! { WG_SKIP });
                         }
                     };
@@ -1136,7 +1469,13 @@ impl Lowerer {
                     let slot_id = Ident::new(slot, Span::call_site());
                     return self.emit_op(target, Ty::M31, quote! { eval.input(#slot_id) });
                 }
-                self.skip("expr", format!("field access `.{m}` on non-input base `{}`", tok_str(&f.base)));
+                self.skip(
+                    "expr",
+                    format!(
+                        "field access `.{m}` on non-input base `{}`",
+                        tok_str(&f.base)
+                    ),
+                );
                 (Ty::Unknown, quote! { WG_SKIP })
             }
             Member::Unnamed(idx) => {
@@ -1146,7 +1485,10 @@ impl Lowerer {
                 let elem_ty = match &bt {
                     Ty::Tuple(v) if i < v.len() => v[i].clone(),
                     _ => {
-                        self.skip("expr", format!("tuple projection .{i} on non-tuple `{}`", tok_str(&f.base)));
+                        self.skip(
+                            "expr",
+                            format!("tuple projection .{i} on non-tuple `{}`", tok_str(&f.base)),
+                        );
                         Ty::Unknown
                     }
                 };
@@ -1159,13 +1501,19 @@ impl Lowerer {
     fn lower_index(&mut self, ix: &ExprIndex, target: Target) -> (Ty, TokenStream) {
         let (bt, btok) = self.lower_node(&ix.expr, Target::Temp);
         let Some(i) = expr_usize(&ix.index) else {
-            self.skip("expr", format!("non-literal index: `{}`", tok_str(&ix.index)));
+            self.skip(
+                "expr",
+                format!("non-literal index: `{}`", tok_str(&ix.index)),
+            );
             return (Ty::Unknown, quote! { WG_SKIP });
         };
         let elem_ty = match &bt {
             Ty::Array(e, _) => (**e).clone(),
             _ => {
-                self.skip("expr", format!("index [{i}] on non-array `{}`", tok_str(&ix.expr)));
+                self.skip(
+                    "expr",
+                    format!("index [{i}] on non-array `{}`", tok_str(&ix.expr)),
+                );
                 Ty::Unknown
             }
         };
@@ -1177,16 +1525,78 @@ impl Lowerer {
         let method = mc.method.to_string();
         match method.as_str() {
             "get_m31" => {
+                // Hoisted felt const receiver: the limb is a transform-time constant
+                // (G3) — no need to materialize the felt.
+                if let Some(limbs) = self.peek_felt_const(&mc.receiver) {
+                    let Some(i) = mc.args.first().and_then(expr_usize) else {
+                        self.skip("expr", "get_m31 without literal index".to_string());
+                        return (Ty::Unknown, quote! { WG_SKIP });
+                    };
+                    if i >= FELT252_LIMBS {
+                        self.skip(
+                            "expr",
+                            format!("get_m31({i}) out of range for Felt252 (28 limbs)"),
+                        );
+                        return (Ty::Unknown, quote! { WG_SKIP });
+                    }
+                    return self.const_m31_leaf(target, limbs[i]);
+                }
                 let (rt, rtok) = self.lower_node(&mc.receiver, Target::Temp);
                 let Some(i) = mc.args.first().and_then(expr_usize) else {
                     self.skip("expr", "get_m31 without literal index".to_string());
                     return (Ty::Unknown, quote! { WG_SKIP });
                 };
-                if rt != Ty::Felt {
-                    self.skip("expr", format!("get_m31 on non-Felt `{}`", tok_str(&mc.receiver)));
-                }
                 let lit = usize_lit(i);
-                self.emit_op(target, Ty::M31, quote! { eval.felt_get_m31(&#rtok, #lit) })
+                // WIDTH-AWARE (G1): `felt_get_m31` is 28x9 semantics ONLY. A Width27
+                // receiver must never route through it, and out-of-range indices are
+                // SOURCE bugs that must skip loudly, not wrap.
+                match rt {
+                    Ty::Felt252 if i < FELT252_LIMBS => {
+                        self.emit_op(target, Ty::M31, quote! { eval.felt_get_m31(&#rtok, #lit) })
+                    }
+                    Ty::Felt252 => {
+                        self.skip(
+                            "expr",
+                            format!("get_m31({i}) out of range for Felt252 (28 limbs)"),
+                        );
+                        (Ty::Unknown, quote! { WG_SKIP })
+                    }
+                    Ty::ConstFelt252(limbs) if i < FELT252_LIMBS => {
+                        self.const_m31_leaf(target, limbs[i])
+                    }
+                    Ty::ConstFelt252(_) => {
+                        self.skip(
+                            "expr",
+                            format!("get_m31({i}) out of range for Felt252 (28 limbs)"),
+                        );
+                        (Ty::Unknown, quote! { WG_SKIP })
+                    }
+                    Ty::FeltW27 if i < FELTW27_LIMBS => self.w27_site(Ty::M31),
+                    Ty::FeltW27Limbs if i < FELTW27_LIMBS => {
+                        // The transformer holds the 10 limb tokens as an array value.
+                        self.leaf(target, Ty::M31, quote! { #rtok[#lit] })
+                    }
+                    Ty::FeltW27 | Ty::FeltW27Limbs => {
+                        self.skip(
+                            "expr",
+                            format!(
+                                "get_m31({i}) out of range for Felt252Width27 (10 limbs) — \
+                                 source bug"
+                            ),
+                        );
+                        (Ty::Unknown, quote! { WG_SKIP })
+                    }
+                    _ => {
+                        // Unknown/other receiver: record the skip; the RESULT of a
+                        // source-level `get_m31` is always PackedM31, so type M31 to
+                        // limit cascade noise (emission is blocked by the skip).
+                        self.skip(
+                            "expr",
+                            format!("get_m31 on non-Felt `{}`", tok_str(&mc.receiver)),
+                        );
+                        self.emit_op(target, Ty::M31, quote! { eval.felt_get_m31(&#rtok, #lit) })
+                    }
+                }
             }
             "as_m31" => {
                 let (rt, rtok) = self.lower_node(&mc.receiver, Target::Temp);
@@ -1195,17 +1605,28 @@ impl Lowerer {
                 } else if rt.is_mask() {
                     self.emit_op(target, Ty::M31, quote! { eval.mask_as_m31(#rtok) })
                 } else {
-                    self.skip("expr", format!("as_m31 on {:?} `{}`", rt, tok_str(&mc.receiver)));
+                    self.skip(
+                        "expr",
+                        format!("as_m31 on {:?} `{}`", rt, tok_str(&mc.receiver)),
+                    );
                     (Ty::Unknown, quote! { WG_SKIP })
                 }
             }
             // u32 family (census-only): .low()/.high() split a u32 into u16 halves.
+            // Cross-checked against `UInt32` (common `prover_types/cpu.rs`):
+            //   .low()  = value & 0xFFFF  → ISA `Trunc16` (or `U32And` imm 0xFFFF)
+            //   .high() = value >> 16     → ISA `U32Shr` imm 16
+            //   from_limbs(low, high) = (low & 0xFFFF) | ((high & 0xFFFF) << 16)
+            // Both halves are U16-typed; emission needs the u32 trait extension.
             "low" | "high" => {
                 let (rt, _rtok) = self.lower_node(&mc.receiver, Target::Temp);
                 if rt.is_u32() {
                     self.u32_site(Ty::U16)
                 } else {
-                    self.skip("method", format!(".{method}() on `{}`", tok_str(&mc.receiver)));
+                    self.skip(
+                        "method",
+                        format!(".{method}() on `{}`", tok_str(&mc.receiver)),
+                    );
                     (Ty::Unknown, quote! { WG_SKIP })
                 }
             }
@@ -1220,17 +1641,28 @@ impl Lowerer {
             "inverse" => {
                 let (rt, rtok) = self.lower_node(&mc.receiver, Target::Temp);
                 if !rt.is_m31() {
-                    self.skip("expr", format!("inverse on non-M31 `{}`", tok_str(&mc.receiver)));
+                    self.skip(
+                        "expr",
+                        format!("inverse on non-M31 `{}`", tok_str(&mc.receiver)),
+                    );
                 }
                 self.emit_op(target, Ty::M31, quote! { eval.m31_inverse(#rtok) })
             }
             "deduce_output" => {
                 let recv = tok_str(strip_parens(&mc.receiver));
-                let (_at, atok) = self.lower_arg(mc.args.first());
+                // Aggregate-aware: builtin deduce args are tuples; lower their leaves
+                // for real (the deduce itself skips below for non-mem receivers).
+                let (_at, atok) = match mc.args.first() {
+                    Some(e) => self.lower_aggregate(strip_parens(e)),
+                    None => {
+                        self.skip("expr", "missing argument".to_string());
+                        (Ty::Unknown, quote! { WG_SKIP })
+                    }
+                };
                 if Some(&recv) == self.addr_state.as_ref() {
                     self.emit_op(target, Ty::M31, quote! { eval.mem_addr_to_id(#atok) })
                 } else if Some(&recv) == self.big_state.as_ref() {
-                    self.emit_op(target, Ty::Felt, quote! { eval.mem_id_to_value(#atok) })
+                    self.emit_op(target, Ty::Felt252, quote! { eval.mem_id_to_value(#atok) })
                 } else {
                     self.skip("deduce_output", format!("{recv}.deduce_output"));
                     (Ty::Unknown, quote! { WG_SKIP })
@@ -1239,18 +1671,38 @@ impl Lowerer {
             "packed_at" => {
                 if is_path_named(&mc.receiver, "enabler_col") {
                     self.emit_op(target, Ty::M31, quote! { eval.enabler() })
+                } else if self
+                    .seq_idents
+                    .iter()
+                    .any(|s| is_path_named(&mc.receiver, s))
+                    && mc
+                        .args
+                        .first()
+                        .map(|a| is_path_named(a, &self.row_index_name))
+                        .unwrap_or(false)
+                {
+                    // `seq.packed_at(row_index)` — the packed row index (Seq is the
+                    // identity sequence). An M31 iota; census-only until the builtin
+                    // lane feeds it as an extra input word (G4).
+                    self.seq_site()
                 } else {
                     // preprocessed column .packed_at(row_index) etc.
-                    self.skip("method", format!("{}.packed_at (non-enabler)", tok_str(&mc.receiver)));
+                    self.skip(
+                        "method",
+                        format!("{}.packed_at (non-enabler)", tok_str(&mc.receiver)),
+                    );
                     (Ty::Unknown, quote! { WG_SKIP })
                 }
             }
             other => {
                 // Recurse into args for census completeness, then skip.
                 for a in &mc.args {
-                    let _ = self.lower_node(a, Target::Temp);
+                    let _ = self.lower_aggregate(a);
                 }
-                self.skip("method", format!(".{other}() on `{}`", tok_str(&mc.receiver)));
+                self.skip(
+                    "method",
+                    format!(".{other}() on `{}`", tok_str(&mc.receiver)),
+                );
                 (Ty::Unknown, quote! { WG_SKIP })
             }
         }
@@ -1274,7 +1726,9 @@ impl Lowerer {
                 self.emit_op(target, Ty::Mask, quote! { eval.mask_from_m31(#a) })
             }
             "PackedFelt252 :: from_limbs" => {
-                // Single array argument of 28 M31 exprs.
+                // Single array argument of EXACTLY 28 M31 exprs (the trait's
+                // `felt_from_limbs` takes `[M31; FELT_N_LIMBS]`; a shorter source array
+                // would zero-fill on the host — not expressible, loud skip).
                 let arr = match call.args.first().map(strip_parens) {
                     Some(Expr::Array(ExprArray { elems, .. })) => elems,
                     _ => {
@@ -1282,12 +1736,143 @@ impl Lowerer {
                         return (Ty::Unknown, quote! { WG_SKIP });
                     }
                 };
+                if arr.len() != FELT252_LIMBS {
+                    self.skip(
+                        "call",
+                        format!("PackedFelt252::from_limbs with {} != 28 limbs", arr.len()),
+                    );
+                    return (Ty::Unknown, quote! { WG_SKIP });
+                }
                 let mut toks = Vec::new();
                 for e in arr {
                     let (_t, k) = self.lower_node(strip_parens(e), Target::Temp);
                     toks.push(k);
                 }
-                self.emit_op(target, Ty::Felt, quote! { eval.felt_from_limbs([ #(#toks),* ]) })
+                self.emit_op(
+                    target,
+                    Ty::Felt252,
+                    quote! { eval.felt_from_limbs([ #(#toks),* ]) },
+                )
+            }
+            "PackedFelt252Width27 :: from_limbs" => {
+                // 10 M31 limb exprs — the transformer itself holds the limbs, so the
+                // W27 value is modeled as a `[E::M31; 10]` array binding (no trait op
+                // needed). Same canonical-limb contract as `felt_from_limbs` (limbs
+                // assumed < 2^27); the byte-equality gate is the arbiter.
+                let arr = match call.args.first().map(strip_parens) {
+                    Some(Expr::Array(ExprArray { elems, .. })) => elems,
+                    _ => {
+                        self.skip("call", "Width27 from_limbs without array arg".to_string());
+                        return (Ty::Unknown, quote! { WG_SKIP });
+                    }
+                };
+                if arr.len() != FELTW27_LIMBS {
+                    self.skip(
+                        "call",
+                        format!(
+                            "PackedFelt252Width27::from_limbs with {} != 10 limbs",
+                            arr.len()
+                        ),
+                    );
+                    return (Ty::Unknown, quote! { WG_SKIP });
+                }
+                let mut toks = Vec::new();
+                for e in arr {
+                    let (t, k) = self.lower_node(strip_parens(e), Target::Temp);
+                    if !t.is_m31() && t != Ty::Unknown {
+                        self.skip("call", format!("Width27 from_limbs limb is {t:?}, not M31"));
+                    }
+                    toks.push(k);
+                }
+                let tok = self.bind(target, quote! { [ #(#toks),* ] });
+                (Ty::FeltW27Limbs, tok)
+            }
+            "PackedFelt252Width27 :: from_packed_felt252" => {
+                // f252 → w27 width conversion (G2): w27[j] = f9[3j] + f9[3j+1]*2^9 +
+                // f9[3j+2]*2^18 — exact (27 = 3*9; each w27 limb < 2^27 < P, so plain
+                // M31 mul-by-const + add). For j = 9 only f9[27] exists (252 = 9*27+9).
+                // Bit-matches `Felt252Width27::from(Felt252)` (limb reinterpretation,
+                // cpu.rs) for canonical 9-bit source limbs — the same canonicity
+                // contract every `felt_get_m31` use already carries.
+                let (at, atok) = self.lower_arg(call.args.first());
+                match at {
+                    Ty::Felt252 | Ty::ConstFelt252(_) => {
+                        let mut limb_toks: Vec<TokenStream> = Vec::new();
+                        for j in 0..FELTW27_LIMBS {
+                            let mut acc: Option<TokenStream> = None;
+                            for k in 0..3usize {
+                                let idx = 3 * j + k;
+                                if idx >= FELT252_LIMBS {
+                                    break;
+                                }
+                                let il = usize_lit(idx);
+                                let limb = self
+                                    .bind(Target::Temp, quote! { eval.felt_get_m31(&#atok, #il) });
+                                let term = if k == 0 {
+                                    limb
+                                } else {
+                                    let c = 1u32 << (FELT252_LIMB_BITS * k);
+                                    self.referenced_m31.insert(c);
+                                    let cid = Ident::new(&format!("m31_{c}"), Span::call_site());
+                                    self.bind(Target::Temp, quote! { eval.m31_mul(#limb, #cid) })
+                                };
+                                acc = Some(match acc {
+                                    None => term,
+                                    Some(a) => {
+                                        self.bind(Target::Temp, quote! { eval.m31_add(#a, #term) })
+                                    }
+                                });
+                            }
+                            limb_toks.push(acc.expect("j*3 < 28 for all j < 10"));
+                        }
+                        let tok = self.bind(target, quote! { [ #(#limb_toks),* ] });
+                        (Ty::FeltW27Limbs, tok)
+                    }
+                    other => {
+                        self.skip(
+                            "call",
+                            format!(
+                                "from_packed_felt252 on {:?} `{}`",
+                                other,
+                                call.args.first().map(tok_str).unwrap_or_default()
+                            ),
+                        );
+                        (Ty::Unknown, quote! { WG_SKIP })
+                    }
+                }
+            }
+            "PackedFelt252 :: from_packed_felt252width27" => {
+                // w27 → f252 width conversion: f9[3j+k] = (w27[j] >> 9k) & 0x1FF (G2).
+                // Requires shift/mask on 27-bit limbs — beyond the u16 trait ops; lowers
+                // to `U32Shr`/`U32And` once the u32 trait extension lands. Census-only,
+                // typed Felt252 (the result IS a 28x9 felt).
+                let (at, _atok) = self.lower_arg(call.args.first());
+                match at {
+                    Ty::FeltW27 | Ty::FeltW27Limbs => self.w27_site(Ty::Felt252),
+                    other => {
+                        self.skip(
+                            "call",
+                            format!(
+                                "from_packed_felt252width27 on {:?} `{}`",
+                                other,
+                                call.args.first().map(tok_str).unwrap_or_default()
+                            ),
+                        );
+                        (Ty::Unknown, quote! { WG_SKIP })
+                    }
+                }
+            }
+            "PackedFelt252 :: from_m31" => {
+                // Felt252 whose VALUE is the (31-bit) M31: limbs 0..3 are 9-bit windows
+                // of the value (limbs 4..28 zero) — needs `U32Shr`/`U32And`; census-only
+                // under the u32 trait extension, typed Felt252.
+                let (at, _a) = self.lower_arg(call.args.first());
+                if at.is_m31() || at == Ty::Unknown {
+                    self.u32_site(Ty::Felt252)
+                } else {
+                    self.skip("call", format!("PackedFelt252::from_m31 on {at:?}"));
+                    (Ty::Unknown, quote! { WG_SKIP })
+                }
             }
             // u32 family (census-only).
             "PackedUInt32 :: from_m31" => {
@@ -1305,15 +1890,27 @@ impl Lowerer {
                 self.u32_site(Ty::U32)
             }
             p if p.ends_with(":: deduce_output") => {
+                // Lower the args for REAL (tuple/array shapes route through
+                // lower_aggregate, so their M31/felt leaves record cleanly).
                 for a in &call.args {
-                    let _ = self.lower_node(a, Target::Temp);
+                    let _ = self.lower_aggregate(a);
                 }
+                // Known-signature deduce (G5): type the RESULT so downstream
+                // projections resolve; the call stays census-only (deduce_sites).
+                // The result type is transcribed from the host fast_deduction
+                // signature — a WRONG shape here would silently mis-type everything
+                // downstream, so entries are added only with the signature in view.
+                if let Some(ty) = known_deduce_output_ty(p) {
+                    return self.deduce_site(ty);
+                }
+                // Unknown-signature deduce: the honest skip — the quantified
+                // EC/poseidon/blake deduce backlog.
                 self.skip("deduce_output", p.to_string());
                 (Ty::Unknown, quote! { WG_SKIP })
             }
             other => {
                 for a in &call.args {
-                    let _ = self.lower_node(a, Target::Temp);
+                    let _ = self.lower_aggregate(a);
                 }
                 self.skip("call", format!("call `{other}(..)`"));
                 (Ty::Unknown, quote! { WG_SKIP })
@@ -1344,7 +1941,10 @@ impl Lowerer {
                 if lt.is_u32() && rt.is_u32() {
                     return self.u32_site(Ty::U32);
                 }
-                self.skip("binop", format!("`<<` by non-const `{}`", tok_str(&b.right)));
+                self.skip(
+                    "binop",
+                    format!("`<<` by non-const `{}`", tok_str(&b.right)),
+                );
                 (Ty::Unknown, quote! { WG_SKIP })
             }
             BinOp::Shr(_) => {
@@ -1368,7 +1968,10 @@ impl Lowerer {
                 if lt.is_u32() && rt.is_u32() {
                     return self.u32_site(Ty::U32);
                 }
-                self.skip("binop", format!("`>>` by non-const `{}`", tok_str(&b.right)));
+                self.skip(
+                    "binop",
+                    format!("`>>` by non-const `{}`", tok_str(&b.right)),
+                );
                 (Ty::Unknown, quote! { WG_SKIP })
             }
             BinOp::BitAnd(_) => {
@@ -1380,7 +1983,10 @@ impl Lowerer {
                         let kl = u32_lit(k);
                         return self.emit_op(target, Ty::U16, quote! { eval.u16_and(#ltok, #kl) });
                     }
-                    self.skip("binop", format!("`&` (mask) on non-U16 `{}`", tok_str(&b.left)));
+                    self.skip(
+                        "binop",
+                        format!("`&` (mask) on non-U16 `{}`", tok_str(&b.left)),
+                    );
                     return (Ty::Unknown, quote! { WG_SKIP });
                 }
                 if let Some(k) = self.peek_const_u16(&b.left) {
@@ -1389,7 +1995,10 @@ impl Lowerer {
                         let kl = u32_lit(k);
                         return self.emit_op(target, Ty::U16, quote! { eval.u16_and(#rtok, #kl) });
                     }
-                    self.skip("binop", format!("`&` (mask) on non-U16 `{}`", tok_str(&b.right)));
+                    self.skip(
+                        "binop",
+                        format!("`&` (mask) on non-U16 `{}`", tok_str(&b.right)),
+                    );
                     return (Ty::Unknown, quote! { WG_SKIP });
                 }
                 if self.peek_const_u32(&b.right).is_some() {
@@ -1486,7 +2095,10 @@ impl Lowerer {
             other => {
                 let _ = self.lower_node(&b.left, Target::Temp);
                 let _ = self.lower_node(&b.right, Target::Temp);
-                self.skip("binop", format!("unsupported binary op `{}`", tok_str_op(&other)));
+                self.skip(
+                    "binop",
+                    format!("unsupported binary op `{}`", tok_str_op(&other)),
+                );
                 (Ty::Unknown, quote! { WG_SKIP })
             }
         }
@@ -1601,8 +2213,14 @@ fn build_marked_block(
         slots.iter().map(|s| format!(", {s}")).collect::<String>()
     ));
     seg.push(String::new());
-    seg.push(format!("const N_LOOKUP_WORDS: usize = {};", fa.n_lookup_words));
-    seg.push(format!("const N_SUB_INPUT_WORDS: usize = {};", fa.n_sub_words));
+    seg.push(format!(
+        "const N_LOOKUP_WORDS: usize = {};",
+        fa.n_lookup_words
+    ));
+    seg.push(format!(
+        "const N_SUB_INPUT_WORDS: usize = {};",
+        fa.n_sub_words
+    ));
     seg.push(String::new());
 
     // 1. The generic per-row body.
@@ -1666,7 +2284,9 @@ fn build_marked_block(
     seg.push(String::new());
     seg.push(render(&sub_flat_tokens(lw)));
     seg.push(String::new());
-    seg.push("/// Byte-comparison bundle (only public types cross the module boundary).".to_string());
+    seg.push(
+        "/// Byte-comparison bundle (only public types cross the module boundary).".to_string(),
+    );
     seg.push(render(&generic_simd_diff_struct_tokens()));
     seg.push(String::new());
     seg.push(
@@ -2126,6 +2746,129 @@ fn local_const(local: &Local) -> Option<ConstVal> {
     Some(ConstVal { kind, value: v })
 }
 
+/// If `local` is `let IDENT = PackedFelt252::broadcast(Felt252::from([A, B, C, D]));`
+/// (the hoisted felt-constant idiom, G3 — 4 LITTLE-ENDIAN u64 words), return the words.
+/// A `PackedFelt252Width27::broadcast` would decompose to 10 x 27-bit limbs instead, but
+/// no such method exists on the packed type today, so only the Felt252 form is parsed.
+fn local_felt_const(local: &Local) -> Option<[u64; 4]> {
+    let init = local.init.as_ref()?;
+    let call = match strip_parens(&init.expr) {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    let path = match &*call.func {
+        Expr::Path(p) => tok_str(&p.path),
+        _ => return None,
+    };
+    if path != "PackedFelt252 :: broadcast" {
+        return None;
+    }
+    // arg: Felt252::from([A, B, C, D])
+    let inner = match call.args.first().map(strip_parens) {
+        Some(Expr::Call(c)) => c,
+        _ => return None,
+    };
+    let inner_path = match &*inner.func {
+        Expr::Path(p) => tok_str(&p.path),
+        _ => return None,
+    };
+    if inner_path != "Felt252 :: from" {
+        return None;
+    }
+    let arr = match inner.args.first().map(strip_parens) {
+        Some(Expr::Array(ExprArray { elems, .. })) if elems.len() == 4 => elems,
+        _ => return None,
+    };
+    let mut words = [0u64; 4];
+    for (i, e) in arr.iter().enumerate() {
+        match strip_parens(e) {
+            Expr::Lit(el) => match &el.lit {
+                Lit::Int(l) => words[i] = l.base10_parse::<u64>().ok()?,
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    Some(words)
+}
+
+/// Decompose the 4 little-endian u64 words of a `Felt252::from([u64; 4])` into the 28
+/// canonical 9-bit limbs — bit-identical to `Felt252::from([u64;4])` (which masks the
+/// top word to 60 bits, keeping the low 252 bits) followed by `Felt252::get_m31(i)`
+/// (9-bit window at bit `9*i`; common `prover_types/cpu.rs`).
+fn felt252_const_limbs(words: [u64; 4]) -> [u32; FELT252_LIMBS] {
+    let mut limbs = words;
+    limbs[3] &= 0x0fff_ffff_ffff_ffff; // From<[u64;4]> masks to 252 bits.
+    std::array::from_fn(|i| {
+        let mask = (1u64 << FELT252_LIMB_BITS) - 1;
+        let shift = FELT252_LIMB_BITS * i;
+        let low = shift / 64;
+        let shift_low = shift & 0x3F;
+        let high = (shift + FELT252_LIMB_BITS - 1) / 64;
+        let v = if low == high {
+            (limbs[low] >> shift_low) & mask
+        } else {
+            ((limbs[low] >> shift_low) | (limbs[high] << (64 - shift_low))) & mask
+        };
+        v as u32
+    })
+}
+
+/// RESULT types of the KNOWN `PackedX::deduce_output` signatures (G5), transcribed from
+/// the host `witness/fast_deduction/{pedersen,ec_op,blake}.rs` with the signatures in
+/// view — a WRONG shape here would silently mis-type everything downstream of a deduce,
+/// so entries are never guessed:
+///   * `PackedPartialEcMul<N>::deduce_output((M31, M31, ([M31; N], [Felt252; 2])))` returns the
+///     same tuple shape (pedersen.rs; WindowBits18 => N=14, WindowBits9 => N=28).
+///   * `PackedPartialEcMulGeneric::deduce_output` returns `Box<(M31, M31, State)>` with `State =
+///     (Felt252Width27, [Felt252; 2], [Felt252; 2], M31)` (ec_op.rs) — typed as the inner tuple;
+///     source projections auto-deref through the `Box`.
+///   * points tables: `([M31; 1]) -> [Felt252; 2]` (pedersen.rs).
+///   * `PackedBlakeG: ([U32; 6]) -> [U32; 4]`; `PackedBlakeRoundSigma: (M31) -> [M31; 16]`
+///     (blake.rs; `N_BLAKE_SIGMA_COLS = 16`).
+fn known_deduce_output_ty(path: &str) -> Option<Ty> {
+    let felt2 = || Ty::Array(Box::new(Ty::Felt252), 2);
+    match path {
+        "PackedPartialEcMulWindowBits18 :: deduce_output" => Some(Ty::Tuple(vec![
+            Ty::M31,
+            Ty::M31,
+            Ty::Tuple(vec![Ty::Array(Box::new(Ty::M31), 14), felt2()]),
+        ])),
+        "PackedPartialEcMulWindowBits9 :: deduce_output" => Some(Ty::Tuple(vec![
+            Ty::M31,
+            Ty::M31,
+            Ty::Tuple(vec![Ty::Array(Box::new(Ty::M31), 28), felt2()]),
+        ])),
+        "PackedPartialEcMulGeneric :: deduce_output" => Some(Ty::Tuple(vec![
+            Ty::M31,
+            Ty::M31,
+            Ty::Tuple(vec![Ty::FeltW27, felt2(), felt2(), Ty::M31]),
+        ])),
+        "PackedPedersenPointsTableWindowBits18 :: deduce_output"
+        | "PackedPedersenPointsTableWindowBits9 :: deduce_output" => Some(felt2()),
+        "PackedBlakeG :: deduce_output" => Some(Ty::Array(Box::new(Ty::U32), 4)),
+        "PackedBlakeRoundSigma :: deduce_output" => Some(Ty::Array(Box::new(Ty::M31), 16)),
+        _ => None,
+    }
+}
+
+/// If `local` is `let IDENT = Seq::new(...);` (the preamble row-index sequence), return
+/// its name. Inside the closure, `IDENT.packed_at(row_index)` IS the packed row index
+/// (an iota) — typed M31 and census-only until the builtin lane feeds it as an input
+/// word (G4).
+fn local_seq_ident(local: &Local) -> Option<String> {
+    let name = local_ident(local)?;
+    let init = local.init.as_ref()?;
+    let call = match strip_parens(&init.expr) {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    match &*call.func {
+        Expr::Path(p) if tok_str(&p.path) == "Seq :: new" => Some(name),
+        _ => None,
+    }
+}
+
 fn is_path_named(e: &Expr, name: &str) -> bool {
     matches!(strip_parens(e), Expr::Path(p) if p.path.is_ident(name))
 }
@@ -2235,7 +2978,10 @@ fn insert_block(src: &str, block: &str) -> Option<String> {
         if line_start == 0 {
             break;
         }
-        let prev_line_start = src[..line_start - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let prev_line_start = src[..line_start - 1]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let prev = src[prev_line_start..line_start - 1].trim_start();
         if prev.starts_with("#[") || prev.starts_with("///") || prev.starts_with("//!") {
             line_start = prev_line_start;
@@ -2269,7 +3015,8 @@ fn run_census(files: &[PathBuf]) -> ExitCode {
 
     let n = analyses.len();
     let writers = analyses.iter().filter(|(_, a)| a.has_writer).count();
-    let matched: Vec<&(PathBuf, FileAnalysis)> = analyses.iter().filter(|(_, a)| a.matched).collect();
+    let matched: Vec<&(PathBuf, FileAnalysis)> =
+        analyses.iter().filter(|(_, a)| a.matched).collect();
     let matched_u32: Vec<&(PathBuf, FileAnalysis)> =
         analyses.iter().filter(|(_, a)| a.matched_u32).collect();
 
@@ -2279,7 +3026,10 @@ fn run_census(files: &[PathBuf]) -> ExitCode {
     println!("Files scanned:                          {n}");
     println!("  with write_trace_simd:                {writers}");
     println!("  MATCHED (rewritable):                 {}", matched.len());
-    println!("  MATCHED (needs u32 trait extension):  {}", matched_u32.len());
+    println!(
+        "  MATCHED (needs trait ext: u32/input):  {}",
+        matched_u32.len()
+    );
     println!(
         "  skipped:                              {}",
         n - matched.len() - matched_u32.len()
@@ -2295,17 +3045,31 @@ fn run_census(files: &[PathBuf]) -> ExitCode {
     }
     println!();
 
-    println!("--- MATCHED files (needs u32 trait extension; census-only, NOT emitted) ---");
+    println!(
+        "--- MATCHED files (needs trait extension: u32/input/w27/seq/deduce; census-only, NOT emitted) ---"
+    );
     for (_p, a) in &matched_u32 {
         println!(
-            "  {:<34} cols={:<4} lookup_words={:<4} sub_words={:<4} u32_sites={}",
-            a.component, a.n_cols, a.n_lookup_words, a.n_sub_words, a.u32_sites
+            "  {:<34} cols={:<4} lookup_words={:<4} sub_words={:<4} u32_sites={:<4} \
+             input_sites={:<4} w27_sites={:<4} seq_sites={:<4} deduce_sites={}",
+            a.component,
+            a.n_cols,
+            a.n_lookup_words,
+            a.n_sub_words,
+            a.u32_sites,
+            a.input_sites,
+            a.w27_sites,
+            a.seq_sites,
+            a.deduce_sites
         );
     }
     println!();
 
     println!("--- SKIPPED files (loud reasons) ---");
-    for (_p, a) in analyses.iter().filter(|(_, a)| !a.matched && !a.matched_u32) {
+    for (_p, a) in analyses
+        .iter()
+        .filter(|(_, a)| !a.matched && !a.matched_u32)
+    {
         if let Some(fs) = &a.file_skip {
             println!("  {:<34} [{}] {}", a.component, fs.category, fs.detail);
         } else {
@@ -2319,11 +3083,7 @@ fn run_census(files: &[PathBuf]) -> ExitCode {
                 a.component,
                 a.skips.len(),
                 summ.join(", "),
-                if a.u32_sites > 0 {
-                    format!(" + {} u32 sites", a.u32_sites)
-                } else {
-                    String::new()
-                }
+                census_site_suffix(a)
             );
             let mut seen: BTreeSet<String> = BTreeSet::new();
             for s in &a.skips {
@@ -2379,7 +3139,9 @@ fn run_census(files: &[PathBuf]) -> ExitCode {
 
     // Construct-skip census grouped across files (non-deduce), normalized so specific
     // identifiers/values collapse into one backlog row per construct KIND.
-    println!("--- unmatched-construct census (grouped by kind across files, excl. deduce_output) ---");
+    println!(
+        "--- unmatched-construct census (grouped by kind across files, excl. deduce_output) ---"
+    );
     let mut group: BTreeMap<(&'static str, String), (usize, BTreeSet<String>)> = BTreeMap::new();
     for (_p, a) in &analyses {
         if let Some(fs) = &a.file_skip {
@@ -2403,7 +3165,10 @@ fn run_census(files: &[PathBuf]) -> ExitCode {
     gvec.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
     let shown = gvec.len().min(70);
     for ((cat, detail), (count, fileset)) in gvec.iter().take(shown) {
-        println!("  [{cat}] {detail}  — {count} sites in {} files", fileset.len());
+        println!(
+            "  [{cat}] {detail}  — {count} sites in {} files",
+            fileset.len()
+        );
     }
     if gvec.len() > shown {
         println!("  ... ({} more construct kinds)", gvec.len() - shown);
@@ -2450,6 +3215,24 @@ fn strip_paren_nums(s: &str) -> String {
     out
 }
 
+/// " + N u32 sites + M input sites + ..." suffix for census rows (census-only sites that
+/// are typed but not emittable).
+fn census_site_suffix(a: &FileAnalysis) -> String {
+    let mut parts = Vec::new();
+    for (n, what) in [
+        (a.u32_sites, "u32"),
+        (a.input_sites, "input"),
+        (a.w27_sites, "w27"),
+        (a.seq_sites, "seq"),
+        (a.deduce_sites, "deduce"),
+    ] {
+        if n > 0 {
+            parts.push(format!(" + {n} {what} sites"));
+        }
+    }
+    parts.concat()
+}
+
 fn distinct_skips(skips: &[Skip]) -> usize {
     skips
         .iter()
@@ -2461,9 +3244,9 @@ fn distinct_skips(skips: &[Skip]) -> usize {
 fn not_emittable_reason(a: &FileAnalysis) -> String {
     if a.matched_u32 {
         return format!(
-            "matched via u32 census rules only ({} u32 sites) — needs u32 trait \
-             extension; not emitted",
-            a.u32_sites
+            "matched via census-only rules ({} u32 / {} input / {} w27 / {} seq / {} deduce \
+             sites) — needs trait/lane extension; not emitted",
+            a.u32_sites, a.input_sites, a.w27_sites, a.seq_sites, a.deduce_sites
         );
     }
     a.file_skip
@@ -2503,7 +3286,10 @@ fn run_emit_dir(files: &[PathBuf], dir: &Path) -> ExitCode {
         let src = std::fs::read_to_string(f).unwrap();
         let cleaned = strip_existing_block(&src);
         let Some(full) = insert_block(&cleaned, block) else {
-            eprintln!("SKIP {}: no `struct LookupData` anchor for insert", a.component);
+            eprintln!(
+                "SKIP {}: no `struct LookupData` anchor for insert",
+                a.component
+            );
             skipped += 1;
             continue;
         };
@@ -2567,7 +3353,10 @@ fn run_check(files: &[PathBuf]) -> ExitCode {
                 let want = block.trim_end();
                 if on_disk.trim_end() != want {
                     drift += 1;
-                    eprintln!("DRIFT {}: on-disk block differs from generated", a.component);
+                    eprintln!(
+                        "DRIFT {}: on-disk block differs from generated",
+                        a.component
+                    );
                 }
             }
             None => {
@@ -2593,20 +3382,32 @@ fn run_check(files: &[PathBuf]) -> ExitCode {
 mod tests {
     use super::*;
 
-    fn lower_snippet_with_slots(
+    fn lower_snippet_full(
         consts: &[(&str, ConstKind, u32)],
+        felt_consts: BTreeMap<String, [u32; FELT252_LIMBS]>,
+        input_ty: Ty,
         body: &str,
         sub_slots: Vec<SubSlot>,
     ) -> Lowerer {
         let mut cmap = BTreeMap::new();
         for (n, k, v) in consts {
-            cmap.insert(n.to_string(), ConstVal { kind: *k, value: *v });
+            cmap.insert(
+                n.to_string(),
+                ConstVal {
+                    kind: *k,
+                    value: *v,
+                },
+            );
         }
         let mut lw = Lowerer::new(
             cmap,
+            felt_consts,
+            ["seq".to_string()].into_iter().collect(),
             Some("memory_address_to_id_state".to_string()),
             Some("memory_id_to_big_state".to_string()),
             "add_opcode_input".to_string(),
+            input_ty,
+            "row_index".to_string(),
             "row".to_string(),
             "lookup_data".to_string(),
             "sub_component_inputs".to_string(),
@@ -2618,13 +3419,24 @@ mod tests {
         lw
     }
 
+    fn lower_snippet_with_slots(
+        consts: &[(&str, ConstKind, u32)],
+        body: &str,
+        sub_slots: Vec<SubSlot>,
+    ) -> Lowerer {
+        lower_snippet_full(consts, BTreeMap::new(), Ty::Unknown, body, sub_slots)
+    }
+
     fn lower_snippet(consts: &[(&str, ConstKind, u32)], body: &str) -> Lowerer {
         lower_snippet_with_slots(consts, body, vec![])
     }
 
     #[test]
     fn infer_input_fields() {
-        let lw = lower_snippet(&[], "let a = add_opcode_input.pc; let b = add_opcode_input.fp;");
+        let lw = lower_snippet(
+            &[],
+            "let a = add_opcode_input.pc; let b = add_opcode_input.fp;",
+        );
         assert_eq!(lw.env["a"], Ty::M31);
         assert_eq!(lw.env["b"], Ty::M31);
         assert!(lw.skips.is_empty());
@@ -2643,7 +3455,7 @@ mod tests {
              let x = ((PackedUInt16::from_m31(f.get_m31(1))) & (UInt16_127)) << (UInt16_9); \
              let y = x.as_m31();",
         );
-        assert_eq!(lw.env["f"], Ty::Felt);
+        assert_eq!(lw.env["f"], Ty::Felt252);
         assert_eq!(lw.env["x"], Ty::U16);
         assert_eq!(lw.env["y"], Ty::M31);
         assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
@@ -2725,26 +3537,73 @@ mod tests {
 
     #[test]
     fn unknown_deduce_is_skip() {
+        // A deduce whose signature is NOT in `known_deduce_output_ty` must stay a loud
+        // skip (the fictional name keeps this test valid as the table grows).
         let lw = lower_snippet(
             &[],
-            "let x = PackedPartialEcMulGeneric::deduce_output(add_opcode_input.pc);",
+            "let x = PackedNotInTheTable::deduce_output(add_opcode_input.pc);",
         );
         assert!(!lw.skips.is_empty());
         assert!(lw.skips.iter().any(|s| s.category == "deduce_output"));
+        assert_eq!(lw.deduce_sites, 0);
+    }
+
+    #[test]
+    fn known_deduce_types_result_and_counts_site() {
+        // G5: a KNOWN-signature deduce types its result (here (M31, M31, ([M31;14],
+        // [Felt252;2]))) so downstream projections resolve — .0 is M31 (usable in real
+        // M31 ops), .2.1[0].get_m31(3) is a felt limb — with NO skips; the call itself
+        // is census-only via `deduce_sites`, which blocks emission.
+        let p = "add_opcode_input.pc";
+        let windows = vec![p; 14].join(", ");
+        let body = format!(
+            "let f = memory_id_to_big_state.deduce_output(\
+                 memory_address_to_id_state.deduce_output(add_opcode_input.pc)); \
+             let out = PackedPartialEcMulWindowBits18::deduce_output((add_opcode_input.pc, \
+             add_opcode_input.ap, ([{windows}], [f, f]))); \
+             let chain = out.0; \
+             let win0 = out.2.0[0]; \
+             let acc_limb = out.2.1[0].get_m31(3); \
+             let s = ((chain) + (win0)) + ((acc_limb) + (chain)); \
+             let pt = PackedPedersenPointsTableWindowBits18::deduce_output([add_opcode_input.fp]); \
+             let ptl = pt[1].get_m31(27);",
+        );
+        let lw = lower_snippet(&[], &body);
+        assert_eq!(
+            lw.deduce_sites, 2,
+            "two known deduce sites (W18 + points table); skips: {:?}",
+            lw.skips
+        );
+        assert!(
+            lw.skips.is_empty(),
+            "projections off a typed deduce result must not skip: {:?}",
+            lw.skips
+        );
     }
 
     #[test]
     fn u32_family_is_census_only_match() {
         let lw = lower_snippet(
-            &[("UInt32_511", ConstKind::U32, 511), ("UInt32_9", ConstKind::U32, 9)],
+            &[
+                ("UInt32_511", ConstKind::U32, 511),
+                ("UInt32_9", ConstKind::U32, 9),
+            ],
             "let a = add_opcode_input.ap; \
              let x = PackedUInt32::from_m31(a); \
              let y = ((x) & (UInt32_511)) + ((x) << (UInt32_9)); \
              let z = y.low().as_m31(); \
              let w = y.high().as_m31();",
         );
-        assert!(lw.skips.is_empty(), "u32 family must not skip: {:?}", lw.skips);
-        assert!(lw.u32_sites >= 5, "expected u32 sites, got {}", lw.u32_sites);
+        assert!(
+            lw.skips.is_empty(),
+            "u32 family must not skip: {:?}",
+            lw.skips
+        );
+        assert!(
+            lw.u32_sites >= 5,
+            "expected u32 sites, got {}",
+            lw.u32_sites
+        );
         assert_eq!(lw.env["z"], Ty::M31);
         assert_eq!(lw.env["w"], Ty::M31);
     }
@@ -2805,7 +3664,10 @@ mod tests {
                 ("memory_id_to_big".to_string(), 1, 10),
             ]
         );
-        assert_eq!(slots.iter().map(|s| s.shape.scalar_count()).sum::<usize>(), 11);
+        assert_eq!(
+            slots.iter().map(|s| s.shape.scalar_count()).sum::<usize>(),
+            11
+        );
     }
 
     #[test]
@@ -2842,11 +3704,208 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let big_pos = s.find("set_sub_input_word (1").expect("big word at flat 1");
-        let addr_pos = s.find("set_sub_input_word (0").expect("addr word at flat 0");
+        let addr_pos = s
+            .find("set_sub_input_word (0")
+            .expect("addr word at flat 0");
         // File order: big (flat 1) is EMITTED before addr (flat 0).
         assert!(
             big_pos < addr_pos,
             "emission must follow file order with decl-order indices"
+        );
+    }
+
+    // ---- Step-2 front-end: felt widths, felt consts, width conversions, seq ---------
+
+    /// Bit-window decomposition mirrors `Felt252::from([u64;4])` + `get_m31` exactly
+    /// (hand-computed vectors; the tool is standalone so no differential dep on the
+    /// prover types — the per-component byte-equality gate is the end-to-end arbiter).
+    #[test]
+    fn felt_const_limb_decomposition() {
+        // value = 1 → limb0 = 1, rest 0.
+        let l = felt252_const_limbs([1, 0, 0, 0]);
+        assert_eq!(l[0], 1);
+        assert!(l[1..].iter().all(|&v| v == 0));
+
+        // limb0 = 0x1FF, limb1 = 3 (value = 0x1FF | 3<<9).
+        let l = felt252_const_limbs([0x1FF | (3 << 9), 0, 0, 0]);
+        assert_eq!((l[0], l[1]), (0x1FF, 3));
+
+        // Word-boundary window: limb 7 spans bits 63..72 → (w0>>63) | (w1<<1).
+        let l = felt252_const_limbs([1u64 << 63, 0b1010, 0, 0]);
+        assert_eq!(l[7], 1 | (0b1010 << 1));
+
+        // Top word masked to 60 bits (252-bit value): all-ones w3 gives limb27 = 511
+        // and no bits beyond 252 leak in.
+        let l = felt252_const_limbs([0, 0, 0, u64::MAX]);
+        assert_eq!(l[27], 511);
+        // Every limb is a canonical 9-bit value.
+        assert!(l.iter().all(|&v| v < 512));
+    }
+
+    #[test]
+    fn felt_const_get_m31_is_const_limb() {
+        let mut felts = BTreeMap::new();
+        // value 1 → limb0 = 1, limb5 = 0.
+        felts.insert(
+            "Felt252_1_0_0_0".to_string(),
+            felt252_const_limbs([1, 0, 0, 0]),
+        );
+        let lw = lower_snippet_full(
+            &[],
+            felts,
+            Ty::Unknown,
+            "let a = Felt252_1_0_0_0.get_m31(0); let b = Felt252_1_0_0_0.get_m31(5);",
+            vec![],
+        );
+        assert_eq!(lw.env["a"], Ty::ConstM31(1));
+        assert_eq!(lw.env["b"], Ty::ConstM31(0));
+        assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
+        assert!(lw.referenced_m31.contains(&1));
+        // No felt materialization needed for limb reads.
+        let s = lw.out.iter().map(|t| t.to_string()).collect::<String>();
+        assert!(!s.contains("felt_from_limbs"));
+    }
+
+    #[test]
+    fn felt_const_bare_use_materializes_from_limbs() {
+        let mut felts = BTreeMap::new();
+        felts.insert(
+            "Felt252_1_0_0_0".to_string(),
+            felt252_const_limbs([1, 0, 0, 0]),
+        );
+        let lw = lower_snippet_full(&[], felts, Ty::Unknown, "let f = Felt252_1_0_0_0;", vec![]);
+        assert!(matches!(lw.env["f"], Ty::ConstFelt252(_)));
+        assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
+        let s = lw.out.iter().map(|t| t.to_string()).collect::<String>();
+        assert!(s.contains("felt_from_limbs"));
+    }
+
+    #[test]
+    fn hoisted_felt_const_is_parsed() {
+        let stmt: Stmt = syn::parse_str(
+            "let Felt252_1_2_3_4 = PackedFelt252::broadcast(Felt252::from([1, 2, 3, 4]));",
+        )
+        .unwrap();
+        let Stmt::Local(local) = stmt else { panic!() };
+        assert_eq!(local_felt_const(&local), Some([1, 2, 3, 4]));
+    }
+
+    /// W27 get_m31: in-range is a census-only site (typed M31, blocks emission — the
+    /// recording layer is 28x9 only); out-of-range is a LOUD skip (source bug).
+    #[test]
+    fn w27_input_get_m31_widths() {
+        let lw = lower_snippet_full(
+            &[],
+            BTreeMap::new(),
+            Ty::FeltW27,
+            "let a = add_opcode_input.get_m31(9);",
+            vec![],
+        );
+        assert_eq!(lw.env["a"], Ty::M31);
+        assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
+        assert_eq!(lw.w27_sites, 1);
+        assert_eq!(lw.input_sites, 1);
+
+        let lw = lower_snippet_full(
+            &[],
+            BTreeMap::new(),
+            Ty::FeltW27,
+            "let a = add_opcode_input.get_m31(10);",
+            vec![],
+        );
+        assert!(
+            lw.skips
+                .iter()
+                .any(|s| s.detail.contains("out of range for Felt252Width27")),
+            "skips: {:?}",
+            lw.skips
+        );
+    }
+
+    /// Felt252 get_m31(i >= 28) is a loud skip, never a wrap.
+    #[test]
+    fn felt252_get_m31_out_of_range_is_loud() {
+        let lw = lower_snippet(
+            &[],
+            "let f = memory_id_to_big_state.deduce_output(memory_address_to_id_state.deduce_output(add_opcode_input.pc)); \
+             let a = f.get_m31(28);",
+        );
+        assert!(
+            lw.skips
+                .iter()
+                .any(|s| s.detail.contains("out of range for Felt252")),
+            "skips: {:?}",
+            lw.skips
+        );
+    }
+
+    /// f252 → w27 conversion (G2): 10 limbs, each `f9[3j] + f9[3j+1]*2^9 + f9[3j+2]*2^18`
+    /// (j=9 → f9[27] alone); pure felt_get_m31 + m31_mul/m31_add — REAL lowering.
+    #[test]
+    fn from_packed_felt252_lowers_to_limb_schoolbook() {
+        let lw = lower_snippet(
+            &[],
+            "let f = memory_id_to_big_state.deduce_output(memory_address_to_id_state.deduce_output(add_opcode_input.pc)); \
+             let w = PackedFelt252Width27::from_packed_felt252(f); \
+             let x = w.get_m31(0); let y = w.get_m31(9);",
+        );
+        assert_eq!(lw.env["w"], Ty::FeltW27Limbs);
+        assert_eq!(lw.env["x"], Ty::M31);
+        assert_eq!(lw.env["y"], Ty::M31);
+        assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
+        assert_eq!(lw.w27_sites, 0, "limb-backed W27 must not be census-only");
+        let s = lw
+            .out
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 28 limb extractions, weighted by 2^9 / 2^18.
+        assert_eq!(s.matches("felt_get_m31").count(), 28);
+        assert!(lw.referenced_m31.contains(&512));
+        assert!(lw.referenced_m31.contains(&262144));
+        // get_m31 on the limb-backed value is an array projection, not an eval op.
+        assert!(s.contains("[9]"), "limb projection: {s}");
+    }
+
+    /// w27 → f252 needs 27-bit shift/mask (u32 extension) — census-only, typed Felt252.
+    #[test]
+    fn from_packed_felt252width27_is_census_only() {
+        let lw = lower_snippet_full(
+            &[],
+            BTreeMap::new(),
+            Ty::FeltW27,
+            "let f = PackedFelt252::from_packed_felt252width27(add_opcode_input); \
+             let a = f.get_m31(20);",
+            vec![],
+        );
+        assert_eq!(lw.env["f"], Ty::Felt252);
+        assert_eq!(lw.env["a"], Ty::M31);
+        assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
+        assert_eq!(lw.w27_sites, 1);
+    }
+
+    /// `seq.packed_at(row_index)` is the packed row index — census-only M31 (G4).
+    #[test]
+    fn seq_packed_at_is_census_only_m31() {
+        let lw = lower_snippet(&[], "let s = seq.packed_at(row_index); let t = (s) * (s);");
+        assert_eq!(lw.env["s"], Ty::M31);
+        assert_eq!(lw.env["t"], Ty::M31);
+        assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
+        assert_eq!(lw.seq_sites, 1);
+    }
+
+    /// from_limbs with the wrong arity is a loud skip (the trait op is `[M31; 28]`).
+    #[test]
+    fn felt_from_limbs_arity_is_checked() {
+        let lw = lower_snippet(
+            &[],
+            "let a = add_opcode_input.ap; let f = PackedFelt252::from_limbs([a, a, a]);",
+        );
+        assert!(
+            lw.skips.iter().any(|s| s.detail.contains("!= 28 limbs")),
+            "skips: {:?}",
+            lw.skips
         );
     }
 
