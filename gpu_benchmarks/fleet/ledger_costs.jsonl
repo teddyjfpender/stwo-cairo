@@ -22,3 +22,4 @@
 {"ts": "2026-07-03T17:39:57+00:00", "event": "run", "pod_id": "kkogzcvy29ixbb", "gpu": "H100 NVL", "usd_hr": 2.59, "purpose": "round13-stage0-aprime", "run_id": "20260703T173524Z.jit-witness-gate", "note": "FAIL"}
 {"ts": "2026-07-03T17:57:47+00:00", "event": "run", "pod_id": "kkogzcvy29ixbb", "gpu": "H100 NVL", "usd_hr": 2.59, "purpose": "round13-v2", "run_id": "20260703T174506Z.jit-witness-gate", "note": "PASS"}
 {"ts": "2026-07-03T17:59:27+00:00", "event": "stop", "pod_id": "kkogzcvy29ixbb", "gpu": "H100 NVL", "usd_hr": 2.59}
+{"ts": "2026-07-04T14:31:23+00:00", "event": "run", "pod_id": "kkogzcvy29ixbb", "gpu": "H100 NVL", "usd_hr": 2.59, "purpose": "A2-pipelined-commit + B2-stream-fanout duty-cycle validation", "run_id": "20260704T141736Z.jit-witness-gate", "note": "FAIL"}

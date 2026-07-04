@@ -1,0 +1,88 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export TENT=/workspace/stwo-cairo/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip; export OUT=/workspace/out; STWO_WITNESS_JIT_SELFTEST=1 STWO_WITNESS_JIT_SOURCE=emitted STWO_WITNESS_JIT_SAMPLES=200000 $GB --pie $TENT --backend cuda 2>&1
+--8<-- output --8<--
+stwo witness-JIT: registered dynamic program component=add_opcode instrs=483
+stwo witness-JIT: registered dynamic program component=assert_eq_opcode instrs=151
+stwo witness-JIT: registered dynamic program component=jnz_opcode_taken instrs=318
+stwo witness-JIT: registered dynamic program component=add_opcode_small instrs=428
+stwo witness-JIT: registered dynamic program component=assert_eq_opcode_imm instrs=112
+stwo witness-JIT: registered dynamic program component=assert_eq_opcode_double_deref instrs=223
+stwo witness-JIT: registered dynamic program component=call_opcode_abs instrs=252
+stwo witness-JIT: registered dynamic program component=call_opcode_rel_imm instrs=237
+stwo witness-JIT: registered dynamic program component=jnz_opcode_non_taken instrs=137
+stwo witness-JIT: registered dynamic program component=jump_opcode_abs instrs=167
+stwo witness-JIT: registered dynamic program component=jump_opcode_double_deref instrs=246
+stwo witness-JIT: registered dynamic program component=jump_opcode_rel instrs=192
+stwo witness-JIT: registered dynamic program component=jump_opcode_rel_imm instrs=149
+stwo witness-JIT: registered dynamic program component=ret_opcode instrs=168
+selftest inputs: vm_s=0.247 adapt_s=0.066 n_addr=619509 n_big=12361 n_small=133978 add_opcode=54573 assert_eq_opcode=47071 jnz_opcode_taken=34395 (cap=200000)
+=== WITNESS_JIT_SELFTEST ===
+device_exec_tables: n_addrs=619509 n_big=12361 n_small=133978 big_col_len=16384 small_col_len=262144 h2d_bytes=5017236 (4.8 MiB) build_s=0.179
+LEG deduce_output : checked=619508 mismatch=0 [0.117s] 619508 addrs (big+small), 28 limbs each
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_1535458b582bc8dc key=22ced9c647a52914 source_bytes=25772 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_1535458b582bc8dc nvrtc_ms=200
+stwo JIT: module load start kernel=stwo_jit_witness_1535458b582bc8dc ptx_bytes=88764 relax_opt=0
+stwo JIT: stwo_jit_witness_1535458b582bc8dc ready in 303 ms (module_load_ms=101, NVRTC compile)
+LEG wt:add_opcode : checked=12715509 mismatch=0 [0.521s] 54573 states x 103 cols + 117 lookup + 13 sub words; 157 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_c4b01b327c2ce2a3 key=68f4a4c5e4b1669f source_bytes=8623 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_c4b01b327c2ce2a3 nvrtc_ms=82
+stwo JIT: module load start kernel=stwo_jit_witness_c4b01b327c2ce2a3 ptx_bytes=17299 relax_opt=0
+stwo JIT: stwo_jit_witness_c4b01b327c2ce2a3 ready in 104 ms (module_load_ms=20, NVRTC compile)
+LEG wt:assert_eq_opcode : checked=2118195 mismatch=0 [0.143s] 47071 states x 12 cols + 24 lookup + 9 sub words; 2122 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_b37424b6011f268e key=c86a4519d519fce2 source_bytes=16744 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_b37424b6011f268e nvrtc_ms=170
+stwo JIT: module load start kernel=stwo_jit_witness_b37424b6011f268e ptx_bytes=60098 relax_opt=0
+stwo JIT: stwo_jit_witness_b37424b6011f268e ready in 239 ms (module_load_ms=67, NVRTC compile)
+LEG wt:jnz_opcode_taken : checked=4884090 mismatch=0 [0.317s] 34395 states x 47 cols + 84 lookup + 11 sub words; 191 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_643d6ea7402e00f9 key=210ed47e2371a97e source_bytes=21630 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_643d6ea7402e00f9 nvrtc_ms=152
+stwo JIT: module load start kernel=stwo_jit_witness_643d6ea7402e00f9 ptx_bytes=54188 relax_opt=0
+stwo JIT: stwo_jit_witness_643d6ea7402e00f9 ready in 211 ms (module_load_ms=57, NVRTC compile)
+LEG wt:add_opcode_small : checked=19024330 mismatch=0 [0.512s] 112570 states x 39 cols + 117 lookup + 13 sub words; 607 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_e17e872ded26ebd1 key=a033657624d745e1 source_bytes=6858 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_e17e872ded26ebd1 nvrtc_ms=78
+stwo JIT: module load start kernel=stwo_jit_witness_e17e872ded26ebd1 ptx_bytes=13162 relax_opt=0
+stwo JIT: stwo_jit_witness_e17e872ded26ebd1 ready in 96 ms (module_load_ms=16, NVRTC compile)
+LEG wt:assert_eq_opcode_imm : checked=1242822 mismatch=0 [0.116s] 29591 states x 9 cols + 24 lookup + 9 sub words; 352 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_06f670fcbec124d8 key=0138d970bce7f19e source_bytes=12057 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_06f670fcbec124d8 nvrtc_ms=101
+stwo JIT: module load start kernel=stwo_jit_witness_06f670fcbec124d8 ptx_bytes=30878 relax_opt=0
+stwo JIT: stwo_jit_witness_06f670fcbec124d8 ready in 136 ms (module_load_ms=33, NVRTC compile)
+LEG wt:assert_eq_opcode_double_deref : checked=11539506 mismatch=0 [0.317s] 132638 states x 19 cols + 57 lookup + 11 sub words; 1041 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_3343f9826788070c key=6018cfa7f6150f62 source_bytes=13379 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_3343f9826788070c nvrtc_ms=126
+stwo JIT: module load start kernel=stwo_jit_witness_3343f9826788070c ptx_bytes=39517 relax_opt=0
+stwo JIT: stwo_jit_witness_3343f9826788070c ready in 165 ms (module_load_ms=37, NVRTC compile)
+LEG wt:call_opcode_abs : checked=10075 mismatch=0 [0.167s] 65 states x 25 cols + 117 lookup + 13 sub words; 2 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_ce0ddfc37a60580e key=f7df47e5a80bd170 source_bytes=12633 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_ce0ddfc37a60580e nvrtc_ms=125
+stwo JIT: module load start kernel=stwo_jit_witness_ce0ddfc37a60580e ptx_bytes=37086 relax_opt=0
+stwo JIT: stwo_jit_witness_ce0ddfc37a60580e ready in 165 ms (module_load_ms=38, NVRTC compile)
+LEG wt:call_opcode_rel_imm : checked=2504656 mismatch=0 [0.197s] 16264 states x 24 cols + 117 lookup + 13 sub words; 561 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_1ab1e90dff938797 key=47f18c3b996f0408 source_bytes=8020 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_1ab1e90dff938797 nvrtc_ms=84
+stwo JIT: module load start kernel=stwo_jit_witness_1ab1e90dff938797 ptx_bytes=17427 relax_opt=0
+stwo JIT: stwo_jit_witness_1ab1e90dff938797 ready in 106 ms (module_load_ms=19, NVRTC compile)
+LEG wt:jnz_opcode_non_taken : checked=541098 mismatch=0 [0.113s] 7842 states x 9 cols + 51 lookup + 9 sub words; 175 distinct instrs
+LEG wt:jump_opcode_abs : checked=0 mismatch=0 [0.000s] SKIPPED: no states of this opcode in the PIE
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_a2cb569f891013bf key=de277a6fc79ca15c source_bytes=13074 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_a2cb569f891013bf nvrtc_ms=112
+stwo JIT: module load start kernel=stwo_jit_witness_a2cb569f891013bf ptx_bytes=35663 relax_opt=0
+stwo JIT: stwo_jit_witness_a2cb569f891013bf ready in 149 ms (module_load_ms=35, NVRTC compile)
+LEG wt:jump_opcode_double_deref : checked=7424 mismatch=0 [0.150s] 64 states x 21 cols + 84 lookup + 11 sub words; 1 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_c7457acb39874135 key=4fe4f864ddec1802 source_bytes=10418 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_c7457acb39874135 nvrtc_ms=94
+stwo JIT: module load start kernel=stwo_jit_witness_c7457acb39874135 ptx_bytes=24023 relax_opt=0
+stwo JIT: stwo_jit_witness_c7457acb39874135 ready in 122 ms (module_load_ms=26, NVRTC compile)
+LEG wt:jump_opcode_rel : checked=1976 mismatch=0 [0.123s] 26 states x 16 cols + 51 lookup + 9 sub words; 1 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_7db50b96e3fbaedb key=86986262183545b3 source_bytes=8495 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_7db50b96e3fbaedb nvrtc_ms=87
+stwo JIT: module load start kernel=stwo_jit_witness_7db50b96e3fbaedb ptx_bytes=19548 relax_opt=0
+stwo JIT: stwo_jit_witness_7db50b96e3fbaedb ready in 111 ms (module_load_ms=22, NVRTC compile)
+LEG wt:jump_opcode_rel_imm : checked=1814415 mismatch=0 [0.135s] 24855 states x 13 cols + 51 lookup + 9 sub words; 64 distinct instrs
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_a290ddc144ee416a key=13477ff671645f42 source_bytes=9486 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_a290ddc144ee416a nvrtc_ms=99
+stwo JIT: module load start kernel=stwo_jit_witness_a290ddc144ee416a ptx_bytes=28020 relax_opt=0
+stwo JIT: stwo_jit_witness_a290ddc144ee416a ready in 128 ms (module_load_ms=26, NVRTC compile)
+LEG wt:ret_opcode : checked=1812519 mismatch=0 [0.145s] 16329 states x 16 cols + 84 lookup + 11 sub words; 310 distinct instrs
+=== SELFTEST PASS : 14 legs passed, 1 skipped, 0 failed ===

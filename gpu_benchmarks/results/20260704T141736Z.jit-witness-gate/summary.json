@@ -1,0 +1,163 @@
+{
+  "run_id": "20260704T141736Z.jit-witness-gate",
+  "manifest": "jit-witness-gate",
+  "pod": {
+    "id": "kkogzcvy29ixbb",
+    "gpu": "H100 NVL",
+    "usd_hr": 2.59
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "a46b4f0581df",
+      "diff_sha256": "e3b0c44298fc1c14",
+      "dirty": false
+    },
+    "stwo-cairo": {
+      "rev": "2284e3412ff5",
+      "diff_sha256": "e3b0c44298fc1c14",
+      "dirty": false
+    }
+  },
+  "steps": [
+    {
+      "name": "prereqs",
+      "rc": 0,
+      "seconds": 1.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-determinism",
+      "rc": 0,
+      "seconds": 263.1,
+      "passed": true,
+      "reasons": [
+        "GPU idle alarm during gpu_bound step"
+      ],
+      "artifacts": [],
+      "gpu_idle_alarm": true
+    },
+    {
+      "name": "selftest-emitted",
+      "rc": 0,
+      "seconds": 5.7,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "device-interaction-selftest",
+      "rc": 0,
+      "seconds": 2.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-lane-off",
+      "rc": 0,
+      "seconds": 49.0,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [
+        "sn2_off.json"
+      ],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-lane-on",
+      "rc": 0,
+      "seconds": 49.5,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [
+        "sn2_on.json"
+      ],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-lane-on-reps",
+      "rc": 0,
+      "seconds": 66.1,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [
+        "sn2_on_reps.json"
+      ],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-span-delta",
+      "rc": 0,
+      "seconds": 31.1,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-fused-commit",
+      "rc": 0,
+      "seconds": 47.8,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [
+        "sn2_fused.json"
+      ],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-device-interaction",
+      "rc": 0,
+      "seconds": 46.9,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [
+        "sn2_di.json"
+      ],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-force-relax",
+      "rc": 0,
+      "seconds": 109.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [
+        "sn2_rx.json"
+      ],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-async-spine",
+      "rc": 0,
+      "seconds": 46.7,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [
+        "sn2_as.json"
+      ],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-pipelined-commit",
+      "rc": 0,
+      "seconds": 46.6,
+      "passed": false,
+      "reasons": [
+        "must_match failed: 'PC_ENGAGED'",
+        "must_not_match hit: 'PC_NOT_ENGAGED'"
+      ],
+      "artifacts": [
+        "sn2_pc.json"
+      ],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": false,
+  "wall_s": 827.3
+}

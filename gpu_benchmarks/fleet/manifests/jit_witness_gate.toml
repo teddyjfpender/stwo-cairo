@@ -265,7 +265,7 @@ STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_DEVICE_INTERACTION=1 STWO_CUDA_PIPELINED
 STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/sn2_pc.proof $GB --pie $SN/SN_PIE_2.zip \
   --backend cuda --reps 2 --reuse-input > $OUT/sn2_pc.json 2> $OUT/sn2_pc.err; rc=$?
 tail -1 $OUT/sn2_pc.json
-grep -q 'A. engaged' $OUT/sn2_pc.err && echo PC_ENGAGED || echo PC_NOT_ENGAGED
+grep -q 'A2 engaged' $OUT/sn2_pc.err && echo PC_ENGAGED || echo PC_NOT_ENGAGED
 a=$(sha256sum $OUT/sn2_off.proof | cut -d' ' -f1)
 b=$(sha256sum $OUT/sn2_pc.proof  | cut -d' ' -f1)
 if [ "$a" = "$b" ]; then echo PC_PROOF_MATCH; else echo PC_PROOF_DIVERGED; fi
@@ -295,7 +295,7 @@ STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_DEVICE_INTERACTION=1 STWO_CUDA_STREAM_FA
 STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/sn2_sf.proof $GB --pie $SN/SN_PIE_2.zip \
   --backend cuda --reps 2 --reuse-input > $OUT/sn2_sf.json 2> $OUT/sn2_sf.err; rc=$?
 tail -1 $OUT/sn2_sf.json
-grep -q 'B. engaged' $OUT/sn2_sf.err && echo SF_ENGAGED || echo SF_NOT_ENGAGED
+grep -q 'B2 engaged' $OUT/sn2_sf.err && echo SF_ENGAGED || echo SF_NOT_ENGAGED
 a=$(sha256sum $OUT/sn2_off.proof | cut -d' ' -f1)
 b=$(sha256sum $OUT/sn2_sf.proof  | cut -d' ' -f1)
 if [ "$a" = "$b" ]; then echo SF_PROOF_MATCH; else echo SF_PROOF_DIVERGED; fi

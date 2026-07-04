@@ -1248,8 +1248,11 @@ impl CairoClaimGenerator {
                     use std::sync::Once;
                     static ENGAGED: Once = Once::new();
                     ENGAGED.call_once(|| {
+                        // ASCII-only marker ("A2", not "A\u{2033}"): a grep pattern like
+                        // `A. engaged` matches a single BYTE for `.`, which cannot span the
+                        // 3-byte UTF-8 prime, so a unicode marker reads as never-engaged.
                         eprintln!(
-                            "STWO_CUDA_PIPELINED_COMMIT: A\u{2033} engaged — {} opcode-prefix \
+                            "STWO_CUDA_PIPELINED_COMMIT: A2 engaged - {} opcode-prefix \
                          columns interpolating on a committer thread under the host-heavy witness \
                          components",
                             opcode_evals.len()

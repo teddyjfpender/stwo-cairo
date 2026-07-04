@@ -1,0 +1,6 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export TENT=/workspace/stwo-cairo/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip; export OUT=/workspace/out; STWO_BENCH_TRACE=json STWO_CUDA_WITNESS_JIT_PROVE=1 $GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 1 --reuse-input 2>&1 | grep -o '"wt:add_opcode":{[^}]*}' || true
+echo span-delta-recorded
+--8<-- output --8<--
+"wt:add_opcode":{"count":1,"pool_gb_at_close":4.735,"total_ms":728.311}
+span-delta-recorded

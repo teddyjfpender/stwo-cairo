@@ -1,0 +1,10 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export TENT=/workspace/stwo-cairo/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip; export OUT=/workspace/out; STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_DEVICE_INTERACTION=1 STWO_CUDA_ASYNC_SPINE=1 STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/sn2_as.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 2 --reuse-input > $OUT/sn2_as.json 2> $OUT/sn2_as.err; rc=$?
+tail -1 $OUT/sn2_as.json
+a=$(sha256sum $OUT/sn2_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/sn2_as.proof  | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo AS_PROOF_MATCH; else echo AS_PROOF_DIVERGED; fi
+exit $rc
+--8<-- output --8<--
+{"adapt_s":1.1,"backend":"cuda","bootloader_overhead_pct":3.51,"cycle_count":7977397,"fold_step":3,"gpu":"NVIDIA H100 NVL","host_mem_gb":1511.351,"mhz":0.513,"n":1,"n_queries":70,"nproc":16,"peak_rss_gb":20.276,"pie_n_steps":7706864,"pool_reserved_high_gb":36.776,"pool_used_high_gb":35.495,"pow_bits":26,"program":"SN_PIE_2.zip","proof_kb":3006.636,"prove_s_cold":19.402,"prove_s_warm":15.562,"security_bits":96,"steps_per_s":512636.0,"useful_mhz":0.495,"verify_ms":17.068,"vm_s":5.348,"vram_end_gb":37.448,"vram_peak_gb":37.448}
+AS_PROOF_MATCH
