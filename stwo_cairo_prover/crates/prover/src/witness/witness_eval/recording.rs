@@ -141,6 +141,7 @@ impl WitnessEval for RecordingWitnessEval {
     type U16 = RecVal;
     type Mask = RecVal;
     type Felt = RecFelt;
+    type U32 = RecVal;
 
     // ---- Leaves ----------------------------------------------------------------
 
@@ -155,6 +156,31 @@ impl WitnessEval for RecordingWitnessEval {
     #[inline]
     fn enabler(&mut self) -> RecVal {
         let slot = self.enabler_slot;
+        RecVal::Ok(self.recorder.input(slot))
+    }
+
+    // ---- u32 integer ops (blake family) — bit-exact ISA lowerings of the
+    // ---- PackedUInt32 semantics (common prover_types/simd.rs:192-209) -------------
+
+    #[inline]
+    fn u32_from_limbs(&mut self, low: RecVal, high: RecVal) -> RecVal {
+        // low + (high << 16): both operands canonical 16-bit, so the raw u32 ops are
+        // exact (no overflow below 2^32).
+        let shifted = self.un(high, |r, x| r.u32_shl(x, 16));
+        self.bin(low, shifted, |r, x, y| r.u32_add(x, y))
+    }
+    #[inline]
+    fn u32_low(&mut self, a: RecVal) -> RecVal {
+        self.un(a, |r, x| r.u32_and(x, 0xFFFF))
+    }
+    #[inline]
+    fn u32_high(&mut self, a: RecVal) -> RecVal {
+        self.un(a, |r, x| r.u32_shr(x, 16))
+    }
+    #[inline]
+    fn input_u32(&mut self, slot: u32) -> RecVal {
+        // Same Input op — the kernel reads the raw u32 word from the input column;
+        // M31-vs-u32 is a transformer-side typing distinction only.
         RecVal::Ok(self.recorder.input(slot))
     }
 
@@ -200,6 +226,16 @@ impl WitnessEval for RecordingWitnessEval {
             RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
             RecFelt::Limbs(vec![p; FELT_N_LIMBS]),
         ]
+    }
+
+    fn deduce_blake_g(&mut self, _input: [RecVal; 6]) -> [RecVal; 4] {
+        let p = self.poison("deduce_blake_g");
+        [p; 4]
+    }
+
+    fn deduce_blake_round_sigma(&mut self, _round: RecVal) -> [RecVal; 16] {
+        let p = self.poison("deduce_blake_round_sigma");
+        [p; 16]
     }
 
     // ---- M31 field ops (ISA-core) ----------------------------------------------
@@ -342,6 +378,10 @@ impl WitnessEval for RecordingWitnessEval {
         }
     }
     #[inline]
+    fn set_sub_input_word_u32(&mut self, word: usize, value: RecVal) {
+        // Same SubWord op — raw register store; the flat word is full 32-bit.
+        self.set_sub_input_word(word, value);
+    }
     fn set_sub_input_word(&mut self, word: usize, value: RecVal) {
         // Sub-component inputs are first-class ISA effects (`WitnessOp::SubWord`): the
         // kernel stores them into a flat per-row buffer that the prove-path hook D2H\'s

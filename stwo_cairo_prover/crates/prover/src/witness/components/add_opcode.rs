@@ -1542,14 +1542,30 @@ fn write_trace_generic_simd(
                 *lookup_data.mults_0 = lw[115];
                 *lookup_data.mults_1 = lw[116];
                 let sw = eval.sub_scratch();
-                *sub_component_inputs.verify_instruction[0] =
-                    (sw[0], [sw[1], sw[2], sw[3]], [sw[4], sw[5]], sw[6]);
-                *sub_component_inputs.memory_address_to_id[0] = sw[7];
-                *sub_component_inputs.memory_address_to_id[1] = sw[8];
-                *sub_component_inputs.memory_address_to_id[2] = sw[9];
-                *sub_component_inputs.memory_id_to_big[0] = sw[10];
-                *sub_component_inputs.memory_id_to_big[1] = sw[11];
-                *sub_component_inputs.memory_id_to_big[2] = sw[12];
+                *sub_component_inputs.verify_instruction[0] = (
+                    unsafe { PackedM31::from_simd_unchecked(sw[0]) },
+                    [
+                        unsafe { PackedM31::from_simd_unchecked(sw[1]) },
+                        unsafe { PackedM31::from_simd_unchecked(sw[2]) },
+                        unsafe { PackedM31::from_simd_unchecked(sw[3]) },
+                    ],
+                    [unsafe { PackedM31::from_simd_unchecked(sw[4]) }, unsafe {
+                        PackedM31::from_simd_unchecked(sw[5])
+                    }],
+                    unsafe { PackedM31::from_simd_unchecked(sw[6]) },
+                );
+                *sub_component_inputs.memory_address_to_id[0] =
+                    unsafe { PackedM31::from_simd_unchecked(sw[7]) };
+                *sub_component_inputs.memory_address_to_id[1] =
+                    unsafe { PackedM31::from_simd_unchecked(sw[8]) };
+                *sub_component_inputs.memory_address_to_id[2] =
+                    unsafe { PackedM31::from_simd_unchecked(sw[9]) };
+                *sub_component_inputs.memory_id_to_big[0] =
+                    unsafe { PackedM31::from_simd_unchecked(sw[10]) };
+                *sub_component_inputs.memory_id_to_big[1] =
+                    unsafe { PackedM31::from_simd_unchecked(sw[11]) };
+                *sub_component_inputs.memory_id_to_big[2] =
+                    unsafe { PackedM31::from_simd_unchecked(sw[12]) };
             },
         );
     (trace, lookup_data, sub_component_inputs)
@@ -1647,103 +1663,46 @@ fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
     ]
 }
 
-/// Flatten an accessor-built `InteractionClaimGenerator`'s private `LookupData` for
-/// byte-comparison against `GenericSimdDiff::orig_lookup` (the prove-accessor gate).
-#[cfg(test)]
-pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
-    lookup_data_flat(&ig.lookup_data)
-}
-
-/// PROVE-LANE SHADOW DIFF (debug instrument, `STWO_JIT_PROVE_SHADOW=1`): run the
-/// host SIMD writer — a PURE read of the states, no feeding — beside the device
-/// lane's outputs and report the first divergences per surface (committed trace,
-/// lookup words, sub words) with exact (row, column/word) coordinates. Observation
-/// only; the caller's lane proceeds unchanged.
-pub(crate) fn shadow_compare_against_host(
-    inputs: &[InputType],
-    device_cols: &[Vec<u32>],
-    lookup_flat: &[u32],
-    sub_flat: &[u32],
-    n_padded: usize,
-    memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
-    memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
-    verify_instruction_state: &verify_instruction::ClaimGenerator,
-) {
-    use stwo::prover::backend::simd::m31::N_LANES;
-    let n_rows = inputs.len();
-    let mut padded = inputs.to_vec();
-    padded.resize(n_padded, *padded.first().unwrap());
-    let packed = pack_values(&padded);
-    let (trace, ld, sci) = write_trace_simd(
-        packed,
-        n_rows,
-        memory_address_to_id_state,
-        memory_id_to_big_state,
-        verify_instruction_state,
-    );
-    let n_packed_rows = n_padded / N_LANES;
-    let mut bad = 0usize;
-    for r in 0..n_padded {
-        let host_row = trace.row_at(r);
-        for c in 0..N_TRACE_COLUMNS {
-            if device_cols[c][r] != host_row[c].0 {
-                eprintln!(
-                    "SHADOW trace row {r} col {c}: host {} device {} (real={})",
-                    host_row[c].0,
-                    device_cols[c][r],
-                    r < n_rows
-                );
-                bad += 1;
-                if bad >= 8 {
-                    return;
-                }
-            }
-        }
-    }
-    let mut check_flats = |name: &str, flats: Vec<Vec<PackedM31>>, dev: &[u32]| {
-        let mut w = 0usize;
-        for (fi, field) in flats.iter().enumerate() {
-            let width = field.len() / n_packed_rows;
-            for k in 0..width {
-                for r in 0..n_padded {
-                    let hv = field[(r / N_LANES) * width + k].to_array()[r % N_LANES].0;
-                    let dv = dev[w * n_padded + r];
-                    if hv != dv {
-                        eprintln!(
-                            "SHADOW {name} row {r} word {w} (field {fi}+{k}): host {hv} \
-                             device {dv} (real={})",
-                            r < n_rows
-                        );
-                        bad += 1;
-                        if bad >= 16 {
-                            return;
-                        }
-                    }
-                }
-                w += 1;
-            }
-        }
-    };
-    check_flats("lookup", lookup_data_flat(&ld), lookup_flat);
-    check_flats("sub", sub_inputs_flat(&sci), sub_flat);
-    eprintln!(
-        "SHADOW add_opcode: {} divergences ({} padded rows, {} real)",
-        bad, n_padded, n_rows
-    );
-}
-
-fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<PackedM31>> {
+fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
     vec![
         sci.verify_instruction[0]
             .iter()
-            .flat_map(|t| vec![t.0, t.1[0], t.1[1], t.1[2], t.2[0], t.2[1], t.3])
+            .flat_map(|t| {
+                vec![
+                    t.0.into_simd(),
+                    t.1[0].into_simd(),
+                    t.1[1].into_simd(),
+                    t.1[2].into_simd(),
+                    t.2[0].into_simd(),
+                    t.2[1].into_simd(),
+                    t.3.into_simd(),
+                ]
+            })
             .collect::<Vec<_>>(),
-        sci.memory_address_to_id[0].clone(),
-        sci.memory_address_to_id[1].clone(),
-        sci.memory_address_to_id[2].clone(),
-        sci.memory_id_to_big[0].clone(),
-        sci.memory_id_to_big[1].clone(),
-        sci.memory_id_to_big[2].clone(),
+        sci.memory_address_to_id[0]
+            .iter()
+            .map(|v| v.into_simd())
+            .collect::<Vec<_>>(),
+        sci.memory_address_to_id[1]
+            .iter()
+            .map(|v| v.into_simd())
+            .collect::<Vec<_>>(),
+        sci.memory_address_to_id[2]
+            .iter()
+            .map(|v| v.into_simd())
+            .collect::<Vec<_>>(),
+        sci.memory_id_to_big[0]
+            .iter()
+            .map(|v| v.into_simd())
+            .collect::<Vec<_>>(),
+        sci.memory_id_to_big[1]
+            .iter()
+            .map(|v| v.into_simd())
+            .collect::<Vec<_>>(),
+        sci.memory_id_to_big[2]
+            .iter()
+            .map(|v| v.into_simd())
+            .collect::<Vec<_>>(),
     ]
 }
 
@@ -1755,8 +1714,8 @@ pub(crate) struct GenericSimdDiff {
     pub gen_rows: Vec<[M31; N_TRACE_COLUMNS]>,
     pub orig_lookup: Vec<Vec<PackedM31>>,
     pub gen_lookup: Vec<Vec<PackedM31>>,
-    pub orig_sub: Vec<Vec<PackedM31>>,
-    pub gen_sub: Vec<Vec<PackedM31>>,
+    pub orig_sub: Vec<Vec<Simd<u32, N_LANES>>>,
+    pub gen_sub: Vec<Vec<Simd<u32, N_LANES>>>,
     pub orig_interaction_cols: Vec<Vec<M31>>,
     pub gen_interaction_cols: Vec<Vec<M31>>,
     pub orig_claimed_sum: SecureField,
@@ -1774,7 +1733,7 @@ pub(crate) fn generic_simd_diff(
 ) -> GenericSimdDiff {
     let (trace_o, ld_o, sci_o) = write_trace_simd(
         inputs.clone(),
-        n_rows,
+        n_rows.clone(),
         memory_address_to_id_state,
         memory_id_to_big_state,
         verify_instruction_state,
@@ -1944,6 +1903,115 @@ impl InteractionClaimGenerator {
 // flat-word layouts mirror the emitted `set_lookup_word`/`set_sub_input_word`
 // indices exactly (declaration order); both are regression-fenced by
 // `jit_prove_backend::tests`. ---
+
+/// Flatten an accessor-built `InteractionClaimGenerator`'s private `LookupData` for
+/// byte-comparison against `GenericSimdDiff::orig_lookup` (the prove-accessor gate).
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
+}
+
+/// PROVE-LANE SHADOW DIFF (debug instrument, `STWO_JIT_PROVE_SHADOW=1`): run the
+/// host SIMD writer — a PURE read of the states, no feeding — beside the device
+/// lane's outputs and report the first divergences per surface (committed trace,
+/// lookup words, sub words) with exact (row, column/word) coordinates. Observation
+/// only; the caller's lane proceeds unchanged.
+pub(crate) fn shadow_compare_against_host(
+    inputs: &[InputType],
+    device_cols: &[Vec<u32>],
+    lookup_flat: &[u32],
+    sub_flat: &[u32],
+    n_padded: usize,
+    memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
+    memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
+    verify_instruction_state: &verify_instruction::ClaimGenerator,
+) {
+    use stwo::prover::backend::simd::m31::N_LANES;
+    let n_rows = inputs.len();
+    let mut padded = inputs.to_vec();
+    padded.resize(n_padded, *padded.first().unwrap());
+    let packed = pack_values(&padded);
+    let (trace, ld, sci) = write_trace_simd(
+        packed,
+        n_rows,
+        memory_address_to_id_state,
+        memory_id_to_big_state,
+        verify_instruction_state,
+    );
+    let n_packed_rows = n_padded / N_LANES;
+    let mut bad = 0usize;
+    for r in 0..n_padded {
+        let host_row = trace.row_at(r);
+        for c in 0..N_TRACE_COLUMNS {
+            if device_cols[c][r] != host_row[c].0 {
+                eprintln!(
+                    "SHADOW trace row {r} col {c}: host {} device {} (real={})",
+                    host_row[c].0,
+                    device_cols[c][r],
+                    r < n_rows
+                );
+                bad += 1;
+                if bad >= 8 {
+                    return;
+                }
+            }
+        }
+    }
+    let mut check_flats = |name: &str, flats: Vec<Vec<PackedM31>>, dev: &[u32]| {
+        let mut w = 0usize;
+        for (fi, field) in flats.iter().enumerate() {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                for r in 0..n_padded {
+                    let hv = field[(r / N_LANES) * width + k].to_array()[r % N_LANES].0;
+                    let dv = dev[w * n_padded + r];
+                    if hv != dv {
+                        eprintln!(
+                            "SHADOW {name} row {r} word {w} (field {fi}+{k}): host {hv} \
+                             device {dv} (real={})",
+                            r < n_rows
+                        );
+                        bad += 1;
+                        if bad >= 16 {
+                            return;
+                        }
+                    }
+                }
+                w += 1;
+            }
+        }
+    };
+    check_flats("lookup", lookup_data_flat(&ld), lookup_flat);
+    let mut check_raw = |name: &str, flats: Vec<Vec<Simd<u32, N_LANES>>>, dev: &[u32]| {
+        let mut w = 0usize;
+        for (fi, field) in flats.iter().enumerate() {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                for r in 0..n_padded {
+                    let hv = field[(r / N_LANES) * width + k].as_array()[r % N_LANES];
+                    let dv = dev[w * n_padded + r];
+                    if hv != dv {
+                        eprintln!(
+                            "SHADOW {name} row {r} word {w} (field {fi}+{k}): host {hv} \
+                             device {dv} (real={})",
+                            r < n_rows
+                        );
+                        bad += 1;
+                        if bad >= 16 {
+                            return;
+                        }
+                    }
+                }
+                w += 1;
+            }
+        }
+    };
+    check_raw("sub", sub_inputs_flat(&sci), sub_flat);
+    eprintln!(
+        "SHADOW add_opcode: {} divergences ({} padded rows, {} real)",
+        bad, n_padded, n_rows
+    );
+}
 
 /// Lookup field list (name, width) in `LookupData` declaration order — the §6a
 /// descriptor builder's input (trailing two scalars are `mults_0`/`mults_1`).

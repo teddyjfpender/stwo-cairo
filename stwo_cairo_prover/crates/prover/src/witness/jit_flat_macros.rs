@@ -211,7 +211,34 @@ macro_rules! jit_sub_accessors {
                 }
             };
             check_flats("lookup", lookup_data_flat(&ld), lookup_flat);
-            check_flats("sub", sub_inputs_flat(&sci), sub_flat);
+            // Sub flats travel as RAW 32-bit lanes (M31 words canonical, blake u32
+            // words full-width) — compare the raw words.
+            let mut check_raw =
+                |name: &str, flats: Vec<Vec<std::simd::Simd<u32, N_LANES>>>, dev: &[u32]| {
+                    let mut w = 0usize;
+                    for (fi, field) in flats.iter().enumerate() {
+                        let width = field.len() / n_packed_rows;
+                        for k in 0..width {
+                            for r in 0..n_padded {
+                                let hv = field[(r / N_LANES) * width + k].as_array()[r % N_LANES];
+                                let dv = dev[w * n_padded + r];
+                                if hv != dv {
+                                    eprintln!(
+                                        "SHADOW {name} row {r} word {w} (field {fi}+{k}): \
+                                         host {hv} device {dv} (real={})",
+                                        r < n_rows
+                                    );
+                                    bad += 1;
+                                    if bad >= 16 {
+                                        return;
+                                    }
+                                }
+                            }
+                            w += 1;
+                        }
+                    }
+                };
+            check_raw("sub", sub_inputs_flat(&sci), sub_flat);
             eprintln!(
                 "SHADOW {}: {} divergences ({} padded rows, {} real)",
                 module_path!(),

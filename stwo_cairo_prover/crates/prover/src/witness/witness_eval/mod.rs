@@ -115,6 +115,9 @@ pub trait WitnessEval {
     /// felt252 value — a bundle of 28 M31 limbs. Bodies only construct/extract limbs
     /// (no felt arithmetic), so this is pure bookkeeping (SIMD: `PackedFelt252`).
     type Felt: Clone;
+    /// 32-bit integer value (SIMD: `PackedUInt32`; recording: a raw SSA register —
+    /// the device kernel reads/writes full 32-bit words, which do NOT fit in M31).
+    type U32: Copy;
 
     // ---- Leaves ----------------------------------------------------------------
 
@@ -192,6 +195,20 @@ pub trait WitnessEval {
         (id, value)
     }
 
+    // ---- u32 integer ops (the blake family; full 32-bit words) -------------------
+
+    /// `PackedUInt32::from_limbs([low, high])`: `low + (high << 16)` (both operands
+    /// canonical 16-bit M31 values; common `prover_types/simd.rs:204`).
+    fn u32_from_limbs(&mut self, low: Self::M31, high: Self::M31) -> Self::U32;
+    /// `PackedUInt32::low()`: `a & 0xFFFF` (simd.rs:192).
+    fn u32_low(&mut self, a: Self::U32) -> Self::U16;
+    /// `PackedUInt32::high()`: `a >> 16` (simd.rs:198).
+    fn u32_high(&mut self, a: Self::U32) -> Self::U16;
+
+    /// Read the full-32-bit input word at `slot` (the blake message words; the device
+    /// lane's input columns are raw u32 buffers, so the same column serves both).
+    fn input_u32(&mut self, slot: u32) -> Self::U32;
+
     // ---- Builtin-lane leaves (the fp256/EC family; opcode bodies never call these) --
 
     /// The packed row index (`seq.packed_at(row_index)` — the iota column the builtin
@@ -224,6 +241,14 @@ pub trait WitnessEval {
     /// pedersen.rs): the pedersen points-table row `[x, y]` for a window index.
     fn deduce_pedersen_points_table_w18(&mut self, index: Self::M31) -> [Self::Felt; 2];
 
+    /// `PackedBlakeG::deduce_output` (fast_deduction/blake.rs): the blake g-function,
+    /// `[a, b, c, d, m0, m1] -> [a', b', c', d']` on full 32-bit words.
+    fn deduce_blake_g(&mut self, input: [Self::U32; 6]) -> [Self::U32; 4];
+
+    /// `PackedBlakeRoundSigma::deduce_output` (fast_deduction/blake.rs): the sigma
+    /// permutation row for a round index (`[M31; 16]`).
+    fn deduce_blake_round_sigma(&mut self, round: Self::M31) -> [Self::M31; 16];
+
     // ---- Effects (flat-indexed) ------------------------------------------------
 
     /// Commit `value` to trace column `col`.
@@ -235,4 +260,7 @@ pub trait WitnessEval {
     /// tuple/array scalars in declaration order; a felt-valued sub-input occupies 28
     /// consecutive words — its canonical 9-bit limbs).
     fn set_sub_input_word(&mut self, word: usize, value: Self::M31);
+    /// Emit a FULL-32-BIT sub-component-input word (the blake_g feeds). Same flat
+    /// index space as `set_sub_input_word`; the word is raw u32, not M31.
+    fn set_sub_input_word_u32(&mut self, word: usize, value: Self::U32);
 }

@@ -285,8 +285,8 @@ use crate::witness::witness_eval::recording::{RecordingOutput, RecordingWitnessE
 use crate::witness::witness_eval::simd::SimdWitnessEval;
 use crate::witness::witness_eval::{WitnessEval, SLOT_AP, SLOT_FP, SLOT_PC};
 
-const N_LOOKUP_WORDS: usize = 24;
-const N_SUB_INPUT_WORDS: usize = 9;
+pub(crate) const N_LOOKUP_WORDS: usize = 24;
+pub(crate) const N_SUB_INPUT_WORDS: usize = 9;
 
 /// The per-row `assert_eq_opcode_imm` base-trace body, routed through `WitnessEval`.
 /// Mechanical transcription of `write_trace_simd`'s per-row closure (baseline above).
@@ -503,10 +503,22 @@ fn write_trace_generic_simd(
                 *lookup_data.mults_0 = lw[22];
                 *lookup_data.mults_1 = lw[23];
                 let sw = eval.sub_scratch();
-                *sub_component_inputs.verify_instruction[0] =
-                    (sw[0], [sw[1], sw[2], sw[3]], [sw[4], sw[5]], sw[6]);
-                *sub_component_inputs.memory_address_to_id[0] = sw[7];
-                *sub_component_inputs.memory_address_to_id[1] = sw[8];
+                *sub_component_inputs.verify_instruction[0] = (
+                    unsafe { PackedM31::from_simd_unchecked(sw[0]) },
+                    [
+                        unsafe { PackedM31::from_simd_unchecked(sw[1]) },
+                        unsafe { PackedM31::from_simd_unchecked(sw[2]) },
+                        unsafe { PackedM31::from_simd_unchecked(sw[3]) },
+                    ],
+                    [unsafe { PackedM31::from_simd_unchecked(sw[4]) }, unsafe {
+                        PackedM31::from_simd_unchecked(sw[5])
+                    }],
+                    unsafe { PackedM31::from_simd_unchecked(sw[6]) },
+                );
+                *sub_component_inputs.memory_address_to_id[0] =
+                    unsafe { PackedM31::from_simd_unchecked(sw[7]) };
+                *sub_component_inputs.memory_address_to_id[1] =
+                    unsafe { PackedM31::from_simd_unchecked(sw[8]) };
             },
         );
     (trace, lookup_data, sub_component_inputs)
@@ -593,14 +605,30 @@ fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
     ]
 }
 
-fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<PackedM31>> {
+fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
     vec![
         sci.verify_instruction[0]
             .iter()
-            .flat_map(|t| vec![t.0, t.1[0], t.1[1], t.1[2], t.2[0], t.2[1], t.3])
+            .flat_map(|t| {
+                vec![
+                    t.0.into_simd(),
+                    t.1[0].into_simd(),
+                    t.1[1].into_simd(),
+                    t.1[2].into_simd(),
+                    t.2[0].into_simd(),
+                    t.2[1].into_simd(),
+                    t.3.into_simd(),
+                ]
+            })
             .collect::<Vec<_>>(),
-        sci.memory_address_to_id[0].clone(),
-        sci.memory_address_to_id[1].clone(),
+        sci.memory_address_to_id[0]
+            .iter()
+            .map(|v| v.into_simd())
+            .collect::<Vec<_>>(),
+        sci.memory_address_to_id[1]
+            .iter()
+            .map(|v| v.into_simd())
+            .collect::<Vec<_>>(),
     ]
 }
 
@@ -612,8 +640,8 @@ pub(crate) struct GenericSimdDiff {
     pub gen_rows: Vec<[M31; N_TRACE_COLUMNS]>,
     pub orig_lookup: Vec<Vec<PackedM31>>,
     pub gen_lookup: Vec<Vec<PackedM31>>,
-    pub orig_sub: Vec<Vec<PackedM31>>,
-    pub gen_sub: Vec<Vec<PackedM31>>,
+    pub orig_sub: Vec<Vec<Simd<u32, N_LANES>>>,
+    pub gen_sub: Vec<Vec<Simd<u32, N_LANES>>>,
     pub orig_interaction_cols: Vec<Vec<M31>>,
     pub gen_interaction_cols: Vec<Vec<M31>>,
     pub orig_claimed_sum: SecureField,
@@ -631,7 +659,7 @@ pub(crate) fn generic_simd_diff(
 ) -> GenericSimdDiff {
     let (trace_o, ld_o, sci_o) = write_trace_simd(
         inputs.clone(),
-        n_rows,
+        n_rows.clone(),
         memory_address_to_id_state,
         memory_id_to_big_state,
         verify_instruction_state,

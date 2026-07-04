@@ -19,6 +19,7 @@
 use stwo_cairo_common::prover_types::simd::SIMD_ENUMERATION_0;
 
 use crate::witness::components::{memory_address_to_id, memory_id_to_big};
+use crate::witness::fast_deduction::blake::{PackedBlakeG, PackedBlakeRoundSigma};
 use crate::witness::fast_deduction::pedersen::{
     PackedPartialEcMulWindowBits18, PackedPedersenPointsTableWindowBits18,
 };
@@ -31,7 +32,11 @@ use crate::witness::witness_eval::{WitnessEval, FELT_N_LIMBS, SLOT_AP, SLOT_FP, 
 /// transformer's slot map assigns and the device lane feeds its input columns).
 pub enum SimdInputs {
     Casm(PackedCasmState),
-    Flat(Vec<PackedM31>),
+    /// Flattened input words as RAW 32-bit lanes: M31 slots hold canonical values,
+    /// u32 slots (blake message words) hold full 32-bit words that do NOT fit in
+    /// `PackedM31` — the raw transport is what the device lane's u32 input columns
+    /// carry, so both evaluators read the same bytes.
+    Flat(Vec<Simd<u32, N_LANES>>),
 }
 
 impl From<PackedCasmState> for SimdInputs {
@@ -42,6 +47,12 @@ impl From<PackedCasmState> for SimdInputs {
 
 impl From<Vec<PackedM31>> for SimdInputs {
     fn from(words: Vec<PackedM31>) -> Self {
+        Self::Flat(words.into_iter().map(PackedM31::into_simd).collect())
+    }
+}
+
+impl From<Vec<Simd<u32, N_LANES>>> for SimdInputs {
+    fn from(words: Vec<Simd<u32, N_LANES>>) -> Self {
         Self::Flat(words)
     }
 }
@@ -66,9 +77,10 @@ pub struct SimdWitnessEval<'a, 'trace, const N: usize> {
     enabler: &'a Enabler,
     /// Flat lookup-tuple words written by `set_lookup_word`, reshaped by the driver.
     lookup_scratch: Vec<PackedM31>,
-    /// Flat sub-component-input words written by `set_sub_input_word`, reshaped by the
-    /// driver.
-    sub_scratch: Vec<PackedM31>,
+    /// Flat sub-component-input words (RAW 32-bit lanes: M31 words canonical, u32
+    /// words full-width) written by `set_sub_input_word{,_u32}`, reshaped by the
+    /// driver with the per-shape types.
+    sub_scratch: Vec<Simd<u32, N_LANES>>,
 }
 
 impl<'a, 'trace, const N: usize> SimdWitnessEval<'a, 'trace, N> {
@@ -95,7 +107,7 @@ impl<'a, 'trace, const N: usize> SimdWitnessEval<'a, 'trace, N> {
             row_index,
             enabler,
             lookup_scratch: vec![PackedM31::zero(); n_lookup_words],
-            sub_scratch: vec![PackedM31::zero(); n_sub_words],
+            sub_scratch: vec![Simd::splat(0); n_sub_words],
         }
     }
 
@@ -105,9 +117,10 @@ impl<'a, 'trace, const N: usize> SimdWitnessEval<'a, 'trace, N> {
         &self.lookup_scratch
     }
 
-    /// Flat sub-component-input words (declaration order across `SubComponentInputs`).
+    /// Flat sub-component-input words (declaration order across `SubComponentInputs`),
+    /// as raw 32-bit lanes; the driver rebuilds the typed values per shape.
     #[inline(always)]
-    pub fn sub_scratch(&self) -> &[PackedM31] {
+    pub fn sub_scratch(&self) -> &[Simd<u32, N_LANES>] {
         &self.sub_scratch
     }
 }
@@ -117,6 +130,7 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
     type U16 = PackedUInt16;
     type Mask = PackedBool;
     type Felt = PackedFelt252;
+    type U32 = PackedUInt32;
 
     // ---- Leaves ----------------------------------------------------------------
 
@@ -129,7 +143,11 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
                 SLOT_FP => input.fp,
                 _ => panic!("SimdWitnessEval::input: unexpected CasmState slot {slot}"),
             },
-            SimdInputs::Flat(words) => words[slot as usize],
+            // Slot typing contract: M31 slots carry canonical (< P) values — the
+            // transformer only emits `input(slot)` for M31-typed leaves.
+            SimdInputs::Flat(words) => unsafe {
+                PackedM31::from_simd_unchecked(words[slot as usize])
+            },
         }
     }
 
@@ -248,6 +266,28 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
             .deduce_output(id)
     }
 
+    // ---- u32 integer ops (blake family) ------------------------------------------
+
+    #[inline(always)]
+    fn u32_from_limbs(&mut self, low: PackedM31, high: PackedM31) -> PackedUInt32 {
+        PackedUInt32::from_limbs([low, high])
+    }
+    #[inline(always)]
+    fn u32_low(&mut self, a: PackedUInt32) -> PackedUInt16 {
+        a.low()
+    }
+    #[inline(always)]
+    fn u32_high(&mut self, a: PackedUInt32) -> PackedUInt16 {
+        a.high()
+    }
+    #[inline(always)]
+    fn input_u32(&mut self, slot: u32) -> PackedUInt32 {
+        match &self.input {
+            SimdInputs::Casm(_) => panic!("input_u32 on an opcode CasmState input"),
+            SimdInputs::Flat(words) => PackedUInt32::from_simd(words[slot as usize]),
+        }
+    }
+
     // ---- Builtin-lane leaves ----------------------------------------------------
 
     /// Bit-identical to `Seq::packed_at(self.row_index)` (common
@@ -277,6 +317,16 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
         PackedPedersenPointsTableWindowBits18::deduce_output([index])
     }
 
+    #[inline(always)]
+    fn deduce_blake_g(&mut self, input: [PackedUInt32; 6]) -> [PackedUInt32; 4] {
+        PackedBlakeG::deduce_output(input)
+    }
+
+    #[inline(always)]
+    fn deduce_blake_round_sigma(&mut self, round: PackedM31) -> [PackedM31; 16] {
+        PackedBlakeRoundSigma::deduce_output(round)
+    }
+
     // ---- Effects ---------------------------------------------------------------
 
     #[inline(always)]
@@ -289,6 +339,10 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
     }
     #[inline(always)]
     fn set_sub_input_word(&mut self, word: usize, value: PackedM31) {
-        self.sub_scratch[word] = value;
+        self.sub_scratch[word] = value.into_simd();
+    }
+    #[inline(always)]
+    fn set_sub_input_word_u32(&mut self, word: usize, value: PackedUInt32) {
+        self.sub_scratch[word] = value.simd;
     }
 }

@@ -72,6 +72,22 @@ fn fill_fixture(components: &[&str]) -> CairoClaimGenerator {
 
 /// Byte-compare two `[Vec<PackedM31>]` field bundles lane-for-lane (via `to_array`), with
 /// a descriptive failure locator.
+/// Byte-compare two raw-lane field bundles (`Simd<u32, 16>` words — the sub-input
+/// flat transport, which carries both canonical M31 words and full-32-bit u32 words).
+fn assert_raw_field_bundles_eq(
+    a: &[Vec<Simd<u32, N_LANES>>],
+    b: &[Vec<Simd<u32, N_LANES>>],
+    what: &str,
+) {
+    assert_eq!(a.len(), b.len(), "{what}: field count differs");
+    for (fi, (fa, fb)) in a.iter().zip(b.iter()).enumerate() {
+        assert_eq!(fa.len(), fb.len(), "{what}: field {fi} length differs");
+        for (i, (x, y)) in fa.iter().zip(fb.iter()).enumerate() {
+            assert_eq!(x, y, "{what}: field {fi} word {i} differs");
+        }
+    }
+}
+
 fn assert_packed_field_bundles_eq(a: &[Vec<PackedM31>], b: &[Vec<PackedM31>], what: &str) {
     assert_eq!(a.len(), b.len(), "{what}: field count differs");
     for (fi, (fa, fb)) in a.iter().zip(b.iter()).enumerate() {
@@ -119,7 +135,7 @@ macro_rules! assert_generic_diff_byte_identical {
         // (ii) Every LookupData array.
         assert_packed_field_bundles_eq(&diff.orig_lookup, &diff.gen_lookup, "lookup_data");
         // (iii) Every SubComponentInputs scalar (pre-drain).
-        assert_packed_field_bundles_eq(&diff.orig_sub, &diff.gen_sub, "sub_component_inputs");
+        assert_raw_field_bundles_eq(&diff.orig_sub, &diff.gen_sub, "sub_component_inputs");
         // Bonus: finalized interaction trace + claimed sum through the real logup path.
         assert_eq!(
             diff.orig_claimed_sum, diff.gen_claimed_sum,
@@ -215,7 +231,7 @@ macro_rules! assert_recording_interpreter_matches_host {
                 let width = field.len() / n_packed_rows;
                 for k in 0..width {
                     if !out.poisoned_sub_words.contains(&w) {
-                        let hv = field[pr * width + k].to_array()[lane].0;
+                        let hv = field[pr * width + k].as_array()[lane];
                         assert_eq!(
                             ro.sub_words[w], hv,
                             "interpreter vs host: row {r} sub word {w} (field {fi}, offset {k})"
@@ -384,7 +400,7 @@ fn add_opcode_prove_accessors_match_host() {
         let (pr, lane) = (r / N_LANES, r % N_LANES);
         let vi = &sub.verify_instruction[r];
         let host_vi: Vec<u32> = (0..7)
-            .map(|k| diff.orig_sub[0][pr * 7 + k].to_array()[lane].0)
+            .map(|k| diff.orig_sub[0][pr * 7 + k].as_array()[lane])
             .collect();
         let got_vi = [
             vi.0 .0, vi.1[0].0, vi.1[1].0, vi.1[2].0, vi.2[0].0, vi.2[1].0, vi.3 .0,
@@ -393,14 +409,14 @@ fn add_opcode_prove_accessors_match_host() {
         for (j, addrs) in sub.memory_address_to_id.iter().enumerate() {
             assert_eq!(
                 addrs[r].0,
-                diff.orig_sub[1 + j][pr].to_array()[lane].0,
+                diff.orig_sub[1 + j][pr].as_array()[lane],
                 "addr feed {j} row {r}"
             );
         }
         for (j, ids) in sub.memory_id_to_big.iter().enumerate() {
             assert_eq!(
                 ids[r].0,
-                diff.orig_sub[4 + j][pr].to_array()[lane].0,
+                diff.orig_sub[4 + j][pr].as_array()[lane],
                 "id feed {j} row {r}"
             );
         }
@@ -540,20 +556,20 @@ macro_rules! prove_accessor_parity_gate {
                     t.0 .0, t.1[0].0, t.1[1].0, t.1[2].0, t.2[0].0, t.2[1].0, t.3 .0,
                 ];
                 let host: Vec<u32> = (0..7)
-                    .map(|k| diff.orig_sub[0][pr * 7 + k].to_array()[lane].0)
+                    .map(|k| diff.orig_sub[0][pr * 7 + k].as_array()[lane])
                     .collect();
                 assert_eq!(got.as_slice(), host.as_slice(), "vi tuple row {r}");
                 for (j, col) in addrs.iter().enumerate() {
                     assert_eq!(
                         col[r].0,
-                        diff.orig_sub[1 + j][pr].to_array()[lane].0,
+                        diff.orig_sub[1 + j][pr].as_array()[lane],
                         "addr feed {j} row {r}"
                     );
                 }
                 for (j, col) in ids.iter().enumerate() {
                     assert_eq!(
                         col[r].0,
-                        diff.orig_sub[1 + $na + j][pr].to_array()[lane].0,
+                        diff.orig_sub[1 + $na + j][pr].as_array()[lane],
                         "id feed {j} row {r}"
                     );
                 }
@@ -1046,4 +1062,169 @@ fn pedersen_aggregator_generic_simd_byte_identical() {
         &rc8,
         &w18,
     ));
+}
+
+// ------------------- newly-emitted cohort (opcode fixture) -------------------------
+
+/// Gate (a) for `mul_opcode_small` (u32-family opcode, newly emitted).
+#[test]
+fn mul_opcode_small_generic_simd_byte_identical() {
+    use crate::witness::components::mul_opcode_small as m;
+    let cg = fill_fixture(&[
+        "mul_opcode_small",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "verify_instruction",
+        "range_check_11",
+    ]);
+    let gen = cg.mul_opcode_small.expect("mul_opcode_small populated");
+    let mem_addr = cg.memory_address_to_id.expect("mem addr");
+    let mem_big = cg.memory_id_to_big.expect("mem big");
+    let vi = cg.verify_instruction.expect("verify_instruction");
+    let rc11 = cg.range_check_11.expect("range_check_11");
+    let (_, packed, n_rows) = pack_pilot_inputs(gen.inputs);
+    assert_generic_diff_byte_identical!(m::generic_simd_diff(
+        packed, n_rows, &mem_addr, &mem_big, &vi, &rc11,
+    ));
+}
+
+/// Gate (a) for `qm_31_add_mul_opcode` (newly emitted).
+#[test]
+fn qm_31_add_mul_opcode_generic_simd_byte_identical() {
+    use crate::witness::components::qm_31_add_mul_opcode as m;
+    let cg = fill_fixture(&[
+        "qm_31_add_mul_opcode",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "verify_instruction",
+        "range_check_4_4_4_4",
+    ]);
+    let gen = cg
+        .qm_31_add_mul_opcode
+        .expect("qm_31_add_mul_opcode populated");
+    let mem_addr = cg.memory_address_to_id.expect("mem addr");
+    let mem_big = cg.memory_id_to_big.expect("mem big");
+    let vi = cg.verify_instruction.expect("verify_instruction");
+    let rc4444 = cg.range_check_4_4_4_4.expect("range_check_4_4_4_4");
+    let (_, packed, n_rows) = pack_pilot_inputs(gen.inputs);
+    assert_generic_diff_byte_identical!(m::generic_simd_diff(
+        packed, n_rows, &mem_addr, &mem_big, &vi, &rc4444,
+    ));
+}
+
+/// Gate (a) for `verify_instruction` (mults-shaped, newly emitted): the SERIAL host
+/// component every opcode feeds — its generic body includes the mults input column.
+#[test]
+fn verify_instruction_generic_simd_byte_identical() {
+    use crate::witness::components::verify_instruction as m;
+    let cg = fill_fixture(&[
+        "verify_instruction",
+        "range_check_7_2_5",
+        "range_check_4_3",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        // Feed verify_instruction's mults the way production does: run an opcode
+        // writer that pushes into it.
+        "add_opcode",
+    ]);
+    let vi = cg.verify_instruction.expect("verify_instruction populated");
+    let rc725 = cg.range_check_7_2_5.expect("range_check_7_2_5");
+    let rc43 = cg.range_check_4_3.expect("range_check_4_3");
+    let mem_addr = cg.memory_address_to_id.expect("mem addr");
+    let mem_big = cg.memory_id_to_big.expect("mem big");
+    {
+        let add = cg.add_opcode.expect("add_opcode populated");
+        let _ = add.write_trace(&mem_addr, &mem_big, &vi);
+    }
+    let mut inputs_mults = vi
+        .mults
+        .iter()
+        .map(|entry| (*entry.key(), M31(entry.value().load(Ordering::Relaxed))))
+        .collect::<Vec<_>>();
+    inputs_mults.sort_by_key(|(input, _)| input.0);
+    let (mut inputs, mut mults) = inputs_mults.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+    let n_rows = inputs.len();
+    assert_ne!(
+        n_rows, 0,
+        "no verify_instruction rows after feeding add_opcode"
+    );
+    let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+    inputs.resize(size, *inputs.first().unwrap());
+    mults.resize(size, M31::zero());
+    let packed_inputs = pack_values(&inputs);
+    let packed_mults = pack_values(&mults);
+    assert_generic_diff_byte_identical!(m::generic_simd_diff(
+        packed_inputs,
+        vec![packed_mults],
+        &rc725,
+        &rc43,
+        &mem_addr,
+        &mem_big,
+    ));
+}
+
+// --------------------------------- blake_round -------------------------------------
+
+/// Gate (a) for `blake_round` (u32 family, newly emitted): the generic body — u32
+/// input words (`input_u32`), `u32_low/high/from_limbs`, u32 sub-words, and the REAL
+/// `deduce_blake_g` / `deduce_blake_round_sigma` hooks — is byte-identical to the
+/// original writer. No test fixture exercises blake, so the inputs are SYNTHETIC but
+/// memory-valid: the message pointer targets low program addresses present in the
+/// opcode fixture's memory (both writers see identical inputs, so parity is exact
+/// regardless of semantic meaning).
+#[test]
+fn blake_round_generic_simd_byte_identical() {
+    use stwo_cairo_common::prover_types::cpu::UInt32;
+
+    use crate::witness::components::blake_round as m;
+    let cg = fill_fixture(&[
+        "blake_round",
+        "blake_round_sigma",
+        "blake_g",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "range_check_7_2_5",
+    ]);
+    let sigma = cg.blake_round_sigma.expect("blake_round_sigma populated");
+    let mem_addr = cg.memory_address_to_id.expect("mem addr");
+    let mem_big = cg.memory_id_to_big.expect("mem big");
+    let rc725 = cg.range_check_7_2_5.expect("range_check_7_2_5");
+    let blake_g = cg.blake_g.expect("blake_g populated");
+
+    // Synthetic rows: chain id, round < 10, 16 message words, message pointer at a
+    // low program address (the fixture's program segment starts at 1 and is far
+    // longer than ptr+16, so every derived address deduces successfully).
+    let inputs: Vec<m::InputType> = (0..24u32)
+        .map(|i| {
+            let words: [UInt32; 16] =
+                std::array::from_fn(|j| UInt32::from(0x9E37_79B9u32.wrapping_mul(j as u32 + i)));
+            (M31(i + 1), M31(i % 10), (words, M31(1 + (i % 4))))
+        })
+        .collect();
+    let n_rows = inputs.len();
+    let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+    let mut padded = inputs;
+    padded.resize(size, *padded.first().unwrap());
+    let packed = pack_values(&padded);
+
+    assert_generic_diff_byte_identical!(m::generic_simd_diff(
+        packed, n_rows, &sigma, &mem_addr, &mem_big, &rc725, &blake_g,
+    ));
+}
+
+/// The blake_round pinned poison manifest: poisons ONLY at its 8 `deduce_blake_g`
+/// and 1 `deduce_blake_round_sigma` calls.
+#[test]
+fn blake_round_recording_poison_manifest() {
+    use crate::witness::components::blake_round as m;
+    let rec = m::record_blake_round();
+    assert_eq!(
+        rec.poison_ops,
+        std::collections::BTreeMap::from([
+            ("deduce_blake_g", 8usize),
+            ("deduce_blake_round_sigma", 1usize),
+        ]),
+        "poison manifest changed: {:?}",
+        rec.poison_ops
+    );
 }

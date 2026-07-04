@@ -178,6 +178,9 @@ struct ConstVal {
 #[derive(Clone, Debug, PartialEq)]
 enum Shape {
     Scalar,
+    /// A full-32-bit (`PackedUInt32`) element: ONE flat word carrying a raw u32 (the
+    /// blake_g feeds). The flat transport is raw lanes, so nothing is lost.
+    U32,
     /// A `PackedFelt252`-valued element: 28 flat limb words (canonical 9-bit limbs, the
     /// same `felt_get_m31` decomposition everywhere else in the lane). The driver
     /// reconstructs it with `PackedFelt252::from_limbs` — the exact inverse for
@@ -190,11 +193,18 @@ enum Shape {
 impl Shape {
     fn scalar_count(&self) -> usize {
         match self {
-            Shape::Scalar => 1,
+            Shape::Scalar | Shape::U32 => 1,
             Shape::Felt => FELT252_LIMBS,
             Shape::Tuple(v) | Shape::Array(v) => v.iter().map(Shape::scalar_count).sum(),
         }
     }
+}
+
+/// One flattened sub-input word at lowering time: its value token and whether it is a
+/// full-32-bit word (stored via `set_sub_input_word_u32`) or a canonical M31 word.
+struct SubLeaf {
+    tok: TokenStream,
+    u32: bool,
 }
 
 /// One `(field, index)` slot of `SubComponentInputs`, with its flat base word index
@@ -511,14 +521,9 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
     // KNOWN result type resolves to `Felt252` at that path. The flatten side re-checks
     // the LOWERED type per leaf and skips loudly on any disagreement (fail-closed) —
     // this recognizer only sets the flat WIDTH layout, never semantics.
-    let deduce_bound = scan_deduce_bindings(body_stmts);
-    let felt_consts_for_shape = felt_consts.clone();
-    let is_felt_expr =
-        move |e: &Expr| -> bool { sub_expr_is_felt(e, &felt_consts_for_shape, &deduce_bound) };
-
     // Derive the SubComponentInputs DECLARATION-ORDER flat layout: struct fields ×
-    // array lengths × the value shape observed at this file's assignment sites.
-    let sub_slots = match build_sub_layout(&file, body_stmts, &sub_name, &is_felt_expr) {
+    // array lengths × the DECLARED element shapes (the host-typed ground truth).
+    let sub_slots = match build_sub_layout(&file, body_stmts, &sub_name, path.parent()) {
         Ok(l) => l,
         Err(s) => {
             fa.file_skip = Some(s);
@@ -765,9 +770,95 @@ fn syn_type_to_ty(ty: &Type) -> Ty {
     }
 }
 
-/// Parse `struct SubComponentInputs` field declarations: (name, array_len) in order.
-/// Field types are `[Vec<...>; N]`.
-fn parse_sub_struct(file: &syn::File) -> Result<Vec<(String, usize)>, Skip> {
+/// Shape of a declared sub-input element type `T` (from `[Vec<T>; N]`): the
+/// DECLARATION is the ground truth for the flat layout + typed reconstruction (RHS
+/// expressions cannot always be type-walked — e.g. u32 locals built via
+/// `from_limbs`). Recognized leaves mirror `syn_type_to_ty`.
+fn shape_from_syn_type(ty: &Type, dir: Option<&Path>) -> Option<Shape> {
+    match ty {
+        Type::Paren(p) => shape_from_syn_type(&p.elem, dir),
+        Type::Group(g) => shape_from_syn_type(&g.elem, dir),
+        Type::Tuple(t) => Some(Shape::Tuple(
+            t.elems
+                .iter()
+                .map(|e| shape_from_syn_type(e, dir))
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        Type::Array(a) => {
+            let n = expr_usize(&a.len)?;
+            let e = shape_from_syn_type(&a.elem, dir)?;
+            Some(Shape::Array(vec![e; n]))
+        }
+        Type::Path(p) => {
+            let segs: Vec<String> = p
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            match segs.last()?.as_str() {
+                "PackedM31" => Some(Shape::Scalar),
+                "PackedUInt32" => Some(Shape::U32),
+                "PackedFelt252" => Some(Shape::Felt),
+                // `<component>::PackedInputType` — resolve by parsing the SIBLING
+                // component file's alias (the transformer runs over the components
+                // dir, so the sibling is on disk next to the current file).
+                "PackedInputType" if segs.len() == 2 => {
+                    let dir = dir?;
+                    let sibling = dir.join(format!("{}.rs", segs[0]));
+                    let ty = sibling_input_ty(&sibling)?;
+                    ty_to_shape(&ty)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Parse (and cache) a sibling component file's `PackedInputType` alias as a `Ty`.
+fn sibling_input_ty(path: &Path) -> Option<Ty> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<BTreeMap<PathBuf, Option<Ty>>>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap();
+    let cache = guard.get_or_insert_with(BTreeMap::new);
+    if let Some(t) = cache.get(path) {
+        return t.clone();
+    }
+    let ty = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|src| syn::parse_file(&src).ok())
+        .map(|file| parse_input_type(&file))
+        .filter(|t| !matches!(t, Ty::Unknown));
+    cache.insert(path.to_path_buf(), ty.clone());
+    ty
+}
+
+/// Convert an input `Ty` tree to a flat sub-word `Shape` (leaves must be M31 / U32 /
+/// Felt252; anything else — e.g. a FeltW27 — is unsupported and returns None loudly
+/// upstream, never a silent width guess).
+fn ty_to_shape(ty: &Ty) -> Option<Shape> {
+    match ty {
+        Ty::M31 => Some(Shape::Scalar),
+        Ty::U32 => Some(Shape::U32),
+        Ty::Felt252 => Some(Shape::Felt),
+        Ty::Tuple(v) => Some(Shape::Tuple(
+            v.iter().map(ty_to_shape).collect::<Option<Vec<_>>>()?,
+        )),
+        Ty::Array(e, n) => {
+            let s = ty_to_shape(e)?;
+            Some(Shape::Array(vec![s; *n]))
+        }
+        _ => None,
+    }
+}
+
+/// Parse `struct SubComponentInputs` field declarations: (name, array_len, DECLARED
+/// element shape) in order. Field types are `[Vec<T>; N]`.
+fn parse_sub_struct(
+    file: &syn::File,
+    dir: Option<&Path>,
+) -> Result<Vec<(String, usize, Shape)>, Skip> {
     let st = file.items.iter().find_map(|it| match it {
         Item::Struct(s) if s.ident == "SubComponentInputs" => Some(s),
         _ => None,
@@ -805,49 +896,35 @@ fn parse_sub_struct(file: &syn::File) -> Result<Vec<(String, usize)>, Skip> {
                 detail: format!("SubComponentInputs.{name}: non-literal array length"),
             });
         };
-        out.push((name, len));
+        // [Vec<T>; N] -> T's declared shape.
+        let elem_shape = (|| {
+            let Type::Path(p) = &*arr.elem else {
+                return None;
+            };
+            let seg = p.path.segments.last()?;
+            if seg.ident != "Vec" {
+                return None;
+            }
+            let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+                return None;
+            };
+            let syn::GenericArgument::Type(t) = args.args.first()? else {
+                return None;
+            };
+            shape_from_syn_type(t, dir)
+        })();
+        let Some(elem_shape) = elem_shape else {
+            return Err(Skip {
+                category: "skeleton",
+                detail: format!(
+                    "SubComponentInputs.{name}: unrecognized element type `{}`",
+                    tok_str(&arr.elem)
+                ),
+            });
+        };
+        out.push((name, len, elem_shape));
     }
     Ok(out)
-}
-
-/// Syntactic value shape of a sub-input assignment RHS (tuple/array nesting only —
-/// leaves are scalars; type-checking of the leaves happens during lowering).
-fn syntactic_shape(expr: &Expr, is_felt: &dyn Fn(&Expr) -> bool) -> Shape {
-    match strip_parens(expr) {
-        Expr::Tuple(ExprTuple { elems, .. }) => {
-            Shape::Tuple(elems.iter().map(|e| syntactic_shape(e, is_felt)).collect())
-        }
-        Expr::Array(ExprArray { elems, .. }) => {
-            Shape::Array(elems.iter().map(|e| syntactic_shape(e, is_felt)).collect())
-        }
-        e if is_felt(e) => Shape::Felt,
-        _ => Shape::Scalar,
-    }
-}
-
-/// Scan the closure body for `let x = PackedX::deduce_output(..);` bindings whose
-/// signature is in [`known_deduce_output_ty`], returning `x -> result Ty`. Used only to
-/// set the flat WIDTH of felt-valued sub-input elements at scan time (the lowering
-/// re-derives types independently and any disagreement skips loudly).
-fn scan_deduce_bindings(body_stmts: &[Stmt]) -> BTreeMap<String, Ty> {
-    let mut bound = BTreeMap::new();
-    for st in body_stmts {
-        let Stmt::Local(local) = st else { continue };
-        let Some(name) = local_ident(local) else {
-            continue;
-        };
-        let Some(init) = local.init.as_ref() else {
-            continue;
-        };
-        let Expr::Call(call) = strip_parens(&init.expr) else {
-            continue;
-        };
-        let Expr::Path(p) = &*call.func else { continue };
-        if let Some(ty) = known_deduce_output_ty(&tok_str(&p.path)) {
-            bound.insert(name, ty);
-        }
-    }
-    bound
 }
 
 /// Match the generated multiplicity-column read idiom
@@ -901,52 +978,18 @@ fn match_mults_read(expr: &Expr, row_index_name: &str) -> Option<usize> {
     expr_usize(index)
 }
 
-/// Is this sub-input element expression felt-valued? True for hoisted felt broadcast
-/// constant idents and for `.N`/`[i]` projection chains rooted at a known-deduce
-/// binding that resolve to `Felt252`.
-fn sub_expr_is_felt(
-    expr: &Expr,
-    felt_consts: &BTreeMap<String, [u32; FELT252_LIMBS]>,
-    deduce_bound: &BTreeMap<String, Ty>,
-) -> bool {
-    fn resolve<'t>(expr: &Expr, deduce_bound: &'t BTreeMap<String, Ty>) -> Option<&'t Ty> {
-        // Returns the Ty of a projection chain rooted at a deduce binding.
-        fn walk<'t>(expr: &Expr, deduce_bound: &'t BTreeMap<String, Ty>) -> Option<&'t Ty> {
-            match strip_parens(expr) {
-                Expr::Path(p) => deduce_bound.get(&tok_str(&p.path)),
-                Expr::Field(ExprField {
-                    base,
-                    member: Member::Unnamed(idx),
-                    ..
-                }) => match walk(base, deduce_bound)? {
-                    Ty::Tuple(v) => v.get(idx.index as usize),
-                    _ => None,
-                },
-                Expr::Index(ExprIndex { expr: base, .. }) => match walk(base, deduce_bound)? {
-                    Ty::Array(e, _) => Some(e),
-                    _ => None,
-                },
-                _ => None,
-            }
-        }
-        walk(expr, deduce_bound)
-    }
-    match strip_parens(expr) {
-        Expr::Path(p) => felt_consts.contains_key(&tok_str(&p.path)),
-        e => matches!(resolve(e, deduce_bound), Some(Ty::Felt252)),
-    }
-}
-
 /// Pre-scan the closure body's top-level statements for
 /// `*<sub_name>.<field>[k] = rhs;` and derive the DECLARATION-ORDER flat layout.
 fn build_sub_layout(
     file: &syn::File,
     body_stmts: &[Stmt],
     sub_name: &str,
-    is_felt: &dyn Fn(&Expr) -> bool,
+    dir: Option<&Path>,
 ) -> Result<Vec<SubSlot>, Skip> {
-    // Collect (field, k, shape) at every assignment site (file order).
-    let mut seen: BTreeMap<(String, usize), Shape> = BTreeMap::new();
+    // Collect assigned (field, k) sites for coverage checking (file order). The slot
+    // SHAPES come from the SubComponentInputs DECLARATION — the ground truth the host
+    // type checker already enforces on every RHS.
+    let mut seen: BTreeSet<(String, usize)> = BTreeSet::new();
     for st in body_stmts {
         let Stmt::Expr(Expr::Assign(a), _) = st else {
             continue;
@@ -983,8 +1026,7 @@ fn build_sub_layout(
                 detail: format!("sub-input index not a literal: `{}`", tok_str(index)),
             });
         };
-        let shape = syntactic_shape(&a.right, is_felt);
-        if seen.insert((field.clone(), k), shape).is_some() {
+        if !seen.insert((field.clone(), k)) {
             return Err(Skip {
                 category: "effect",
                 detail: format!("sub-input `{field}[{k}]` assigned more than once"),
@@ -997,10 +1039,10 @@ fn build_sub_layout(
         return Ok(Vec::new());
     }
 
-    let decl = parse_sub_struct(file)?;
+    let decl = parse_sub_struct(file, dir)?;
     // Every observed field must be declared; every declared (field,k) must be assigned.
-    let declared: BTreeSet<&String> = decl.iter().map(|(n, _)| n).collect();
-    for (field, k) in seen.keys() {
+    let declared: BTreeSet<&String> = decl.iter().map(|(n, ..)| n).collect();
+    for (field, k) in seen.iter() {
         if !declared.contains(field) {
             return Err(Skip {
                 category: "effect",
@@ -1010,19 +1052,19 @@ fn build_sub_layout(
     }
     let mut slots = Vec::new();
     let mut base = 0usize;
-    for (field, len) in &decl {
+    for (field, len, elem_shape) in &decl {
         for k in 0..*len {
-            let Some(shape) = seen.get(&(field.clone(), k)) else {
+            if !seen.contains(&(field.clone(), k)) {
                 return Err(Skip {
                     category: "effect",
                     detail: format!("sub-input `{field}[{k}]` declared but never assigned"),
                 });
-            };
-            let count = shape.scalar_count();
+            }
+            let count = elem_shape.scalar_count();
             slots.push(SubSlot {
                 field: field.clone(),
                 index: k,
-                shape: shape.clone(),
+                shape: elem_shape.clone(),
                 base,
             });
             base += count;
@@ -1309,6 +1351,37 @@ impl Lowerer {
         ))
     }
 
+    /// `PackedBlakeG::deduce_output([a, b, c, d, m0, m1])` (6 full-32-bit words) as a
+    /// REAL `eval.deduce_blake_g([...])` call. `None` when the literal array shape is
+    /// absent (fallback: census-only).
+    fn lower_blake_g_deduce(
+        &mut self,
+        call: &syn::ExprCall,
+        target: Target,
+    ) -> Option<TokenStream> {
+        let arg = strip_parens(call.args.first()?);
+        let Expr::Array(ExprArray { elems, .. }) = arg else {
+            return None;
+        };
+        if elems.len() != 6 {
+            return None;
+        }
+        let toks: Vec<TokenStream> = elems
+            .iter()
+            .map(|e| {
+                let (ty, tok) = self.lower_node(strip_parens(e), Target::Temp);
+                if !ty.is_u32() {
+                    self.skip(
+                        "deduce_output",
+                        format!("blake_g input is not u32: `{}` ({ty:?})", tok_str(e)),
+                    );
+                }
+                tok
+            })
+            .collect();
+        Some(self.bind(target, quote! { eval.deduce_blake_g([ #(#toks),* ]) }))
+    }
+
     /// `PackedPedersenPointsTableWindowBits18::deduce_output([index])` as a REAL
     /// `eval.deduce_pedersen_points_table_w18(index)` call.
     fn lower_points_table_deduce(
@@ -1402,9 +1475,31 @@ impl Lowerer {
                 let slot = u32_lit(*base as u32);
                 self.emit_op(target, Ty::M31, quote! { eval.input(#slot) })
             }
+            Ty::U32 => {
+                // Full-32-bit input word (blake message words) — its own read op; the
+                // device lane's u32 input columns carry it raw.
+                let slot = u32_lit(*base as u32);
+                self.emit_op(target, Ty::U32, quote! { eval.input_u32(#slot) })
+            }
             Ty::Tuple(_) | Ty::Array(..) => self.leaf(target, ty.clone(), quote! { WG_INPUT_AGG }),
+            Ty::Felt252 => {
+                // Felt input leaf: 28 consecutive limb slots -> a REAL felt value via
+                // `felt_from_limbs` over 28 input reads (existing ops; the lane feeds
+                // the felt's canonical limbs as 28 input columns).
+                let limb_ids: Vec<TokenStream> = (0..FELT252_LIMBS)
+                    .map(|j| {
+                        let slot = u32_lit((*base + j) as u32);
+                        self.bind(Target::Temp, quote! { eval.input(#slot) })
+                    })
+                    .collect();
+                self.emit_op(
+                    target,
+                    Ty::Felt252,
+                    quote! { eval.felt_from_limbs([ #(#limb_ids),* ]) },
+                )
+            }
             _ => {
-                // Felt / U16 / U32 input leaves: typed but not yet fed by the lane.
+                // U16 / W27 / other input leaves: typed but not yet fed by the lane.
                 let _ = what;
                 self.input_sites += 1;
                 self.leaf(target, (**inner).clone(), quote! { WG_INPUT_CENSUS_ONLY })
@@ -1573,8 +1668,13 @@ impl Lowerer {
                 }
                 for (j, leaf) in leaves.iter().enumerate() {
                     let w = usize_lit(base_idx + j);
-                    self.out
-                        .push(quote! { eval.set_sub_input_word(#w, #leaf); });
+                    let tok = &leaf.tok;
+                    if leaf.u32 {
+                        self.out
+                            .push(quote! { eval.set_sub_input_word_u32(#w, #tok); });
+                    } else {
+                        self.out.push(quote! { eval.set_sub_input_word(#w, #tok); });
+                    }
                 }
             }
             // *lookup_data.field = <array or scalar>;
@@ -1984,9 +2084,18 @@ impl Lowerer {
             //   from_limbs(low, high) = (low & 0xFFFF) | ((high & 0xFFFF) << 16)
             // Both halves are U16-typed; emission needs the u32 trait extension.
             "low" | "high" => {
-                let (rt, _rtok) = self.lower_node(&mc.receiver, Target::Temp);
+                let (rt, rtok) = self.lower_node(&mc.receiver, Target::Temp);
                 if rt.is_u32() {
-                    self.u32_site(Ty::U16)
+                    // REAL trait ops now (u32 trait extension landed).
+                    let op = Ident::new(
+                        if method == "low" {
+                            "u32_low"
+                        } else {
+                            "u32_high"
+                        },
+                        Span::call_site(),
+                    );
+                    self.emit_op(target, Ty::U16, quote! { eval.#op(#rtok) })
                 } else {
                     self.skip(
                         "method",
@@ -2247,9 +2356,22 @@ impl Lowerer {
                 self.u32_site(Ty::U32)
             }
             "PackedUInt32 :: from_limbs" => {
+                // `low + (high << 16)` (simd.rs:204) — a REAL trait op when the
+                // literal `[low, high]` shape is present (the generated idiom).
                 if let Some(Expr::Array(ExprArray { elems, .. })) =
                     call.args.first().map(strip_parens)
                 {
+                    if elems.len() == 2 {
+                        let (lt, ltok) = self.lower_node(strip_parens(&elems[0]), Target::Temp);
+                        let (ht, htok) = self.lower_node(strip_parens(&elems[1]), Target::Temp);
+                        self.require_m31(&lt, "u32_from_limbs low", &elems[0]);
+                        self.require_m31(&ht, "u32_from_limbs high", &elems[1]);
+                        return self.emit_op(
+                            target,
+                            Ty::U32,
+                            quote! { eval.u32_from_limbs(#ltok, #htok) },
+                        );
+                    }
                     for e in elems {
                         let _ = self.lower_node(strip_parens(e), Target::Temp);
                     }
@@ -2283,6 +2405,24 @@ impl Lowerer {
                         let _ = self.lower_aggregate(a);
                     }
                     return self.deduce_site(known_deduce_output_ty(p).expect("in table"));
+                }
+                if p == "PackedBlakeG :: deduce_output" {
+                    if let Some(tok) = self.lower_blake_g_deduce(call, target) {
+                        return (known_deduce_output_ty(p).expect("BlakeG in table"), tok);
+                    }
+                    for a in &call.args {
+                        let _ = self.lower_aggregate(a);
+                    }
+                    return self.deduce_site(known_deduce_output_ty(p).expect("in table"));
+                }
+                if p == "PackedBlakeRoundSigma :: deduce_output" {
+                    let (rt, rtok) = match call.args.first() {
+                        Some(e) => self.lower_node(strip_parens(e), Target::Temp),
+                        None => (Ty::Unknown, quote! { WG_SKIP }),
+                    };
+                    self.require_m31(&rt, "sigma deduce round", &call.args[0]);
+                    let tok = self.bind(target, quote! { eval.deduce_blake_round_sigma(#rtok) });
+                    return (known_deduce_output_ty(p).expect("Sigma in table"), tok);
                 }
                 // Census-only / unknown deduces: lower the args for REAL first
                 // (tuple/array shapes route through lower_aggregate, so their
@@ -2517,7 +2657,8 @@ impl Lowerer {
 
     /// Lower a `sub_component_inputs` RHS into ordered scalar leaf tokens (source order,
     /// which is exactly the shape's scalar order).
-    fn flatten_sub(&mut self, expr: &Expr) -> Vec<TokenStream> {
+    fn flatten_sub(&mut self, expr: &Expr) -> Vec<SubLeaf> {
+        let m31 = |tok: TokenStream| SubLeaf { tok, u32: false };
         match strip_parens(expr) {
             Expr::Tuple(ExprTuple { elems, .. }) | Expr::Array(ExprArray { elems, .. }) => {
                 let mut leaves = Vec::new();
@@ -2529,6 +2670,9 @@ impl Lowerer {
             other => {
                 let (ty, tok) = self.lower_node(other, Target::Temp);
                 match ty {
+                    // Full-32-bit sub element (blake words): one raw word, stored via
+                    // the u32 effect (the flat transport is raw lanes).
+                    Ty::U32 => vec![SubLeaf { tok, u32: true }],
                     // Felt-valued sub element: 28 flat limb words (the canonical
                     // decomposition; the driver's `from_limbs` reconstruction is the
                     // exact inverse, so the receiver sees the identical felt).
@@ -2537,19 +2681,20 @@ impl Lowerer {
                         (0..FELT252_LIMBS)
                             .map(|j| {
                                 let jl = usize_lit(j);
-                                self.bind(Target::Temp, quote! { eval.felt_get_m31(&#felt, #jl) })
+                                m31(self
+                                    .bind(Target::Temp, quote! { eval.felt_get_m31(&#felt, #jl) }))
                             })
                             .collect()
                     }
                     Ty::ConstFelt252(limbs) => (0..FELT252_LIMBS)
                         .map(|j| {
                             let (_t, tok) = self.const_m31_leaf(Target::Temp, limbs[j]);
-                            tok
+                            m31(tok)
                         })
                         .collect(),
                     _ => {
                         self.require_m31(&ty, "sub-input word", other);
-                        vec![tok]
+                        vec![m31(tok)]
                     }
                 }
             }
@@ -2631,11 +2776,11 @@ fn build_marked_block(
     ));
     seg.push(String::new());
     seg.push(format!(
-        "const N_LOOKUP_WORDS: usize = {};",
+        "pub(crate) const N_LOOKUP_WORDS: usize = {};",
         fa.n_lookup_words
     ));
     seg.push(format!(
-        "const N_SUB_INPUT_WORDS: usize = {};",
+        "pub(crate) const N_SUB_INPUT_WORDS: usize = {};",
         fa.n_sub_words
     ));
     seg.push(String::new());
@@ -2724,7 +2869,7 @@ fn build_marked_block(
         "/// Run BOTH SIMD writers on the same (pure-read) states and return public compare data."
             .to_string(),
     );
-    seg.push(render(&generic_simd_diff_fn_tokens(writer)));
+    seg.push(render(&generic_simd_diff_fn_tokens(writer, &file)));
     seg.push(END_MARKER.to_string());
 
     seg.join("\n")
@@ -2860,17 +3005,21 @@ fn generic_simd_tokens(component: &str, lw: &Lowerer, writer: &ItemFn) -> TokenS
         // layout — then the multiplicity columns (K+2+k).]
         let mut words = input_flatten_tokens(&lw.input_ty, quote! { #input_id });
         if !lw.mults_reads.is_empty() {
-            words.push(quote! { PackedM31::zero() });
-            words.push(quote! { PackedM31::zero() });
+            words.push(quote! { Simd::splat(0) });
+            words.push(quote! { Simd::splat(0) });
             let max_k = *lw.mults_reads.iter().max().unwrap();
             for k in 0..=max_k {
                 if lw.mults_reads.contains(&k) {
                     let kl = usize_lit(k);
                     words.push(quote! {
-                        *mults[#kl].get(row_index).unwrap_or(&PackedM31::zero())
+                        mults[#kl]
+                            .get(row_index)
+                            .copied()
+                            .unwrap_or(PackedM31::zero())
+                            .into_simd()
                     });
                 } else {
-                    words.push(quote! { PackedM31::zero() });
+                    words.push(quote! { Simd::splat(0) });
                 }
             }
         }
@@ -2979,7 +3128,14 @@ fn reconstruct_sub(lw: &Lowerer, sub_id: &Ident) -> Vec<TokenStream> {
 /// emitted, so this is unreachable for those (the unreachable!() is the guard).
 fn input_flatten_tokens(ty: &Ty, base: TokenStream) -> Vec<TokenStream> {
     match ty {
-        Ty::M31 => vec![base],
+        Ty::M31 => vec![quote! { #base.into_simd() }],
+        Ty::U32 => vec![quote! { #base.simd }],
+        Ty::Felt252 => (0..FELT252_LIMBS)
+            .map(|j| {
+                let lit = usize_lit(j);
+                quote! { #base.get_m31(#lit).into_simd() }
+            })
+            .collect(),
         Ty::Tuple(v) => {
             let mut out = Vec::new();
             for (i, e) in v.iter().enumerate() {
@@ -3007,7 +3163,13 @@ fn rebuild_shape(shape: &Shape, idx: &mut usize) -> TokenStream {
         Shape::Scalar => {
             let i = usize_lit(*idx);
             *idx += 1;
-            quote! { sw[#i] }
+            // Raw lane -> canonical M31 (the store side wrote a canonical value).
+            quote! { unsafe { PackedM31::from_simd_unchecked(sw[#i]) } }
+        }
+        Shape::U32 => {
+            let i = usize_lit(*idx);
+            *idx += 1;
+            quote! { PackedUInt32::from_simd(sw[#i]) }
         }
         Shape::Felt => {
             // 28 consecutive limb words -> the felt value (exact inverse of the
@@ -3016,7 +3178,7 @@ fn rebuild_shape(shape: &Shape, idx: &mut usize) -> TokenStream {
                 .map(|_| {
                     let i = usize_lit(*idx);
                     *idx += 1;
-                    quote! { sw[#i] }
+                    quote! { unsafe { PackedM31::from_simd_unchecked(sw[#i]) } }
                 })
                 .collect();
             quote! { PackedFelt252::from_limbs([ #(#limbs),* ]) }
@@ -3082,7 +3244,9 @@ fn sub_flat_tokens(lw: &Lowerer) -> TokenStream {
         let field = Ident::new(&sa.field, Span::call_site());
         let k = usize_lit(sa.index);
         match &sa.shape {
-            Shape::Scalar => parts.push(quote! { sci.#field[#k].clone() }),
+            Shape::Scalar => parts.push(quote! {
+                sci.#field[#k].iter().map(|v| v.into_simd()).collect::<Vec<_>>()
+            }),
             _ => {
                 let t: Ident = Ident::new("t", Span::call_site());
                 let scalars = shape_projection(&sa.shape, quote! { #t });
@@ -3096,7 +3260,7 @@ fn sub_flat_tokens(lw: &Lowerer) -> TokenStream {
         }
     }
     quote! {
-        fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<PackedM31>> {
+        fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
             vec![ #(#parts),* ]
         }
     }
@@ -3106,11 +3270,12 @@ fn sub_flat_tokens(lw: &Lowerer) -> TokenStream {
 /// `&PackedInputType` via `.N` / `[j]`; each leaf is a Copy `PackedM31` via auto-deref.
 fn shape_projection(shape: &Shape, base: TokenStream) -> Vec<TokenStream> {
     match shape {
-        Shape::Scalar => vec![quote! { #base }],
+        Shape::Scalar => vec![quote! { #base.into_simd() }],
+        Shape::U32 => vec![quote! { #base.simd }],
         Shape::Felt => (0..FELT252_LIMBS)
             .map(|j| {
                 let lit = usize_lit(j);
-                quote! { #base.get_m31(#lit) }
+                quote! { #base.get_m31(#lit).into_simd() }
             })
             .collect(),
         Shape::Tuple(v) => {
@@ -3142,8 +3307,8 @@ fn generic_simd_diff_struct_tokens() -> TokenStream {
             pub gen_rows: Vec<[M31; N_TRACE_COLUMNS]>,
             pub orig_lookup: Vec<Vec<PackedM31>>,
             pub gen_lookup: Vec<Vec<PackedM31>>,
-            pub orig_sub: Vec<Vec<PackedM31>>,
-            pub gen_sub: Vec<Vec<PackedM31>>,
+            pub orig_sub: Vec<Vec<Simd<u32, N_LANES>>>,
+            pub gen_sub: Vec<Vec<Simd<u32, N_LANES>>>,
             pub orig_interaction_cols: Vec<Vec<M31>>,
             pub gen_interaction_cols: Vec<Vec<M31>>,
             pub orig_claimed_sum: SecureField,
@@ -3154,7 +3319,25 @@ fn generic_simd_diff_struct_tokens() -> TokenStream {
 
 /// `generic_simd_diff(...)`: same params as `write_trace_simd`; runs both writers and
 /// packages the compare bundle (verbatim body from the shape-spec).
-fn generic_simd_diff_fn_tokens(writer: &ItemFn) -> TokenStream {
+fn generic_simd_diff_fn_tokens(writer: &ItemFn, file: &syn::File) -> TokenStream {
+    // Some components' `InteractionClaimGenerator` carries an extra `n_rows` field
+    // (e.g. blake_round); include it in the literal when declared (`n_rows` is a
+    // writer param, in scope in the harness).
+    let ig_has_n_rows = file.items.iter().any(|it| match it {
+        Item::Struct(st) if st.ident == "InteractionClaimGenerator" => match &st.fields {
+            Fields::Named(n) => n
+                .named
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "n_rows")),
+            _ => false,
+        },
+        _ => false,
+    });
+    let ig_extra: TokenStream = if ig_has_n_rows {
+        quote! { n_rows, }
+    } else {
+        quote! {}
+    };
     let inputs = &writer.sig.inputs;
     // Argument names in order; the first must be `inputs`. BY-VALUE params (no `&` in
     // the type — e.g. the aggregator's `mults: Vec<Vec<PackedM31>>`) are cloned into
@@ -3203,11 +3386,13 @@ fn generic_simd_diff_fn_tokens(writer: &ItemFn) -> TokenStream {
             let common = relations::CommonLookupElements::dummy();
             let (raw_o, _) = InteractionClaimGenerator {
                 log_size,
+                #ig_extra
                 lookup_data: ld_o,
             }
             .write_interaction_trace(&common);
             let (raw_g, _) = InteractionClaimGenerator {
                 log_size,
+                #ig_extra
                 lookup_data: ld_g,
             }
             .write_interaction_trace(&common);
@@ -4171,11 +4356,12 @@ mod tests {
             "u32 family must not skip: {:?}",
             lw.skips
         );
-        assert!(
-            lw.u32_sites >= 5,
-            "expected u32 sites, got {}",
-            lw.u32_sites
-        );
+        // from_m31 / & / << remain census-only (4 sites); .low()/.high() are REAL
+        // trait ops now (u32 trait extension) and no longer count.
+        assert_eq!(lw.u32_sites, 4, "u32 census sites");
+        let body = lw.out.iter().map(|t| t.to_string()).collect::<String>();
+        assert!(body.contains("eval . u32_low ("), "body: {body}");
+        assert!(body.contains("eval . u32_high ("), "body: {body}");
         assert_eq!(lw.env["z"], Ty::M31);
         assert_eq!(lw.env["w"], Ty::M31);
     }
@@ -4205,9 +4391,10 @@ mod tests {
     fn sub_layout_is_declaration_order() {
         let file: syn::File = syn::parse_str(
             "struct SubComponentInputs {\n\
-                 verify_instruction: [Vec<A>; 1],\n\
-                 memory_address_to_id: [Vec<B>; 2],\n\
-                 memory_id_to_big: [Vec<C>; 2],\n\
+                 verify_instruction: [Vec<(PackedM31, [PackedM31; 3], [PackedM31; 2], \
+                 PackedM31)>; 1],\n\
+                 memory_address_to_id: [Vec<PackedM31>; 2],\n\
+                 memory_id_to_big: [Vec<PackedM31>; 2],\n\
              }",
         )
         .unwrap();
@@ -4221,10 +4408,7 @@ mod tests {
              }",
         )
         .unwrap();
-        let slots = build_sub_layout(&file, &body.stmts, "sub_component_inputs", &|_: &Expr| {
-            false
-        })
-        .unwrap();
+        let slots = build_sub_layout(&file, &body.stmts, "sub_component_inputs", None).unwrap();
         let got: Vec<(String, usize, usize)> = slots
             .iter()
             .map(|s| (s.field.clone(), s.index, s.base))
@@ -4247,15 +4431,13 @@ mod tests {
 
     #[test]
     fn sub_layout_missing_assignment_is_loud() {
-        let file: syn::File =
-            syn::parse_str("struct SubComponentInputs { memory_address_to_id: [Vec<B>; 2] }")
-                .unwrap();
+        let file: syn::File = syn::parse_str(
+            "struct SubComponentInputs { memory_address_to_id: [Vec<PackedM31>; 2] }",
+        )
+        .unwrap();
         let body: syn::Block =
             syn::parse_str("{ *sub_component_inputs.memory_address_to_id[0] = x0; }").unwrap();
-        let err = build_sub_layout(&file, &body.stmts, "sub_component_inputs", &|_: &Expr| {
-            false
-        })
-        .unwrap_err();
+        let err = build_sub_layout(&file, &body.stmts, "sub_component_inputs", None).unwrap_err();
         assert!(err.detail.contains("never assigned"), "{}", err.detail);
     }
 
@@ -4263,8 +4445,8 @@ mod tests {
     fn sub_words_use_declaration_order_bases() {
         let file: syn::File = syn::parse_str(
             "struct SubComponentInputs {\n\
-                 memory_address_to_id: [Vec<B>; 1],\n\
-                 memory_id_to_big: [Vec<C>; 1],\n\
+                 memory_address_to_id: [Vec<PackedM31>; 1],\n\
+                 memory_id_to_big: [Vec<PackedM31>; 1],\n\
              }",
         )
         .unwrap();
@@ -4272,10 +4454,7 @@ mod tests {
         let body_src = "*sub_component_inputs.memory_id_to_big[0] = add_opcode_input.pc;\n\
                         *sub_component_inputs.memory_address_to_id[0] = add_opcode_input.ap;";
         let block: syn::Block = syn::parse_str(&format!("{{ {body_src} }}")).unwrap();
-        let slots = build_sub_layout(&file, &block.stmts, "sub_component_inputs", &|_: &Expr| {
-            false
-        })
-        .unwrap();
+        let slots = build_sub_layout(&file, &block.stmts, "sub_component_inputs", None).unwrap();
         let lw = lower_snippet_with_slots(&[], body_src, slots);
         assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
         let s = lw
