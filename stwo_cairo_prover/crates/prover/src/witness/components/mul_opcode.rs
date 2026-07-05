@@ -4953,6 +4953,69 @@ crate::jit_lookup_accessor! {
     mults_1: scalar,
 }
 
+/// Device-DAG feed layout (facts, DECLARATION order): one entry per
+/// `SubComponentInputs` instance — (field, instance, downstream state
+/// param, relation_index, flat word base, words per instance).
+#[allow(dead_code)]
+pub(crate) const SUB_FEED_LAYOUT: &[(&str, usize, &str, u32, usize, usize)] = &[
+    ("verify_instruction", 0, "verify_instruction_state", 0, 0, 7),
+    (
+        "memory_address_to_id",
+        0,
+        "memory_address_to_id_state",
+        0,
+        7,
+        1,
+    ),
+    (
+        "memory_address_to_id",
+        1,
+        "memory_address_to_id_state",
+        0,
+        8,
+        1,
+    ),
+    (
+        "memory_address_to_id",
+        2,
+        "memory_address_to_id_state",
+        0,
+        9,
+        1,
+    ),
+    ("memory_id_to_big", 0, "memory_id_to_big_state", 0, 10, 1),
+    ("memory_id_to_big", 1, "memory_id_to_big_state", 0, 11, 1),
+    ("memory_id_to_big", 2, "memory_id_to_big_state", 0, 12, 1),
+    ("range_check_20", 0, "range_check_20_state", 0, 13, 1),
+    ("range_check_20", 1, "range_check_20_state", 0, 14, 1),
+    ("range_check_20", 2, "range_check_20_state", 0, 15, 1),
+    ("range_check_20", 3, "range_check_20_state", 0, 16, 1),
+    ("range_check_20_b", 0, "range_check_20_state", 1, 17, 1),
+    ("range_check_20_b", 1, "range_check_20_state", 1, 18, 1),
+    ("range_check_20_b", 2, "range_check_20_state", 1, 19, 1),
+    ("range_check_20_b", 3, "range_check_20_state", 1, 20, 1),
+    ("range_check_20_c", 0, "range_check_20_state", 2, 21, 1),
+    ("range_check_20_c", 1, "range_check_20_state", 2, 22, 1),
+    ("range_check_20_c", 2, "range_check_20_state", 2, 23, 1),
+    ("range_check_20_c", 3, "range_check_20_state", 2, 24, 1),
+    ("range_check_20_d", 0, "range_check_20_state", 3, 25, 1),
+    ("range_check_20_d", 1, "range_check_20_state", 3, 26, 1),
+    ("range_check_20_d", 2, "range_check_20_state", 3, 27, 1),
+    ("range_check_20_d", 3, "range_check_20_state", 3, 28, 1),
+    ("range_check_20_e", 0, "range_check_20_state", 4, 29, 1),
+    ("range_check_20_e", 1, "range_check_20_state", 4, 30, 1),
+    ("range_check_20_e", 2, "range_check_20_state", 4, 31, 1),
+    ("range_check_20_f", 0, "range_check_20_state", 5, 32, 1),
+    ("range_check_20_f", 1, "range_check_20_state", 5, 33, 1),
+    ("range_check_20_f", 2, "range_check_20_state", 5, 34, 1),
+    ("range_check_20_g", 0, "range_check_20_state", 6, 35, 1),
+    ("range_check_20_g", 1, "range_check_20_state", 6, 36, 1),
+    ("range_check_20_g", 2, "range_check_20_state", 6, 37, 1),
+    ("range_check_20_h", 0, "range_check_20_state", 7, 38, 1),
+    ("range_check_20_h", 1, "range_check_20_state", 7, 39, 1),
+    ("range_check_20_h", 2, "range_check_20_state", 7, 40, 1),
+];
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {

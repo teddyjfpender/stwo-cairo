@@ -680,6 +680,130 @@ fn igen_has_n_rows(file: &syn::File) -> bool {
     })
 }
 
+/// Parse the ORIGINAL `write_trace` feed loops into field -> (downstream state
+/// param, relation_index): `for inputs in sub_component_inputs.FIELD {
+/// STATE.add_packed_inputs(inputs, REL) }` or `{ add_inputs(STATE, &inputs, _,
+/// REL) }`. The literal REL argument is the consumer's multiplicity slot — the
+/// device-DAG feed layout's ground truth.
+fn parse_feed_map(file: &syn::File) -> std::collections::BTreeMap<String, (String, u32)> {
+    use syn::visit::Visit;
+    #[derive(Default)]
+    struct FeedVisitor {
+        map: std::collections::BTreeMap<String, (String, u32)>,
+    }
+    fn int_lit(e: &Expr) -> Option<u32> {
+        if let Expr::Lit(l) = strip_parens(e) {
+            if let syn::Lit::Int(i) = &l.lit {
+                return i.base10_parse::<u32>().ok();
+            }
+        }
+        None
+    }
+    impl<'a> Visit<'a> for FeedVisitor {
+        // `sub_component_inputs.FIELD.iter().for_each(|inputs| { STATE.add_packed_
+        // inputs(inputs, REL); })` — the generated chain shape.
+        fn visit_expr_method_call(&mut self, node: &'a syn::ExprMethodCall) {
+            if node.method == "for_each" {
+                // receiver: sub_component_inputs.FIELD.iter()
+                let field = (|| {
+                    let Expr::MethodCall(iter_mc) = strip_parens(&node.receiver) else {
+                        return None;
+                    };
+                    if iter_mc.method != "iter" && iter_mc.method != "into_iter" {
+                        return None;
+                    }
+                    let Expr::Field(f) = strip_parens(&iter_mc.receiver) else {
+                        return None;
+                    };
+                    if !is_path_named(&f.base, "sub_component_inputs") {
+                        return None;
+                    }
+                    match &f.member {
+                        syn::Member::Named(id) => Some(id.to_string()),
+                        syn::Member::Unnamed(_) => None,
+                    }
+                })();
+                if let (Some(field), Some(Expr::Closure(cl))) =
+                    (field, node.args.first().map(strip_parens))
+                {
+                    if let Expr::Block(b) = strip_parens(&cl.body) {
+                        for st in &b.block.stmts {
+                            let Stmt::Expr(e, _) = st else { continue };
+                            if let Expr::MethodCall(mc) = strip_parens(e) {
+                                if mc.method == "add_packed_inputs" {
+                                    if let Expr::Path(p) = strip_parens(&mc.receiver) {
+                                        if let Some(rel) = mc.args.last().and_then(int_lit) {
+                                            self.map
+                                                .insert(field.clone(), (tok_str(&p.path), rel));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            syn::visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_expr_for_loop(&mut self, node: &'a syn::ExprForLoop) {
+            // The iterated expr: sub_component_inputs.FIELD (possibly behind refs).
+            let mut it: &Expr = strip_parens(&node.expr);
+            if let Expr::Reference(r) = it {
+                it = strip_parens(&r.expr);
+            }
+            if let Expr::Field(f) = it {
+                if is_path_named(&f.base, "sub_component_inputs") {
+                    if let syn::Member::Named(field_id) = &f.member {
+                        let field = field_id.to_string();
+                        for st in &node.body.stmts {
+                            let e = match st {
+                                Stmt::Expr(e, _) => e,
+                                _ => continue,
+                            };
+                            match strip_parens(e) {
+                                // STATE.add_packed_inputs(inputs, REL)
+                                Expr::MethodCall(mc) if mc.method == "add_packed_inputs" => {
+                                    if let Expr::Path(p) = strip_parens(&mc.receiver) {
+                                        if let Some(rel) = mc.args.last().and_then(int_lit) {
+                                            self.map.insert(
+                                                field.clone(),
+                                                (tok_str(&p.path), rel),
+                                            );
+                                        }
+                                    }
+                                }
+                                // add_inputs(STATE, &inputs, LEN, REL)
+                                Expr::Call(c) => {
+                                    let is_add = matches!(&*c.func, Expr::Path(p)
+                                        if p.path.segments.last()
+                                            .is_some_and(|s| s.ident == "add_inputs"));
+                                    if is_add {
+                                        if let (Some(Expr::Path(sp)), Some(rel)) = (
+                                            c.args.first().map(strip_parens),
+                                            c.args.last().and_then(int_lit),
+                                        ) {
+                                            self.map.insert(
+                                                field.clone(),
+                                                (tok_str(&sp.path), rel),
+                                            );
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            syn::visit::visit_expr_for_loop(self, node);
+        }
+    }
+    let mut v = FeedVisitor::default();
+    v.visit_file(file);
+    v.map
+}
+
 fn parse_lookup_data(file: &syn::File) -> Result<Vec<LookupField>, Skip> {
     let st = file.items.iter().find_map(|it| match it {
         Item::Struct(s) if s.ident == "LookupData" => Some(s),
@@ -2988,6 +3112,34 @@ fn build_marked_block(
         }
         inv.push('}');
         seg.push(inv);
+        seg.push(String::new());
+    }
+
+    // 5b. Device-DAG feed layout: one entry per SubComponentInputs instance —
+    // facts only (the feed driver classifies count-style vs input-list).
+    {
+        let feed_map = parse_feed_map(file);
+        let mut lay = String::new();
+        lay.push_str(
+            "/// Device-DAG feed layout (facts, DECLARATION order): one entry per\n             /// `SubComponentInputs` instance — (field, instance, downstream state\n             /// param, relation_index, flat word base, words per instance).\n             #[allow(dead_code)]\n             pub(crate) const SUB_FEED_LAYOUT: &[(&str, usize, &str, u32, usize, usize)] = &[\n",
+        );
+        for slot in &lw.sub_slots {
+            let (state, rel) = feed_map
+                .get(&slot.field)
+                .cloned()
+                .unwrap_or_else(|| ("UNMAPPED".to_string(), u32::MAX));
+            lay.push_str(&format!(
+                "    (\"{}\", {}, \"{}\", {}, {}, {}),\n",
+                slot.field,
+                slot.index,
+                state,
+                rel,
+                slot.base,
+                slot.shape.scalar_count(),
+            ));
+        }
+        lay.push_str("];");
+        seg.push(lay);
         seg.push(String::new());
     }
 

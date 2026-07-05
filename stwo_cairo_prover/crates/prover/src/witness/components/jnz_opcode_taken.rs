@@ -1149,6 +1149,32 @@ crate::jit_lookup_accessor! {
     mults_1: scalar,
 }
 
+/// Device-DAG feed layout (facts, DECLARATION order): one entry per
+/// `SubComponentInputs` instance — (field, instance, downstream state
+/// param, relation_index, flat word base, words per instance).
+#[allow(dead_code)]
+pub(crate) const SUB_FEED_LAYOUT: &[(&str, usize, &str, u32, usize, usize)] = &[
+    ("verify_instruction", 0, "verify_instruction_state", 0, 0, 7),
+    (
+        "memory_address_to_id",
+        0,
+        "memory_address_to_id_state",
+        0,
+        7,
+        1,
+    ),
+    (
+        "memory_address_to_id",
+        1,
+        "memory_address_to_id_state",
+        0,
+        8,
+        1,
+    ),
+    ("memory_id_to_big", 0, "memory_id_to_big_state", 0, 9, 1),
+    ("memory_id_to_big", 1, "memory_id_to_big_state", 0, 10, 1),
+];
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {

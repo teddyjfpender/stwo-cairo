@@ -873,6 +873,27 @@ crate::jit_lookup_accessor! {
     mults_1: scalar,
 }
 
+/// Device-DAG feed layout (facts, DECLARATION order): one entry per
+/// `SubComponentInputs` instance — (field, instance, downstream state
+/// param, relation_index, flat word base, words per instance).
+#[allow(dead_code)]
+pub(crate) const SUB_FEED_LAYOUT: &[(&str, usize, &str, u32, usize, usize)] = &[
+    ("range_check_9_9", 0, "range_check_9_9_state", 0, 0, 2),
+    ("range_check_18", 0, "range_check_18_state", 0, 2, 1),
+    ("range_check_18", 1, "range_check_18_state", 0, 3, 1),
+    ("range_check_18", 2, "range_check_18_state", 0, 4, 1),
+    ("range_check_18", 3, "range_check_18_state", 0, 5, 1),
+    ("range_check_18", 4, "range_check_18_state", 0, 6, 1),
+    ("range_check_18", 5, "range_check_18_state", 0, 7, 1),
+    ("range_check_18", 6, "range_check_18_state", 0, 8, 1),
+    ("range_check_9_9_b", 0, "range_check_9_9_state", 1, 9, 2),
+    ("range_check_18_b", 0, "range_check_18_state", 1, 11, 1),
+    ("range_check_18_b", 1, "range_check_18_state", 1, 12, 1),
+    ("range_check_9_9_c", 0, "range_check_9_9_state", 2, 13, 2),
+    ("range_check_9_9_d", 0, "range_check_9_9_state", 3, 15, 2),
+    ("range_check_9_9_e", 0, "range_check_9_9_state", 4, 17, 2),
+];
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
