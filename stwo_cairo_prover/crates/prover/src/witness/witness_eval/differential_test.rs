@@ -3151,3 +3151,150 @@ fn aggregator_and_blake_count_feeds_match_consumer_feeds() {
         eprintln!("count gate [blake_round]: PASS ({n} descriptors)");
     }
 }
+
+// ---------------- B3 edge gate: producer sub buffer == consumer inputs --------------
+
+/// Pure-Rust mirror of `witness_edge_gather_kernel` (same indexing + padding
+/// rule): consumer col k at row = producer sub word (base + j*words + k) at
+/// producer row r, with j/r from instance-major stacking and padding rows
+/// replicating the first packed row's lanes.
+fn host_edge_gather(
+    producer_sub: &[u32],
+    producer_rows: usize,
+    word_base: usize,
+    words_per_instance: usize,
+    n_instances: usize,
+    consumer_rows: usize,
+) -> Vec<Vec<u32>> {
+    let real_rows = n_instances * producer_rows;
+    (0..words_per_instance)
+        .map(|k| {
+            (0..consumer_rows)
+                .map(|row| {
+                    let src = if row < real_rows { row } else { row & 15 };
+                    let (j, r) = (src / producer_rows, src % producer_rows);
+                    producer_sub[(word_base + j * words_per_instance + k) * producer_rows + r]
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// THE EDGE GATE (aggregator→w18): the device-edge gather of the aggregator's
+/// sub buffer must be byte-identical to the w18 inputs the HOST FEED produced —
+/// the full 72-word instances, instance-major stacking, padding rule included.
+/// Validates the B3 layout contract with zero hardware.
+#[test]
+fn aggregator_to_w18_edge_gather_matches_host_feed() {
+    use crate::witness::components::pedersen_aggregator_window_bits_18 as agg;
+
+    // The fixture chain feeds w18 through the aggregator's REAL host feed.
+    let (w18_packed, _n_rows, _pts, _rc99, _rc20, _mem) = w18_fixture();
+
+    // Reconstruct the aggregator side: rerun the fixture up to the aggregator
+    // diff (pure) to get its sub buffer.
+    use cairo_vm::types::layout_name::LayoutName;
+    use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
+    use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
+    let compiled = get_compiled_cairo_program_path("test_prove_verify_pedersen_builtin");
+    let input = run_and_adapt(
+        &compiled,
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .expect("pedersen fixture");
+    let ProverInput {
+        state_transitions,
+        memory,
+        builtin_segments,
+        ..
+    } = input;
+    let mut cg = CairoClaimGenerator::default();
+    let mut set: IndexSet<&str> = IndexSet::new();
+    for c in [
+        "pedersen_aggregator_window_bits_18",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "range_check_8",
+        "partial_ec_mul_window_bits_18",
+        "pedersen_builtin",
+    ] {
+        set.insert(c);
+    }
+    cg.fill_components(
+        &set,
+        state_transitions.casm_states_by_opcode,
+        &builtin_segments,
+        Arc::new(memory),
+        Arc::new(PreProcessedTrace::canonical_without_pedersen()),
+    );
+    {
+        let pb = cg.pedersen_builtin.take().unwrap();
+        let _ = pb.write_trace(
+            cg.memory_address_to_id.as_ref().unwrap(),
+            cg.pedersen_aggregator_window_bits_18.as_ref().unwrap(),
+        );
+    }
+    let gen = cg.pedersen_aggregator_window_bits_18.unwrap();
+    let mem_big = cg.memory_id_to_big.unwrap();
+    let rc8 = cg.range_check_8.unwrap();
+    let w18s = cg.partial_ec_mul_window_bits_18.unwrap();
+    let mut inputs_mults = gen
+        .mults
+        .iter()
+        .map(|e| (*e.key(), M31(e.value().load(Ordering::Relaxed))))
+        .collect::<Vec<_>>();
+    inputs_mults.sort_by_key(|(i, _)| i.0);
+    let (mut inputs, mut mults) = inputs_mults.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+    let agg_real = inputs.len();
+    let agg_padded = std::cmp::max(agg_real.next_power_of_two(), N_LANES);
+    inputs.resize(agg_padded, *inputs.first().unwrap());
+    mults.resize(agg_padded, M31::zero());
+    let diff = agg::generic_simd_diff(
+        pack_values(&inputs),
+        vec![pack_values(&mults)],
+        &mem_big,
+        &rc8,
+        &w18s,
+    );
+    let agg_sub = sub_flat_from_diff(&diff.orig_sub, agg_padded);
+
+    // The device edge: aggregator sub base 7, 28 instances x 72 words.
+    let w18_real = 28 * agg_padded;
+    let w18_padded = w18_real.next_power_of_two().max(N_LANES);
+    let gathered = host_edge_gather(&agg_sub, agg_padded, 7, 72, 28, w18_padded);
+
+    // Host ground truth: w18's packed inputs (host-fed, padded by its writer's
+    // rule) flattened to the same 72 slot columns.
+    assert_eq!(
+        w18_packed.len() * N_LANES,
+        w18_padded,
+        "w18 padded extent disagrees with the edge stacking"
+    );
+    for (row, (pr, lane)) in (0..w18_padded).map(|r| (r, (r / N_LANES, r % N_LANES))) {
+        let p = &w18_packed[pr];
+        assert_eq!(gathered[0][row], p.0.to_array()[lane].0, "chain row {row}");
+        assert_eq!(gathered[1][row], p.1.to_array()[lane].0, "round row {row}");
+        for (wi, w) in p.2 .0.iter().enumerate() {
+            assert_eq!(
+                gathered[2 + wi][row],
+                w.to_array()[lane].0,
+                "window {wi} row {row}"
+            );
+        }
+        for (fi, f) in p.2 .1.iter().enumerate() {
+            for i in 0..28 {
+                assert_eq!(
+                    gathered[16 + fi * 28 + i][row],
+                    f.get_m31(i).to_array()[lane].0,
+                    "felt {fi} limb {i} row {row}"
+                );
+            }
+        }
+    }
+    eprintln!(
+        "edge gate [aggregator->w18]: PASS ({agg_padded} producer rows x 28 instances -> \
+         {w18_padded} consumer rows)"
+    );
+}
