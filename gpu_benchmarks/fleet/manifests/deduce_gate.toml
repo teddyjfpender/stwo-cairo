@@ -189,3 +189,17 @@ if [ "$a" = "$b" ]; then echo C2048_PROOF_MATCH; else echo C2048_PROOF_MISMATCH;
 timeout_s = 7200
 gpu_bound = true
 must_match = ['C2048_PROOF_MATCH']
+
+# --- 11. E2: sustained throughput with the DAG lanes on (the existing P5
+# pipeline harness: producers feed adapted inputs; the prover thread runs
+# proofs back-to-back sharing every cache). feed_starved_s isolates host-feed
+# limits from prover throughput. Measurement, not a gate. ------------------------------
+[[step]]
+name = "sn2-sustained-dag"
+cmd = '''
+STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_WITNESS_JIT_MAX_INSTRS=20000 \
+STWO_CUDA_WITNESS_EDGES=1 \
+$GB --pie $SN/SN_PIE_2.zip --backend cuda --pipeline 3 --producers 3 \
+  --reuse-input 2>&1 | tail -10'''
+timeout_s = 7200
+gpu_bound = true

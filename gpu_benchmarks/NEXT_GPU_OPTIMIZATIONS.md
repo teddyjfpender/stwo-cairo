@@ -332,6 +332,52 @@ directive).
   merge from device counts, input-list relations stay host, fail-closed both
   ways. Live seams: aggregator (rc_8), blake_round (rc_7_2_5).
 
+### Landed (continued — the C/D/E increments)
+
+- **B3 device edges**: aggregator→w18 (transactional pair: producer stashes
+  device sub buffer + HOST flat mirror, skips its w18 feed; consumer gathers
+  72 device columns and launches from device pointers; any failure rebuilds on
+  CPU from the stashed flat — exactly-once in every combination) and
+  blake_round→blake_g (row-major interleave straight into the CERTIFIED hand
+  kernel's ABI). Both edge gates green (pure-Rust kernel mirrors vs the host
+  feeds, real fixtures).
+- **C1**: resolved as configuration + gate — the code's governor default is
+  already 2048; the 512 was the sm_90 driver-JIT override, which the cubin
+  path (SASS at compile time) bypasses. `sn2-cubin-2048` A/Bs it with byte
+  identity.
+- **C2**: `MerkleOpsLifted::build_top_layers` (defaulted — CPU/SIMD unchanged;
+  vcs_lifted 15/15) + the fused-tail handoff (TAIL_LEVELS=12, retained-only) +
+  the CUDA override running one `stwo_blake2s_tail` launch (same hash routine
+  — scheduling only; flagged for prover-team review per the
+  security-critical-file precedent).
+- **E2**: the P5 pipeline harness (`--pipeline/--producers`) predates this
+  program; the manifest's `sn2-sustained-dag` measures sustained throughput
+  with the DAG lanes on.
+
+### Deferred WITH REASONS (pod-gated by the program's own evidence)
+
+- **Hash-from-registers leaf fusion (C)**: the deepest blind-CUDA surgery of
+  the program (rfft output stage + blake2s state assembly), soundness-adjacent,
+  and a bandwidth-shaping win that only matters after the launch floor drops.
+  Revisit with nsys after the pod session.
+- **Phase-graph capture (D2) + inter-tree overlap (E1)**: gap-compression
+  class. A′, A″, and B′ — the same class — each measured FLAT because CPU work
+  dominated the gaps; the landed A/B phases delete that CPU work, so these may
+  finally pay — but WHICH of them pays is exactly what the post-DAG duty-cycle
+  and phase ledger measure. Building them blind before that measurement
+  inverts the program's evidence discipline (P4 codifies this). The mechanical
+  enabler that is NOT deferred: the witness path is already
+  stream-parameterized (the graphs prerequisite for the phase that matters
+  most post-DAG).
+- **Full stream-ABI sweep (D1)**: dead plumbing until D2/E1 consume it; lands
+  with them.
+- **chains→cube_252 edge (B3)**: the poseidon chains are HOST writers today
+  (no device sub buffer exists to edge from); the edge waits for their own
+  lane cycle, and their measured span share is small.
+- **Overlapped concurrent proves (E2+)**: two prover threads sharing the
+  device (pool/caches are process-global but never validated under concurrent
+  proves) — pod-gated experimentation after the sustained numbers land.
+
 ### Outstanding (execution order)
 
 1. **B2 tail**: count gates for generic/cube_252/aggregator/blake (clone the
