@@ -7,6 +7,7 @@ pub mod cairo_claim_generator;
 pub mod components;
 pub mod fast_deduction;
 #[macro_use]
+pub mod device_feed;
 mod jit_flat_macros;
 pub mod jit_prove_backend;
 pub mod jit_witness_hook;
