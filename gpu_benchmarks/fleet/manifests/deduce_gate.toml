@@ -58,13 +58,16 @@ must_not_match = ['SKIPPED \(stub build\)']
 # --- 3. WHOLE-KERNEL BUILTIN GATES: the recorded programs as actual CUDA kernels,
 # byte-compared against the host writer on every column / lookup / sub word (the
 # interp gates' device legs — they auto-run on a CUDA build). This also pays the
-# NVRTC+ptxas cost for the aggregator's 5005-instr kernel ONCE, into the PTX cache. --
+# NVRTC+ptxas cost for the aggregator's 5005-instr kernel ONCE, into the PTX cache.
+# The witness governor (default 2048, fail-closed) must be raised HERE too — the
+# device legs run through the same launch path as the prove (blake 2178, agg 5005). --
 [[step]]
 name = "device-gate-blake"
 cmd = """
 . $HOME/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH
 cd $PROVER
 STWO_CUDA_ARCH=sm_90 RUSTFLAGS="-C target-cpu=x86-64-v3" \
+STWO_CUDA_WITNESS_JIT_MAX_INSTRS=20000 \
   cargo test --release -p stwo-cairo-prover blake_round_recording_interpreter_matches_host -- --nocapture 2>&1 | tail -12"""
 timeout_s = 3600
 gpu_bound = true
@@ -77,6 +80,7 @@ cmd = """
 . $HOME/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH
 cd $PROVER
 STWO_CUDA_ARCH=sm_90 RUSTFLAGS="-C target-cpu=x86-64-v3" \
+STWO_CUDA_WITNESS_JIT_MAX_INSTRS=20000 \
   cargo test --release -p stwo-cairo-prover pedersen_aggregator_recording_interpreter_matches_host -- --nocapture 2>&1 | tail -12"""
 timeout_s = 7200
 gpu_bound = true
