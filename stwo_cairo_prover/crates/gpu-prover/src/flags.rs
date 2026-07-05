@@ -30,6 +30,32 @@ pub const FLAGS: &[FlagDef] = &[
     },
 ];
 
+/// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed
+/// fast configuration — device witness lanes, device interaction, device edges,
+/// and a witness governor sized for the biggest recorded program). Applied as
+/// process env at prover construction ONLY where the variable is unset, so a
+/// manifest step's explicit value (including `=0` kill switches) always wins.
+/// Migration scaffolding (R4): deleted at M6 when the lanes become the
+/// unconditional single path.
+pub const GPU_NATIVE_DEFAULTS: &[(&str, &str)] = &[
+    ("STWO_CUDA_WITNESS_JIT_PROVE", "1"),
+    ("STWO_CUDA_WITNESS_JIT_MAX_INSTRS", "20000"),
+    ("STWO_CUDA_DEVICE_INTERACTION", "1"),
+    ("STWO_CUDA_WITNESS_EDGES", "1"),
+];
+
+/// Apply [`GPU_NATIVE_DEFAULTS`] (unset variables only). Called once at
+/// `GpuCairoProver::new`; benign on SIMD (the flags gate CUDA-only seams).
+pub fn apply_gpu_native_defaults() {
+    for (name, value) in GPU_NATIVE_DEFAULTS {
+        if std::env::var_os(name).is_none() {
+            // SAFETY-ADJACENT NOTE: setenv concurrent with getenv is racy; the
+            // prover is constructed before prove-time threads read these.
+            std::env::set_var(name, value);
+        }
+    }
+}
+
 /// `true` iff `name` is registered in [`FLAGS`] and set to `1` in the environment.
 pub fn flag_on(name: &str) -> bool {
     debug_assert!(

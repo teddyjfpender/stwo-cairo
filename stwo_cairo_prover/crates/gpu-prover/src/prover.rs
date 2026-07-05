@@ -178,6 +178,9 @@ where
                 config.pipeline_depth
             )));
         }
+        // The gpu-native engine defaults to the composed device configuration
+        // (explicit env, including =0 kill switches, always wins) — design §3.
+        crate::flags::apply_gpu_native_defaults();
         Ok(Self {
             config,
             twiddles: HashMap::new(),
