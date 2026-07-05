@@ -1,0 +1,25 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; export PROVER=/workspace/stwo-cairo/stwo_cairo_prover; . $HOME/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH
+cd $PROVER
+STWO_CUDA_ARCH=sm_90 RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release -p stwo-cairo-prover stwo_wit_deduce_oracle -- --nocapture 2>&1 | tail -20
+--8<-- output --8<--
+kind3 row 3670015: device [507, 236, 277, 435, 174, 376, 240, 213, 418, 509, 298, 280, 474, 340, 32, 391, 212, 384, 77, 46, 190, 194, 438, 232, 351, 219, 228, 226, 20, 246, 459, 28, 357, 150, 415, 453, 465, 98, 434, 103, 423, 393, 25, 400, 442, 218, 349, 116, 431, 203, 404, 216, 206, 181, 492, 77] host [411, 313, 82, 24, 377, 495, 263, 249, 131, 5, 292, 396, 471, 471, 85, 135, 215, 331, 215, 87, 164, 427, 249, 121, 380, 408, 67, 62, 141, 377, 493, 313, 56, 137, 52, 245, 339, 341, 462, 216, 482, 359, 443, 5, 301, 195, 495, 330, 144, 387, 417, 321, 309, 156, 211, 98]
+kind3 row 3670031: device [111, 40, 83, 8, 221, 212, 475, 260, 32, 481, 317, 263, 78, 178, 318, 470, 118, 455, 102, 256, 85, 459, 491, 409, 53, 392, 59, 188, 419, 126, 457, 316, 217, 396, 460, 253, 109, 510, 369, 389, 231, 353, 179, 506, 399, 479, 128, 126, 375, 438, 177, 311, 48, 212, 23, 194] host [137, 335, 257, 384, 250, 303, 288, 150, 380, 100, 269, 473, 191, 202, 330, 179, 469, 347, 200, 474, 247, 330, 342, 142, 76, 396, 17, 38, 406, 80, 297, 483, 256, 294, 12, 208, 123, 248, 80, 253, 234, 13, 208, 154, 471, 194, 148, 218, 498, 511, 412, 10, 305, 102, 393, 39]
+kind3 row 3670032: device [4, 308, 50, 10, 484, 254, 340, 102, 119, 330, 8, 354, 176, 395, 89, 318, 345, 501, 225, 451, 14, 56, 384, 386, 424, 501, 440, 147, 375, 492, 123, 306, 45, 509, 190, 124, 425, 399, 335, 499, 478, 396, 178, 482, 277, 380, 216, 293, 203, 408, 228, 392, 436, 384, 380, 134] host [391, 290, 423, 367, 272, 279, 480, 220, 141, 32, 340, 472, 177, 276, 209, 422, 251, 356, 410, 407, 92, 43, 146, 354, 124, 472, 42, 94, 263, 145, 362, 120, 181, 423, 194, 406, 188, 107, 293, 506, 240, 221, 124, 262, 268, 239, 460, 245, 273, 296, 331, 448, 411, 475, 115, 70]
+
+thread 'witness::witness_eval::differential_test::stwo_wit_deduce_oracle_matches_fast_deduction' panicked at crates/prover/src/witness/witness_eval/differential_test.rs:1840:5:
+assertion `left == right` failed: points-table oracle mismatches
+  left: 144
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test witness::witness_eval::differential_test::stwo_wit_deduce_oracle_matches_fast_deduction ... FAILED
+
+failures:
+
+failures:
+    witness::witness_eval::differential_test::stwo_wit_deduce_oracle_matches_fast_deduction
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 86 filtered out; finished in 2.67s
+
+[PEDERSEN_TABLE_GPU] Initialization complete!
+error: test failed, to rerun pass `-p stwo-cairo-prover --lib`

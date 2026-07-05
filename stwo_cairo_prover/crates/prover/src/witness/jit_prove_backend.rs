@@ -631,6 +631,11 @@ pub trait BuiltinLaneSpec {
     const N_TRACE: usize;
     const N_LOOKUP_WORDS: usize;
     const N_SUB_WORDS: usize;
+    /// Whether this component's kernel reads the pedersen points table
+    /// (computed EC deduces). When true, the lane registers the HOST-BUILT
+    /// table on device before launching — the GPU-generated table was
+    /// falsified by the deduce-gate oracle and is quarantined.
+    const NEEDS_PEDERSEN_TABLE: bool;
     type Claim;
     type IGen;
     fn record() -> RecordingOutput;
@@ -686,6 +691,13 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
             recording.poisoned_cols.len(),
             recording.poisoned_lookup_words.len(),
             recording.poisoned_sub_words.len(),
+        );
+        return None;
+    }
+    if C::NEEDS_PEDERSEN_TABLE && !ensure_device_pedersen_table() {
+        eprintln!(
+            "jit_prove[{}]: host pedersen table registration failed — falling back",
+            C::LABEL
         );
         return None;
     }
@@ -757,6 +769,21 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
 
 use crate::witness::components::{blake_round, pedersen_aggregator_window_bits_18};
 
+/// Register the HOST-BUILT `PEDERSEN_TABLE_18` on device (borrowed mode) — the
+/// deduce lane's only permitted table source: the oracle falsified the
+/// GPU-generated table (144/256 rows, run 20260705T113615Z). Idempotent per
+/// process; `false` (stub build / upload failure) → callers fall back to host.
+pub(crate) fn ensure_device_pedersen_table() -> bool {
+    use stwo_cairo_common::preprocessed_columns::pedersen::PedersenPoints;
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return false;
+    }
+    let n_rows = PedersenPoints::<18>::new(0).get_data().len();
+    stwo_backend_cuda::pedersen_table::register_borrowed_pedersen_table(n_rows, |c, buf| {
+        buf.extend(PedersenPoints::<18>::new(c).get_data().iter().map(|m| m.0));
+    })
+}
+
 pub struct PedersenAggregatorW18Lane;
 impl BuiltinLaneSpec for PedersenAggregatorW18Lane {
     const LABEL: &'static str = "pedersen_aggregator_window_bits_18";
@@ -775,6 +802,7 @@ impl BuiltinLaneSpec for PedersenAggregatorW18Lane {
     fn lookup_fields() -> &'static [(&'static str, usize)] {
         pedersen_aggregator_window_bits_18::JIT_LOOKUP_FIELDS
     }
+    const NEEDS_PEDERSEN_TABLE: bool = true;
     fn igen_from_flats(log_size: u32, _n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
         pedersen_aggregator_window_bits_18::interaction_gen_from_flat_lookup_words(
             log_size, words, n_rows,
@@ -800,6 +828,7 @@ impl BuiltinLaneSpec for BlakeRoundLane {
     fn lookup_fields() -> &'static [(&'static str, usize)] {
         blake_round::JIT_LOOKUP_FIELDS
     }
+    const NEEDS_PEDERSEN_TABLE: bool = false;
     fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
         blake_round::interaction_gen_from_flat_lookup_words(log_size, n_real, words, n_rows)
     }

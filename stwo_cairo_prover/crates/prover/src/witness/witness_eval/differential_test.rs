@@ -1298,6 +1298,7 @@ impl stwo_backend_cuda::jit_witness::interp::DeduceHost for FastDeductionHost {
 fn assert_device_builtin_leg_matches_host(
     label: &'static str,
     program: stwo_backend_cuda::jit_witness::isa::WitnessProgram,
+    needs_pedersen_table: bool,
     rows: &[Vec<u32>],
     addr_ids: &[u32],
     f252_values: &[[u32; 8]],
@@ -1309,6 +1310,12 @@ fn assert_device_builtin_leg_matches_host(
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         eprintln!("device leg [{label}]: SKIPPED (stub build)");
         return;
+    }
+    if needs_pedersen_table {
+        assert!(
+            crate::witness::jit_prove_backend::ensure_device_pedersen_table(),
+            "[{label}] host pedersen table registration failed on a CUDA build"
+        );
     }
     let n = rows.len();
     // Transpose the interpreter gate's per-row slot vectors into raw input
@@ -1517,6 +1524,7 @@ fn blake_round_recording_interpreter_matches_host() {
     assert_device_builtin_leg_matches_host(
         "blake_round",
         out.program,
+        false,
         &rows,
         &addr_ids,
         &f252_values,
@@ -1712,6 +1720,7 @@ fn pedersen_aggregator_recording_interpreter_matches_host() {
     assert_device_builtin_leg_matches_host(
         "pedersen_aggregator_window_bits_18",
         out.program,
+        true,
         &rows,
         &addr_ids,
         &f252_values,
@@ -1783,6 +1792,12 @@ fn stwo_wit_deduce_oracle_matches_fast_deduction() {
         eprintln!("deduce oracle: SKIPPED (stub build)");
         return;
     }
+    // The oracle reads the device table for BOTH kinds; only the host-built
+    // table is permitted (the GPU-generated one is what this leg falsified).
+    assert!(
+        crate::witness::jit_prove_backend::ensure_device_pedersen_table(),
+        "host pedersen table registration failed on a CUDA build"
+    );
     let mut host = FastDeductionHost;
     let run_oracle = |kind: u32, items: &[Vec<u32>], out_words: usize| -> Vec<Vec<u32>> {
         let in_words = items[0].len();

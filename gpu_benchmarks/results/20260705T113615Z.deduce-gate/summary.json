@@ -1,0 +1,56 @@
+{
+  "run_id": "20260705T113615Z.deduce-gate",
+  "manifest": "deduce-gate",
+  "pod": {
+    "id": "kkogzcvy29ixbb",
+    "gpu": "H100 NVL",
+    "usd_hr": 2.59
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "25e08048218e",
+      "diff_sha256": "e3b0c44298fc1c14",
+      "dirty": false
+    },
+    "stwo-cairo": {
+      "rev": "50e8045f2f25",
+      "diff_sha256": "c186d02c303080b1",
+      "dirty": true
+    }
+  },
+  "steps": [
+    {
+      "name": "prereqs",
+      "rc": 0,
+      "seconds": 1.7,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "test-build",
+      "rc": 0,
+      "seconds": 168.5,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "oracle-legs",
+      "rc": 101,
+      "seconds": 4.9,
+      "passed": false,
+      "reasons": [
+        "rc=101",
+        "must_match failed: 'deduce oracle kind 3: PASS'",
+        "must_match failed: 'deduce oracle kind 2: PASS'"
+      ],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": false,
+  "wall_s": 184.5
+}
