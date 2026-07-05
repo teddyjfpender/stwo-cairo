@@ -290,3 +290,73 @@ radix/fusion, hash throughput) on a saturated device.
   H100→A40 (bandwidth-shaped, not launch-shaped).
 - P4: graphs (step 5) are FLAT if attempted before steps 2-3 (the A′/A″/B′
   lesson generalizes: don't compress gaps between work the CPU is creating).
+
+---
+
+## 7. Implementation status (living section — updated per increment)
+
+Updated 2026-07-05. Every landed item is committed, byte-identity-gated, and
+stub-safe on macOS; nothing below has pod validation yet (the single validating
+pod session runs after §4/§5's implementable set is complete, per the program
+directive).
+
+### Landed
+
+**§4.1 witness residency — COMPLETE (code + local gates)**
+- Borrowed pedersen table (the oracle falsified the GPU-generated table —
+  144/256 sampled rows vs host, run 20260705T113615Z; the host table is now the
+  only permitted source, uploaded column-streamed in borrowed mode; generation
+  quarantined, fill paths fail closed).
+- Felt DeduceKinds 4-7 (device = `ec_add_affine`'s proven Montgomery operand
+  pattern; the host `Felt252` compensation algebra verified canonical-value
+  in/out before transcription), full u32 trait lane, W27 lane (SIMD = the
+  production conversion pair; recording = the exact 27→9 regroup).
+- The ENTIRE fp256/EC + poseidon-fp256 family through the automated lane with
+  ZERO poisons: pedersen_aggregator (5,005 instrs), blake_round (2,178),
+  partial_ec_mul_w18 (7,917), partial_ec_mul_generic (17,000), cube_252,
+  range_check_252_width_27; u32-cohort unlock: mul_opcode, add_ap_opcode,
+  blake_g. All byte-identical + interpreter-identical on real fixtures;
+  pod-gated device legs wired into the interp gates.
+
+**§4.2 device DAG — count-feed core COMPLETE**
+- Transformer-emitted `JIT_LOOKUP_FIELDS` / igen accessors / `SUB_FEED_LAYOUT`
+  for all 27 lane components (hand accessor data entry deleted).
+- `witness_feed_counts.cu` (descriptor-driven generalization of the certified
+  blake_g count feed) + FFI; launches return the DEVICE sub buffer.
+- Consumer surfaces (`add_count_tables` + `input_to_row_lut` where tuple-keyed)
+  for all ten count families; verified `COUNT_RELATIONS` registry.
+- **The count gate**: on the real w18 fixture, the device-feed path (emitted
+  layout → descriptors → fold/LUT → merge) is byte-identical to the consumers'
+  own `add_input` feeds — 127 descriptors, first run, zero hardware.
+- Prove-path split: `DeviceFeedPlan` in the builtin lane — count relations
+  merge from device counts, input-list relations stay host, fail-closed both
+  ways. Live seams: aggregator (rc_8), blake_round (rc_7_2_5).
+
+### Outstanding (execution order)
+
+1. **B2 tail**: count gates for generic/cube_252/aggregator/blake (clone the
+   w18 gate); prove seams for w18/generic/cube_252; rc_252_width_27 registry
+   entry (consumer shape differs — verify first); mem-table + sigma count
+   families.
+2. **B3 device edges**: producer sub buffer → consumer input columns for the
+   input-list feeds (aggregator→w18 28×72-word instances, blake_round→blake_g,
+   chains→cube_252) via a gather kernel; deletes the last host feed volume.
+3. **C commit fusion**: 2048-instr composition via the cubin path (no
+   load-time ptxas, -O3 kept); single-block Merkle tail kernel;
+   hash-from-registers leaf fusion; sm_90 cp.async/L2-persistence.
+4. **D phase graphs**: stream param through the remaining externs;
+   capture-safe event bridges; arena slots by column identity; per-phase
+   capture (witness DAG / commit / FRI).
+5. **E**: inter-tree overlap across channel absorbs; two-proof pipelining
+   (device Fiat-Shamir channel EXCLUDED pending human approval — barrier
+   overlap does not touch channel code).
+6. **The single pod session**: extended `deduce_gate.toml` (oracle legs →
+   whole-kernel gates → count-feed gate → lane-ON proofs with engagement →
+   whole-proof byte identity → perf) validating the whole program. Expectation
+   per §5's ranked trajectory (measured, not asserted): the landed steps 1-3
+   band lands around ~9-10s / ~0.8 useful MHz on SN_PIE_2 warm, with C/D/E
+   carrying the band toward ~6s / ~1.2+ before the bandwidth floor becomes the
+   measured frontier.
+
+Toolchain note: the prover lib-test crate requires `RUST_MIN_STACK=16777216`
+to COMPILE (rustc SIGBUS below; the emitted components keep growing).
