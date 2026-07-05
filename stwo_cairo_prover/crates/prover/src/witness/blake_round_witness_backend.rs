@@ -59,6 +59,8 @@ pub const BR_N_TRACE: usize = N_TRACE_COLUMNS; // 212
 pub trait BlakeRoundWitness: FromSimdColumns {
     /// Writes the blake_round base trace on `Self` and feeds its five
     /// sub-components. Trace/claim bytes must be identical to the host writer's.
+    /// `jit_memory`: the prover-input memory the D′ witness-JIT lane resolves its
+    /// device execution tables from. `None` (or the Simd backend) → host writer.
     #[allow(clippy::too_many_arguments)]
     fn write_trace(
         gen: blake_round::ClaimGenerator,
@@ -67,6 +69,7 @@ pub trait BlakeRoundWitness: FromSimdColumns {
         memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
         range_check_7_2_5_state: &range_check_7_2_5::ClaimGenerator,
         blake_g_state: &blake_g::ClaimGenerator,
+        jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         BlakeRoundClaim,
@@ -82,6 +85,7 @@ impl BlakeRoundWitness for SimdBackend {
         memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
         range_check_7_2_5_state: &range_check_7_2_5::ClaimGenerator,
         blake_g_state: &blake_g::ClaimGenerator,
+        _jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         BlakeRoundClaim,
@@ -106,16 +110,69 @@ impl BlakeRoundWitness for CudaBackend {
         memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
         range_check_7_2_5_state: &range_check_7_2_5::ClaimGenerator,
         blake_g_state: &blake_g::ClaimGenerator,
+        jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         BlakeRoundClaim,
         blake_round::InteractionClaimGenerator,
     ) {
+        // D′ witness-JIT lane: the recorded program — 8 blake_g + 1 sigma
+        // computed deduces — launched as a JIT kernel on the slot-layout inputs
+        // `[chain, round, 16 raw message words, mp | enabler | iota]`. Gated by
+        // `STWO_CUDA_WITNESS_JIT_PROVE(_BLAKE_ROUND)`; any unavailability falls
+        // back to the host writer below (this block only READS `gen`).
+        if let Some(mem) = jit_memory {
+            use stwo::prover::backend::simd::m31::N_LANES;
+            let packed: Vec<blake_round::PackedInputType> =
+                gen.packed_inputs.lock().unwrap().clone();
+            let remainder_empty = gen.remainder_inputs.lock().unwrap().is_empty();
+            if !packed.is_empty() && remainder_empty {
+                // Replicate the host preamble EXACTLY: n_rows counts every lane of
+                // the pre-pad packed rows; padding repeats the first PACKED row.
+                let n_vec_rows = packed.len();
+                let n_real = n_vec_rows * N_LANES;
+                let packed_size = n_vec_rows.next_power_of_two();
+                let size = packed_size * N_LANES;
+                let mut padded = packed;
+                padded.resize(packed_size, *padded.first().unwrap());
+                let mut cols: Vec<Vec<u32>> = vec![Vec::with_capacity(size); 21];
+                for p in &padded {
+                    let chain = p.0.to_array();
+                    let round = p.1.to_array();
+                    let mp = p.2 .1.to_array();
+                    for l in 0..N_LANES {
+                        cols[0].push(chain[l].0);
+                        cols[1].push(round[l].0);
+                        for (wi, w) in p.2 .0.iter().enumerate() {
+                            cols[2 + wi].push(w.simd.as_array()[l]);
+                        }
+                        cols[18].push(mp[l].0);
+                    }
+                }
+                cols[19] = (0..size).map(|r| u32::from(r < n_real)).collect();
+                cols[20] = (0..size).map(|r| r as u32).collect();
+                let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace::<
+                    crate::witness::jit_prove_backend::BlakeRoundLane,
+                >(&cols, n_real, mem, |sub_flat, n_padded| {
+                    blake_round::feed_sub_inputs_from_flat(
+                        sub_flat,
+                        n_padded,
+                        blake_round_sigma_state,
+                        memory_address_to_id_state,
+                        memory_id_to_big_state,
+                        range_check_7_2_5_state,
+                        blake_g_state,
+                    );
+                });
+                if let Some(out) = launched {
+                    return out;
+                }
+            }
+        }
         if device_lane_enabled() {
-            // The device 212-col kernel + device-to-device blake_g feed are
-            // pod-validation-gated (see module docs). Until they pass the
-            // STWO_CUDA_WITNESS_VERIFY differential + e2e byte-equality on a pod,
-            // fall back to the host writer so the switch never silently ships an
+            // The hand-ported 212-col kernel design is superseded by the JIT lane
+            // above; until the JIT lane passes the pod gates, the switch still
+            // falls back to the host writer so it never silently ships an
             // unvalidated witness.
             warn_device_lane_pending();
         }

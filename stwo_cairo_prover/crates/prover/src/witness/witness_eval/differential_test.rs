@@ -39,6 +39,15 @@ use crate::witness::prelude::*;
 
 /// Deserialize the fixture and populate `components` on a fresh `CairoClaimGenerator`.
 fn fill_fixture(components: &[&str]) -> CairoClaimGenerator {
+    fill_fixture_with_memory(components).0
+}
+
+/// [`fill_fixture`], additionally returning the raw memory tables (addr→id ids,
+/// f252 values, small values) that the DEVICE execution tables upload from — the
+/// claim generator consumes the `Memory` itself.
+fn fill_fixture_with_memory(
+    components: &[&str],
+) -> (CairoClaimGenerator, Vec<u32>, Vec<[u32; 8]>, Vec<u128>) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test_data/test_prove_verify_all_opcode_components/prover_input.json");
     let json = std::fs::read_to_string(&path)
@@ -51,6 +60,9 @@ fn fill_fixture(components: &[&str]) -> CairoClaimGenerator {
         builtin_segments,
         ..
     } = input;
+    let addr_ids: Vec<u32> = memory.address_to_id.iter().map(|e| e.0).collect();
+    let f252_values = memory.f252_values.clone();
+    let small_values = memory.small_values.clone();
 
     let mut cg = CairoClaimGenerator::default();
     let mut set: IndexSet<&str> = IndexSet::new();
@@ -67,7 +79,7 @@ fn fill_fixture(components: &[&str]) -> CairoClaimGenerator {
         Arc::new(memory),
         preprocessed_trace,
     );
-    cg
+    (cg, addr_ids, f252_values, small_values)
 }
 
 /// Byte-compare two `[Vec<PackedM31>]` field bundles lane-for-lane (via `to_array`), with
@@ -1230,7 +1242,9 @@ impl stwo_backend_cuda::jit_witness::interp::DeduceHost for FastDeductionHost {
         use stwo_cairo_common::prover_types::simd::{PackedFelt252, PackedUInt32};
 
         use crate::witness::fast_deduction::blake::{PackedBlakeG, PackedBlakeRoundSigma};
-        use crate::witness::fast_deduction::pedersen::PackedPartialEcMulWindowBits18;
+        use crate::witness::fast_deduction::pedersen::{
+            PackedPartialEcMulWindowBits18, PackedPedersenPointsTableWindowBits18,
+        };
         let m31 = |v: u32| PackedM31::broadcast(M31(v));
         let felt =
             |limbs: &[u32]| PackedFelt252::from_limbs(std::array::from_fn(|i| m31(limbs[i])));
@@ -1262,9 +1276,106 @@ impl stwo_backend_cuda::jit_witness::interp::DeduceHost for FastDeductionHost {
                 }
                 out
             }
+            3 => {
+                let points = PackedPedersenPointsTableWindowBits18::deduce_output([m31(args[0])]);
+                let mut out = Vec::with_capacity(56);
+                for f in &points {
+                    out.extend((0..28).map(|i| f.get_m31(i).to_array()[0].0));
+                }
+                out
+            }
             k => panic!("unexpected deduce kind {k}"),
         }
     }
+}
+
+/// GATE (c), pod only: the same recorded program LAUNCHED AS A CUDA KERNEL on the
+/// slot-layout input columns, byte-compared against the host writer everywhere the
+/// interpreter gate compares (committed columns, lookup words, sub words — all padded
+/// rows). No-op on stub builds (macOS/CI); on a pod build it runs as part of the
+/// normal suite, so `cargo nextest` on hardware IS the device gate.
+#[allow(clippy::too_many_arguments)]
+fn assert_device_builtin_leg_matches_host(
+    label: &'static str,
+    program: stwo_backend_cuda::jit_witness::isa::WitnessProgram,
+    rows: &[Vec<u32>],
+    addr_ids: &[u32],
+    f252_values: &[[u32; 8]],
+    small_values: &[u128],
+    orig_rows: &[Vec<M31>],
+    orig_lookup: &[Vec<PackedM31>],
+    orig_sub: &[Vec<Simd<u32, N_LANES>>],
+) {
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        eprintln!("device leg [{label}]: SKIPPED (stub build)");
+        return;
+    }
+    let n = rows.len();
+    // Transpose the interpreter gate's per-row slot vectors into raw input
+    // columns, trimmed to the program's read extent (a body that never reads its
+    // trailing slots — blake_round's iota — records fewer inputs than the
+    // canonical layout provides; the launch requires an exact count).
+    let n_slots = (program.n_inputs as usize).min(rows[0].len());
+    let cols: Vec<Vec<u32>> = (0..n_slots)
+        .map(|s| rows.iter().map(|r| r[s]).collect())
+        .collect();
+    stwo_backend_cuda::jit_witness::register_recorded_program(label, program);
+    let tables = stwo_backend_cuda::exec_tables::DeviceExecutionTables::upload(
+        addr_ids,
+        f252_values,
+        small_values,
+    );
+    let (dev_cols, _lookup_dev, lookup_flat, sub_flat) =
+        stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
+            label, &cols, &tables, true,
+        )
+        .unwrap_or_else(|| panic!("device leg [{label}]: launch unavailable"));
+
+    assert_eq!(dev_cols.len(), orig_rows[0].len(), "[{label}] column count");
+    for (c, col) in dev_cols.iter().enumerate() {
+        let dv = col.to_vec();
+        for r in 0..n {
+            assert_eq!(
+                dv[r].0, orig_rows[r][c].0,
+                "[{label}] device col {c} row {r}"
+            );
+        }
+    }
+    let n_packed_rows = n / N_LANES;
+    // Word-major flats: `flat[w * n + r]`, `w` enumerating fields in declaration
+    // order then words within the field — the same enumeration the recorder used.
+    let mut w = 0usize;
+    for field in orig_lookup {
+        let width = field.len() / n_packed_rows;
+        for k in 0..width {
+            for r in 0..n {
+                let hv = field[(r / N_LANES) * width + k].to_array()[r % N_LANES].0;
+                assert_eq!(
+                    lookup_flat[w * n + r],
+                    hv,
+                    "[{label}] lookup word {w} row {r}"
+                );
+            }
+            w += 1;
+        }
+    }
+    let mut w = 0usize;
+    for field in orig_sub {
+        let width = field.len() / n_packed_rows;
+        for k in 0..width {
+            for r in 0..n {
+                let hv = field[(r / N_LANES) * width + k].as_array()[r % N_LANES];
+                assert_eq!(sub_flat[w * n + r], hv, "[{label}] sub word {w} row {r}");
+            }
+            w += 1;
+        }
+    }
+    eprintln!(
+        "device leg [{label}]: PASS ({n} rows, {} cols, {} lookup words, {} sub words)",
+        dev_cols.len(),
+        lookup_flat.len() / n,
+        sub_flat.len() / n,
+    );
 }
 
 /// GATE (b) for `blake_round` (ISA-V3): the RECORDED PROGRAM — the exact bytecode the
@@ -1278,7 +1389,7 @@ fn blake_round_recording_interpreter_matches_host() {
     use stwo_cairo_common::prover_types::cpu::UInt32;
 
     use crate::witness::components::blake_round as m;
-    let cg = fill_fixture(&[
+    let (cg, addr_ids, f252_values, small_values) = fill_fixture_with_memory(&[
         "blake_round",
         "blake_round_sigma",
         "blake_g",
@@ -1330,17 +1441,23 @@ fn blake_round_recording_interpreter_matches_host() {
         }
     };
 
+    // Slot layout: flat input words 0..19 (m31, m31, 16 raw u32 words, m31),
+    // enabler 19, iota 20.
+    let rows: Vec<Vec<u32>> = (0..(1usize << diff.log_size))
+        .map(|r| {
+            let src = &padded[r];
+            let mut row_inputs: Vec<u32> = vec![src.0 .0, src.1 .0];
+            row_inputs.extend(src.2 .0.iter().map(|w| w.value));
+            row_inputs.push(src.2 .1 .0);
+            row_inputs.push(u32::from(r < n_rows)); // enabler
+            row_inputs.push(r as u32); // iota (unused by this body)
+            row_inputs
+        })
+        .collect();
+
     let n_packed_rows = 1usize << (diff.log_size - LOG_N_LANES);
-    for r in 0..(1usize << diff.log_size) {
-        // Slot layout: flat input words 0..19 (m31, m31, 16 raw u32 words, m31),
-        // enabler 19, iota 20.
-        let src = &padded[r];
-        let mut row_inputs: Vec<u32> = vec![src.0 .0, src.1 .0];
-        row_inputs.extend(src.2 .0.iter().map(|w| w.value));
-        row_inputs.push(src.2 .1 .0);
-        row_inputs.push(u32::from(r < n_rows)); // enabler
-        row_inputs.push(r as u32); // iota (unused by this body)
-        let ro = interpret_row_with(&out.program, &row_inputs, &oracle, &mut FastDeductionHost);
+    for (r, row_inputs) in rows.iter().enumerate() {
+        let ro = interpret_row_with(&out.program, row_inputs, &oracle, &mut FastDeductionHost);
 
         for (c, hv) in diff.orig_rows[r].iter().enumerate() {
             assert_eq!(ro.columns[c], hv.0, "row {r} column {c}");
@@ -1365,6 +1482,49 @@ fn blake_round_recording_interpreter_matches_host() {
             }
         }
     }
+
+    // Prove-accessor parity: the macro-generated igen rebuild from word-major
+    // flats must reproduce the host `LookupData` byte-for-byte — fences the
+    // 850-word field-list data entry against `LookupData` drift.
+    let n_padded = 1usize << diff.log_size;
+    let flat_from = |fields: &[Vec<PackedM31>]| -> Vec<u32> {
+        let n_words: usize = fields.iter().map(|f| f.len() / n_packed_rows).sum();
+        let mut flat = vec![0u32; n_words * n_padded];
+        let mut w = 0usize;
+        for field in fields {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                for r in 0..n_padded {
+                    flat[w * n_padded + r] =
+                        field[(r / N_LANES) * width + k].to_array()[r % N_LANES].0;
+                }
+                w += 1;
+            }
+        }
+        flat
+    };
+    let lookup_flat = flat_from(&diff.orig_lookup);
+    let igen =
+        m::interaction_gen_from_flat_lookup_words(diff.log_size, n_rows, &lookup_flat, n_padded);
+    assert_packed_field_bundles_eq(
+        &m::test_lookup_data_flat(&igen),
+        &diff.orig_lookup,
+        "blake_round prove-accessor lookup_data",
+    );
+
+    // GATE (c), pod builds only: the same program as an actual CUDA kernel.
+    let host_rows: Vec<Vec<M31>> = diff.orig_rows.iter().map(|r| r.to_vec()).collect();
+    assert_device_builtin_leg_matches_host(
+        "blake_round",
+        out.program,
+        &rows,
+        &addr_ids,
+        &f252_values,
+        &small_values,
+        &host_rows,
+        &diff.orig_lookup,
+        &diff.orig_sub,
+    );
 }
 
 /// GATE (b) for `pedersen_aggregator_window_bits_18` (ISA-V3): the recorded program —
@@ -1393,6 +1553,9 @@ fn pedersen_aggregator_recording_interpreter_matches_host() {
         builtin_segments,
         ..
     } = input;
+    let addr_ids: Vec<u32> = memory.address_to_id.iter().map(|e| e.0).collect();
+    let f252_values = memory.f252_values.clone();
+    let small_values = memory.small_values.clone();
     let mut cg = CairoClaimGenerator::default();
     let mut set: IndexSet<&str> = IndexSet::new();
     for c in [
@@ -1471,20 +1634,25 @@ fn pedersen_aggregator_recording_interpreter_matches_host() {
         }
     };
 
+    // Slot layout: inputs 0..3 (in.0[0], in.0[1], in.1), enabler 3, iota 4,
+    // mults[0] 5.
+    let rows: Vec<Vec<u32>> = (0..(1usize << diff.log_size))
+        .map(|r| {
+            let src = &inputs[r];
+            vec![
+                src.0[0].0,
+                src.0[1].0,
+                src.1 .0,
+                u32::from(r < n_rows),
+                r as u32,
+                mults[r].0,
+            ]
+        })
+        .collect();
+
     let n_packed_rows = 1usize << (diff.log_size - LOG_N_LANES);
-    for r in 0..(1usize << diff.log_size) {
-        // Slot layout: inputs 0..3 (in.0[0], in.0[1], in.1), enabler 3, iota 4,
-        // mults[0] 5.
-        let src = &inputs[r];
-        let row_inputs: Vec<u32> = vec![
-            src.0[0].0,
-            src.0[1].0,
-            src.1 .0,
-            u32::from(r < n_rows),
-            r as u32,
-            mults[r].0,
-        ];
-        let ro = interpret_row_with(&out.program, &row_inputs, &oracle, &mut FastDeductionHost);
+    for (r, row_inputs) in rows.iter().enumerate() {
+        let ro = interpret_row_with(&out.program, row_inputs, &oracle, &mut FastDeductionHost);
 
         for (c, hv) in diff.orig_rows[r].iter().enumerate() {
             assert_eq!(ro.columns[c], hv.0, "row {r} column {c}");
@@ -1509,4 +1677,213 @@ fn pedersen_aggregator_recording_interpreter_matches_host() {
             }
         }
     }
+
+    // Prove-accessor parity: the macro-generated igen rebuild from word-major
+    // flats must reproduce the host `LookupData` byte-for-byte — fences the
+    // 396-word field-list data entry against `LookupData` drift.
+    let n_padded = 1usize << diff.log_size;
+    let flat_from = |fields: &[Vec<PackedM31>]| -> Vec<u32> {
+        let n_words: usize = fields.iter().map(|f| f.len() / n_packed_rows).sum();
+        let mut flat = vec![0u32; n_words * n_padded];
+        let mut w = 0usize;
+        for field in fields {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                for r in 0..n_padded {
+                    flat[w * n_padded + r] =
+                        field[(r / N_LANES) * width + k].to_array()[r % N_LANES].0;
+                }
+                w += 1;
+            }
+        }
+        flat
+    };
+    let lookup_flat = flat_from(&diff.orig_lookup);
+    let igen = agg::interaction_gen_from_flat_lookup_words(diff.log_size, &lookup_flat, n_padded);
+    assert_packed_field_bundles_eq(
+        &agg::test_lookup_data_flat(&igen),
+        &diff.orig_lookup,
+        "pedersen_aggregator prove-accessor lookup_data",
+    );
+
+    // GATE (c), pod builds only: the same program — 28 chained EC-round DeduceCalls
+    // included — as an actual CUDA kernel against the fp256 device functions.
+    let host_rows: Vec<Vec<M31>> = diff.orig_rows.iter().map(|r| r.to_vec()).collect();
+    assert_device_builtin_leg_matches_host(
+        "pedersen_aggregator_window_bits_18",
+        out.program,
+        &rows,
+        &addr_ids,
+        &f252_values,
+        &small_values,
+        &host_rows,
+        &diff.orig_lookup,
+        &diff.orig_sub,
+    );
+}
+
+/// Pins the builtin recordings' shapes to the `BuiltinLaneSpec` constants in
+/// `jit_prove_backend.rs` — a mismatch there would otherwise only surface as a
+/// silent runtime fallback. Also prints instruction counts (the prove-lane
+/// governor input: raise `STWO_CUDA_WITNESS_JIT_MAX_INSTRS` past these on pod).
+#[test]
+fn builtin_lane_recording_shapes_match_specs() {
+    use crate::witness::components::{
+        blake_round as br, pedersen_aggregator_window_bits_18 as agg,
+    };
+
+    let a = agg::record_pedersen_aggregator_window_bits_18();
+    eprintln!(
+        "aggregator recording: {} instrs, {} cols, {} lookup, {} sub, {} inputs",
+        a.program.n_instrs(),
+        a.program.n_cols,
+        a.program.n_lookup_words,
+        a.program.n_sub_words,
+        a.program.n_inputs,
+    );
+    assert_eq!(a.program.n_cols, 206);
+    assert_eq!(a.program.n_lookup_words, 396);
+    assert_eq!(a.program.n_sub_words, 3 + 4 + 28 * 72);
+    assert_eq!(a.program.n_inputs, 6);
+    let agg_field_words: usize = agg::JIT_LOOKUP_FIELDS.iter().map(|f| f.1).sum();
+    assert_eq!(agg_field_words as u32, a.program.n_lookup_words);
+
+    let b = br::record_blake_round();
+    eprintln!(
+        "blake_round recording: {} instrs, {} cols, {} lookup, {} sub, {} inputs",
+        b.program.n_instrs(),
+        b.program.n_cols,
+        b.program.n_lookup_words,
+        b.program.n_sub_words,
+        b.program.n_inputs,
+    );
+    assert_eq!(b.program.n_cols, 212);
+    assert_eq!(b.program.n_lookup_words, 850);
+    assert_eq!(b.program.n_sub_words, 1 + 16 * 3 + 16 + 16 + 8 * 6);
+    // 20, not 21: the blake body never reads its iota slot (20) — the seam
+    // builds the canonical 21 and the launcher trims to the read extent.
+    assert_eq!(b.program.n_inputs, 20);
+    let blake_field_words: usize = br::JIT_LOOKUP_FIELDS.iter().map(|f| f.1).sum();
+    assert_eq!(blake_field_words as u32, b.program.n_lookup_words);
+}
+
+/// POD ORACLE LEGS (deduce kinds 2/3): the precompiled `stwo_wit_deduce_*` device
+/// functions — the exact code the JIT kernels embed — vs the host `fast_deduction`
+/// reference ([`FastDeductionHost`]). Kind 3 doubles as the device TABLE spot check:
+/// the GPU-generated pedersen table vs the host `PEDERSEN_TABLE_18`, across every
+/// section boundary. Kind 2 exercises the full W18 round (limb packing, table read,
+/// `ec_add_affine` incl. `felt_inverse`, limb unpacking) on real curve points, with
+/// chained rounds so each output feeds the next round's accumulator. No-op on stub
+/// builds; runs as part of the normal suite on a pod build.
+#[test]
+fn stwo_wit_deduce_oracle_matches_fast_deduction() {
+    use stwo_backend_cuda::jit_witness::interp::DeduceHost;
+
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        eprintln!("deduce oracle: SKIPPED (stub build)");
+        return;
+    }
+    let mut host = FastDeductionHost;
+    let run_oracle = |kind: u32, items: &[Vec<u32>], out_words: usize| -> Vec<Vec<u32>> {
+        let in_words = items[0].len();
+        let flat_in: Vec<u32> = items.iter().flatten().copied().collect();
+        let mut flat_out = vec![0u32; items.len() * out_words];
+        let rc = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_wit_deduce_oracle_run(
+                kind,
+                flat_in.as_ptr(),
+                flat_out.as_mut_ptr(),
+                items.len() as u32,
+            )
+        };
+        assert_eq!(
+            rc, 0,
+            "oracle launch failed (kind {kind}, in_words {in_words})"
+        );
+        flat_out.chunks(out_words).map(<[u32]>::to_vec).collect()
+    };
+
+    // Deterministic LCG (no external randomness; reproducible failures).
+    let mut state = 0x1234_5678u64;
+    let mut next = |bound: u32| -> u32 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 33) as u32) % bound
+    };
+
+    // ---- Kind 3: points-table reads, section boundaries + spread. --------------
+    // Host layout [low0 | high0(16) | low2 | high2(16)]: 0, 3670016, 3670032, 7340048;
+    // unpadded total 7340064.
+    let mut table_rows: Vec<u32> = vec![
+        0, 1, 262143, 262144, 3670015, 3670016, 3670031, 3670032, 3670033, 7340031, 7340047,
+        7340048, 7340063,
+    ];
+    for _ in 0..243 {
+        table_rows.push(next(7_340_064));
+    }
+    let items3: Vec<Vec<u32>> = table_rows.iter().map(|&r| vec![r]).collect();
+    let dev3 = run_oracle(3, &items3, 56);
+    let mut mismatches = 0usize;
+    for (item, dev) in items3.iter().zip(&dev3) {
+        let host_out = host.deduce(3, item);
+        if dev != &host_out {
+            mismatches += 1;
+            if mismatches <= 3 {
+                eprintln!(
+                    "kind3 row {}: device {:?} host {:?}",
+                    item[0], dev, host_out
+                );
+            }
+        }
+    }
+    assert_eq!(mismatches, 0, "points-table oracle mismatches");
+    eprintln!(
+        "deduce oracle kind 3: PASS ({} rows incl. section boundaries)",
+        items3.len()
+    );
+
+    // ---- Kind 2: W18 EC rounds on real curve points, chained. ------------------
+    // Accumulators start from table points (valid curve points by construction);
+    // each case then chains CHAIN_LEN rounds, device output feeding both device and
+    // host next-round inputs (divergence localizes to the exact round).
+    const CHAIN_LEN: usize = 4;
+    let mut cases: Vec<Vec<u32>> = Vec::new();
+    for case in 0..64 {
+        let round = if case < 28 {
+            case as u32
+        } else {
+            next(28 - CHAIN_LEN as u32)
+        };
+        let round = round.min(28 - CHAIN_LEN as u32);
+        let acc_point = host.deduce(3, &[next(7_340_064)]);
+        let mut args = vec![case as u32, round];
+        args.extend((0..14).map(|_| next(1 << 18)));
+        args.extend(&acc_point); // 56 limb words = both coordinates
+        cases.push(args);
+    }
+    let mut current = cases;
+    for step in 0..CHAIN_LEN {
+        let dev2 = run_oracle(2, &current, 72);
+        let mut mismatches = 0usize;
+        for (item, dev) in current.iter().zip(&dev2) {
+            let host_out = host.deduce(2, item);
+            if dev != &host_out {
+                mismatches += 1;
+                if mismatches <= 3 {
+                    eprintln!(
+                        "kind2 step {step} (chain {}, round {}): device {:?} host {:?}",
+                        item[0], item[1], dev, host_out
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "W18 round oracle mismatches at chain step {step}"
+        );
+        // Feed the outputs forward as the next round's inputs.
+        current = dev2;
+    }
+    eprintln!("deduce oracle kind 2: PASS (64 cases x {CHAIN_LEN} chained rounds)");
 }

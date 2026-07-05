@@ -58,6 +58,53 @@ macro_rules! jit_lookup_accessor {
             }
         }
     };
+    // Variant for modules whose `InteractionClaimGenerator` also carries the REAL
+    // row count (`n_rows`, pre-padding — blake_round's enabler bound). The flats
+    // are still indexed by the PADDED extent; the extra leading parameter is the
+    // real count stored into the generator verbatim.
+    (
+        with_n_rows $n_lookup:expr;
+        $( $field:ident : $width:tt ),+ $(,)?
+    ) => {
+        /// Lookup field list (name, width) in `LookupData` declaration order.
+        pub(crate) const JIT_LOOKUP_FIELDS: &[(&str, usize)] = &[
+            $( (stringify!($field), $crate::jit_lookup_accessor!(@width $width)) ),+
+        ];
+
+        /// Rebuild the interaction generator from the device kernel's flat lookup
+        /// words (word-major). `n_real` is the pre-padding row count the host
+        /// writer stores as the generator's enabler bound.
+        pub(crate) fn interaction_gen_from_flat_lookup_words(
+            log_size: u32,
+            n_real: usize,
+            words: &[u32],
+            n_rows: usize,
+        ) -> InteractionClaimGenerator {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            use stwo::prover::backend::simd::m31::{PackedM31, N_LANES};
+            let n_vec = n_rows / N_LANES;
+            assert_eq!(words.len(), $n_lookup * n_rows);
+            let packed_field = |off: usize, k: usize, vi: usize| {
+                PackedM31::from_array(std::array::from_fn(|l| {
+                    stwo::core::fields::m31::M31::from_u32_unchecked(
+                        words[(off + k) * n_rows + vi * N_LANES + l],
+                    )
+                }))
+            };
+            let mut off = 0usize;
+            $(
+                let $field = $crate::jit_lookup_accessor!(
+                    @field packed_field, n_vec, off, $width
+                );
+            )+
+            assert_eq!(off, $n_lookup, "lookup layout drift vs LookupData");
+            InteractionClaimGenerator {
+                n_rows: n_real,
+                log_size,
+                lookup_data: LookupData { $( $field ),+ },
+            }
+        }
+    };
     (@width scalar) => { 1usize };
     (@width $k:literal) => { $k as usize };
     (@field $pf:ident, $n_vec:ident, $off:ident, scalar) => {{

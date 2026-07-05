@@ -4068,6 +4068,20 @@ fn run_in_place(files: &[PathBuf]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Comparison view of a block for `--check`: comment-only lines are dropped
+/// (rustfmt's `wrap_comments` reflows generated prose at `comment_width`, and for
+/// long component names the reflow differs from the emitted wrapping — pure
+/// noise). Code lines compare EXACTLY; the fence's teeth are unchanged.
+fn check_view(block: &str) -> String {
+    block
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
+}
+
 fn run_check(files: &[PathBuf]) -> ExitCode {
     let mut drift = 0;
     for f in files {
@@ -4079,8 +4093,7 @@ fn run_check(files: &[PathBuf]) -> ExitCode {
         let src = std::fs::read_to_string(f).unwrap();
         match extract_block(&src) {
             Some(on_disk) => {
-                let want = block.trim_end();
-                if on_disk.trim_end() != want {
+                if check_view(&on_disk) != check_view(block) {
                     drift += 1;
                     eprintln!(
                         "DRIFT {}: on-disk block differs from generated",

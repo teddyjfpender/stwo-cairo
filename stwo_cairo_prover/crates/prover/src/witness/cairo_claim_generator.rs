@@ -1291,6 +1291,7 @@ impl CairoClaimGenerator {
                     self.memory_id_to_big.as_ref().unwrap(),
                     self.range_check_7_2_5.as_ref().unwrap(),
                     self.blake_g.as_ref().unwrap(),
+                    self.jit_memory.as_ref(),
                 );
                 evals.extend(trace);
                 (claim, interaction_gen)
@@ -1487,6 +1488,7 @@ impl CairoClaimGenerator {
                         self.memory_id_to_big.as_ref().unwrap(),
                         self.range_check_8.as_ref().unwrap(),
                         self.partial_ec_mul_window_bits_18.as_ref().unwrap(),
+                        self.jit_memory.as_ref(),
                     );
                 evals.extend(trace);
                 (claim, interaction_gen)

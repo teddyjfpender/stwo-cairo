@@ -6442,3 +6442,133 @@ impl InteractionClaimGenerator {
         })
     }
 }
+
+// ---- Witness-JIT prove-lane accessors (builtin slot layout; consumed by
+// ---- `jit_builtin_prove_backend.rs`; parity-fenced in `differential_test.rs`) ------
+
+crate::jit_lookup_accessor! {
+    with_n_rows 850;
+    blake_g_0: 21,
+    blake_g_1: 21,
+    blake_g_2: 21,
+    blake_g_3: 21,
+    blake_g_4: 21,
+    blake_g_5: 21,
+    blake_g_6: 21,
+    blake_g_7: 21,
+    blake_round_0: 36,
+    blake_round_1: 36,
+    blake_round_sigma_0: 18,
+    memory_address_to_id_0: 3,
+    memory_address_to_id_1: 3,
+    memory_address_to_id_2: 3,
+    memory_address_to_id_3: 3,
+    memory_address_to_id_4: 3,
+    memory_address_to_id_5: 3,
+    memory_address_to_id_6: 3,
+    memory_address_to_id_7: 3,
+    memory_address_to_id_8: 3,
+    memory_address_to_id_9: 3,
+    memory_address_to_id_10: 3,
+    memory_address_to_id_11: 3,
+    memory_address_to_id_12: 3,
+    memory_address_to_id_13: 3,
+    memory_address_to_id_14: 3,
+    memory_address_to_id_15: 3,
+    memory_id_to_big_0: 30,
+    memory_id_to_big_1: 30,
+    memory_id_to_big_2: 30,
+    memory_id_to_big_3: 30,
+    memory_id_to_big_4: 30,
+    memory_id_to_big_5: 30,
+    memory_id_to_big_6: 30,
+    memory_id_to_big_7: 30,
+    memory_id_to_big_8: 30,
+    memory_id_to_big_9: 30,
+    memory_id_to_big_10: 30,
+    memory_id_to_big_11: 30,
+    memory_id_to_big_12: 30,
+    memory_id_to_big_13: 30,
+    memory_id_to_big_14: 30,
+    memory_id_to_big_15: 30,
+    range_check_7_2_5_0: 4,
+    range_check_7_2_5_1: 4,
+    range_check_7_2_5_2: 4,
+    range_check_7_2_5_3: 4,
+    range_check_7_2_5_4: 4,
+    range_check_7_2_5_5: 4,
+    range_check_7_2_5_6: 4,
+    range_check_7_2_5_7: 4,
+    range_check_7_2_5_8: 4,
+    range_check_7_2_5_9: 4,
+    range_check_7_2_5_10: 4,
+    range_check_7_2_5_11: 4,
+    range_check_7_2_5_12: 4,
+    range_check_7_2_5_13: 4,
+    range_check_7_2_5_14: 4,
+    range_check_7_2_5_15: 4,
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
+}
+
+/// Feed the decoded sub-inputs into the downstream states — the same entry
+/// points, per-relation order (sigma → rc725 ×16 → addr ×16 → mem_big ×16 →
+/// blake_g ×8), and full padded extent as the host writer's drain loops. Word
+/// layout per instance follows the `SubComponentInputs` declaration; blake_g
+/// inputs travel as RAW u32 lanes (message words exceed the M31 modulus).
+pub(crate) fn feed_sub_inputs_from_flat(
+    words: &[u32],
+    n_rows: usize,
+    blake_round_sigma_state: &blake_round_sigma::ClaimGenerator,
+    memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
+    memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
+    range_check_7_2_5_state: &range_check_7_2_5::ClaimGenerator,
+    blake_g_state: &blake_g::ClaimGenerator,
+) {
+    use crate::witness::utils::AddInputs;
+    const N_SUB: usize = 1 + 16 * 3 + 16 + 16 + 8 * 6;
+    assert_eq!(words.len(), N_SUB * n_rows, "sub layout drift");
+    let n_vec = n_rows / N_LANES;
+    let m31 = |word: usize, vi: usize| {
+        PackedM31::from_array(std::array::from_fn(|l| {
+            M31::from_u32_unchecked(words[word * n_rows + vi * N_LANES + l])
+        }))
+    };
+    let raw_u32 = |word: usize, vi: usize| PackedUInt32 {
+        simd: std::simd::Simd::from_array(std::array::from_fn(|l| {
+            words[word * n_rows + vi * N_LANES + l]
+        })),
+    };
+    {
+        let col: Vec<blake_round_sigma::PackedInputType> =
+            (0..n_vec).map(|vi| [m31(0, vi)]).collect();
+        blake_round_sigma_state.add_packed_inputs(&col, 0);
+    }
+    for j in 0..16 {
+        let base = 1 + j * 3;
+        let col: Vec<range_check_7_2_5::PackedInputType> = (0..n_vec)
+            .map(|vi| std::array::from_fn(|i| m31(base + i, vi)))
+            .collect();
+        range_check_7_2_5_state.add_packed_inputs(&col, 0);
+    }
+    for j in 0..16 {
+        let col: Vec<memory_address_to_id::PackedInputType> =
+            (0..n_vec).map(|vi| m31(49 + j, vi)).collect();
+        memory_address_to_id_state.add_packed_inputs(&col, 0);
+    }
+    for j in 0..16 {
+        let col: Vec<memory_id_to_big::PackedInputType> =
+            (0..n_vec).map(|vi| m31(65 + j, vi)).collect();
+        memory_id_to_big_state.add_packed_inputs(&col, 0);
+    }
+    for j in 0..8 {
+        let base = 81 + j * 6;
+        let col: Vec<blake_g::PackedInputType> = (0..n_vec)
+            .map(|vi| std::array::from_fn(|i| raw_u32(base + i, vi)))
+            .collect();
+        blake_g_state.add_packed_inputs(&col, 0);
+    }
+}

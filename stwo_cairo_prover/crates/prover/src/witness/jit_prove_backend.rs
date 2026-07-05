@@ -618,3 +618,189 @@ opcode_lane_spec!(
     n_sub = 11,
     record = ret_opcode::record_ret_opcode
 );
+
+// ---------------- Builtin lane (D′: slot-layout inputs, computed EC/blake deduces) ---
+
+/// Per-component spec for a BUILTIN JIT component (the pedersen_aggregator /
+/// blake_round class): inputs arrive as caller-built slot columns — `[flat
+/// words | enabler | iota | mults…]`, raw u32 — rather than CasmStates, and the
+/// downstream sub feeds are component-specific (a closure at the seam, since the
+/// downstream state tuples differ per component).
+pub trait BuiltinLaneSpec {
+    const LABEL: &'static str;
+    const N_TRACE: usize;
+    const N_LOOKUP_WORDS: usize;
+    const N_SUB_WORDS: usize;
+    type Claim;
+    type IGen;
+    fn record() -> RecordingOutput;
+    fn claim(log_size: u32) -> Self::Claim;
+    /// `(name, width)` per `LookupData` field, declaration order — the §6a
+    /// device-interaction descriptor builder's input (unused until that lane
+    /// extends to builtins, but the layout contract lives here).
+    fn lookup_fields() -> &'static [(&'static str, usize)];
+    /// `n_real` is the pre-padding row count (blake_round's IGen stores it as the
+    /// enabler bound; the aggregator's IGen has no such field and ignores it).
+    fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen;
+}
+
+/// Generic builtin device write: validate the recording against the spec, launch
+/// it on the caller-built slot columns, and rebuild (trace, claim, igen); the
+/// caller then applies its component-specific sub feeds via `feed(sub_flat,
+/// n_padded)`. `None` = fall back to the host writer (reason logged) — the
+/// caller's `gen` is untouched (this only ever READS the inputs), so the host
+/// path stays valid.
+///
+/// §6a note: builtins always take the host-flats interaction path for now
+/// (`want_host_lookup = true`); extending the device-interaction stash to the
+/// builtin specs is a separate, separately-gated step.
+pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
+    input_cols: &[Vec<u32>],
+    n_real: usize,
+    mem: &Arc<Memory>,
+    feed: impl FnOnce(&[u32], usize),
+) -> Option<(Evals<stwo_backend_cuda::CudaBackend>, C::Claim, C::IGen)> {
+    if !lane_enabled(C::LABEL) || !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return None;
+    }
+    let t0 = std::time::Instant::now();
+    let recording = C::record();
+    let program = &recording.program;
+    if program.n_cols as usize != C::N_TRACE
+        || program.n_lookup_words as usize != C::N_LOOKUP_WORDS
+        || program.n_sub_words as usize != C::N_SUB_WORDS
+        || !recording.poisoned_cols.is_empty()
+        || !recording.poisoned_lookup_words.is_empty()
+        || !recording.poisoned_sub_words.is_empty()
+    {
+        eprintln!(
+            "jit_prove[{}]: recording shape mismatch (cols {} vs {}, lookup {} vs {}, sub {} \
+             vs {}, poison {}/{}/{}) — falling back",
+            C::LABEL,
+            program.n_cols,
+            C::N_TRACE,
+            program.n_lookup_words,
+            C::N_LOOKUP_WORDS,
+            program.n_sub_words,
+            C::N_SUB_WORDS,
+            recording.poisoned_cols.len(),
+            recording.poisoned_lookup_words.len(),
+            recording.poisoned_sub_words.len(),
+        );
+        return None;
+    }
+    // Callers build the FULL canonical slot layout; a body that never reads its
+    // trailing slots (blake_round's iota) records fewer inputs — trim to the
+    // program's read extent. Slots are positional, so trailing-only truncation
+    // is sound; too FEW columns is still a hard mismatch.
+    let n_inputs = program.n_inputs as usize;
+    if input_cols.len() < n_inputs {
+        eprintln!(
+            "jit_prove[{}]: {} input columns built, program reads {} — falling back",
+            C::LABEL,
+            input_cols.len(),
+            n_inputs
+        );
+        return None;
+    }
+    let input_cols = &input_cols[..n_inputs];
+    stwo_backend_cuda::jit_witness::register_recorded_program(C::LABEL, recording.program);
+
+    let tables = stwo_backend_cuda::exec_tables::exec_tables_cached(
+        mem.address_to_id.as_ptr() as usize,
+        || {
+            let addr_ids: Vec<u32> = mem.address_to_id.iter().map(|e| e.0).collect();
+            stwo_backend_cuda::exec_tables::DeviceExecutionTables::upload(
+                &addr_ids,
+                &mem.f252_values,
+                &mem.small_values,
+            )
+        },
+    );
+
+    let (cols, _lookup_dev, lookup_flat, sub_flat) =
+        stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
+            C::LABEL,
+            input_cols,
+            tables,
+            true,
+        )?;
+    let column_length = input_cols[0].len();
+    let log_size = column_length.ilog2();
+    if cols.len() != C::N_TRACE {
+        eprintln!(
+            "jit_prove[{}]: kernel returned {} columns, expected {} — falling back",
+            C::LABEL,
+            cols.len(),
+            C::N_TRACE
+        );
+        return None;
+    }
+    eprintln!(
+        "jit_prove[{}]: device witness {} real rows (log_size {}) in {:.1} ms",
+        C::LABEL,
+        n_real,
+        log_size,
+        t0.elapsed().as_secs_f64() * 1e3,
+    );
+
+    let domain = CanonicCoset::new(log_size).circle_domain();
+    let trace: Evals<stwo_backend_cuda::CudaBackend> = cols
+        .into_iter()
+        .map(|c| CircleEvaluation::new(domain, c))
+        .collect();
+    let claim = C::claim(log_size);
+    let igen = C::igen_from_flats(log_size, n_real, &lookup_flat, column_length);
+    feed(&sub_flat, column_length);
+    Some((trace, claim, igen))
+}
+
+use crate::witness::components::{blake_round, pedersen_aggregator_window_bits_18};
+
+pub struct PedersenAggregatorW18Lane;
+impl BuiltinLaneSpec for PedersenAggregatorW18Lane {
+    const LABEL: &'static str = "pedersen_aggregator_window_bits_18";
+    const N_TRACE: usize = 206;
+    const N_LOOKUP_WORDS: usize = 396;
+    const N_SUB_WORDS: usize = 3 + 4 + 28 * 72;
+    type Claim = cairo_air::components::pedersen_aggregator_window_bits_18::Claim;
+    type IGen = pedersen_aggregator_window_bits_18::InteractionClaimGenerator;
+
+    fn record() -> RecordingOutput {
+        pedersen_aggregator_window_bits_18::record_pedersen_aggregator_window_bits_18()
+    }
+    fn claim(log_size: u32) -> Self::Claim {
+        Self::Claim { log_size }
+    }
+    fn lookup_fields() -> &'static [(&'static str, usize)] {
+        pedersen_aggregator_window_bits_18::JIT_LOOKUP_FIELDS
+    }
+    fn igen_from_flats(log_size: u32, _n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
+        pedersen_aggregator_window_bits_18::interaction_gen_from_flat_lookup_words(
+            log_size, words, n_rows,
+        )
+    }
+}
+
+pub struct BlakeRoundLane;
+impl BuiltinLaneSpec for BlakeRoundLane {
+    const LABEL: &'static str = "blake_round";
+    const N_TRACE: usize = 212;
+    const N_LOOKUP_WORDS: usize = 850;
+    const N_SUB_WORDS: usize = 1 + 16 * 3 + 16 + 16 + 8 * 6;
+    type Claim = cairo_air::components::blake_round::Claim;
+    type IGen = blake_round::InteractionClaimGenerator;
+
+    fn record() -> RecordingOutput {
+        blake_round::record_blake_round()
+    }
+    fn claim(log_size: u32) -> Self::Claim {
+        Self::Claim { log_size }
+    }
+    fn lookup_fields() -> &'static [(&'static str, usize)] {
+        blake_round::JIT_LOOKUP_FIELDS
+    }
+    fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
+        blake_round::interaction_gen_from_flat_lookup_words(log_size, n_real, words, n_rows)
+    }
+}

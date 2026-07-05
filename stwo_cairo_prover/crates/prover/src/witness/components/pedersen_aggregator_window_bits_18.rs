@@ -14779,3 +14779,77 @@ impl InteractionClaimGenerator {
         })
     }
 }
+
+// ---- Witness-JIT prove-lane accessors (builtin slot layout; consumed by
+// ---- `jit_builtin_prove_backend.rs`; parity-fenced in `differential_test.rs`) ------
+
+crate::jit_lookup_accessor! {
+    396;
+    memory_id_to_big_0: 30,
+    memory_id_to_big_1: 30,
+    range_check_8_2: 2,
+    range_check_8_3: 2,
+    range_check_8_4: 2,
+    range_check_8_5: 2,
+    partial_ec_mul_window_bits_18_6: 73,
+    partial_ec_mul_window_bits_18_7: 73,
+    partial_ec_mul_window_bits_18_8: 73,
+    partial_ec_mul_window_bits_18_9: 73,
+    memory_id_to_big_10: 30,
+    pedersen_aggregator_window_bits_18_11: 4,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
+}
+
+/// Feed the decoded sub-inputs into the downstream states — the same entry
+/// points, per-relation order (mem_big ×3 → rc8 ×4 → w18 ×28), and full padded
+/// extent as the host writer's drain loops. Word layout per instance follows the
+/// `SubComponentInputs` declaration; each w18 input is 72 words in recorder
+/// order (chain, round, 14 windows, 2×28 felt limbs).
+pub(crate) fn feed_sub_inputs_from_flat(
+    words: &[u32],
+    n_rows: usize,
+    memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
+    range_check_8_state: &range_check_8::ClaimGenerator,
+    partial_ec_mul_window_bits_18_state: &partial_ec_mul_window_bits_18::ClaimGenerator,
+) {
+    use crate::witness::utils::add_inputs;
+    const N_SUB: usize = 3 + 4 + 28 * 72;
+    assert_eq!(words.len(), N_SUB * n_rows, "sub layout drift");
+    let n_vec = n_rows / N_LANES;
+    let m31 = |word: usize, vi: usize| {
+        PackedM31::from_array(std::array::from_fn(|l| {
+            M31::from_u32_unchecked(words[word * n_rows + vi * N_LANES + l])
+        }))
+    };
+    for j in 0..3 {
+        let col: Vec<memory_id_to_big::PackedInputType> = (0..n_vec).map(|vi| m31(j, vi)).collect();
+        add_inputs(memory_id_to_big_state, &col, n_rows, 0);
+    }
+    for j in 0..4 {
+        let col: Vec<range_check_8::PackedInputType> =
+            (0..n_vec).map(|vi| [m31(3 + j, vi)]).collect();
+        add_inputs(range_check_8_state, &col, n_rows, 0);
+    }
+    for j in 0..28 {
+        let base = 7 + j * 72;
+        let col: Vec<partial_ec_mul_window_bits_18::PackedInputType> = (0..n_vec)
+            .map(|vi| {
+                let chain = m31(base, vi);
+                let round = m31(base + 1, vi);
+                let windows: [PackedM31; 14] = std::array::from_fn(|i| m31(base + 2 + i, vi));
+                let acc = [
+                    PackedFelt252::from_limbs(std::array::from_fn(|i| m31(base + 16 + i, vi))),
+                    PackedFelt252::from_limbs(std::array::from_fn(|i| m31(base + 44 + i, vi))),
+                ];
+                (chain, round, (windows, acc))
+            })
+            .collect();
+        add_inputs(partial_ec_mul_window_bits_18_state, &col, n_rows, 0);
+    }
+}

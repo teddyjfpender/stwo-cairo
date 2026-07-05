@@ -53,6 +53,7 @@ use cairo_air::components::partial_ec_mul_generic::Claim as PartialEcMulGenericC
 use cairo_air::components::partial_ec_mul_window_bits_18::Claim as PartialEcMulW18Claim;
 use cairo_air::components::pedersen_aggregator_window_bits_18::Claim as PedersenAggregatorW18Claim;
 use stwo::core::fields::m31::BaseField;
+use stwo::prover::backend::simd::m31::N_LANES;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::FromSimdColumns;
 use stwo::prover::poly::circle::CircleEvaluation;
@@ -175,11 +176,14 @@ pub trait PartialEcMulWindowBits18Witness: FromSimdColumns {
 
 /// Backend hook for the `pedersen_aggregator_window_bits_18` base-trace write.
 pub trait PedersenAggregatorWindowBits18Witness: FromSimdColumns {
+    /// `jit_memory`: the prover-input memory the D′ witness-JIT lane resolves its
+    /// device execution tables from. `None` (or the Simd backend) → host writer.
     fn write_trace(
         gen: pedersen_aggregator_window_bits_18::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         range_check_8: &range_check_8::ClaimGenerator,
         partial_ec_mul_window_bits_18: &partial_ec_mul_window_bits_18::ClaimGenerator,
+        jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         PedersenAggregatorW18Claim,
@@ -237,6 +241,7 @@ impl PedersenAggregatorWindowBits18Witness for SimdBackend {
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         range_check_8: &range_check_8::ClaimGenerator,
         partial_ec_mul_window_bits_18: &partial_ec_mul_window_bits_18::ClaimGenerator,
+        _jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         PedersenAggregatorW18Claim,
@@ -312,11 +317,61 @@ impl PedersenAggregatorWindowBits18Witness for CudaBackend {
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         range_check_8: &range_check_8::ClaimGenerator,
         partial_ec_mul_window_bits_18: &partial_ec_mul_window_bits_18::ClaimGenerator,
+        jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         PedersenAggregatorW18Claim,
         pedersen_aggregator_window_bits_18::InteractionClaimGenerator,
     ) {
+        // D′ witness-JIT lane: the recorded program — 28 computed EC-round
+        // deduces on the fp256 device functions — launched as a JIT kernel on
+        // the slot-layout inputs `[in0, in1, in2 | enabler | iota | mults]`.
+        // Gated by `STWO_CUDA_WITNESS_JIT_PROVE(_PEDERSEN_AGGREGATOR_WINDOW_
+        // BITS_18)`; any unavailability falls back to the host writer below
+        // (this block only READS `gen`, so the fallback stays valid).
+        if let Some(mem) = jit_memory {
+            use std::sync::atomic::Ordering;
+            let mut inputs_mults = gen
+                .mults
+                .iter()
+                .map(|entry| {
+                    (
+                        *entry.key(),
+                        BaseField::from_u32_unchecked(entry.value().load(Ordering::Relaxed)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            inputs_mults.sort_by_key(|(input, _)| input.0);
+            let (mut inputs, mut mults) = inputs_mults.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+            let n_real = inputs.len();
+            if n_real > 0 {
+                let size = std::cmp::max(n_real.next_power_of_two(), N_LANES);
+                inputs.resize(size, *inputs.first().unwrap());
+                mults.resize(size, BaseField::from_u32_unchecked(0));
+                let cols: Vec<Vec<u32>> = vec![
+                    inputs.iter().map(|i| i.0[0].0).collect(),
+                    inputs.iter().map(|i| i.0[1].0).collect(),
+                    inputs.iter().map(|i| i.1 .0).collect(),
+                    (0..size).map(|r| u32::from(r < n_real)).collect(),
+                    (0..size).map(|r| r as u32).collect(),
+                    mults.iter().map(|m| m.0).collect(),
+                ];
+                let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace::<
+                    crate::witness::jit_prove_backend::PedersenAggregatorW18Lane,
+                >(&cols, n_real, mem, |sub_flat, n_padded| {
+                    pedersen_aggregator_window_bits_18::feed_sub_inputs_from_flat(
+                        sub_flat,
+                        n_padded,
+                        memory_id_to_big,
+                        range_check_8,
+                        partial_ec_mul_window_bits_18,
+                    );
+                });
+                if let Some(out) = launched {
+                    return out;
+                }
+            }
+        }
         if device_lane_enabled(PedersenLane::AggregatorWindowBits18) {
             warn_device_pending(PedersenLane::AggregatorWindowBits18);
         }
