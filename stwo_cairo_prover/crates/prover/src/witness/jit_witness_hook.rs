@@ -241,6 +241,7 @@ pub fn run_device_interaction_selftest(input: &stwo_cairo_adapter::ProverInput) 
                         let dev = device_interaction_from_flats(
                             lookup_dev.device_ptr,
                             n_padded,
+                            n_padded, // opcode descs carry no ENABLER mult source
                             &descs,
                             alphas,
                             elements.z(),

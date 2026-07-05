@@ -8,9 +8,7 @@
 //! `Schedule::levels()`; trace COLLECTION order stays the claim
 //! generator's (Fiat-Shamir-fixed) and is not this table's concern.
 
-use crate::schedule::{
-    ComponentNode, CountFeed, InputEdge, LogSizeSource, OutputEdge, Schedule,
-};
+use crate::schedule::{ComponentNode, CountFeed, InputEdge, LogSizeSource, OutputEdge, Schedule};
 
 pub static CAIRO_SCHEDULE: Schedule = Schedule { nodes: NODES };
 
@@ -41,8 +39,14 @@ static NODES: &[ComponentNode] = &[
             },
         ],
         counts: &[
-            CountFeed { family: "range_check_11_state", n_relations: 1 },
-            CountFeed { family: "range_check_18_state", n_relations: 1 },
+            CountFeed {
+                family: "range_check_11_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "range_check_18_state",
+                n_relations: 1,
+            },
         ],
         slots: None,
     },
@@ -178,14 +182,12 @@ static NODES: &[ComponentNode] = &[
         id: "blake_g",
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[
-            InputEdge::Producer {
-                of: "blake_round",
-                word_base: 81,
-                words_per_instance: 6,
-                n_instances: 8,
-            },
-        ],
+        inputs: &[InputEdge::Producer {
+            of: "blake_round",
+            word_base: 81,
+            words_per_instance: 6,
+            n_instances: 8,
+        }],
         outputs: &[
             OutputEdge {
                 to: "verify_bitwise_xor_12",
@@ -252,23 +254,22 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 16,
             },
         ],
-        counts: &[
-            CountFeed { family: "range_check_7_2_5_state", n_relations: 1 },
-        ],
+        counts: &[CountFeed {
+            family: "range_check_7_2_5_state",
+            n_relations: 1,
+        }],
         slots: None,
     },
     ComponentNode {
         id: "blake_round_sigma",
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[
-            InputEdge::Producer {
-                of: "blake_round",
-                word_base: 0,
-                words_per_instance: 1,
-                n_instances: 1,
-            },
-        ],
+        inputs: &[InputEdge::Producer {
+            of: "blake_round",
+            word_base: 0,
+            words_per_instance: 1,
+            n_instances: 1,
+        }],
         outputs: &[],
         counts: &[],
         slots: None,
@@ -336,8 +337,14 @@ static NODES: &[ComponentNode] = &[
         inputs: &[],
         outputs: &[],
         counts: &[
-            CountFeed { family: "range_check_20_state", n_relations: 8 },
-            CountFeed { family: "range_check_9_9_state", n_relations: 8 },
+            CountFeed {
+                family: "range_check_20_state",
+                n_relations: 8,
+            },
+            CountFeed {
+                family: "range_check_9_9_state",
+                n_relations: 8,
+            },
         ],
         slots: None,
     },
@@ -788,9 +795,10 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
         ],
-        counts: &[
-            CountFeed { family: "range_check_20_state", n_relations: 8 },
-        ],
+        counts: &[CountFeed {
+            family: "range_check_20_state",
+            n_relations: 8,
+        }],
         slots: None,
     },
     ComponentNode {
@@ -818,9 +826,10 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
         ],
-        counts: &[
-            CountFeed { family: "range_check_11_state", n_relations: 1 },
-        ],
+        counts: &[CountFeed {
+            family: "range_check_11_state",
+            n_relations: 1,
+        }],
         slots: None,
     },
     ComponentNode {
@@ -830,9 +839,18 @@ static NODES: &[ComponentNode] = &[
         inputs: &[],
         outputs: &[],
         counts: &[
-            CountFeed { family: "range_check_20_state", n_relations: 8 },
-            CountFeed { family: "range_check_8_state", n_relations: 1 },
-            CountFeed { family: "range_check_9_9_state", n_relations: 8 },
+            CountFeed {
+                family: "range_check_20_state",
+                n_relations: 8,
+            },
+            CountFeed {
+                family: "range_check_8_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "range_check_9_9_state",
+                n_relations: 8,
+            },
         ],
         slots: None,
     },
@@ -840,19 +858,26 @@ static NODES: &[ComponentNode] = &[
         id: "partial_ec_mul_window_bits_18",
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[
-            InputEdge::Producer {
-                of: "pedersen_aggregator_window_bits_18",
-                word_base: 7,
-                words_per_instance: 72,
-                n_instances: 28,
-            },
-        ],
+        inputs: &[InputEdge::Producer {
+            of: "pedersen_aggregator_window_bits_18",
+            word_base: 7,
+            words_per_instance: 72,
+            n_instances: 28,
+        }],
         outputs: &[],
         counts: &[
-            CountFeed { family: "pedersen_points_table_window_bits_18_state", n_relations: 1 },
-            CountFeed { family: "range_check_20_state", n_relations: 8 },
-            CountFeed { family: "range_check_9_9_state", n_relations: 8 },
+            CountFeed {
+                family: "pedersen_points_table_window_bits_18_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "range_check_20_state",
+                n_relations: 8,
+            },
+            CountFeed {
+                family: "range_check_9_9_state",
+                n_relations: 8,
+            },
         ],
         slots: None,
     },
@@ -875,9 +900,10 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 28,
             },
         ],
-        counts: &[
-            CountFeed { family: "range_check_8_state", n_relations: 1 },
-        ],
+        counts: &[CountFeed {
+            family: "range_check_8_state",
+            n_relations: 1,
+        }],
         slots: None,
     },
     ComponentNode {
@@ -905,9 +931,10 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
         ],
-        counts: &[
-            CountFeed { family: "range_check_4_4_4_4_state", n_relations: 1 },
-        ],
+        counts: &[CountFeed {
+            family: "range_check_4_4_4_4_state",
+            n_relations: 1,
+        }],
         slots: None,
     },
     ComponentNode {
@@ -917,8 +944,14 @@ static NODES: &[ComponentNode] = &[
         inputs: &[],
         outputs: &[],
         counts: &[
-            CountFeed { family: "range_check_18_state", n_relations: 2 },
-            CountFeed { family: "range_check_9_9_state", n_relations: 5 },
+            CountFeed {
+                family: "range_check_18_state",
+                n_relations: 2,
+            },
+            CountFeed {
+                family: "range_check_9_9_state",
+                n_relations: 5,
+            },
         ],
         slots: None,
     },
@@ -926,14 +959,12 @@ static NODES: &[ComponentNode] = &[
         id: "range_check_4_3",
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[
-            InputEdge::Producer {
-                of: "verify_instruction",
-                word_base: 3,
-                words_per_instance: 2,
-                n_instances: 1,
-            },
-        ],
+        inputs: &[InputEdge::Producer {
+            of: "verify_instruction",
+            word_base: 3,
+            words_per_instance: 2,
+            n_instances: 1,
+        }],
         outputs: &[],
         counts: &[],
         slots: None,
@@ -971,14 +1002,12 @@ static NODES: &[ComponentNode] = &[
         kernel: None,
         log_size: LogSizeSource::FromStates,
         inputs: &[],
-        outputs: &[
-            OutputEdge {
-                to: "verify_bitwise_xor_8",
-                word_base: 0,
-                words_per_instance: 3,
-                n_instances: 8,
-            },
-        ],
+        outputs: &[OutputEdge {
+            to: "verify_bitwise_xor_8",
+            word_base: 0,
+            words_per_instance: 3,
+            n_instances: 8,
+        }],
         counts: &[],
         slots: None,
     },
@@ -986,14 +1015,12 @@ static NODES: &[ComponentNode] = &[
         id: "verify_bitwise_xor_12",
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[
-            InputEdge::Producer {
-                of: "blake_g",
-                word_base: 24,
-                words_per_instance: 3,
-                n_instances: 2,
-            },
-        ],
+        inputs: &[InputEdge::Producer {
+            of: "blake_g",
+            word_base: 24,
+            words_per_instance: 3,
+            n_instances: 2,
+        }],
         outputs: &[],
         counts: &[],
         slots: None,
@@ -1002,14 +1029,12 @@ static NODES: &[ComponentNode] = &[
         id: "verify_bitwise_xor_4",
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[
-            InputEdge::Producer {
-                of: "blake_g",
-                word_base: 30,
-                words_per_instance: 3,
-                n_instances: 2,
-            },
-        ],
+        inputs: &[InputEdge::Producer {
+            of: "blake_g",
+            word_base: 30,
+            words_per_instance: 3,
+            n_instances: 2,
+        }],
         outputs: &[],
         counts: &[],
         slots: None,
@@ -1018,14 +1043,12 @@ static NODES: &[ComponentNode] = &[
         id: "verify_bitwise_xor_7",
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[
-            InputEdge::Producer {
-                of: "blake_g",
-                word_base: 36,
-                words_per_instance: 3,
-                n_instances: 2,
-            },
-        ],
+        inputs: &[InputEdge::Producer {
+            of: "blake_g",
+            word_base: 36,
+            words_per_instance: 3,
+            n_instances: 2,
+        }],
         outputs: &[],
         counts: &[],
         slots: None,
@@ -1056,14 +1079,12 @@ static NODES: &[ComponentNode] = &[
         id: "verify_bitwise_xor_9",
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[
-            InputEdge::Producer {
-                of: "blake_g",
-                word_base: 42,
-                words_per_instance: 3,
-                n_instances: 2,
-            },
-        ],
+        inputs: &[InputEdge::Producer {
+            of: "blake_g",
+            word_base: 42,
+            words_per_instance: 3,
+            n_instances: 2,
+        }],
         outputs: &[],
         counts: &[],
         slots: None,
@@ -1202,9 +1223,10 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
         ],
-        counts: &[
-            CountFeed { family: "range_check_7_2_5_state", n_relations: 1 },
-        ],
+        counts: &[CountFeed {
+            family: "range_check_7_2_5_state",
+            n_relations: 1,
+        }],
         slots: None,
     },
 ];

@@ -11,6 +11,7 @@ pub mod device_feed;
 mod jit_flat_macros;
 pub mod jit_prove_backend;
 pub mod jit_witness_hook;
+pub mod logup_descs;
 pub mod memory_witness_backend;
 pub mod opcodes;
 pub mod pedersen_witness_backend;

@@ -304,6 +304,9 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
         let out = stwo_backend_cuda::logup_pairs::device_interaction_from_flats(
             lookup_dev.device_ptr,
             n_rows,
+            // Opcode descriptors carry no ENABLER mult source (the enabler is the
+            // mults_1 flats column); n_real is unused but passed truthfully.
+            n_rows,
             &descs,
             &elements.alpha_powers()[..max_w],
             elements.z(),

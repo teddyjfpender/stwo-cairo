@@ -330,6 +330,56 @@ fn add_opcode_recording_interpreter_matches_host() {
 /// sum. The sub-input comparison spans ALL padded rows — the host feeds padding
 /// rows too (`mults_0 = 1` everywhere); a lane that truncates at the real row
 /// count fails this test (and would produce an unverifiable proof).
+
+/// §6a LOCAL GATE engine: the emitted `JIT_LOGUP_DESCS` facts, resolved against
+/// `JIT_LOOKUP_FIELDS` and run through the HOST MIRROR of the device pair kernel
+/// (`logup_descs::host_mirror_raw_logup`), must finalize to the SAME interaction
+/// trace and claimed sum as the module's generated `write_interaction_trace` —
+/// over the same word-major flats. Proves the descriptor semantics without any
+/// CUDA; the pod differential then covers only the kernel's re-implementation.
+#[allow(clippy::too_many_arguments)]
+fn assert_logup_descs_match_writer(
+    label: &str,
+    fields: &[(&str, usize)],
+    facts: &[crate::witness::logup_descs::LogupDescFact],
+    raw_ref: stwo_constraint_framework::RawLogupTrace,
+    lookup_flat: &[u32],
+    n_padded: usize,
+    n_real: usize,
+    elements: &cairo_air::relations::CommonLookupElements,
+) {
+    use stwo::prover::backend::Column as _;
+    use stwo_constraint_framework::LogupFinalizeBackend;
+
+    use crate::witness::logup_descs::{host_mirror_raw_logup, resolve_logup_descs};
+
+    let descs = resolve_logup_descs(fields, facts);
+    let raw_mirror = host_mirror_raw_logup(lookup_flat, n_padded, n_real, &descs, elements);
+    let (evals_ref, sum_ref) = <SimdBackend as LogupFinalizeBackend>::finalize_raw_logup(raw_ref);
+    let (evals_mir, sum_mir) =
+        <SimdBackend as LogupFinalizeBackend>::finalize_raw_logup(raw_mirror);
+    assert_eq!(sum_ref, sum_mir, "{label}: claimed sum differs");
+    assert_eq!(
+        evals_ref.len(),
+        evals_mir.len(),
+        "{label}: column count differs"
+    );
+    for (c, (a, b)) in evals_ref.iter().zip(&evals_mir).enumerate() {
+        assert_eq!(
+            a.values.to_cpu(),
+            b.values.to_cpu(),
+            "{label}: interaction column {c} differs"
+        );
+    }
+}
+
+/// Deterministic lookup elements for the §6a legs (any elements work — the gate
+/// compares two computations of the same function of them).
+fn test_lookup_elements() -> cairo_air::relations::CommonLookupElements {
+    use stwo::core::channel::Blake2sChannel;
+    cairo_air::relations::CommonLookupElements::draw(&mut Blake2sChannel::default())
+}
+
 #[test]
 fn add_opcode_prove_accessors_match_host() {
     let cg = fill_fixture(&[
@@ -402,6 +452,23 @@ fn add_opcode_prove_accessors_match_host() {
         &diff.orig_lookup,
         "prove-accessor lookup_data",
     );
+
+    // §6a leg: emitted JIT_LOGUP_DESCS → host mirror ≡ the generated writer
+    // (the opcode shape: mults_0/mults_1 flats columns + trailing solo negated).
+    {
+        let elements = test_lookup_elements();
+        let (raw_ref, _claim) = igen.write_interaction_trace(&elements);
+        assert_logup_descs_match_writer(
+            "add_opcode",
+            add_opcode::JIT_LOOKUP_FIELDS,
+            add_opcode::JIT_LOGUP_DESCS,
+            raw_ref,
+            &lookup_flat,
+            n_padded,
+            n_rows,
+            &elements,
+        );
+    }
 
     // (ii) The decoded sub-inputs, all padded rows, against the host writer's
     // pre-drain SubComponentInputs (fields: vi tuple ×7 words, 3 addrs, 3 ids).
@@ -1537,6 +1604,24 @@ fn blake_round_recording_interpreter_matches_host() {
         "blake_round prove-accessor lookup_data",
     );
 
+    // §6a leg: emitted JIT_LOGUP_DESCS → host mirror ≡ the generated writer.
+    // Blake exercises what opcodes cannot: NON-ADJACENT pairing (sigma ⟷
+    // rc_7_2_5), constant-one mults, and the real-row ENABLER (pair + solo).
+    {
+        let elements = test_lookup_elements();
+        let (raw_ref, _claim) = igen.write_interaction_trace(&elements);
+        assert_logup_descs_match_writer(
+            "blake_round",
+            m::JIT_LOOKUP_FIELDS,
+            m::JIT_LOGUP_DESCS,
+            raw_ref,
+            &lookup_flat,
+            n_padded,
+            n_rows,
+            &elements,
+        );
+    }
+
     // GATE (c), pod builds only: the same program as an actual CUDA kernel.
     let host_rows: Vec<Vec<M31>> = diff.orig_rows.iter().map(|r| r.to_vec()).collect();
     assert_device_builtin_leg_matches_host(
@@ -1731,6 +1816,26 @@ fn pedersen_aggregator_recording_interpreter_matches_host() {
         &diff.orig_lookup,
         "pedersen_aggregator prove-accessor lookup_data",
     );
+
+    // §6a leg: emitted JIT_LOGUP_DESCS → host mirror ≡ the generated writer.
+    // The aggregator exercises SIGN-VARYING fractions (w18 yields negated
+    // mid-stream; own-relation yield negated against mults_1).
+    {
+        let elements = test_lookup_elements();
+        let (raw_ref, _claim) = igen.write_interaction_trace(&elements);
+        assert_logup_descs_match_writer(
+            "pedersen_aggregator_window_bits_18",
+            agg::JIT_LOOKUP_FIELDS,
+            agg::JIT_LOGUP_DESCS,
+            raw_ref,
+            &lookup_flat,
+            n_padded,
+            // No ENABLER mult source in the aggregator's descriptors (its mults
+            // are flats columns); n_real is unused.
+            n_padded,
+            &elements,
+        );
+    }
 
     // GATE (c), pod builds only: the same program — 28 chained EC-round DeduceCalls
     // included — as an actual CUDA kernel against the fp256 device functions.

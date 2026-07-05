@@ -685,6 +685,176 @@ fn igen_has_n_rows(file: &syn::File) -> bool {
 /// STATE.add_packed_inputs(inputs, REL) }` or `{ add_inputs(STATE, &inputs, _,
 /// REL) }`. The literal REL argument is the consumer's multiplicity slot — the
 /// device-DAG feed layout's ground truth.
+/// Parse the module's `write_interaction_trace` into per-logup-column descriptor
+/// FACTS for the §6a device-interaction lane: `(a_field, a_mult, a_neg, b_field,
+/// b_mult, b_neg)` per column, in column order; `b_field == ""` for a trailing
+/// solo column; mult encoding `"1"` (one), `"enabler"` (real-row enabler), else a
+/// scalar lookup-data field name. Pairing order is arbitrary (blake_round pairs
+/// sigma with rc_7_2_5) and sign patterns vary (the aggregator negates yields
+/// mid-stream), so these are parsed facts — never derivation rules. An
+/// unrecognized numerator form ABORTS the emit: new AIR shapes must be examined,
+/// not skipped.
+type LogupDescFact = (String, String, bool, String, String, bool);
+fn parse_logup_descs(file: &syn::File) -> Option<Vec<LogupDescFact>> {
+    use quote::ToTokens;
+
+    // `&self.lookup_data.FIELD` → FIELD.
+    fn lookup_field(e: &Expr) -> Option<String> {
+        let e = strip_parens(e);
+        let inner = if let Expr::Reference(r) = e {
+            strip_parens(&r.expr)
+        } else {
+            e
+        };
+        let Expr::Field(f) = inner else { return None };
+        let Expr::Field(base) = strip_parens(&f.base) else {
+            return None;
+        };
+        let syn::Member::Named(m) = &base.member else {
+            return None;
+        };
+        if m != "lookup_data" {
+            return None;
+        }
+        match &f.member {
+            syn::Member::Named(id) => Some(id.to_string()),
+            syn::Member::Unnamed(_) => None,
+        }
+    }
+
+    // Find `fn write_interaction_trace` (any impl block).
+    let mut body: Option<&syn::Block> = None;
+    for item in &file.items {
+        if let syn::Item::Impl(im) = item {
+            for ii in &im.items {
+                if let syn::ImplItem::Fn(f) = ii {
+                    if f.sig.ident == "write_interaction_trace" {
+                        body = Some(&f.block);
+                    }
+                }
+            }
+        }
+    }
+    let body = body?;
+
+    struct ColVisitor {
+        descs: Vec<LogupDescFact>,
+        failed: Option<String>,
+    }
+    impl<'a> syn::visit::Visit<'a> for ColVisitor {
+        fn visit_expr_method_call(&mut self, node: &'a syn::ExprMethodCall) {
+            syn::visit::visit_expr_method_call(self, node);
+            if node.method != "for_each" || self.failed.is_some() {
+                return;
+            }
+            // Receiver chain: TUPLE.into_par_iter()[.enumerate()]
+            let mut recv = strip_parens(&node.receiver);
+            if let Expr::MethodCall(mc) = recv {
+                if mc.method == "enumerate" {
+                    recv = strip_parens(&mc.receiver);
+                }
+            }
+            let Expr::MethodCall(ipi) = recv else { return };
+            if ipi.method != "into_par_iter" {
+                return;
+            }
+            let Expr::Tuple(tup) = strip_parens(&ipi.receiver) else {
+                return;
+            };
+            // First tuple element must be col_gen.par_iter_mut(); the rest are
+            // lookup-data field refs.
+            let mut elems = tup.elems.iter();
+            let Some(Expr::MethodCall(first)) = elems.next().map(strip_parens) else {
+                return;
+            };
+            if first.method != "par_iter_mut" {
+                return;
+            }
+            let fields: Vec<String> = elems.map(|e| lookup_field(e)).collect::<Option<_>>()
+                .unwrap_or_default();
+            if fields.is_empty() {
+                return;
+            }
+            // The closure body's write_frac numerator, whitespace-normalized.
+            let Some(Expr::Closure(cl)) = node.args.first().map(strip_parens) else {
+                return;
+            };
+            let mut numerator: Option<String> = None;
+            struct FracVisitor<'b>(&'b mut Option<String>);
+            impl<'a, 'b> syn::visit::Visit<'a> for FracVisitor<'b> {
+                fn visit_expr_method_call(&mut self, n: &'a syn::ExprMethodCall) {
+                    if n.method == "write_frac" {
+                        if let Some(arg) = n.args.first() {
+                            *self.0 = Some(
+                                arg.to_token_stream()
+                                    .to_string()
+                                    .chars()
+                                    .filter(|c| !c.is_whitespace())
+                                    .collect(),
+                            );
+                        }
+                    }
+                    syn::visit::visit_expr_method_call(self, n);
+                }
+            }
+            FracVisitor(&mut numerator).visit_expr(&cl.body);
+            let Some(num) = numerator else { return };
+
+            let fact = match (num.as_str(), fields.len()) {
+                ("denom0**mult1+denom1**mult0", 4) => (
+                    fields[0].clone(), fields[2].clone(), false,
+                    fields[1].clone(), fields[3].clone(), false,
+                ),
+                ("denom0+denom1", 2) => (
+                    fields[0].clone(), "1".into(), false,
+                    fields[1].clone(), "1".into(), false,
+                ),
+                ("denom1**mult0-denom0**mult1", 4) => (
+                    fields[0].clone(), fields[2].clone(), false,
+                    fields[1].clone(), fields[3].clone(), true,
+                ),
+                ("denom0**mult1-denom1**mult0", 4) => (
+                    fields[0].clone(), fields[2].clone(), true,
+                    fields[1].clone(), fields[3].clone(), false,
+                ),
+                ("denom0*enabler_col.packed_at(i)+denom1", 2) => (
+                    fields[0].clone(), "1".into(), false,
+                    fields[1].clone(), "enabler".into(), false,
+                ),
+                ("(-mult).into()", 2) => (
+                    fields[0].clone(), fields[1].clone(), true,
+                    String::new(), String::new(), false,
+                ),
+                ("-PackedQM31::one()*enabler_col.packed_at(i)", 1) => (
+                    fields[0].clone(), "enabler".into(), true,
+                    String::new(), String::new(), false,
+                ),
+                _ => {
+                    self.failed = Some(format!(
+                        "unrecognized logup numerator form ({} fields): {num}",
+                        fields.len()
+                    ));
+                    return;
+                }
+            };
+            self.descs.push(fact);
+        }
+    }
+    let mut v = ColVisitor {
+        descs: Vec::new(),
+        failed: None,
+    };
+    syn::visit::Visit::visit_block(&mut v, body);
+    if let Some(err) = v.failed {
+        eprintln!("parse_logup_descs: {err}");
+        std::process::exit(1);
+    }
+    if v.descs.is_empty() {
+        return None;
+    }
+    Some(v.descs)
+}
+
 fn parse_feed_map(file: &syn::File) -> std::collections::BTreeMap<String, (String, u32)> {
     use syn::visit::Visit;
     #[derive(Default)]
@@ -3140,6 +3310,29 @@ fn build_marked_block(
         }
         lay.push_str("];");
         seg.push(lay);
+        seg.push(String::new());
+    }
+
+    // 5c. §6a device-interaction descriptors: one entry per logup column, parsed
+    // from this module's write_interaction_trace. Facts only — pairing order is
+    // arbitrary and sign/mult patterns vary per component; an unrecognized
+    // numerator form aborts the emit inside parse_logup_descs.
+    {
+        let descs = parse_logup_descs(&file).unwrap_or_else(|| {
+            eprintln!("JIT_LOGUP_DESCS: write_interaction_trace not found/empty");
+            std::process::exit(1);
+        });
+        let mut d = String::new();
+        d.push_str(
+            "/// §6a device-interaction descriptors (facts, COLUMN order): one entry\n             /// per logup column — (a_field, a_mult, a_neg, b_field, b_mult, b_neg);\n             /// b_field == \"\" for a trailing solo column. mult encoding: \"1\" = one,\n             /// \"enabler\" = the real-row enabler, else a scalar lookup-data field.\n             #[allow(dead_code)]\n             pub(crate) const JIT_LOGUP_DESCS: &[(&str, &str, bool, &str, &str, bool)] = &[\n",
+        );
+        for (af, am, an, bf, bm, bn) in &descs {
+            d.push_str(&format!(
+                "    (\"{af}\", \"{am}\", {an}, \"{bf}\", \"{bm}\", {bn}),\n"
+            ));
+        }
+        d.push_str("];");
+        seg.push(d);
         seg.push(String::new());
     }
 

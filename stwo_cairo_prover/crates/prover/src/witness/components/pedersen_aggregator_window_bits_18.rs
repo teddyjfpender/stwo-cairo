@@ -12537,6 +12537,62 @@ pub(crate) const SUB_FEED_LAYOUT: &[(&str, usize, &str, u32, usize, usize)] = &[
     ),
 ];
 
+/// §6a device-interaction descriptors (facts, COLUMN order): one entry
+/// per logup column — (a_field, a_mult, a_neg, b_field, b_mult, b_neg);
+/// b_field == "" for a trailing solo column. mult encoding: "1" = one,
+/// "enabler" = the real-row enabler, else a scalar lookup-data field.
+#[allow(dead_code)]
+pub(crate) const JIT_LOGUP_DESCS: &[(&str, &str, bool, &str, &str, bool)] = &[
+    (
+        "memory_id_to_big_0",
+        "mults_0",
+        false,
+        "memory_id_to_big_1",
+        "mults_0",
+        false,
+    ),
+    (
+        "range_check_8_2",
+        "mults_0",
+        false,
+        "range_check_8_3",
+        "mults_0",
+        false,
+    ),
+    (
+        "range_check_8_4",
+        "mults_0",
+        false,
+        "range_check_8_5",
+        "mults_0",
+        false,
+    ),
+    (
+        "partial_ec_mul_window_bits_18_6",
+        "mults_0",
+        true,
+        "partial_ec_mul_window_bits_18_7",
+        "mults_0",
+        false,
+    ),
+    (
+        "partial_ec_mul_window_bits_18_8",
+        "mults_0",
+        true,
+        "partial_ec_mul_window_bits_18_9",
+        "mults_0",
+        false,
+    ),
+    (
+        "memory_id_to_big_10",
+        "mults_0",
+        false,
+        "pedersen_aggregator_window_bits_18_11",
+        "mults_1",
+        true,
+    ),
+];
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {

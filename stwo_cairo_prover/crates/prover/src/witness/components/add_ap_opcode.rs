@@ -900,6 +900,39 @@ pub(crate) const SUB_FEED_LAYOUT: &[(&str, usize, &str, u32, usize, usize)] = &[
     ("range_check_11", 0, "range_check_11_state", 0, 10, 1),
 ];
 
+/// §6a device-interaction descriptors (facts, COLUMN order): one entry
+/// per logup column — (a_field, a_mult, a_neg, b_field, b_mult, b_neg);
+/// b_field == "" for a trailing solo column. mult encoding: "1" = one,
+/// "enabler" = the real-row enabler, else a scalar lookup-data field.
+#[allow(dead_code)]
+pub(crate) const JIT_LOGUP_DESCS: &[(&str, &str, bool, &str, &str, bool)] = &[
+    (
+        "verify_instruction_0",
+        "mults_0",
+        false,
+        "memory_address_to_id_1",
+        "mults_0",
+        false,
+    ),
+    (
+        "memory_id_to_big_2",
+        "mults_0",
+        false,
+        "range_check_18_3",
+        "mults_0",
+        false,
+    ),
+    (
+        "range_check_11_4",
+        "mults_0",
+        false,
+        "opcodes_5",
+        "mults_1",
+        false,
+    ),
+    ("opcodes_6", "mults_1", true, "", "", false),
+];
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
