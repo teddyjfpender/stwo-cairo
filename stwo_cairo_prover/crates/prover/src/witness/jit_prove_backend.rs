@@ -656,6 +656,42 @@ pub trait BuiltinLaneSpec {
 /// launch's resident sub buffer; the caller's host `feed` closure receives the
 /// device-fed state set and MUST skip those relations (double-feeding corrupts
 /// multiplicities). Fail-closed: any unavailability feeds everything on host.
+/// B3 device edges master switch: when on, producer lanes SKIP their
+/// input-list host feed and stash the sub buffer for the consumer.
+pub(crate) fn edges_enabled() -> bool {
+    std::env::var("STWO_CUDA_WITNESS_EDGES").as_deref() == Ok("1")
+}
+
+/// The B3 edge stash: producer label-keyed (BY CONSUMER edge key) device sub
+/// buffer + its HOST flat mirror + the producer's padded row count. The host
+/// flat makes every consumer-side failure recoverable on CPU (rebuild the
+/// inputs with the edge-gate math) — exactly-once feeds with no pair rerun.
+type EdgeStash = std::sync::Mutex<
+    std::collections::HashMap<&'static str, (stwo_backend_cuda::BaseFieldVec, Vec<u32>, usize)>,
+>;
+fn edge_stash() -> &'static EdgeStash {
+    static STASH: std::sync::OnceLock<EdgeStash> = std::sync::OnceLock::new();
+    STASH.get_or_init(Default::default)
+}
+
+/// Pop a stashed edge for `consumer_key` (one-shot per prove).
+pub(crate) fn take_edge(
+    consumer_key: &'static str,
+) -> Option<(stwo_backend_cuda::BaseFieldVec, Vec<u32>, usize)> {
+    edge_stash().lock().unwrap().remove(consumer_key)
+}
+
+/// The consumer-side input source for a builtin launch.
+pub(crate) enum BuiltinInputs<'a> {
+    /// Host-built slot columns (uploaded by the launch).
+    HostCols(&'a [Vec<u32>]),
+    /// Device edge: gathered producer columns + host tail (enabler/iota).
+    Edge {
+        device_cols: Vec<stwo_backend_cuda::BaseFieldVec>,
+        host_tail: Vec<Vec<u32>>,
+    },
+}
+
 pub(crate) struct DeviceFeedPlan<'a> {
     pub layout: &'static [(&'static str, usize, &'static str, u32, usize, usize)],
     pub lut_for: &'a dyn Fn(&'static str) -> Vec<u32>,
@@ -682,6 +718,26 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
     n_real: usize,
     mem: &Arc<Memory>,
     device_feed: Option<DeviceFeedPlan<'_>>,
+    feed: impl FnOnce(&[u32], usize, &[&'static str]),
+) -> Option<(Evals<stwo_backend_cuda::CudaBackend>, C::Claim, C::IGen)> {
+    builtin_cuda_write_trace_from::<C>(
+        BuiltinInputs::HostCols(input_cols),
+        n_real,
+        mem,
+        device_feed,
+        None,
+        feed,
+    )
+}
+
+/// Full-generality builtin device write (host cols OR device edge inputs;
+/// optional producer-side edge stash under `stash_edge`).
+pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
+    inputs: BuiltinInputs<'_>,
+    n_real: usize,
+    mem: &Arc<Memory>,
+    device_feed: Option<DeviceFeedPlan<'_>>,
+    stash_edge: Option<&'static str>,
     feed: impl FnOnce(&[u32], usize, &[&'static str]),
 ) -> Option<(Evals<stwo_backend_cuda::CudaBackend>, C::Claim, C::IGen)> {
     if !lane_enabled(C::LABEL) || !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
@@ -725,16 +781,24 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
     // program's read extent. Slots are positional, so trailing-only truncation
     // is sound; too FEW columns is still a hard mismatch.
     let n_inputs = program.n_inputs as usize;
-    if input_cols.len() < n_inputs {
+    let provided = match &inputs {
+        BuiltinInputs::HostCols(c) => c.len(),
+        BuiltinInputs::Edge {
+            device_cols,
+            host_tail,
+        } => device_cols.len() + host_tail.len(),
+    };
+    if provided < n_inputs {
         eprintln!(
-            "jit_prove[{}]: {} input columns built, program reads {} — falling back",
+            "jit_prove[{}]: {provided} input columns built, program reads {n_inputs} —              falling back",
             C::LABEL,
-            input_cols.len(),
-            n_inputs
         );
         return None;
     }
-    let input_cols = &input_cols[..n_inputs];
+    let inputs = match inputs {
+        BuiltinInputs::HostCols(c) => BuiltinInputs::HostCols(&c[..n_inputs.min(c.len())]),
+        other => other,
+    };
     stwo_backend_cuda::jit_witness::register_recorded_program(C::LABEL, recording.program);
 
     let tables = stwo_backend_cuda::exec_tables::exec_tables_cached(
@@ -749,14 +813,35 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
         },
     );
 
-    let (cols, _lookup_dev, lookup_flat, sub_dev, sub_flat) =
-        stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
-            C::LABEL,
-            input_cols,
-            tables,
-            true,
-        )?;
-    let column_length = input_cols[0].len();
+    let (cols, _lookup_dev, lookup_flat, sub_dev, sub_flat) = match &inputs {
+        BuiltinInputs::HostCols(input_cols) => {
+            stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
+                C::LABEL,
+                input_cols,
+                tables,
+                true,
+            )?
+        }
+        BuiltinInputs::Edge {
+            device_cols,
+            host_tail,
+        } => {
+            let ptrs: Vec<*const u32> = device_cols.iter().map(|c| c.device_ptr).collect();
+            let n = host_tail[0].len();
+            stwo_backend_cuda::exec_tables::launch_recorded_builtin_mixed(
+                C::LABEL,
+                &ptrs,
+                host_tail,
+                n,
+                tables,
+                true,
+            )?
+        }
+    };
+    let column_length = match &inputs {
+        BuiltinInputs::HostCols(input_cols) => input_cols[0].len(),
+        BuiltinInputs::Edge { host_tail, .. } => host_tail[0].len(),
+    };
     let log_size = column_length.ilog2();
     if cols.len() != C::N_TRACE {
         eprintln!(
@@ -836,6 +921,23 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
                     );
                 }
             }
+        }
+    }
+    // B3 producer role: stash the sub buffer for the consumer edge and add the
+    // consumer's state key to the skip set — its input-list feed happens as the
+    // consumer's device inputs (or the consumer rebuilds from the stashed HOST
+    // flat on any failure; exactly-once either way).
+    if let Some(consumer_key) = stash_edge {
+        if edges_enabled() {
+            edge_stash()
+                .lock()
+                .unwrap()
+                .insert(consumer_key, (sub_dev, sub_flat.clone(), column_length));
+            device_fed.push(consumer_key);
+            eprintln!(
+                "jit_prove[{}]: stashed device edge for {consumer_key}",
+                C::LABEL
+            );
         }
     }
     feed(&sub_flat, column_length, &device_fed);

@@ -15077,6 +15077,26 @@ pub(crate) fn feed_sub_inputs_from_flat(
             add_inputs(range_check_8_state, &col, n_rows, 0);
         }
     }
+    if !skip.contains(&"partial_ec_mul_window_bits_18_state") {
+        feed_w18_inputs_from_flat(words, n_rows, partial_ec_mul_window_bits_18_state);
+    }
+}
+
+/// Feed the 28 w18 EC-round input instances from the aggregator's word-major
+/// sub flat (base 7, 72 words each) — the host side of the aggregator->w18
+/// edge, also the consumer's CPU rebuild path when the device edge fails.
+pub(crate) fn feed_w18_inputs_from_flat(
+    words: &[u32],
+    n_rows: usize,
+    partial_ec_mul_window_bits_18_state: &partial_ec_mul_window_bits_18::ClaimGenerator,
+) {
+    use crate::witness::utils::add_inputs;
+    let n_vec = n_rows / N_LANES;
+    let m31 = |word: usize, vi: usize| {
+        PackedM31::from_array(std::array::from_fn(|l| {
+            M31::from_u32_unchecked(words[word * n_rows + vi * N_LANES + l])
+        }))
+    };
     for j in 0..28 {
         let base = 7 + j * 72;
         let col: Vec<partial_ec_mul_window_bits_18::PackedInputType> = (0..n_vec)

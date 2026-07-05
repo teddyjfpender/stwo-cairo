@@ -377,6 +377,76 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
         // deduces on the device pedersen table), slot columns `[in.0, in.1,
         // 14 windows, acc0 x28, acc1 x28 | enabler | iota]`. ALL relations are
         // count-style (points table included) — device feed REQUIRED.
+        // B3 edge consumer: the aggregator's lane stashed its device sub buffer
+        // (and skipped the host w18 feed). Prefer the device gather; any failure
+        // rebuilds the inputs on CPU from the stashed HOST flat (the edge-gate
+        // math) so feeds stay exactly-once with no pair rerun.
+        if let Some(mem) = jit_memory {
+            if let Some((sub_dev, sub_host, prod_rows)) =
+                crate::witness::jit_prove_backend::take_edge("partial_ec_mul_window_bits_18_state")
+            {
+                use stwo::prover::backend::simd::m31::N_LANES;
+                let n_real = 28 * prod_rows;
+                let padded = std::cmp::max(n_real.next_power_of_two(), N_LANES);
+                let host_tail: Vec<Vec<u32>> = vec![
+                    (0..padded).map(|r| u32::from(r < n_real)).collect(),
+                    (0..padded).map(|r| r as u32).collect(),
+                ];
+                let lut_for = |family: &'static str| -> Vec<u32> {
+                    match family {
+                        "range_check_9_9_state" => range_check_9_9.input_to_row_lut(),
+                        other => panic!("unexpected LUT family {other}"),
+                    }
+                };
+                let merge = |family: &'static str, counts: &[u32]| match family {
+                    "pedersen_points_table_window_bits_18_state" => {
+                        pedersen_points_table.add_count_tables(counts)
+                    }
+                    "range_check_9_9_state" => range_check_9_9.add_count_tables(counts),
+                    "range_check_20_state" => range_check_20.add_count_tables(counts),
+                    other => panic!("unexpected count family {other}"),
+                };
+                let plan = crate::witness::jit_prove_backend::DeviceFeedPlan {
+                    layout: partial_ec_mul_window_bits_18::SUB_FEED_LAYOUT,
+                    lut_for: &lut_for,
+                    merge: &merge,
+                    require: true,
+                };
+                let launched = stwo_backend_cuda::exec_tables::witness_edge_gather(
+                    &sub_dev, prod_rows, 7, 72, 28, padded,
+                )
+                .and_then(|device_cols| {
+                    crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<
+                        crate::witness::jit_prove_backend::PartialEcMulW18Lane,
+                    >(
+                        crate::witness::jit_prove_backend::BuiltinInputs::Edge {
+                            device_cols,
+                            host_tail: host_tail.clone(),
+                        },
+                        n_real,
+                        mem,
+                        Some(plan),
+                        None,
+                        |_s, _n, fed| debug_assert!(!fed.is_empty()),
+                    )
+                });
+                match launched {
+                    Some(out) => return out,
+                    None => {
+                        // Recoverable: rebuild the generator's inputs from the
+                        // stashed HOST flat, then fall through to the normal
+                        // paths (device host-cols lane, then the host writer).
+                        eprintln!(
+                            "jit_prove[partial_ec_mul_window_bits_18]: device edge failed — \
+                             rebuilding inputs from the stashed host flat"
+                        );
+                        pedersen_aggregator_window_bits_18::feed_w18_inputs_from_flat(
+                            &sub_host, prod_rows, &gen,
+                        );
+                    }
+                }
+            }
+        }
         if let Some(mem) = jit_memory {
             use stwo::prover::backend::simd::m31::N_LANES;
             let packed: Vec<partial_ec_mul_window_bits_18::PackedInputType> =
@@ -508,13 +578,14 @@ impl PedersenAggregatorWindowBits18Witness for CudaBackend {
                     merge: &merge,
                     require: false,
                 };
-                let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace::<
+                let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<
                     crate::witness::jit_prove_backend::PedersenAggregatorW18Lane,
                 >(
-                    &cols,
+                    crate::witness::jit_prove_backend::BuiltinInputs::HostCols(&cols),
                     n_real,
                     mem,
                     Some(plan),
+                    Some("partial_ec_mul_window_bits_18_state"),
                     |sub_flat, n_padded, skip| {
                         pedersen_aggregator_window_bits_18::feed_sub_inputs_from_flat(
                             sub_flat,
