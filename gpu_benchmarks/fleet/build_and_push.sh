@@ -30,9 +30,9 @@ SSHB="ssh -i $KEY -p $BPORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/d
 
 echo "== builder: $(echo "$BUILDER" | cut -d"|" -f1,4) =="
 if [ "$SKIP_SYNC" = 0 ]; then
-  rsync -az --partial -e "ssh -i $KEY -p $BPORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --exclude=target --exclude=.git \
+  rsync -rlptz --partial --no-owner --no-group -e "ssh -i $KEY -p $BPORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --exclude=target --exclude=.git \
     /Users/theodorepender/code/personal/stwo/ "root@$BHOST:/workspace/stwo/"
-  rsync -az --partial -e "ssh -i $KEY -p $BPORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --exclude=target --exclude=.git \
+  rsync -rlptz --partial --no-owner --no-group -e "ssh -i $KEY -p $BPORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --exclude=target --exclude=.git \
     --exclude="gpu_benchmarks/pie/sn/*.zip" \
     /Users/theodorepender/code/personal/stwo-cairo/ "root@$BHOST:/workspace/stwo-cairo/"
   $SSHB 'sed -i "s|/Users/theodorepender/code/personal/stwo|/workspace/stwo|g" /workspace/stwo-cairo/stwo_cairo_prover/Cargo.toml'
@@ -65,10 +65,10 @@ for p in "${PODS[@]}"; do
     # Builder pushes directly pod-to-pod via the account key already in the agent
     # (run this script under ssh -A; nothing is persisted on any pod).
     ssh -A -i "$KEY" -p "$BPORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$BHOST" \
-      "rsync -az -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $PORT' \
+      "rsync -rlptz --no-owner --no-group -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $PORT' \
         /workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench \
         root@$HOST:/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench && \
-       rsync -az -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $PORT' \
+       rsync -rlptz --no-owner --no-group -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $PORT' \
         /root/.cache/stwo-jit/ root@$HOST:/root/.cache/stwo-jit/" \
       && echo "  $ID: binary + jit cache pushed"
     ssh -i "$KEY" -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "root@$HOST" \
