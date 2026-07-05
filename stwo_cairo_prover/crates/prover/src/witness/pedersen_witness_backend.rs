@@ -356,17 +356,36 @@ impl PedersenAggregatorWindowBits18Witness for CudaBackend {
                     (0..size).map(|r| r as u32).collect(),
                     mults.iter().map(|m| m.0).collect(),
                 ];
+                let lut_for = |family: &'static str| -> Vec<u32> {
+                    panic!("aggregator count feed needs no LUT, got {family}")
+                };
+                let merge = |family: &'static str, counts: &[u32]| match family {
+                    "range_check_8_state" => range_check_8.add_count_tables(counts),
+                    other => panic!("unexpected count family {other}"),
+                };
+                let plan = crate::witness::jit_prove_backend::DeviceFeedPlan {
+                    layout: pedersen_aggregator_window_bits_18::SUB_FEED_LAYOUT,
+                    lut_for: &lut_for,
+                    merge: &merge,
+                };
                 let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace::<
                     crate::witness::jit_prove_backend::PedersenAggregatorW18Lane,
-                >(&cols, n_real, mem, |sub_flat, n_padded| {
-                    pedersen_aggregator_window_bits_18::feed_sub_inputs_from_flat(
-                        sub_flat,
-                        n_padded,
-                        memory_id_to_big,
-                        range_check_8,
-                        partial_ec_mul_window_bits_18,
-                    );
-                });
+                >(
+                    &cols,
+                    n_real,
+                    mem,
+                    Some(plan),
+                    |sub_flat, n_padded, skip| {
+                        pedersen_aggregator_window_bits_18::feed_sub_inputs_from_flat(
+                            sub_flat,
+                            n_padded,
+                            memory_id_to_big,
+                            range_check_8,
+                            partial_ec_mul_window_bits_18,
+                            skip,
+                        );
+                    },
+                );
                 if let Some(out) = launched {
                     return out;
                 }

@@ -649,12 +649,25 @@ pub trait BuiltinLaneSpec {
     fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen;
 }
 
+/// The device-DAG count-feed plan for one component (B2): the emitted
+/// `SUB_FEED_LAYOUT`, a LUT provider per relation family, and a per-family
+/// merge into the downstream states' `add_count_tables`. Relations covered by
+/// [`crate::witness::device_feed::COUNT_RELATIONS`] feed ON DEVICE from the
+/// launch's resident sub buffer; the caller's host `feed` closure receives the
+/// device-fed state set and MUST skip those relations (double-feeding corrupts
+/// multiplicities). Fail-closed: any unavailability feeds everything on host.
+pub(crate) struct DeviceFeedPlan<'a> {
+    pub layout: &'static [(&'static str, usize, &'static str, u32, usize, usize)],
+    pub lut_for: &'a dyn Fn(&'static str) -> Vec<u32>,
+    pub merge: &'a dyn Fn(&'static str, &[u32]),
+}
+
 /// Generic builtin device write: validate the recording against the spec, launch
 /// it on the caller-built slot columns, and rebuild (trace, claim, igen); the
 /// caller then applies its component-specific sub feeds via `feed(sub_flat,
-/// n_padded)`. `None` = fall back to the host writer (reason logged) — the
-/// caller's `gen` is untouched (this only ever READS the inputs), so the host
-/// path stays valid.
+/// n_padded, device_fed_states)`. `None` = fall back to the host writer (reason
+/// logged) — the caller's `gen` is untouched (this only ever READS the inputs),
+/// so the host path stays valid.
 ///
 /// §6a note: builtins always take the host-flats interaction path for now
 /// (`want_host_lookup = true`); extending the device-interaction stash to the
@@ -663,7 +676,8 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
     input_cols: &[Vec<u32>],
     n_real: usize,
     mem: &Arc<Memory>,
-    feed: impl FnOnce(&[u32], usize),
+    device_feed: Option<DeviceFeedPlan<'_>>,
+    feed: impl FnOnce(&[u32], usize, &[&'static str]),
 ) -> Option<(Evals<stwo_backend_cuda::CudaBackend>, C::Claim, C::IGen)> {
     if !lane_enabled(C::LABEL) || !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         return None;
@@ -730,7 +744,7 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
         },
     );
 
-    let (cols, _lookup_dev, lookup_flat, _sub_dev, sub_flat) =
+    let (cols, _lookup_dev, lookup_flat, sub_dev, sub_flat) =
         stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
             C::LABEL,
             input_cols,
@@ -763,7 +777,56 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
         .collect();
     let claim = C::claim(log_size);
     let igen = C::igen_from_flats(log_size, n_real, &lookup_flat, column_length);
-    feed(&sub_flat, column_length);
+
+    // Device-DAG count feed: count-style relations feed on device from the
+    // resident sub buffer; the host closure then skips them. Any failure feeds
+    // everything on host (empty skip set) — never a double feed, never a miss.
+    let mut device_fed: Vec<&'static str> = Vec::new();
+    if let Some(plan) = device_feed {
+        let (descs, lut_slots, counts_slots) = crate::witness::device_feed::build_feed_descriptors(
+            plan.layout,
+            crate::witness::device_feed::COUNT_RELATIONS,
+        );
+        if !descs.is_empty() {
+            let luts: Vec<Vec<u32>> = lut_slots.iter().map(|s| (plan.lut_for)(s)).collect();
+            let sizes: Vec<usize> = counts_slots
+                .iter()
+                .map(|s| {
+                    let rel = crate::witness::device_feed::COUNT_RELATIONS
+                        .iter()
+                        .find(|r| r.state_param == *s)
+                        .expect("counts slot always registry-backed");
+                    rel.n_relations * rel.table_size
+                })
+                .collect();
+            match stwo_backend_cuda::exec_tables::run_witness_feed_counts(
+                &sub_dev,
+                column_length,
+                &descs,
+                &luts,
+                &sizes,
+            ) {
+                Some(counts) => {
+                    for (slot, c) in counts_slots.iter().zip(&counts) {
+                        (plan.merge)(slot, c);
+                    }
+                    device_fed = counts_slots;
+                    eprintln!(
+                        "jit_prove[{}]: device count feed merged {} relation families",
+                        C::LABEL,
+                        device_fed.len()
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "jit_prove[{}]: device count feed unavailable — host feeds all",
+                        C::LABEL
+                    );
+                }
+            }
+        }
+    }
+    feed(&sub_flat, column_length, &device_fed);
     Some((trace, claim, igen))
 }
 

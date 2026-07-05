@@ -15055,6 +15055,7 @@ pub(crate) fn feed_sub_inputs_from_flat(
     memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
     range_check_8_state: &range_check_8::ClaimGenerator,
     partial_ec_mul_window_bits_18_state: &partial_ec_mul_window_bits_18::ClaimGenerator,
+    skip: &[&str],
 ) {
     use crate::witness::utils::add_inputs;
     const N_SUB: usize = 3 + 4 + 28 * 72;
@@ -15069,10 +15070,12 @@ pub(crate) fn feed_sub_inputs_from_flat(
         let col: Vec<memory_id_to_big::PackedInputType> = (0..n_vec).map(|vi| m31(j, vi)).collect();
         add_inputs(memory_id_to_big_state, &col, n_rows, 0);
     }
-    for j in 0..4 {
-        let col: Vec<range_check_8::PackedInputType> =
-            (0..n_vec).map(|vi| [m31(3 + j, vi)]).collect();
-        add_inputs(range_check_8_state, &col, n_rows, 0);
+    if !skip.contains(&"range_check_8_state") {
+        for j in 0..4 {
+            let col: Vec<range_check_8::PackedInputType> =
+                (0..n_vec).map(|vi| [m31(3 + j, vi)]).collect();
+            add_inputs(range_check_8_state, &col, n_rows, 0);
+        }
     }
     for j in 0..28 {
         let base = 7 + j * 72;

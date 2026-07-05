@@ -151,19 +151,41 @@ impl BlakeRoundWitness for CudaBackend {
                 }
                 cols[19] = (0..size).map(|r| u32::from(r < n_real)).collect();
                 cols[20] = (0..size).map(|r| r as u32).collect();
+                let lut_for = |family: &'static str| -> Vec<u32> {
+                    match family {
+                        "range_check_7_2_5_state" => range_check_7_2_5_state.input_to_row_lut(),
+                        other => panic!("unexpected LUT family {other}"),
+                    }
+                };
+                let merge = |family: &'static str, counts: &[u32]| match family {
+                    "range_check_7_2_5_state" => range_check_7_2_5_state.add_count_tables(counts),
+                    other => panic!("unexpected count family {other}"),
+                };
+                let plan = crate::witness::jit_prove_backend::DeviceFeedPlan {
+                    layout: blake_round::SUB_FEED_LAYOUT,
+                    lut_for: &lut_for,
+                    merge: &merge,
+                };
                 let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace::<
                     crate::witness::jit_prove_backend::BlakeRoundLane,
-                >(&cols, n_real, mem, |sub_flat, n_padded| {
-                    blake_round::feed_sub_inputs_from_flat(
-                        sub_flat,
-                        n_padded,
-                        blake_round_sigma_state,
-                        memory_address_to_id_state,
-                        memory_id_to_big_state,
-                        range_check_7_2_5_state,
-                        blake_g_state,
-                    );
-                });
+                >(
+                    &cols,
+                    n_real,
+                    mem,
+                    Some(plan),
+                    |sub_flat, n_padded, skip| {
+                        blake_round::feed_sub_inputs_from_flat(
+                            sub_flat,
+                            n_padded,
+                            blake_round_sigma_state,
+                            memory_address_to_id_state,
+                            memory_id_to_big_state,
+                            range_check_7_2_5_state,
+                            blake_g_state,
+                            skip,
+                        );
+                    },
+                );
                 if let Some(out) = launched {
                     return out;
                 }

@@ -6703,6 +6703,7 @@ pub(crate) fn feed_sub_inputs_from_flat(
     memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
     range_check_7_2_5_state: &range_check_7_2_5::ClaimGenerator,
     blake_g_state: &blake_g::ClaimGenerator,
+    skip: &[&str],
 ) {
     use crate::witness::utils::AddInputs;
     const N_SUB: usize = 1 + 16 * 3 + 16 + 16 + 8 * 6;
@@ -6723,12 +6724,14 @@ pub(crate) fn feed_sub_inputs_from_flat(
             (0..n_vec).map(|vi| [m31(0, vi)]).collect();
         blake_round_sigma_state.add_packed_inputs(&col, 0);
     }
-    for j in 0..16 {
-        let base = 1 + j * 3;
-        let col: Vec<range_check_7_2_5::PackedInputType> = (0..n_vec)
-            .map(|vi| std::array::from_fn(|i| m31(base + i, vi)))
-            .collect();
-        range_check_7_2_5_state.add_packed_inputs(&col, 0);
+    if !skip.contains(&"range_check_7_2_5_state") {
+        for j in 0..16 {
+            let base = 1 + j * 3;
+            let col: Vec<range_check_7_2_5::PackedInputType> = (0..n_vec)
+                .map(|vi| std::array::from_fn(|i| m31(base + i, vi)))
+                .collect();
+            range_check_7_2_5_state.add_packed_inputs(&col, 0);
+        }
     }
     for j in 0..16 {
         let col: Vec<memory_address_to_id::PackedInputType> =
