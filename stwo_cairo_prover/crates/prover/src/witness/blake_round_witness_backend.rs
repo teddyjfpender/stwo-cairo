@@ -167,13 +167,14 @@ impl BlakeRoundWitness for CudaBackend {
                     merge: &merge,
                     require: false,
                 };
-                let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace::<
+                let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<
                     crate::witness::jit_prove_backend::BlakeRoundLane,
                 >(
-                    &cols,
+                    crate::witness::jit_prove_backend::BuiltinInputs::HostCols(&cols),
                     n_real,
                     mem,
                     Some(plan),
+                    Some("blake_g_state"),
                     |sub_flat, n_padded, skip| {
                         blake_round::feed_sub_inputs_from_flat(
                             sub_flat,

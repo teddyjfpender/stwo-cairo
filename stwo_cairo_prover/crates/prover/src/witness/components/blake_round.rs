@@ -6743,6 +6743,26 @@ pub(crate) fn feed_sub_inputs_from_flat(
             (0..n_vec).map(|vi| m31(65 + j, vi)).collect();
         memory_id_to_big_state.add_packed_inputs(&col, 0);
     }
+    if !skip.contains(&"blake_g_state") {
+        feed_blake_g_inputs_from_flat(words, n_rows, blake_g_state);
+    }
+}
+
+/// Feed the 8 blake_g input instances from blake_round's word-major sub flat
+/// (base 81, 6 raw u32 words each) — the host side of the blake_round->blake_g
+/// edge, also the consumer's CPU rebuild path when the device edge fails.
+pub(crate) fn feed_blake_g_inputs_from_flat(
+    words: &[u32],
+    n_rows: usize,
+    blake_g_state: &blake_g::ClaimGenerator,
+) {
+    use crate::witness::utils::AddInputs;
+    let n_vec = n_rows / N_LANES;
+    let raw_u32 = |word: usize, vi: usize| PackedUInt32 {
+        simd: std::simd::Simd::from_array(std::array::from_fn(|l| {
+            words[word * n_rows + vi * N_LANES + l]
+        })),
+    };
     for j in 0..8 {
         let base = 81 + j * 6;
         let col: Vec<blake_g::PackedInputType> = (0..n_vec)

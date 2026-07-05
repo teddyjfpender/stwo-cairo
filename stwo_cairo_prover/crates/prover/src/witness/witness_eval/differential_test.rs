@@ -3298,3 +3298,80 @@ fn aggregator_to_w18_edge_gather_matches_host_feed() {
          {w18_padded} consumer rows)"
     );
 }
+
+/// THE EDGE GATE (blake_round→blake_g): the row-major interleave of blake's
+/// sub buffer must be byte-identical to the inputs blake_g's HOST FEED
+/// produces (raw u32 words, instance-major, padding rule) — the exact layout
+/// the certified hand kernel uploads.
+#[test]
+fn blake_to_blake_g_edge_interleave_matches_host_feed() {
+    use stwo_cairo_common::prover_types::cpu::UInt32;
+
+    use crate::witness::components::{blake_g, blake_round};
+
+    let (cg, _a, _f, _s) = fill_fixture_with_memory(&[
+        "blake_round",
+        "blake_round_sigma",
+        "blake_g",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "range_check_7_2_5",
+    ]);
+    let sigma = cg.blake_round_sigma.expect("sigma");
+    let mem_addr = cg.memory_address_to_id.expect("mem addr");
+    let mem_big = cg.memory_id_to_big.expect("mem big");
+    let rc725 = cg.range_check_7_2_5.expect("rc725");
+    let blake_g_state = cg.blake_g.expect("blake_g");
+    let inputs: Vec<blake_round::InputType> = (0..24u32)
+        .map(|i| {
+            let words: [UInt32; 16] =
+                std::array::from_fn(|j| UInt32::from(0x9E37_79B9u32.wrapping_mul(j as u32 + i)));
+            (M31(i + 1), M31(i % 10), (words, M31(1 + (i % 4))))
+        })
+        .collect();
+    let n_rows = inputs.len();
+    let prod_padded = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+    let mut padded = inputs;
+    padded.resize(prod_padded, *padded.first().unwrap());
+    let packed = pack_values(&padded);
+    let diff = blake_round::generic_simd_diff(
+        packed,
+        n_rows,
+        &sigma,
+        &mem_addr,
+        &mem_big,
+        &rc725,
+        &blake_g_state,
+    );
+    let sub_flat = sub_flat_from_diff(&diff.orig_sub, prod_padded);
+
+    // Host feed ground truth: feed a FRESH blake_g state from the flat (the
+    // producer's exact host semantics), then read its packed inputs.
+    let fresh = blake_g::ClaimGenerator {
+        packed_inputs: std::sync::Mutex::new(vec![]),
+        remainder_inputs: std::sync::Mutex::new(vec![]),
+    };
+    blake_round::feed_blake_g_inputs_from_flat(&sub_flat, prod_padded, &fresh);
+    let mut fed = fresh.packed_inputs.into_inner().unwrap();
+    assert!(!fed.is_empty());
+    let n_real = 8 * prod_padded;
+    assert_eq!(fed.len() * N_LANES, n_real);
+    let cons_padded = std::cmp::max(n_real.next_power_of_two(), N_LANES);
+    fed.resize(cons_padded / N_LANES, *fed.first().unwrap());
+
+    // Device-edge mirror: row-major interleave with the kernel's exact rule.
+    for row in 0..cons_padded {
+        let src = if row < n_real { row } else { row & 15 };
+        let (j, r) = (src / prod_padded, src % prod_padded);
+        let (pr, lane) = (row / N_LANES, row % N_LANES);
+        for w in 0..6 {
+            let mirrored = sub_flat[(81 + j * 6 + w) * prod_padded + r];
+            let host = fed[pr][w].simd.as_array()[lane];
+            assert_eq!(mirrored, host, "row {row} word {w}");
+        }
+    }
+    eprintln!(
+        "edge gate [blake_round->blake_g]: PASS ({prod_padded} producer rows x 8 -> \
+         {cons_padded} consumer rows)"
+    );
+}

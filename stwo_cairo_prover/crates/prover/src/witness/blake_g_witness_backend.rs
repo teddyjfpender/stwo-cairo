@@ -151,11 +151,75 @@ impl BlakeGWitness for CudaBackend {
         xor9: &verify_bitwise_xor_9::ClaimGenerator,
     ) -> (Evals<Self>, BlakeGClaim, Self::InteractionGen) {
         if !device_lane_enabled() {
+            // The blake_round producer may have stashed the edge and skipped
+            // the host blake_g feed; rebuild the inputs from the stashed HOST
+            // flat before the host writer runs (exactly-once feeds).
+            if let Some((_dev, sub_host, prod_rows)) =
+                crate::witness::jit_prove_backend::take_edge("blake_g_state")
+            {
+                crate::witness::components::blake_round::feed_blake_g_inputs_from_flat(
+                    &sub_host, prod_rows, &gen,
+                );
+            }
             let (trace, claim, interaction_gen) = gen.write_trace(xor8, xor12, xor4, xor7, xor9);
             return (
                 Self::from_simd_evals(trace.to_evals()),
                 claim,
                 CudaBlakeGInteractionGen::Host(interaction_gen),
+            );
+        }
+
+        // B3 edge consumer: blake_round's lane stashed its device sub buffer
+        // (and skipped the host blake_g feed). Build the row-major input buffer
+        // straight from it; any failure rebuilds the generator's inputs on CPU
+        // from the stashed HOST flat and falls through to the host-built path.
+        let mut edge_inputs: Option<(stwo_backend_cuda::BaseFieldVec, usize)> = None;
+        if let Some((sub_dev, sub_host, prod_rows)) =
+            crate::witness::jit_prove_backend::take_edge("blake_g_state")
+        {
+            let n_rows_edge = 8 * prod_rows;
+            let column_length = std::cmp::max(n_rows_edge.next_power_of_two(), N_LANES);
+            let out = stwo_backend_cuda::BaseFieldVec::new_zeroes(column_length * 6);
+            let rc = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_blake_g_inputs_from_sub(
+                    sub_dev.device_ptr,
+                    prod_rows as u32,
+                    81,
+                    8,
+                    column_length as u32,
+                    out.device_ptr.cast_mut(),
+                )
+            };
+            if rc == 0 {
+                edge_inputs = Some((out, n_rows_edge));
+            } else {
+                eprintln!(
+                    "jit_prove[blake_g]: device edge interleave failed — rebuilding                      inputs from the stashed host flat"
+                );
+                crate::witness::components::blake_round::feed_blake_g_inputs_from_flat(
+                    &sub_host, prod_rows, &gen,
+                );
+            }
+        }
+        if let Some((inputs_dev, n_rows)) = edge_inputs {
+            let column_length = inputs_dev.len() / 6;
+            let log_size = column_length.ilog2();
+            let cols = device::write_trace(&inputs_dev, n_rows, column_length);
+            feed_xor_counts(&cols, column_length, xor8, xor12, xor4, xor7, xor9);
+            let domain = CanonicCoset::new(log_size).circle_domain();
+            let trace: Evals<Self> = cols[..BG_N_TRACE]
+                .iter()
+                .map(|c| CircleEvaluation::new(domain, c.clone()))
+                .collect();
+            let claim = BlakeGClaim { log_size };
+            return (
+                trace,
+                claim,
+                CudaBlakeGInteractionGen::Device(DeviceBlakeGWitness {
+                    cols,
+                    log_size,
+                    verify_host: None,
+                }),
             );
         }
 
