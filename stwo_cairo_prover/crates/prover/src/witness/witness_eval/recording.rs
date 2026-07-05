@@ -141,6 +141,29 @@ impl RecordingWitnessEval {
         }
     }
 
+    /// fp256 body arithmetic: one `DeduceCall` of the given felt kind on
+    /// `[a limbs | b limbs]` (56 args), returning the 28 result limbs. Poison in
+    /// either operand degrades to an all-poison bundle (censused under `op`).
+    fn felt_bin(
+        &mut self,
+        kind: DeduceKind,
+        op: &'static str,
+        a: &RecFelt,
+        b: &RecFelt,
+    ) -> RecFelt {
+        let args = (|| {
+            let mut args = self.felt_arg_limbs(a)?;
+            args.extend(self.felt_arg_limbs(b)?);
+            Some(args)
+        })();
+        let Some(args) = args else {
+            let p = self.poison(op);
+            return RecFelt::Limbs(vec![p; FELT_N_LIMBS]);
+        };
+        let outs = self.recorder.deduce(kind, &args);
+        RecFelt::Limbs(outs.into_iter().map(RecVal::Ok).collect())
+    }
+
     /// Unwrap plain deduce args; `None` on any poison (the caller falls back to the
     /// poisoned result, keeping poison-propagation semantics).
     fn plain_args(args: &[RecVal]) -> Option<Vec<Val>> {
@@ -213,6 +236,32 @@ impl WitnessEval for RecordingWitnessEval {
         // Same Input op — the kernel reads the raw u32 word from the input column;
         // M31-vs-u32 is a transformer-side typing distinction only.
         RecVal::Ok(self.recorder.input(slot))
+    }
+
+    fn u32_from_m31(&mut self, a: RecVal) -> RecVal {
+        // Canonical M31 register value IS the 32-bit word — identity.
+        a
+    }
+    fn u32_const(&mut self, v: u32) -> RecVal {
+        RecVal::Ok(self.recorder.constant(v))
+    }
+    fn u32_add(&mut self, a: RecVal, b: RecVal) -> RecVal {
+        self.bin(a, b, |r, x, y| r.u32_add(x, y))
+    }
+    fn u32_sub(&mut self, a: RecVal, b: RecVal) -> RecVal {
+        self.bin(a, b, |r, x, y| r.u32_sub(x, y))
+    }
+    fn u32_mul(&mut self, a: RecVal, b: RecVal) -> RecVal {
+        self.bin(a, b, |r, x, y| r.u32_mul(x, y))
+    }
+    fn u32_and_imm(&mut self, a: RecVal, mask: u32) -> RecVal {
+        self.un(a, |r, x| r.u32_and(x, mask))
+    }
+    fn u32_shl_imm(&mut self, a: RecVal, amount: u32) -> RecVal {
+        self.un(a, |r, x| r.u32_shl(x, amount))
+    }
+    fn u32_shr_imm(&mut self, a: RecVal, amount: u32) -> RecVal {
+        self.un(a, |r, x| r.u32_shr(x, amount))
     }
 
     // ---- Builtin-lane leaves ----------------------------------------------------
@@ -411,6 +460,21 @@ impl WitnessEval for RecordingWitnessEval {
             }
             RecFelt::Limbs(v) => v[i],
         }
+    }
+
+    // ---- Felt field arithmetic: DeduceKind::Felt{Add,Sub,Mul,Div} ---------------
+
+    fn felt_add(&mut self, a: RecFelt, b: RecFelt) -> RecFelt {
+        self.felt_bin(DeduceKind::FeltAdd, "felt_add", &a, &b)
+    }
+    fn felt_sub(&mut self, a: RecFelt, b: RecFelt) -> RecFelt {
+        self.felt_bin(DeduceKind::FeltSub, "felt_sub", &a, &b)
+    }
+    fn felt_mul(&mut self, a: RecFelt, b: RecFelt) -> RecFelt {
+        self.felt_bin(DeduceKind::FeltMul, "felt_mul", &a, &b)
+    }
+    fn felt_div(&mut self, a: RecFelt, b: RecFelt) -> RecFelt {
+        self.felt_bin(DeduceKind::FeltDiv, "felt_div", &a, &b)
     }
 
     // ---- Memory ops (`mem_read` uses the trait default) ------------------------

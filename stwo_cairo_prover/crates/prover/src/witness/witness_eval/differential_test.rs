@@ -1284,6 +1284,24 @@ impl stwo_backend_cuda::jit_witness::interp::DeduceHost for FastDeductionHost {
                 }
                 out
             }
+            // fp256 body ops: the host reference is Felt252's own operators
+            // (canonical-value semantics — the device functions mirror them).
+            4..=7 => {
+                use stwo_cairo_common::prover_types::cpu::Felt252;
+                let scalar = |limbs: &[u32]| {
+                    let m31s: Vec<M31> = limbs.iter().map(|&v| M31(v)).collect();
+                    Felt252::from_limbs(&m31s)
+                };
+                let a = scalar(&args[..28]);
+                let b = scalar(&args[28..56]);
+                let r = match kind {
+                    4 => a + b,
+                    5 => a - b,
+                    6 => a * b,
+                    _ => a / b,
+                };
+                (0..28).map(|i| r.get_m31(i).0).collect()
+            }
             k => panic!("unexpected deduce kind {k}"),
         }
     }
@@ -1901,4 +1919,320 @@ fn stwo_wit_deduce_oracle_matches_fast_deduction() {
         current = dev2;
     }
     eprintln!("deduce oracle kind 2: PASS (64 cases x {CHAIN_LEN} chained rounds)");
+}
+
+// ---------------- fp256/EC flagship: partial_ec_mul_window_bits_18 ------------------
+
+/// Shared fixture prep for the w18 gates: run the pedersen fixture, feed the
+/// aggregator (pedersen_builtin -> aggregator write_trace -> w18 inputs), and
+/// return (w18 gen, points/rc states, padded packed inputs, n_rows, memory).
+#[allow(clippy::type_complexity)]
+fn w18_fixture() -> (
+    Vec<crate::witness::components::partial_ec_mul_window_bits_18::PackedInputType>,
+    usize,
+    crate::witness::components::pedersen_points_table_window_bits_18::ClaimGenerator,
+    crate::witness::components::range_check_9_9::ClaimGenerator,
+    crate::witness::components::range_check_20::ClaimGenerator,
+    (Vec<u32>, Vec<[u32; 8]>, Vec<u128>),
+) {
+    use cairo_vm::types::layout_name::LayoutName;
+    use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
+    use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
+
+    let compiled = get_compiled_cairo_program_path("test_prove_verify_pedersen_builtin");
+    let input = run_and_adapt(
+        &compiled,
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .expect("run_and_adapt pedersen fixture");
+    let ProverInput {
+        state_transitions,
+        memory,
+        builtin_segments,
+        ..
+    } = input;
+    let addr_ids: Vec<u32> = memory.address_to_id.iter().map(|e| e.0).collect();
+    let f252_values = memory.f252_values.clone();
+    let small_values = memory.small_values.clone();
+    let mut cg = CairoClaimGenerator::default();
+    let mut set: IndexSet<&str> = IndexSet::new();
+    for c in [
+        "partial_ec_mul_window_bits_18",
+        "pedersen_points_table_window_bits_18",
+        "range_check_9_9",
+        "range_check_20",
+        "pedersen_aggregator_window_bits_18",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "range_check_8",
+        "pedersen_builtin",
+    ] {
+        set.insert(c);
+    }
+    let preprocessed_trace = Arc::new(PreProcessedTrace::canonical_without_pedersen());
+    cg.fill_components(
+        &set,
+        state_transitions.casm_states_by_opcode,
+        &builtin_segments,
+        Arc::new(memory),
+        preprocessed_trace,
+    );
+    // Production feed chain: pedersen_builtin -> aggregator mults; aggregator
+    // write_trace -> w18 inputs (28 chained EC rounds per aggregator row).
+    {
+        let pb = cg.pedersen_builtin.take().expect("pedersen_builtin");
+        let mem_addr = cg.memory_address_to_id.as_ref().expect("mem addr");
+        let agg_state = cg
+            .pedersen_aggregator_window_bits_18
+            .as_ref()
+            .expect("aggregator state");
+        let _ = pb.write_trace(mem_addr, agg_state);
+    }
+    {
+        let agg = cg
+            .pedersen_aggregator_window_bits_18
+            .take()
+            .expect("aggregator populated");
+        let mem_big = cg.memory_id_to_big.as_ref().expect("mem big");
+        let rc8 = cg.range_check_8.as_ref().expect("range_check_8");
+        let w18_state = cg
+            .partial_ec_mul_window_bits_18
+            .as_ref()
+            .expect("w18 state");
+        let _ = agg.write_trace(mem_big, rc8, w18_state);
+    }
+    let gen = cg.partial_ec_mul_window_bits_18.expect("w18 populated");
+    let pts = cg
+        .pedersen_points_table_window_bits_18
+        .expect("points table state");
+    let rc99 = cg.range_check_9_9.expect("range_check_9_9");
+    let rc20 = cg.range_check_20.expect("range_check_20");
+
+    let mut packed = gen.packed_inputs.into_inner().unwrap();
+    assert!(!packed.is_empty(), "fixture fed no w18 inputs");
+    assert!(gen.remainder_inputs.lock().unwrap().is_empty());
+    let n_vec_rows = packed.len();
+    let n_rows = n_vec_rows * N_LANES;
+    let packed_size = n_vec_rows.next_power_of_two();
+    packed.resize(packed_size, *packed.first().unwrap());
+    (
+        packed,
+        n_rows,
+        pts,
+        rc99,
+        rc20,
+        (addr_ids, f252_values, small_values),
+    )
+}
+
+/// Gate (a) for `partial_ec_mul_window_bits_18` — the fp256/EC flagship: felt
+/// DeduceKinds 4-7 (inline slope arithmetic incl. division), the points-table
+/// deduce, and the u32 lane, in one 297-column writer.
+#[test]
+fn partial_ec_mul_w18_generic_simd_byte_identical() {
+    use crate::witness::components::partial_ec_mul_window_bits_18 as m;
+    let (packed, n_rows, pts, rc99, rc20, _mem) = w18_fixture();
+    assert_generic_diff_byte_identical!(m::generic_simd_diff(packed, n_rows, &pts, &rc99, &rc20));
+}
+
+/// The w18 recording manifest: FULLY recorded — zero poisons; the EC round's
+/// felt arithmetic and table read all lower to real DeduceCalls.
+#[test]
+fn partial_ec_mul_w18_recording_poison_manifest() {
+    use stwo_backend_cuda::jit_witness::isa::{DeduceKind, WitnessOp};
+
+    use crate::witness::components::partial_ec_mul_window_bits_18 as m;
+    let rec = m::record_partial_ec_mul_window_bits_18();
+    assert!(rec.poison_ops.is_empty(), "poisons: {:?}", rec.poison_ops);
+    assert!(rec.poisoned_cols.is_empty());
+    assert!(rec.poisoned_lookup_words.is_empty());
+    assert!(rec.poisoned_sub_words.is_empty());
+    let count = |k: DeduceKind| {
+        rec.program
+            .insts
+            .iter()
+            .filter(|i| i.op == WitnessOp::DeduceCall as u8 && i.imm == k as u32)
+            .count()
+    };
+    eprintln!(
+        "w18 deduces: points={} add={} sub={} mul={} div={} instrs={}",
+        count(DeduceKind::PedersenPointsTableW18),
+        count(DeduceKind::FeltAdd),
+        count(DeduceKind::FeltSub),
+        count(DeduceKind::FeltMul),
+        count(DeduceKind::FeltDiv),
+        rec.program.n_instrs(),
+    );
+    assert_eq!(count(DeduceKind::PedersenPointsTableW18), 1);
+    // The EC-add round body: slope = (y2-y1)/(x2-x1) (1 div, subs), then
+    // x3/y3 via 2 muls and more subs — pinned from the first green recording.
+    assert_eq!(count(DeduceKind::FeltAdd), 0);
+    assert_eq!(count(DeduceKind::FeltSub), 6);
+    assert_eq!(count(DeduceKind::FeltMul), 2);
+    assert_eq!(count(DeduceKind::FeltDiv), 1);
+}
+
+/// GATE (b)+(c) for w18: the recorded program interpreted with the
+/// fast_deduction/Felt252 reference host is byte-identical to the host writer
+/// everywhere; on a pod build the same program then runs as a CUDA kernel.
+#[test]
+fn partial_ec_mul_w18_recording_interpreter_matches_host() {
+    use stwo_backend_cuda::jit_witness::interp::interpret_row_with;
+
+    use crate::witness::components::partial_ec_mul_window_bits_18 as m;
+    let (packed, n_rows, pts, rc99, rc20, (addr_ids, f252_values, small_values)) = w18_fixture();
+    let diff = m::generic_simd_diff(packed.clone(), n_rows, &pts, &rc99, &rc20);
+
+    let out = m::record_partial_ec_mul_window_bits_18();
+    assert!(out.poison_ops.is_empty(), "poisons: {:?}", out.poison_ops);
+
+    // The w18 body reads NO memory tables (its felts arrive as input limbs);
+    // any table read reaching the oracle is a recording bug.
+    let oracle = |table: u32, key: u32, limb: u32| -> u32 {
+        panic!("unexpected table read: table {table} key {key} limb {limb}")
+    };
+
+    // Slot layout: flat input words 0..72 (in.0, in.1, 14 windows, acc0 limbs,
+    // acc1 limbs), enabler 72, iota 73.
+    let n_padded = packed.len() * N_LANES;
+    let rows: Vec<Vec<u32>> = (0..n_padded)
+        .map(|r| {
+            let (pr, lane) = (r / N_LANES, r % N_LANES);
+            let p = &packed[pr];
+            let mut row = vec![p.0.to_array()[lane].0, p.1.to_array()[lane].0];
+            row.extend(p.2 .0.iter().map(|w| w.to_array()[lane].0));
+            for f in &p.2 .1 {
+                row.extend((0..28).map(|i| f.get_m31(i).to_array()[lane].0));
+            }
+            row.push(u32::from(r < n_rows)); // enabler
+            row.push(r as u32); // iota
+            row
+        })
+        .collect();
+
+    let n_packed_rows = n_padded / N_LANES;
+    for (r, row_inputs) in rows.iter().enumerate() {
+        let ro = interpret_row_with(&out.program, row_inputs, &oracle, &mut FastDeductionHost);
+        for (c, hv) in diff.orig_rows[r].iter().enumerate() {
+            assert_eq!(ro.columns[c], hv.0, "row {r} column {c}");
+        }
+        let (pr, lane) = (r / N_LANES, r % N_LANES);
+        let mut w = 0usize;
+        for field in diff.orig_lookup.iter() {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                let hv = field[pr * width + k].to_array()[lane].0;
+                assert_eq!(ro.lookup_words[w], hv, "row {r} lookup word {w} (+{k})");
+                w += 1;
+            }
+        }
+        let mut w = 0usize;
+        for field in diff.orig_sub.iter() {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                let hv = field[pr * width + k].as_array()[lane];
+                assert_eq!(ro.sub_words[w], hv, "row {r} sub word {w} (+{k})");
+                w += 1;
+            }
+        }
+    }
+
+    // GATE (c), pod builds only: the same program as an actual CUDA kernel.
+    let host_rows: Vec<Vec<M31>> = diff.orig_rows.iter().map(|r| r.to_vec()).collect();
+    assert_device_builtin_leg_matches_host(
+        "partial_ec_mul_window_bits_18",
+        out.program,
+        true,
+        &rows,
+        &addr_ids,
+        &f252_values,
+        &small_values,
+        &host_rows,
+        &diff.orig_lookup,
+        &diff.orig_sub,
+    );
+}
+
+// ---------------- u32-cohort unlocks (mul_opcode, add_ap_opcode, blake_g) -----------
+
+/// Gate (a) for `mul_opcode` (u32-heavy opcode, unlocked by the u32 trait lane).
+#[test]
+fn mul_opcode_generic_simd_byte_identical() {
+    use crate::witness::components::mul_opcode as m;
+    let cg = fill_fixture(&[
+        "mul_opcode",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "verify_instruction",
+        "range_check_20",
+    ]);
+    let gen = cg.mul_opcode.expect("mul_opcode populated");
+    let mem_addr = cg.memory_address_to_id.expect("mem addr");
+    let mem_big = cg.memory_id_to_big.expect("mem big");
+    let vi = cg.verify_instruction.expect("verify_instruction");
+    let rc20 = cg.range_check_20.expect("range_check_20");
+    let (_, packed, n_rows) = pack_pilot_inputs(gen.inputs);
+    assert_generic_diff_byte_identical!(m::generic_simd_diff(
+        packed, n_rows, &mem_addr, &mem_big, &vi, &rc20,
+    ));
+}
+
+/// Gate (a) for `add_ap_opcode` (u32-family opcode, unlocked by the u32 trait lane).
+#[test]
+fn add_ap_opcode_generic_simd_byte_identical() {
+    use crate::witness::components::add_ap_opcode as m;
+    let cg = fill_fixture(&[
+        "add_ap_opcode",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "verify_instruction",
+        "range_check_18",
+        "range_check_11",
+    ]);
+    let gen = cg.add_ap_opcode.expect("add_ap_opcode populated");
+    let mem_addr = cg.memory_address_to_id.expect("mem addr");
+    let mem_big = cg.memory_id_to_big.expect("mem big");
+    let vi = cg.verify_instruction.expect("verify_instruction");
+    let rc18 = cg.range_check_18.expect("range_check_18");
+    let rc11 = cg.range_check_11.expect("range_check_11");
+    let (_, packed, n_rows) = pack_pilot_inputs(gen.inputs);
+    assert_generic_diff_byte_identical!(m::generic_simd_diff(
+        packed, n_rows, &mem_addr, &mem_big, &vi, &rc18, &rc11,
+    ));
+}
+
+/// Gate (a) for `blake_g` (the g-function component itself — full u32 body).
+/// Synthetic inputs: the two host lanes must be byte-identical on ANY words.
+#[test]
+fn blake_g_generic_simd_byte_identical() {
+    use stwo_cairo_common::prover_types::cpu::UInt32;
+
+    use crate::witness::components::blake_g as m;
+    let cg = fill_fixture(&[
+        "blake_g",
+        "verify_bitwise_xor_8",
+        "verify_bitwise_xor_12",
+        "verify_bitwise_xor_4",
+        "verify_bitwise_xor_7",
+        "verify_bitwise_xor_9",
+    ]);
+    let xor8 = cg.verify_bitwise_xor_8.expect("xor8");
+    let xor12 = cg.verify_bitwise_xor_12.expect("xor12");
+    let xor4 = cg.verify_bitwise_xor_4.expect("xor4");
+    let xor7 = cg.verify_bitwise_xor_7.expect("xor7");
+    let xor9 = cg.verify_bitwise_xor_9.expect("xor9");
+
+    let inputs: Vec<m::InputType> = (0..48u32)
+        .map(|i| std::array::from_fn(|j| UInt32::from(0x9E37_79B9u32.wrapping_mul(i + j as u32))))
+        .collect();
+    let n_rows = inputs.len();
+    let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+    let mut padded = inputs;
+    padded.resize(size, *padded.first().unwrap());
+    let packed = pack_values(&padded);
+    assert_generic_diff_byte_identical!(m::generic_simd_diff(
+        packed, n_rows, &xor8, &xor12, &xor4, &xor7, &xor9,
+    ));
 }

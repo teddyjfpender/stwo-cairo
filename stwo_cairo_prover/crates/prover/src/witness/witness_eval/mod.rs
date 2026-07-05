@@ -174,6 +174,16 @@ pub trait WitnessEval {
     fn felt_from_limbs(&mut self, limbs: [Self::M31; FELT_N_LIMBS]) -> Self::Felt;
     fn felt_get_m31(&mut self, felt: &Self::Felt, i: usize) -> Self::M31;
 
+    // ---- Felt field arithmetic (fp256 body ops — the partial_ec_mul writers'
+    // ---- inline `Felt252` operators; recording = DeduceKind::Felt{Add,Sub,Mul,Div}).
+
+    fn felt_add(&mut self, a: Self::Felt, b: Self::Felt) -> Self::Felt;
+    fn felt_sub(&mut self, a: Self::Felt, b: Self::Felt) -> Self::Felt;
+    fn felt_mul(&mut self, a: Self::Felt, b: Self::Felt) -> Self::Felt;
+    /// Host semantics panic on division by zero (`Felt252`'s `Div`); the
+    /// writers only divide by EC slope denominators.
+    fn felt_div(&mut self, a: Self::Felt, b: Self::Felt) -> Self::Felt;
+
     // ---- Memory ops (the keystone binding — see module docs) --------------------
 
     /// `memory_address_to_id.deduce_output(addr)` → encoded id.
@@ -208,6 +218,19 @@ pub trait WitnessEval {
     /// Read the full-32-bit input word at `slot` (the blake message words; the device
     /// lane's input columns are raw u32 buffers, so the same column serves both).
     fn input_u32(&mut self, slot: u32) -> Self::U32;
+
+    /// `PackedUInt32::from_m31(a)`: the canonical M31 value as a 32-bit word (pure
+    /// widening — the recording reuses the register, whose value is already < P).
+    fn u32_from_m31(&mut self, a: Self::M31) -> Self::U32;
+    /// A broadcast u32 constant (`PackedUInt32::broadcast(UInt32::from(v))`).
+    fn u32_const(&mut self, v: u32) -> Self::U32;
+    /// Wrapping 32-bit arithmetic (`PackedUInt32` operator semantics).
+    fn u32_add(&mut self, a: Self::U32, b: Self::U32) -> Self::U32;
+    fn u32_sub(&mut self, a: Self::U32, b: Self::U32) -> Self::U32;
+    fn u32_mul(&mut self, a: Self::U32, b: Self::U32) -> Self::U32;
+    fn u32_and_imm(&mut self, a: Self::U32, mask: u32) -> Self::U32;
+    fn u32_shl_imm(&mut self, a: Self::U32, amount: u32) -> Self::U32;
+    fn u32_shr_imm(&mut self, a: Self::U32, amount: u32) -> Self::U32;
 
     // ---- Builtin-lane leaves (the fp256/EC family; opcode bodies never call these) --
 

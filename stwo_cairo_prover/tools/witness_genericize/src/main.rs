@@ -136,6 +136,11 @@ impl Ty {
     fn is_u16(&self) -> bool {
         matches!(self, Ty::U16)
     }
+    /// Felt-shaped operand: a live `E::Felt` value or a hoisted felt constant
+    /// (materialized to `felt_from_limbs` of constants at use).
+    fn is_feltish(&self) -> bool {
+        matches!(self, Ty::Felt252 | Ty::ConstFelt252(_))
+    }
     fn is_u32(&self) -> bool {
         matches!(self, Ty::U32 | Ty::ConstU32(_))
     }
@@ -1267,6 +1272,27 @@ impl Lowerer {
     /// Lower one expression expected to produce an `E::Felt` value: a felt-typed
     /// expression as-is, or a hoisted felt constant materialized via
     /// `felt_from_limbs` over its 28 const limbs. `None` = not a felt here.
+    /// Materialize a u32-shaped (ty, tok) pair as an `E::U32` value token —
+    /// hoisted broadcast constants become `eval.u32_const(v)`.
+    fn u32ish_value(&mut self, ty: Ty, tok: TokenStream) -> TokenStream {
+        match ty {
+            Ty::ConstU32(v) => {
+                let vl = u32_lit(v);
+                self.bind(Target::Temp, quote! { eval.u32_const(#vl) })
+            }
+            _ => tok,
+        }
+    }
+
+    /// Materialize a felt-shaped (ty, tok) pair as an `E::Felt` value token —
+    /// constants become `felt_from_limbs` of hoisted limb constants.
+    fn feltish_value(&mut self, ty: Ty, tok: TokenStream) -> TokenStream {
+        match ty {
+            Ty::ConstFelt252(limbs) => self.felt_const_value(Target::Temp, limbs).1,
+            _ => tok,
+        }
+    }
+
     fn lower_felt_value(&mut self, e: &Expr) -> Option<TokenStream> {
         if let Some(limbs) = self.peek_felt_const(e) {
             let (_t, tok) = self.felt_const_value(Target::Temp, limbs);
@@ -2350,10 +2376,14 @@ impl Lowerer {
                     (Ty::Unknown, quote! { WG_SKIP })
                 }
             }
-            // u32 family (census-only).
             "PackedUInt32 :: from_m31" => {
-                let (_t, _a) = self.lower_arg(call.args.first());
-                self.u32_site(Ty::U32)
+                let (at, a) = self.lower_arg(call.args.first());
+                if at.is_m31() {
+                    self.emit_op(target, Ty::U32, quote! { eval.u32_from_m31(#a) })
+                } else {
+                    self.skip("call", format!("PackedUInt32::from_m31 on {at:?}"));
+                    (Ty::Unknown, quote! { WG_SKIP })
+                }
             }
             "PackedUInt32 :: from_limbs" => {
                 // `low + (high << 16)` (simd.rs:204) — a REAL trait op when the
@@ -2465,9 +2495,11 @@ impl Lowerer {
                     self.skip("binop", format!("`<<` on non-U16 `{}`", tok_str(&b.left)));
                     return (Ty::Unknown, quote! { WG_SKIP });
                 }
-                if self.peek_const_u32(&b.right).is_some() {
+                if let Some(k) = self.peek_const_u32(&b.right) {
                     if lt.is_u32() {
-                        return self.u32_site(Ty::U32);
+                        let l = self.u32ish_value(lt, ltok);
+                        let kl = u32_lit(k);
+                        return self.emit_op(target, Ty::U32, quote! { eval.u32_shl_imm(#l, #kl) });
                     }
                     self.skip("binop", format!("`<<` (u32) on {:?}", lt));
                     return (Ty::Unknown, quote! { WG_SKIP });
@@ -2492,9 +2524,11 @@ impl Lowerer {
                     self.skip("binop", format!("`>>` on non-U16 `{}`", tok_str(&b.left)));
                     return (Ty::Unknown, quote! { WG_SKIP });
                 }
-                if self.peek_const_u32(&b.right).is_some() {
+                if let Some(k) = self.peek_const_u32(&b.right) {
                     if lt.is_u32() {
-                        return self.u32_site(Ty::U32);
+                        let l = self.u32ish_value(lt, ltok);
+                        let kl = u32_lit(k);
+                        return self.emit_op(target, Ty::U32, quote! { eval.u32_shr_imm(#l, #kl) });
                     }
                     self.skip("binop", format!("`>>` (u32) on {:?}", lt));
                     return (Ty::Unknown, quote! { WG_SKIP });
@@ -2536,18 +2570,22 @@ impl Lowerer {
                     );
                     return (Ty::Unknown, quote! { WG_SKIP });
                 }
-                if self.peek_const_u32(&b.right).is_some() {
-                    let (lt, _ltok) = self.lower_node(&b.left, Target::Temp);
+                if let Some(k) = self.peek_const_u32(&b.right) {
+                    let (lt, ltok) = self.lower_node(&b.left, Target::Temp);
                     if lt.is_u32() {
-                        return self.u32_site(Ty::U32);
+                        let l = self.u32ish_value(lt, ltok);
+                        let kl = u32_lit(k);
+                        return self.emit_op(target, Ty::U32, quote! { eval.u32_and_imm(#l, #kl) });
                     }
                     self.skip("binop", format!("`&` (u32 mask) on {:?}", lt));
                     return (Ty::Unknown, quote! { WG_SKIP });
                 }
-                if self.peek_const_u32(&b.left).is_some() {
-                    let (rt, _rtok) = self.lower_node(&b.right, Target::Temp);
+                if let Some(k) = self.peek_const_u32(&b.left) {
+                    let (rt, rtok) = self.lower_node(&b.right, Target::Temp);
                     if rt.is_u32() {
-                        return self.u32_site(Ty::U32);
+                        let r = self.u32ish_value(rt, rtok);
+                        let kl = u32_lit(k);
+                        return self.emit_op(target, Ty::U32, quote! { eval.u32_and_imm(#r, #kl) });
                     }
                     self.skip("binop", format!("`&` (u32 mask) on {:?}", rt));
                     return (Ty::Unknown, quote! { WG_SKIP });
@@ -2599,7 +2637,17 @@ impl Lowerer {
                         (Ty::Unknown, quote! { WG_SKIP })
                     }
                 } else if lt.is_u32() && rt.is_u32() {
-                    self.u32_site(Ty::U32)
+                    let l = self.u32ish_value(lt, ltok);
+                    let r = self.u32ish_value(rt, rtok);
+                    self.emit_op(target, Ty::U32, quote! { eval.u32_add(#l, #r) })
+                } else if lt.is_feltish() && rt.is_feltish() {
+                    let l = self.feltish_value(lt, ltok);
+                    let r = self.feltish_value(rt, rtok);
+                    self.emit_op(
+                        target,
+                        Ty::Felt252,
+                        quote! { eval.felt_add(#l.clone(), #r.clone()) },
+                    )
                 } else {
                     self.skip("binop", format!("`+` on {:?}/{:?}", lt, rt));
                     (Ty::Unknown, quote! { WG_SKIP })
@@ -2611,7 +2659,17 @@ impl Lowerer {
                 if lt.is_m31() && rt.is_m31() {
                     self.emit_op(target, Ty::M31, quote! { eval.m31_sub(#ltok, #rtok) })
                 } else if lt.is_u32() && rt.is_u32() {
-                    self.u32_site(Ty::U32)
+                    let l = self.u32ish_value(lt, ltok);
+                    let r = self.u32ish_value(rt, rtok);
+                    self.emit_op(target, Ty::U32, quote! { eval.u32_sub(#l, #r) })
+                } else if lt.is_feltish() && rt.is_feltish() {
+                    let l = self.feltish_value(lt, ltok);
+                    let r = self.feltish_value(rt, rtok);
+                    self.emit_op(
+                        target,
+                        Ty::Felt252,
+                        quote! { eval.felt_sub(#l.clone(), #r.clone()) },
+                    )
                 } else {
                     self.skip("binop", format!("`-` on {:?}/{:?}", lt, rt));
                     (Ty::Unknown, quote! { WG_SKIP })
@@ -2622,8 +2680,34 @@ impl Lowerer {
                 let (rt, rtok) = self.lower_node(&b.right, Target::Temp);
                 if lt.is_m31() && rt.is_m31() {
                     self.emit_op(target, Ty::M31, quote! { eval.m31_mul(#ltok, #rtok) })
+                } else if lt.is_feltish() && rt.is_feltish() {
+                    let l = self.feltish_value(lt, ltok);
+                    let r = self.feltish_value(rt, rtok);
+                    self.emit_op(
+                        target,
+                        Ty::Felt252,
+                        quote! { eval.felt_mul(#l.clone(), #r.clone()) },
+                    )
                 } else {
                     self.skip("binop", format!("`*` on {:?}/{:?}", lt, rt));
+                    (Ty::Unknown, quote! { WG_SKIP })
+                }
+            }
+            BinOp::Div(_) => {
+                // ONLY felt division exists in the writers (EC slope denominators;
+                // the host `Felt252::div` panics on zero — see DeduceKind::FeltDiv).
+                let (lt, ltok) = self.lower_node(&b.left, Target::Temp);
+                let (rt, rtok) = self.lower_node(&b.right, Target::Temp);
+                if lt.is_feltish() && rt.is_feltish() {
+                    let l = self.feltish_value(lt, ltok);
+                    let r = self.feltish_value(rt, rtok);
+                    self.emit_op(
+                        target,
+                        Ty::Felt252,
+                        quote! { eval.felt_div(#l.clone(), #r.clone()) },
+                    )
+                } else {
+                    self.skip("binop", format!("`/` on {:?}/{:?}", lt, rt));
                     (Ty::Unknown, quote! { WG_SKIP })
                 }
             }
@@ -4352,7 +4436,7 @@ mod tests {
     }
 
     #[test]
-    fn u32_family_is_census_only_match() {
+    fn u32_family_lowers_to_real_trait_ops() {
         let lw = lower_snippet(
             &[
                 ("UInt32_511", ConstKind::U32, 511),
@@ -4369,10 +4453,14 @@ mod tests {
             "u32 family must not skip: {:?}",
             lw.skips
         );
-        // from_m31 / & / << remain census-only (4 sites); .low()/.high() are REAL
-        // trait ops now (u32 trait extension) and no longer count.
-        assert_eq!(lw.u32_sites, 4, "u32 census sites");
+        // The whole family is REAL now (fp256-cohort u32 extension): from_m31,
+        // masked and, const shl, wrapping add, low/high — zero census sites.
+        assert_eq!(lw.u32_sites, 0, "u32 census sites");
         let body = lw.out.iter().map(|t| t.to_string()).collect::<String>();
+        assert!(body.contains("eval . u32_from_m31 ("), "body: {body}");
+        assert!(body.contains("eval . u32_and_imm ("), "body: {body}");
+        assert!(body.contains("eval . u32_shl_imm ("), "body: {body}");
+        assert!(body.contains("eval . u32_add ("), "body: {body}");
         assert!(body.contains("eval . u32_low ("), "body: {body}");
         assert!(body.contains("eval . u32_high ("), "body: {body}");
         assert_eq!(lw.env["z"], Ty::M31);

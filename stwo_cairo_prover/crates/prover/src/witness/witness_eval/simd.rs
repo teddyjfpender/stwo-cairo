@@ -251,6 +251,19 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
         felt.get_m31(i)
     }
 
+    fn felt_add(&mut self, a: PackedFelt252, b: PackedFelt252) -> PackedFelt252 {
+        a + b
+    }
+    fn felt_sub(&mut self, a: PackedFelt252, b: PackedFelt252) -> PackedFelt252 {
+        a - b
+    }
+    fn felt_mul(&mut self, a: PackedFelt252, b: PackedFelt252) -> PackedFelt252 {
+        a * b
+    }
+    fn felt_div(&mut self, a: PackedFelt252, b: PackedFelt252) -> PackedFelt252 {
+        a / b
+    }
+
     // ---- Memory ops (keystone binding; `mem_read` uses the trait default) ------
 
     #[inline(always)]
@@ -286,6 +299,37 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
             SimdInputs::Casm(_) => panic!("input_u32 on an opcode CasmState input"),
             SimdInputs::Flat(words) => PackedUInt32::from_simd(words[slot as usize]),
         }
+    }
+
+    fn u32_from_m31(&mut self, a: PackedM31) -> PackedUInt32 {
+        PackedUInt32::from_m31(a)
+    }
+    fn u32_const(&mut self, v: u32) -> PackedUInt32 {
+        PackedUInt32::broadcast(UInt32::from(v))
+    }
+    fn u32_add(&mut self, a: PackedUInt32, b: PackedUInt32) -> PackedUInt32 {
+        a + b
+    }
+    fn u32_sub(&mut self, a: PackedUInt32, b: PackedUInt32) -> PackedUInt32 {
+        // PackedUInt32 has no Sub operator; wrapping lane-wise sub on the raw
+        // simd matches the ISA's C-unsigned `(a - b)` exactly.
+        PackedUInt32 {
+            simd: a.simd - b.simd,
+        }
+    }
+    fn u32_mul(&mut self, a: PackedUInt32, b: PackedUInt32) -> PackedUInt32 {
+        PackedUInt32 {
+            simd: a.simd * b.simd,
+        }
+    }
+    fn u32_and_imm(&mut self, a: PackedUInt32, mask: u32) -> PackedUInt32 {
+        a & PackedUInt32::broadcast(UInt32::from(mask))
+    }
+    fn u32_shl_imm(&mut self, a: PackedUInt32, amount: u32) -> PackedUInt32 {
+        a << PackedUInt32::broadcast(UInt32::from(amount))
+    }
+    fn u32_shr_imm(&mut self, a: PackedUInt32, amount: u32) -> PackedUInt32 {
+        a >> PackedUInt32::broadcast(UInt32::from(amount))
     }
 
     // ---- Builtin-lane leaves ----------------------------------------------------
