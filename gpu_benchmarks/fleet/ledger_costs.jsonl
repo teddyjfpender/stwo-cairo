@@ -31,3 +31,4 @@
 {"ts": "2026-07-05T18:01:01+00:00", "event": "run", "pod_id": "kkogzcvy29ixbb", "gpu": "H100 NVL", "usd_hr": 2.59, "purpose": "deduce-gate", "run_id": "20260705T175013Z.deduce-gate", "note": "FAIL"}
 {"ts": "2026-07-05T18:22:15+00:00", "event": "run", "pod_id": "kkogzcvy29ixbb", "gpu": "H100 NVL", "usd_hr": 2.59, "purpose": "deduce-gate", "run_id": "20260705T181611Z.deduce-gate", "note": "FAIL"}
 {"ts": "2026-07-05T18:37:41+00:00", "event": "create", "pod_id": "r2lzrq311gkemx", "gpu": "H100 SXM", "usd_hr": 3.29, "purpose": "deduce-gate"}
+{"ts": "2026-07-05T22:53:14+00:00", "event": "create", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29, "purpose": "m0-m3-gate"}
