@@ -197,6 +197,8 @@ STWO_JIT_LOG=1 STWO_DUMP_PROOF=$OUT/aot.proof $GB --pie $SN/SN_PIE_2.zip --backe
   --reps 2 --reuse-input 2> $OUT/aot.err | tail -6
 hits=$(grep -c 'AOT pack hit' $OUT/aot.err || true)
 echo "aot_hits=$hits"
+whits=$(grep -c 'AOT pack hit kernel=stwo_jit_witness_' $OUT/aot.err || true)
+echo "aot_witness_hits=$whits"
 grep -m1 'AOT pack hit' $OUT/aot.err
 nvrtc=$(grep -c 'compile start component' $OUT/aot.err || true)
 echo "nvrtc_compiles=$nvrtc"
