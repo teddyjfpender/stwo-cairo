@@ -1046,8 +1046,13 @@ impl BuiltinLaneSpec for PartialEcMulGenericLane {
     const N_TRACE: usize = 624;
     const N_LOOKUP_WORDS: usize = partial_ec_mul_generic::N_LOOKUP_WORDS;
     const N_SUB_WORDS: usize = partial_ec_mul_generic::N_SUB_INPUT_WORDS;
-    // Inline felt arithmetic only — no table reads.
-    const NEEDS_PEDERSEN_TABLE: bool = false;
+    // TRUE although the body never READS the table: the felt deduces embed the
+    // fp256 chain, so this kernel's CUmodule declares the table globals and the
+    // fail-closed module-load fill rejects it when no host table is registered
+    // (ROUND-28 pod finding: generic runs BEFORE the aggregator, so it cannot
+    // ride anyone else's registration). Registration is process-cached — the
+    // extra ensure is idempotent.
+    const NEEDS_PEDERSEN_TABLE: bool = true;
     type Claim = cairo_air::components::partial_ec_mul_generic::Claim;
     type IGen = partial_ec_mul_generic::InteractionClaimGenerator;
 
@@ -1071,7 +1076,9 @@ impl BuiltinLaneSpec for Cube252Lane {
     const N_TRACE: usize = 141;
     const N_LOOKUP_WORDS: usize = cube_252::N_LOOKUP_WORDS;
     const N_SUB_WORDS: usize = cube_252::N_SUB_INPUT_WORDS;
-    const NEEDS_PEDERSEN_TABLE: bool = false;
+    // TRUE for the same reason as the generic lane: fp256 embed => the module
+    // declares the table globals => registration must precede module load.
+    const NEEDS_PEDERSEN_TABLE: bool = true;
     type Claim = cairo_air::components::cube_252::Claim;
     type IGen = cube_252::InteractionClaimGenerator;
 

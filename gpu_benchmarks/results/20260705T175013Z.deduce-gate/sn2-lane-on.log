@@ -1,0 +1,15 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; export PROVER=/workspace/stwo-cairo/stwo_cairo_prover; STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_WITNESS_JIT_MAX_INSTRS=6000 \
+STWO_DUMP_PROOF=$OUT/deduce_on.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 1 --reuse-input 2> $OUT/deduce_on.err | tail -4
+grep -E 'jit_prove\[pedersen_aggregator_window_bits_18\]: device witness' $OUT/deduce_on.err
+grep -E 'jit_prove\[blake_round\]: device witness' $OUT/deduce_on.err
+grep -E 'falling back' $OUT/deduce_on.err | head -5 || true
+test -s $OUT/deduce_on.proof && echo ON_PROOF_OK
+--8<-- output --8<--
+{"adapt_s":1.05,"backend":"cuda","bootloader_overhead_pct":3.51,"cycle_count":7977397,"fold_step":3,"gpu":"NVIDIA H100 NVL","host_mem_gb":1511.351,"mhz":0.314,"n":1,"n_queries":70,"nproc":16,"peak_rss_gb":20.97,"pie_n_steps":7706864,"pool_reserved_high_gb":38.52,"pool_used_high_gb":37.241,"pow_bits":26,"program":"SN_PIE_2.zip","proof_kb":3006.636,"prove_s_cold":25.379,"prove_s_warm":25.379,"security_bits":96,"steps_per_s":314326.0,"useful_mhz":0.304,"verify_ms":17.165,"vm_s":5.14,"vram_end_gb":39.901,"vram_peak_gb":39.901}
+jit_prove[pedersen_aggregator_window_bits_18]: device witness 18258 real rows (log_size 15) in 192.7 ms
+jit_prove[blake_round]: device witness 655360 real rows (log_size 20) in 1978.9 ms
+jit_prove[partial_ec_mul_generic]: program has 17000 instrs > cap 6000, falling back (precompile + raise STWO_CUDA_WITNESS_JIT_MAX_INSTRS to enable)
+jit_prove[partial_ec_mul_window_bits_18]: program has 7917 instrs > cap 6000, falling back (precompile + raise STWO_CUDA_WITNESS_JIT_MAX_INSTRS to enable)
+ON_PROOF_OK

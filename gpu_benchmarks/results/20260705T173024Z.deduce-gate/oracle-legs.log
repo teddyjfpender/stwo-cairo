@@ -1,0 +1,25 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; export PROVER=/workspace/stwo-cairo/stwo_cairo_prover; . $HOME/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH
+cd $PROVER
+STWO_CUDA_ARCH=sm_90 RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release -p stwo-cairo-prover stwo_wit_deduce_oracle -- --nocapture 2>&1 | tail -20
+--8<-- output --8<--
+    |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `stwo-cairo-prover` (lib test) generated 36 warnings (23 duplicates)
+    Finished `release` profile [optimized] target(s) in 0.21s
+     Running unittests src/lib.rs (target/release/deps/stwo_cairo_prover-b411c1c107711a3c)
+
+running 1 test
+pedersen table: registered HOST-BUILT table on device (56 cols x 8388608 rows, borrowed mode)
+deduce oracle kind 3: PASS (256 rows incl. section boundaries)
+deduce oracle kind 2: PASS (64 cases x 4 chained rounds)
+test witness::witness_eval::differential_test::stwo_wit_deduce_oracle_matches_fast_deduction ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 106 filtered out; finished in 2.44s
+
+     Running unittests src/bin/gpu_bench.rs (target/release/deps/gpu_bench-e8ebf50f610b4559)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,117 @@
+{
+  "run_id": "20260705T175013Z.deduce-gate",
+  "manifest": "deduce-gate",
+  "pod": {
+    "id": "kkogzcvy29ixbb",
+    "gpu": "H100 NVL",
+    "usd_hr": 2.59
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "6cbb4da2e25c",
+      "diff_sha256": "e3b0c44298fc1c14",
+      "dirty": false
+    },
+    "stwo-cairo": {
+      "rev": "7a03fa50ac7a",
+      "diff_sha256": "3e74351b243572b1",
+      "dirty": true
+    }
+  },
+  "steps": [
+    {
+      "name": "prereqs",
+      "rc": 0,
+      "seconds": 1.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "test-build",
+      "rc": 0,
+      "seconds": 246.7,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "oracle-legs",
+      "rc": 0,
+      "seconds": 4.8,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "device-gate-blake",
+      "rc": 0,
+      "seconds": 2.3,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "device-gate-aggregator",
+      "rc": 0,
+      "seconds": 4.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-lane-off",
+      "rc": 0,
+      "seconds": 166.0,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-lane-on",
+      "rc": 0,
+      "seconds": 36.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-byte-identity",
+      "rc": 0,
+      "seconds": 1.5,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-perf-on",
+      "rc": 0,
+      "seconds": 68.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "sn2-lane-on-dag",
+      "rc": 0,
+      "seconds": 85.6,
+      "passed": false,
+      "reasons": [
+        "must_match failed: 'jit_prove\\\\[partial_ec_mul_generic\\\\]: device witness'"
+      ],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": false,
+  "wall_s": 648.7
+}

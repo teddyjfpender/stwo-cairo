@@ -1802,18 +1802,36 @@ fn builtin_lane_recording_shapes_match_specs() {
     use crate::witness::components::{
         cube_252 as cb, partial_ec_mul_generic as pg, partial_ec_mul_window_bits_18 as pw,
     };
-    for (label, prog) in [
-        ("pedersen_aggregator_window_bits_18", &a.program),
-        ("blake_round", &b.program),
+    use crate::witness::jit_prove_backend::{
+        BlakeRoundLane, BuiltinLaneSpec, Cube252Lane, PartialEcMulGenericLane, PartialEcMulW18Lane,
+        PedersenAggregatorW18Lane,
+    };
+    for (label, prog, needs_table) in [
+        (
+            "pedersen_aggregator_window_bits_18",
+            &a.program,
+            PedersenAggregatorW18Lane::NEEDS_PEDERSEN_TABLE,
+        ),
+        (
+            "blake_round",
+            &b.program,
+            BlakeRoundLane::NEEDS_PEDERSEN_TABLE,
+        ),
         (
             "partial_ec_mul_window_bits_18",
             &pw::record_partial_ec_mul_window_bits_18().program,
+            PartialEcMulW18Lane::NEEDS_PEDERSEN_TABLE,
         ),
         (
             "partial_ec_mul_generic",
             &pg::record_partial_ec_mul_generic().program,
+            PartialEcMulGenericLane::NEEDS_PEDERSEN_TABLE,
         ),
-        ("cube_252", &cb::record_cube_252().program),
+        (
+            "cube_252",
+            &cb::record_cube_252().program,
+            Cube252Lane::NEEDS_PEDERSEN_TABLE,
+        ),
     ] {
         assert_eq!(
             prog.n_mult_tables, 0,
@@ -1821,9 +1839,24 @@ fn builtin_lane_recording_shapes_match_specs() {
             prog.n_mult_tables
         );
         assert!(
-            stwo_backend_cuda::jit_witness::codegen::compile_witness_to_cuda_source(prog)
-                .is_some(),
+            stwo_backend_cuda::jit_witness::codegen::compile_witness_to_cuda_source(prog).is_some(),
             "[{label}] codegen returned None — the prove launch would silently fall back"
+        );
+        // NEEDS_PEDERSEN_TABLE tracks the fp256 EMBED, not table READS: any
+        // fp256 deduce kind makes the kernel's CUmodule declare the table
+        // globals, and the fail-closed load fill rejects the module when no
+        // host table is registered — component ORDER must never decide whether
+        // a lane engages (ROUND-28 pod finding: partial_ec_mul_generic ran
+        // before the aggregator's registration and silently fell back).
+        use stwo_backend_cuda::jit_witness::isa::{DeduceKind, WitnessOp};
+        let embeds_fp256 = prog.insts.iter().any(|inst| {
+            WitnessOp::from_raw(inst.op) == Some(WitnessOp::DeduceCall)
+                && DeduceKind::from_raw(inst.imm)
+                    .is_some_and(|k| !matches!(k, DeduceKind::BlakeG | DeduceKind::BlakeRoundSigma))
+        });
+        assert_eq!(
+            needs_table, embeds_fp256,
+            "[{label}] NEEDS_PEDERSEN_TABLE ({needs_table}) must equal fp256-embed ({embeds_fp256})"
         );
     }
 }
@@ -2461,13 +2494,14 @@ fn partial_ec_mul_generic_recording_interpreter_matches_host() {
     }
 
     // GATE (c), pod builds only: the same program as an actual CUDA kernel.
-    // (No pedersen table: generic's felts arrive as inputs; its EC math is
-    // inline felt arithmetic, not table-driven.)
+    // Table required although the body never reads it: the felt deduces embed
+    // the fp256 chain, so the CUmodule declares the table globals and the
+    // fail-closed load fill needs the host table registered (ROUND-28).
     let host_rows: Vec<Vec<M31>> = diff.orig_rows.iter().map(|r| r.to_vec()).collect();
     assert_device_builtin_leg_matches_host(
         "partial_ec_mul_generic",
         out.program,
-        false,
+        true,
         &rows,
         &addr_ids,
         &f252_values,
