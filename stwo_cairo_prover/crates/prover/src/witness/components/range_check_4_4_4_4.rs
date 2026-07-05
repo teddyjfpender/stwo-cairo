@@ -43,6 +43,41 @@ impl ClaimGenerator {
         }
     }
 
+    /// Dense input -> row lookup table for the device count feed: index = the
+    /// MSB-first fold of the tuple (4-4-4-4 bits), length
+    /// `1 << 16`. Content is the inversion of THIS generator's
+    /// `input_to_row` map — the actual preprocessed layout, never a closed form.
+    pub fn input_to_row_lut(&self) -> Vec<u32> {
+        const LUT_SIZE: usize = 1 << 16;
+        assert_eq!(
+            self.input_to_row.len(),
+            LUT_SIZE,
+            "input_to_row map does not cover the full tuple space"
+        );
+        let mut lut = vec![0u32; LUT_SIZE];
+        for (k, &row) in &self.input_to_row {
+            lut[((k[0].0 as usize) << 12)
+                | ((k[1].0 as usize) << 8)
+                | ((k[2].0 as usize) << 4)
+                | ((k[3].0 as usize) << 0)] = row as u32;
+        }
+        lut
+    }
+
+    /// Merge relation-indexed device count tables into the multiplicity columns
+    /// (the device-DAG count-feed consumer surface; see `witness/device_feed.rs`).
+    pub fn add_count_tables(&self, counts: &[u32]) {
+        let table_size = counts.len() / 1;
+        assert_eq!(counts.len(), 1 * table_size);
+        for (relation_index, table) in counts.chunks_exact(table_size).enumerate() {
+            for (row, &count) in table.iter().enumerate() {
+                if count != 0 {
+                    self.mults[relation_index].add_at(row as u32, count);
+                }
+            }
+        }
+    }
+
     pub fn write_trace(
         self,
     ) -> (

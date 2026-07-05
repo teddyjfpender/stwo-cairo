@@ -24,6 +24,23 @@ impl ClaimGenerator {
         }
     }
 
+    /// Merge relation-indexed device count tables (layout `counts[relation_index
+    /// * table_size + row]`, row = the value/row key `add_input` uses directly)
+    /// into the multiplicity columns. Zero counts skipped; `add_at` merges are
+    /// identical to the same number of `increase_at` calls — the device-DAG
+    /// count-feed consumer surface (see `witness/device_feed.rs`).
+    pub fn add_count_tables(&self, counts: &[u32]) {
+        let table_size = counts.len() / 1;
+        assert_eq!(counts.len(), 1 * table_size);
+        for (relation_index, table) in counts.chunks_exact(table_size).enumerate() {
+            for (row, &count) in table.iter().enumerate() {
+                if count != 0 {
+                    self.mults[relation_index].add_at(row as u32, count);
+                }
+            }
+        }
+    }
+
     pub fn write_trace(
         self,
     ) -> (
