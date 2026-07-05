@@ -153,6 +153,7 @@ pub trait PartialEcMulGenericWitness: FromSimdColumns {
         range_check_8: &range_check_8::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
         range_check_20: &range_check_20::ClaimGenerator,
+        jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         PartialEcMulGenericClaim,
@@ -167,6 +168,7 @@ pub trait PartialEcMulWindowBits18Witness: FromSimdColumns {
         pedersen_points_table: &pedersen_points_table_window_bits_18::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
         range_check_20: &range_check_20::ClaimGenerator,
+        jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         PartialEcMulW18Claim,
@@ -199,6 +201,7 @@ impl PartialEcMulGenericWitness for SimdBackend {
         range_check_8: &range_check_8::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
         range_check_20: &range_check_20::ClaimGenerator,
+        _jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         PartialEcMulGenericClaim,
@@ -220,6 +223,7 @@ impl PartialEcMulWindowBits18Witness for SimdBackend {
         pedersen_points_table: &pedersen_points_table_window_bits_18::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
         range_check_20: &range_check_20::ClaimGenerator,
+        _jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         PartialEcMulW18Claim,
@@ -269,11 +273,81 @@ impl PartialEcMulGenericWitness for CudaBackend {
         range_check_8: &range_check_8::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
         range_check_20: &range_check_20::ClaimGenerator,
+        jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         PartialEcMulGenericClaim,
         partial_ec_mul_generic::InteractionClaimGenerator,
     ) {
+        // D′ witness-JIT lane: 17,000-instr recorded body (inline fp256 felt
+        // deduces), slot columns `[in.0, in.1, W27 x10, 2x28, 2x28, in.2.3 |
+        // enabler | iota]`. ALL its relations are count-style — the device feed
+        // is REQUIRED; any unavailability falls back to the host writer below.
+        if let Some(mem) = jit_memory {
+            use stwo::prover::backend::simd::m31::N_LANES;
+            let packed: Vec<partial_ec_mul_generic::PackedInputType> =
+                gen.packed_inputs.lock().unwrap().clone();
+            let remainder_empty = gen.remainder_inputs.lock().unwrap().is_empty();
+            if !packed.is_empty() && remainder_empty {
+                let n_vec_rows = packed.len();
+                let n_real = n_vec_rows * N_LANES;
+                let packed_size = n_vec_rows.next_power_of_two();
+                let size = packed_size * N_LANES;
+                let mut padded = packed;
+                padded.resize(packed_size, *padded.first().unwrap());
+                let mut cols: Vec<Vec<u32>> = vec![Vec::with_capacity(size); 127];
+                for p in &padded {
+                    let a0 = p.0.to_array();
+                    let a1 = p.1.to_array();
+                    let tail = p.2 .3.to_array();
+                    for l in 0..N_LANES {
+                        cols[0].push(a0[l].0);
+                        cols[1].push(a1[l].0);
+                        for i in 0..10 {
+                            cols[2 + i].push(p.2 .0.get_m31(i).to_array()[l].0);
+                        }
+                        for (fi, f) in p.2 .1.iter().enumerate() {
+                            for i in 0..28 {
+                                cols[12 + fi * 28 + i].push(f.get_m31(i).to_array()[l].0);
+                            }
+                        }
+                        for (fi, f) in p.2 .2.iter().enumerate() {
+                            for i in 0..28 {
+                                cols[68 + fi * 28 + i].push(f.get_m31(i).to_array()[l].0);
+                            }
+                        }
+                        cols[124].push(tail[l].0);
+                    }
+                }
+                cols[125] = (0..size).map(|r| u32::from(r < n_real)).collect();
+                cols[126] = (0..size).map(|r| r as u32).collect();
+                let lut_for = |family: &'static str| -> Vec<u32> {
+                    match family {
+                        "range_check_9_9_state" => range_check_9_9.input_to_row_lut(),
+                        other => panic!("unexpected LUT family {other}"),
+                    }
+                };
+                let merge = |family: &'static str, counts: &[u32]| match family {
+                    "range_check_8_state" => range_check_8.add_count_tables(counts),
+                    "range_check_9_9_state" => range_check_9_9.add_count_tables(counts),
+                    "range_check_20_state" => range_check_20.add_count_tables(counts),
+                    other => panic!("unexpected count family {other}"),
+                };
+                let launched = crate::witness::jit_prove_backend::all_count_builtin_write_trace::<
+                    crate::witness::jit_prove_backend::PartialEcMulGenericLane,
+                >(
+                    &cols,
+                    n_real,
+                    mem,
+                    partial_ec_mul_generic::SUB_FEED_LAYOUT,
+                    &lut_for,
+                    &merge,
+                );
+                if let Some(out) = launched {
+                    return out;
+                }
+            }
+        }
         if device_lane_enabled(PedersenLane::PartialEcMulGeneric) {
             warn_device_pending(PedersenLane::PartialEcMulGeneric);
         }
@@ -293,11 +367,76 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
         pedersen_points_table: &pedersen_points_table_window_bits_18::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
         range_check_20: &range_check_20::ClaimGenerator,
+        jit_memory: Option<&std::sync::Arc<stwo_cairo_adapter::memory::Memory>>,
     ) -> (
         Evals<Self>,
         PartialEcMulW18Claim,
         partial_ec_mul_window_bits_18::InteractionClaimGenerator,
     ) {
+        // D′ witness-JIT lane: the W18 EC-round body (points-table + felt
+        // deduces on the device pedersen table), slot columns `[in.0, in.1,
+        // 14 windows, acc0 x28, acc1 x28 | enabler | iota]`. ALL relations are
+        // count-style (points table included) — device feed REQUIRED.
+        if let Some(mem) = jit_memory {
+            use stwo::prover::backend::simd::m31::N_LANES;
+            let packed: Vec<partial_ec_mul_window_bits_18::PackedInputType> =
+                gen.packed_inputs.lock().unwrap().clone();
+            let remainder_empty = gen.remainder_inputs.lock().unwrap().is_empty();
+            if !packed.is_empty() && remainder_empty {
+                let n_vec_rows = packed.len();
+                let n_real = n_vec_rows * N_LANES;
+                let packed_size = n_vec_rows.next_power_of_two();
+                let size = packed_size * N_LANES;
+                let mut padded = packed;
+                padded.resize(packed_size, *padded.first().unwrap());
+                let mut cols: Vec<Vec<u32>> = vec![Vec::with_capacity(size); 74];
+                for p in &padded {
+                    let a0 = p.0.to_array();
+                    let a1 = p.1.to_array();
+                    for l in 0..N_LANES {
+                        cols[0].push(a0[l].0);
+                        cols[1].push(a1[l].0);
+                        for (wi, w) in p.2 .0.iter().enumerate() {
+                            cols[2 + wi].push(w.to_array()[l].0);
+                        }
+                        for (fi, f) in p.2 .1.iter().enumerate() {
+                            for i in 0..28 {
+                                cols[16 + fi * 28 + i].push(f.get_m31(i).to_array()[l].0);
+                            }
+                        }
+                    }
+                }
+                cols[72] = (0..size).map(|r| u32::from(r < n_real)).collect();
+                cols[73] = (0..size).map(|r| r as u32).collect();
+                let lut_for = |family: &'static str| -> Vec<u32> {
+                    match family {
+                        "range_check_9_9_state" => range_check_9_9.input_to_row_lut(),
+                        other => panic!("unexpected LUT family {other}"),
+                    }
+                };
+                let merge = |family: &'static str, counts: &[u32]| match family {
+                    "pedersen_points_table_window_bits_18_state" => {
+                        pedersen_points_table.add_count_tables(counts)
+                    }
+                    "range_check_9_9_state" => range_check_9_9.add_count_tables(counts),
+                    "range_check_20_state" => range_check_20.add_count_tables(counts),
+                    other => panic!("unexpected count family {other}"),
+                };
+                let launched = crate::witness::jit_prove_backend::all_count_builtin_write_trace::<
+                    crate::witness::jit_prove_backend::PartialEcMulW18Lane,
+                >(
+                    &cols,
+                    n_real,
+                    mem,
+                    partial_ec_mul_window_bits_18::SUB_FEED_LAYOUT,
+                    &lut_for,
+                    &merge,
+                );
+                if let Some(out) = launched {
+                    return out;
+                }
+            }
+        }
         if device_lane_enabled(PedersenLane::PartialEcMulWindowBits18) {
             warn_device_pending(PedersenLane::PartialEcMulWindowBits18);
         }
@@ -367,6 +506,7 @@ impl PedersenAggregatorWindowBits18Witness for CudaBackend {
                     layout: pedersen_aggregator_window_bits_18::SUB_FEED_LAYOUT,
                     lut_for: &lut_for,
                     merge: &merge,
+                    require: false,
                 };
                 let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace::<
                     crate::witness::jit_prove_backend::PedersenAggregatorW18Lane,

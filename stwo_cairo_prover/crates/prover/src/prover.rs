@@ -151,6 +151,7 @@ where
         + crate::witness::blake_g_witness_backend::BlakeGWitness
         + crate::witness::jit_prove_backend::OpcodeJitBackend
         + crate::witness::blake_round_witness_backend::BlakeRoundWitness
+        + crate::witness::jit_prove_backend::Cube252Witness
         + crate::witness::pedersen_witness_backend::PartialEcMulGenericWitness
         + crate::witness::pedersen_witness_backend::PartialEcMulWindowBits18Witness
         + crate::witness::pedersen_witness_backend::PedersenAggregatorWindowBits18Witness
@@ -303,6 +304,7 @@ where
         + crate::witness::blake_g_witness_backend::BlakeGWitness
         + crate::witness::jit_prove_backend::OpcodeJitBackend
         + crate::witness::blake_round_witness_backend::BlakeRoundWitness
+        + crate::witness::jit_prove_backend::Cube252Witness
         + crate::witness::pedersen_witness_backend::PartialEcMulGenericWitness
         + crate::witness::pedersen_witness_backend::PartialEcMulWindowBits18Witness
         + crate::witness::pedersen_witness_backend::PedersenAggregatorWindowBits18Witness
@@ -354,6 +356,7 @@ where
         + crate::witness::blake_g_witness_backend::BlakeGWitness
         + crate::witness::jit_prove_backend::OpcodeJitBackend
         + crate::witness::blake_round_witness_backend::BlakeRoundWitness
+        + crate::witness::jit_prove_backend::Cube252Witness
         + crate::witness::pedersen_witness_backend::PartialEcMulGenericWitness
         + crate::witness::pedersen_witness_backend::PartialEcMulWindowBits18Witness
         + crate::witness::pedersen_witness_backend::PedersenAggregatorWindowBits18Witness

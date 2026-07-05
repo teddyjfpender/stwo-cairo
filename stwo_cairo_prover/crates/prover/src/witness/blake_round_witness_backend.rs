@@ -165,6 +165,7 @@ impl BlakeRoundWitness for CudaBackend {
                     layout: blake_round::SUB_FEED_LAYOUT,
                     lut_for: &lut_for,
                     merge: &merge,
+                    require: false,
                 };
                 let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace::<
                     crate::witness::jit_prove_backend::BlakeRoundLane,

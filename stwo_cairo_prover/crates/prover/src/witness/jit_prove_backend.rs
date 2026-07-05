@@ -660,6 +660,11 @@ pub(crate) struct DeviceFeedPlan<'a> {
     pub layout: &'static [(&'static str, usize, &'static str, u32, usize, usize)],
     pub lut_for: &'a dyn Fn(&'static str) -> Vec<u32>,
     pub merge: &'a dyn Fn(&'static str, &[u32]),
+    /// When EVERY relation the component feeds is count-style, the seam sets
+    /// this and provides NO host feed: a device-feed failure then fails the
+    /// whole lane (`None` → the host WRITER reruns — still exactly-once feeds,
+    /// never a silent miss).
+    pub require: bool,
 }
 
 /// Generic builtin device write: validate the recording against the spec, launch
@@ -818,6 +823,13 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
                     );
                 }
                 None => {
+                    if plan.require {
+                        eprintln!(
+                            "jit_prove[{}]: REQUIRED device count feed unavailable —                              falling back to the host writer",
+                            C::LABEL
+                        );
+                        return None;
+                    }
                     eprintln!(
                         "jit_prove[{}]: device count feed unavailable — host feeds all",
                         C::LABEL
@@ -851,8 +863,8 @@ pub struct PedersenAggregatorW18Lane;
 impl BuiltinLaneSpec for PedersenAggregatorW18Lane {
     const LABEL: &'static str = "pedersen_aggregator_window_bits_18";
     const N_TRACE: usize = 206;
-    const N_LOOKUP_WORDS: usize = 396;
-    const N_SUB_WORDS: usize = 3 + 4 + 28 * 72;
+    const N_LOOKUP_WORDS: usize = pedersen_aggregator_window_bits_18::N_LOOKUP_WORDS;
+    const N_SUB_WORDS: usize = pedersen_aggregator_window_bits_18::N_SUB_INPUT_WORDS;
     type Claim = cairo_air::components::pedersen_aggregator_window_bits_18::Claim;
     type IGen = pedersen_aggregator_window_bits_18::InteractionClaimGenerator;
 
@@ -877,8 +889,8 @@ pub struct BlakeRoundLane;
 impl BuiltinLaneSpec for BlakeRoundLane {
     const LABEL: &'static str = "blake_round";
     const N_TRACE: usize = 212;
-    const N_LOOKUP_WORDS: usize = 850;
-    const N_SUB_WORDS: usize = 1 + 16 * 3 + 16 + 16 + 8 * 6;
+    const N_LOOKUP_WORDS: usize = blake_round::N_LOOKUP_WORDS;
+    const N_SUB_WORDS: usize = blake_round::N_SUB_INPUT_WORDS;
     type Claim = cairo_air::components::blake_round::Claim;
     type IGen = blake_round::InteractionClaimGenerator;
 
@@ -894,5 +906,207 @@ impl BuiltinLaneSpec for BlakeRoundLane {
     const NEEDS_PEDERSEN_TABLE: bool = false;
     fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
         blake_round::interaction_gen_from_flat_lookup_words(log_size, n_real, words, n_rows)
+    }
+}
+
+use crate::witness::components::{cube_252, partial_ec_mul_generic, partial_ec_mul_window_bits_18};
+
+pub struct PartialEcMulW18Lane;
+impl BuiltinLaneSpec for PartialEcMulW18Lane {
+    const LABEL: &'static str = "partial_ec_mul_window_bits_18";
+    const N_TRACE: usize = 297;
+    const N_LOOKUP_WORDS: usize = partial_ec_mul_window_bits_18::N_LOOKUP_WORDS;
+    const N_SUB_WORDS: usize = partial_ec_mul_window_bits_18::N_SUB_INPUT_WORDS;
+    // The recorded body's points-table + EC-round deduces read the device table.
+    const NEEDS_PEDERSEN_TABLE: bool = true;
+    type Claim = cairo_air::components::partial_ec_mul_window_bits_18::Claim;
+    type IGen = partial_ec_mul_window_bits_18::InteractionClaimGenerator;
+
+    fn record() -> RecordingOutput {
+        partial_ec_mul_window_bits_18::record_partial_ec_mul_window_bits_18()
+    }
+    fn claim(log_size: u32) -> Self::Claim {
+        Self::Claim { log_size }
+    }
+    fn lookup_fields() -> &'static [(&'static str, usize)] {
+        partial_ec_mul_window_bits_18::JIT_LOOKUP_FIELDS
+    }
+    fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
+        partial_ec_mul_window_bits_18::interaction_gen_from_flat_lookup_words(
+            log_size, n_real, words, n_rows,
+        )
+    }
+}
+
+pub struct PartialEcMulGenericLane;
+impl BuiltinLaneSpec for PartialEcMulGenericLane {
+    const LABEL: &'static str = "partial_ec_mul_generic";
+    const N_TRACE: usize = 624;
+    const N_LOOKUP_WORDS: usize = partial_ec_mul_generic::N_LOOKUP_WORDS;
+    const N_SUB_WORDS: usize = partial_ec_mul_generic::N_SUB_INPUT_WORDS;
+    // Inline felt arithmetic only — no table reads.
+    const NEEDS_PEDERSEN_TABLE: bool = false;
+    type Claim = cairo_air::components::partial_ec_mul_generic::Claim;
+    type IGen = partial_ec_mul_generic::InteractionClaimGenerator;
+
+    fn record() -> RecordingOutput {
+        partial_ec_mul_generic::record_partial_ec_mul_generic()
+    }
+    fn claim(log_size: u32) -> Self::Claim {
+        Self::Claim { log_size }
+    }
+    fn lookup_fields() -> &'static [(&'static str, usize)] {
+        partial_ec_mul_generic::JIT_LOOKUP_FIELDS
+    }
+    fn igen_from_flats(log_size: u32, _n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
+        partial_ec_mul_generic::interaction_gen_from_flat_lookup_words(log_size, words, n_rows)
+    }
+}
+
+pub struct Cube252Lane;
+impl BuiltinLaneSpec for Cube252Lane {
+    const LABEL: &'static str = "cube_252";
+    const N_TRACE: usize = 141;
+    const N_LOOKUP_WORDS: usize = cube_252::N_LOOKUP_WORDS;
+    const N_SUB_WORDS: usize = cube_252::N_SUB_INPUT_WORDS;
+    const NEEDS_PEDERSEN_TABLE: bool = false;
+    type Claim = cairo_air::components::cube_252::Claim;
+    type IGen = cube_252::InteractionClaimGenerator;
+
+    fn record() -> RecordingOutput {
+        cube_252::record_cube_252()
+    }
+    fn claim(log_size: u32) -> Self::Claim {
+        Self::Claim { log_size }
+    }
+    fn lookup_fields() -> &'static [(&'static str, usize)] {
+        cube_252::JIT_LOOKUP_FIELDS
+    }
+    fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
+        cube_252::interaction_gen_from_flat_lookup_words(log_size, n_real, words, n_rows)
+    }
+}
+
+/// Device write for the ALL-COUNT builtins (w18 / generic / cube_252): every
+/// downstream relation is count-style, so the device feed is REQUIRED and no
+/// host feed exists — any unavailability falls back to the host writer. The
+/// caller supplies the packed inputs already padded by the host preamble rule
+/// (first-packed-row replication) flattened to slot columns.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn all_count_builtin_write_trace<C: BuiltinLaneSpec>(
+    cols: &[Vec<u32>],
+    n_real: usize,
+    mem: &Arc<Memory>,
+    layout: &'static [(&'static str, usize, &'static str, u32, usize, usize)],
+    lut_for: &dyn Fn(&'static str) -> Vec<u32>,
+    merge: &dyn Fn(&'static str, &[u32]),
+) -> Option<(Evals<stwo_backend_cuda::CudaBackend>, C::Claim, C::IGen)> {
+    let plan = DeviceFeedPlan {
+        layout,
+        lut_for,
+        merge,
+        require: true,
+    };
+    builtin_cuda_write_trace::<C>(cols, n_real, mem, Some(plan), |_sub, _n, fed| {
+        debug_assert!(
+            !fed.is_empty(),
+            "require-mode feed reached with nothing fed"
+        );
+    })
+}
+
+use crate::witness::components::{range_check_20, range_check_9_9};
+
+/// Backend seam for the `cube_252` base-trace write (poseidon-family fp256):
+/// Simd = the generated writer verbatim; Cuda = the witness-JIT lane (12 slot
+/// columns from the W27 input; ALL relations count-style — device feed
+/// REQUIRED, host-writer fallback on any unavailability).
+pub trait Cube252Witness: FromSimdColumns {
+    fn write_trace(
+        gen: cube_252::ClaimGenerator,
+        range_check_9_9_state: &range_check_9_9::ClaimGenerator,
+        range_check_20_state: &range_check_20::ClaimGenerator,
+        jit_memory: Option<&Arc<Memory>>,
+    ) -> (
+        Evals<Self>,
+        cairo_air::components::cube_252::Claim,
+        cube_252::InteractionClaimGenerator,
+    );
+}
+
+impl Cube252Witness for SimdBackend {
+    fn write_trace(
+        gen: cube_252::ClaimGenerator,
+        range_check_9_9_state: &range_check_9_9::ClaimGenerator,
+        range_check_20_state: &range_check_20::ClaimGenerator,
+        _jit_memory: Option<&Arc<Memory>>,
+    ) -> (
+        Evals<Self>,
+        cairo_air::components::cube_252::Claim,
+        cube_252::InteractionClaimGenerator,
+    ) {
+        let (trace, claim, igen) = gen.write_trace(range_check_9_9_state, range_check_20_state);
+        (trace.to_evals(), claim, igen)
+    }
+}
+
+impl Cube252Witness for stwo_backend_cuda::CudaBackend {
+    fn write_trace(
+        gen: cube_252::ClaimGenerator,
+        range_check_9_9_state: &range_check_9_9::ClaimGenerator,
+        range_check_20_state: &range_check_20::ClaimGenerator,
+        jit_memory: Option<&Arc<Memory>>,
+    ) -> (
+        Evals<Self>,
+        cairo_air::components::cube_252::Claim,
+        cube_252::InteractionClaimGenerator,
+    ) {
+        if let Some(mem) = jit_memory {
+            let packed: Vec<cube_252::PackedInputType> = gen.packed_inputs.lock().unwrap().clone();
+            let remainder_empty = gen.remainder_inputs.lock().unwrap().is_empty();
+            if !packed.is_empty() && remainder_empty {
+                let n_vec_rows = packed.len();
+                let n_real = n_vec_rows * N_LANES;
+                let packed_size = n_vec_rows.next_power_of_two();
+                let size = packed_size * N_LANES;
+                let mut padded = packed;
+                padded.resize(packed_size, *padded.first().unwrap());
+                // Slot columns: W27 words 0..10 | enabler 10 | iota 11.
+                let mut cols: Vec<Vec<u32>> = vec![Vec::with_capacity(size); 12];
+                for p in &padded {
+                    for l in 0..N_LANES {
+                        for i in 0..10 {
+                            cols[i].push(p.get_m31(i).to_array()[l].0);
+                        }
+                    }
+                }
+                cols[10] = (0..size).map(|r| u32::from(r < n_real)).collect();
+                cols[11] = (0..size).map(|r| r as u32).collect();
+                let lut_for = |family: &'static str| -> Vec<u32> {
+                    match family {
+                        "range_check_9_9_state" => range_check_9_9_state.input_to_row_lut(),
+                        other => panic!("unexpected LUT family {other}"),
+                    }
+                };
+                let merge = |family: &'static str, counts: &[u32]| match family {
+                    "range_check_9_9_state" => range_check_9_9_state.add_count_tables(counts),
+                    "range_check_20_state" => range_check_20_state.add_count_tables(counts),
+                    other => panic!("unexpected count family {other}"),
+                };
+                let launched = all_count_builtin_write_trace::<Cube252Lane>(
+                    &cols,
+                    n_real,
+                    mem,
+                    cube_252::SUB_FEED_LAYOUT,
+                    &lut_for,
+                    &merge,
+                );
+                if let Some(out) = launched {
+                    return out;
+                }
+            }
+        }
+        let (trace, claim, igen) = gen.write_trace(range_check_9_9_state, range_check_20_state);
+        (Self::from_simd_evals(trace.to_evals()), claim, igen)
     }
 }

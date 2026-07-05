@@ -30,9 +30,9 @@ use crate::witness::blake_round_witness_backend::BlakeRoundWitness;
 use crate::witness::components::*;
 use crate::witness::jit_prove_backend::{
     AddOpcodeLane, AddOpcodeSmallLane, AssertEqOpcodeDoubleDerefLane, AssertEqOpcodeImmLane,
-    AssertEqOpcodeLane, CallOpcodeAbsLane, CallOpcodeRelImmLane, JnzOpcodeNonTakenLane,
-    JnzOpcodeTakenLane, JumpOpcodeAbsLane, JumpOpcodeDoubleDerefLane, JumpOpcodeRelImmLane,
-    JumpOpcodeRelLane, OpcodeJitBackend, RetOpcodeLane,
+    AssertEqOpcodeLane, CallOpcodeAbsLane, CallOpcodeRelImmLane, Cube252Witness,
+    JnzOpcodeNonTakenLane, JnzOpcodeTakenLane, JumpOpcodeAbsLane, JumpOpcodeDoubleDerefLane,
+    JumpOpcodeRelImmLane, JumpOpcodeRelLane, OpcodeJitBackend, RetOpcodeLane,
 };
 use crate::witness::memory_witness_backend::MemoryIdToBigWitness;
 use crate::witness::pedersen_witness_backend::{
@@ -759,6 +759,7 @@ impl CairoClaimGenerator {
             + BlakeGWitness
             + OpcodeJitBackend
             + BlakeRoundWitness
+            + crate::witness::jit_prove_backend::Cube252Witness
             + PartialEcMulGenericWitness
             + PartialEcMulWindowBits18Witness
             + PedersenAggregatorWindowBits18Witness
@@ -1470,6 +1471,7 @@ impl CairoClaimGenerator {
                         self.range_check_8.as_ref().unwrap(),
                         self.range_check_9_9.as_ref().unwrap(),
                         self.range_check_20.as_ref().unwrap(),
+                        self.jit_memory.as_ref(),
                     );
                 evals.extend(trace);
                 (claim, interaction_gen)
@@ -1504,6 +1506,7 @@ impl CairoClaimGenerator {
                             self.pedersen_points_table_window_bits_18.as_ref().unwrap(),
                             self.range_check_9_9.as_ref().unwrap(),
                             self.range_check_20.as_ref().unwrap(),
+                            self.jit_memory.as_ref(),
                         );
                     evals.extend(trace);
                     (claim, interaction_gen)
@@ -1615,11 +1618,13 @@ impl CairoClaimGenerator {
             .cube_252
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:cube_252").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
+                let (trace, claim, interaction_gen) = <B as Cube252Witness>::write_trace(
+                    gen,
                     self.range_check_9_9.as_ref().unwrap(),
                     self.range_check_20.as_ref().unwrap(),
+                    self.jit_memory.as_ref(),
                 );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
+                evals.extend(trace);
                 (claim, interaction_gen)
             })
             .unzip();
