@@ -710,6 +710,50 @@ pub trait BuiltinLaneSpec {
     fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen;
 }
 
+/// Every lane recording, for the AOT `kernel_emit` tool (design §4/§17, M3):
+/// `(label, recorded witness program)`. Colocated with the spec definitions;
+/// gpu-prover's schedule-table pin asserts each label is a schedule node, so a
+/// lane added without a registry entry (or vice versa) fails a gate, not
+/// silently ships NVRTC-only.
+pub fn all_lane_recordings() -> Vec<(
+    &'static str,
+    stwo_backend_cuda::jit_witness::isa::WitnessProgram,
+)> {
+    fn op<C: OpcodeLaneSpec>() -> (
+        &'static str,
+        stwo_backend_cuda::jit_witness::isa::WitnessProgram,
+    ) {
+        (C::LABEL, C::record().program)
+    }
+    fn bi<C: BuiltinLaneSpec>() -> (
+        &'static str,
+        stwo_backend_cuda::jit_witness::isa::WitnessProgram,
+    ) {
+        (C::LABEL, C::record().program)
+    }
+    vec![
+        op::<AddOpcodeLane>(),
+        op::<AssertEqOpcodeLane>(),
+        op::<JnzOpcodeTakenLane>(),
+        op::<AddOpcodeSmallLane>(),
+        op::<AssertEqOpcodeImmLane>(),
+        op::<AssertEqOpcodeDoubleDerefLane>(),
+        op::<CallOpcodeAbsLane>(),
+        op::<CallOpcodeRelImmLane>(),
+        op::<JnzOpcodeNonTakenLane>(),
+        op::<JumpOpcodeAbsLane>(),
+        op::<JumpOpcodeDoubleDerefLane>(),
+        op::<JumpOpcodeRelLane>(),
+        op::<JumpOpcodeRelImmLane>(),
+        op::<RetOpcodeLane>(),
+        bi::<PedersenAggregatorW18Lane>(),
+        bi::<BlakeRoundLane>(),
+        bi::<PartialEcMulW18Lane>(),
+        bi::<PartialEcMulGenericLane>(),
+        bi::<Cube252Lane>(),
+    ]
+}
+
 /// The device-DAG count-feed plan for one component (B2): the emitted
 /// `SUB_FEED_LAYOUT`, a LUT provider per relation family, and a per-family
 /// merge into the downstream states' `add_count_tables`. Relations covered by

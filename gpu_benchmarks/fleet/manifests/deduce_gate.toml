@@ -16,7 +16,11 @@ stop_on_failure = true
 
 [env]
 RUST_MIN_STACK = "4194304"
-STWO_JIT_MAX_KERNEL_INSTRS = "512"
+# 2048 = the AOT pack's lowering cap (kernel_emit DEFAULT_AOT_MAX_INSTRS): keys
+# must match for embedded-cubin hits. The old 512 sm_90 override existed for
+# load-time driver ptxas, which the AOT path never runs; NVRTC fallbacks (drift)
+# still honor this cap.
+STWO_JIT_MAX_KERNEL_INSTRS = "2048"
 STWO_JIT_CUBIN_CACHE = "1"
 GB = "/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench"
 SN = "/workspace/stwo-cairo/gpu_benchmarks/pie/sn"
@@ -182,6 +186,26 @@ echo "off=$a"; echo "dag=$b"
 if [ "$a" = "$b" ]; then echo DAG_PROOF_MATCH; else echo DAG_PROOF_MISMATCH; fi"""
 timeout_s = 120
 must_match = ['DAG_PROOF_MATCH']
+
+# --- 9a. M3 AOT PACK: the baseline prove must hit the embedded -O3 cubins
+# (no NVRTC/ptxas at prove time) and stay byte-identical. Cold == warm is the
+# falsifiable P5 prediction — compare reps in the ledger. -------------------------------
+[[step]]
+name = "sn2-aot-pack"
+cmd = '''
+STWO_JIT_LOG=1 STWO_DUMP_PROOF=$OUT/aot.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 2 --reuse-input 2> $OUT/aot.err | tail -6
+hits=$(grep -c 'AOT pack hit' $OUT/aot.err || true)
+echo "aot_hits=$hits"
+grep -m1 'AOT pack hit' $OUT/aot.err
+nvrtc=$(grep -c 'compile start component' $OUT/aot.err || true)
+echo "nvrtc_compiles=$nvrtc"
+a=$(sha256sum $OUT/deduce_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/aot.proof | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo AOT_PROOF_MATCH; else echo AOT_PROOF_MISMATCH; fi'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['AOT pack hit', 'AOT_PROOF_MATCH']
 
 # --- 9b. M1 ENGINE PARITY (GPU_RESIDENT_PROVER_DESIGN.md §11): the gpu-native
 # pipeline (stwo-cairo-gpu-prover) must be byte-identical to the legacy engine on

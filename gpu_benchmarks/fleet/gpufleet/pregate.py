@@ -35,6 +35,13 @@ def _init_checks(stwo: Path, stwo_cairo: Path) -> list[tuple[str, list[str], Pat
             prover,
         ),
         (
+            "kernel_emit --check (AOT kernel sources drift gate)",
+            ["cargo", "run", "--profile", "witness-opt-1", "-p", "stwo-cairo-gpu-prover",
+             "--bin", "kernel_emit", "--features", "emit-tools", "--",
+             "--stwo-root", "../../stwo", "--check"],
+            prover,
+        ),
+        (
             "schedule_emit --check (generated schedule table drift gate)",
             ["cargo", "run", "--manifest-path", "tools/schedule_emit/Cargo.toml",
              "--", "--prover-root", ".", "--check"],

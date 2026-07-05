@@ -18,6 +18,9 @@ slow-tests = []
 # Enables the CairoPie bootloader ingestion path in the gpu_bench binary.
 pie-bench = ["dep:cairo-program-runner-lib"]
 
+# Enables the AOT kernel_emit tool (needs dev-utils fixtures at runtime).
+emit-tools = ["dep:stwo-cairo-dev-utils"]
+
 [dependencies]
 stwo-cairo-prover = { path = "../prover", version = "~1.2.2" }
 stwo-cairo-adapter = { path = "../adapter", version = "~1.2.2" }
@@ -44,6 +47,14 @@ cairo-program-runner-lib = { git = "https://github.com/starkware-libs/proving-ut
 # shipped inside cairo-program-runner-lib via `cargo metadata`.
 [build-dependencies]
 serde_json.workspace = true
+
+[[bin]]
+name = "kernel_emit"
+required-features = ["emit-tools"]
+
+[dependencies.stwo-cairo-dev-utils]
+path = "../dev_utils"
+optional = true
 
 [dev-dependencies]
 stwo-cairo-dev-utils = { path = "../dev_utils" }

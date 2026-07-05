@@ -62,3 +62,23 @@ fn error_types_are_exercised_by_validate() {
     // the unit tests in schedule.rs own the negative cases.
     let _ = ScheduleError::Cycle("x");
 }
+
+/// M3 completeness fence: every lane recording label is a schedule node — a lane
+/// added without schedule metadata (or a schedule regeneration that loses a lane
+/// component) fails here, so the AOT kernel set and the DAG stay in lockstep.
+#[test]
+fn lane_recordings_are_schedule_nodes() {
+    let recordings = stwo_cairo_prover::witness::jit_prove_backend::all_lane_recordings();
+    assert!(
+        recordings.len() >= 19,
+        "lane registry shrank: {}",
+        recordings.len()
+    );
+    for (label, program) in &recordings {
+        assert!(
+            CAIRO_SCHEDULE.nodes.iter().any(|n| n.id == *label),
+            "lane {label} missing from the generated schedule table"
+        );
+        assert!(program.n_cols > 0, "{label}: empty recording");
+    }
+}
