@@ -1792,6 +1792,40 @@ fn builtin_lane_recording_shapes_match_specs() {
     assert_eq!(b.program.n_inputs, 20);
     let blake_field_words: usize = br::JIT_LOOKUP_FIELDS.iter().map(|f| f.1).sum();
     assert_eq!(blake_field_words as u32, b.program.n_lookup_words);
+
+    // PROVE-LANE LAUNCHABILITY, all five builtin lanes: the launch path declines
+    // (silent `None` → "launch unavailable" on pod) any program with mult tables
+    // (counts flow through the SEPARATE feed kernel, never through MultPush) or
+    // any program codegen can't lower. Both are properties of the RECORDING —
+    // hardware-independent, so pin them here where a plain `cargo test` on a
+    // laptop catches them before a pod ever spins up.
+    use crate::witness::components::{
+        cube_252 as cb, partial_ec_mul_generic as pg, partial_ec_mul_window_bits_18 as pw,
+    };
+    for (label, prog) in [
+        ("pedersen_aggregator_window_bits_18", &a.program),
+        ("blake_round", &b.program),
+        (
+            "partial_ec_mul_window_bits_18",
+            &pw::record_partial_ec_mul_window_bits_18().program,
+        ),
+        (
+            "partial_ec_mul_generic",
+            &pg::record_partial_ec_mul_generic().program,
+        ),
+        ("cube_252", &cb::record_cube_252().program),
+    ] {
+        assert_eq!(
+            prog.n_mult_tables, 0,
+            "[{label}] records {} mult tables — the prove launch declines these",
+            prog.n_mult_tables
+        );
+        assert!(
+            stwo_backend_cuda::jit_witness::codegen::compile_witness_to_cuda_source(prog)
+                .is_some(),
+            "[{label}] codegen returned None — the prove launch would silently fall back"
+        );
+    }
 }
 
 /// POD ORACLE LEGS (deduce kinds 2/3): the precompiled `stwo_wit_deduce_*` device

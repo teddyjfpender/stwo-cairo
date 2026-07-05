@@ -1,0 +1,73 @@
+{
+  "run_id": "20260705T170147Z.deduce-gate",
+  "manifest": "deduce-gate",
+  "pod": {
+    "id": "kkogzcvy29ixbb",
+    "gpu": "H100 NVL",
+    "usd_hr": 2.59
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "b1cc35f9138d",
+      "diff_sha256": "e3b0c44298fc1c14",
+      "dirty": false
+    },
+    "stwo-cairo": {
+      "rev": "8c7d3bce94a0",
+      "diff_sha256": "a4e78282ac57249e",
+      "dirty": true
+    }
+  },
+  "steps": [
+    {
+      "name": "prereqs",
+      "rc": 0,
+      "seconds": 1.7,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "test-build",
+      "rc": 0,
+      "seconds": 1.8,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "oracle-legs",
+      "rc": 0,
+      "seconds": 4.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "device-gate-blake",
+      "rc": 0,
+      "seconds": 4.2,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "device-gate-aggregator",
+      "rc": 101,
+      "seconds": 4.7,
+      "passed": false,
+      "reasons": [
+        "rc=101",
+        "must_match failed: 'device leg \\\\[pedersen_aggregator_window_bits_18\\\\]: PASS'"
+      ],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": false,
+  "wall_s": 31.6
+}
