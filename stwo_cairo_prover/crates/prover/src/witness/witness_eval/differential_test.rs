@@ -2757,3 +2757,397 @@ fn partial_ec_mul_w18_count_feed_matches_consumer_feeds() {
         descs.len() / crate::witness::device_feed::WFC_DESC_STRIDE
     );
 }
+
+/// Shared engine for the count gates: run the device-feed path (descriptors +
+/// pure-Rust kernel mirror) AND replay the same tuples through `host_feed`
+/// (the consumers' own `add_input` semantics), so the caller can byte-compare
+/// its two fresh state sets. Returns the descriptor count (0 = the component
+/// touches no count relations — the caller should assert its expectation).
+fn run_count_feed_paths(
+    layout: &'static [(&'static str, usize, &'static str, u32, usize, usize)],
+    sub_flat: &[u32],
+    n_padded: usize,
+    lut_for: impl Fn(&'static str) -> Vec<u32>,
+    merge: impl Fn(&'static str, &[u32]),
+    mut host_feed: impl FnMut(&'static str, u32, &[u32]),
+) -> usize {
+    use crate::witness::device_feed::{
+        build_feed_descriptors, host_feed_counts, COUNT_RELATIONS, WFC_DESC_STRIDE,
+    };
+    let (descs, lut_slots, counts_slots) = build_feed_descriptors(layout, COUNT_RELATIONS);
+    if descs.is_empty() {
+        return 0;
+    }
+    let luts: Vec<Vec<u32>> = lut_slots.iter().map(|s| lut_for(s)).collect();
+    let mut counts: Vec<Vec<u32>> = counts_slots
+        .iter()
+        .map(|s| {
+            let rel = COUNT_RELATIONS
+                .iter()
+                .find(|r| r.state_param == *s)
+                .unwrap();
+            vec![0u32; rel.n_relations * rel.table_size]
+        })
+        .collect();
+    host_feed_counts(sub_flat, n_padded, &descs, &luts, &mut counts);
+    for (slot, c) in counts_slots.iter().zip(&counts) {
+        merge(slot, c);
+    }
+    // Host reference: the consumers' own add_input over the same tuples —
+    // ONLY for count relations (the same set the descriptors cover). Tuples
+    // whose fold key exceeds the domain are skipped, mirroring the kernel's
+    // memory-safety guard (only synthetic gate inputs can produce them; a real
+    // trace's host feed would panic on such a tuple).
+    for &(_f, _i, state, rel, base, words) in layout {
+        let Some(relation) = COUNT_RELATIONS.iter().find(|r| r.state_param == state) else {
+            continue;
+        };
+        let mut tuple = vec![0u32; words];
+        for r in 0..n_padded {
+            let mut key: u64 = 0;
+            for (k, t) in tuple.iter_mut().enumerate() {
+                *t = sub_flat[(base + k) * n_padded + r];
+                key = (key << relation.word_bits[k]) | u64::from(*t);
+            }
+            if key as usize >= relation.table_size {
+                continue;
+            }
+            host_feed(state, rel, &tuple);
+        }
+    }
+    descs.len() / WFC_DESC_STRIDE
+}
+
+/// Byte-compare two multiplicity column sets.
+fn assert_mults_eq(name: &str, a: Vec<Vec<PackedM31>>, b: Vec<Vec<PackedM31>>) {
+    assert_eq!(a.len(), b.len(), "{name} relation count");
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        for (v, (p, q)) in x.iter().zip(y).enumerate() {
+            assert_eq!(
+                p.to_array(),
+                q.to_array(),
+                "{name} relation {i} packed row {v}"
+            );
+        }
+    }
+}
+
+/// Word-major sub flats from a GenericSimdDiff's host SubComponentInputs.
+fn sub_flat_from_diff(
+    orig_sub: &[Vec<std::simd::Simd<u32, N_LANES>>],
+    n_padded: usize,
+) -> Vec<u32> {
+    let n_packed_rows = n_padded / N_LANES;
+    let n_sub: usize = orig_sub.iter().map(|f| f.len() / n_packed_rows).sum();
+    let mut flat = vec![0u32; n_sub * n_padded];
+    let mut w = 0usize;
+    for field in orig_sub {
+        let width = field.len() / n_packed_rows;
+        for k in 0..width {
+            for r in 0..n_padded {
+                flat[w * n_padded + r] = field[(r / N_LANES) * width + k].as_array()[r % N_LANES];
+            }
+            w += 1;
+        }
+    }
+    flat
+}
+
+/// COUNT GATE for `partial_ec_mul_generic` (rc_8 / rc_9_9 / rc_20).
+#[test]
+fn partial_ec_mul_generic_count_feed_matches_consumer_feeds() {
+    use crate::witness::components::{
+        partial_ec_mul_generic as m, range_check_20, range_check_8, range_check_9_9,
+    };
+    use crate::witness::utils::AddInputs;
+
+    let (packed, n_rows, rc8, rc99, rc20, _mem) = partial_ec_mul_generic_fixture();
+    let diff = m::generic_simd_diff(packed.clone(), n_rows, &rc8, &rc99, &rc20);
+    let n_padded = packed.len() * N_LANES;
+    let sub_flat = sub_flat_from_diff(&diff.orig_sub, n_padded);
+
+    let preproc = Arc::new(PreProcessedTrace::canonical_without_pedersen());
+    let (d8, d99, d20) = (
+        range_check_8::ClaimGenerator::new(preproc.clone()),
+        range_check_9_9::ClaimGenerator::new(preproc.clone()),
+        range_check_20::ClaimGenerator::new(preproc.clone()),
+    );
+    let (h8, h99, h20) = (
+        range_check_8::ClaimGenerator::new(preproc.clone()),
+        range_check_9_9::ClaimGenerator::new(preproc.clone()),
+        range_check_20::ClaimGenerator::new(preproc),
+    );
+    let n = run_count_feed_paths(
+        m::SUB_FEED_LAYOUT,
+        &sub_flat,
+        n_padded,
+        |f| match f {
+            "range_check_9_9_state" => rc99.input_to_row_lut(),
+            other => panic!("unexpected LUT family {other}"),
+        },
+        |f, c| match f {
+            "range_check_8_state" => d8.add_count_tables(c),
+            "range_check_9_9_state" => d99.add_count_tables(c),
+            "range_check_20_state" => d20.add_count_tables(c),
+            other => panic!("unexpected count family {other}"),
+        },
+        |f, rel, t| match f {
+            "range_check_8_state" => h8.add_input(&[M31(t[0])], rel as usize),
+            "range_check_9_9_state" => h99.add_input(&[M31(t[0]), M31(t[1])], rel as usize),
+            "range_check_20_state" => h20.add_input(&[M31(t[0])], rel as usize),
+            other => panic!("unexpected state {other}"),
+        },
+    );
+    assert!(n > 0, "generic must have count descriptors");
+    let flat = |g: [crate::witness::utils::AtomicMultiplicityColumn; 1]| {
+        g.into_iter().map(|m| m.into_simd_vec()).collect::<Vec<_>>()
+    };
+    let _ = flat;
+    assert_mults_eq(
+        "generic rc_8",
+        d8.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+        h8.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+    );
+    assert_mults_eq(
+        "generic rc_9_9",
+        d99.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+        h99.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+    );
+    assert_mults_eq(
+        "generic rc_20",
+        d20.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+        h20.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+    );
+    eprintln!("count gate [partial_ec_mul_generic]: PASS ({n} descriptors)");
+}
+
+/// COUNT GATE for `cube_252` (rc_9_9 / rc_20).
+#[test]
+fn cube_252_count_feed_matches_consumer_feeds() {
+    use crate::witness::components::{cube_252 as m, range_check_20, range_check_9_9};
+    use crate::witness::utils::AddInputs;
+
+    let (cg,) = poseidon_family_fixture();
+    let gen = cg.cube_252.expect("cube_252 populated");
+    let rc99 = cg.range_check_9_9.expect("rc99");
+    let rc20 = cg.range_check_20.expect("rc20");
+    let mut packed = gen.packed_inputs.into_inner().unwrap();
+    let n_rows = packed.len() * N_LANES;
+    let packed_size = packed.len().next_power_of_two();
+    packed.resize(packed_size, *packed.first().unwrap());
+    let diff = m::generic_simd_diff(packed.clone(), n_rows, &rc99, &rc20);
+    let n_padded = packed.len() * N_LANES;
+    let sub_flat = sub_flat_from_diff(&diff.orig_sub, n_padded);
+
+    let preproc = Arc::new(PreProcessedTrace::canonical_without_pedersen());
+    let (d99, d20) = (
+        range_check_9_9::ClaimGenerator::new(preproc.clone()),
+        range_check_20::ClaimGenerator::new(preproc.clone()),
+    );
+    let (h99, h20) = (
+        range_check_9_9::ClaimGenerator::new(preproc.clone()),
+        range_check_20::ClaimGenerator::new(preproc),
+    );
+    let n = run_count_feed_paths(
+        m::SUB_FEED_LAYOUT,
+        &sub_flat,
+        n_padded,
+        |f| match f {
+            "range_check_9_9_state" => rc99.input_to_row_lut(),
+            other => panic!("unexpected LUT family {other}"),
+        },
+        |f, c| match f {
+            "range_check_9_9_state" => d99.add_count_tables(c),
+            "range_check_20_state" => d20.add_count_tables(c),
+            other => panic!("unexpected count family {other}"),
+        },
+        |f, rel, t| match f {
+            "range_check_9_9_state" => h99.add_input(&[M31(t[0]), M31(t[1])], rel as usize),
+            "range_check_20_state" => h20.add_input(&[M31(t[0])], rel as usize),
+            other => panic!("unexpected state {other}"),
+        },
+    );
+    assert!(n > 0, "cube_252 must have count descriptors");
+    assert_mults_eq(
+        "cube rc_9_9",
+        d99.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+        h99.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+    );
+    assert_mults_eq(
+        "cube rc_20",
+        d20.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+        h20.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+    );
+    eprintln!("count gate [cube_252]: PASS ({n} descriptors)");
+}
+
+/// COUNT GATES for the two PROVE-WIRED components (aggregator: rc_8;
+/// blake_round: rc_7_2_5 through its LUT) — the exact split the seams run.
+#[test]
+fn aggregator_and_blake_count_feeds_match_consumer_feeds() {
+    use stwo_cairo_common::prover_types::cpu::UInt32;
+
+    use crate::witness::components::{
+        blake_round, pedersen_aggregator_window_bits_18 as agg, range_check_7_2_5, range_check_8,
+    };
+    use crate::witness::utils::AddInputs;
+
+    let preproc = Arc::new(PreProcessedTrace::canonical_without_pedersen());
+
+    // Aggregator on the pedersen fixture.
+    {
+        let (packed, n_rows, pts, rc99v, rc20v, _mem) = w18_fixture();
+        let _ = (packed, n_rows, pts, rc99v, rc20v); // fixture warms the chain
+    }
+    {
+        use cairo_vm::types::layout_name::LayoutName;
+        use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
+        use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
+        let compiled = get_compiled_cairo_program_path("test_prove_verify_pedersen_builtin");
+        let input = run_and_adapt(
+            &compiled,
+            ProgramType::Json,
+            LayoutName::all_cairo_stwo,
+            None,
+        )
+        .expect("pedersen fixture");
+        let ProverInput {
+            state_transitions,
+            memory,
+            builtin_segments,
+            ..
+        } = input;
+        let mut cg = CairoClaimGenerator::default();
+        let mut set: IndexSet<&str> = IndexSet::new();
+        for c in [
+            "pedersen_aggregator_window_bits_18",
+            "memory_address_to_id",
+            "memory_id_to_big",
+            "range_check_8",
+            "partial_ec_mul_window_bits_18",
+            "pedersen_builtin",
+        ] {
+            set.insert(c);
+        }
+        cg.fill_components(
+            &set,
+            state_transitions.casm_states_by_opcode,
+            &builtin_segments,
+            Arc::new(memory),
+            Arc::new(PreProcessedTrace::canonical_without_pedersen()),
+        );
+        {
+            let pb = cg.pedersen_builtin.take().unwrap();
+            let _ = pb.write_trace(
+                cg.memory_address_to_id.as_ref().unwrap(),
+                cg.pedersen_aggregator_window_bits_18.as_ref().unwrap(),
+            );
+        }
+        let gen = cg.pedersen_aggregator_window_bits_18.unwrap();
+        let mem_big = cg.memory_id_to_big.unwrap();
+        let rc8 = cg.range_check_8.unwrap();
+        let w18s = cg.partial_ec_mul_window_bits_18.unwrap();
+        let mut inputs_mults = gen
+            .mults
+            .iter()
+            .map(|e| (*e.key(), M31(e.value().load(Ordering::Relaxed))))
+            .collect::<Vec<_>>();
+        inputs_mults.sort_by_key(|(i, _)| i.0);
+        let (mut inputs, mut mults) = inputs_mults.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+        let n_rows = inputs.len();
+        let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+        inputs.resize(size, *inputs.first().unwrap());
+        mults.resize(size, M31::zero());
+        let packed_inputs = pack_values(&inputs);
+        let packed_mults = pack_values(&mults);
+        let diff = agg::generic_simd_diff(packed_inputs, vec![packed_mults], &mem_big, &rc8, &w18s);
+        let sub_flat = sub_flat_from_diff(&diff.orig_sub, size);
+
+        let d8 = range_check_8::ClaimGenerator::new(preproc.clone());
+        let h8 = range_check_8::ClaimGenerator::new(preproc.clone());
+        let n = run_count_feed_paths(
+            agg::SUB_FEED_LAYOUT,
+            &sub_flat,
+            size,
+            |f| panic!("aggregator needs no LUT, got {f}"),
+            |f, c| match f {
+                "range_check_8_state" => d8.add_count_tables(c),
+                other => panic!("unexpected count family {other}"),
+            },
+            |f, rel, t| match f {
+                "range_check_8_state" => h8.add_input(&[M31(t[0])], rel as usize),
+                other => panic!("unexpected state {other}"),
+            },
+        );
+        assert!(n > 0);
+        assert_mults_eq(
+            "aggregator rc_8",
+            d8.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+            h8.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+        );
+        eprintln!("count gate [pedersen_aggregator]: PASS ({n} descriptors)");
+    }
+
+    // blake_round on synthetic inputs (the interp-gate recipe).
+    {
+        let (cg, _a, _f, _s) = fill_fixture_with_memory(&[
+            "blake_round",
+            "blake_round_sigma",
+            "blake_g",
+            "memory_address_to_id",
+            "memory_id_to_big",
+            "range_check_7_2_5",
+        ]);
+        let sigma = cg.blake_round_sigma.expect("sigma");
+        let mem_addr = cg.memory_address_to_id.expect("mem addr");
+        let mem_big = cg.memory_id_to_big.expect("mem big");
+        let rc725 = cg.range_check_7_2_5.expect("rc725");
+        let blake_g = cg.blake_g.expect("blake_g");
+        let inputs: Vec<blake_round::InputType> = (0..24u32)
+            .map(|i| {
+                let words: [UInt32; 16] = std::array::from_fn(|j| {
+                    UInt32::from(0x9E37_79B9u32.wrapping_mul(j as u32 + i))
+                });
+                (M31(i + 1), M31(i % 10), (words, M31(1 + (i % 4))))
+            })
+            .collect();
+        let n_rows = inputs.len();
+        let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+        let mut padded = inputs;
+        padded.resize(size, *padded.first().unwrap());
+        let packed = pack_values(&padded);
+        let diff = blake_round::generic_simd_diff(
+            packed, n_rows, &sigma, &mem_addr, &mem_big, &rc725, &blake_g,
+        );
+        let sub_flat = sub_flat_from_diff(&diff.orig_sub, size);
+
+        let d725 = range_check_7_2_5::ClaimGenerator::new(preproc.clone());
+        let h725 = range_check_7_2_5::ClaimGenerator::new(preproc.clone());
+        let n = run_count_feed_paths(
+            blake_round::SUB_FEED_LAYOUT,
+            &sub_flat,
+            size,
+            |f| match f {
+                "range_check_7_2_5_state" => rc725.input_to_row_lut(),
+                other => panic!("unexpected LUT family {other}"),
+            },
+            |f, c| match f {
+                "range_check_7_2_5_state" => d725.add_count_tables(c),
+                other => panic!("unexpected count family {other}"),
+            },
+            |f, rel, t| match f {
+                "range_check_7_2_5_state" => {
+                    h725.add_input(&[M31(t[0]), M31(t[1]), M31(t[2])], rel as usize)
+                }
+                other => panic!("unexpected state {other}"),
+            },
+        );
+        assert!(n > 0);
+        assert_mults_eq(
+            "blake rc_7_2_5",
+            d725.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+            h725.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
+        );
+        eprintln!("count gate [blake_round]: PASS ({n} descriptors)");
+    }
+}

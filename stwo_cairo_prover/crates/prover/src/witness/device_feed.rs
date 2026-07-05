@@ -133,6 +133,12 @@ pub fn host_feed_counts(
                 key = (key << e[2 + i]) | u64::from(sub_flat[(word_base + i) * n_rows + row]);
             }
             let table_size = e[8] as usize;
+            // Key domain check BEFORE any LUT deref — mirrors the kernel; an
+            // out-of-width tuple (impossible on a valid trace, where the host
+            // feed would panic) is dropped, never an OOB access.
+            if key as usize >= table_size {
+                continue;
+            }
             let idx = if e[9] == WFC_NO_LUT {
                 key as usize
             } else {
