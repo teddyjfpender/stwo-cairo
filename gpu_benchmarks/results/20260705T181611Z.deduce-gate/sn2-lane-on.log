@@ -1,0 +1,10 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=512; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; export PROVER=/workspace/stwo-cairo/stwo_cairo_prover; STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_WITNESS_JIT_MAX_INSTRS=6000 \
+STWO_DUMP_PROOF=$OUT/deduce_on.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 1 --reuse-input 2> $OUT/deduce_on.err | tail -4
+grep -E 'jit_prove\[pedersen_aggregator_window_bits_18\]: device witness' $OUT/deduce_on.err
+grep -E 'jit_prove\[blake_round\]: device witness' $OUT/deduce_on.err
+grep -E 'falling back' $OUT/deduce_on.err | head -5 || true
+test -s $OUT/deduce_on.proof && echo ON_PROOF_OK
+--8<-- output --8<--
+Connection to 38.143.35.131 closed by remote host.

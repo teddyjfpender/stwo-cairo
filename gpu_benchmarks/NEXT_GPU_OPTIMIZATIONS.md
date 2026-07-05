@@ -406,3 +406,53 @@ directive).
 
 Toolchain note: the prover lib-test crate requires `RUST_MIN_STACK=16777216`
 to COMPILE (rustc SIGBUS below; the emitted components keep growing).
+
+### ROUND-28 pod session results (2026-07-05, H100 NVL, SN_PIE_2 — measured)
+
+**Validated on hardware, first proofs of the full program:**
+- Oracle legs (deduce kinds 2+3): PASS — the fp256/EC device functions and the
+  borrowed host pedersen table are byte-exact on hardware.
+- Whole-kernel device gates: blake_round PASS; pedersen_aggregator PASS after
+  the NVRTC wall (below) — every committed column, lookup word and sub word
+  byte-identical to the host writer.
+- Lane-off baseline prove: PASS after the C2 tail fix (below) — the fused
+  Merkle tail is live in the default commit path. Warm 17.49 s / 0.441 useful
+  MHz (NOTE: this manifest measures the deduce lane in ISOLATION — no
+  ASYNC_SPINE / PIPELINED_COMMIT — so it is not comparable to the composed
+  15.53 s round-13 number).
+- Lane-on prove (aggregator+blake, cap 6000): engaged, PASS, and
+  **whole-proof byte-identity vs lane-off: PASS** — the program's core
+  soundness gate on a real Starknet OS PIE proof.
+- Lane-on perf (same partial config): warm 17.86 s — the two lanes alone do
+  not buy wall time yet; the blake device witness costs ~2.0 s where the host
+  span was 0.93 s (input-column upload + JIT witness at log 20). The win
+  thesis rests on the DAG (feeds+edges deleting host work), not on lane
+  substitution alone — consistent with §5's ranking, unproven until the
+  full-DAG perf numbers land.
+- DAG prove: blake + aggregator + w18 + cube_252 all engaged with device
+  count feeds (1/1/3/2 relation families) and both edge stashes; proof
+  completed. partial_ec_mul_generic silently fell back — root-caused and
+  fixed (below); its re-validation did not run (session cut short).
+
+**Three hardware-only walls found and fixed (none reachable by local gates):**
+1. NVRTC JIT-mode compatibility: the fp256 embed chain was offline-nvcc-only —
+   24 errors (pure-__host__ fns, one-arg static_asserts under --std=c++14,
+   UINT32_MAX/curandState, a compound literal). Fixed offline-invariant
+   (!__CUDACC_RTC__ guards + RTC-only prelude macros); probe-validated via a
+   30-line libnvrtc harness before any Rust rebuild. stwo 90591283.
+2. C2 tail kernel launch: 1024-thread block exceeds the SM register file with
+   the inlined blake2s → launch failed in the BASELINE prove. 256-thread
+   bounded block (scheduling-only). stwo 6cbb4da2.
+3. NEEDS_PEDERSEN_TABLE semantics: the generic lane runs BEFORE the aggregator;
+   its felt-deduce kernel embeds fp256 (module declares the table globals) and
+   the fail-closed load fill rejected it — silent fallback + ~30 s wasted NVRTC.
+   The flag now tracks the EMBED, not table READS (generic + cube_252 = true),
+   and the shape pin asserts flag == embeds-fp256 for all five lanes.
+   cairo e7211293.
+
+**Session cut short: RunPod balance exhausted mid-run** (pod terminated by the
+provider; volumeless /workspace lost — next session pays full re-sync/build).
+Remaining pod items, in order: re-run deduce_gate.toml end-to-end (generic
+engagement + DAG byte-identity + cubin-2048 A/B + sustained-DAG), then ONE
+composed-config run (ASYNC_SPINE + PIPELINED_COMMIT + STREAM_FANOUT + full DAG
++ 2048 cubin, identity-gated) for the honest current-best number.
