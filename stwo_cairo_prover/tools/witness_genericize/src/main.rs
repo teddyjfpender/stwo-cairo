@@ -668,6 +668,18 @@ fn closure_binders(
     Some((row_index, names))
 }
 
+/// Whether the module's `InteractionClaimGenerator` carries a real-row count
+/// (`n_rows`) alongside `log_size` + `lookup_data` — selects the accessor
+/// macro's ctor variant.
+fn igen_has_n_rows(file: &syn::File) -> bool {
+    file.items.iter().any(|it| {
+        matches!(it,
+            Item::Struct(s) if s.ident == "InteractionClaimGenerator"
+                && matches!(&s.fields, syn::Fields::Named(f)
+                    if f.named.iter().any(|fld| fld.ident.as_ref().is_some_and(|i| i == "n_rows"))))
+    })
+}
+
 fn parse_lookup_data(file: &syn::File) -> Result<Vec<LookupField>, Skip> {
     let st = file.items.iter().find_map(|it| match it {
         Item::Struct(s) if s.ident == "LookupData" => Some(s),
@@ -2955,13 +2967,42 @@ fn build_marked_block(
     }));
     seg.push(String::new());
 
-    // 5. Test-only surface: flats + GenericSimdDiff + generic_simd_diff.
+    // 5. Lookup-flat accessors (the witness-JIT prove / device-interaction
+    // seam): JIT_LOOKUP_FIELDS + interaction_gen_from_flat_lookup_words, field
+    // list in LookupData declaration order; ctor variant per the module's
+    // InteractionClaimGenerator shape.
+    {
+        let mut inv = String::new();
+        inv.push_str("crate::jit_lookup_accessor! {\n");
+        if igen_has_n_rows(file) {
+            inv.push_str(&format!("    with_n_rows {};\n", fa.n_lookup_words));
+        } else {
+            inv.push_str(&format!("    {};\n", fa.n_lookup_words));
+        }
+        for f in &lw.lookup_fields {
+            if f.scalar {
+                inv.push_str(&format!("    {}: scalar,\n", f.name));
+            } else {
+                inv.push_str(&format!("    {}: {},\n", f.name, f.width));
+            }
+        }
+        inv.push('}');
+        seg.push(inv);
+        seg.push(String::new());
+    }
+
+    // 6. Test-only surface: flats + GenericSimdDiff + generic_simd_diff.
     seg.push(
         "// ---- Test-only surface for the byte-equality gate ---------------------------------"
             .to_string(),
     );
     seg.push(String::new());
     seg.push(render(&lookup_flat_tokens(lw)));
+    seg.push(String::new());
+    seg.push(
+        "#[cfg(test)]\npub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator)          -> Vec<Vec<PackedM31>> {\n    lookup_data_flat(&ig.lookup_data)\n}"
+            .to_string(),
+    );
     seg.push(String::new());
     seg.push(render(&sub_flat_tokens(lw)));
     seg.push(String::new());

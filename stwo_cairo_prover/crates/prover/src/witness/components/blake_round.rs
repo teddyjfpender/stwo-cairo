@@ -5458,6 +5458,69 @@ pub(crate) fn record_blake_round() -> RecordingOutput {
     eval.finish()
 }
 
+crate::jit_lookup_accessor! {
+    with_n_rows 850;
+    blake_g_0: 21,
+    blake_g_1: 21,
+    blake_g_2: 21,
+    blake_g_3: 21,
+    blake_g_4: 21,
+    blake_g_5: 21,
+    blake_g_6: 21,
+    blake_g_7: 21,
+    blake_round_0: 36,
+    blake_round_1: 36,
+    blake_round_sigma_0: 18,
+    memory_address_to_id_0: 3,
+    memory_address_to_id_1: 3,
+    memory_address_to_id_2: 3,
+    memory_address_to_id_3: 3,
+    memory_address_to_id_4: 3,
+    memory_address_to_id_5: 3,
+    memory_address_to_id_6: 3,
+    memory_address_to_id_7: 3,
+    memory_address_to_id_8: 3,
+    memory_address_to_id_9: 3,
+    memory_address_to_id_10: 3,
+    memory_address_to_id_11: 3,
+    memory_address_to_id_12: 3,
+    memory_address_to_id_13: 3,
+    memory_address_to_id_14: 3,
+    memory_address_to_id_15: 3,
+    memory_id_to_big_0: 30,
+    memory_id_to_big_1: 30,
+    memory_id_to_big_2: 30,
+    memory_id_to_big_3: 30,
+    memory_id_to_big_4: 30,
+    memory_id_to_big_5: 30,
+    memory_id_to_big_6: 30,
+    memory_id_to_big_7: 30,
+    memory_id_to_big_8: 30,
+    memory_id_to_big_9: 30,
+    memory_id_to_big_10: 30,
+    memory_id_to_big_11: 30,
+    memory_id_to_big_12: 30,
+    memory_id_to_big_13: 30,
+    memory_id_to_big_14: 30,
+    memory_id_to_big_15: 30,
+    range_check_7_2_5_0: 4,
+    range_check_7_2_5_1: 4,
+    range_check_7_2_5_2: 4,
+    range_check_7_2_5_3: 4,
+    range_check_7_2_5_4: 4,
+    range_check_7_2_5_5: 4,
+    range_check_7_2_5_6: 4,
+    range_check_7_2_5_7: 4,
+    range_check_7_2_5_8: 4,
+    range_check_7_2_5_9: 4,
+    range_check_7_2_5_10: 4,
+    range_check_7_2_5_11: 4,
+    range_check_7_2_5_12: 4,
+    range_check_7_2_5_13: 4,
+    range_check_7_2_5_14: 4,
+    range_check_7_2_5_15: 4,
+}
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
@@ -5586,6 +5649,11 @@ fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
         ld.range_check_7_2_5_14.iter().flatten().copied().collect(),
         ld.range_check_7_2_5_15.iter().flatten().copied().collect(),
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
 }
 
 fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
@@ -6446,73 +6514,7 @@ impl InteractionClaimGenerator {
 // ---- Witness-JIT prove-lane accessors (builtin slot layout; consumed by
 // ---- `jit_builtin_prove_backend.rs`; parity-fenced in `differential_test.rs`) ------
 
-crate::jit_lookup_accessor! {
-    with_n_rows 850;
-    blake_g_0: 21,
-    blake_g_1: 21,
-    blake_g_2: 21,
-    blake_g_3: 21,
-    blake_g_4: 21,
-    blake_g_5: 21,
-    blake_g_6: 21,
-    blake_g_7: 21,
-    blake_round_0: 36,
-    blake_round_1: 36,
-    blake_round_sigma_0: 18,
-    memory_address_to_id_0: 3,
-    memory_address_to_id_1: 3,
-    memory_address_to_id_2: 3,
-    memory_address_to_id_3: 3,
-    memory_address_to_id_4: 3,
-    memory_address_to_id_5: 3,
-    memory_address_to_id_6: 3,
-    memory_address_to_id_7: 3,
-    memory_address_to_id_8: 3,
-    memory_address_to_id_9: 3,
-    memory_address_to_id_10: 3,
-    memory_address_to_id_11: 3,
-    memory_address_to_id_12: 3,
-    memory_address_to_id_13: 3,
-    memory_address_to_id_14: 3,
-    memory_address_to_id_15: 3,
-    memory_id_to_big_0: 30,
-    memory_id_to_big_1: 30,
-    memory_id_to_big_2: 30,
-    memory_id_to_big_3: 30,
-    memory_id_to_big_4: 30,
-    memory_id_to_big_5: 30,
-    memory_id_to_big_6: 30,
-    memory_id_to_big_7: 30,
-    memory_id_to_big_8: 30,
-    memory_id_to_big_9: 30,
-    memory_id_to_big_10: 30,
-    memory_id_to_big_11: 30,
-    memory_id_to_big_12: 30,
-    memory_id_to_big_13: 30,
-    memory_id_to_big_14: 30,
-    memory_id_to_big_15: 30,
-    range_check_7_2_5_0: 4,
-    range_check_7_2_5_1: 4,
-    range_check_7_2_5_2: 4,
-    range_check_7_2_5_3: 4,
-    range_check_7_2_5_4: 4,
-    range_check_7_2_5_5: 4,
-    range_check_7_2_5_6: 4,
-    range_check_7_2_5_7: 4,
-    range_check_7_2_5_8: 4,
-    range_check_7_2_5_9: 4,
-    range_check_7_2_5_10: 4,
-    range_check_7_2_5_11: 4,
-    range_check_7_2_5_12: 4,
-    range_check_7_2_5_13: 4,
-    range_check_7_2_5_14: 4,
-    range_check_7_2_5_15: 4,
-}
 
-#[cfg(test)]
-pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
-    lookup_data_flat(&ig.lookup_data)
-}
 
 /// Feed the decoded sub-inputs into the downstream states — the same entry
 /// points, per-relation order (sigma → rc725 ×16 → addr ×16 → mem_big ×16 →

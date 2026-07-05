@@ -4910,6 +4910,49 @@ pub(crate) fn record_mul_opcode() -> RecordingOutput {
     eval.finish()
 }
 
+crate::jit_lookup_accessor! {
+    173;
+    verify_instruction_0: 8,
+    memory_address_to_id_1: 3,
+    memory_id_to_big_2: 30,
+    memory_address_to_id_3: 3,
+    memory_id_to_big_4: 30,
+    memory_address_to_id_5: 3,
+    memory_id_to_big_6: 30,
+    range_check_20_7: 2,
+    range_check_20_b_8: 2,
+    range_check_20_c_9: 2,
+    range_check_20_d_10: 2,
+    range_check_20_e_11: 2,
+    range_check_20_f_12: 2,
+    range_check_20_g_13: 2,
+    range_check_20_h_14: 2,
+    range_check_20_15: 2,
+    range_check_20_b_16: 2,
+    range_check_20_c_17: 2,
+    range_check_20_d_18: 2,
+    range_check_20_e_19: 2,
+    range_check_20_f_20: 2,
+    range_check_20_g_21: 2,
+    range_check_20_h_22: 2,
+    range_check_20_23: 2,
+    range_check_20_b_24: 2,
+    range_check_20_c_25: 2,
+    range_check_20_d_26: 2,
+    range_check_20_e_27: 2,
+    range_check_20_f_28: 2,
+    range_check_20_g_29: 2,
+    range_check_20_h_30: 2,
+    range_check_20_31: 2,
+    range_check_20_b_32: 2,
+    range_check_20_c_33: 2,
+    range_check_20_d_34: 2,
+    opcodes_35: 4,
+    opcodes_36: 4,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
@@ -4966,6 +5009,11 @@ fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
         ld.mults_0.clone(),
         ld.mults_1.clone(),
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
 }
 
 fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {

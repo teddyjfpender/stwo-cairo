@@ -1633,6 +1633,21 @@ pub(crate) fn record_add_opcode() -> RecordingOutput {
     eval.finish()
 }
 
+crate::jit_lookup_accessor! {
+    117;
+    verify_instruction_0: 8,
+    memory_address_to_id_1: 3,
+    memory_id_to_big_2: 30,
+    memory_address_to_id_3: 3,
+    memory_id_to_big_4: 30,
+    memory_address_to_id_5: 3,
+    memory_id_to_big_6: 30,
+    opcodes_7: 4,
+    opcodes_8: 4,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
@@ -1661,6 +1676,11 @@ fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
         ld.mults_0.clone(),
         ld.mults_1.clone(),
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
 }
 
 fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
@@ -1904,12 +1924,6 @@ impl InteractionClaimGenerator {
 // indices exactly (declaration order); both are regression-fenced by
 // `jit_prove_backend::tests`. ---
 
-/// Flatten an accessor-built `InteractionClaimGenerator`'s private `LookupData` for
-/// byte-comparison against `GenericSimdDiff::orig_lookup` (the prove-accessor gate).
-#[cfg(test)]
-pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
-    lookup_data_flat(&ig.lookup_data)
-}
 
 /// PROVE-LANE SHADOW DIFF (debug instrument, `STWO_JIT_PROVE_SHADOW=1`): run the
 /// host SIMD writer — a PURE read of the states, no feeding — beside the device
@@ -2013,90 +2027,6 @@ pub(crate) fn shadow_compare_against_host(
     );
 }
 
-/// Lookup field list (name, width) in `LookupData` declaration order — the §6a
-/// descriptor builder's input (trailing two scalars are `mults_0`/`mults_1`).
-pub(crate) const JIT_LOOKUP_FIELDS: &[(&str, usize)] = &[
-    ("verify_instruction_0", 8),
-    ("memory_address_to_id_1", 3),
-    ("memory_id_to_big_2", 30),
-    ("memory_address_to_id_3", 3),
-    ("memory_id_to_big_4", 30),
-    ("memory_address_to_id_5", 3),
-    ("memory_id_to_big_6", 30),
-    ("opcodes_7", 4),
-    ("opcodes_8", 4),
-    ("mults_0", 1),
-    ("mults_1", 1),
-];
-
-/// Lookup-word field sizes in `LookupData` declaration order; sum = N_LOOKUP_WORDS.
-pub(crate) const JIT_LOOKUP_FIELD_SIZES: [usize; 11] = [8, 3, 30, 3, 30, 3, 30, 4, 4, 1, 1];
-
-/// Rebuild the interaction generator from the device kernel's flat lookup words
-/// (word-major: `words[w * n_rows + r]`, `n_rows` a multiple of `N_LANES` — the
-/// codegen store layout, so each packed lane group is one contiguous 64B run).
-pub(crate) fn interaction_gen_from_flat_lookup_words(
-    log_size: u32,
-    words: &[u32],
-    n_rows: usize,
-) -> InteractionClaimGenerator {
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    use stwo::prover::backend::simd::m31::{PackedM31, N_LANES};
-    let n_vec = n_rows / N_LANES;
-    assert_eq!(words.len(), N_LOOKUP_WORDS * n_rows);
-    let packed_field = |off: usize, k: usize, vi: usize| {
-        PackedM31::from_array(std::array::from_fn(|l| {
-            M31::from_u32_unchecked(words[(off + k) * n_rows + vi * N_LANES + l])
-        }))
-    };
-    fn field<const K: usize>(
-        n_vec: usize,
-        f: impl Fn(usize, usize) -> PackedM31 + Sync,
-    ) -> Vec<[PackedM31; K]> {
-        (0..n_vec)
-            .into_par_iter()
-            .map(|vi| std::array::from_fn(|k| f(k, vi)))
-            .collect()
-    }
-    let mut off = 0usize;
-    macro_rules! take {
-        ($k:expr) => {{
-            let o = off;
-            off += $k;
-            field::<$k>(n_vec, |k, vi| packed_field(o, k, vi))
-        }};
-    }
-    let verify_instruction_0 = take!(8);
-    let memory_address_to_id_1 = take!(3);
-    let memory_id_to_big_2 = take!(30);
-    let memory_address_to_id_3 = take!(3);
-    let memory_id_to_big_4 = take!(30);
-    let memory_address_to_id_5 = take!(3);
-    let memory_id_to_big_6 = take!(30);
-    let opcodes_7 = take!(4);
-    let opcodes_8 = take!(4);
-    let mults_0: Vec<PackedM31> = (0..n_vec).map(|vi| packed_field(off, 0, vi)).collect();
-    off += 1;
-    let mults_1: Vec<PackedM31> = (0..n_vec).map(|vi| packed_field(off, 0, vi)).collect();
-    off += 1;
-    assert_eq!(off, N_LOOKUP_WORDS);
-    InteractionClaimGenerator {
-        log_size,
-        lookup_data: LookupData {
-            verify_instruction_0,
-            memory_address_to_id_1,
-            memory_id_to_big_2,
-            memory_address_to_id_3,
-            memory_id_to_big_4,
-            memory_address_to_id_5,
-            memory_id_to_big_6,
-            opcodes_7,
-            opcodes_8,
-            mults_0,
-            mults_1,
-        },
-    }
-}
 
 /// The sub-component inputs decoded from the device kernel's flat sub-input words
 /// (word-major, N_SUB_INPUT_WORDS per row). Word order mirrors the emitted

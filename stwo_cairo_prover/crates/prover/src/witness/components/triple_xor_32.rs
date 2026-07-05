@@ -759,6 +759,21 @@ pub(crate) fn record_triple_xor_32() -> RecordingOutput {
     eval.finish()
 }
 
+crate::jit_lookup_accessor! {
+    43;
+    verify_bitwise_xor_8_0: 4,
+    verify_bitwise_xor_8_1: 4,
+    verify_bitwise_xor_8_2: 4,
+    verify_bitwise_xor_8_3: 4,
+    verify_bitwise_xor_8_b_4: 4,
+    verify_bitwise_xor_8_b_5: 4,
+    verify_bitwise_xor_8_b_6: 4,
+    verify_bitwise_xor_8_b_7: 4,
+    triple_xor_32_8: 9,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
@@ -807,6 +822,11 @@ fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
         ld.mults_0.clone(),
         ld.mults_1.clone(),
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
 }
 
 fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {

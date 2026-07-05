@@ -792,6 +792,17 @@ pub(crate) fn record_jump_opcode_abs() -> RecordingOutput {
     eval.finish()
 }
 
+crate::jit_lookup_accessor! {
+    51;
+    verify_instruction_0: 8,
+    memory_address_to_id_1: 3,
+    memory_id_to_big_2: 30,
+    opcodes_3: 4,
+    opcodes_4: 4,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
@@ -808,6 +819,11 @@ fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
         ld.mults_0.clone(),
         ld.mults_1.clone(),
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
 }
 
 fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
@@ -996,21 +1012,6 @@ impl InteractionClaimGenerator {
 // --- witness-JIT prove-lane accessors (marked additive; layout mirrors LookupData /
 // the emitted sub-word order; fenced by the prove-accessor parity gate) ---------------
 
-/// Flatten an accessor-built generator's `LookupData` for the parity gate.
-#[cfg(test)]
-pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
-    lookup_data_flat(&ig.lookup_data)
-}
 
-crate::jit_lookup_accessor! {
-    N_LOOKUP_WORDS;
-    verify_instruction_0: 8,
-    memory_address_to_id_1: 3,
-    memory_id_to_big_2: 30,
-    opcodes_3: 4,
-    opcodes_4: 4,
-    mults_0: scalar,
-    mults_1: scalar,
-}
 
 crate::jit_sub_accessors!(N_SUB_INPUT_WORDS, n_addr = 1, n_id = 1);

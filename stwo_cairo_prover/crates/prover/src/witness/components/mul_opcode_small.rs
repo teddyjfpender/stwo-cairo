@@ -1472,6 +1472,24 @@ pub(crate) fn record_mul_opcode_small() -> RecordingOutput {
     eval.finish()
 }
 
+crate::jit_lookup_accessor! {
+    123;
+    verify_instruction_0: 8,
+    memory_address_to_id_1: 3,
+    memory_id_to_big_2: 30,
+    memory_address_to_id_3: 3,
+    memory_id_to_big_4: 30,
+    memory_address_to_id_5: 3,
+    memory_id_to_big_6: 30,
+    range_check_11_7: 2,
+    range_check_11_8: 2,
+    range_check_11_9: 2,
+    opcodes_10: 4,
+    opcodes_11: 4,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
@@ -1503,6 +1521,11 @@ fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
         ld.mults_0.clone(),
         ld.mults_1.clone(),
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
 }
 
 fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {

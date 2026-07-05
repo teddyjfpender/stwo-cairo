@@ -1574,6 +1574,29 @@ pub(crate) fn record_blake_g() -> RecordingOutput {
     eval.finish()
 }
 
+crate::jit_lookup_accessor! {
+    87;
+    verify_bitwise_xor_8_0: 4,
+    verify_bitwise_xor_8_1: 4,
+    verify_bitwise_xor_8_b_2: 4,
+    verify_bitwise_xor_8_b_3: 4,
+    verify_bitwise_xor_12_4: 4,
+    verify_bitwise_xor_4_5: 4,
+    verify_bitwise_xor_12_6: 4,
+    verify_bitwise_xor_4_7: 4,
+    verify_bitwise_xor_8_8: 4,
+    verify_bitwise_xor_8_9: 4,
+    verify_bitwise_xor_8_b_10: 4,
+    verify_bitwise_xor_8_b_11: 4,
+    verify_bitwise_xor_7_12: 4,
+    verify_bitwise_xor_9_13: 4,
+    verify_bitwise_xor_7_14: 4,
+    verify_bitwise_xor_9_15: 4,
+    blake_g_16: 21,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
@@ -1662,6 +1685,11 @@ fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
         ld.mults_0.clone(),
         ld.mults_1.clone(),
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
 }
 
 fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {

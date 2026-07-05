@@ -655,8 +655,8 @@ fn range_check_252_width_27_row_body<E: WitnessEval>(eval: &mut E) {
 }
 
 /// Generic SIMD driver: same allocation as `write_trace_simd`, but each row runs
-/// `range_check_252_width_27_row_body` on a per-row `SimdWitnessEval`, then reconstructs the
-/// concrete `LookupData` / `SubComponentInputs` from the eval's flat scratch. Module-private (it
+/// `range_check_252_width_27_row_body` on a per-row `SimdWitnessEval`, then reconstructs the concrete
+/// `LookupData` / `SubComponentInputs` from the eval's flat scratch. Module-private (it
 /// returns the module-private `LookupData` / `SubComponentInputs`; wider visibility would
 /// be E0446 and force a change OUTSIDE this block). External callers use the `pub(crate)`
 /// `write_trace_generic` method or the `#[cfg(test)]` `generic_simd_diff` harness.
@@ -852,6 +852,27 @@ pub(crate) fn record_range_check_252_width_27() -> RecordingOutput {
     eval.finish()
 }
 
+crate::jit_lookup_accessor! {
+    46;
+    range_check_9_9_0: 3,
+    range_check_18_1: 2,
+    range_check_18_2: 2,
+    range_check_9_9_b_3: 3,
+    range_check_18_b_4: 2,
+    range_check_18_5: 2,
+    range_check_9_9_c_6: 3,
+    range_check_18_7: 2,
+    range_check_18_8: 2,
+    range_check_9_9_d_9: 3,
+    range_check_18_b_10: 2,
+    range_check_18_11: 2,
+    range_check_9_9_e_12: 3,
+    range_check_18_13: 2,
+    range_check_252_width_27_14: 11,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+
 // ---- Test-only surface for the byte-equality gate ---------------------------------
 
 fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
@@ -878,6 +899,11 @@ fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
         ld.mults_0.clone(),
         ld.mults_1.clone(),
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    lookup_data_flat(&ig.lookup_data)
 }
 
 fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
