@@ -2595,3 +2595,165 @@ fn poseidon_family_recording_poison_manifests() {
         r.program.n_instrs()
     );
 }
+
+// ---------------- B2 count-feed gate: descriptors + keying vs the consumers ---------
+
+/// THE COUNT GATE: the device-feed path (SUB_FEED_LAYOUT -> descriptors ->
+/// fold/LUT -> count tables -> add_count_tables merge) must produce EXACTLY the
+/// multiplicities the consumers' own `add_input` feeds produce — on the real
+/// w18 fixture, over every padded row, for every count relation the component
+/// touches (points table, rc_9_9 x36 instances, rc_20 x24). Runs the pure-Rust
+/// kernel mirror, so a keying/layout bug is caught with no hardware.
+#[test]
+fn partial_ec_mul_w18_count_feed_matches_consumer_feeds() {
+    use crate::witness::components::{
+        partial_ec_mul_window_bits_18 as m, pedersen_points_table_window_bits_18, range_check_20,
+        range_check_9_9,
+    };
+    use crate::witness::device_feed::{build_feed_descriptors, host_feed_counts, COUNT_RELATIONS};
+
+    let (packed, n_rows, pts, rc99, rc20, _mem) = w18_fixture();
+    let diff = m::generic_simd_diff(packed.clone(), n_rows, &pts, &rc99, &rc20);
+    let n_padded = packed.len() * N_LANES;
+    let n_packed_rows = n_padded / N_LANES;
+
+    // Word-major sub flats from the host writer's own SubComponentInputs.
+    let n_sub: usize = diff.orig_sub.iter().map(|f| f.len() / n_packed_rows).sum();
+    let mut sub_flat = vec![0u32; n_sub * n_padded];
+    let mut w = 0usize;
+    for field in diff.orig_sub.iter() {
+        let width = field.len() / n_packed_rows;
+        for k in 0..width {
+            for r in 0..n_padded {
+                sub_flat[w * n_padded + r] =
+                    field[(r / N_LANES) * width + k].as_array()[r % N_LANES];
+            }
+            w += 1;
+        }
+    }
+
+    // Device path (host mirror): descriptors from the emitted layout + registry.
+    let (descs, lut_slots, counts_slots) =
+        build_feed_descriptors(m::SUB_FEED_LAYOUT, COUNT_RELATIONS);
+    assert!(
+        !descs.is_empty(),
+        "w18 must have count-relation feed descriptors"
+    );
+    let luts: Vec<Vec<u32>> = lut_slots
+        .iter()
+        .map(|s| match *s {
+            "range_check_9_9_state" => rc99.input_to_row_lut(),
+            other => panic!("unexpected LUT slot {other}"),
+        })
+        .collect();
+    let mut counts: Vec<Vec<u32>> = counts_slots
+        .iter()
+        .map(|s| {
+            let rel = COUNT_RELATIONS
+                .iter()
+                .find(|r| r.state_param == *s)
+                .unwrap();
+            vec![0u32; rel.n_relations * rel.table_size]
+        })
+        .collect();
+    host_feed_counts(&sub_flat, n_padded, &descs, &luts, &mut counts);
+
+    // Merge into FRESH consumer states...
+    let preproc = Arc::new(PreProcessedTrace::canonical_without_pedersen());
+    let device_pts = pedersen_points_table_window_bits_18::ClaimGenerator::new(preproc.clone());
+    let device_rc99 = range_check_9_9::ClaimGenerator::new(preproc.clone());
+    let device_rc20 = range_check_20::ClaimGenerator::new(preproc.clone());
+    for (slot, c) in counts_slots.iter().zip(&counts) {
+        match *slot {
+            "pedersen_points_table_window_bits_18_state" => device_pts.add_count_tables(c),
+            "range_check_9_9_state" => device_rc99.add_count_tables(c),
+            "range_check_20_state" => device_rc20.add_count_tables(c),
+            other => panic!("unexpected counts slot {other}"),
+        }
+    }
+
+    // ...and compare against states fed by the consumers' OWN add_input calls
+    // over the same sub tuples (the host writer's exact feed semantics).
+    let host_pts = pedersen_points_table_window_bits_18::ClaimGenerator::new(preproc.clone());
+    let host_rc99 = range_check_9_9::ClaimGenerator::new(preproc.clone());
+    let host_rc20 = range_check_20::ClaimGenerator::new(preproc);
+    for &(_f, _i, state, rel, base, words) in m::SUB_FEED_LAYOUT {
+        for r in 0..n_padded {
+            let word = |k: usize| sub_flat[(base + k) * n_padded + r];
+            match state {
+                "pedersen_points_table_window_bits_18_state" => {
+                    use crate::witness::utils::AddInputs;
+                    host_pts.add_input(&[M31(word(0))], rel as usize);
+                }
+                "range_check_9_9_state" => {
+                    use crate::witness::utils::AddInputs;
+                    host_rc99.add_input(&[M31(word(0)), M31(word(1))], rel as usize);
+                }
+                "range_check_20_state" => {
+                    use crate::witness::utils::AddInputs;
+                    host_rc20.add_input(&[M31(word(0))], rel as usize);
+                }
+                other => panic!("unexpected state {other}"),
+            }
+            let _ = words;
+        }
+    }
+
+    // Byte-compare every multiplicity column.
+    let cmp = |name: &str, a: Vec<_>, b: Vec<_>| {
+        let (a, b): (Vec<Vec<PackedM31>>, Vec<Vec<PackedM31>>) = (a, b);
+        assert_eq!(a.len(), b.len(), "{name} relation count");
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            for (v, (p, q)) in x.iter().zip(y).enumerate() {
+                assert_eq!(
+                    p.to_array(),
+                    q.to_array(),
+                    "{name} relation {i} packed row {v}"
+                );
+            }
+        }
+    };
+    cmp(
+        "points_table",
+        device_pts
+            .mults
+            .into_iter()
+            .map(|m| m.into_simd_vec())
+            .collect(),
+        host_pts
+            .mults
+            .into_iter()
+            .map(|m| m.into_simd_vec())
+            .collect(),
+    );
+    cmp(
+        "rc_9_9",
+        device_rc99
+            .mults
+            .into_iter()
+            .map(|m| m.into_simd_vec())
+            .collect(),
+        host_rc99
+            .mults
+            .into_iter()
+            .map(|m| m.into_simd_vec())
+            .collect(),
+    );
+    cmp(
+        "rc_20",
+        device_rc20
+            .mults
+            .into_iter()
+            .map(|m| m.into_simd_vec())
+            .collect(),
+        host_rc20
+            .mults
+            .into_iter()
+            .map(|m| m.into_simd_vec())
+            .collect(),
+    );
+    eprintln!(
+        "count gate [partial_ec_mul_window_bits_18]: PASS ({} descriptors, {n_padded} rows)",
+        descs.len() / crate::witness::device_feed::WFC_DESC_STRIDE
+    );
+}

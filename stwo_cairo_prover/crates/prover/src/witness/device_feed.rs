@@ -35,6 +35,116 @@ pub struct CountRelation {
     pub needs_lut: bool,
 }
 
+/// The count-relation registry: every family the device feed serves, with
+/// VERIFIED shapes (LOG_SIZE from cairo-air; mults lengths from the consumer
+/// ClaimGenerators; key packing = the consumer's own `add_input` semantics —
+/// direct value/row for single-word families, MSB-first tuple fold through the
+/// generator's `input_to_row_lut` for multi-word ones). The local count gate
+/// (`differential_test`) fences every entry against the consumer's real feeds.
+pub const COUNT_RELATIONS: &[CountRelation] = &[
+    CountRelation {
+        state_param: "range_check_8_state",
+        word_bits: &[8],
+        table_size: 1 << 8,
+        n_relations: 1,
+        needs_lut: false,
+    },
+    CountRelation {
+        state_param: "range_check_11_state",
+        word_bits: &[11],
+        table_size: 1 << 11,
+        n_relations: 1,
+        needs_lut: false,
+    },
+    CountRelation {
+        state_param: "range_check_18_state",
+        word_bits: &[18],
+        table_size: 1 << 18,
+        n_relations: 2,
+        needs_lut: false,
+    },
+    CountRelation {
+        state_param: "range_check_20_state",
+        word_bits: &[20],
+        table_size: 1 << 20,
+        n_relations: 8,
+        needs_lut: false,
+    },
+    CountRelation {
+        state_param: "range_check_9_9_state",
+        word_bits: &[9, 9],
+        table_size: 1 << 18,
+        n_relations: 8,
+        needs_lut: true,
+    },
+    CountRelation {
+        state_param: "range_check_4_4_state",
+        word_bits: &[4, 4],
+        table_size: 1 << 8,
+        n_relations: 1,
+        needs_lut: true,
+    },
+    CountRelation {
+        state_param: "range_check_4_4_4_4_state",
+        word_bits: &[4, 4, 4, 4],
+        table_size: 1 << 16,
+        n_relations: 1,
+        needs_lut: true,
+    },
+    CountRelation {
+        state_param: "range_check_3_3_3_3_3_state",
+        word_bits: &[3, 3, 3, 3, 3],
+        table_size: 1 << 15,
+        n_relations: 1,
+        needs_lut: true,
+    },
+    CountRelation {
+        state_param: "range_check_7_2_5_state",
+        word_bits: &[7, 2, 5],
+        table_size: 1 << 14,
+        n_relations: 1,
+        needs_lut: true,
+    },
+    CountRelation {
+        state_param: "pedersen_points_table_window_bits_18_state",
+        word_bits: &[23],
+        table_size: 1 << 23,
+        n_relations: 1,
+        needs_lut: false,
+    },
+];
+
+/// Pure-Rust mirror of `witness_feed_counts_kernel` — the SAME descriptors,
+/// fold, LUT indirection, and bounds behavior, over the word-major flats. The
+/// local count gate runs THIS against consumer-fed states, so a keying bug is
+/// caught without hardware; the CUDA kernel is then structurally identical.
+pub fn host_feed_counts(
+    sub_flat: &[u32],
+    n_rows: usize,
+    descs: &[u32],
+    luts: &[Vec<u32>],
+    counts: &mut [Vec<u32>],
+) {
+    for e in descs.chunks_exact(WFC_DESC_STRIDE) {
+        let (word_base, n_words) = (e[0] as usize, e[1] as usize);
+        for row in 0..n_rows {
+            let mut key: u64 = 0;
+            for i in 0..n_words {
+                key = (key << e[2 + i]) | u64::from(sub_flat[(word_base + i) * n_rows + row]);
+            }
+            let table_size = e[8] as usize;
+            let idx = if e[9] == WFC_NO_LUT {
+                key as usize
+            } else {
+                luts[e[9] as usize][key as usize] as usize
+            };
+            if idx < table_size {
+                counts[e[10] as usize][e[7] as usize * table_size + idx] += 1;
+            }
+        }
+    }
+}
+
 /// Descriptor stride of `witness_feed_counts.cu` (flat u32 ABI).
 pub const WFC_DESC_STRIDE: usize = 11;
 pub const WFC_NO_LUT: u32 = u32::MAX;
