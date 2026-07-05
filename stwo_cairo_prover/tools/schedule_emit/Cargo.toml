@@ -1,0 +1,21 @@
+# Standalone (NOT a workspace member) generator for the gpu-prover component
+# schedule table (GPU_RESIDENT_PROVER_DESIGN.md §17: schedule_emit). Parses the
+# transformer-emitted SUB_FEED_LAYOUT consts in the witness components plus the
+# COUNT_RELATIONS registry in device_feed.rs, and emits
+# crates/gpu-prover/src/schedule_table.rs — machine-written, --check drift-gated.
+# The empty [workspace] table makes this its own workspace root (same idiom as
+# tools/witness_genericize).
+[workspace]
+
+[package]
+name = "schedule_emit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "schedule_emit"
+path = "src/main.rs"
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits", "parsing"] }

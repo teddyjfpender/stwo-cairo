@@ -35,6 +35,12 @@ def _init_checks(stwo: Path, stwo_cairo: Path) -> list[tuple[str, list[str], Pat
             prover,
         ),
         (
+            "schedule_emit --check (generated schedule table drift gate)",
+            ["cargo", "run", "--manifest-path", "tools/schedule_emit/Cargo.toml",
+             "--", "--prover-root", ".", "--check"],
+            prover,
+        ),
+        (
             "gpu-prover lib tests (schedule/flags) + parity gate compile",
             ["cargo", "test", "-p", "stwo-cairo-gpu-prover", "--release", "--lib"],
             prover,

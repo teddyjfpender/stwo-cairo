@@ -19,6 +19,7 @@ pub mod flags;
 pub mod phases;
 pub mod prover;
 pub mod schedule;
+pub mod schedule_table;
 pub mod state;
 
 pub use prover::{CairoBackend, GpuCairoProver, GpuProverConfig};
