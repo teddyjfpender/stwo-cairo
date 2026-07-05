@@ -2,6 +2,7 @@
 members = [
     "crates/adapter",
     "crates/prover",
+    "crates/gpu-prover",
     "crates/cairo-serialize",
     "crates/cairo-serialize-derive",
     "crates/utils",
@@ -81,7 +82,7 @@ lto = true
 # See cairo-ci.yaml for an example command.
 [profile.witness-opt-1]
 inherits = "dev"
-package = { "stwo-cairo-prover" = { opt-level = 1 }, "stwo" = { opt-level = 1 } }
+package = { "stwo-cairo-prover" = { opt-level = 1 }, "stwo-cairo-gpu-prover" = { opt-level = 1 }, "stwo" = { opt-level = 1 } }
 
 [profile.adapter-release]
 inherits = "dev"

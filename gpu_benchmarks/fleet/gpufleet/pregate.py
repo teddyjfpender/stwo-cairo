@@ -35,8 +35,13 @@ def _init_checks(stwo: Path, stwo_cairo: Path) -> list[tuple[str, list[str], Pat
             prover,
         ),
         (
+            "gpu-prover lib tests (schedule/flags) + parity gate compile",
+            ["cargo", "test", "-p", "stwo-cairo-gpu-prover", "--release", "--lib"],
+            prover,
+        ),
+        (
             "gpu_bench compiles (pie-bench)",
-            ["cargo", "check", "--release", "-p", "stwo-cairo-prover",
+            ["cargo", "check", "--release", "-p", "stwo-cairo-gpu-prover",
              "--bin", "gpu_bench", "--features", "pie-bench"],
             prover,
         ),

@@ -200,7 +200,8 @@ gpu-prover/
   tests/             parity gates vs prove_cairo (per-phase + whole-proof)
 ```
 
-`gpu_bench` gains `--pipeline=gpu-native` so every manifest step can A/B the
+`gpu_bench` gains `--engine gpu-native|legacy` (`--pipeline` was already taken
+by pipelining depth) so every manifest step can A/B the
 two pipelines on the same PIE from day one. The full two-repo directory map,
 placement rules, code-design rules, the strict CUDA standard, the normative
 API signatures, and the codegen tool inventory are §13–§17.
@@ -554,7 +555,7 @@ M2 to cover the remaining milestones (U7).
 | M | contents | exit gate | expected composed SN_PIE_2 |
 |---|---|---|---|
 | **M0** | Finish round-28 validation: generic engagement, DAG byte-identity, cubin-2048 A/B, sustained-DAG, composed run | existing 13-step manifest green | honest current-best (~12–13s est.) |
-| **M1** | `gpu-prover` crate scaffold: GpuCairoProver + DeviceProofState + schedule table + phases calling the EXISTING lane/commit code; `--pipeline=gpu-native` A/B | **parity**: byte-identical to legacy pipeline + SIMD | = M0 (structure, not speed) |
+| **M1** | `gpu-prover` crate scaffold: GpuCairoProver + DeviceProofState + schedule table + phases calling the EXISTING lane/commit code; `--engine gpu-native` A/B (gpu_bench moves to the gpu-prover crate — the harness sits above both engines) | **parity**: byte-identical to legacy pipeline + SIMD | = M0 (structure, not speed) |
 | **M2** | Witness DAG owned by the scheduler: **schedule_emit** generates the ComponentNode table + COUNT_RELATIONS; all count feeds + edges via the schedule; §6a for builtins; memory/table components into the lane; stream ABI sweep via **ffi_emit** | milestone invariant + P1 (idle < 60%) + Schedule::validate in CI | **~9–10s** |
 | **M3** | AOT: **kernel_emit**, checked-in generated .cu, drift gate, fused -O3 composition; ffi_emit owns raw.rs/stubs.rs; DELETE NitrooZK lane | drift gate green; cold==warm (P5); `make codegen --check` in CI | **~7.5–8.5s** |
 | **M4** | Commit fusion: stage-fused NTT, twiddle regen, layer-pair, then hash-from-registers (review path); **VRAM diet lands here (U5)** — SN_PIE_2 proves on the 4090 | conformance + identity + P6 (BW-scaling) + 4090 fit | **~5–6s** H100; first real 4090 number |

@@ -12,10 +12,16 @@
 //!
 //! Usage:
 //!   gpu_bench --program path/to/compiled.json --iterations N --backend cuda|simd \
+//!             [--engine legacy|gpu-native] \
 //!             [--reps 3] [--pipeline <depth>] [--reuse-input] [--adapt-only]
 //!   gpu_bench --pie a.zip[,b.zip,...] [--pie-copies N] [--pie-mode aggregate|rotate] \
 //!             [--producers N] --backend cuda|simd ...
 //!             (requires building with --features pie-bench)
+//!
+//! `--engine` selects the prover pipeline: `legacy` (default — `prove_cairo`, the
+//! parity oracle) or `gpu-native` (`stwo-cairo-gpu-prover`, the pipeline of
+//! gpu_benchmarks/GPU_RESIDENT_PROVER_DESIGN.md §3). Proofs must be byte-identical
+//! across engines at every milestone (design §9); records carry an `engine` field.
 //!
 //! `--pie` ingests CairoPie zips via the simple bootloader (SHARP-style aggregation:
 //! all listed PIEs run as tasks of one bootloader execution; `--pie-copies` replicates
@@ -62,6 +68,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use cairo_air::verifier::verify_cairo;
+use cairo_air::CairoProof;
 use cairo_vm::cairo_run::{cairo_run_program, CairoRunConfig};
 use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::{
     BuiltinHintProcessor, HintFunc,
@@ -71,6 +78,7 @@ use cairo_vm::types::layout_name::LayoutName;
 use cairo_vm::types::program::Program;
 use cairo_vm::Felt252;
 use serde_json::json;
+use stwo::core::channel::MerkleChannel;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
@@ -78,8 +86,43 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo_cairo_adapter::adapter::adapt;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+use stwo_cairo_gpu_prover::{CairoBackend, GpuCairoProver, GpuProverConfig};
 use stwo_cairo_prover::prover::{prove_cairo, ChannelHash, ProverParameters};
 use stwo_cairo_serialize::CairoSerialize;
+
+/// Prover engine: `legacy` (`prove_cairo` — the parity oracle) or `gpu-native`
+/// (`stwo-cairo-gpu-prover`, GPU_RESIDENT_PROVER_DESIGN.md §3).
+fn engine() -> String {
+    arg("--engine").unwrap_or_else(|| "legacy".to_string())
+}
+
+/// The gpu-native engine's persistent prover contexts (one per backend type): reps
+/// within a bench process share twiddle/preprocessed-tree caches, exactly as the
+/// legacy engine's process-global statics do — warm-rep numbers stay comparable
+/// across engines.
+static GPU_NATIVE_CUDA: OnceLock<
+    Mutex<GpuCairoProver<stwo_backend_cuda::CudaBackend, Blake2sMerkleChannel>>,
+> = OnceLock::new();
+static GPU_NATIVE_SIMD: OnceLock<Mutex<GpuCairoProver<SimdBackend, Blake2sMerkleChannel>>> =
+    OnceLock::new();
+
+fn prove_gpu_native<B, MC>(
+    cell: &OnceLock<Mutex<GpuCairoProver<B, MC>>>,
+    input: ProverInput,
+    params: ProverParameters,
+) -> CairoProof<MC::H>
+where
+    B: CairoBackend<MC>,
+    MC: MerkleChannel + 'static,
+{
+    let prover = cell.get_or_init(|| {
+        Mutex::new(GpuCairoProver::new(GpuProverConfig::default()).expect("gpu-native config"))
+    });
+    let mut prover = prover.lock().unwrap();
+    prover
+        .prove(input, params)
+        .expect("gpu-native prove failed")
+}
 
 fn arg(name: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
@@ -546,6 +589,7 @@ fn record_context(backend: &str) -> serde_json::Value {
         "n_queries": pcs.fri_config.n_queries,
         "pow_bits": pcs.pow_bits,
         "fold_step": pcs.fri_config.fold_step,
+        "engine": engine(),
         "gpu": gpu_name(backend),
         "nproc": nproc(),
         "host_mem_gb": round3(host_mem_gb()),
@@ -574,17 +618,25 @@ macro_rules! prove_sampled {
     ($backend:expr, $input:expr, $variant:expr) => {{
         let sampler = VramSampler::start();
         let start = Instant::now();
-        let proof = match $backend {
-            "cuda" => prove_cairo::<stwo_backend_cuda::CudaBackend, Blake2sMerkleChannel>(
-                $input,
-                prover_params($variant),
-            )
-            .unwrap(),
-            "simd" => {
+        let proof = match ($backend, engine().as_str()) {
+            ("cuda", "legacy") => {
+                prove_cairo::<stwo_backend_cuda::CudaBackend, Blake2sMerkleChannel>(
+                    $input,
+                    prover_params($variant),
+                )
+                .unwrap()
+            }
+            ("simd", "legacy") => {
                 prove_cairo::<SimdBackend, Blake2sMerkleChannel>($input, prover_params($variant))
                     .unwrap()
             }
-            other => panic!("unknown backend {other}"),
+            ("cuda", "gpu-native") => {
+                prove_gpu_native(&GPU_NATIVE_CUDA, $input, prover_params($variant))
+            }
+            ("simd", "gpu-native") => {
+                prove_gpu_native(&GPU_NATIVE_SIMD, $input, prover_params($variant))
+            }
+            (backend, engine) => panic!("unknown backend/engine {backend}/{engine}"),
         };
         let elapsed = start.elapsed().as_secs_f64();
         (proof, elapsed, sampler.stop())

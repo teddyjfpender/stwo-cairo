@@ -54,7 +54,7 @@ ARCH_LIST="${STWO_CUDA_ARCH:-sm_86,sm_89}"
 echo "   arch: $ARCH_LIST"
 $SSHB '. $HOME/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH
 cd /workspace/stwo-cairo/stwo_cairo_prover
-STWO_CUDA_ARCH='"$ARCH_LIST"' RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p stwo-cairo-prover --bin gpu_bench --features pie-bench 2>&1 | tail -1
+STWO_CUDA_ARCH='"$ARCH_LIST"' RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench 2>&1 | tail -1
 ls -la target/release/gpu_bench'
 
 echo "== pushing to fleet =="

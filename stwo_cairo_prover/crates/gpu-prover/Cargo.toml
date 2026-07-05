@@ -1,0 +1,50 @@
+[package]
+name = "stwo-cairo-gpu-prover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GPU-native Cairo prover pipeline (gpu_benchmarks/GPU_RESIDENT_PROVER_DESIGN.md)"
+
+# NOTE on gpu_bench + pie-bench gating (moved here from the prover crate with the
+# gpu_bench binary): the CairoPie ingestion path in `src/bin/gpu_bench.rs` and its
+# cairo-program-runner-lib dependency are fully `#[cfg(feature = "pie-bench")]`-gated.
+# No `required-features` on the bin — cargo errors on explicitly requested targets
+# with unmet required-features, which would break the feature-off build.
+
+[features]
+slow-tests = []
+
+# Enables the CairoPie bootloader ingestion path in the gpu_bench binary.
+pie-bench = ["dep:cairo-program-runner-lib"]
+
+[dependencies]
+stwo-cairo-prover = { path = "../prover", version = "~1.2.2" }
+stwo-cairo-adapter = { path = "../adapter", version = "~1.2.2" }
+stwo-cairo-common = { path = "../common", version = "~1.2.2", features = ["prover"] }
+stwo-cairo-serialize = { path = "../cairo-serialize", version = "~1.2.2" }
+cairo-air = { path = "../cairo-air", version = "~1.2.2" }
+stwo = { workspace = true, features = ["parallel", "prover"] }
+stwo-constraint-framework = { workspace = true, features = ["parallel", "prover"] }
+stwo-backend-cuda.workspace = true
+cairo-vm.workspace = true
+num-traits.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+libc = "0.2"
+bincode = "1"
+starknet-ff.workspace = true
+
+# Optional: CairoPie bootloader ingestion for gpu_bench (--pie). Same pin as the
+# prover crate carried: cairo-vm =3.2.0, cairo-lang =2.17.0-rc.4.
+cairo-program-runner-lib = { git = "https://github.com/starkware-libs/proving-utils", rev = "14490bfd", optional = true }
+
+# Used by build.rs (only when pie-bench is enabled) to locate the bootloader JSON
+# shipped inside cairo-program-runner-lib via `cargo metadata`.
+[build-dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+stwo-cairo-dev-utils = { path = "../dev_utils" }
+test-log = { version = "0.2.17", features = ["trace"] }

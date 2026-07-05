@@ -178,6 +178,22 @@ if [ "$a" = "$b" ]; then echo DAG_PROOF_MATCH; else echo DAG_PROOF_MISMATCH; fi"
 timeout_s = 120
 must_match = ['DAG_PROOF_MATCH']
 
+# --- 9b. M1 ENGINE PARITY (GPU_RESIDENT_PROVER_DESIGN.md §11): the gpu-native
+# pipeline (stwo-cairo-gpu-prover) must be byte-identical to the legacy engine on
+# CUDA. Same default flag set as the lane-off baseline it compares against. ------------
+[[step]]
+name = "sn2-engine-parity"
+cmd = '''
+STWO_DUMP_PROOF=$OUT/gpu_native.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --engine gpu-native --reps 2 --reuse-input 2>&1 | tail -6
+a=$(sha256sum $OUT/deduce_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/gpu_native.proof | cut -d' ' -f1)
+echo "legacy=$a"; echo "native=$b"
+if [ "$a" = "$b" ]; then echo ENGINE_PROOF_MATCH; else echo ENGINE_PROOF_MISMATCH; fi'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['ENGINE_PROOF_MATCH']
+
 # --- 10. C1: 2048-instr composition under the cubin path (the load-time ptxas cliff
 # only exists on the PTX path; SASS-at-compile-time makes 2048/-O3 safe). A/B vs the
 # 512 split: identity + perf. -----------------------------------------------------------
