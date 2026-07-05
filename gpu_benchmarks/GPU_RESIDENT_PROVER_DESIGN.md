@@ -569,6 +569,35 @@ with memory BW ±20% across H100/4090/A40 after M4 · P7 launches/proof <100
 after M5 · P8 sustained ≥ single +15% after M6 · P9 idle-sample share <20%
 after M5.
 
+## 11b. Implementation status (living section)
+
+Updated 2026-07-05. Everything below is committed, locally gated, and stub-safe
+on macOS; pod validation batched into one session (running).
+
+- **M1 COMPLETE**: `crates/gpu-prover` — GpuCairoProver (persistent twiddle +
+  preprocessed-tree caches), phases/{ingest,witness,commit,interaction,stark},
+  CairoBackend traits, flags registry, schedule types. Parity gate GREEN
+  locally (byte-identical to prove_cairo, cold + warm). gpu_bench moved here
+  (+ `--engine`); fleet scripts updated.
+- **M2a COMPLETE**: schedule_emit → 36-node generated feed DAG (zero hand
+  data); certified edges pinned; --check in pregate.
+- **M2b COMPLETE**: §6a for builtins. JIT_LOGUP_DESCS emitted facts (7-form
+  closed grammar parsed from every generated writer — pairing is arbitrary
+  order, signs vary, mults ∈ {flats, one, enabler}); generalized device
+  descriptors (MultSrc + explicit signs + n_real); host mirror
+  finalize-identical to the writers on all three shape classes (LOCAL gates,
+  zero CUDA); stash + collection branches for the five builtin lanes.
+- **M3 LOCAL-COMPLETE**: aot emit surface; kernel_emit (118 kernels @ the
+  cap-aligned 2048, coverage-fenced fixture matrix, --check in pregate);
+  build.rs per-arch -O3 cubin pack embedded + runtime tier-0 lookup (miss =
+  drift = NVRTC fallback); NitrooZK lane DELETED; manifest cap 512→2048 +
+  sn2-aot-pack gate. gpu-native engine defaults = the composed device config.
+- **M2 tail deferred**: ffi_emit + stream sweep, memory/table components into
+  the lane, witness-phase-owns-schedule — after the pod session's numbers.
+- **Pod session (in flight)**: M0 remainder + M1 engine parity + M2b DAG
+  interaction + M3 AOT gates (deduce_gate.toml, 15 steps), then
+  record_runs.toml (composed gpu-native on all four SN PIEs + sustained).
+
 ## 12. Effort and risk
 
 | workstream | size | risk | pod-dependent? |
