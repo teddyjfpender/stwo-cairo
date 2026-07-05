@@ -211,7 +211,7 @@ fn cuda_jit_lane<C: OpcodeLaneSpec>(inputs: &[CasmState], mem: &Memory) -> Optio
         tables,
         !device_interaction_enabled(),
     );
-    let Some((cols, lookup_dev, lookup_flat, sub_flat)) = launched else {
+    let Some((cols, lookup_dev, lookup_flat, _sub_dev, sub_flat)) = launched else {
         // launch_recorded_witness_for_prove logged the specific reason.
         return None;
     };
@@ -730,7 +730,7 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
         },
     );
 
-    let (cols, _lookup_dev, lookup_flat, sub_flat) =
+    let (cols, _lookup_dev, lookup_flat, _sub_dev, sub_flat) =
         stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
             C::LABEL,
             input_cols,

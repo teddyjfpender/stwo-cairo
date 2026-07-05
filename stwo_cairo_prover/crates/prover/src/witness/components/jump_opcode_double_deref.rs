@@ -893,8 +893,8 @@ fn jump_opcode_double_deref_row_body<E: WitnessEval>(eval: &mut E) {
 }
 
 /// Generic SIMD driver: same allocation as `write_trace_simd`, but each row runs
-/// `jump_opcode_double_deref_row_body` on a per-row `SimdWitnessEval`, then reconstructs the concrete
-/// `LookupData` / `SubComponentInputs` from the eval's flat scratch. Module-private (it
+/// `jump_opcode_double_deref_row_body` on a per-row `SimdWitnessEval`, then reconstructs the
+/// concrete `LookupData` / `SubComponentInputs` from the eval's flat scratch. Module-private (it
 /// returns the module-private `LookupData` / `SubComponentInputs`; wider visibility would
 /// be E0446 and force a change OUTSIDE this block). External callers use the `pub(crate)`
 /// `write_trace_generic` method or the `#[cfg(test)]` `generic_simd_diff` harness.
@@ -1306,7 +1306,5 @@ impl InteractionClaimGenerator {
 
 // --- witness-JIT prove-lane accessors (marked additive; layout mirrors LookupData /
 // the emitted sub-word order; fenced by the prove-accessor parity gate) ---------------
-
-
 
 crate::jit_sub_accessors!(N_SUB_INPUT_WORDS, n_addr = 2, n_id = 2);

@@ -217,7 +217,7 @@ pub fn run_device_interaction_selftest(input: &stwo_cairo_adapter::ProverInput) 
                         eprintln!("DEVICE_INTERACTION {}: FAIL (launch unavailable)", $label);
                         all_ok = false;
                     }
-                    Some((_cols, lookup_dev, lookup_flat, _sub)) => {
+                    Some((_cols, lookup_dev, lookup_flat, _sub_dev, _sub)) => {
                         // HOST reference: accessors -> write_interaction_trace -> SIMD finalize.
                         let igen = $module::interaction_gen_from_flat_lookup_words(
                             log_size,

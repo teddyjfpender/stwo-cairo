@@ -16291,8 +16291,8 @@ fn partial_ec_mul_window_bits_18_row_body<E: WitnessEval>(eval: &mut E) {
 }
 
 /// Generic SIMD driver: same allocation as `write_trace_simd`, but each row runs
-/// `partial_ec_mul_window_bits_18_row_body` on a per-row `SimdWitnessEval`, then reconstructs the concrete
-/// `LookupData` / `SubComponentInputs` from the eval's flat scratch. Module-private (it
+/// `partial_ec_mul_window_bits_18_row_body` on a per-row `SimdWitnessEval`, then reconstructs the
+/// concrete `LookupData` / `SubComponentInputs` from the eval's flat scratch. Module-private (it
 /// returns the module-private `LookupData` / `SubComponentInputs`; wider visibility would
 /// be E0446 and force a change OUTSIDE this block). External callers use the `pub(crate)`
 /// `write_trace_generic` method or the `#[cfg(test)]` `generic_simd_diff` harness.

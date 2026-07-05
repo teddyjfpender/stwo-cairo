@@ -1106,6 +1106,4 @@ impl InteractionClaimGenerator {
 // --- witness-JIT prove-lane accessors (marked additive; layout mirrors LookupData /
 // the emitted sub-word order; fenced by the prove-accessor parity gate) ---------------
 
-
-
 crate::jit_sub_accessors!(N_SUB_INPUT_WORDS, n_addr = 2, n_id = 2);

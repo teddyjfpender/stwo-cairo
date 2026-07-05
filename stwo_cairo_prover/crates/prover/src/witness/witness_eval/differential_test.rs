@@ -1350,7 +1350,7 @@ fn assert_device_builtin_leg_matches_host(
         f252_values,
         small_values,
     );
-    let (dev_cols, _lookup_dev, lookup_flat, sub_flat) =
+    let (dev_cols, _lookup_dev, lookup_flat, _sub_dev, sub_flat) =
         stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
             label, &cols, &tables, true,
         )

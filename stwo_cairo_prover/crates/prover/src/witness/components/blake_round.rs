@@ -6514,8 +6514,6 @@ impl InteractionClaimGenerator {
 // ---- Witness-JIT prove-lane accessors (builtin slot layout; consumed by
 // ---- `jit_builtin_prove_backend.rs`; parity-fenced in `differential_test.rs`) ------
 
-
-
 /// Feed the decoded sub-inputs into the downstream states — the same entry
 /// points, per-relation order (sigma → rc725 ×16 → addr ×16 → mem_big ×16 →
 /// blake_g ×8), and full padded extent as the host writer's drain loops. Word

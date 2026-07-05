@@ -1924,7 +1924,6 @@ impl InteractionClaimGenerator {
 // indices exactly (declaration order); both are regression-fenced by
 // `jit_prove_backend::tests`. ---
 
-
 /// PROVE-LANE SHADOW DIFF (debug instrument, `STWO_JIT_PROVE_SHADOW=1`): run the
 /// host SIMD writer — a PURE read of the states, no feeding — beside the device
 /// lane's outputs and report the first divergences per surface (committed trace,
@@ -2026,7 +2025,6 @@ pub(crate) fn shadow_compare_against_host(
         bad, n_padded, n_rows
     );
 }
-
 
 /// The sub-component inputs decoded from the device kernel's flat sub-input words
 /// (word-major, N_SUB_INPUT_WORDS per row). Word order mirrors the emitted
