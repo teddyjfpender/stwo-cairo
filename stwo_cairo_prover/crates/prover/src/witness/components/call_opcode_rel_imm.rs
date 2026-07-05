@@ -611,13 +611,13 @@ fn call_opcode_rel_imm_row_body<E: WitnessEval>(eval: &mut E) {
     eval.set_lookup_word(9, input_ap_col1);
     eval.set_lookup_word(10, stored_fp_id_col3);
     let memory_id_to_big_value_tmp_82d62_5 = eval.mem_id_to_value(stored_fp_id_col3);
-    let stored_fp_limb_0_col4 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_5, 0);
+    let stored_fp_limb_0_col4 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_5.clone(), 0);
     eval.set_col(4, stored_fp_limb_0_col4);
-    let stored_fp_limb_1_col5 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_5, 1);
+    let stored_fp_limb_1_col5 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_5.clone(), 1);
     eval.set_col(5, stored_fp_limb_1_col5);
-    let stored_fp_limb_2_col6 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_5, 2);
+    let stored_fp_limb_2_col6 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_5.clone(), 2);
     eval.set_col(6, stored_fp_limb_2_col6);
-    let stored_fp_limb_3_col7 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_5, 3);
+    let stored_fp_limb_3_col7 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_5.clone(), 3);
     eval.set_col(7, stored_fp_limb_3_col7);
     let wg_v0 = eval.u16_from_m31(stored_fp_limb_3_col7);
     let wg_v1 = eval.u16_and(wg_v0, 2);
@@ -686,7 +686,7 @@ fn call_opcode_rel_imm_row_body<E: WitnessEval>(eval: &mut E) {
         m31_0,
     ]);
     let read_positive_num_bits_29_output_tmp_82d62_9 = (
-        read_positive_known_id_num_bits_29_output_tmp_82d62_8,
+        read_positive_known_id_num_bits_29_output_tmp_82d62_8.clone(),
         stored_fp_id_col3,
     );
     let wg_v2 = eval.m31_add(input_ap_col1, m31_1);
@@ -700,13 +700,17 @@ fn call_opcode_rel_imm_row_body<E: WitnessEval>(eval: &mut E) {
     eval.set_lookup_word(42, wg_v4);
     eval.set_lookup_word(43, stored_ret_pc_id_col9);
     let memory_id_to_big_value_tmp_82d62_12 = eval.mem_id_to_value(stored_ret_pc_id_col9);
-    let stored_ret_pc_limb_0_col10 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_12, 0);
+    let stored_ret_pc_limb_0_col10 =
+        eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_12.clone(), 0);
     eval.set_col(10, stored_ret_pc_limb_0_col10);
-    let stored_ret_pc_limb_1_col11 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_12, 1);
+    let stored_ret_pc_limb_1_col11 =
+        eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_12.clone(), 1);
     eval.set_col(11, stored_ret_pc_limb_1_col11);
-    let stored_ret_pc_limb_2_col12 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_12, 2);
+    let stored_ret_pc_limb_2_col12 =
+        eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_12.clone(), 2);
     eval.set_col(12, stored_ret_pc_limb_2_col12);
-    let stored_ret_pc_limb_3_col13 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_12, 3);
+    let stored_ret_pc_limb_3_col13 =
+        eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_12.clone(), 3);
     eval.set_col(13, stored_ret_pc_limb_3_col13);
     let wg_v5 = eval.u16_from_m31(stored_ret_pc_limb_3_col13);
     let wg_v6 = eval.u16_and(wg_v5, 2);
@@ -775,7 +779,7 @@ fn call_opcode_rel_imm_row_body<E: WitnessEval>(eval: &mut E) {
         m31_0,
     ]);
     let read_positive_num_bits_29_output_tmp_82d62_16 = (
-        read_positive_known_id_num_bits_29_output_tmp_82d62_15,
+        read_positive_known_id_num_bits_29_output_tmp_82d62_15.clone(),
         stored_ret_pc_id_col9,
     );
     let wg_v7 = eval.m31_add(input_pc_col0, m31_1);
@@ -789,11 +793,11 @@ fn call_opcode_rel_imm_row_body<E: WitnessEval>(eval: &mut E) {
     eval.set_lookup_word(75, wg_v9);
     eval.set_lookup_word(76, distance_to_next_pc_id_col15);
     let memory_id_to_big_value_tmp_82d62_19 = eval.mem_id_to_value(distance_to_next_pc_id_col15);
-    let wg_v10 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19, 27);
+    let wg_v10 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19.clone(), 27);
     let msb_tmp_82d62_20 = eval.m31_eq(wg_v10, m31_256);
     let msb_col16 = eval.mask_as_m31(msb_tmp_82d62_20);
     eval.set_col(16, msb_col16);
-    let wg_v11 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19, 20);
+    let wg_v11 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19.clone(), 20);
     let wg_v12 = eval.m31_eq(wg_v11, m31_511);
     let mid_limbs_set_tmp_82d62_21 = eval.mask_and(wg_v12, msb_tmp_82d62_20);
     let mid_limbs_set_col17 = eval.mask_as_m31(mid_limbs_set_tmp_82d62_21);
@@ -812,15 +816,15 @@ fn call_opcode_rel_imm_row_body<E: WitnessEval>(eval: &mut E) {
         wg_v17,
     ];
     let distance_to_next_pc_limb_0_col18 =
-        eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19, 0);
+        eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19.clone(), 0);
     eval.set_col(18, distance_to_next_pc_limb_0_col18);
     let distance_to_next_pc_limb_1_col19 =
-        eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19, 1);
+        eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19.clone(), 1);
     eval.set_col(19, distance_to_next_pc_limb_1_col19);
     let distance_to_next_pc_limb_2_col20 =
-        eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19, 2);
+        eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19.clone(), 2);
     eval.set_col(20, distance_to_next_pc_limb_2_col20);
-    let wg_v18 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19, 3);
+    let wg_v18 = eval.felt_get_m31(&memory_id_to_big_value_tmp_82d62_19.clone(), 3);
     let wg_v19 = eval.u16_from_m31(wg_v18);
     let remainder_bits_tmp_82d62_23 = eval.u16_and(wg_v19, 3);
     let remainder_bits_col21 = eval.u16_as_m31(remainder_bits_tmp_82d62_23);

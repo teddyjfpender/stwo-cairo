@@ -462,6 +462,36 @@ impl WitnessEval for RecordingWitnessEval {
         }
     }
 
+    fn felt_from_w27_words(&mut self, words: [RecVal; 10]) -> RecFelt {
+        // Exact 27->9 regroup on raw registers: limb 3j+t = (w[j] >> 9t) & 0x1FF
+        // (j < 9); limb 27 = w[9] & 0x1FF (top word is 9 bits — mask is identity,
+        // kept for uniformity). Any poisoned word degrades the whole felt.
+        let Some(w): Option<Vec<Val>> = words
+            .iter()
+            .map(|r| match r {
+                RecVal::Ok(x) => Some(*x),
+                RecVal::Poison => None,
+            })
+            .collect()
+        else {
+            let p = self.poison("felt_from_w27_words");
+            return RecFelt::Limbs(vec![p; FELT_N_LIMBS]);
+        };
+        let mut limbs = Vec::with_capacity(FELT_N_LIMBS);
+        for j in 0..9 {
+            for t in 0..3u32 {
+                let shifted = if t == 0 {
+                    w[j]
+                } else {
+                    self.recorder.u32_shr(w[j], 9 * t)
+                };
+                limbs.push(RecVal::Ok(self.recorder.u32_and(shifted, 0x1FF)));
+            }
+        }
+        limbs.push(RecVal::Ok(self.recorder.u32_and(w[9], 0x1FF)));
+        RecFelt::Limbs(limbs)
+    }
+
     // ---- Felt field arithmetic: DeduceKind::Felt{Add,Sub,Mul,Div} ---------------
 
     fn felt_add(&mut self, a: RecFelt, b: RecFelt) -> RecFelt {

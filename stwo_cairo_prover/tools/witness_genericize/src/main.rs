@@ -1524,8 +1524,20 @@ impl Lowerer {
                     quote! { eval.felt_from_limbs([ #(#limb_ids),* ]) },
                 )
             }
+            Ty::FeltW27 => {
+                // W27 input leaf: 10 consecutive word slots (27-bit values are
+                // M31-safe) -> the limb-array value FeltW27Limbs carries.
+                let word_ids: Vec<TokenStream> = (0..FELTW27_LIMBS)
+                    .map(|j| {
+                        let slot = u32_lit((*base + j) as u32);
+                        self.bind(Target::Temp, quote! { eval.input(#slot) })
+                    })
+                    .collect();
+                let tok = self.bind(target, quote! { [ #(#word_ids),* ] });
+                (Ty::FeltW27Limbs, tok)
+            }
             _ => {
-                // U16 / W27 / other input leaves: typed but not yet fed by the lane.
+                // U16 / other input leaves: typed but not yet fed by the lane.
                 let _ = what;
                 self.input_sites += 1;
                 self.leaf(target, (**inner).clone(), quote! { WG_INPUT_CENSUS_ONLY })
@@ -1892,6 +1904,12 @@ impl Lowerer {
         }
         if let Some(ty) = self.env.get(&name).cloned() {
             let id = Ident::new(&name, Span::call_site());
+            // `E::Felt` is Clone-not-Copy: an alias binding (`let new = old;`)
+            // must clone, or the original moves and later uses are E0382
+            // (cube_252's unpack alias). Every other handle type is Copy.
+            if ty == Ty::Felt252 {
+                return self.leaf(target, ty, quote! { #id.clone() });
+            }
             return self.leaf(target, ty, quote! { #id });
         }
         self.skip("expr", format!("unknown identifier `{name}`"));
@@ -2344,13 +2362,16 @@ impl Lowerer {
                 }
             }
             "PackedFelt252 :: from_packed_felt252width27" => {
-                // w27 → f252 width conversion: f9[3j+k] = (w27[j] >> 9k) & 0x1FF (G2).
-                // Requires shift/mask on 27-bit limbs — beyond the u16 trait ops; lowers
-                // to `U32Shr`/`U32And` once the u32 trait extension lands. Census-only,
-                // typed Felt252 (the result IS a 28x9 felt).
-                let (at, _atok) = self.lower_arg(call.args.first());
+                // w27 → f252 width conversion: the REAL `felt_from_w27_words` trait op
+                // (SIMD = the production conversion pair; recording = the exact 27->9
+                // regroup on raw u32 ops). Opaque W27 (no known limb tokens) stays
+                // census-only.
+                let (at, atok) = self.lower_arg(call.args.first());
                 match at {
-                    Ty::FeltW27 | Ty::FeltW27Limbs => self.w27_site(Ty::Felt252),
+                    Ty::FeltW27Limbs => {
+                        self.emit_op(target, Ty::Felt252, quote! { eval.felt_from_w27_words(#atok) })
+                    }
+                    Ty::FeltW27 => self.w27_site(Ty::Felt252),
                     other => {
                         self.skip(
                             "call",
@@ -3215,6 +3236,13 @@ fn input_flatten_tokens(ty: &Ty, base: TokenStream) -> Vec<TokenStream> {
         Ty::M31 => vec![quote! { #base.into_simd() }],
         Ty::U32 => vec![quote! { #base.simd }],
         Ty::Felt252 => (0..FELT252_LIMBS)
+            .map(|j| {
+                let lit = usize_lit(j);
+                quote! { #base.get_m31(#lit).into_simd() }
+            })
+            .collect(),
+        // W27 input leaf: 10 word columns (27-bit values, M31-safe raw words).
+        Ty::FeltW27 => (0..FELTW27_LIMBS)
             .map(|j| {
                 let lit = usize_lit(j);
                 quote! { #base.get_m31(#lit).into_simd() }
@@ -4664,8 +4692,10 @@ mod tests {
         );
         assert_eq!(lw.env["a"], Ty::M31);
         assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
-        assert_eq!(lw.w27_sites, 1);
-        assert_eq!(lw.input_sites, 1);
+        // Real now: the input projects to 10 input reads; get_m31(9) is a plain
+        // array index on the word tokens.
+        assert_eq!(lw.w27_sites, 0);
+        assert_eq!(lw.input_sites, 0);
 
         let lw = lower_snippet_full(
             &[],
@@ -4731,7 +4761,7 @@ mod tests {
 
     /// w27 → f252 needs 27-bit shift/mask (u32 extension) — census-only, typed Felt252.
     #[test]
-    fn from_packed_felt252width27_is_census_only() {
+    fn from_packed_felt252width27_lowers_to_real_trait_op() {
         let lw = lower_snippet_full(
             &[],
             BTreeMap::new(),
@@ -4743,7 +4773,13 @@ mod tests {
         assert_eq!(lw.env["f"], Ty::Felt252);
         assert_eq!(lw.env["a"], Ty::M31);
         assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
-        assert_eq!(lw.w27_sites, 1);
+        // W27 inputs materialize as 10 real input reads; the conversion is the
+        // REAL felt_from_w27_words trait op — nothing censused.
+        assert_eq!(lw.w27_sites, 0);
+        assert_eq!(lw.input_sites, 0);
+        let body = lw.out.iter().map(|t| t.to_string()).collect::<String>();
+        assert!(body.contains("eval . felt_from_w27_words ("), "body: {body}");
+        assert!(body.contains("eval . input ("), "body: {body}");
     }
 
     /// `seq.packed_at(row_index)` is the packed row index — a REAL `eval.iota()` op

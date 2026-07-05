@@ -318,19 +318,19 @@ fn assert_eq_opcode_imm_row_body<E: WitnessEval>(eval: &mut E) {
     let memory_address_to_id_value_tmp_86a47_0 = eval.mem_addr_to_id(input_pc_col0);
     let memory_id_to_big_value_tmp_86a47_1 =
         eval.mem_id_to_value(memory_address_to_id_value_tmp_86a47_0);
-    let wg_v0 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1, 0);
+    let wg_v0 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1.clone(), 0);
     let wg_v1 = eval.u16_from_m31(wg_v0);
-    let wg_v2 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1, 1);
+    let wg_v2 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1.clone(), 1);
     let wg_v3 = eval.u16_from_m31(wg_v2);
     let wg_v4 = eval.u16_and(wg_v3, 127);
     let wg_v5 = eval.u16_shl(wg_v4, 9);
     let offset0_tmp_86a47_2 = eval.u16_add(wg_v1, wg_v5);
     let offset0_col3 = eval.u16_as_m31(offset0_tmp_86a47_2);
     eval.set_col(3, offset0_col3);
-    let wg_v6 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1, 5);
+    let wg_v6 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1.clone(), 5);
     let wg_v7 = eval.u16_from_m31(wg_v6);
     let wg_v8 = eval.u16_shr(wg_v7, 3);
-    let wg_v9 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1, 6);
+    let wg_v9 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1.clone(), 6);
     let wg_v10 = eval.u16_from_m31(wg_v9);
     let wg_v11 = eval.u16_shl(wg_v10, 6);
     let wg_v12 = eval.u16_add(wg_v8, wg_v11);
@@ -338,10 +338,10 @@ fn assert_eq_opcode_imm_row_body<E: WitnessEval>(eval: &mut E) {
     let dst_base_fp_tmp_86a47_3 = eval.u16_and(wg_v13, 1);
     let dst_base_fp_col4 = eval.u16_as_m31(dst_base_fp_tmp_86a47_3);
     eval.set_col(4, dst_base_fp_col4);
-    let wg_v14 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1, 5);
+    let wg_v14 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1.clone(), 5);
     let wg_v15 = eval.u16_from_m31(wg_v14);
     let wg_v16 = eval.u16_shr(wg_v15, 3);
-    let wg_v17 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1, 6);
+    let wg_v17 = eval.felt_get_m31(&memory_id_to_big_value_tmp_86a47_1.clone(), 6);
     let wg_v18 = eval.u16_from_m31(wg_v17);
     let wg_v19 = eval.u16_shl(wg_v18, 6);
     let wg_v20 = eval.u16_add(wg_v16, wg_v19);

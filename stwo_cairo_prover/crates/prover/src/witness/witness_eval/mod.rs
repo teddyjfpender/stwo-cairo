@@ -174,6 +174,14 @@ pub trait WitnessEval {
     fn felt_from_limbs(&mut self, limbs: [Self::M31; FELT_N_LIMBS]) -> Self::Felt;
     fn felt_get_m31(&mut self, felt: &Self::Felt, i: usize) -> Self::M31;
 
+    /// Reassemble a `Felt252` from the 10 words of a `Felt252Width27` input —
+    /// an EXACT regroup (27 = 3x9): 9-bit limb `3j+t` = `(w[j] >> 9t) & 0x1FF`
+    /// for `j < 9`, limb 27 = `w[9]` (its top word is 9 bits). SIMD uses the
+    /// production conversion pair (`PackedFelt252Width27::from_limbs` +
+    /// `PackedFelt252::from_packed_felt252width27`) — byte-identical by
+    /// construction; the recording lowers the schoolbook shifts.
+    fn felt_from_w27_words(&mut self, words: [Self::M31; 10]) -> Self::Felt;
+
     // ---- Felt field arithmetic (fp256 body ops — the partial_ec_mul writers'
     // ---- inline `Felt252` operators; recording = DeduceKind::Felt{Add,Sub,Mul,Div}).
 

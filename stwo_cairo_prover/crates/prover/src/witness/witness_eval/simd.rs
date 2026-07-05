@@ -251,6 +251,10 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
         felt.get_m31(i)
     }
 
+    fn felt_from_w27_words(&mut self, words: [PackedM31; 10]) -> PackedFelt252 {
+        PackedFelt252::from_packed_felt252width27(PackedFelt252Width27::from_limbs(words))
+    }
+
     fn felt_add(&mut self, a: PackedFelt252, b: PackedFelt252) -> PackedFelt252 {
         a + b
     }
