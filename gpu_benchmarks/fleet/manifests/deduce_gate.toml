@@ -148,7 +148,7 @@ gpu_bound = true
 name = "sn2-lane-on-dag"
 cmd = '''
 STWO_CUDA_WITNESS_JIT_PROVE=1 STWO_CUDA_WITNESS_JIT_MAX_INSTRS=20000 \
-STWO_CUDA_WITNESS_EDGES=1 \
+STWO_CUDA_WITNESS_EDGES=1 STWO_CUDA_DEVICE_INTERACTION=1 \
 STWO_DUMP_PROOF=$OUT/dag_on.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
   --reps 1 --reuse-input 2> $OUT/dag_on.err | tail -4
 grep -E 'device count feed merged' $OUT/dag_on.err | head -3
@@ -156,6 +156,9 @@ grep -E 'stashed device edge' $OUT/dag_on.err | head -2
 grep -E 'jit_prove\[partial_ec_mul_window_bits_18\]: device witness' $OUT/dag_on.err
 grep -E 'jit_prove\[partial_ec_mul_generic\]: device witness' $OUT/dag_on.err
 grep -E 'jit_prove\[cube_252\]: device witness' $OUT/dag_on.err || true
+grep -E 'jit_interaction\[blake_round\]: device logup' $OUT/dag_on.err
+grep -E 'jit_interaction\[pedersen_aggregator_window_bits_18\]: device logup' $OUT/dag_on.err
+grep -E 'jit_interaction\[partial_ec_mul_window_bits_18\]: device logup' $OUT/dag_on.err
 test -s $OUT/dag_on.proof && echo DAG_PROOF_OK'''
 timeout_s = 7200
 gpu_bound = true
@@ -164,6 +167,8 @@ must_match = [
   'stashed device edge',
   'jit_prove\[partial_ec_mul_window_bits_18\]: device witness',
   'jit_prove\[partial_ec_mul_generic\]: device witness',
+  'jit_interaction\[blake_round\]: device logup',
+  'jit_interaction\[pedersen_aggregator_window_bits_18\]: device logup',
   'DAG_PROOF_OK',
 ]
 

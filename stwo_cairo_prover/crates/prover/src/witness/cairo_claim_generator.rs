@@ -30,9 +30,10 @@ use crate::witness::blake_round_witness_backend::BlakeRoundWitness;
 use crate::witness::components::*;
 use crate::witness::jit_prove_backend::{
     AddOpcodeLane, AddOpcodeSmallLane, AssertEqOpcodeDoubleDerefLane, AssertEqOpcodeImmLane,
-    AssertEqOpcodeLane, CallOpcodeAbsLane, CallOpcodeRelImmLane, Cube252Witness,
-    JnzOpcodeNonTakenLane, JnzOpcodeTakenLane, JumpOpcodeAbsLane, JumpOpcodeDoubleDerefLane,
-    JumpOpcodeRelImmLane, JumpOpcodeRelLane, OpcodeJitBackend, RetOpcodeLane,
+    AssertEqOpcodeLane, BlakeRoundLane, CallOpcodeAbsLane, CallOpcodeRelImmLane, Cube252Lane,
+    Cube252Witness, JnzOpcodeNonTakenLane, JnzOpcodeTakenLane, JumpOpcodeAbsLane,
+    JumpOpcodeDoubleDerefLane, JumpOpcodeRelImmLane, JumpOpcodeRelLane, OpcodeJitBackend,
+    PartialEcMulGenericLane, PartialEcMulW18Lane, PedersenAggregatorW18Lane, RetOpcodeLane,
 };
 use crate::witness::memory_witness_backend::MemoryIdToBigWitness;
 use crate::witness::pedersen_witness_backend::{
@@ -2351,9 +2352,14 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.blake_round {
-                s.spawn(|_| {
-                    blake_round_result = Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<BlakeRoundLane>() {
+                    drop(gen); // §6a: the device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        blake_round_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.blake_g {
                 s.spawn(|_| {
@@ -2436,22 +2442,39 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.partial_ec_mul_generic {
-                s.spawn(|_| {
-                    partial_ec_mul_generic_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<
+                    PartialEcMulGenericLane,
+                >() {
+                    drop(gen); // §6a: the device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        partial_ec_mul_generic_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.pedersen_aggregator_window_bits_18 {
-                s.spawn(|_| {
-                    pedersen_aggregator_window_bits_18_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<
+                    PedersenAggregatorW18Lane,
+                >() {
+                    drop(gen); // §6a: the device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        pedersen_aggregator_window_bits_18_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.partial_ec_mul_window_bits_18 {
-                s.spawn(|_| {
-                    partial_ec_mul_window_bits_18_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<PartialEcMulW18Lane>(
+                ) {
+                    drop(gen); // §6a: the device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        partial_ec_mul_window_bits_18_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.pedersen_points_table_window_bits_18 {
                 s.spawn(|_| {
@@ -2496,9 +2519,13 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.cube_252 {
-                s.spawn(|_| {
-                    cube_252_result = Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<Cube252Lane>() {
+                    drop(gen); // §6a: the device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        cube_252_result = Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.poseidon_round_keys {
                 s.spawn(|_| {
@@ -2850,11 +2877,19 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let blake_round_interaction_claim = blake_round_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+        let blake_round_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<BlakeRoundLane>(
+                common_lookup_elements,
+            ) {
             evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+            Some(cairo_air::components::blake_round::InteractionClaim { claimed_sum })
+        } else {
+            blake_round_result.map(|(raw, build_claim)| {
+                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            })
+        };
         let blake_g_interaction_claim = blake_g_result.map(|(trace, claimed_sum)| {
             evals.extend(trace);
             BlakeGInteractionClaim { claimed_sum }
@@ -2926,24 +2961,56 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             evals.extend(trace);
             build_claim(claimed_sum)
         });
-        let partial_ec_mul_generic_interaction_claim =
+        let partial_ec_mul_generic_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<PartialEcMulGenericLane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::partial_ec_mul_generic::InteractionClaim { claimed_sum })
+        } else {
             partial_ec_mul_generic_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let pedersen_aggregator_window_bits_18_interaction_claim =
+            })
+        };
+        let pedersen_aggregator_window_bits_18_interaction_claim = if let Some((
+            trace,
+            claimed_sum,
+        )) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<PedersenAggregatorW18Lane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(
+                cairo_air::components::pedersen_aggregator_window_bits_18::InteractionClaim {
+                    claimed_sum,
+                },
+            )
+        } else {
             pedersen_aggregator_window_bits_18_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
-        let partial_ec_mul_window_bits_18_interaction_claim = partial_ec_mul_window_bits_18_result
-            .map(|(raw, build_claim)| {
+            })
+        };
+        let partial_ec_mul_window_bits_18_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<PartialEcMulW18Lane>(
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(
+                cairo_air::components::partial_ec_mul_window_bits_18::InteractionClaim {
+                    claimed_sum,
+                },
+            )
+        } else {
+            partial_ec_mul_window_bits_18_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
+            })
+        };
         let pedersen_points_table_window_bits_18_interaction_claim =
             pedersen_points_table_window_bits_18_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -2986,11 +3053,19 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let cube_252_interaction_claim = cube_252_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+        let cube_252_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<Cube252Lane>(
+                common_lookup_elements,
+            ) {
             evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+            Some(cairo_air::components::cube_252::InteractionClaim { claimed_sum })
+        } else {
+            cube_252_result.map(|(raw, build_claim)| {
+                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            })
+        };
         let poseidon_round_keys_interaction_claim =
             poseidon_round_keys_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);

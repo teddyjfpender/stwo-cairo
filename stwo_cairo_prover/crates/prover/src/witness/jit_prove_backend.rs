@@ -62,7 +62,7 @@ pub(crate) fn device_interaction_enabled() -> bool {
 }
 
 type DeviceLookupStash = std::sync::Mutex<
-    std::collections::HashMap<&'static str, (stwo_backend_cuda::BaseFieldVec, usize)>,
+    std::collections::HashMap<&'static str, (stwo_backend_cuda::BaseFieldVec, usize, usize)>,
 >;
 
 fn device_lookup_stash() -> &'static DeviceLookupStash {
@@ -95,6 +95,10 @@ pub trait OpcodeLaneSpec {
     /// `(name, width)` per `LookupData` field, declaration order (trailing two are
     /// `mults_0`/`mults_1`) — the §6a descriptor builder's input.
     fn lookup_fields() -> &'static [(&'static str, usize)];
+    /// The emitted per-column descriptor FACTS (`JIT_LOGUP_DESCS`) — parsed from
+    /// this component's generated `write_interaction_trace`; resolved via
+    /// `logup_descs::resolve_logup_descs` and gate-proven by the host mirror.
+    fn logup_descs() -> &'static [crate::witness::logup_descs::LogupDescFact];
     fn record() -> RecordingOutput;
     fn host_write(
         gen: Self::Gen,
@@ -263,6 +267,17 @@ pub trait OpcodeJitBackend: FromSimdColumns + Sized {
         None
     }
 
+    /// Builtin-lane variants of the §6a hooks (same stash, `BuiltinLaneSpec`-keyed).
+    fn builtin_device_interaction_pending<C: BuiltinLaneSpec>() -> bool {
+        false
+    }
+    fn builtin_device_interaction<C: BuiltinLaneSpec>(
+        elements: &cairo_air::relations::CommonLookupElements,
+    ) -> Option<(Evals<Self>, stwo::core::fields::qm31::SecureField)> {
+        let _ = elements;
+        None
+    }
+
     fn lane_write_trace<C: OpcodeLaneSpec>(
         gen: C::Gen,
         addr_state: &memory_address_to_id::ClaimGenerator,
@@ -292,21 +307,18 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
     fn device_interaction<C: OpcodeLaneSpec>(
         elements: &cairo_air::relations::CommonLookupElements,
     ) -> Option<(Evals<Self>, stwo::core::fields::qm31::SecureField)> {
-        let (lookup_dev, n_rows) = device_lookup_stash().lock().unwrap().remove(C::LABEL)?;
+        let (lookup_dev, n_rows, n_real) =
+            device_lookup_stash().lock().unwrap().remove(C::LABEL)?;
         let t0 = std::time::Instant::now();
-        let fields = C::lookup_fields();
-        let n = fields.len();
-        let tuple_fields: Vec<(&str, usize)> = fields[..n - 2].to_vec();
-        let m0 = fields[..n - 2].iter().map(|f| f.1).sum::<usize>() as u32;
+        // Resolved from the EMITTED per-column facts (gate-proven by the host
+        // mirror against the generated writer) — no derivation rules.
         let descs =
-            stwo_backend_cuda::logup_pairs::descriptors_for_fields(&tuple_fields, m0, m0 + 1);
-        let max_w = tuple_fields.iter().map(|f| f.1).max()?;
+            crate::witness::logup_descs::resolve_logup_descs(C::lookup_fields(), C::logup_descs());
+        let max_w = crate::witness::logup_descs::max_tuple_width(&descs);
         let out = stwo_backend_cuda::logup_pairs::device_interaction_from_flats(
             lookup_dev.device_ptr,
             n_rows,
-            // Opcode descriptors carry no ENABLER mult source (the enabler is the
-            // mults_1 flats column); n_real is unused but passed truthfully.
-            n_rows,
+            n_real,
             &descs,
             &elements.alpha_powers()[..max_w],
             elements.z(),
@@ -323,6 +335,47 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
         } else {
             // The host raw pairs were never computed (spawn skipped) and the flats
             // were never copied: no fallback exists by design. Fail loudly.
+            panic!(
+                "jit_interaction[{}]: device interaction kernel failed with no host \
+                 fallback (STWO_CUDA_DEVICE_INTERACTION=1 skipped the flats copy)",
+                C::LABEL
+            );
+        }
+    }
+
+    fn builtin_device_interaction_pending<C: BuiltinLaneSpec>() -> bool {
+        device_lookup_stash().lock().unwrap().contains_key(C::LABEL)
+    }
+
+    fn builtin_device_interaction<C: BuiltinLaneSpec>(
+        elements: &cairo_air::relations::CommonLookupElements,
+    ) -> Option<(Evals<Self>, stwo::core::fields::qm31::SecureField)> {
+        let (lookup_dev, n_rows, n_real) =
+            device_lookup_stash().lock().unwrap().remove(C::LABEL)?;
+        let t0 = std::time::Instant::now();
+        let descs =
+            crate::witness::logup_descs::resolve_logup_descs(C::lookup_fields(), C::logup_descs());
+        let max_w = crate::witness::logup_descs::max_tuple_width(&descs);
+        let out = stwo_backend_cuda::logup_pairs::device_interaction_from_flats(
+            lookup_dev.device_ptr,
+            n_rows,
+            n_real,
+            &descs,
+            &elements.alpha_powers()[..max_w],
+            elements.z(),
+        );
+        if let Some((evals, sum)) = out {
+            eprintln!(
+                "jit_interaction[{}]: device logup {} rows x {} cols in {:.1} ms",
+                C::LABEL,
+                n_rows,
+                descs.len(),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+            Some((evals, sum))
+        } else {
+            // The host flats were never copied (the stash skipped the D2H): no
+            // fallback exists by design. Fail loudly.
             panic!(
                 "jit_interaction[{}]: device interaction kernel failed with no host \
                  fallback (STWO_CUDA_DEVICE_INTERACTION=1 skipped the flats copy)",
@@ -395,10 +448,11 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
             // igen below is an EMPTY placeholder that the device path replaces
             // (if the device path were to fail, the empty interaction trace fails
             // composition loudly — never silently wrong).
-            device_lookup_stash()
-                .lock()
-                .unwrap()
-                .insert(C::LABEL, (out.lookup_dev, out.column_length));
+            device_lookup_stash().lock().unwrap().insert(
+                C::LABEL,
+                // No ENABLER mult source in opcode descriptors; n_real unused.
+                (out.lookup_dev, out.column_length, out.column_length),
+            );
             C::igen_from_flats(out.log_size, &[], 0)
         } else {
             C::igen_from_flats(out.log_size, &out.lookup_flat, out.column_length)
@@ -442,6 +496,9 @@ macro_rules! opcode_lane_spec {
             }
             fn lookup_fields() -> &'static [(&'static str, usize)] {
                 $module::JIT_LOOKUP_FIELDS
+            }
+            fn logup_descs() -> &'static [crate::witness::logup_descs::LogupDescFact] {
+                $module::JIT_LOGUP_DESCS
             }
             fn record() -> RecordingOutput {
                 $record()
@@ -644,9 +701,10 @@ pub trait BuiltinLaneSpec {
     fn record() -> RecordingOutput;
     fn claim(log_size: u32) -> Self::Claim;
     /// `(name, width)` per `LookupData` field, declaration order — the §6a
-    /// device-interaction descriptor builder's input (unused until that lane
-    /// extends to builtins, but the layout contract lives here).
+    /// device-interaction descriptor builder's input.
     fn lookup_fields() -> &'static [(&'static str, usize)];
+    /// The emitted per-column descriptor FACTS (`JIT_LOGUP_DESCS`).
+    fn logup_descs() -> &'static [crate::witness::logup_descs::LogupDescFact];
     /// `n_real` is the pre-padding row count (blake_round's IGen stores it as the
     /// enabler bound; the aggregator's IGen has no such field and ignores it).
     fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen;
@@ -816,13 +874,14 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
         },
     );
 
-    let (cols, _lookup_dev, lookup_flat, sub_dev, sub_flat) = match &inputs {
+    let want_host_lookup = !device_interaction_enabled();
+    let (cols, lookup_dev, lookup_flat, sub_dev, sub_flat) = match &inputs {
         BuiltinInputs::HostCols(input_cols) => {
             stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
                 C::LABEL,
                 input_cols,
                 tables,
-                true,
+                want_host_lookup,
             )?
         }
         BuiltinInputs::Edge {
@@ -837,7 +896,7 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
                 host_tail,
                 n,
                 tables,
-                true,
+                want_host_lookup,
             )?
         }
     };
@@ -869,7 +928,19 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
         .map(|c| CircleEvaluation::new(domain, c))
         .collect();
     let claim = C::claim(log_size);
-    let igen = C::igen_from_flats(log_size, n_real, &lookup_flat, column_length);
+    let igen = if !want_host_lookup {
+        // §6a: park the device lookup buffer (with the ENABLER bound n_real) for
+        // interaction time; the empty placeholder igen is replaced by the device
+        // path — if that path were to fail, the empty interaction trace fails
+        // composition loudly, never silently wrong.
+        device_lookup_stash()
+            .lock()
+            .unwrap()
+            .insert(C::LABEL, (lookup_dev, column_length, n_real));
+        C::igen_from_flats(log_size, n_real, &[], 0)
+    } else {
+        C::igen_from_flats(log_size, n_real, &lookup_flat, column_length)
+    };
 
     // Device-DAG count feed: count-style relations feed on device from the
     // resident sub buffer; the host closure then skips them. Any failure feeds
@@ -982,6 +1053,9 @@ impl BuiltinLaneSpec for PedersenAggregatorW18Lane {
     fn lookup_fields() -> &'static [(&'static str, usize)] {
         pedersen_aggregator_window_bits_18::JIT_LOOKUP_FIELDS
     }
+    fn logup_descs() -> &'static [crate::witness::logup_descs::LogupDescFact] {
+        pedersen_aggregator_window_bits_18::JIT_LOGUP_DESCS
+    }
     const NEEDS_PEDERSEN_TABLE: bool = true;
     fn igen_from_flats(log_size: u32, _n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
         pedersen_aggregator_window_bits_18::interaction_gen_from_flat_lookup_words(
@@ -1007,6 +1081,9 @@ impl BuiltinLaneSpec for BlakeRoundLane {
     }
     fn lookup_fields() -> &'static [(&'static str, usize)] {
         blake_round::JIT_LOOKUP_FIELDS
+    }
+    fn logup_descs() -> &'static [crate::witness::logup_descs::LogupDescFact] {
+        blake_round::JIT_LOGUP_DESCS
     }
     const NEEDS_PEDERSEN_TABLE: bool = false;
     fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
@@ -1035,6 +1112,9 @@ impl BuiltinLaneSpec for PartialEcMulW18Lane {
     }
     fn lookup_fields() -> &'static [(&'static str, usize)] {
         partial_ec_mul_window_bits_18::JIT_LOOKUP_FIELDS
+    }
+    fn logup_descs() -> &'static [crate::witness::logup_descs::LogupDescFact] {
+        partial_ec_mul_window_bits_18::JIT_LOGUP_DESCS
     }
     fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
         partial_ec_mul_window_bits_18::interaction_gen_from_flat_lookup_words(
@@ -1068,6 +1148,9 @@ impl BuiltinLaneSpec for PartialEcMulGenericLane {
     fn lookup_fields() -> &'static [(&'static str, usize)] {
         partial_ec_mul_generic::JIT_LOOKUP_FIELDS
     }
+    fn logup_descs() -> &'static [crate::witness::logup_descs::LogupDescFact] {
+        partial_ec_mul_generic::JIT_LOGUP_DESCS
+    }
     fn igen_from_flats(log_size: u32, _n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
         partial_ec_mul_generic::interaction_gen_from_flat_lookup_words(log_size, words, n_rows)
     }
@@ -1093,6 +1176,9 @@ impl BuiltinLaneSpec for Cube252Lane {
     }
     fn lookup_fields() -> &'static [(&'static str, usize)] {
         cube_252::JIT_LOOKUP_FIELDS
+    }
+    fn logup_descs() -> &'static [crate::witness::logup_descs::LogupDescFact] {
+        cube_252::JIT_LOGUP_DESCS
     }
     fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen {
         cube_252::interaction_gen_from_flat_lookup_words(log_size, n_real, words, n_rows)
