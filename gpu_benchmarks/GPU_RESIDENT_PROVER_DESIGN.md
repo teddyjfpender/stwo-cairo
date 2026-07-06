@@ -1359,3 +1359,55 @@ through `ctx`.
 3. Pod-validate single-proof byte-identity with the island on a non-default context stream.
 4. Two `DeviceProofState`s in the resident harness (own contexts, off the mutex),
    explicit FS barrier; measure two-proof wall.
+
+## 20. NORTH STAR (2026-07-06, reviewer): GPU-Resident Proof DAG Runtime
+
+The proof stops being "Rust drives phase A, waits, copies, samples FS, drives phase B"
+and becomes a mostly device-resident DAG: explicit stream ownership, persistent
+artifacts, fused kernels, minimum transcript decisions crossing phase boundaries.
+**Sub-2s is PHASE DELETION, not scheduling** — the scheduler buys sustained MHz; sub-2s
+needs: no preproc rebuild, no host witness round trips, no full-domain materialization
+between composition/quotient/FRI, no host FS barriers, no CPU-shaped hash path.
+
+The 10 components:
+1. Streamful CudaExecContext EVERYWHERE — {stream, memory_pool, scratch_arena,
+   graph_capture_mode, proof_lane_id}. No implicit stream 0, no global stream-0 pool
+   ops, no hidden syncs. Foundation for overlap + graph capture. (CudaExecContext
+   primitive committed stwo cfd234e6; needs threading through all ops.)
+2. Persistent Compact PCS Artifact Cache — PreprocessedArtifact {root,
+   retained_merkle_layers, coeffs_or_compact_eval_source, cache_key,
+   persistent_device_storage}. HARD INVARIANT: zero pointers into per-proof arenas.
+   Removes ~1.2s warm rebuild + establishes the resident-artifact pattern. [PRIORITY 1]
+3. GPU-Resident Write-Base engine — host sends compact inputs, GPU expands columns, no
+   sub-word mirrors unless host-consumed, no host repack on critical path, component DAG
+   emits into device column buffers. Goal: Write Base <500-700ms (now ~1.84s). (D→H→D
+   sub-word gate landed a first cut, ROUND-43.)
+4. Device Fiat-Shamir minimal spine — GPU kernels produce commitments, device transcript
+   absorbs root/derives challenges, dependent kernels launch from captured graph, host
+   gets only final bytes. Makes the serial spine tiny + device-local (not "parallel FS").
+5. CUDA Graph proof DAG — capture commit→absorb→interaction→absorb→composition→quotient→
+   FRI→decommit→serialize; graph-update pointers/counts/challenges. Kills launch-gap
+   orchestration.
+6. FRI/Quotient/Decommit FUSION — composition tile→quotient tile→FRI fold/hash tile→
+   retained query material, WITHOUT writing full intermediate domains. Biggest latency
+   cut after witness+preproc. [SOUNDNESS-CRITICAL fri/pcs → SUPERVISED]
+7. GPU-native Commit/Hash engine — specialize leaf hash by log-size/column-group, hash
+   from producer registers/shared, avoid LDE write-then-reread, split BLAKE state across
+   warps for occupancy, persistent blocks for Merkle levels, batch trees/layers per
+   launch. (Leaf-occupancy hint measured FLAT ROUND-42 — the win is deleting memory
+   traffic + hash-from-tile, not tuning BLAKE.)
+8. Two-lane work-conserving scheduler — per-lane stream/pool/scratch, memory-budget
+   admission, lane A on FS/host-edge while lane B runs compute. Sustained MHz, NOT
+   single-proof sub-2s. (Negative control ROUND-40 proved host prove-path non-reentrant
+   → scheduler must schedule DEVICE work from resident states, one orchestration thread.)
+9. AOT kernel pack + shape specialization — AOT-compile all hot SN PIE shapes, specialize
+   by log-size/column-width/builtin-layout, version packs by layout/hash/config; removes
+   NVRTC from measured paths + fleet cold starts + unlocks graph-capture stability.
+10. Resident proof serialization — device builds auth paths/openings into compact buffers,
+    ONE final D2H, no thousands of small gathers, deterministic byte layout gated vs
+    current prover.
+
+PRIORITY ORDER: (1) approach-B preproc compact artifact → (2) streamful CudaExecContext /
+kill stream-0 → (3) GPU-resident Write-Base continuation → (4) device FS minimal spine →
+(5) CUDA graph replay → (6) FRI/quotient/decommit fusion → (7) commit/hash engine → (8)
+two-lane scheduler. Several (2/4/5/6) touch soundness/security-critical code = SUPERVISED.
