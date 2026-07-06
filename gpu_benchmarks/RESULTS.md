@@ -733,3 +733,50 @@ per-proof streams. Therefore:
     for meaningful two-proof throughput, not just for sub-2s single-proof latency.
   - Keystone-first (#2 fused commit + #1 device witness) is the right sequencing;
     stream plumbing alone is capped by the non-reentrant host witness path.
+
+## 2026-07-06 — Keystone #2 (fused commit) bottleneck MEASURED: occupancy-bound, not bandwidth
+
+STWO_COMMIT_PROBE (cudaFuncAttributes + cudaOccupancyMaxActiveBlocks) on SN_PIE_2 / H100 sm_90:
+  stream_leaf_update:             regs=255 localmem=64  maxBlocksPerSM=1 occupancy=0.125
+  commit_on_first_layer_lifted:   regs=255 localmem=64  maxBlocksPerSM=1 occupancy=0.125
+  commit_on_layer_using_previous: regs=251 localmem=128 maxBlocksPerSM=1 occupancy=0.125
+  stream_leaf_finalize:           regs=92              maxBlocksPerSM=2 occupancy=0.250
+
+The commit/leaf-hash kernels are pinned at 255 registers (the cap) → 1 block/SM →
+12.5% occupancy, AND already spilling to local memory. DEFINITIVELY occupancy/
+register-bound (blake2s full-unroll register explosion), confirming the ledger's
+evidence-based finding with hard numbers. The LDE HBM round-trip is a bandwidth
+red herring (~5ms); the lever is register-pressure reduction / occupancy.
+
+First byte-identical experiment: __launch_bounds__(BLOCK_SIZE, minBlocks) on the three
+255-reg kernels to force >=2 blocks/SM (25%+ occupancy). Pure perf hint — proof stays
+byte-identical (verify + hash). Tests occupancy-gain vs register-cap-spilling trade-off.
+Follow-ups if it plateaus: shared-mem message block, loop-rolled blake2s rounds
+(algorithmic register reduction without forced spilling).
+
+## 2026-07-06 — Keystone #2 leaf-occupancy hint: MEASURED FLAT (measure-first caught a false win)
+
+minBlocks=2 __launch_bounds__ hint: byte-identical (proof_kb 3006.636, verify ok),
+occupancy DOUBLED 0.125→0.250 (regs 255→128, no added spilling — confirmed by
+STWO_COMMIT_PROBE). But total-prove impact is FLAT: two minBlocks=2 warm runs gave
+11.556s and 12.38s — a 0.82s run-to-run variance on IDENTICAL config, swamping any
+signal (original 255-reg baseline was 12.33s). The occupancy avenue is a dead end
+for total prove: the leaf-hash is blake2s-COMPUTE-bound (not latency/occupancy-bound),
+and the commit-Merkle slice is small. Reverted default to 1 (neutral); kept the knob
++ probe as diagnostics. (Note: the -D=1 override didn't propagate on one build — moot
+given the flat finding; multi-rep median needed to measure sub-second changes.)
+
+WARM PHASE BREAKDOWN (SN_PIE_2, H100 sm_90, M5c diet, gpu-native — the real levers):
+  Write Base trace (D→H→D hidden tax, #1)   2091 ms   <- BIGGEST single lever
+  Trees decommit                            1350 ms
+  Compute preprocessed trace commitment     1225 ms
+  Composition                               1076 ms
+  Compute base trace commitment              671 ms
+  Compute FRI quotients                      608 ms
+  Evaluate OOD (OODS)                        572 ms
+  Compute interaction trace commitment       461 ms
+  FRI commit / decommit                  308 / 207 ms
+  prove_ex (Prove STARKs) total             4142 ms ; prove_cairo 11.5s (incl VM+adapt ~5.4s host)
+Redirect: #1 (D→H→D, ~2.1s) is the single biggest prove-side lever, > the entire
+leaf-hash. Sub-2s needs #1 (Write Base 2.1→~0.3) + commit/decommit consolidation,
+not leaf-hash occupancy. Next: close the D→H→D loop on the builtin lanes.

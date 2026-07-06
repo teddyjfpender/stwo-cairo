@@ -1431,7 +1431,8 @@ fn assert_device_builtin_leg_matches_host(
     );
     let (dev_cols, _lookup_dev, lookup_flat, _sub_dev, sub_flat) =
         stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
-            label, &cols, &tables, true,
+            label, &cols, &tables, true, // want_host_sub
+            true,
         )
         .unwrap_or_else(|| panic!("device leg [{label}]: launch unavailable"));
 

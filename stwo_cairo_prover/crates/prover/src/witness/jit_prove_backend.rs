@@ -999,6 +999,14 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
     );
 
     let want_host_lookup = !device_interaction_enabled();
+    // Skip the (largest) sub-word D2H + host repack when `sub_flat` is provably
+    // unused: an all-count builtin (device_feed present + `require`, so every count
+    // is device-fed and the host `feed` closure is a no-op) with no producer edge
+    // stash. Anything else — edge producers (stash_edge), non-required/absent feeds,
+    // or the shadow diff — keeps the host copy (fail-closed). Below, sub_flat is
+    // touched only by the stash_edge clone and the feed closure, both no-ops here.
+    let want_host_sub = !(device_feed.as_ref().is_some_and(|p| p.require) && stash_edge.is_none())
+        || std::env::var("STWO_JIT_PROVE_SHADOW").as_deref() == Ok("1");
     let (cols, lookup_dev, lookup_flat, sub_dev, sub_flat) = match &inputs {
         BuiltinInputs::HostCols(input_cols) => {
             stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
@@ -1006,6 +1014,7 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
                 input_cols,
                 tables,
                 want_host_lookup,
+                want_host_sub,
             )?
         }
         BuiltinInputs::Edge {
@@ -1021,6 +1030,7 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
                 n,
                 tables,
                 want_host_lookup,
+                want_host_sub,
             )?
         }
     };
