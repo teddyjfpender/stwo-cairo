@@ -20,6 +20,20 @@ GB = "/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench"
 SN = "/workspace/stwo-cairo/gpu_benchmarks/pie/sn"
 OUT = "/workspace/out"
 
+# --- 0. Identity baseline: the LEGACY engine's proof (self-contained — a fresh
+# pod has no deduce_off.proof from the gate manifest). ---------------------------------
+[[step]]
+name = "record-baseline"
+cmd = '''
+mkdir -p $OUT
+$GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 1 --reuse-input > /dev/null 2>&1 || true
+STWO_DUMP_PROOF=$OUT/deduce_off.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 1 --reuse-input 2>/dev/null | tail -3
+test -s $OUT/deduce_off.proof && echo BASELINE_OK'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['BASELINE_OK']
+
 # --- SN_PIE_2 (7.68M steps): the ledger's reference PIE, 3 reps + identity. ---------
 [[step]]
 name = "record-sn2"
