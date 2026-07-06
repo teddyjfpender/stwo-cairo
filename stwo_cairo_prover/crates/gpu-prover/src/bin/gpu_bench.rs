@@ -423,7 +423,12 @@ fn load_pie_input(pie_paths: &[String], copies: usize) -> LoadedInput {
         tasks,
     };
 
-    let bootloader_path = std::path::PathBuf::from(env!("BOOTLOADER_JSON_PATH"));
+    // Runtime override first: the compile-time path is baked at build and can
+    // point into a container layer that a pod stop/resume wipes ($HOME cargo
+    // checkouts); STWO_BOOTLOADER_JSON relocates it without a rebuild.
+    let bootloader_path = std::env::var("STWO_BOOTLOADER_JSON")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(env!("BOOTLOADER_JSON_PATH")));
     let bootloader_program = VmProgram::from_file(bootloader_path.as_path(), Some("main"))
         .expect("Failed to load simple_bootloader_compiled.json");
 

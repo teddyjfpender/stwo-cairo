@@ -43,3 +43,4 @@
 {"ts": "2026-07-06T02:11:03+00:00", "event": "run", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29, "purpose": "m4-validate", "run_id": "20260706T020932Z.m4-validate", "note": "FAIL"}
 {"ts": "2026-07-06T02:34:06+00:00", "event": "run", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29, "purpose": "m4-validate", "run_id": "20260706T023111Z.m4-validate", "note": "PASS"}
 {"ts": "2026-07-06T02:39:48+00:00", "event": "stop", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29}
+{"ts": "2026-07-06T03:02:08+00:00", "event": "resume", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29}

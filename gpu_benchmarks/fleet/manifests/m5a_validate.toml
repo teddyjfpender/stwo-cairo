@@ -1,0 +1,78 @@
+# M5a validation: builtin lanes as concurrent dependency arms + stream fanout
+# default-ON in gpu-native. Byte identity is the gate; the phase ledger
+# re-measures Write Base trace (was 4.08s over ~5.9s of sequential lane spans).
+#
+#   gpufleet run manifests/m5a_validate.toml --pod <ID> --skip-pregate --keep
+
+[meta]
+name = "m5a-validate"
+stop_on_failure = true
+
+[env]
+RUST_MIN_STACK = "4194304"
+STWO_JIT_MAX_KERNEL_INSTRS = "2048"
+STWO_JIT_CUBIN_CACHE = "1"
+GB = "/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench"
+SN = "/workspace/stwo-cairo/gpu_benchmarks/pie/sn"
+OUT = "/workspace/out"
+
+[[step]]
+name = "m5a-baseline"
+cmd = '''
+mkdir -p $OUT && rm -f $OUT/m5a_off.proof $OUT/m5a_on.proof
+STWO_DUMP_PROOF=$OUT/m5a_off.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 1 --reuse-input 2>/dev/null | tail -3
+test -s $OUT/m5a_off.proof && echo M5A_BASELINE_OK'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['M5A_BASELINE_OK']
+
+# gpu-native: arms + fanout default ON; identity + the B2 engagement marker +
+# the re-measured witness span.
+[[step]]
+name = "m5a-gpu-native"
+cmd = '''
+STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/m5a_on.proof \
+  $GB --pie $SN/SN_PIE_2.zip \
+  --backend cuda --engine gpu-native --reps 3 --reuse-input 2> $OUT/m5a_on.err \
+  > $OUT/m5a_on.json
+tail -2 $OUT/m5a_on.json
+grep -m1 'B2 engaged' $OUT/m5a_on.err
+python3 - <<'PY'
+import json
+docs=[d for d in (json.loads(l) for l in open('/workspace/out/m5a_on.json') if l.strip().startswith('{')) if 'phase_totals' in d]
+t=docs[-1]['phase_totals']
+for k in ['Write Base trace','Merkle','Commitment','Prove STARKs','prove_cairo']:
+    if k in t: print(f"span[{k}]={t[k]['total_ms']/1000:.3f}s")
+PY
+a=$(sha256sum $OUT/m5a_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/m5a_on.proof | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo M5A_PROOF_MATCH; else echo M5A_PROOF_MISMATCH; fi'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['B2 engaged', 'M5A_PROOF_MATCH']
+
+# Records under the new path (verify-gated internally).
+[[step]]
+name = "m5a-sn3"
+cmd = '''
+$GB --pie $SN/SN_PIE_3.zip --backend cuda --engine gpu-native --reps 2 \
+  --reuse-input 2>/dev/null | tail -1'''
+timeout_s = 10800
+gpu_bound = true
+
+[[step]]
+name = "m5a-sn4"
+cmd = '''
+$GB --pie $SN/SN_PIE_4.zip --backend cuda --engine gpu-native --reps 2 \
+  --reuse-input 2>/dev/null | tail -1'''
+timeout_s = 10800
+gpu_bound = true
+
+[[step]]
+name = "m5a-sn1"
+cmd = '''
+$GB --pie $SN/SN_PIE_1.zip --backend cuda --engine gpu-native --reps 2 \
+  --reuse-input 2>/dev/null | tail -1'''
+timeout_s = 10800
+gpu_bound = true
