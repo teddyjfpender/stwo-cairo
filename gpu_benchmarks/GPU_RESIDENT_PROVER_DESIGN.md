@@ -1197,6 +1197,17 @@ overhead." Aggressive form: never materialize full evals for some phases —
 fuse `coeffs → LDE tile → composition/quotient accumulator` so regenerated
 values STREAM through the consumer and never become a resident array.
 
+### Priority 1 STATUS (2026-07-06): batched decommit gather — LANDED, 3.6x -> 1.53x
+Bisection (STWO_PVT timers) pinned the diet's 3.6x to ONE spot: the compact
+decommit's per-row at_unreduced gather (queries x columns individual device
+readbacks), trees_decommit 17.3s — NOT composition/quotients/re-LDE (re-LDE was
+0.12s). Routed it through CUDA's batched gather_unreduced: trees_decommit
+17.3->1.26s, M5c 26.7->11.23s (1.53x vs non-diet 7.35s), byte-identical, peak
+31.6GB (two proofs fit 80GB). Residual 1.53x = inherent stream_lde regen
+(composition ExtendToEvalDomain + FRI-quotient Coeffs + the batched decommit);
+the shared-lease is the remaining P1 lever but the batched gather was dominant.
+Unblocks P2: two dieted proofs (2x31.6=63GB) fit an 80GB card at 1.53x each.
+
 ### Priority 2: M6 = a work-conserving GPU scheduler (NOT "two host threads racing")
 The scheduling unit is no longer "a proof" — it is "ready GPU work from any
 proof whose dependencies are satisfied." The scheduler owns: per-proof phase
