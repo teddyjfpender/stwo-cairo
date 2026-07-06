@@ -1221,6 +1221,47 @@ the scheduler overlaps COMPLEMENTARY kernels (not two HBM-heavy ones).
 Success metric (2× SN2 M5c wall): **<14.8s** beats non-diet throughput;
 **<11s** meaningful win; **<8s** strong signal the 10 MHz direction is real.
 
+### Priority 2 CONCRETE PLAN — M6-a: streamful two-state resident scheduler (2026-07-06)
+
+The existing `gpu_bench --pipeline` only overlaps VM/adapt producers with a
+SERIAL proving consumer (gpu_bench.rs:711/788: "current proof occupies the
+prover"; GpuCairoProver rejects pipeline_depth!=1 at prover.rs:190). It cannot
+answer the M6 question. M6-a builds the real thing:
+
+**Blocker to internalize:** every kernel launches on the legacy stream 0 and
+the pool allocates stream-0-ordered (exec_tables.rs; StreamFork forks pool
+streams FROM legacy and joins back — intra-proof only). Two host threads each
+calling prove() would serialize on stream 0 / force hidden fences. The
+DeviceProofState today (state.rs) is just phase-output types — the resident
+arena was deferred. So M6-a needs stream-explicit execution threaded through.
+
+**Increment plan (each compiles + is measured):**
+1. `--resident-pipeline N` harness (separate from `--pipeline`): pre-load N SN2
+   inputs, prove them, report `2proof_wall_s`, `per_proof_s`,
+   `sustained_useful_mhz`, `vram_peak_gb`, `feed_starved_s`, byte-equality for
+   BOTH proofs. Start by proving SEQUENTIALLY (the baseline = 2x single ≈ 22.5s
+   at M5c 11.23s) so the harness + metrics are correct before concurrency.
+2. `CudaExecContext` / `DeviceQueue` abstraction carrying (stream, priority,
+   allocator ordering, event deps). Thread it from GpuCairoProver::prove through
+   the backend launch sites (replacing implicit legacy-stream-0). Two proof
+   states get two contexts (distinct streams + pool namespaces). This is the
+   large refactor; do it incrementally, phase by phase, byte-identity-gated.
+3. Priorities: proof A critical path → high-priority stream; proof B
+   challenge-independent/background → low-priority; regen/NTT/Merkle chunked as
+   yieldable units; root/challenge reads event-gated (eventually device-FS).
+4. M5c diet ON (2x31.6=63.2GB, ~16GB H100 headroom) → budgeted eval lease:
+   retain the hottest regenerated evals across composition/quotients/decommit
+   where it saves the most seconds/GB (the spare VRAM makes the lease
+   diet-compatible HERE, unlike the single-proof case where holding = non-diet).
+5. Remove the pipeline_depth!=1 rejection (prover.rs:190) once #1-#2 land.
+
+**Hard gates (two SN2 proofs, wall time):** <14.8s beats non-diet throughput;
+<11s meaningful scheduler win; <8s strong 10 MHz signal. (NB: these are
+TWO-PROOF WALL, distinct from the 11.23s single-proof M5c latency.)
+
+Parallel, non-blocking: P3 leaf-hash redesign (warp/half-warp cooperative
+blake2s; NTT-final-output→blake2s-update to avoid the HBM LDE write+reread).
+
 ### Priority 3: redesign the leaf-hash kernel (occupancy-bound, confirmed)
 one-thread-per-leaf blake2s carries too much state (h[8]+m[16]+v[16]+temps).
 Prototype: warp-cooperative (one warp/half-warp per leaf, lanes hold pieces of
