@@ -672,3 +672,72 @@ echo "deadman installed: ttl=6.0h idle=45min pid=$(cat /var/run/gpufleet-deadman
 
 --8<-- output --8<--
 deadman installed: ttl=6.0h idle=45min pid=643
+
+$ 
+set -e
+export DEBIAN_FRONTEND=noninteractive
+command -v rsync >/dev/null && command -v tmux >/dev/null && command -v jq >/dev/null || {
+  apt-get update -qq && apt-get install -y -qq rsync tmux jq bc >/dev/null; }
+command -v cargo >/dev/null 2>&1 || [ -x ~/.cargo/bin/cargo ] || {
+  curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none >/dev/null; }
+mkdir -p /workspace
+echo bootstrap-ok
+
+--8<-- output --8<--
+perl: warning: Setting locale failed.
+perl: warning: Please check that your locale settings:
+	LANGUAGE = (unset),
+	LC_ALL = (unset),
+	LANG = "en_GB.UTF-8"
+    are supported and installed on your system.
+perl: warning: Falling back to the standard locale ("C").
+debconf: delaying package configuration, since apt-utils is not installed
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /root/.rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to default
+info: default host triple is x86_64-unknown-linux-gnu
+info: skipping toolchain installation
+bootstrap-ok
+
+$ 
+mkdir -p /var/log
+touch /tmp/gpufleet.heartbeat
+cat > /usr/local/bin/gpufleet-deadman.sh <<'DEADMAN'
+#!/bin/sh
+# gpufleet deadman: stop this pod (kill PID 1 -> container exits -> GPU billing
+# stops) on TTL expiry or on idleness (stale heartbeat AND no prover process).
+TTL_S=21600
+IDLE_S=2700
+HB=/tmp/gpufleet.heartbeat
+START=$(date +%s)
+while :; do
+  sleep 60
+  NOW=$(date +%s)
+  if [ $((NOW - START)) -ge "$TTL_S" ]; then
+    echo "$(date -u) deadman: TTL reached, stopping pod" >> /var/log/gpufleet-deadman.log
+    kill 1; exit 0
+  fi
+  HB_AGE=$((NOW - $(stat -c %Y "$HB" 2>/dev/null || echo 0)))
+  BUSY=$(pgrep -f 'gpu_bench|cargo|rustc|nvcc|ptxas|rsync' | head -1)
+  if [ "$HB_AGE" -ge "$IDLE_S" ] && [ -z "$BUSY" ]; then
+    echo "$(date -u) deadman: idle ${HB_AGE}s and no work, stopping pod"       >> /var/log/gpufleet-deadman.log
+    kill 1; exit 0
+  fi
+done
+DEADMAN
+chmod +x /usr/local/bin/gpufleet-deadman.sh
+# Replace a previous instance via PIDFILE — never pkill by pattern: this very
+# shell's cmdline contains the script text (heredoc), so any -f pattern that can
+# find the old daemon also finds and kills THIS session (learned the hard way).
+if [ -f /var/run/gpufleet-deadman.pid ]; then
+  kill "$(cat /var/run/gpufleet-deadman.pid)" 2>/dev/null || true
+fi
+nohup /usr/local/bin/gpufleet-deadman.sh >/dev/null 2>&1 &
+echo $! > /var/run/gpufleet-deadman.pid
+echo "deadman installed: ttl=6.0h idle=45min pid=$(cat /var/run/gpufleet-deadman.pid)"
+
+--8<-- output --8<--
+deadman installed: ttl=6.0h idle=45min pid=714

@@ -1293,3 +1293,69 @@ low-occupancy kernels, batching across proofs beats two separate launches.
 server + budgeted eval residency + streamed commit hashing + graph/device-FS
 orchestration. Parallelizing Fiat-Shamir itself is not the lever; scheduling
 around it and shrinking the work between barriers is.
+
+## 19. INCREMENT-2 BLUEPRINT (2026-07-06) — streamful streaming-commit island + CudaExecContext
+
+Reviewer directive (supersedes "naive two-proof" as the M6 build): increment 2 is
+NOT "two host threads calling prove" (that serializes on the `GPU_NATIVE_CUDA`
+Mutex or on stream 0, or exposes resource-lifetime bugs — it is a NEGATIVE CONTROL,
+not M6). Build a streamful ISLAND first (the self-contained M5c streaming commit),
+threaded through a resource-owning `CudaExecContext`, then wire two
+`DeviceProofState`s onto it. Generalize the pattern phase-by-phase only if the
+two-proof wall actually moves.
+
+### Backend reality (recon 2026-07-06, read-only)
+- No cudarc, no device/context object: raw CUDA FFI (`cudart` + driver + NVRTC).
+  ~127 `<<<grid,block>>>` launch sites hard-code the legacy default stream 0.
+- The pool = the device DEFAULT pool, every alloc/free/memset stream-0-ordered
+  (`cuda_mem_pool.cuh:11`, `cudaMallocFromPoolAsync/FreeAsync(...,0)`). Correctness
+  today is by stream-0 total-ordering, NOT locks. Two proofs on distinct streams
+  sharing this one pool have NO ordering guarantee between one's `cudaFreeAsync` and
+  the other's kernels → the central hazard.
+- Events + multi-stream fully available (CUDA ≥11.2). The `stwo_fanout_*` fresh-event
+  fork/join primitives exist but bridge back to legacy stream 0 — they are within-proof
+  lane helpers, NOT general per-proof streams.
+
+### The island (blake2s.rs `stream_commit_leaves_from_coeffs`, per group)
+`lde(c)` (poly.rs:619 `ntt_n2b_columns`, allocs LDE buffer) → upload pointer+log
+tables (pointer_vec.rs `UploadedDevicePointerVec`/`UploadedUint32Vec`) →
+`stream_leaf_update` (blake2s.cu:510) → `drop((table,logs,evals))` FREES on stream 0.
+That final free is the point-3 lifetime hazard verbatim.
+
+### CudaExecContext (resource-owning — NOT a bare stream ptr)
+New C++ FFI (`cuda_exec_context.cu`) + Rust RAII wrapper (`backend/exec_context.rs`):
+```
+struct StwoExecContext { cudaStream_t stream; cudaMemPool_t pool; bool owns_pool; }
+stwo_exec_context_{create,destroy,sync,stream,pool}
+stwo_exec_context_alloc_u32(ctx,count)  // cudaMallocFromPoolAsync(ctx->pool, ctx->stream)
+stwo_exec_context_free_u32(ctx,ptr)     // cudaFreeAsync(ptr, ctx->stream)  — stream-ordered on ITS stream
+```
+Each context owns its OWN `cudaMemPool` (via `cudaMemPoolCreate`, release-threshold
+UINT64_MAX) → two proofs allocate from DISJOINT pools → no cross-stream reuse hazard.
+Drop = sync stream → destroy stream → destroy pool. Buffers allocated in the context
+free on ITS stream, ordered after their last use on that stream (single-stream island
+⇒ pure stream-ordering suffices; no explicit events needed WITHIN one island).
+
+### `_on(stream)` variants (minimal hot path only)
+Add a trailing `void* stream` (null = legacy, byte-identical default — the pattern
+round-15 used for `stwo_cuda_jit_witness_launch`) to: `stream_leaf_init/update/finalize`
+(blake2s.cu), `ntt_n2b_columns` (rfft/ifft launch), and the pointer/u32 upload+free
+(so `UploadedDevicePointerVec`/`UploadedUint32Vec` alloc+free on the context stream).
+Launch becomes `kernel<<<blocks,BLOCK,0,(cudaStream_t)stream>>>(...)`. Then a
+`stream_commit_leaves_from_coeffs_on(ctx, ...)` routes every op + the per-group free
+through `ctx`.
+
+### Gates
+- Default off (null stream) ⇒ byte-identical (stream 0). Existing
+  `stream_commit_leaves_matches_bulk` + `stream_leaf_layer_matches_build_leaves` guard
+  the island; add a `_on(ctx)` byte-identity test (same digest as null).
+- Two-proof: `proof_byte_equal` + verify. Wall vs 25.24s baseline, gates <14.8/<11/<8s.
+- Realistic: island overlap alone lands ~15-20s (commit is ~2-4s/proof of ~12s);
+  <11s needs generalizing to more phases + cross-proof batching / leaf-hash wins.
+
+### Sequence
+1. CudaExecContext (C++ FFI + Rust RAII), compile-clean on mac stub.
+2. `_on(stream)` island variants + `stream_commit_leaves_from_coeffs_on` + byte-id test.
+3. Pod-validate single-proof byte-identity with the island on a non-default context stream.
+4. Two `DeviceProofState`s in the resident harness (own contexts, off the mutex),
+   explicit FS barrier; measure two-proof wall.
