@@ -24,6 +24,11 @@ pub const FLAGS: &[FlagDef] = &[
         deletion_milestone: "M4 (superseded by the VRAM diet as default on 24GB cards)",
     },
     FlagDef {
+        name: "STWO_VRAM_PHASES",
+        purpose: "per-phase pool high-water attribution (R5): log + reset at phase boundaries",
+        deletion_milestone: "never (the residency ledger instrument)",
+    },
+    FlagDef {
         name: "STWO_CAIRO_STREAM_LDE",
         purpose: "legacy-shared: release evaluations per tree at commit; later phases run from coefficients",
         deletion_milestone: "M4 (folds into the diet)",

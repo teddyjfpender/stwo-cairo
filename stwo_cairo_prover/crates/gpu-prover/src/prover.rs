@@ -39,6 +39,22 @@ use tracing::{span, Level};
 use crate::state::{IngestOutput, WitnessOutput};
 use crate::{flags, phases};
 
+/// Per-phase VRAM attribution (design §1.1 R5): when `STWO_VRAM_PHASES=1`,
+/// log the pool high-water since the previous mark, then reset — the ledger
+/// that ranks the diet's targets (stream-LDE was falsified by exactly this
+/// kind of measurement).
+fn vram_phase_mark(phase: &str) {
+    if crate::flags::flag_on("STWO_VRAM_PHASES") {
+        let (used, reserved) = stwo_backend_cuda::gpu_pool_highwater();
+        eprintln!(
+            "vram_phase[{phase}]: used_high={:.2}GB reserved_high={:.2}GB",
+            used as f64 / 1e9,
+            reserved as f64 / 1e9
+        );
+        stwo_backend_cuda::gpu_pool_highwater_reset();
+    }
+}
+
 /// The witness-side backend bounds (everything `write_trace` and the interaction
 /// generator require; no channel involved).
 pub trait CairoWitnessBackend:
@@ -231,6 +247,7 @@ where
             claim,
             interaction_generator,
         } = phases::witness::run::<B>(generator, opt_n_id_to_big_components, None);
+        vram_phase_mark("witness");
 
         // ── Domain sizing + persistent caches ────────────────────────────────
         let max_domain_log_size =
@@ -281,6 +298,7 @@ where
             commitment_scheme.set_stream_lde();
         }
 
+        vram_phase_mark("preprocessed_tree");
         commitment_scheme.commit_tree(preprocessed_tree, channel);
 
         claim.mix_into::<MC>(channel);
@@ -297,6 +315,7 @@ where
         }
         tree_builder.commit(channel);
         span.exit();
+        vram_phase_mark("base_commit");
 
         let interaction_pow = B::grind(channel, INTERACTION_POW_BITS);
         channel.mix_u64(interaction_pow);
@@ -305,6 +324,7 @@ where
         // ── Phase: interaction ───────────────────────────────────────────────
         let (interaction_trace_evals, interaction_claim) =
             phases::interaction::run(interaction_generator, &interaction_elements);
+        vram_phase_mark("interaction_write");
 
         tracing::info!(
             "Witness trace cells: {:?}",
@@ -321,6 +341,7 @@ where
         tree_builder.extend_evals(interaction_trace_evals);
         tree_builder.commit(channel);
         span.exit();
+        vram_phase_mark("interaction_commit");
 
         // ── Phase: STARK core (composition + FRI + PoW + decommit) ──────────
         let proof = phases::stark::run(
@@ -332,6 +353,8 @@ where
             commitment_scheme,
             include_all_preprocessed_columns,
         )?;
+
+        vram_phase_mark("stark_core");
 
         Ok(CairoProof {
             claim,

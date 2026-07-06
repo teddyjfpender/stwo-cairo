@@ -32,8 +32,10 @@ must_match = ['M4_BASELINE_OK']
 [[step]]
 name = "m4-gpu-native"
 cmd = '''
-STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/m4_on.proof $GB --pie $SN/SN_PIE_2.zip \
+STWO_BENCH_TRACE=json STWO_VRAM_PHASES=1 STWO_DUMP_PROOF=$OUT/m4_on.proof \
+  $GB --pie $SN/SN_PIE_2.zip \
   --backend cuda --engine gpu-native --reps 3 --reuse-input 2> $OUT/m4_on.err | tail -12
+grep 'vram_phase' $OUT/m4_on.err | tail -7
 grep -m1 'device mem count feed merged' $OUT/m4_on.err
 a=$(sha256sum $OUT/m4_off.proof | cut -d' ' -f1)
 b=$(sha256sum $OUT/m4_on.proof | cut -d' ' -f1)
