@@ -619,6 +619,19 @@ on macOS; pod validation batched into one session (running).
   stark_core 34.4) — the diet targets the base LDE+tree working set.
   Remaining M4 tail: diet design from the ledger, twiddle regen-in-kernel,
   stage-fused NTT audit, 4090 fit.
+- **M5a VALIDATED (2026-07-06, run 20260706T030913Z)**: the builtin witness
+  section runs as 7 concurrent dependency arms (edges from the certified
+  schedule + per-writer state arguments; cross-arm states are atomic
+  commutative counts; consumers stay in the sequential tail; evals order
+  restored canonically from slots) and STWO_CUDA_STREAM_FANOUT=1 joined the
+  gpu-native defaults (lanes overlap on 4 pool streams, fork/join bridged).
+  Byte-identity: gpu_native_parity_simd GREEN local, M5A_PROOF_MATCH pod.
+  Records (warm, useful MHz): SN_PIE_2 **7.39s/1.043**, SN_PIE_3
+  **8.78s/1.604**, SN_PIE_4 **10.34s/1.359**, SN_PIE_1 **10.81s/1.355** —
+  all four PIEs above 1 MHz useful. Ledger: Write Base trace 4.08→2.33s;
+  prove_cairo 7.47s ≈ witness 2.3 + commit 2.0 + STARKs 2.2 — the pie is
+  even, so M5b inter-tree overlap and M6 pipelining are the road on.
+  Fleet math: 10 MHz aggregate ≈ 6-7 H100s.
 
 ## 12. Effort and risk
 
