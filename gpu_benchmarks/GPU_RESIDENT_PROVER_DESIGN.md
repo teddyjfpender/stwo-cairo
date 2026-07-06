@@ -633,6 +633,31 @@ on macOS; pod validation batched into one session (running).
   even, so M5b inter-tree overlap and M6 pipelining are the road on.
   Fleet math: 10 MHz aggregate ≈ 6-7 H100s.
 
+- **M5b VALIDATED + FINALIZED (2026-07-06)**: batched OODS (group by
+  (log_size, folded point), one launch pair + one D2H per group) — within-
+  session A/B −0.38s on SN3, OODS span 0.56→0.076s, byte-identical; guarded
+  at grid.y>65535 (adversarial-review finding). Leaf-hash __launch_bounds__:
+  Merkle-span decomposition showed 95% of Merkle is the log24 LEAF hash
+  (635ms/rep, occupancy-bound), cut to 512ms/rep (−19%) by capping registers.
+  Per-lane committer DISABLED from defaults (A/B: helps SN2 ~0.3s, within-
+  noise/negative on 14M PIEs — overlap must pay; flag+code retained).
+  Sustained pipelining 0.543→0.741 useful MHz (+36%). Methodology: pod
+  inter-session variance ~7-8%, within-session 2.1% — A/B on one pod state is
+  the reliable measurement. Adversarial workflow: 4/5 findings refuted.
+- **10 MHz THESIS (converged)**: single-card intra-proof micro-levers are
+  exhausted (sub-second, near noise). The linchpin is the VRAM DIET at the
+  base_commit peak (40.7GB): sustained pipelining is below single (0.74<1.05)
+  because 2× SN2 (85GB) don't fit an 80GB card → concurrent proofs serialize
+  on VRAM. stream_lde only cuts POST-commit retention, not the peak (all ~700
+  LDE'd base columns must be resident for the leaf hash). The real diet =
+  STREAM LDE COLUMN-GROUPS INTO THE LEAF HASH incrementally (LDE a group →
+  update every leaf's running blake2s state → free the group), cutting the
+  peak from all-columns to one-group + leaf states. Byte-identical (blake2s
+  is streaming), soundness-adjacent (VCS path → conformance gate + review).
+  Then 2 proofs fit → M6 pipelining pays (sustained → ~1.5-2× single) → fleet
+  → 10 MHz aggregate. The diet is thus the H100 pipelining gate, not just the
+  4090 gate.
+
 ## 11c. Next-lever ranking (adversarial-review workflow, 2026-07-06)
 
 An 11-agent adversarial workflow reviewed the M5b changes (4/5 findings
