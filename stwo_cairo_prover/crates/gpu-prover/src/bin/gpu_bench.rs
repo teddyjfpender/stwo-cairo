@@ -782,6 +782,140 @@ fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
     );
 }
 
+/// M6-a increment 2: TRUE two-proof concurrency — `N` host threads, each driving a
+/// full independent proof through its OWN `GpuCairoProver` instance, so the
+/// process-global singleton `Mutex` that `prove_sampled!` locks (which would
+/// serialize the threads on the host) is bypassed. One VRAM sampler spans the whole
+/// concurrent window, so `vram_peak_gb` is the SIMULTANEOUS resident peak (two
+/// dieted SN2 proofs ~= 63GB on an 80GB card). The M5c diet stays on.
+///
+/// Correctness: the two proofs allocate DISJOINT pool buffers, and today every
+/// kernel + pool op is ordered on the legacy default stream 0 (backend recon), so
+/// their GPU work is totally ordered on one stream => byte-identical proofs (gated
+/// by `proof_byte_equal`), just GPU-serialized. What overlaps is the HOST compute
+/// (the ~96%-idle-GPU wall is host-bound: partial_ec_mul / blake witness gen on the
+/// CPU). This measures that host overlap — the cheap lever before the
+/// per-thread-default-stream build, which would additionally isolate each proof
+/// onto its own stream and lift the stream-0 D2H-drain coupling.
+///
+/// The per-thread `set_var` races that `GpuCairoProver::{new,prove}` would trigger
+/// are all pre-empted on the main thread before any spawn: the diet vars are set
+/// here, and a throwaway prover is constructed to run `apply_gpu_native_defaults` +
+/// CUDA init once, so per-thread construction finds every env var already set and
+/// writes none.
+fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
+    assert!(n >= 1, "--resident-concurrent <N> must be >= 1");
+    assert_eq!(backend, "cuda", "resident-concurrent is cuda-only");
+    assert_eq!(
+        engine().as_str(),
+        "gpu-native",
+        "resident-concurrent requires --engine gpu-native (the M5c diet path)"
+    );
+    let variant = source.preprocessed_variant();
+    prewarm_pedersen_tables(variant);
+
+    // Pre-set the diet-implied env on the MAIN thread (single-threaded here), so
+    // GpuCairoProver::prove's internal set_var is a guarded no-op and no write races
+    // a sibling thread's getenv. Mirrors main()'s STREAM_LDE fan-out but also covers
+    // the STREAM_LEAF_COMMIT diet used by the sequential baseline.
+    let diet_on = std::env::var("STWO_CUDA_STREAM_LEAF_COMMIT").as_deref() == Ok("1")
+        || std::env::var("STWO_CAIRO_STREAM_LDE").as_deref() == Ok("1");
+    if diet_on {
+        // SAFETY: single-threaded (before any spawn); no sibling getenv yet.
+        unsafe {
+            std::env::set_var("STWO_STORE_COEFFS", "1");
+            std::env::set_var("STWO_FORCE_EXTEND_EVAL_MODE", "1");
+        }
+    }
+    // Warm-up prover on the main thread: runs apply_gpu_native_defaults (set_var of
+    // any unset GPU_NATIVE_DEFAULTS) and one-time CUDA init BEFORE spawning, so the
+    // per-thread `new` calls find every default set and race no env writes.
+    drop(
+        GpuCairoProver::<stwo_backend_cuda::CudaBackend, Blake2sMerkleChannel>::new(
+            GpuProverConfig::default(),
+        )
+        .expect("warm-up gpu prover"),
+    );
+
+    let loaded = source.load();
+    let pie_n_steps = loaded.pie_n_steps;
+    let cycle_count = cycle_count_of(&loaded.input);
+    let inputs: Vec<ProverInput> = (0..n).map(|_| loaded.input.clone()).collect();
+
+    let sampler = VramSampler::start();
+    let wall_start = Instant::now();
+
+    // Each thread builds its own prover (prove() takes &mut self) and proves one
+    // proof; returns (prove_s, proof_hash). thread::scope joins all before returning.
+    let results: Vec<(f64, u64)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(i, input)| {
+                scope.spawn(move || {
+                    let mut prover = GpuCairoProver::<
+                        stwo_backend_cuda::CudaBackend,
+                        Blake2sMerkleChannel,
+                    >::new(GpuProverConfig::default())
+                    .expect("per-thread gpu prover");
+                    let t = Instant::now();
+                    let proof = prover
+                        .prove(input, prover_params(variant))
+                        .expect("concurrent prove failed");
+                    let elapsed = t.elapsed().as_secs_f64();
+                    let bytes = bincode::serialize(&proof).expect("serialize proof");
+                    let hash = seahash_of(&bytes);
+                    // Verify one proof (outside the per-proof timer; ~20ms, negligible
+                    // on the wall) to confirm the concurrent path produces valid proofs.
+                    if i == 0 {
+                        verify_cairo::<Blake2sMerkleChannel>(proof.into())
+                            .expect("concurrent proof verify");
+                    }
+                    eprintln!("concurrent_proof={i} prove_s={elapsed:.3}");
+                    (elapsed, hash)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("prover thread panicked"))
+            .collect()
+    });
+
+    let wall_s = wall_start.elapsed().as_secs_f64();
+    let vram_peak_gb = sampler.stop();
+
+    // Same statement proved N times => identical proof bytes.
+    let byte_equal = results.iter().all(|(_, h)| *h == results[0].1);
+    let per_proof_s = results.iter().map(|(t, _)| *t).sum::<f64>() / n as f64;
+    // serial_wall = what the same N proofs cost back-to-back; overlap_speedup =
+    // how much the concurrency compressed that (1.0 = fully serialized, N = perfect).
+    let serial_wall: f64 = results.iter().map(|(t, _)| *t).sum();
+    let total_steps = pie_n_steps.map(|s| s * n);
+    println!(
+        "{}",
+        merge_json(
+            json!({
+                "mode": "resident-concurrent",
+                "concurrency": "threaded-stream0",
+                "n_proofs": n,
+                "twoproof_wall_s": round3(wall_s),
+                "per_proof_s": round3(per_proof_s),
+                "serial_wall_s": round3(serial_wall),
+                "overlap_speedup": round3(serial_wall / wall_s),
+                "sustained_steps_per_s": total_steps.map(|s| (s as f64 / wall_s).round()),
+                "sustained_useful_mhz": total_steps.map(|s| round3(s as f64 / wall_s / 1e6)),
+                "cycle_useful_mhz": round3((cycle_count * n) as f64 / wall_s / 1e6),
+                "vram_peak_gb": round3(vram_peak_gb),
+                "feed_starved_s": 0.0,
+                "proof_byte_equal": byte_equal,
+                "pie_n_steps": pie_n_steps,
+            }),
+            record_context(backend)
+        )
+    );
+}
+
 fn seahash_of(bytes: &[u8]) -> u64 {
     // Cheap content hash for cross-proof byte-equality (no crypto needed here).
     let mut h = 0xcbf29ce484222325u64;
@@ -1156,6 +1290,16 @@ fn main() {
     if let Some(n) = arg("--resident-pipeline") {
         let n: usize = n.parse().expect("--resident-pipeline <N>");
         run_resident_pipeline(&source, &backend, n);
+        return;
+    }
+
+    // M6-a increment 2: N proofs CONCURRENTLY (one host thread + own prover each),
+    // vs --resident-pipeline's sequential baseline. Reports the same two-proof-wall
+    // metrics plus overlap_speedup (serial_wall / wall). This is the throughput
+    // experiment the M6 gates measure (<14.8s / <11s / <8s two-proof wall).
+    if let Some(n) = arg("--resident-concurrent") {
+        let n: usize = n.parse().expect("--resident-concurrent <N>");
+        run_resident_concurrent(&source, &backend, n);
         return;
     }
 

@@ -240,8 +240,13 @@ where
         // rather than read the released buffers. Set before the composition phase
         // reads it; the witness/commit phases ignore this flag.
         // SAFETY: single set on the main thread before any concurrent getenv of
-        // this key (composition runs later).
-        if flags::flag_on("STWO_CUDA_STREAM_LEAF_COMMIT") || flags::flag_on("STWO_CAIRO_STREAM_LDE")
+        // this key (composition runs later). The `!= Ok("1")` guard makes this a
+        // no-op when the caller already set the var on the main thread before
+        // spawning prove threads (the resident-concurrent harness does exactly
+        // this) — so no set_var ever races a sibling thread's getenv.
+        if (flags::flag_on("STWO_CUDA_STREAM_LEAF_COMMIT")
+            || flags::flag_on("STWO_CAIRO_STREAM_LDE"))
+            && std::env::var("STWO_FORCE_EXTEND_EVAL_MODE").as_deref() != Ok("1")
         {
             unsafe {
                 std::env::set_var("STWO_FORCE_EXTEND_EVAL_MODE", "1");
