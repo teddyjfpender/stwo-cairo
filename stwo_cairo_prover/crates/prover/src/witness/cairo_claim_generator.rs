@@ -1240,30 +1240,97 @@ impl CairoClaimGenerator {
         // (verify_instruction, blake_round, partial_ec_mul, pedersen_aggregator, ...)
         // generate — hiding the opcode iFFTs under the ~2.8s host block. `evals` is
         // emptied here so the rest of the assembly refills it with the suffix columns.
-        let opcode_committer: Option<(std::thread::JoinHandle<Vec<CircleCoefficients<B>>>, usize)> =
-            pipeline_twiddles.map(|tree| {
-                let opcode_evals = std::mem::take(&mut evals);
-                let tree_ptr = tree as *const TwiddleTree<B> as usize;
-                // One-time engage marker so the gate can confirm the ON path actually ran
-                // (rather than silently falling back to Evals on a cold twiddle cache).
-                {
-                    use std::sync::Once;
-                    static ENGAGED: Once = Once::new();
-                    ENGAGED.call_once(|| {
-                        // ASCII-only marker ("A2", not "A\u{2033}"): a grep pattern like
-                        // `A. engaged` matches a single BYTE for `.`, which cannot span the
-                        // 3-byte UTF-8 prime, so a unicode marker reads as never-engaged.
-                        eprintln!(
-                            "STWO_CUDA_PIPELINED_COMMIT: A2 engaged - {} opcode-prefix \
-                         columns interpolating on a committer thread under the host-heavy witness \
-                         components",
-                            opcode_evals.len()
-                        );
-                    });
+        // M5b: the committer is a CHANNEL — batch 0 is the opcode prefix (as in
+        // A2), and every builtin lane sends its columns the moment it finishes,
+        // so their iFFTs run on the committer thread WHILE later arms and the
+        // sequential tail still generate. Batches carry their canonical index
+        // (the drain order below) and are re-sorted at the join, so the final
+        // polynomial order is exactly the sequential path's `evals` order.
+        #[allow(clippy::type_complexity)]
+        let committer: Option<(
+            std::sync::mpsc::Sender<(usize, Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>)>,
+            std::thread::JoinHandle<Vec<(usize, Vec<CircleCoefficients<B>>)>>,
+            usize,
+        )> = pipeline_twiddles.map(|tree| {
+            let opcode_evals = std::mem::take(&mut evals);
+            let tree_ptr = tree as *const TwiddleTree<B> as usize;
+            // One-time engage marker so the gate can confirm the ON path actually ran
+            // (rather than silently falling back to Evals on a cold twiddle cache).
+            {
+                use std::sync::Once;
+                static ENGAGED: Once = Once::new();
+                ENGAGED.call_once(|| {
+                    // ASCII-only marker ("A2", not "A\u{2033}"): a grep pattern like
+                    // `A. engaged` matches a single BYTE for `.`, which cannot span the
+                    // 3-byte UTF-8 prime, so a unicode marker reads as never-engaged.
+                    eprintln!(
+                        "STWO_CUDA_PIPELINED_COMMIT: A2 engaged - {} opcode-prefix \
+                         columns + per-lane builtin batches interpolating on a committer \
+                         thread under the witness arms",
+                        opcode_evals.len()
+                    );
+                });
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send((0usize, opcode_evals))
+                .expect("committer receiver alive at construction");
+            let handle = std::thread::spawn(move || {
+                let mut out = Vec::new();
+                while let Ok((idx, batch)) = rx.recv() {
+                    out.push((idx, B::interpolate_columns(batch, tree)));
                 }
-                let handle = std::thread::spawn(move || B::interpolate_columns(opcode_evals, tree));
-                (handle, tree_ptr)
+                out
             });
+            (tx, handle, tree_ptr)
+        });
+
+        /// Hand a finished lane's columns to the committer (returning an empty
+        /// vec for its slot) or keep them for the sequential interpolate path.
+        fn send_or_keep<T>(
+            idx: usize,
+            ev: Vec<T>,
+            tx: &Option<std::sync::mpsc::Sender<(usize, Vec<T>)>>,
+        ) -> Vec<T> {
+            match tx {
+                Some(tx) => {
+                    tx.send((idx, ev)).expect("lane committer thread alive");
+                    Vec::new()
+                }
+                None => ev,
+            }
+        }
+
+        // Canonical batch indices = the drain order below (batch 0 = opcode prefix;
+        // the sequential tail's columns interpolate at the join, after all batches).
+        const L_VI: usize = 1;
+        const L_BLAKE_ROUND: usize = 2;
+        const L_BLAKE_G: usize = 3;
+        const L_SIGMA: usize = 4;
+        const L_TRIPLE_XOR: usize = 5;
+        const L_XOR12: usize = 6;
+        const L_ADD_MOD: usize = 7;
+        const L_BITWISE: usize = 8;
+        const L_MUL_MOD: usize = 9;
+        const L_PEDERSEN_B: usize = 10;
+        const L_NARROW: usize = 11;
+        const L_POSEIDON_B: usize = 12;
+        const L_RC96: usize = 13;
+        const L_RC_B: usize = 14;
+        const L_EC_OP: usize = 15;
+        const L_EC_GEN: usize = 16;
+        const L_AGG18: usize = 17;
+        const L_ECM18: usize = 18;
+        const L_PTS18: usize = 19;
+        const L_AGG9: usize = 20;
+        const L_ECM9: usize = 21;
+        const L_PTS9: usize = 22;
+        const L_POS_AGG: usize = 23;
+        const L_POS3: usize = 24;
+        const L_POS_FULL: usize = 25;
+        const L_CUBE: usize = 26;
+        const L_KEYS: usize = 27;
+        const L_RC252: usize = 28;
+        let lane_tx = committer.as_ref().map(|(tx, ..)| tx.clone());
 
         // ---------------------------------------------------------------------
         // Builtin lanes: dependency arms (design M5a). The certified schedule +
@@ -1359,6 +1426,7 @@ impl CairoClaimGenerator {
             // Arm V: verify_instruction (all opcode feeders joined above).
             if let Some(gen) = vi_gen {
                 let slot = &mut vi_out;
+                let tx = lane_tx.clone();
                 s.spawn(move |_| {
                     let _wt = tracing::info_span!("wt:verify_instruction").entered();
                     let (trace, claim, interaction_gen) = gen.write_trace(
@@ -1367,7 +1435,11 @@ impl CairoClaimGenerator {
                         addr_state.unwrap(),
                         id_state.unwrap(),
                     );
-                    *slot = Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    *slot = Some((
+                        send_or_keep(L_VI, B::from_simd_evals(trace.to_evals()), &tx),
+                        claim,
+                        interaction_gen,
+                    ));
                 });
             }
 
@@ -1378,6 +1450,7 @@ impl CairoClaimGenerator {
                 let sigma_slot = &mut blake_round_sigma_out;
                 let txor_slot = &mut triple_xor_32_out;
                 let vbx12_slot = &mut verify_bitwise_xor_12_out;
+                let tx = lane_tx.clone();
                 s.spawn(move |_| {
                     let sigma_gen = blake_round_sigma_gen;
                     let blake_g_state = blake_g_gen;
@@ -1395,7 +1468,11 @@ impl CairoClaimGenerator {
                             blake_g_state.as_ref().unwrap(),
                             jit_memory,
                         );
-                        *blake_round_slot = Some((trace, claim, interaction_gen));
+                        *blake_round_slot = Some((
+                            send_or_keep(L_BLAKE_ROUND, trace, &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = blake_g_state {
                         let _wt = tracing::info_span!("wt:blake_g").entered();
@@ -1407,24 +1484,35 @@ impl CairoClaimGenerator {
                             vbx_7.unwrap(),
                             vbx_9.unwrap(),
                         );
-                        *blake_g_slot = Some((trace, claim, interaction_gen));
+                        *blake_g_slot =
+                            Some((send_or_keep(L_BLAKE_G, trace, &tx), claim, interaction_gen));
                     }
                     if let Some(gen) = sigma_gen {
                         let _wt = tracing::info_span!("wt:blake_round_sigma").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace();
-                        *sigma_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *sigma_slot = Some((
+                            send_or_keep(L_SIGMA, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = triple_xor_32_gen {
                         let _wt = tracing::info_span!("wt:triple_xor_32").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace(vbx_8.unwrap());
-                        *txor_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *txor_slot = Some((
+                            send_or_keep(L_TRIPLE_XOR, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = verify_bitwise_xor_12_gen {
                         let _wt = tracing::info_span!("wt:verify_bitwise_xor_12").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace();
-                        *vbx12_slot = Some((B::from_simd_evals(trace), claim, interaction_gen));
+                        *vbx12_slot = Some((
+                            send_or_keep(L_XOR12, B::from_simd_evals(trace), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                 });
             }
@@ -1436,13 +1524,17 @@ impl CairoClaimGenerator {
                 let mul_mod_slot = &mut mul_mod_builtin_out;
                 let rc96_slot = &mut range_check96_builtin_out;
                 let rcb_slot = &mut range_check_builtin_out;
+                let tx = lane_tx.clone();
                 s.spawn(move |_| {
                     if let Some(gen) = add_mod_builtin_gen {
                         let _wt = tracing::info_span!("wt:add_mod_builtin").entered();
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), id_state.unwrap());
-                        *add_mod_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *add_mod_slot = Some((
+                            send_or_keep(L_ADD_MOD, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = bitwise_builtin_gen {
                         let _wt = tracing::info_span!("wt:bitwise_builtin").entered();
@@ -1452,8 +1544,11 @@ impl CairoClaimGenerator {
                             vbx_9.unwrap(),
                             vbx_8.unwrap(),
                         );
-                        *bitwise_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *bitwise_slot = Some((
+                            send_or_keep(L_BITWISE, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = mul_mod_builtin_gen {
                         let _wt = tracing::info_span!("wt:mul_mod_builtin").entered();
@@ -1464,22 +1559,31 @@ impl CairoClaimGenerator {
                             rc_3_6_6_3.unwrap(),
                             rc_18.unwrap(),
                         );
-                        *mul_mod_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *mul_mod_slot = Some((
+                            send_or_keep(L_MUL_MOD, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = range_check96_builtin_gen {
                         let _wt = tracing::info_span!("wt:range_check96_builtin").entered();
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), id_state.unwrap(), rc_6.unwrap());
-                        *rc96_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *rc96_slot = Some((
+                            send_or_keep(L_RC96, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = range_check_builtin_gen {
                         let _wt = tracing::info_span!("wt:range_check_builtin").entered();
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), id_state.unwrap());
-                        *rcb_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *rcb_slot = Some((
+                            send_or_keep(L_RC_B, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                 });
             }
@@ -1491,6 +1595,7 @@ impl CairoClaimGenerator {
                 let agg18_slot = &mut pedersen_aggregator_window_bits_18_out;
                 let ecm18_slot = &mut partial_ec_mul_window_bits_18_out;
                 let pts18_slot = &mut pedersen_points_table_window_bits_18_out;
+                let tx = lane_tx.clone();
                 s.spawn(move |_| {
                     let agg18_gen = pedersen_aggregator_window_bits_18_gen;
                     let ecm18_gen = partial_ec_mul_window_bits_18_gen;
@@ -1499,8 +1604,11 @@ impl CairoClaimGenerator {
                         let _wt = tracing::info_span!("wt:pedersen_builtin").entered();
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), agg18_gen.as_ref().unwrap());
-                        *ped_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *ped_slot = Some((
+                            send_or_keep(L_PEDERSEN_B, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = agg18_gen {
                         let _wt =
@@ -1513,7 +1621,8 @@ impl CairoClaimGenerator {
                                 ecm18_gen.as_ref().unwrap(),
                                 jit_memory,
                             );
-                        *agg18_slot = Some((trace, claim, interaction_gen));
+                        *agg18_slot =
+                            Some((send_or_keep(L_AGG18, trace, &tx), claim, interaction_gen));
                     }
                     if let Some(gen) = ecm18_gen {
                         let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_18").entered();
@@ -1525,14 +1634,18 @@ impl CairoClaimGenerator {
                                 rc_20.unwrap(),
                                 jit_memory,
                             );
-                        *ecm18_slot = Some((trace, claim, interaction_gen));
+                        *ecm18_slot =
+                            Some((send_or_keep(L_ECM18, trace, &tx), claim, interaction_gen));
                     }
                     if let Some(gen) = pts18_gen {
                         let _wt = tracing::info_span!("wt:pedersen_points_table_window_bits_18")
                             .entered();
                         let (trace, claim, interaction_gen) = gen.write_trace();
-                        *pts18_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *pts18_slot = Some((
+                            send_or_keep(L_PTS18, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                 });
             }
@@ -1543,6 +1656,7 @@ impl CairoClaimGenerator {
                 let agg9_slot = &mut pedersen_aggregator_window_bits_9_out;
                 let ecm9_slot = &mut partial_ec_mul_window_bits_9_out;
                 let pts9_slot = &mut pedersen_points_table_window_bits_9_out;
+                let tx = lane_tx.clone();
                 s.spawn(move |_| {
                     let agg9_gen = pedersen_aggregator_window_bits_9_gen;
                     let ecm9_gen = partial_ec_mul_window_bits_9_gen;
@@ -1552,8 +1666,11 @@ impl CairoClaimGenerator {
                             tracing::info_span!("wt:pedersen_builtin_narrow_windows").entered();
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), agg9_gen.as_ref().unwrap());
-                        *narrow_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *narrow_slot = Some((
+                            send_or_keep(L_NARROW, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = agg9_gen {
                         let _wt =
@@ -1563,8 +1680,11 @@ impl CairoClaimGenerator {
                             rc_8.unwrap(),
                             ecm9_gen.as_ref().unwrap(),
                         );
-                        *agg9_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *agg9_slot = Some((
+                            send_or_keep(L_AGG9, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = ecm9_gen {
                         let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_9").entered();
@@ -1573,15 +1693,21 @@ impl CairoClaimGenerator {
                             rc_9_9.unwrap(),
                             rc_20.unwrap(),
                         );
-                        *ecm9_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *ecm9_slot = Some((
+                            send_or_keep(L_ECM9, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = pts9_gen {
                         let _wt =
                             tracing::info_span!("wt:pedersen_points_table_window_bits_9").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace();
-                        *pts9_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *pts9_slot = Some((
+                            send_or_keep(L_PTS9, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                 });
             }
@@ -1590,6 +1716,7 @@ impl CairoClaimGenerator {
             {
                 let ec_op_slot = &mut ec_op_builtin_out;
                 let ec_gen_slot = &mut partial_ec_mul_generic_out;
+                let tx = lane_tx.clone();
                 s.spawn(move |_| {
                     let ec_generic_gen = partial_ec_mul_generic_gen;
                     if let Some(gen) = ec_op_builtin_gen {
@@ -1600,8 +1727,11 @@ impl CairoClaimGenerator {
                             rc_8.unwrap(),
                             ec_generic_gen.as_ref().unwrap(),
                         );
-                        *ec_op_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *ec_op_slot = Some((
+                            send_or_keep(L_EC_OP, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = ec_generic_gen {
                         let _wt = tracing::info_span!("wt:partial_ec_mul_generic").entered();
@@ -1613,7 +1743,8 @@ impl CairoClaimGenerator {
                                 rc_20.unwrap(),
                                 jit_memory,
                             );
-                        *ec_gen_slot = Some((trace, claim, interaction_gen));
+                        *ec_gen_slot =
+                            Some((send_or_keep(L_EC_GEN, trace, &tx), claim, interaction_gen));
                     }
                 });
             }
@@ -1628,6 +1759,7 @@ impl CairoClaimGenerator {
                 let cube_slot = &mut cube_252_out;
                 let keys_slot = &mut poseidon_round_keys_out;
                 let rc252_slot = &mut range_check_252_width_27_out;
+                let tx = lane_tx.clone();
                 s.spawn(move |_| {
                     let pos_agg_gen = poseidon_aggregator_gen;
                     let pos3_gen = poseidon_3_partial_rounds_chain_gen;
@@ -1639,8 +1771,11 @@ impl CairoClaimGenerator {
                         let _wt = tracing::info_span!("wt:poseidon_builtin").entered();
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), pos_agg_gen.as_ref().unwrap());
-                        *pos_b_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *pos_b_slot = Some((
+                            send_or_keep(L_POSEIDON_B, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = pos_agg_gen {
                         let _wt = tracing::info_span!("wt:poseidon_aggregator").entered();
@@ -1654,8 +1789,11 @@ impl CairoClaimGenerator {
                             rc_4_4.unwrap(),
                             pos3_gen.as_ref().unwrap(),
                         );
-                        *pos_agg_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *pos_agg_slot = Some((
+                            send_or_keep(L_POS_AGG, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = pos3_gen {
                         let _wt =
@@ -1667,8 +1805,11 @@ impl CairoClaimGenerator {
                             rc_4_4.unwrap(),
                             rc252_gen.as_ref().unwrap(),
                         );
-                        *pos3_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *pos3_slot = Some((
+                            send_or_keep(L_POS3, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = pos_full_gen {
                         let _wt = tracing::info_span!("wt:poseidon_full_round_chain").entered();
@@ -1677,8 +1818,11 @@ impl CairoClaimGenerator {
                             keys_gen.as_ref().unwrap(),
                             rc_3_3_3_3_3.unwrap(),
                         );
-                        *pos_full_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *pos_full_slot = Some((
+                            send_or_keep(L_POS_FULL, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = cube_gen {
                         let _wt = tracing::info_span!("wt:cube_252").entered();
@@ -1688,20 +1832,27 @@ impl CairoClaimGenerator {
                             rc_20.unwrap(),
                             jit_memory,
                         );
-                        *cube_slot = Some((trace, claim, interaction_gen));
+                        *cube_slot =
+                            Some((send_or_keep(L_CUBE, trace, &tx), claim, interaction_gen));
                     }
                     if let Some(gen) = keys_gen {
                         let _wt = tracing::info_span!("wt:poseidon_round_keys").entered();
                         let (trace, claim, interaction_gen) = gen.write_trace();
-                        *keys_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *keys_slot = Some((
+                            send_or_keep(L_KEYS, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                     if let Some(gen) = rc252_gen {
                         let _wt = tracing::info_span!("wt:range_check_252_width_27").entered();
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(rc_9_9.unwrap(), rc_18.unwrap());
-                        *rc252_slot =
-                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                        *rc252_slot = Some((
+                            send_or_keep(L_RC252, B::from_simd_evals(trace.to_evals()), &tx),
+                            claim,
+                            interaction_gen,
+                        ));
                     }
                 });
             }
@@ -1970,10 +2121,19 @@ impl CairoClaimGenerator {
         // the full `evals` at once (`interpolate_columns` is per-column independent).
         // Without a committer, `evals` is the full trace and the caller interpolates
         // it at commit time exactly as before (byte-identical to the pre-A″ flow).
-        let base_trace = match opcode_committer {
-            Some((handle, tree_ptr)) => {
+        let base_trace = match committer {
+            Some((tx, handle, tree_ptr)) => {
+                // Dropping the sender ends the committer's recv loop after the
+                // last in-flight batch.
+                drop(lane_tx);
+                drop(tx);
                 let tree = pipeline_twiddles.expect("committer implies pipeline_twiddles");
-                let mut polys = handle.join().expect("A″ opcode committer thread panicked");
+                let mut batches = handle.join().expect("lane committer thread panicked");
+                batches.sort_by_key(|(idx, _)| *idx);
+                let mut polys: Vec<CircleCoefficients<B>> =
+                    batches.into_iter().flat_map(|(_, b)| b).collect();
+                // The sequential tail's columns (memory/rc/xor lanes) are the
+                // final canonical suffix — interpolated here, appended last.
                 polys.extend(B::interpolate_columns(evals, tree));
                 BaseTrace::Polys { polys, tree_ptr }
             }

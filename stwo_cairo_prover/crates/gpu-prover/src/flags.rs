@@ -38,6 +38,11 @@ pub const FLAGS: &[FlagDef] = &[
         purpose: "legacy-shared: witness lanes launch on pool streams (fork/join bridged) so concurrent lanes overlap on-device",
         deletion_milestone: "M6 (fanout becomes the unconditional lane path)",
     },
+    FlagDef {
+        name: "STWO_CUDA_PIPELINED_COMMIT",
+        purpose: "legacy-shared: warm proves interpolate finished lanes on a committer thread under the witness phase",
+        deletion_milestone: "M6 (the committer becomes the unconditional path)",
+    },
 ];
 
 /// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed
@@ -58,6 +63,10 @@ pub const GPU_NATIVE_DEFAULTS: &[(&str, &str)] = &[
     // overlap on-device. Post-Merkle ledger: Write Base trace 4.08s over
     // ~5.9s of sequential lane spans is the #1 remaining lever.
     ("STWO_CUDA_STREAM_FANOUT", "1"),
+    // M5b: warm proves interpolate the opcode prefix + every finished builtin
+    // lane on a committer thread under the witness arms (per-lane batches,
+    // canonical reassembly, tree verified by identity at commit).
+    ("STWO_CUDA_PIPELINED_COMMIT", "1"),
 ];
 
 /// Apply [`GPU_NATIVE_DEFAULTS`] (unset variables only). Called once at

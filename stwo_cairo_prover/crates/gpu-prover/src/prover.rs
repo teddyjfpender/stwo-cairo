@@ -241,12 +241,25 @@ where
         } = phases::ingest::run(input, preprocessed_trace_variant);
 
         // ── Phase: witness ───────────────────────────────────────────────────
-        // M1 passes no pipelined-commit twiddles: the byte-identical Evals path.
+        // Pipelined commit (M5b): on a WARM process the largest cached twiddle
+        // tree is the commitment tree, so the witness phase interpolates the
+        // opcode prefix AND each finished builtin lane on a committer thread
+        // while later arms still generate. Cold prove (empty cache) or flag off
+        // → None → the byte-identical Evals path. The commit site verifies the
+        // tree by identity and fails closed if the trace size changed.
+        let pipeline_twiddles = if flags::flag_on("STWO_CUDA_PIPELINED_COMMIT") {
+            self.twiddles
+                .iter()
+                .max_by_key(|(log_size, _)| **log_size)
+                .map(|(_, tree)| *tree)
+        } else {
+            None
+        };
         let WitnessOutput {
             trace,
             claim,
             interaction_generator,
-        } = phases::witness::run::<B>(generator, opt_n_id_to_big_components, None);
+        } = phases::witness::run::<B>(generator, opt_n_id_to_big_components, pipeline_twiddles);
         vram_phase_mark("witness");
 
         // ── Domain sizing + persistent caches ────────────────────────────────
@@ -308,9 +321,17 @@ where
             BaseTrace::Evals(evals) => {
                 tree_builder.extend_evals(evals);
             }
-            BaseTrace::Polys { .. } => {
-                // write_trace was called with pipeline_twiddles=None above.
-                unreachable!("gpu-native M1 requested the Evals path");
+            BaseTrace::Polys { polys, tree_ptr } => {
+                // Byte-identity requires the committer to have interpolated with
+                // THIS exact tree — verify by identity, fail closed on a
+                // mid-process trace-size change (a stale tree would silently
+                // fork the proof).
+                assert_eq!(
+                    tree_ptr, twiddles as *const TwiddleTree<B> as usize,
+                    "STWO_CUDA_PIPELINED_COMMIT: committer tree is not the commitment tree \
+                     (trace size changed mid-process)"
+                );
+                tree_builder.extend_polys(polys);
             }
         }
         tree_builder.commit(channel);
