@@ -673,7 +673,7 @@ per column).
 
 Result (SN_PIE_2, warm): **trees_decommit 17.3s → 1.26s**; **M5c prove 26.7s → 11.23s
 (3.6x → 1.53x vs non-diet 7.35s)**; **byte-identical (G_PROOF_MATCH)**; peak **31.6GB**
-(two proofs now fit an 80GB card). Hits the design's "<11s meaningful win" mark.
+(two proofs now fit an 80GB card). NOTE: 11.23s is the SINGLE-proof M5c latency (1.53x of non-diet 7.35s); the <11s / <14.8s gates are for the TWO-proof WALL time (M6-a's target), a different quantity — not yet measured.
 
 The residual 1.53x (~3.9s over non-diet) is the inherent stream_lde regen —
 composition ExtendToEvalDomain (~0.9s), FRI-quotient Coeffs regen (~0.55s), the
