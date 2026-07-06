@@ -706,3 +706,30 @@ throughput), <11s (meaningful), <8s (strong 10 MHz signal). The concurrent
 scheduler (CudaExecContext: per-proof streams + pool namespaces + event deps +
 priorities, threading past the current stream-0-centric backend; round-27 flagged
 pool concurrency as never-validated) is the next major multi-session build.
+
+## 2026-07-06 — M6-a negative control: two-host-threads-calling-prove is UNSAFE (decisive)
+
+`--resident-concurrent 2` (N host threads, each its own GpuCairoProver, bypassing the
+GPU_NATIVE_CUDA singleton mutex) on SN_PIE_2 / H100 SXM, M5c diet on:
+**one thread PANICKED** — `partial_ec_mul_window_bits_18.rs:38` (`assert!(!packed_inputs
+.is_empty())`) — the component received ZERO inputs under concurrent proves. So the
+HOST witness-generation/feed path is NOT re-entrant across two concurrent proofs
+(the other proof completed, 15.06s). This is not mere serialization — it is a hard
+correctness failure. Fully vindicates the reviewer directive: two host threads
+calling prove is a NEGATIVE CONTROL, not M6.
+
+Sequential baseline re-confirmed same session: --resident-pipeline 2 = 26.32s wall
+(14.29 + 11.99, first proof cold-tainted), proof_byte_equal=true, 30.9GB peak; warm
+single 12.33s. Consistent with the 25.24s prior baseline.
+
+ARCHITECTURAL IMPLICATION (drives the roadmap): the host witness path (the fp256/EC
+family — partial_ec_mul/blake_round/pedersen — is still HOST) is non-reentrant, so a
+throughput scheduler CANNOT overlap two proofs' host witness generation even with
+per-proof streams. Therefore:
+  - The resident scheduler must run ONE host orchestration thread scheduling DEVICE
+    work from two DeviceProofStates (device kernels overlap on separate streams), NOT
+    two host prove() paths.
+  - Moving the witness to device (component #1, device witness DAG) is a PREREQUISITE
+    for meaningful two-proof throughput, not just for sub-2s single-proof latency.
+  - Keystone-first (#2 fused commit + #1 device witness) is the right sequencing;
+    stream plumbing alone is capped by the non-reentrant host witness path.
