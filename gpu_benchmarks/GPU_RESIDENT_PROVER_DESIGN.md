@@ -1411,3 +1411,98 @@ PRIORITY ORDER: (1) approach-B preproc compact artifact → (2) streamful CudaEx
 kill stream-0 → (3) GPU-resident Write-Base continuation → (4) device FS minimal spine →
 (5) CUDA graph replay → (6) FRI/quotient/decommit fusion → (7) commit/hash engine → (8)
 two-lane scheduler. Several (2/4/5/6) touch soundness/security-critical code = SUPERVISED.
+
+## 21. APPROACH-B DESIGN FOR REVIEW (2026-07-06) — Persistent Compact Preprocessed Artifact [SUPERVISED, PCS]
+
+Removes the ~1.2s/proof warm preprocessed rebuild the diet pays, and is the first
+instance of the §20.2 persistent-compact-PCS-artifact pattern. Status: DESIGN — awaiting
+human sign-off before implementation (touches pcs decommit = SOUNDNESS-CRITICAL).
+
+### Ground truth vs contract (why the design is conservative)
+The pcs contract (read): a Borrowed tree's evals are pool-taken-by-move (owns_memory=true)
+and — per the read — should survive the per-proof pool drop; compaction/release/give-back
+are all Owned-only. Yet approach A (Borrow the cached tree with resident evals under
+stream_lde) EMPIRICALLY CRASHED (cudaErrorIllegalAddress, cache-hit prove). The crash
+mechanism is not fully pinned (candidate: composition's STWO_FORCE_EXTEND_EVAL_MODE regen
+path, or a pooled buffer whose owns_memory is not what the read assumed). DESIGN RULE:
+do not rely on resident-eval survival or take_or_alloc ownership. The artifact OWNS its
+persistent state by construction (freshly-allocated, leaked, never pool-associated), and
+decommit regenerates from those persistent coeffs — never reads resident evals.
+
+### The artifact (persistent, zero per-proof-arena pointers — the hard invariant)
+```
+struct PreprocessedArtifact<B, MC> {
+    root: <MC::H as MerkleHasher>::Hash,          // absorbed into the per-proof channel
+    layers: Vec<Col<B, H::Hash>>,                 // retained Merkle layers (all but pruned bottom 4)
+    compact: CompactTreeColumns<B>,               // native coeffs + per-column CircleDomain
+    lifting_log_size: Option<u32>, log_blowup: u32,
+    cache_key: u64,
+}
+```
+Every device buffer here is allocated OUTSIDE any per-proof `base_column_pool` and leaked
+`&'static` (or owned by the persistent GpuCairoProver). The Merkle `layers` are already
+pool-independent (Blake2sHashVec, own_memory, per the contract §f). The `compact` coeffs,
+however, come from `compact_tree_columns` which may leave them as moved-in input coeffs
+(pool-independent) OR pool-adjacent — so at build time we DEEP-COPY the compact coeffs
+into fresh leaked BaseFieldVecs (`clone()` = device alloc + D2D) to guarantee ownership,
+regardless of their provenance. Cost: one-time, at cache build.
+
+### Build-once flow (gpu-prover orchestration, autonomous part)
+On cache miss (first prove of a shape):
+1. `build_preprocessed_tree` (Owned) with store_coeffs — as today (~1.2s, once).
+2. `compact_tree_columns(take polynomials)` → CompactTreeColumns (coeffs+domain; evals released).
+3. Deep-copy: clone the compact coeffs + move the retained Merkle layers into fresh leaked
+   buffers; assemble `PreprocessedArtifact`; leak+cache it (keyed, below).
+Subsequent proves: cache hit → no rebuild.
+
+### Per-proof flow (needs the pcs change)
+- commit: absorb `artifact.root` into the channel (cheap; no buffers touched).
+- decommit: a NEW borrowed-compacted path — feed `artifact.compact` (by ref, cloned per
+  proof OR borrow-restructured) + `artifact.layers` + a live per-proof scratch pool into
+  the existing `decommit_compact_tree` regeneration logic (re-LDE coeffs → gather query +
+  pruned-bottom rows → decommit_gathered against the retained layers).
+
+### The pcs change [SUPERVISED — the sign-off item]
+Today (contract §e): Borrowed tree → `compact=None` → `tree.decommit` (reads resident
+evals). Add: a per-tree "external compact" supplied by the caller so a Borrowed tree can
+route through `decommit_compact_tree`. Minimal surface:
+- `CommitmentSchemeProver::commit_tree_compact(artifact_ref)` (or a flag on the tree entry)
+  that records the borrowed tree + its external CompactTreeColumns.
+- decommit indexing (pcs/mod.rs:536): for such trees use the external compact via
+  `decommit_compact_tree` instead of `tree.decommit`.
+- `decommit_compact_tree` currently consumes CompactTreeColumns by value (moves coeffs);
+  either clone per proof (device D2D, acceptable) or restructure to borrow `&CompactTreeColumns`.
+No change to the regen math, the Merkle verifier, FRI, or the channel — only WHERE the
+compact descriptor comes from (caller-supplied vs produced at :478).
+
+### Invariant preservation (the review package)
+1. No per-proof-arena pointers: artifact buffers are freshly-leaked + deep-copied at build;
+   never `give_back` to a per-proof pool. (Gate: run 2+ proofs; the 2nd cache-hit must not
+   crash — the exact test that caught approach A.)
+2. Root + layers byte-identical to fresh Owned: the artifact IS the once-built tree's root
+   + layers (moved, not recomputed). Trivially identical.
+3. Openings match fresh rebuild: `decommit_compact_tree` is the SAME regen logic the diet
+   already uses for the Owned preproc tree today — same coeffs, same domain, same twiddles,
+   same lifting_log_size → bit-exact leaf-hash recompute for the pruned bottom 4 → same
+   auth paths. (Gate: per-query opening equality.)
+4. Cache key: hash of {preprocessed_trace ids, log_sizes, log_blowup, lifting_log_size,
+   hasher (MC), store_coeffs, backend config, pcs params}. (Extends the current
+   preprocessed_tree key, which already covers ids/log_sizes/blowup/lifting/store_coeffs.)
+5. cache-hit proof sha256 == rebuild proof sha256 (STWO_DUMP_PROOF + sha256sum, both paths
+   same binary via the kill switch). MANDATORY.
+6. verifier passes on the cache-hit proof.
+7. second cache-hit prove clean (--resident-pipeline 2 → proof_byte_equal + no illegal addr).
+8. kill switch: STWO_DIET_REBUILD_PREPROCESSED=1 keeps the current Owned-rebuild path
+   (already implemented).
+
+### Soundness note (from the contract)
+Regen is bit-exact ONLY if the artifact preserves the exact coeffs/domain/twiddles/
+lifting_log_size used at commit; a decommit verifying against a stale/wrong root is the
+catastrophic class. The cache key + invariant #5 (whole-proof sha256) are the guards.
+Requires the paper/PCS-owner review for the borrowed-compacted decommit route.
+
+### Validation plan (one pod session AFTER sign-off)
+Same-binary A/B via the kill switch: rebuild (STWO_DIET_REBUILD_PREPROCESSED=1) vs cached
+(default). Gates: STWO_DUMP_PROOF sha256 equal (rebuild vs cached), verify, --resident-pipeline
+2 proof_byte_equal + no crash, warm "Compute preprocessed trace commitment" → ~0 on cache
+hit, prove_s_warm delta ~-1.2s. No pod spend until approved.
