@@ -410,6 +410,8 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
                     layout: partial_ec_mul_window_bits_18::SUB_FEED_LAYOUT,
                     lut_for: &lut_for,
                     merge: &merge,
+                    // Memory families stay host-fed at this seam until sized.
+                    sizes: &|_| None,
                     require: true,
                 };
                 let launched = stwo_backend_cuda::exec_tables::witness_edge_gather(
@@ -576,6 +578,8 @@ impl PedersenAggregatorWindowBits18Witness for CudaBackend {
                     layout: pedersen_aggregator_window_bits_18::SUB_FEED_LAYOUT,
                     lut_for: &lut_for,
                     merge: &merge,
+                    // Memory families stay host-fed at this seam until sized.
+                    sizes: &|_| None,
                     require: false,
                 };
                 let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<

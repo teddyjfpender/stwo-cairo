@@ -19,6 +19,32 @@ pub struct ClaimGenerator {
 }
 
 impl ClaimGenerator {
+    /// Device count-feed LUT (B2 v2): round index -> preprocessed row, dense
+    /// over the 4-bit fold domain (10 real rounds; unmapped keys point at row 0
+    /// but can never be fed by a valid trace — the host feed would panic).
+    pub fn input_to_row_lut(&self) -> Vec<u32> {
+        const LUT_SIZE: usize = 1 << 4;
+        let mut lut = vec![0u32; LUT_SIZE];
+        for ([v0], &row) in &self.input_to_row {
+            lut[v0.0 as usize] = row as u32;
+        }
+        lut
+    }
+
+    /// Test-gate snapshot of the mult columns (non-consuming).
+    pub(crate) fn mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+        self.mults.iter().map(|m| m.snapshot_simd_vec()).collect()
+    }
+
+    /// Device count-feed merge (B2 v2), rc-family idiom.
+    pub fn add_count_tables(&self, counts: &[u32]) {
+        for (row, &count) in counts.iter().enumerate() {
+            if count != 0 {
+                self.mults[0].add_at(row as u32, count);
+            }
+        }
+    }
+
     pub fn new(preprocessed_trace: Arc<PreProcessedTrace>) -> Self {
         let mults = from_fn(|_| AtomicMultiplicityColumn::new(1 << LOG_SIZE));
         let column_ids = [PreProcessedColumnId {

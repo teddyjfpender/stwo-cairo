@@ -165,6 +165,8 @@ impl BlakeRoundWitness for CudaBackend {
                     layout: blake_round::SUB_FEED_LAYOUT,
                     lut_for: &lut_for,
                     merge: &merge,
+                    // Memory families stay host-fed at this seam until sized.
+                    sizes: &|_| None,
                     require: false,
                 };
                 let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<

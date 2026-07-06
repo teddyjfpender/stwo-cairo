@@ -92,6 +92,37 @@ impl ClaimGenerator {
         }
     }
 
+    /// Device count-feed merges (B2 v2, mem-id decode): the big/small tables
+    /// are separate counts slots (`..._state` / `..._state#small`).
+    pub fn add_big_count_tables(&self, counts: &[u32]) {
+        for (row, &count) in counts.iter().enumerate() {
+            if count != 0 {
+                self.big_mults.add_at(row as u32, count);
+            }
+        }
+    }
+    pub fn add_small_count_tables(&self, counts: &[u32]) {
+        for (row, &count) in counts.iter().enumerate() {
+            if count != 0 {
+                self.small_mults.add_at(row as u32, count);
+            }
+        }
+    }
+    /// Test-gate snapshots (non-consuming).
+    pub(crate) fn big_mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+        vec![self.big_mults.snapshot_simd_vec()]
+    }
+    pub(crate) fn small_mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+        vec![self.small_mults.snapshot_simd_vec()]
+    }
+
+    pub fn big_table_size(&self) -> usize {
+        self.big_mults.padded_len()
+    }
+    pub fn small_table_size(&self) -> usize {
+        self.small_mults.padded_len()
+    }
+
     pub fn add_inputs(&self, inputs: &[InputType]) {
         for input in inputs {
             self.add_input(input, 0);

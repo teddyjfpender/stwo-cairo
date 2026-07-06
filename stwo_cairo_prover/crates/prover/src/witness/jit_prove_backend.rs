@@ -801,6 +801,9 @@ pub(crate) struct DeviceFeedPlan<'a> {
     pub layout: &'static [(&'static str, usize, &'static str, u32, usize, usize)],
     pub lut_for: &'a dyn Fn(&'static str) -> Vec<u32>,
     pub merge: &'a dyn Fn(&'static str, &[u32]),
+    /// Runtime table sizes for the memory families (`(rows, small_rows)`);
+    /// `None` leaves a runtime-sized family on the host feed path.
+    pub sizes: &'a dyn Fn(&'static str) -> Option<(usize, usize)>,
     /// When EVERY relation the component feeds is count-style, the seam sets
     /// this and provides NO host feed: a device-feed failure then fails the
     /// whole lane (`None` → the host WRITER reruns — still exactly-once feeds,
@@ -991,22 +994,14 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
     // everything on host (empty skip set) — never a double feed, never a miss.
     let mut device_fed: Vec<&'static str> = Vec::new();
     if let Some(plan) = device_feed {
-        let (descs, lut_slots, counts_slots) = crate::witness::device_feed::build_feed_descriptors(
-            plan.layout,
-            crate::witness::device_feed::COUNT_RELATIONS,
-        );
+        let (descs, lut_slots, counts_slots, sizes) =
+            crate::witness::device_feed::build_feed_descriptors_sized(
+                plan.layout,
+                crate::witness::device_feed::COUNT_RELATIONS,
+                plan.sizes,
+            );
         if !descs.is_empty() {
             let luts: Vec<Vec<u32>> = lut_slots.iter().map(|s| (plan.lut_for)(s)).collect();
-            let sizes: Vec<usize> = counts_slots
-                .iter()
-                .map(|s| {
-                    let rel = crate::witness::device_feed::COUNT_RELATIONS
-                        .iter()
-                        .find(|r| r.state_param == *s)
-                        .expect("counts slot always registry-backed");
-                    rel.n_relations * rel.table_size
-                })
-                .collect();
             match stwo_backend_cuda::exec_tables::run_witness_feed_counts(
                 &sub_dev,
                 column_length,
@@ -1247,6 +1242,8 @@ pub(crate) fn all_count_builtin_write_trace<C: BuiltinLaneSpec>(
         layout,
         lut_for,
         merge,
+        // Memory families stay host-fed at this seam until sized.
+        sizes: &|_| None,
         require: true,
     };
     builtin_cuda_write_trace::<C>(cols, n_real, mem, Some(plan), |_sub, _n, fed| {

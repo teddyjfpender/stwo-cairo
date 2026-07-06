@@ -27,12 +27,21 @@ pub struct CountRelation {
     /// Per-word fold widths (bits), tuple order. `key = ((key << b) | word)`.
     pub word_bits: &'static [u32],
     /// Consumer preprocessed size (rows per relation slot) = `1 << sum(bits)`
-    /// unless the consumer pads differently.
+    /// unless the consumer pads differently. `0` = RUNTIME-SIZED (the memory
+    /// tables): the caller supplies sizes via `build_feed_descriptors_sized`.
     pub table_size: usize,
     /// Number of relation slots (the consumer's `mults` array length).
     pub n_relations: usize,
     /// Whether keys map through the consumer's `input_to_row` LUT.
     pub needs_lut: bool,
+    /// Descriptor kind: 0 = fold(+offset)(+LUT); 1 = MEM-ID DECODE
+    /// (memory_id_to_big: tag = id >> 30 → big/small tables, val = low 30 bits;
+    /// DEFAULT_ID skipped; the small table is a SECOND counts slot named
+    /// `"<state_param>#small"`).
+    pub kind: u32,
+    /// Signed key offset applied after the fold (memory_address_to_id feeds
+    /// addresses; rows are `addr - 1`).
+    pub key_offset: i64,
 }
 
 /// The count-relation registry: every family the device feed serves, with
@@ -48,6 +57,8 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         table_size: 1 << 8,
         n_relations: 1,
         needs_lut: false,
+        kind: 0,
+        key_offset: 0,
     },
     CountRelation {
         state_param: "range_check_11_state",
@@ -55,6 +66,8 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         table_size: 1 << 11,
         n_relations: 1,
         needs_lut: false,
+        kind: 0,
+        key_offset: 0,
     },
     CountRelation {
         state_param: "range_check_18_state",
@@ -62,6 +75,8 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         table_size: 1 << 18,
         n_relations: 2,
         needs_lut: false,
+        kind: 0,
+        key_offset: 0,
     },
     CountRelation {
         state_param: "range_check_20_state",
@@ -69,6 +84,8 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         table_size: 1 << 20,
         n_relations: 8,
         needs_lut: false,
+        kind: 0,
+        key_offset: 0,
     },
     CountRelation {
         state_param: "range_check_9_9_state",
@@ -76,6 +93,8 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         table_size: 1 << 18,
         n_relations: 8,
         needs_lut: true,
+        kind: 0,
+        key_offset: 0,
     },
     CountRelation {
         state_param: "range_check_4_4_state",
@@ -83,6 +102,8 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         table_size: 1 << 8,
         n_relations: 1,
         needs_lut: true,
+        kind: 0,
+        key_offset: 0,
     },
     CountRelation {
         state_param: "range_check_4_4_4_4_state",
@@ -90,6 +111,8 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         table_size: 1 << 16,
         n_relations: 1,
         needs_lut: true,
+        kind: 0,
+        key_offset: 0,
     },
     CountRelation {
         state_param: "range_check_3_3_3_3_3_state",
@@ -97,6 +120,8 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         table_size: 1 << 15,
         n_relations: 1,
         needs_lut: true,
+        kind: 0,
+        key_offset: 0,
     },
     CountRelation {
         state_param: "range_check_7_2_5_state",
@@ -104,6 +129,8 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         table_size: 1 << 14,
         n_relations: 1,
         needs_lut: true,
+        kind: 0,
+        key_offset: 0,
     },
     CountRelation {
         state_param: "pedersen_points_table_window_bits_18_state",
@@ -111,6 +138,37 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         table_size: 1 << 23,
         n_relations: 1,
         needs_lut: false,
+        kind: 0,
+        key_offset: 0,
+    },
+    // ---- The memory-table families (T2 at scale: every opcode feeds these
+    // per row). Runtime-sized (address/id spaces are per-statement).
+    CountRelation {
+        state_param: "memory_address_to_id_state",
+        word_bits: &[31],
+        table_size: 0, // runtime: padded address space
+        n_relations: 1,
+        needs_lut: false,
+        kind: 0,
+        key_offset: -1, // add_input does increase_at(addr - 1)
+    },
+    CountRelation {
+        state_param: "memory_id_to_big_state",
+        word_bits: &[31],
+        table_size: 0, // runtime: (big rows, small rows) via the sizes fn
+        n_relations: 1,
+        needs_lut: false,
+        kind: 1,
+        key_offset: 0,
+    },
+    CountRelation {
+        state_param: "blake_round_sigma_state",
+        word_bits: &[4],
+        table_size: 16,
+        n_relations: 1,
+        needs_lut: true,
+        kind: 0,
+        key_offset: 0,
     },
 ];
 
@@ -127,22 +185,45 @@ pub fn host_feed_counts(
 ) {
     for e in descs.chunks_exact(WFC_DESC_STRIDE) {
         let (word_base, n_words) = (e[0] as usize, e[1] as usize);
+        let table_size = e[8] as usize;
+        let kind = e[11];
         for row in 0..n_rows {
+            if kind == 1 {
+                // MEM-ID DECODE — see the kernel; e[12] = small size, e[13] =
+                // small counts slot; DEFAULT_ID (empty) skipped defensively.
+                let v = sub_flat[word_base * n_rows + row];
+                if v == (1u32 << 30) - 1 {
+                    continue;
+                }
+                let (tag, val) = (v >> 30, (v & 0x3FFF_FFFF) as usize);
+                match tag {
+                    1 if val < table_size => {
+                        counts[e[10] as usize][e[7] as usize * table_size + val] += 1;
+                    }
+                    0 if val < e[12] as usize => {
+                        let small = e[12] as usize;
+                        counts[e[13] as usize][e[7] as usize * small + val] += 1;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             let mut key: u64 = 0;
             for i in 0..n_words {
                 key = (key << e[2 + i]) | u64::from(sub_flat[(word_base + i) * n_rows + row]);
             }
-            let table_size = e[8] as usize;
+            let keyed = key as i64 + i64::from(e[12] as i32);
             // Key domain check BEFORE any LUT deref — mirrors the kernel; an
             // out-of-width tuple (impossible on a valid trace, where the host
             // feed would panic) is dropped, never an OOB access.
-            if key as usize >= table_size {
+            if keyed < 0 || keyed as usize >= table_size {
                 continue;
             }
+            let key = keyed as usize;
             let idx = if e[9] == WFC_NO_LUT {
-                key as usize
+                key
             } else {
-                luts[e[9] as usize][key as usize] as usize
+                luts[e[9] as usize][key] as usize
             };
             if idx < table_size {
                 counts[e[10] as usize][e[7] as usize * table_size + idx] += 1;
@@ -152,7 +233,7 @@ pub fn host_feed_counts(
 }
 
 /// Descriptor stride of `witness_feed_counts.cu` (flat u32 ABI).
-pub const WFC_DESC_STRIDE: usize = 11;
+pub const WFC_DESC_STRIDE: usize = 14;
 pub const WFC_NO_LUT: u32 = u32::MAX;
 
 /// Build the flat device-kernel descriptors for one component's layout,
@@ -165,12 +246,45 @@ pub fn build_feed_descriptors(
     layout: &[(&str, usize, &str, u32, usize, usize)],
     relations: &[CountRelation],
 ) -> (Vec<u32>, Vec<&'static str>, Vec<&'static str>) {
+    let (descs, luts, counts, _sizes) = build_feed_descriptors_sized(layout, relations, &|_| None);
+    (descs, luts, counts)
+}
+
+/// The full builder: `sizes(state_param)` supplies `(table_size, small_size)`
+/// for RUNTIME-SIZED families (`table_size == 0` in the registry — the memory
+/// tables). A runtime family without a size is SKIPPED (stays host-fed) — the
+/// caller opts in per seam; a fixed-size family ignores `sizes`.
+pub fn build_feed_descriptors_sized(
+    layout: &[(&str, usize, &str, u32, usize, usize)],
+    relations: &[CountRelation],
+    sizes: &dyn Fn(&'static str) -> Option<(usize, usize)>,
+) -> (
+    Vec<u32>,
+    Vec<&'static str>,
+    Vec<&'static str>,
+    Vec<usize>, // per counts-slot BUFFER length (n_relations * table rows)
+) {
     let mut descs: Vec<u32> = Vec::new();
     let mut lut_slots: Vec<&'static str> = Vec::new();
     let mut counts_slots: Vec<&'static str> = Vec::new();
+    let mut counts_sizes: Vec<usize> = Vec::new();
+    let slot = |slots: &mut Vec<&'static str>, name: &'static str| -> u32 {
+        slots.iter().position(|s| *s == name).unwrap_or_else(|| {
+            slots.push(name);
+            slots.len() - 1
+        }) as u32
+    };
     for &(_field, _instance, state, rel_index, base, words) in layout {
         let Some(rel) = relations.iter().find(|r| r.state_param == state) else {
             continue; // input-list or host-fed relation
+        };
+        let (table_size, small_size) = if rel.table_size == 0 {
+            match sizes(rel.state_param) {
+                Some(sz) => sz,
+                None => continue, // runtime-sized, caller didn't opt in: host-fed
+            }
+        } else {
+            (rel.table_size, 0)
         };
         assert_eq!(
             words,
@@ -182,21 +296,18 @@ pub fn build_feed_descriptors(
             (rel_index as usize) < rel.n_relations,
             "relation_index {rel_index} out of range for {state}"
         );
-        let counts_index = counts_slots
-            .iter()
-            .position(|s| *s == rel.state_param)
-            .unwrap_or_else(|| {
-                counts_slots.push(rel.state_param);
-                counts_slots.len() - 1
-            }) as u32;
+        let counts_index = slot(&mut counts_slots, rel.state_param);
+        let buf_len = rel.n_relations * table_size;
+        if counts_index as usize == counts_sizes.len() {
+            counts_sizes.push(buf_len);
+        } else {
+            assert_eq!(
+                counts_sizes[counts_index as usize], buf_len,
+                "count family {state} sized inconsistently across entries"
+            );
+        }
         let lut_index = if rel.needs_lut {
-            lut_slots
-                .iter()
-                .position(|s| *s == rel.state_param)
-                .unwrap_or_else(|| {
-                    lut_slots.push(rel.state_param);
-                    lut_slots.len() - 1
-                }) as u32
+            slot(&mut lut_slots, rel.state_param)
         } else {
             WFC_NO_LUT
         };
@@ -207,12 +318,34 @@ pub fn build_feed_descriptors(
             e[2 + i] = *b;
         }
         e[7] = rel_index;
-        e[8] = rel.table_size as u32;
+        e[8] = table_size as u32;
         e[9] = lut_index;
         e[10] = counts_index;
+        e[11] = rel.kind;
+        if rel.kind == 1 {
+            // Mem-id decode: the small table is its own counts slot; leak the
+            // composed name once (bounded by the registry size).
+            e[12] = small_size as u32;
+            let small_name: &'static str =
+                Box::leak(format!("{}#small", rel.state_param).into_boxed_str());
+            // Reuse an existing "#small" slot if present (same family twice).
+            let existing = counts_slots
+                .iter()
+                .position(|s| s.ends_with("#small") && s.starts_with(rel.state_param));
+            e[13] = match existing {
+                Some(i) => i as u32,
+                None => {
+                    let i = slot(&mut counts_slots, small_name);
+                    counts_sizes.push(rel.n_relations * small_size);
+                    i
+                }
+            };
+        } else {
+            e[12] = rel.key_offset as i32 as u32;
+        }
         descs.extend_from_slice(&e);
     }
-    (descs, lut_slots, counts_slots)
+    (descs, lut_slots, counts_slots, counts_sizes)
 }
 
 #[cfg(test)]
@@ -225,6 +358,8 @@ mod tests {
         table_size: 1 << 18,
         n_relations: 8,
         needs_lut: true,
+        kind: 0,
+        key_offset: 0,
     };
     const PTS: CountRelation = CountRelation {
         state_param: "pedersen_points_table_window_bits_18_state",
@@ -232,6 +367,8 @@ mod tests {
         table_size: 1 << 23,
         n_relations: 1,
         needs_lut: false,
+        kind: 0,
+        key_offset: 0,
     };
 
     #[test]

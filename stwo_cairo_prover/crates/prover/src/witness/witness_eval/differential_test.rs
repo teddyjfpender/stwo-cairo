@@ -30,11 +30,15 @@ use std::sync::Arc;
 
 use indexmap::IndexSet;
 use stwo_backend_cuda::jit_witness::interp::interpret_row;
+use stwo_cairo_adapter::memory::Memory;
 use stwo_cairo_adapter::ProverInput;
 
 use super::{TABLE_ADDR_TO_ID, TABLE_ID_TO_BIG};
 use crate::witness::cairo_claim_generator::CairoClaimGenerator;
-use crate::witness::components::{add_opcode, assert_eq_opcode, jnz_opcode_taken};
+use crate::witness::components::{
+    add_opcode, assert_eq_opcode, blake_round_sigma, jnz_opcode_taken, memory_address_to_id,
+    memory_id_to_big,
+};
 use crate::witness::prelude::*;
 
 /// Deserialize the fixture and populate `components` on a fresh `CairoClaimGenerator`.
@@ -45,9 +49,16 @@ fn fill_fixture(components: &[&str]) -> CairoClaimGenerator {
 /// [`fill_fixture`], additionally returning the raw memory tables (addr→id ids,
 /// f252 values, small values) that the DEVICE execution tables upload from — the
 /// claim generator consumes the `Memory` itself.
+#[allow(clippy::type_complexity)]
 fn fill_fixture_with_memory(
     components: &[&str],
-) -> (CairoClaimGenerator, Vec<u32>, Vec<[u32; 8]>, Vec<u128>) {
+) -> (
+    CairoClaimGenerator,
+    Vec<u32>,
+    Vec<[u32; 8]>,
+    Vec<u128>,
+    Arc<Memory>,
+) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test_data/test_prove_verify_all_opcode_components/prover_input.json");
     let json = std::fs::read_to_string(&path)
@@ -72,14 +83,15 @@ fn fill_fixture_with_memory(
 
     // None of the components used here consume the preprocessed trace; any variant is fine.
     let preprocessed_trace = Arc::new(PreProcessedTrace::canonical_without_pedersen());
+    let memory = Arc::new(memory);
     cg.fill_components(
         &set,
         state_transitions.casm_states_by_opcode,
         &builtin_segments,
-        Arc::new(memory),
+        memory.clone(),
         preprocessed_trace,
     );
-    (cg, addr_ids, f252_values, small_values)
+    (cg, addr_ids, f252_values, small_values, memory)
 }
 
 /// Byte-compare two `[Vec<PackedM31>]` field bundles lane-for-lane (via `to_array`), with
@@ -1481,7 +1493,7 @@ fn blake_round_recording_interpreter_matches_host() {
     use stwo_cairo_common::prover_types::cpu::UInt32;
 
     use crate::witness::components::blake_round as m;
-    let (cg, addr_ids, f252_values, small_values) = fill_fixture_with_memory(&[
+    let (cg, addr_ids, f252_values, small_values, _mem_arc) = fill_fixture_with_memory(&[
         "blake_round",
         "blake_round_sigma",
         "blake_g",
@@ -2942,26 +2954,42 @@ fn run_count_feed_paths(
     n_padded: usize,
     lut_for: impl Fn(&'static str) -> Vec<u32>,
     merge: impl Fn(&'static str, &[u32]),
+    host_feed: impl FnMut(&'static str, u32, &[u32]),
+) -> usize {
+    run_count_feed_paths_sized(
+        layout,
+        sub_flat,
+        n_padded,
+        &|_| None,
+        lut_for,
+        merge,
+        host_feed,
+    )
+}
+
+/// The v2 engine: `sizes` opts runtime-sized families (the memory tables) into
+/// the device path; the host reference replays add_input semantics per kind
+/// (fold + offset; mem-id decode skips like the kernel).
+#[allow(clippy::too_many_arguments)]
+fn run_count_feed_paths_sized(
+    layout: &'static [(&'static str, usize, &'static str, u32, usize, usize)],
+    sub_flat: &[u32],
+    n_padded: usize,
+    sizes: &dyn Fn(&'static str) -> Option<(usize, usize)>,
+    lut_for: impl Fn(&'static str) -> Vec<u32>,
+    merge: impl Fn(&'static str, &[u32]),
     mut host_feed: impl FnMut(&'static str, u32, &[u32]),
 ) -> usize {
     use crate::witness::device_feed::{
-        build_feed_descriptors, host_feed_counts, COUNT_RELATIONS, WFC_DESC_STRIDE,
+        build_feed_descriptors_sized, host_feed_counts, COUNT_RELATIONS, WFC_DESC_STRIDE,
     };
-    let (descs, lut_slots, counts_slots) = build_feed_descriptors(layout, COUNT_RELATIONS);
+    let (descs, lut_slots, counts_slots, slot_sizes) =
+        build_feed_descriptors_sized(layout, COUNT_RELATIONS, sizes);
     if descs.is_empty() {
         return 0;
     }
     let luts: Vec<Vec<u32>> = lut_slots.iter().map(|s| lut_for(s)).collect();
-    let mut counts: Vec<Vec<u32>> = counts_slots
-        .iter()
-        .map(|s| {
-            let rel = COUNT_RELATIONS
-                .iter()
-                .find(|r| r.state_param == *s)
-                .unwrap();
-            vec![0u32; rel.n_relations * rel.table_size]
-        })
-        .collect();
+    let mut counts: Vec<Vec<u32>> = slot_sizes.iter().map(|&n| vec![0u32; n]).collect();
     host_feed_counts(sub_flat, n_padded, &descs, &luts, &mut counts);
     for (slot, c) in counts_slots.iter().zip(&counts) {
         merge(slot, c);
@@ -2975,6 +3003,14 @@ fn run_count_feed_paths(
         let Some(relation) = COUNT_RELATIONS.iter().find(|r| r.state_param == state) else {
             continue;
         };
+        let (table_size, _small) = if relation.table_size == 0 {
+            match sizes(relation.state_param) {
+                Some(sz) => sz,
+                None => continue,
+            }
+        } else {
+            (relation.table_size, 0)
+        };
         let mut tuple = vec![0u32; words];
         for r in 0..n_padded {
             let mut key: u64 = 0;
@@ -2982,7 +3018,17 @@ fn run_count_feed_paths(
                 *t = sub_flat[(base + k) * n_padded + r];
                 key = (key << relation.word_bits[k]) | u64::from(*t);
             }
-            if key as usize >= relation.table_size {
+            if relation.kind == 1 {
+                // Mem-id decode: the consumer's add_input decodes; skip only the
+                // defensive DEFAULT_ID like the kernel (valid traces never feed it).
+                if tuple[0] == (1u32 << 30) - 1 {
+                    continue;
+                }
+                host_feed(state, rel, &tuple);
+                continue;
+            }
+            let keyed = key as i64 + relation.key_offset;
+            if keyed < 0 || keyed as usize >= table_size {
                 continue;
             }
             host_feed(state, rel, &tuple);
@@ -3263,7 +3309,7 @@ fn aggregator_and_blake_count_feeds_match_consumer_feeds() {
 
     // blake_round on synthetic inputs (the interp-gate recipe).
     {
-        let (cg, _a, _f, _s) = fill_fixture_with_memory(&[
+        let (cg, _a, _f, _s, _mem_arc) = fill_fixture_with_memory(&[
             "blake_round",
             "blake_round_sigma",
             "blake_g",
@@ -3296,21 +3342,49 @@ fn aggregator_and_blake_count_feeds_match_consumer_feeds() {
 
         let d725 = range_check_7_2_5::ClaimGenerator::new(preproc.clone());
         let h725 = range_check_7_2_5::ClaimGenerator::new(preproc.clone());
-        let n = run_count_feed_paths(
+        // B2 v2 families: independent device/host state pairs over the SAME
+        // memory — the device path merges kernel-mirror counts, the host path
+        // replays the consumers' own add_input; mult columns must match.
+        let d_sigma = blake_round_sigma::ClaimGenerator::new(preproc.clone());
+        let h_sigma = blake_round_sigma::ClaimGenerator::new(preproc.clone());
+        let d_addr = memory_address_to_id::ClaimGenerator::new(_mem_arc.clone());
+        let h_addr = memory_address_to_id::ClaimGenerator::new(_mem_arc.clone());
+        let d_big = memory_id_to_big::ClaimGenerator::new(_mem_arc.clone());
+        let h_big = memory_id_to_big::ClaimGenerator::new(_mem_arc.clone());
+        let n = run_count_feed_paths_sized(
             blake_round::SUB_FEED_LAYOUT,
             &sub_flat,
             size,
+            &|f| match f {
+                "memory_address_to_id_state" => Some((d_addr.table_size(), 0)),
+                "memory_id_to_big_state" => {
+                    Some((d_big.big_table_size(), d_big.small_table_size()))
+                }
+                _ => None,
+            },
             |f| match f {
                 "range_check_7_2_5_state" => rc725.input_to_row_lut(),
+                "blake_round_sigma_state" => d_sigma.input_to_row_lut(),
                 other => panic!("unexpected LUT family {other}"),
             },
             |f, c| match f {
                 "range_check_7_2_5_state" => d725.add_count_tables(c),
+                "blake_round_sigma_state" => d_sigma.add_count_tables(c),
+                "memory_address_to_id_state" => d_addr.add_count_tables(c),
+                "memory_id_to_big_state" => d_big.add_big_count_tables(c),
+                "memory_id_to_big_state#small" => d_big.add_small_count_tables(c),
                 other => panic!("unexpected count family {other}"),
             },
             |f, rel, t| match f {
                 "range_check_7_2_5_state" => {
                     h725.add_input(&[M31(t[0]), M31(t[1]), M31(t[2])], rel as usize)
+                }
+                "blake_round_sigma_state" => h_sigma.add_input(&[M31(t[0])], rel as usize),
+                "memory_address_to_id_state" => {
+                    crate::witness::utils::AddInputs::add_input(&h_addr, &M31(t[0]), rel as usize)
+                }
+                "memory_id_to_big_state" => {
+                    crate::witness::utils::AddInputs::add_input(&h_big, &M31(t[0]), rel as usize)
                 }
                 other => panic!("unexpected state {other}"),
             },
@@ -3321,7 +3395,29 @@ fn aggregator_and_blake_count_feeds_match_consumer_feeds() {
             d725.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
             h725.mults.into_iter().map(|m| m.into_simd_vec()).collect(),
         );
-        eprintln!("count gate [blake_round]: PASS ({n} descriptors)");
+        assert_mults_eq(
+            "blake sigma",
+            d_sigma.mults_snapshot(),
+            h_sigma.mults_snapshot(),
+        );
+        assert_mults_eq(
+            "blake memory_address_to_id",
+            d_addr.mults_snapshot(),
+            h_addr.mults_snapshot(),
+        );
+        assert_mults_eq(
+            "blake memory_id_to_big (big)",
+            d_big.big_mults_snapshot(),
+            h_big.big_mults_snapshot(),
+        );
+        assert_mults_eq(
+            "blake memory_id_to_big (small)",
+            d_big.small_mults_snapshot(),
+            h_big.small_mults_snapshot(),
+        );
+        eprintln!(
+            "count gate [blake_round]: PASS ({n} descriptors incl. mem-table + sigma v2 families)"
+        );
     }
 }
 
@@ -3482,7 +3578,7 @@ fn blake_to_blake_g_edge_interleave_matches_host_feed() {
 
     use crate::witness::components::{blake_g, blake_round};
 
-    let (cg, _a, _f, _s) = fill_fixture_with_memory(&[
+    let (cg, _a, _f, _s, _mem_arc) = fill_fixture_with_memory(&[
         "blake_round",
         "blake_round_sigma",
         "blake_g",

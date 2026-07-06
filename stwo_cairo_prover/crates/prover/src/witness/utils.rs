@@ -64,6 +64,17 @@ impl AtomicMultiplicityColumn {
         unsafe { AtomicU32::from_ptr(ptr).fetch_add(amount, Ordering::Relaxed) };
     }
 
+    /// The column's padded length in scalar slots (the device count-buffer size).
+    pub fn padded_len(&self) -> usize {
+        self.data.len() * N_LANES
+    }
+
+    /// Copy of the packed data (test gates compare mult columns without
+    /// consuming the state).
+    pub fn snapshot_simd_vec(&self) -> Vec<PackedM31> {
+        self.data.clone()
+    }
+
     /// Returns the internal data as a Vec<PackedM31>. The last element of the vector is padded with
     /// zeros if needed. This function performs a copy on the inner data, If atomics are not
     /// necessary, use [`MultiplicityColumn`] instead.

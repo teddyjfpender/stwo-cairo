@@ -103,6 +103,26 @@ impl ClaimGenerator {
         }
     }
 
+    /// Device count-feed merge (B2 v2): flat per-row counts (rows already
+    /// offset to `addr - 1` by the descriptor's key offset).
+    pub fn add_count_tables(&self, counts: &[u32]) {
+        for (row, &count) in counts.iter().enumerate() {
+            if count != 0 {
+                self.multiplicities.add_at(row as u32, count);
+            }
+        }
+    }
+
+    /// Test-gate snapshot of the multiplicity column (non-consuming).
+    pub(crate) fn mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+        vec![self.multiplicities.snapshot_simd_vec()]
+    }
+
+    /// The padded address-space rows — the device count buffer length.
+    pub fn table_size(&self) -> usize {
+        self.multiplicities.padded_len()
+    }
+
     pub fn add_packed_m31(&self, inputs: &PackedBaseField) {
         let addresses = inputs.to_array();
         for address in addresses {
