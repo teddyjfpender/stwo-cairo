@@ -58,6 +58,32 @@ $GB --pie $SN/SN_PIE_4.zip --backend cuda --engine gpu-native --reps 2 \
 timeout_s = 10800
 gpu_bound = true
 
+
+# --- M4 diet probe: streamed-LDE mode on the gpu-native engine — byte identity
+# + the VRAM delta (the diet's projected ~19-20GB is the 4090-fit threshold;
+# SN_PIE_1's 75.4GB DAG peak makes this an H100 need too). -----------------------------
+[[step]]
+name = "record-sn2-stream-lde"
+cmd = '''
+STWO_CAIRO_STREAM_LDE=1 STWO_FORCE_EXTEND_EVAL_MODE=1 \
+STWO_DUMP_PROOF=$OUT/sn2_slde.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --engine gpu-native --reps 2 --reuse-input 2>/dev/null | tail -6
+a=$(sha256sum $OUT/deduce_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/sn2_slde.proof | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo SLDE_PROOF_MATCH; else echo SLDE_PROOF_MISMATCH; fi'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['SLDE_PROOF_MATCH']
+
+[[step]]
+name = "record-sn1-stream-lde"
+cmd = '''
+STWO_CAIRO_STREAM_LDE=1 STWO_FORCE_EXTEND_EVAL_MODE=1 \
+$GB --pie $SN/SN_PIE_1.zip --backend cuda --engine gpu-native --reps 2 \
+  --reuse-input 2>/dev/null | tail -4'''
+timeout_s = 10800
+gpu_bound = true
+
 # --- Sustained throughput, composed config (P5 harness). ----------------------------
 [[step]]
 name = "record-sn2-sustained"
