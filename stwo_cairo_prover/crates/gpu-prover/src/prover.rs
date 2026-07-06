@@ -234,6 +234,20 @@ where
             opt_n_id_to_big_components,
         } = params;
 
+        // Streamed-LDE composition half: when the streaming leaf commit (or
+        // stream_lde) is on, the committed trace evaluations are released, so
+        // composition must regenerate them from coefficients (ExtendToEvalDomain)
+        // rather than read the released buffers. Set before the composition phase
+        // reads it; the witness/commit phases ignore this flag.
+        // SAFETY: single set on the main thread before any concurrent getenv of
+        // this key (composition runs later).
+        if flags::flag_on("STWO_CUDA_STREAM_LEAF_COMMIT") || flags::flag_on("STWO_CAIRO_STREAM_LDE")
+        {
+            unsafe {
+                std::env::set_var("STWO_FORCE_EXTEND_EVAL_MODE", "1");
+            }
+        }
+
         // ── Phase: ingest ────────────────────────────────────────────────────
         let IngestOutput {
             preprocessed_trace,
