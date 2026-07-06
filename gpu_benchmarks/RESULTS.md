@@ -623,3 +623,38 @@ the next PIE while the GPU proves the current); proving is SERIAL on the GPU,
 so sustained is capped at single-proof MHz. Exceeding single needs TRUE
 two-proof GPU concurrency => needs the VRAM diet (streaming-LDE-into-leaf) so
 two proof states fit one card. Not producer tuning.
+
+## 2026-07-06 — M5c: streaming LDE-into-leaf-hash VRAM diet, byte-identical (H100 SXM sk60d6jcg5p4lu)
+
+The linchpin. Base columns are LDE'd one 16-column group at a time, each fed
+into the running per-leaf blake2s state then freed, so all columns' evaluations
+are never resident at once. New device kernels (stream_leaf_init/update/
+finalize) + a coeff-LDE driver, both validated byte-identical to the all-at-once
+path on hardware (stream_leaf_layer_matches_build_leaves +
+stream_commit_leaves_matches_bulk), wired into CommitmentTreeProver behind
+STWO_CUDA_STREAM_LEAF_COMMIT (forces stream_lde + store_coeffs +
+FORCE_EXTEND_EVAL_MODE downstream). **Whole-proof M5C_PROOF_MATCH** on SN_PIE_2.
+
+VRAM (SN_PIE_2): **peak 42.5GB → 30.8GB** (base_commit 40.5→26.1, witness
+23.6, preprocessed_tree 27.5, interaction 27.1, stark_core 28.9). The base_commit
+peak — the original target — fell 40.5→26.1GB.
+
+**Cost finding (decisive for strategy): single-proof time 7.4s → 26.7s (3.6×).**
+The diet is coupled to full stream_lde, which regenerates trace evals from
+coefficients ~3× (composition ExtendToEvalDomain + per-group FRI quotients +
+decommit). This is the "costs a pass" tradeoff (design §7), realized as ~2.6
+extra eval-regen passes. Implications:
+- Single-card MHz: the diet HURTS (3.6×) — it is a memory tool, not a latency lever.
+- 2-proof pipelining on 80GB: 2×30.8=61.6GB now FITS (was 2×42.5=85 > 80). But
+  whether it's a throughput WIN depends on the regen passes overlapping the
+  concurrent proof's compute — plausible given the measured ~55% single-proof
+  GPU util (45% idle to absorb the extra passes), but only the M6 pipelining
+  implementation can measure it. Single-proof 3.6× is a pessimistic upper bound.
+- 4090 fleet (24GB): 30.8GB still over — needs the peak (now stark_core 28.9)
+  dieted further to fit, and the time cost compounds.
+
+Verdict: the memory goal is DELIVERED and byte-identical; the throughput win is
+gated on M6 (measure whether the regen hides under a concurrent proof) and/or
+reducing the regen cost (single cached regen / partial diet). Flag is opt-in
+(NOT a gpu-native default — it regresses single-card). Standing records unchanged
+(SN4 9.89s/1.42 is the current best single-card).
