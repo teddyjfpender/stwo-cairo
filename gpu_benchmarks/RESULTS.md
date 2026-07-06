@@ -780,3 +780,23 @@ WARM PHASE BREAKDOWN (SN_PIE_2, H100 sm_90, M5c diet, gpu-native — the real le
 Redirect: #1 (D→H→D, ~2.1s) is the single biggest prove-side lever, > the entire
 leaf-hash. Sub-2s needs #1 (Write Base 2.1→~0.3) + commit/decommit consolidation,
 not leaf-hash occupancy. Next: close the D→H→D loop on the builtin lanes.
+
+## 2026-07-06 — GpuProofGraph #1 first increment DELIVERED: sub-word D2H gate (D→H→D closure)
+
+The device witness lane core unconditionally D2H'd + host-repacked sub_words even when
+sub_flat is provably unused. Gated it (want_host_sub, mirror of want_host_lookup):
+skip the copy for all-count builtins (device_feed.require + no edge stash), keep it for
+edge producers / opcodes / shadow (fail-closed). Commits: stwo 9eea7846, stwo-cairo d7468b06.
+
+VALIDATED (SN_PIE_2, H100 sm_90, gpu-native, M5c diet):
+  BYTE-IDENTICAL: DAG_PROOF_MATCH_OK (DAG-on proof sha256 == host-lane-off reference; proof_kb 3006.636).
+  Warm wt: span deltas (removed ~1.38GiB D2H + host .map().collect() repack from the rayon critical path):
+    partial_ec_mul_window_bits_18   610 → 429 ms  (−30%)
+    partial_ec_mul_generic          882 → 596 ms  (−32%)
+    cube_252                        392 → 185 ms  (−53%)
+    blake_round / pedersen_agg      unchanged (edge builtins keep host recovery mirror — correct)
+  Write Base trace: 2091 → 1840 ms (−251ms wall; per-component work compresses across parallel cores).
+  Host RSS 23.9 → 8.6 GB. Total warm prove 11.14s (fastest yet, but within ~0.8s total noise — the
+  per-component wt: deltas are the reliable signal).
+Contrast the leaf-occupancy hint (flat): this is a real, byte-identical prove-side win. Remaining
+D→H→D: edge-builtin host mirrors (aggregator/blake_round recovery), opcode verify_instruction host feed.
