@@ -1,0 +1,25 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=2048; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; export PROVER=/workspace/stwo-cairo/stwo_cairo_prover; . $HOME/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH
+cd $PROVER
+STWO_CUDA_ARCH=sm_90 RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release -p stwo-cairo-prover stwo_wit_deduce_oracle -- --nocapture 2>&1 | tail -20
+--8<-- output --8<--
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/verify_instruction.rs:747:15
+    |
+747 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `stwo-cairo-prover` (lib test) generated 37 warnings (24 duplicates)
+    Finished `release` profile [optimized] target(s) in 2.03s
+     Running unittests src/lib.rs (target/release/deps/stwo_cairo_prover-b0d6ebb40e009c68)
+
+running 1 test
+pedersen table: registered HOST-BUILT table on device (56 cols x 8388608 rows, borrowed mode)
+deduce oracle kind 3: PASS (256 rows incl. section boundaries)
+deduce oracle kind 2: PASS (64 cases x 4 chained rounds)
+test witness::witness_eval::differential_test::stwo_wit_deduce_oracle_matches_fast_deduction ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 106 filtered out; finished in 2.91s
+

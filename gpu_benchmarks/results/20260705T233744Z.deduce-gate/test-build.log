@@ -1,0 +1,8 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=2048; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; export PROVER=/workspace/stwo-cairo/stwo_cairo_prover; . $HOME/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH
+cd $PROVER
+STWO_CUDA_ARCH=sm_90 RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release -p stwo-cairo-prover --no-run 2>&1 | tail -3
+--8<-- output --8<--
+warning: `stwo-cairo-prover` (lib test) generated 37 warnings (24 duplicates)
+    Finished `release` profile [optimized] target(s) in 2m 23s
+  Executable unittests src/lib.rs (target/release/deps/stwo_cairo_prover-b0d6ebb40e009c68)

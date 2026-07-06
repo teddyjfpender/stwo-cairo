@@ -1,0 +1,17 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=2048; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; export PROVER=/workspace/stwo-cairo/stwo_cairo_prover; . $HOME/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH
+cd $PROVER
+STWO_CUDA_ARCH=sm_90 RUSTFLAGS="-C target-cpu=x86-64-v3" STWO_CUDA_WITNESS_JIT_MAX_INSTRS=20000 cargo test --release -p stwo-cairo-prover pedersen_aggregator_recording_interpreter_matches_host -- --nocapture 2>&1 | tail -12
+--8<-- output --8<--
+    Finished `release` profile [optimized] target(s) in 2.02s
+     Running unittests src/lib.rs (target/release/deps/stwo_cairo_prover-b0d6ebb40e009c68)
+
+running 1 test
+pedersen table: registered HOST-BUILT table on device (56 cols x 8388608 rows, borrowed mode)
+stwo witness-JIT: registered dynamic program component=pedersen_aggregator_window_bits_18 instrs=5005
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_b0eb28f739a39f20 key=f971534fb6886595 (embedded sm_90 cubin)
+device leg [pedersen_aggregator_window_bits_18]: PASS (16 rows, 206 cols, 396 lookup words, 2023 sub words)
+test witness::witness_eval::differential_test::pedersen_aggregator_recording_interpreter_matches_host ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 106 filtered out; finished in 2.90s
+

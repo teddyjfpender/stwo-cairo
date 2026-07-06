@@ -443,3 +443,43 @@ P2 stream overlap on A40-class → **~2–2.5** on 4090/5090 after the VRAM diet
 aggregate 10–20 MHz is then 5–8 consumer cards at ~$0.15–0.35/MHz-hr versus ~$0.7 on
 H100. The per-component `wt:*` instrumentation shipped this round is the measured next
 step; W3 witness-on-GPU (builtin-first) is the dominant lever the trace now names.
+
+## 2026-07-06 — GPU-native pipeline v1: M0–M3 validated, records on all four SN PIEs (H100 SXM sk60d6jcg5p4lu, runs 20260705T233744Z + 20260706T001447Z)
+
+Config: `--engine gpu-native` (composed defaults: witness JIT lanes + device
+interaction + device edges + governor 20000) + the embedded AOT pack (118
+kernels @ cap 2048, offline -O3 sm_90 cubins; 39 pack hits/prove, runtime-key
+set-compare = all hit). 96-bit (pow26/blowup1/q70). All proofs verified
+in-run; SN_PIE_2 byte-identical to the legacy engine's proof
+(ENGINE_PROOF_MATCH + RECORD_SN2_PROOF_MATCH).
+
+Gates: deduce_gate.toml 15/15 PASS — oracle legs, whole-kernel builtin gates,
+lane on/off + DAG + AOT full-proof byte identity, engine parity, cubin-2048.
+
+| PIE | useful steps | cold s | warm s | useful MHz | prior best | Δ |
+|---|---|---|---|---|---|---|
+| SN_PIE_2 | 7.71M | 14.83 | **10.76** | **0.716** | 13.5 / 0.571 | **+25%** |
+| SN_PIE_1 | 14.65M | 76.6* | **18.20** | **0.805** | 38.7 / 0.378 | **+113%** |
+| SN_PIE_3 | 14.08M | 73.9* | **14.35** | **0.981** | 36.0 / 0.391 | **+151%** |
+| SN_PIE_4 | 14.06M | 73.6* | **14.92** | **0.942** | 29.3c / 0.480 | **+96%** |
+
+*cold includes first-run VM+adapt (~50s single-threaded on this 22-vCPU
+container).
+
+Sustained (pipeline 3, producers 3, aggregate): 0.543 useful MHz over 3 reps
+(42.6s total incl. fill; feed_starved 0.0s — host feed keeps up at this rate).
+
+Session ladder (SN_PIE_2 warm): legacy lane-off 16.76/0.460 → DAG 13.49/0.571
+→ AOT-only 14.62/0.527 → cubin-2048 14.16/0.544 → **gpu-native (DAG+AOT)
+11.25→10.76/0.716** — the DAG and AOT levers COMPOSE.
+
+VRAM: SN_PIE_1 peaked 75.4GB (DAG config; 80GB card at the edge — the M4 diet
+matters even on H100 for 14M-step PIEs). SN_PIE_2 42.5GB.
+
+Fleet math checkpoint: 0.94–0.98 useful MHz/card on 14M PIEs ⇒ ~10 MHz
+aggregate at ~10–11 H100s, or the M4-diet 4090 fleet at projected 2/3 the
+per-card rate for ~1/10 the $/hr — the $/MHz-hr thesis strengthens.
+
+Session cost: ~$4.90 (1.5h H100 SXM incl. 2 full builds + 2 hardware-only AOT
+wall fixes: offline-nvcc curandState in the fp256 embed, and the
+anonymous-namespace extern linkage class — both committed with probes).

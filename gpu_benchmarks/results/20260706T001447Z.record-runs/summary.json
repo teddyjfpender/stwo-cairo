@@ -1,0 +1,70 @@
+{
+  "run_id": "20260706T001447Z.record-runs",
+  "manifest": "record-runs",
+  "pod": {
+    "id": "sk60d6jcg5p4lu",
+    "gpu": "H100 SXM",
+    "usd_hr": 3.29
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "58cf3a547adc",
+      "diff_sha256": "e3b0c44298fc1c14",
+      "dirty": false
+    },
+    "stwo-cairo": {
+      "rev": "7ee73f2d6436",
+      "diff_sha256": "78f79ee589c4b215",
+      "dirty": true
+    }
+  },
+  "steps": [
+    {
+      "name": "record-sn2",
+      "rc": 0,
+      "seconds": 47.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "record-sn1",
+      "rc": 0,
+      "seconds": 112.3,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "record-sn3",
+      "rc": 0,
+      "seconds": 105.5,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "record-sn4",
+      "rc": 0,
+      "seconds": 104.2,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "record-sn2-sustained",
+      "rc": 0,
+      "seconds": 47.0,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": true,
+  "wall_s": 433.5
+}

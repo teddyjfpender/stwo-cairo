@@ -1,0 +1,4 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=2048; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; export PROVER=/workspace/stwo-cairo/stwo_cairo_prover; mkdir -p $OUT && test -x $GB && test -f $SN/SN_PIE_2.zip && nvidia-smi -L
+--8<-- output --8<--
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-d53fa7e5-4f36-3434-6b2b-c18bdf4ef868)
