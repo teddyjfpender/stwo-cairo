@@ -1,0 +1,72 @@
+{
+  "run_id": "20260706T030913Z.m5a-validate",
+  "manifest": "m5a-validate",
+  "pod": {
+    "id": "sk60d6jcg5p4lu",
+    "gpu": "H100 SXM",
+    "usd_hr": 3.29
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "a427e9e452de",
+      "diff_sha256": "e3b0c44298fc1c14",
+      "dirty": false
+    },
+    "stwo-cairo": {
+      "rev": "7eeefadc74e7",
+      "diff_sha256": "e3b0c44298fc1c14",
+      "dirty": false
+    }
+  },
+  "steps": [
+    {
+      "name": "m5a-baseline",
+      "rc": 0,
+      "seconds": 1500.9,
+      "passed": true,
+      "reasons": [
+        "GPU idle alarm during gpu_bound step"
+      ],
+      "artifacts": [],
+      "gpu_idle_alarm": true
+    },
+    {
+      "name": "m5a-gpu-native",
+      "rc": 0,
+      "seconds": 36.0,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "m5a-sn3",
+      "rc": 0,
+      "seconds": 91.2,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "m5a-sn4",
+      "rc": 0,
+      "seconds": 94.7,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "m5a-sn1",
+      "rc": 0,
+      "seconds": 98.9,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": true,
+  "wall_s": 1839.2
+}

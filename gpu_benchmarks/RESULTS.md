@@ -532,3 +532,37 @@ base_commit LDE+tree working set, not stark_core. SN_PIE_1 peak 75.4GB —
 still H100-edge; 4090 fit needs ~3x diet at 14M steps or PIE sharding.
 
 Fleet math: 1.13 useful MHz/card on SN3 ⇒ ~9 H100s for 10 MHz aggregate.
+
+## 2026-07-06 — M5a: builtin lanes as concurrent dependency arms + stream fanout, records again on all four PIEs (H100 SXM sk60d6jcg5p4lu, run 20260706T030913Z)
+
+The post-Merkle ledger's #1 lever delivered. The sequential builtin witness
+section (~3.5s of lane time) now runs as 7 rayon dependency arms derived from
+the certified schedule + per-writer state edges (verify_instruction | blake
+chain | mod/rc builtins | pedersen w18 | pedersen w9 | ec_op→ec_generic |
+poseidon chain), and STWO_CUDA_STREAM_FANOUT=1 joined the gpu-native defaults
+so concurrent lanes' kernels overlap on 4 pool streams (fork/join bridged,
+"B2 engaged"). Byte-identity gated end to end: gpu_native_parity_simd GREEN
+locally, M5A_PROOF_MATCH on pod, all proofs verified in-run.
+
+| PIE | useful steps | warm s | useful MHz | prior best | Δ |
+|---|---|---|---|---|---|
+| SN_PIE_2 | 7.71M | **7.39** | **1.043** (1.079 raw) | 8.98 / 0.858 | **+22%** |
+| SN_PIE_3 | 14.08M | **8.78** | **1.604** (1.635 raw) | 12.43 / 1.133 | **+42%** |
+| SN_PIE_4 | 14.06M | **10.34** | **1.359** (1.385 raw) | 11.45 / 1.228 | **+11%** |
+| SN_PIE_1 | 14.65M | **10.81** | **1.355** (1.380 raw) | 14.90 / 0.983 | **+38%** |
+
+All four Starknet OS PIEs above 1 MHz useful; SN_PIE_3 at **1.6 MHz** —
+4.1x the pre-program SIMD-era 0.39, and 14M steps proven in under 9 seconds.
+
+Ledger after M5a (SN2 warm, prove_cairo 7.47s): Write Base trace 4.08→2.33s,
+Merkle 1.75s, Commitment 2.01s, Prove STARKs 2.22s. The witness arm win is
+partially masked by the A2 committer overlap; the next levers are M5b
+inter-tree/commit overlap and M6 two-proof pipelining — the phase pie is now
+almost evenly split, so overlap (not single-phase compression) is the road on.
+
+Fleet math: 1.6 useful MHz/card on SN3 ⇒ **10 MHz aggregate at ~6-7 H100s**
+(was ~10-11 at M0-M3). Session cost so far ~$7.
+
+Housekeeping fixed this session: STWO_BOOTLOADER_JSON runtime override
+(resume-proof), pods.conf port refresh on resume, testkit merkle conformance
+pinning exact 16-word-block trees.
