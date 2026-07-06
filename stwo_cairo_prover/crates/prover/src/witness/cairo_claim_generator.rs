@@ -766,7 +766,7 @@ impl CairoClaimGenerator {
             + PedersenAggregatorWindowBits18Witness
             + PolyOps,
     >(
-        self,
+        mut self,
         opt_n_id_to_big_components: Option<usize>,
         // Stage A″ (pipelined commit): when `Some`, the opcode-prefix columns are
         // interpolated on a committer thread with this twiddle tree WHILE the serial
@@ -1265,391 +1265,517 @@ impl CairoClaimGenerator {
                 (handle, tree_ptr)
             });
 
-        let (verify_instruction_claim, verify_instruction_interaction_gen) = self
-            .verify_instruction
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:verify_instruction").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.range_check_7_2_5.as_ref().unwrap(),
-                    self.range_check_4_3.as_ref().unwrap(),
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.memory_id_to_big.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (blake_round_claim, blake_round_interaction_gen) = self
-            .blake_round
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:blake_round").entered();
-                // blake_round goes through the [`BlakeRoundWitness`] backend hook:
-                // SimdBackend runs the host writer; CudaBackend's device lane
-                // (pod-gated) is born on device and feeds blake_g device-to-device.
-                let (trace, claim, interaction_gen) = <B as BlakeRoundWitness>::write_trace(
-                    gen,
-                    self.blake_round_sigma.as_ref().unwrap(),
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.memory_id_to_big.as_ref().unwrap(),
-                    self.range_check_7_2_5.as_ref().unwrap(),
-                    self.blake_g.as_ref().unwrap(),
-                    self.jit_memory.as_ref(),
-                );
-                evals.extend(trace);
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (blake_g_claim, blake_g_interaction_gen) = self
-            .blake_g
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:blake_g").entered();
-                let (trace, claim, interaction_gen) = <B as BlakeGWitness>::write_trace(
-                    gen,
-                    self.verify_bitwise_xor_8.as_ref().unwrap(),
-                    self.verify_bitwise_xor_12.as_ref().unwrap(),
-                    self.verify_bitwise_xor_4.as_ref().unwrap(),
-                    self.verify_bitwise_xor_7.as_ref().unwrap(),
-                    self.verify_bitwise_xor_9.as_ref().unwrap(),
-                );
-                evals.extend(trace);
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (blake_round_sigma_claim, blake_round_sigma_interaction_gen) = self
-            .blake_round_sigma
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:blake_round_sigma").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (triple_xor_32_claim, triple_xor_32_interaction_gen) = self
-            .triple_xor_32
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:triple_xor_32").entered();
-                let (trace, claim, interaction_gen) =
-                    gen.write_trace(self.verify_bitwise_xor_8.as_ref().unwrap());
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (verify_bitwise_xor_12_claim, verify_bitwise_xor_12_interaction_gen) = self
-            .verify_bitwise_xor_12
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:verify_bitwise_xor_12").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(B::from_simd_evals(trace));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (add_mod_builtin_claim, add_mod_builtin_interaction_gen) = self
-            .add_mod_builtin
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:add_mod_builtin").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.memory_id_to_big.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (bitwise_builtin_claim, bitwise_builtin_interaction_gen) = self
-            .bitwise_builtin
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:bitwise_builtin").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.memory_id_to_big.as_ref().unwrap(),
-                    self.verify_bitwise_xor_9.as_ref().unwrap(),
-                    self.verify_bitwise_xor_8.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (mul_mod_builtin_claim, mul_mod_builtin_interaction_gen) = self
-            .mul_mod_builtin
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:mul_mod_builtin").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.memory_id_to_big.as_ref().unwrap(),
-                    self.range_check_12.as_ref().unwrap(),
-                    self.range_check_3_6_6_3.as_ref().unwrap(),
-                    self.range_check_18.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (pedersen_builtin_claim, pedersen_builtin_interaction_gen) = self
-            .pedersen_builtin
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:pedersen_builtin").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.pedersen_aggregator_window_bits_18.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
+        // ---------------------------------------------------------------------
+        // Builtin lanes: dependency arms (design M5a). The certified schedule +
+        // the per-writer state arguments define the edges; each arm below runs
+        // its chain in the original file order, arms run CONCURRENTLY (rayon).
+        // Cross-arm shared states (memory/range-check/xor tables) take atomic,
+        // commutative count adds — the same concurrency contract the opcode
+        // scope above already exercises. Consumers of cross-arm-fed states
+        // (memory, rc and xor lanes) stay in the sequential tail after the
+        // join. `evals` order is restored canonically from per-lane slots.
+        // ---------------------------------------------------------------------
+        let vi_gen = self.verify_instruction.take();
+        let blake_round_gen = self.blake_round.take();
+        let blake_g_gen = self.blake_g.take();
+        let blake_round_sigma_gen = self.blake_round_sigma.take();
+        let triple_xor_32_gen = self.triple_xor_32.take();
+        let verify_bitwise_xor_12_gen = self.verify_bitwise_xor_12.take();
+        let add_mod_builtin_gen = self.add_mod_builtin.take();
+        let bitwise_builtin_gen = self.bitwise_builtin.take();
+        let mul_mod_builtin_gen = self.mul_mod_builtin.take();
+        let pedersen_builtin_gen = self.pedersen_builtin.take();
+        let pedersen_narrow_gen = self.pedersen_builtin_narrow_windows.take();
+        let poseidon_builtin_gen = self.poseidon_builtin.take();
+        let range_check96_builtin_gen = self.range_check96_builtin.take();
+        let range_check_builtin_gen = self.range_check_builtin.take();
+        let ec_op_builtin_gen = self.ec_op_builtin.take();
+        let partial_ec_mul_generic_gen = self.partial_ec_mul_generic.take();
+        let pedersen_aggregator_window_bits_18_gen = self.pedersen_aggregator_window_bits_18.take();
+        let partial_ec_mul_window_bits_18_gen = self.partial_ec_mul_window_bits_18.take();
+        let pedersen_points_table_window_bits_18_gen =
+            self.pedersen_points_table_window_bits_18.take();
+        let pedersen_aggregator_window_bits_9_gen = self.pedersen_aggregator_window_bits_9.take();
+        let partial_ec_mul_window_bits_9_gen = self.partial_ec_mul_window_bits_9.take();
+        let pedersen_points_table_window_bits_9_gen =
+            self.pedersen_points_table_window_bits_9.take();
+        let poseidon_aggregator_gen = self.poseidon_aggregator.take();
+        let poseidon_3_partial_rounds_chain_gen = self.poseidon_3_partial_rounds_chain.take();
+        let poseidon_full_round_chain_gen = self.poseidon_full_round_chain.take();
+        let cube_252_gen = self.cube_252.take();
+        let poseidon_round_keys_gen = self.poseidon_round_keys.take();
+        let range_check_252_width_27_gen = self.range_check_252_width_27.take();
+
+        let mut vi_out = None;
+        let mut blake_round_out = None;
+        let mut blake_g_out = None;
+        let mut blake_round_sigma_out = None;
+        let mut triple_xor_32_out = None;
+        let mut verify_bitwise_xor_12_out = None;
+        let mut add_mod_builtin_out = None;
+        let mut bitwise_builtin_out = None;
+        let mut mul_mod_builtin_out = None;
+        let mut pedersen_builtin_out = None;
+        let mut pedersen_narrow_out = None;
+        let mut poseidon_builtin_out = None;
+        let mut range_check96_builtin_out = None;
+        let mut range_check_builtin_out = None;
+        let mut ec_op_builtin_out = None;
+        let mut partial_ec_mul_generic_out = None;
+        let mut pedersen_aggregator_window_bits_18_out = None;
+        let mut partial_ec_mul_window_bits_18_out = None;
+        let mut pedersen_points_table_window_bits_18_out = None;
+        let mut pedersen_aggregator_window_bits_9_out = None;
+        let mut partial_ec_mul_window_bits_9_out = None;
+        let mut pedersen_points_table_window_bits_9_out = None;
+        let mut poseidon_aggregator_out = None;
+        let mut poseidon_3_partial_rounds_chain_out = None;
+        let mut poseidon_full_round_chain_out = None;
+        let mut cube_252_out = None;
+        let mut poseidon_round_keys_out = None;
+        let mut range_check_252_width_27_out = None;
+
+        scope(|s| {
+            let jit_memory = self.jit_memory.as_ref();
+            let addr_state = self.memory_address_to_id.as_ref();
+            let id_state = self.memory_id_to_big.as_ref();
+            let rc_7_2_5 = self.range_check_7_2_5.as_ref();
+            let rc_4_3 = self.range_check_4_3.as_ref();
+            let rc_6 = self.range_check_6.as_ref();
+            let rc_8 = self.range_check_8.as_ref();
+            let rc_9_9 = self.range_check_9_9.as_ref();
+            let rc_12 = self.range_check_12.as_ref();
+            let rc_18 = self.range_check_18.as_ref();
+            let rc_20 = self.range_check_20.as_ref();
+            let rc_3_6_6_3 = self.range_check_3_6_6_3.as_ref();
+            let rc_3_3_3_3_3 = self.range_check_3_3_3_3_3.as_ref();
+            let rc_4_4_4_4 = self.range_check_4_4_4_4.as_ref();
+            let rc_4_4 = self.range_check_4_4.as_ref();
+            let vbx_4 = self.verify_bitwise_xor_4.as_ref();
+            let vbx_7 = self.verify_bitwise_xor_7.as_ref();
+            let vbx_8 = self.verify_bitwise_xor_8.as_ref();
+            let vbx_9 = self.verify_bitwise_xor_9.as_ref();
+
+            // Arm V: verify_instruction (all opcode feeders joined above).
+            if let Some(gen) = vi_gen {
+                let slot = &mut vi_out;
+                s.spawn(move |_| {
+                    let _wt = tracing::info_span!("wt:verify_instruction").entered();
+                    let (trace, claim, interaction_gen) = gen.write_trace(
+                        rc_7_2_5.unwrap(),
+                        rc_4_3.unwrap(),
+                        addr_state.unwrap(),
+                        id_state.unwrap(),
+                    );
+                    *slot = Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                });
+            }
+
+            // Arm B: blake_round -> blake_g -> sigma -> triple_xor_32 -> xor_12.
+            {
+                let blake_round_slot = &mut blake_round_out;
+                let blake_g_slot = &mut blake_g_out;
+                let sigma_slot = &mut blake_round_sigma_out;
+                let txor_slot = &mut triple_xor_32_out;
+                let vbx12_slot = &mut verify_bitwise_xor_12_out;
+                s.spawn(move |_| {
+                    let sigma_gen = blake_round_sigma_gen;
+                    let blake_g_state = blake_g_gen;
+                    if let Some(gen) = blake_round_gen {
+                        let _wt = tracing::info_span!("wt:blake_round").entered();
+                        // blake_round goes through the [`BlakeRoundWitness`] backend hook:
+                        // SimdBackend runs the host writer; CudaBackend's device lane
+                        // (pod-gated) is born on device and feeds blake_g device-to-device.
+                        let (trace, claim, interaction_gen) = <B as BlakeRoundWitness>::write_trace(
+                            gen,
+                            sigma_gen.as_ref().unwrap(),
+                            addr_state.unwrap(),
+                            id_state.unwrap(),
+                            rc_7_2_5.unwrap(),
+                            blake_g_state.as_ref().unwrap(),
+                            jit_memory,
+                        );
+                        *blake_round_slot = Some((trace, claim, interaction_gen));
+                    }
+                    if let Some(gen) = blake_g_state {
+                        let _wt = tracing::info_span!("wt:blake_g").entered();
+                        let (trace, claim, interaction_gen) = <B as BlakeGWitness>::write_trace(
+                            gen,
+                            vbx_8.unwrap(),
+                            verify_bitwise_xor_12_gen.as_ref().unwrap(),
+                            vbx_4.unwrap(),
+                            vbx_7.unwrap(),
+                            vbx_9.unwrap(),
+                        );
+                        *blake_g_slot = Some((trace, claim, interaction_gen));
+                    }
+                    if let Some(gen) = sigma_gen {
+                        let _wt = tracing::info_span!("wt:blake_round_sigma").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace();
+                        *sigma_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = triple_xor_32_gen {
+                        let _wt = tracing::info_span!("wt:triple_xor_32").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace(vbx_8.unwrap());
+                        *txor_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = verify_bitwise_xor_12_gen {
+                        let _wt = tracing::info_span!("wt:verify_bitwise_xor_12").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace();
+                        *vbx12_slot = Some((B::from_simd_evals(trace), claim, interaction_gen));
+                    }
+                });
+            }
+
+            // Arm M: mod/bitwise/rc builtins (feed only atomic count states).
+            {
+                let add_mod_slot = &mut add_mod_builtin_out;
+                let bitwise_slot = &mut bitwise_builtin_out;
+                let mul_mod_slot = &mut mul_mod_builtin_out;
+                let rc96_slot = &mut range_check96_builtin_out;
+                let rcb_slot = &mut range_check_builtin_out;
+                s.spawn(move |_| {
+                    if let Some(gen) = add_mod_builtin_gen {
+                        let _wt = tracing::info_span!("wt:add_mod_builtin").entered();
+                        let (trace, claim, interaction_gen) =
+                            gen.write_trace(addr_state.unwrap(), id_state.unwrap());
+                        *add_mod_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = bitwise_builtin_gen {
+                        let _wt = tracing::info_span!("wt:bitwise_builtin").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace(
+                            addr_state.unwrap(),
+                            id_state.unwrap(),
+                            vbx_9.unwrap(),
+                            vbx_8.unwrap(),
+                        );
+                        *bitwise_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = mul_mod_builtin_gen {
+                        let _wt = tracing::info_span!("wt:mul_mod_builtin").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace(
+                            addr_state.unwrap(),
+                            id_state.unwrap(),
+                            rc_12.unwrap(),
+                            rc_3_6_6_3.unwrap(),
+                            rc_18.unwrap(),
+                        );
+                        *mul_mod_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = range_check96_builtin_gen {
+                        let _wt = tracing::info_span!("wt:range_check96_builtin").entered();
+                        let (trace, claim, interaction_gen) =
+                            gen.write_trace(addr_state.unwrap(), id_state.unwrap(), rc_6.unwrap());
+                        *rc96_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = range_check_builtin_gen {
+                        let _wt = tracing::info_span!("wt:range_check_builtin").entered();
+                        let (trace, claim, interaction_gen) =
+                            gen.write_trace(addr_state.unwrap(), id_state.unwrap());
+                        *rcb_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                });
+            }
+
+            // Arm P18: pedersen_builtin -> aggregator_w18 -> partial_ec_mul_w18 ->
+            // points_table_w18.
+            {
+                let ped_slot = &mut pedersen_builtin_out;
+                let agg18_slot = &mut pedersen_aggregator_window_bits_18_out;
+                let ecm18_slot = &mut partial_ec_mul_window_bits_18_out;
+                let pts18_slot = &mut pedersen_points_table_window_bits_18_out;
+                s.spawn(move |_| {
+                    let agg18_gen = pedersen_aggregator_window_bits_18_gen;
+                    let ecm18_gen = partial_ec_mul_window_bits_18_gen;
+                    let pts18_gen = pedersen_points_table_window_bits_18_gen;
+                    if let Some(gen) = pedersen_builtin_gen {
+                        let _wt = tracing::info_span!("wt:pedersen_builtin").entered();
+                        let (trace, claim, interaction_gen) =
+                            gen.write_trace(addr_state.unwrap(), agg18_gen.as_ref().unwrap());
+                        *ped_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = agg18_gen {
+                        let _wt =
+                            tracing::info_span!("wt:pedersen_aggregator_window_bits_18").entered();
+                        let (trace, claim, interaction_gen) =
+                            <B as PedersenAggregatorWindowBits18Witness>::write_trace(
+                                gen,
+                                id_state.unwrap(),
+                                rc_8.unwrap(),
+                                ecm18_gen.as_ref().unwrap(),
+                                jit_memory,
+                            );
+                        *agg18_slot = Some((trace, claim, interaction_gen));
+                    }
+                    if let Some(gen) = ecm18_gen {
+                        let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_18").entered();
+                        let (trace, claim, interaction_gen) =
+                            <B as PartialEcMulWindowBits18Witness>::write_trace(
+                                gen,
+                                pts18_gen.as_ref().unwrap(),
+                                rc_9_9.unwrap(),
+                                rc_20.unwrap(),
+                                jit_memory,
+                            );
+                        *ecm18_slot = Some((trace, claim, interaction_gen));
+                    }
+                    if let Some(gen) = pts18_gen {
+                        let _wt = tracing::info_span!("wt:pedersen_points_table_window_bits_18")
+                            .entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace();
+                        *pts18_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                });
+            }
+
+            // Arm P9: narrow_windows -> aggregator_w9 -> partial_ec_mul_w9 -> points_table_w9.
+            {
+                let narrow_slot = &mut pedersen_narrow_out;
+                let agg9_slot = &mut pedersen_aggregator_window_bits_9_out;
+                let ecm9_slot = &mut partial_ec_mul_window_bits_9_out;
+                let pts9_slot = &mut pedersen_points_table_window_bits_9_out;
+                s.spawn(move |_| {
+                    let agg9_gen = pedersen_aggregator_window_bits_9_gen;
+                    let ecm9_gen = partial_ec_mul_window_bits_9_gen;
+                    let pts9_gen = pedersen_points_table_window_bits_9_gen;
+                    if let Some(gen) = pedersen_narrow_gen {
+                        let _wt =
+                            tracing::info_span!("wt:pedersen_builtin_narrow_windows").entered();
+                        let (trace, claim, interaction_gen) =
+                            gen.write_trace(addr_state.unwrap(), agg9_gen.as_ref().unwrap());
+                        *narrow_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = agg9_gen {
+                        let _wt =
+                            tracing::info_span!("wt:pedersen_aggregator_window_bits_9").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace(
+                            id_state.unwrap(),
+                            rc_8.unwrap(),
+                            ecm9_gen.as_ref().unwrap(),
+                        );
+                        *agg9_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = ecm9_gen {
+                        let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_9").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace(
+                            pts9_gen.as_ref().unwrap(),
+                            rc_9_9.unwrap(),
+                            rc_20.unwrap(),
+                        );
+                        *ecm9_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = pts9_gen {
+                        let _wt =
+                            tracing::info_span!("wt:pedersen_points_table_window_bits_9").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace();
+                        *pts9_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                });
+            }
+
+            // Arm E: ec_op_builtin -> partial_ec_mul_generic.
+            {
+                let ec_op_slot = &mut ec_op_builtin_out;
+                let ec_gen_slot = &mut partial_ec_mul_generic_out;
+                s.spawn(move |_| {
+                    let ec_generic_gen = partial_ec_mul_generic_gen;
+                    if let Some(gen) = ec_op_builtin_gen {
+                        let _wt = tracing::info_span!("wt:ec_op_builtin").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace(
+                            addr_state.unwrap(),
+                            id_state.unwrap(),
+                            rc_8.unwrap(),
+                            ec_generic_gen.as_ref().unwrap(),
+                        );
+                        *ec_op_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = ec_generic_gen {
+                        let _wt = tracing::info_span!("wt:partial_ec_mul_generic").entered();
+                        let (trace, claim, interaction_gen) =
+                            <B as PartialEcMulGenericWitness>::write_trace(
+                                gen,
+                                rc_8.unwrap(),
+                                rc_9_9.unwrap(),
+                                rc_20.unwrap(),
+                                jit_memory,
+                            );
+                        *ec_gen_slot = Some((trace, claim, interaction_gen));
+                    }
+                });
+            }
+
+            // Arm S: poseidon_builtin -> aggregator -> partial/full chains -> cube -> keys ->
+            // rc252.
+            {
+                let pos_b_slot = &mut poseidon_builtin_out;
+                let pos_agg_slot = &mut poseidon_aggregator_out;
+                let pos3_slot = &mut poseidon_3_partial_rounds_chain_out;
+                let pos_full_slot = &mut poseidon_full_round_chain_out;
+                let cube_slot = &mut cube_252_out;
+                let keys_slot = &mut poseidon_round_keys_out;
+                let rc252_slot = &mut range_check_252_width_27_out;
+                s.spawn(move |_| {
+                    let pos_agg_gen = poseidon_aggregator_gen;
+                    let pos3_gen = poseidon_3_partial_rounds_chain_gen;
+                    let pos_full_gen = poseidon_full_round_chain_gen;
+                    let cube_gen = cube_252_gen;
+                    let keys_gen = poseidon_round_keys_gen;
+                    let rc252_gen = range_check_252_width_27_gen;
+                    if let Some(gen) = poseidon_builtin_gen {
+                        let _wt = tracing::info_span!("wt:poseidon_builtin").entered();
+                        let (trace, claim, interaction_gen) =
+                            gen.write_trace(addr_state.unwrap(), pos_agg_gen.as_ref().unwrap());
+                        *pos_b_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = pos_agg_gen {
+                        let _wt = tracing::info_span!("wt:poseidon_aggregator").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace(
+                            id_state.unwrap(),
+                            pos_full_gen.as_ref().unwrap(),
+                            rc252_gen.as_ref().unwrap(),
+                            cube_gen.as_ref().unwrap(),
+                            rc_3_3_3_3_3.unwrap(),
+                            rc_4_4_4_4.unwrap(),
+                            rc_4_4.unwrap(),
+                            pos3_gen.as_ref().unwrap(),
+                        );
+                        *pos_agg_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = pos3_gen {
+                        let _wt =
+                            tracing::info_span!("wt:poseidon_3_partial_rounds_chain").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace(
+                            keys_gen.as_ref().unwrap(),
+                            cube_gen.as_ref().unwrap(),
+                            rc_4_4_4_4.unwrap(),
+                            rc_4_4.unwrap(),
+                            rc252_gen.as_ref().unwrap(),
+                        );
+                        *pos3_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = pos_full_gen {
+                        let _wt = tracing::info_span!("wt:poseidon_full_round_chain").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace(
+                            cube_gen.as_ref().unwrap(),
+                            keys_gen.as_ref().unwrap(),
+                            rc_3_3_3_3_3.unwrap(),
+                        );
+                        *pos_full_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = cube_gen {
+                        let _wt = tracing::info_span!("wt:cube_252").entered();
+                        let (trace, claim, interaction_gen) = <B as Cube252Witness>::write_trace(
+                            gen,
+                            rc_9_9.unwrap(),
+                            rc_20.unwrap(),
+                            jit_memory,
+                        );
+                        *cube_slot = Some((trace, claim, interaction_gen));
+                    }
+                    if let Some(gen) = keys_gen {
+                        let _wt = tracing::info_span!("wt:poseidon_round_keys").entered();
+                        let (trace, claim, interaction_gen) = gen.write_trace();
+                        *keys_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                    if let Some(gen) = rc252_gen {
+                        let _wt = tracing::info_span!("wt:range_check_252_width_27").entered();
+                        let (trace, claim, interaction_gen) =
+                            gen.write_trace(rc_9_9.unwrap(), rc_18.unwrap());
+                        *rc252_slot =
+                            Some((B::from_simd_evals(trace.to_evals()), claim, interaction_gen));
+                    }
+                });
+            }
+        });
+
+        // Canonical eval order (the exact pre-arm file order) + claim variables.
+        macro_rules! drain {
+            ($out:expr) => {
+                $out.map(|(ev, claim, igen)| {
+                    evals.extend(ev);
+                    (claim, igen)
+                })
+                .unzip()
+            };
+        }
+        let (verify_instruction_claim, verify_instruction_interaction_gen) = drain!(vi_out);
+        let (blake_round_claim, blake_round_interaction_gen) = drain!(blake_round_out);
+        let (blake_g_claim, blake_g_interaction_gen) = drain!(blake_g_out);
+        let (blake_round_sigma_claim, blake_round_sigma_interaction_gen) =
+            drain!(blake_round_sigma_out);
+        let (triple_xor_32_claim, triple_xor_32_interaction_gen) = drain!(triple_xor_32_out);
+        let (verify_bitwise_xor_12_claim, verify_bitwise_xor_12_interaction_gen) =
+            drain!(verify_bitwise_xor_12_out);
+        let (add_mod_builtin_claim, add_mod_builtin_interaction_gen) = drain!(add_mod_builtin_out);
+        let (bitwise_builtin_claim, bitwise_builtin_interaction_gen) = drain!(bitwise_builtin_out);
+        let (mul_mod_builtin_claim, mul_mod_builtin_interaction_gen) = drain!(mul_mod_builtin_out);
+        let (pedersen_builtin_claim, pedersen_builtin_interaction_gen) =
+            drain!(pedersen_builtin_out);
         let (
             pedersen_builtin_narrow_windows_claim,
             pedersen_builtin_narrow_windows_interaction_gen,
-        ) = self
-            .pedersen_builtin_narrow_windows
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:pedersen_builtin_narrow_windows").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.pedersen_aggregator_window_bits_9.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (poseidon_builtin_claim, poseidon_builtin_interaction_gen) = self
-            .poseidon_builtin
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:poseidon_builtin").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.poseidon_aggregator.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (range_check96_builtin_claim, range_check96_builtin_interaction_gen) = self
-            .range_check96_builtin
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:range_check96_builtin").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.memory_id_to_big.as_ref().unwrap(),
-                    self.range_check_6.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (range_check_builtin_claim, range_check_builtin_interaction_gen) = self
-            .range_check_builtin
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:range_check_builtin").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.memory_id_to_big.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (ec_op_builtin_claim, ec_op_builtin_interaction_gen) = self
-            .ec_op_builtin
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:ec_op_builtin").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_address_to_id.as_ref().unwrap(),
-                    self.memory_id_to_big.as_ref().unwrap(),
-                    self.range_check_8.as_ref().unwrap(),
-                    self.partial_ec_mul_generic.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (partial_ec_mul_generic_claim, partial_ec_mul_generic_interaction_gen) = self
-            .partial_ec_mul_generic
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:partial_ec_mul_generic").entered();
-                let (trace, claim, interaction_gen) =
-                    <B as PartialEcMulGenericWitness>::write_trace(
-                        gen,
-                        self.range_check_8.as_ref().unwrap(),
-                        self.range_check_9_9.as_ref().unwrap(),
-                        self.range_check_20.as_ref().unwrap(),
-                        self.jit_memory.as_ref(),
-                    );
-                evals.extend(trace);
-                (claim, interaction_gen)
-            })
-            .unzip();
+        ) = drain!(pedersen_narrow_out);
+        let (poseidon_builtin_claim, poseidon_builtin_interaction_gen) =
+            drain!(poseidon_builtin_out);
+        let (range_check96_builtin_claim, range_check96_builtin_interaction_gen) =
+            drain!(range_check96_builtin_out);
+        let (range_check_builtin_claim, range_check_builtin_interaction_gen) =
+            drain!(range_check_builtin_out);
+        let (ec_op_builtin_claim, ec_op_builtin_interaction_gen) = drain!(ec_op_builtin_out);
+        let (partial_ec_mul_generic_claim, partial_ec_mul_generic_interaction_gen) =
+            drain!(partial_ec_mul_generic_out);
         let (
             pedersen_aggregator_window_bits_18_claim,
             pedersen_aggregator_window_bits_18_interaction_gen,
-        ) = self
-            .pedersen_aggregator_window_bits_18
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:pedersen_aggregator_window_bits_18").entered();
-                let (trace, claim, interaction_gen) =
-                    <B as PedersenAggregatorWindowBits18Witness>::write_trace(
-                        gen,
-                        self.memory_id_to_big.as_ref().unwrap(),
-                        self.range_check_8.as_ref().unwrap(),
-                        self.partial_ec_mul_window_bits_18.as_ref().unwrap(),
-                        self.jit_memory.as_ref(),
-                    );
-                evals.extend(trace);
-                (claim, interaction_gen)
-            })
-            .unzip();
+        ) = drain!(pedersen_aggregator_window_bits_18_out);
         let (partial_ec_mul_window_bits_18_claim, partial_ec_mul_window_bits_18_interaction_gen) =
-            self.partial_ec_mul_window_bits_18
-                .map(|gen| {
-                    let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_18").entered();
-                    let (trace, claim, interaction_gen) =
-                        <B as PartialEcMulWindowBits18Witness>::write_trace(
-                            gen,
-                            self.pedersen_points_table_window_bits_18.as_ref().unwrap(),
-                            self.range_check_9_9.as_ref().unwrap(),
-                            self.range_check_20.as_ref().unwrap(),
-                            self.jit_memory.as_ref(),
-                        );
-                    evals.extend(trace);
-                    (claim, interaction_gen)
-                })
-                .unzip();
+            drain!(partial_ec_mul_window_bits_18_out);
         let (
             pedersen_points_table_window_bits_18_claim,
             pedersen_points_table_window_bits_18_interaction_gen,
-        ) = self
-            .pedersen_points_table_window_bits_18
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:pedersen_points_table_window_bits_18").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
+        ) = drain!(pedersen_points_table_window_bits_18_out);
         let (
             pedersen_aggregator_window_bits_9_claim,
             pedersen_aggregator_window_bits_9_interaction_gen,
-        ) = self
-            .pedersen_aggregator_window_bits_9
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:pedersen_aggregator_window_bits_9").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_id_to_big.as_ref().unwrap(),
-                    self.range_check_8.as_ref().unwrap(),
-                    self.partial_ec_mul_window_bits_9.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
+        ) = drain!(pedersen_aggregator_window_bits_9_out);
         let (partial_ec_mul_window_bits_9_claim, partial_ec_mul_window_bits_9_interaction_gen) =
-            self.partial_ec_mul_window_bits_9
-                .map(|gen| {
-                    let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_9").entered();
-                    let (trace, claim, interaction_gen) = gen.write_trace(
-                        self.pedersen_points_table_window_bits_9.as_ref().unwrap(),
-                        self.range_check_9_9.as_ref().unwrap(),
-                        self.range_check_20.as_ref().unwrap(),
-                    );
-                    evals.extend(B::from_simd_evals(trace.to_evals()));
-                    (claim, interaction_gen)
-                })
-                .unzip();
+            drain!(partial_ec_mul_window_bits_9_out);
         let (
             pedersen_points_table_window_bits_9_claim,
             pedersen_points_table_window_bits_9_interaction_gen,
-        ) = self
-            .pedersen_points_table_window_bits_9
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:pedersen_points_table_window_bits_9").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (poseidon_aggregator_claim, poseidon_aggregator_interaction_gen) = self
-            .poseidon_aggregator
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:poseidon_aggregator").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.memory_id_to_big.as_ref().unwrap(),
-                    self.poseidon_full_round_chain.as_ref().unwrap(),
-                    self.range_check_252_width_27.as_ref().unwrap(),
-                    self.cube_252.as_ref().unwrap(),
-                    self.range_check_3_3_3_3_3.as_ref().unwrap(),
-                    self.range_check_4_4_4_4.as_ref().unwrap(),
-                    self.range_check_4_4.as_ref().unwrap(),
-                    self.poseidon_3_partial_rounds_chain.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
+        ) = drain!(pedersen_points_table_window_bits_9_out);
+        let (poseidon_aggregator_claim, poseidon_aggregator_interaction_gen) =
+            drain!(poseidon_aggregator_out);
         let (
             poseidon_3_partial_rounds_chain_claim,
             poseidon_3_partial_rounds_chain_interaction_gen,
-        ) = self
-            .poseidon_3_partial_rounds_chain
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:poseidon_3_partial_rounds_chain").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.poseidon_round_keys.as_ref().unwrap(),
-                    self.cube_252.as_ref().unwrap(),
-                    self.range_check_4_4_4_4.as_ref().unwrap(),
-                    self.range_check_4_4.as_ref().unwrap(),
-                    self.range_check_252_width_27.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (poseidon_full_round_chain_claim, poseidon_full_round_chain_interaction_gen) = self
-            .poseidon_full_round_chain
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:poseidon_full_round_chain").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.cube_252.as_ref().unwrap(),
-                    self.poseidon_round_keys.as_ref().unwrap(),
-                    self.range_check_3_3_3_3_3.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (cube_252_claim, cube_252_interaction_gen) = self
-            .cube_252
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:cube_252").entered();
-                let (trace, claim, interaction_gen) = <B as Cube252Witness>::write_trace(
-                    gen,
-                    self.range_check_9_9.as_ref().unwrap(),
-                    self.range_check_20.as_ref().unwrap(),
-                    self.jit_memory.as_ref(),
-                );
-                evals.extend(trace);
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (poseidon_round_keys_claim, poseidon_round_keys_interaction_gen) = self
-            .poseidon_round_keys
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:poseidon_round_keys").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace();
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
-        let (range_check_252_width_27_claim, range_check_252_width_27_interaction_gen) = self
-            .range_check_252_width_27
-            .map(|gen| {
-                let _wt = tracing::info_span!("wt:range_check_252_width_27").entered();
-                let (trace, claim, interaction_gen) = gen.write_trace(
-                    self.range_check_9_9.as_ref().unwrap(),
-                    self.range_check_18.as_ref().unwrap(),
-                );
-                evals.extend(B::from_simd_evals(trace.to_evals()));
-                (claim, interaction_gen)
-            })
-            .unzip();
+        ) = drain!(poseidon_3_partial_rounds_chain_out);
+        let (poseidon_full_round_chain_claim, poseidon_full_round_chain_interaction_gen) =
+            drain!(poseidon_full_round_chain_out);
+        let (cube_252_claim, cube_252_interaction_gen) = drain!(cube_252_out);
+        let (poseidon_round_keys_claim, poseidon_round_keys_interaction_gen) =
+            drain!(poseidon_round_keys_out);
+        let (range_check_252_width_27_claim, range_check_252_width_27_interaction_gen) =
+            drain!(range_check_252_width_27_out);
         let (memory_address_to_id_claim, memory_address_to_id_interaction_gen) = self
             .memory_address_to_id
             .map(|gen| {

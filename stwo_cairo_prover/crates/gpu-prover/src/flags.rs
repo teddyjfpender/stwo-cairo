@@ -33,6 +33,11 @@ pub const FLAGS: &[FlagDef] = &[
         purpose: "legacy-shared: release evaluations per tree at commit; later phases run from coefficients",
         deletion_milestone: "M4 (folds into the diet)",
     },
+    FlagDef {
+        name: "STWO_CUDA_STREAM_FANOUT",
+        purpose: "legacy-shared: witness lanes launch on pool streams (fork/join bridged) so concurrent lanes overlap on-device",
+        deletion_milestone: "M6 (fanout becomes the unconditional lane path)",
+    },
 ];
 
 /// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed
@@ -48,6 +53,11 @@ pub const GPU_NATIVE_DEFAULTS: &[(&str, &str)] = &[
     ("STWO_CUDA_DEVICE_INTERACTION", "1"),
     ("STWO_CUDA_WITNESS_EDGES", "1"),
     ("STWO_CUDA_MEM_COUNT_FEEDS", "1"),
+    // Stage B2 fanout: the concurrent (rayon) opcode lanes launch on pool
+    // streams with per-lane fork/join bridges to legacy, so their kernels
+    // overlap on-device. Post-Merkle ledger: Write Base trace 4.08s over
+    // ~5.9s of sequential lane spans is the #1 remaining lever.
+    ("STWO_CUDA_STREAM_FANOUT", "1"),
 ];
 
 /// Apply [`GPU_NATIVE_DEFAULTS`] (unset variables only). Called once at
