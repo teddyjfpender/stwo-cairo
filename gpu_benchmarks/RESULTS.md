@@ -686,3 +686,23 @@ hours — rsync -t preserved local mtimes so cargo skipped rebuilding the stwo p
 and a parallel-feature compile error was hidden by the script's `| tail`. Now touches
 synced source + surfaces build failures. (Earlier "batched decommit didn't help" and
 "PVT absent" results were the stale binary; corrected here.)
+
+## 2026-07-06 — M6-a increment 1: --resident-pipeline harness + two-proof SEQUENTIAL baseline (H100 SXM)
+
+The M6 gates are two-proof-WALL metrics; the existing --pipeline can't measure them
+(it overlaps host-feed of a serial prover, not two provers). New --resident-pipeline N
+harness proves N full proofs and reports twoproof_wall_s / per_proof_s /
+sustained_useful_mhz / vram_peak_gb / feed_starved_s / proof_byte_equal.
+
+Increment 1 (SEQUENTIAL baseline, M5c diet ON, G=32): two SN_PIE_2 proofs
+**twoproof_wall_s = 25.24s**, per_proof 12.59s, sustained_useful_mhz 0.611,
+vram_peak 31.6GB (two proofs fit an 80GB card), proof_byte_equal=true. Also
+confirmed G=32 streaming-commit group default byte-identical (H_G32_MATCH; single
+warm 11.64s ≈ G=16's 11.23s — group tuning within pod noise, neutral).
+
+This 25.24s is the baseline the stream-explicit concurrent scheduler (M6-a
+increment 2) must beat. Gates for the TWO-proof wall: <14.8s (beats non-diet
+throughput), <11s (meaningful), <8s (strong 10 MHz signal). The concurrent
+scheduler (CudaExecContext: per-proof streams + pool namespaces + event deps +
+priorities, threading past the current stream-0-centric backend; round-27 flagged
+pool concurrency as never-validated) is the next major multi-session build.
