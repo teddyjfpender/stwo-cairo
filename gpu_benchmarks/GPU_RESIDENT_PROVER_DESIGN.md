@@ -633,6 +633,55 @@ on macOS; pod validation batched into one session (running).
   even, so M5b inter-tree overlap and M6 pipelining are the road on.
   Fleet math: 10 MHz aggregate ≈ 6-7 H100s.
 
+## 11c. Next-lever ranking (adversarial-review workflow, 2026-07-06)
+
+An 11-agent adversarial workflow reviewed the M5b changes (4/5 findings
+refuted; 1 confirmed = a latent OODS grid.y>65535 robustness cap, guarded)
+and ranked the remaining levers toward 10 MHz, grounded in the M5a SN2
+ledger (prove_cairo 7.47s ≈ Write Base 2.33 + Commitment 2.01 (Merkle 1.75)
++ Prove STARKs 2.22 (OODS ~0.56) + ~0.9 interaction/ingest). The
+load-bearing constraint (F5): a single proof's Fiat-Shamir spine is serial —
+intra-proof overlap only hides work independent up to the next absorb;
+filling the idle 96% SM needs a second proof (M6). Overlap and pipelining
+are complementary, not redundant.
+
+1. **Inter-tree / cross-phase overlap (M5b + extension)** — commit hidden
+   under witness arms; batched OODS off the STARK-core path; tree k iNTT ‖
+   tree k−1 Merkle tail. ~7.47→5.5–6.0s at M5b, toward 3–4s with more
+   overlap. Low risk, soundness-neutral, no gate, pod-validated.
+2. **CUDA graphs** — capture each phase family per (shape, size vector),
+   replay with pointer rebind; attacks the F1 launch-gap floor (R3<100,
+   R4<20%). ~1–2s if idle is launch-dominated. Covers witness/commit/
+   composition; NOT FRI without #4. Medium risk; capability probe (pod is
+   CUDA 11.8; cudaGraphExecUpdate/conditional-node limits vary) + eager
+   fallback. No soundness gate.
+3. **Commit-path kernel throughput** — stage-fused radix-8/16 NTT (~2 DRAM
+   passes vs per-stage-pair), in-kernel twiddle regen, Merkle interior
+   layer-pair + tail. Commitment 2.01→0.6–1.0s (~1.0–1.4s); real headroom
+   because F4 measured commit 75× off the streaming bound. Conformance-gated
+   per size EXCEPT hash-from-registers (soundness-adjacent → own review).
+4. **Device Fiat-Shamir channel** — blake2s absorb/squeeze on device, drawn
+   elements in device buffers, roots absorbed D2D. ~0.3–0.6s standalone but
+   a MULTIPLIER for #1/#2 (turns FRI+PoW+decommit into one graph). HARD gate:
+   U4/U6 full-transcript byte-equality + Teddy approval before default-ON,
+   StarkWare before mainnet. The host mirror byte-check is the safety net.
+5. **M6 two-proof pipelining** — two DeviceProofStates, N+1 ingest/witness
+   fills N's barrier drains. Sustained-throughput lever, not single-proof
+   latency; currently NEGATIVE (M5a sustained 0.543 < single 1.043) because
+   the device isn't residency-clean — turns positive only AFTER #1 lands.
+   For the fleet $/MHz-hr north star (U5) it is THE axis, gated behind #1–#4.
+
+VRAM diet: not a single-card MHz lever (can cost an LDE-regen pass) but a
+FEASIBILITY requirement — SN_PIE_1 peaked 75.4GB, base_commit is the 40.7GB
+SN2 peak — and the gate for the 4090 fleet. Rides in with #3 at M4 (compaction
+lives in the commit loop the NTT fusion rebuilds).
+
+Cross-cutting caveat: #1/#2/#4 interlock (graphs want the channel to cover
+FRI; the channel wants graphs for chaining; both want the overlap schedule as
+their capture topology) — expect sub-additive gains where they touch the same
+phase boundaries. The ledger grades each; every one stays behind whole-proof
+byte-identity before default-ON.
+
 ## 12. Effort and risk
 
 | workstream | size | risk | pod-dependent? |
