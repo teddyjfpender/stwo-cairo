@@ -24,8 +24,8 @@ OUT = "/workspace/out"
 [[step]]
 name = "record-sn2"
 cmd = '''
-STWO_DUMP_PROOF=$OUT/record_sn2.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
-  --engine gpu-native --reps 3 --reuse-input 2> $OUT/record_sn2.err | tail -8
+STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/record_sn2.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --engine gpu-native --reps 3 --reuse-input 2> $OUT/record_sn2.err | tail -12
 a=$(sha256sum $OUT/deduce_off.proof | cut -d' ' -f1)
 b=$(sha256sum $OUT/record_sn2.proof | cut -d' ' -f1)
 if [ "$a" = "$b" ]; then echo RECORD_SN2_PROOF_MATCH; else echo RECORD_SN2_PROOF_MISMATCH; fi'''
