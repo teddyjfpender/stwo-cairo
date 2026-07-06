@@ -483,3 +483,42 @@ per-card rate for ~1/10 the $/hr — the $/MHz-hr thesis strengthens.
 Session cost: ~$4.90 (1.5h H100 SXM incl. 2 full builds + 2 hardware-only AOT
 wall fixes: offline-nvcc curandState in the fp256 embed, and the
 anonymous-namespace extern linkage class — both committed with probes).
+
+## 2026-07-06 — M4 increment: word-block Merkle + device mem count feeds, new records on SN1/SN2/SN3 (H100 SXM sk60d6jcg5p4lu, run 20260706T023111Z)
+
+Two M4 levers landed and validated byte-identical (M4_PROOF_MATCH on SN_PIE_2
+vs the same-build legacy engine):
+
+- **Word-block blake2s Merkle path** — leaf/lifted/interior kernels hash M31
+  words directly as LE message words (no byte staging buffer), unrolled
+  16-word register blocks. Bit-identical by construction *after* fixing an
+  eager-block bug: `blake2s_update` is lazy (`inlen > fill`), so a stream
+  ending on a full 64-byte block flags THAT block last — the eager loop
+  compressed it with last=0 and appended a zero-padded extra block, mis-hashing
+  exactly the trees whose column count ≡ 0 (mod 16). SN_PIE_3's FRI first
+  layer is such a tree: `Fri(FirstLayerCommitmentInvalid RootMismatch)` on
+  both engines while SN2 passed everything. Fix: lazy loop (`col+16 < n`,
+  rem ∈ 1..=16). The testkit merkle conformance now pins 16/32-column
+  mixed-size trees (root + queried values + hash witness) — the old 5-column
+  case could never catch a block-boundary bug; CUDA conformance PASS on pod.
+- **Device memory count feeds v2** — opcode lanes + blake/aggregator builtin
+  seams feed memory_address_to_id (signed key_offset), memory_id_to_big
+  (mem-id decode, big/#small split) and blake sigma LUT counts on device;
+  hand feeders gained skip guards (double-feed hazard caught by the 49-desc
+  differential gate + fail-loud seam panics).
+
+| PIE | useful steps | warm s | useful MHz | prior best | Δ |
+|---|---|---|---|---|---|
+| SN_PIE_2 | 7.71M | **8.98** | **0.858** (0.888 raw) | 10.40 / 0.741 | **+16%** |
+| SN_PIE_3 | 14.08M | **12.43** | **1.133** (1.155 raw) | 13.98 / 1.007 | **+15%** |
+| SN_PIE_1 | 14.65M | **14.90** | **0.983** (1.001 raw) | 18.20 / 0.805 | **+24%** |
+
+First sub-10s Starknet OS proof (SN2 8.98s); SN1 joins SN3 above 1 MHz raw.
+
+Per-phase VRAM ledger (SN_PIE_2, used_high/pool): witness 32.4 →
+preprocessed_tree 26.7 → **base_commit 40.7 (peak)** → interaction_write 36.3
+→ interaction_commit 37.4 → stark_core 34.4 GB. The diet target is the
+base_commit LDE+tree working set, not stark_core. SN_PIE_1 peak 75.4GB —
+still H100-edge; 4090 fit needs ~3x diet at 14M steps or PIE sharding.
+
+Fleet math: 1.13 useful MHz/card on SN3 ⇒ ~9 H100s for 10 MHz aggregate.
