@@ -716,6 +716,82 @@ enum PieMode {
 /// channel of `depth`; the main thread proves each as it arrives. The total wall clock
 /// starts before the producers spawn, so pipeline fill counts. Proof-size capture and
 /// rep-0 verification run after the clock stops to keep the sustained window pure.
+/// M6-a resident two-proof throughput harness. Increment 1: prove N inputs
+/// SEQUENTIALLY (pre-loaded, so feed_starved=0) and report the two-proof-wall
+/// metrics the M6 gates are defined on. This is the baseline the stream-explicit
+/// concurrent scheduler must beat; the metric plumbing here is reused by that
+/// concurrent version (which will overlap the proves on distinct streams).
+fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
+    assert!(n >= 1, "--resident-pipeline <N> must be >= 1");
+    let variant = source.preprocessed_variant();
+    prewarm_pedersen_tables(variant);
+
+    // Pre-load once, clone per proof (feed is off the timed critical path).
+    let loaded = source.load();
+    let pie_n_steps = loaded.pie_n_steps;
+    let cycle_count = cycle_count_of(&loaded.input);
+    let inputs: Vec<ProverInput> = (0..n).map(|_| loaded.input.clone()).collect();
+
+    let wall_start = Instant::now();
+    let mut times = Vec::with_capacity(n);
+    let mut vram_peak_gb = 0.0f64;
+    let mut proof_hashes: Vec<u64> = Vec::with_capacity(n);
+    let mut first_proof = None;
+    for (i, input) in inputs.into_iter().enumerate() {
+        let (proof, elapsed, rep_vram) = prove_sampled!(backend, input, variant);
+        vram_peak_gb = vram_peak_gb.max(rep_vram);
+        times.push(elapsed);
+        // Byte-equality proxy: same input => identical proof bytes across all N.
+        let bytes = bincode::serialize(&proof).expect("serialize proof");
+        proof_hashes.push(seahash_of(&bytes));
+        if i == 0 {
+            first_proof = Some(proof);
+        }
+        eprintln!("resident_proof={i} prove_s={elapsed:.3}");
+    }
+    let wall_s = wall_start.elapsed().as_secs_f64();
+
+    // All N proofs prove the SAME statement => their bytes must be identical.
+    let byte_equal = proof_hashes.iter().all(|h| *h == proof_hashes[0]);
+    // Verify one proof in-run (outside the timed window).
+    if let Some(proof) = first_proof {
+        verify_cairo::<Blake2sMerkleChannel>(proof.into()).expect("resident proof verify");
+    }
+
+    let per_proof_s = times.iter().sum::<f64>() / n as f64;
+    let total_steps = pie_n_steps.map(|s| s * n);
+    println!(
+        "{}",
+        merge_json(
+            json!({
+                "mode": "resident-pipeline",
+                "concurrency": "sequential-baseline",
+                "n_proofs": n,
+                "twoproof_wall_s": round3(wall_s),
+                "per_proof_s": round3(per_proof_s),
+                "sustained_steps_per_s": total_steps.map(|s| (s as f64 / wall_s).round()),
+                "sustained_useful_mhz": total_steps.map(|s| round3(s as f64 / wall_s / 1e6)),
+                "cycle_useful_mhz": round3((cycle_count * n) as f64 / wall_s / 1e6),
+                "vram_peak_gb": round3(vram_peak_gb),
+                "feed_starved_s": 0.0,
+                "proof_byte_equal": byte_equal,
+                "pie_n_steps": pie_n_steps,
+            }),
+            record_context(backend)
+        )
+    );
+}
+
+fn seahash_of(bytes: &[u8]) -> u64 {
+    // Cheap content hash for cross-proof byte-equality (no crypto needed here).
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 fn run_pipelined(
     source: &InputSource,
     backend: &str,
@@ -1070,6 +1146,18 @@ fn main() {
         .unwrap_or_else(|| "1".to_string())
         .parse()
         .expect("--producers must be a usize");
+
+    // M6-a: resident two-proof throughput. Unlike --pipeline (host-feed overlap of
+    // a SERIAL prover), this proves N full proofs and reports the TWO-PROOF-WALL
+    // metrics the M6 gates are defined on (<14.8s beats non-diet throughput, <11s
+    // meaningful, <8s strong). Increment 1 proves them SEQUENTIALLY (the baseline =
+    // N x single ≈ 22.5s at M5c 11.23s) to establish the harness + metrics before
+    // the stream-explicit concurrent scheduler lands.
+    if let Some(n) = arg("--resident-pipeline") {
+        let n: usize = n.parse().expect("--resident-pipeline <N>");
+        run_resident_pipeline(&source, &backend, n);
+        return;
+    }
 
     // P5 sustained-throughput mode; absent flag keeps today's behavior exactly.
     if let Some(depth) = arg("--pipeline") {
