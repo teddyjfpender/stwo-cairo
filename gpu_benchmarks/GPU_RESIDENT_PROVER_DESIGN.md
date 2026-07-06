@@ -602,6 +602,23 @@ on macOS; pod validation batched into one session (running).
   (offline-nvcc curandState in the fp256 embed; anonymous-namespace extern
   linkage — the C13 class). VRAM: SN_PIE_1 DAG config peaked 75.4GB — the
   M4 diet is now also an H100 requirement for 14M PIEs, not only a fleet one.
+- **M4 increment VALIDATED (2026-07-06, run 20260706T023111Z)**: word-block
+  blake2s Merkle (leaf/lifted/interior hash M31 words directly, register
+  blocks, no byte buffer) + device memory count feeds v2 (opcode lanes +
+  blake/aggregator seams: addr −1 offset, mem-id decode with big/#small
+  split, sigma LUT; skip-guarded hand feeders). Byte-identical on SN_PIE_2
+  (M4_PROOF_MATCH). One soundness-relevant bug found AND fenced: the eager
+  word-block loop mis-hashed streams that end on a full 64-byte block
+  (column count ≡ 0 mod 16 — SN_PIE_3's FRI first layer; RootMismatch on
+  internal verify, both engines). Fix = lazy loop matching blake2s_update;
+  the testkit merkle conformance now pins 16/32-column trees, CUDA
+  conformance green on pod. Records (warm, useful MHz): SN_PIE_2
+  **8.98s/0.858** (first sub-10s OS proof), SN_PIE_3 **12.43s/1.133**,
+  SN_PIE_1 **14.90s/0.983**. Per-phase VRAM ledger (STWO_VRAM_PHASES):
+  **base_commit is the peak** (40.7GB of SN2's 42.5; witness 32.4,
+  stark_core 34.4) — the diet targets the base LDE+tree working set.
+  Remaining M4 tail: diet design from the ledger, twiddle regen-in-kernel,
+  stage-fused NTT audit, 4090 fit.
 
 ## 12. Effort and risk
 
