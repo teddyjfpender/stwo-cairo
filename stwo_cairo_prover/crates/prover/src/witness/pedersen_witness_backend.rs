@@ -572,14 +572,24 @@ impl PedersenAggregatorWindowBits18Witness for CudaBackend {
                 };
                 let merge = |family: &'static str, counts: &[u32]| match family {
                     "range_check_8_state" => range_check_8.add_count_tables(counts),
+                    "memory_id_to_big_state" => memory_id_to_big.add_big_count_tables(counts),
+                    "memory_id_to_big_state#small" => {
+                        memory_id_to_big.add_small_count_tables(counts)
+                    }
                     other => panic!("unexpected count family {other}"),
+                };
+                let sizes = |family: &'static str| match family {
+                    "memory_id_to_big_state" => Some((
+                        memory_id_to_big.big_table_size(),
+                        memory_id_to_big.small_table_size(),
+                    )),
+                    _ => None,
                 };
                 let plan = crate::witness::jit_prove_backend::DeviceFeedPlan {
                     layout: pedersen_aggregator_window_bits_18::SUB_FEED_LAYOUT,
                     lut_for: &lut_for,
                     merge: &merge,
-                    // Memory families stay host-fed at this seam until sized.
-                    sizes: &|_| None,
+                    sizes: &sizes,
                     require: false,
                 };
                 let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<

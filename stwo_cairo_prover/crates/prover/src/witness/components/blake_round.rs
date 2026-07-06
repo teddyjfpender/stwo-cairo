@@ -6925,7 +6925,7 @@ pub(crate) fn feed_sub_inputs_from_flat(
             words[word * n_rows + vi * N_LANES + l]
         })),
     };
-    {
+    if !skip.contains(&"blake_round_sigma_state") {
         let col: Vec<blake_round_sigma::PackedInputType> =
             (0..n_vec).map(|vi| [m31(0, vi)]).collect();
         blake_round_sigma_state.add_packed_inputs(&col, 0);
@@ -6939,15 +6939,19 @@ pub(crate) fn feed_sub_inputs_from_flat(
             range_check_7_2_5_state.add_packed_inputs(&col, 0);
         }
     }
-    for j in 0..16 {
-        let col: Vec<memory_address_to_id::PackedInputType> =
-            (0..n_vec).map(|vi| m31(49 + j, vi)).collect();
-        memory_address_to_id_state.add_packed_inputs(&col, 0);
+    if !skip.contains(&"memory_address_to_id_state") {
+        for j in 0..16 {
+            let col: Vec<memory_address_to_id::PackedInputType> =
+                (0..n_vec).map(|vi| m31(49 + j, vi)).collect();
+            memory_address_to_id_state.add_packed_inputs(&col, 0);
+        }
     }
-    for j in 0..16 {
-        let col: Vec<memory_id_to_big::PackedInputType> =
-            (0..n_vec).map(|vi| m31(65 + j, vi)).collect();
-        memory_id_to_big_state.add_packed_inputs(&col, 0);
+    if !skip.contains(&"memory_id_to_big_state") {
+        for j in 0..16 {
+            let col: Vec<memory_id_to_big::PackedInputType> =
+                (0..n_vec).map(|vi| m31(65 + j, vi)).collect();
+            memory_id_to_big_state.add_packed_inputs(&col, 0);
+        }
     }
     if !skip.contains(&"blake_g_state") {
         feed_blake_g_inputs_from_flat(words, n_rows, blake_g_state);

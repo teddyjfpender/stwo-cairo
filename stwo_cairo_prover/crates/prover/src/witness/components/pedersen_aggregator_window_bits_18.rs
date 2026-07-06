@@ -15122,9 +15122,12 @@ pub(crate) fn feed_sub_inputs_from_flat(
             M31::from_u32_unchecked(words[word * n_rows + vi * N_LANES + l])
         }))
     };
-    for j in 0..3 {
-        let col: Vec<memory_id_to_big::PackedInputType> = (0..n_vec).map(|vi| m31(j, vi)).collect();
-        add_inputs(memory_id_to_big_state, &col, n_rows, 0);
+    if !skip.contains(&"memory_id_to_big_state") {
+        for j in 0..3 {
+            let col: Vec<memory_id_to_big::PackedInputType> =
+                (0..n_vec).map(|vi| m31(j, vi)).collect();
+            add_inputs(memory_id_to_big_state, &col, n_rows, 0);
+        }
     }
     if !skip.contains(&"range_check_8_state") {
         for j in 0..4 {

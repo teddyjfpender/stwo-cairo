@@ -154,19 +154,37 @@ impl BlakeRoundWitness for CudaBackend {
                 let lut_for = |family: &'static str| -> Vec<u32> {
                     match family {
                         "range_check_7_2_5_state" => range_check_7_2_5_state.input_to_row_lut(),
+                        "blake_round_sigma_state" => blake_round_sigma_state.input_to_row_lut(),
                         other => panic!("unexpected LUT family {other}"),
                     }
                 };
                 let merge = |family: &'static str, counts: &[u32]| match family {
                     "range_check_7_2_5_state" => range_check_7_2_5_state.add_count_tables(counts),
+                    "blake_round_sigma_state" => blake_round_sigma_state.add_count_tables(counts),
+                    "memory_address_to_id_state" => {
+                        memory_address_to_id_state.add_count_tables(counts)
+                    }
+                    "memory_id_to_big_state" => memory_id_to_big_state.add_big_count_tables(counts),
+                    "memory_id_to_big_state#small" => {
+                        memory_id_to_big_state.add_small_count_tables(counts)
+                    }
                     other => panic!("unexpected count family {other}"),
+                };
+                let sizes = |family: &'static str| match family {
+                    "memory_address_to_id_state" => {
+                        Some((memory_address_to_id_state.table_size(), 0))
+                    }
+                    "memory_id_to_big_state" => Some((
+                        memory_id_to_big_state.big_table_size(),
+                        memory_id_to_big_state.small_table_size(),
+                    )),
+                    _ => None,
                 };
                 let plan = crate::witness::jit_prove_backend::DeviceFeedPlan {
                     layout: blake_round::SUB_FEED_LAYOUT,
                     lut_for: &lut_for,
                     merge: &merge,
-                    // Memory families stay host-fed at this seam until sized.
-                    sizes: &|_| None,
+                    sizes: &sizes,
                     require: false,
                 };
                 let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<
