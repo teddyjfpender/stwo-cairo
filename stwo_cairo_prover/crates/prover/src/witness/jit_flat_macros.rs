@@ -167,22 +167,30 @@ macro_rules! jit_sub_accessors {
 
         /// Feed the decoded sub-inputs into the downstream states — the same entry
         /// points, per-relation order, and full padded extent as the host writer.
+        /// `device_fed` names count families already merged from device counts
+        /// (B2 v2 memory families); their host loops are skipped — double
+        /// feeding corrupts multiplicities.
         pub(crate) fn feed_sub_inputs_from_flat(
             words: &[u32],
             n_rows: usize,
             memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
             memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
             verify_instruction_state: &verify_instruction::ClaimGenerator,
+            device_fed: &[&'static str],
         ) {
             let (vi, addrs, ids) = sub_inputs_from_flat(words, n_rows);
             for input in &vi {
                 $crate::witness::utils::AddInputs::add_input(verify_instruction_state, input, 0);
             }
-            for col in &addrs {
-                memory_address_to_id_state.add_inputs(col);
+            if !device_fed.contains(&"memory_address_to_id_state") {
+                for col in &addrs {
+                    memory_address_to_id_state.add_inputs(col);
+                }
             }
-            for col in &ids {
-                memory_id_to_big_state.add_inputs(col);
+            if !device_fed.contains(&"memory_id_to_big_state") {
+                for col in &ids {
+                    memory_id_to_big_state.add_inputs(col);
+                }
             }
         }
 

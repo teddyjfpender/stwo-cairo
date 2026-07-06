@@ -61,6 +61,12 @@ pub(crate) fn device_interaction_enabled() -> bool {
     std::env::var("STWO_CUDA_DEVICE_INTERACTION").as_deref() == Ok("1")
 }
 
+/// B2 v2 master switch: memory-table count families feed on device from the
+/// lanes' resident sub buffers (gpu-native composed default; explicit =0 wins).
+fn mem_count_feeds_enabled() -> bool {
+    std::env::var("STWO_CUDA_MEM_COUNT_FEEDS").as_deref() == Ok("1")
+}
+
 type DeviceLookupStash = std::sync::Mutex<
     std::collections::HashMap<&'static str, (stwo_backend_cuda::BaseFieldVec, usize, usize)>,
 >;
@@ -114,7 +120,10 @@ pub trait OpcodeLaneSpec {
         addr_state: &memory_address_to_id::ClaimGenerator,
         id_state: &memory_id_to_big::ClaimGenerator,
         vi_state: &verify_instruction::ClaimGenerator,
+        device_fed: &[&'static str],
     );
+    /// The emitted `SUB_FEED_LAYOUT` — the device count feed's descriptor input.
+    fn sub_feed_layout() -> &'static [(&'static str, usize, &'static str, u32, usize, usize)];
     /// Debug instrument (`STWO_JIT_PROVE_SHADOW=1`): byte-diff lane outputs
     /// against the host writer with exact coordinates.
     #[allow(clippy::too_many_arguments)]
@@ -139,6 +148,9 @@ struct LaneOutput {
     /// Word-major flats: `words[w * column_length + row]`.
     lookup_flat: Vec<u32>,
     sub_flat: Vec<u32>,
+    /// The device-resident SUB words — the B2 v2 memory count feed consumes
+    /// them in place.
+    sub_dev: stwo_backend_cuda::BaseFieldVec,
     /// The SAME lookup words, still device-resident — the §6a device-interaction
     /// lane consumes them in place (no D2H) once its differential is green.
     #[allow(dead_code)]
@@ -215,7 +227,7 @@ fn cuda_jit_lane<C: OpcodeLaneSpec>(inputs: &[CasmState], mem: &Memory) -> Optio
         tables,
         !device_interaction_enabled(),
     );
-    let Some((cols, lookup_dev, lookup_flat, _sub_dev, sub_flat)) = launched else {
+    let Some((cols, lookup_dev, lookup_flat, sub_dev, sub_flat)) = launched else {
         // launch_recorded_witness_for_prove logged the specific reason.
         return None;
     };
@@ -240,6 +252,7 @@ fn cuda_jit_lane<C: OpcodeLaneSpec>(inputs: &[CasmState], mem: &Memory) -> Optio
         cols,
         lookup_flat,
         sub_flat,
+        sub_dev,
         lookup_dev,
         column_length,
     })
@@ -457,12 +470,69 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
         } else {
             C::igen_from_flats(out.log_size, &out.lookup_flat, out.column_length)
         };
+        // B2 v2: the memory count families (every opcode's addr/id words) feed
+        // ON DEVICE from the resident sub buffer; the host feeder skips them.
+        // Any failure feeds everything on host — exactly-once either way.
+        let mut device_fed: Vec<&'static str> = Vec::new();
+        if mem_count_feeds_enabled() {
+            let sizes = |st: &'static str| match st {
+                "memory_address_to_id_state" => Some((addr_state.table_size(), 0)),
+                "memory_id_to_big_state" => {
+                    Some((id_state.big_table_size(), id_state.small_table_size()))
+                }
+                _ => None,
+            };
+            let (descs, lut_slots, counts_slots, slot_sizes) =
+                crate::witness::device_feed::build_feed_descriptors_sized(
+                    C::sub_feed_layout(),
+                    crate::witness::device_feed::COUNT_RELATIONS,
+                    &sizes,
+                );
+            if !descs.is_empty() {
+                // The 13 lane opcodes feed no LUT families; a layout growing one
+                // must extend this seam — fail loudly, never feed wrong.
+                let luts: Vec<Vec<u32>> = lut_slots
+                    .iter()
+                    .map(|f| panic!("unexpected LUT count family in opcode lane: {f}"))
+                    .collect();
+                match stwo_backend_cuda::exec_tables::run_witness_feed_counts(
+                    &out.sub_dev,
+                    out.column_length,
+                    &descs,
+                    &luts,
+                    &slot_sizes,
+                ) {
+                    Some(counts) => {
+                        for (slot, c) in counts_slots.iter().zip(&counts) {
+                            match *slot {
+                                "memory_address_to_id_state" => addr_state.add_count_tables(c),
+                                "memory_id_to_big_state" => id_state.add_big_count_tables(c),
+                                "memory_id_to_big_state#small" => {
+                                    id_state.add_small_count_tables(c)
+                                }
+                                other => panic!("unrouted count family {other}"),
+                            }
+                            if !slot.ends_with("#small") {
+                                device_fed.push(slot);
+                            }
+                        }
+                        eprintln!(
+                            "jit_prove[{}]: device mem count feed merged {} families",
+                            C::LABEL,
+                            device_fed.len()
+                        );
+                    }
+                    None => device_fed.clear(),
+                }
+            }
+        }
         C::feed_from_flats(
             &out.sub_flat,
             out.column_length,
             addr_state,
             id_state,
             vi_state,
+            &device_fed,
         );
 
         (trace, claim, interaction_gen)
@@ -524,8 +594,15 @@ macro_rules! opcode_lane_spec {
                 addr_state: &memory_address_to_id::ClaimGenerator,
                 id_state: &memory_id_to_big::ClaimGenerator,
                 vi_state: &verify_instruction::ClaimGenerator,
+                device_fed: &[&'static str],
             ) {
-                $module::feed_sub_inputs_from_flat(words, n_rows, addr_state, id_state, vi_state);
+                $module::feed_sub_inputs_from_flat(
+                    words, n_rows, addr_state, id_state, vi_state, device_fed,
+                );
+            }
+            fn sub_feed_layout(
+            ) -> &'static [(&'static str, usize, &'static str, u32, usize, usize)] {
+                $module::SUB_FEED_LAYOUT
             }
             fn shadow_compare(
                 inputs: &[CasmState],

@@ -2147,15 +2147,20 @@ pub(crate) fn feed_sub_inputs_from_flat(
     memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
     memory_id_to_big_state: &memory_id_to_big::ClaimGenerator,
     verify_instruction_state: &verify_instruction::ClaimGenerator,
+    device_fed: &[&'static str],
 ) {
     let sub = sub_inputs_from_flat(words, n_rows);
     for input in &sub.verify_instruction {
         AddInputs::add_input(verify_instruction_state, input, 0);
     }
-    for addrs in &sub.memory_address_to_id {
-        memory_address_to_id_state.add_inputs(addrs);
+    if !device_fed.contains(&"memory_address_to_id_state") {
+        for addrs in &sub.memory_address_to_id {
+            memory_address_to_id_state.add_inputs(addrs);
+        }
     }
-    for ids in &sub.memory_id_to_big {
-        memory_id_to_big_state.add_inputs(ids);
+    if !device_fed.contains(&"memory_id_to_big_state") {
+        for ids in &sub.memory_id_to_big {
+            memory_id_to_big_state.add_inputs(ids);
+        }
     }
 }

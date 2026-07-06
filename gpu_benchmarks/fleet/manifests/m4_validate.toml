@@ -1,0 +1,60 @@
+# M4 increment validation: word-block blake2s Merkle path + opcode-lane device
+# memory count feeds. Both must be byte-identical (the Merkle rewrite is
+# bit-identical by construction — the whole proof is its gate) and the phase
+# ledger re-measures Merkle (was 4.72s of 10.4s).
+#
+#   gpufleet run manifests/m4_validate.toml --pod <ID> --skip-pregate --keep
+
+[meta]
+name = "m4-validate"
+stop_on_failure = true
+
+[env]
+RUST_MIN_STACK = "4194304"
+STWO_JIT_MAX_KERNEL_INSTRS = "2048"
+STWO_JIT_CUBIN_CACHE = "1"
+GB = "/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench"
+SN = "/workspace/stwo-cairo/gpu_benchmarks/pie/sn"
+OUT = "/workspace/out"
+
+[[step]]
+name = "m4-baseline"
+cmd = '''
+mkdir -p $OUT && rm -f $OUT/m4_off.proof $OUT/m4_on.proof
+STWO_DUMP_PROOF=$OUT/m4_off.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 1 --reuse-input 2>/dev/null | tail -3
+test -s $OUT/m4_off.proof && echo M4_BASELINE_OK'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['M4_BASELINE_OK']
+
+# gpu-native (mem count feeds default ON) + phase ledger + identity.
+[[step]]
+name = "m4-gpu-native"
+cmd = '''
+STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/m4_on.proof $GB --pie $SN/SN_PIE_2.zip \
+  --backend cuda --engine gpu-native --reps 3 --reuse-input 2> $OUT/m4_on.err | tail -12
+grep -m1 'device mem count feed merged' $OUT/m4_on.err
+a=$(sha256sum $OUT/m4_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/m4_on.proof | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo M4_PROOF_MATCH; else echo M4_PROOF_MISMATCH; fi'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['device mem count feed merged', 'M4_PROOF_MATCH']
+
+# The big-PIE records under the new path (verify-gated internally).
+[[step]]
+name = "m4-sn3"
+cmd = '''
+$GB --pie $SN/SN_PIE_3.zip --backend cuda --engine gpu-native --reps 2 \
+  --reuse-input 2>/dev/null | tail -4'''
+timeout_s = 10800
+gpu_bound = true
+
+[[step]]
+name = "m4-sn1"
+cmd = '''
+$GB --pie $SN/SN_PIE_1.zip --backend cuda --engine gpu-native --reps 2 \
+  --reuse-input 2>/dev/null | tail -4'''
+timeout_s = 10800
+gpu_bound = true

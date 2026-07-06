@@ -42,6 +42,7 @@ pub const GPU_NATIVE_DEFAULTS: &[(&str, &str)] = &[
     ("STWO_CUDA_WITNESS_JIT_MAX_INSTRS", "20000"),
     ("STWO_CUDA_DEVICE_INTERACTION", "1"),
     ("STWO_CUDA_WITNESS_EDGES", "1"),
+    ("STWO_CUDA_MEM_COUNT_FEEDS", "1"),
 ];
 
 /// Apply [`GPU_NATIVE_DEFAULTS`] (unset variables only). Called once at

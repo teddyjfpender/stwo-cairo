@@ -1,0 +1,99 @@
+{
+  "run_id": "20260706T010632Z.record-runs",
+  "manifest": "record-runs",
+  "pod": {
+    "id": "sk60d6jcg5p4lu",
+    "gpu": "H100 SXM",
+    "usd_hr": 3.29
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "185759a546b3",
+      "diff_sha256": "e3b0c44298fc1c14",
+      "dirty": false
+    },
+    "stwo-cairo": {
+      "rev": "b4b5f9afd70f",
+      "diff_sha256": "3b116838080037c1",
+      "dirty": true
+    }
+  },
+  "steps": [
+    {
+      "name": "record-baseline",
+      "rc": 0,
+      "seconds": 1503.2,
+      "passed": true,
+      "reasons": [
+        "GPU idle alarm during gpu_bound step"
+      ],
+      "artifacts": [],
+      "gpu_idle_alarm": true
+    },
+    {
+      "name": "record-sn2",
+      "rc": 0,
+      "seconds": 45.3,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "record-sn1",
+      "rc": 0,
+      "seconds": 112.7,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "record-sn3",
+      "rc": 0,
+      "seconds": 102.5,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "record-sn4",
+      "rc": 0,
+      "seconds": 113.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "record-sn2-stream-lde",
+      "rc": 0,
+      "seconds": 69.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "record-sn1-stream-lde",
+      "rc": 0,
+      "seconds": 95.1,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "record-sn2-sustained",
+      "rc": 0,
+      "seconds": 48.4,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": true,
+  "wall_s": 2118.7
+}
