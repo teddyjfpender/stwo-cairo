@@ -819,3 +819,32 @@ The CORRECT fix (the reviewer's approach B) needs a diet-compacted preprocessed 
 PERSISTENT (non-pool) buffers for its retained root+layers+coeffs, and a pcs decommit that
 regens a BORROWED released tree from coeffs (decommit's compact-regen path is Owned-only today,
 pcs/mod.rs:560) → SOUNDNESS-CRITICAL pcs change = SUPERVISED. Deferred to a scoped, approved change.
+
+## 2026-07-06 — Approach-B DELIVERED: persistent compact preprocessed cache (byte-identical, ~1.1s warm)
+
+Workflow-designed + adversarially-verified (diagnose→design→3-lens verify→synthesize, GO_WITH_FIXES),
+then implemented + POD-VALIDATED. Commits: stwo 3fe68464 (pcs Borrowed coeff-regen arm +
+compact_tree_columns_cloned), stwo-cairo 6339d725 (rebuild_owned predicate + max_domain_log_size
+soundness key + debug-asserts + kill-switch flag).
+
+The adversarial review CORRECTED the crash diagnosis: approach-A was NOT a pool use-after-free —
+under stream_lde the committed tree's evals are new_released (size-0), and the coeff-regen decommit
+path was Owned-only, so a Borrowed cached tree fell to tree.decommit → gather on the size-0 buffer →
+OOB read → illegal address. Fix routes the Borrowed cached tree through the SAME coeff-regen decommit
+(read-only compact_tree_columns_cloned; no pcs math/verifier/FRI/channel change). It also caught a
+soundness hole (twiddle-staleness): the decommit re-LDE uses the max_domain_log_size twiddle tree, so
+the cache key now includes it → a cached artifact is only served to a prove re-LDE'ing with the identical
+twiddle tree (differently-sized prove = MISS, never a stale-root decommit). Cross-size caching deferred
+behind a CUDA bit-exactness gate.
+
+VALIDATED (SN_PIE_2, H100 sm_90, gpu-native diet):
+  inv5 BYTE-IDENTICAL: PREPROC_B_MATCH_OK (sha256 cached==rebuild; proof_kb 3006.636)
+  inv7 CACHE-HIT CLEAN: --resident-pipeline 2 proof_byte_equal=true, NO illegal address (the crash is fixed)
+  inv6 verify passes (22ms)
+  WIN: warm "Compute preprocessed trace commitment" ABSENT (cache hit); prove_cairo warm 11.4→10.27s
+       (~1.1s, ~10%); useful_mhz 0.66→0.75 (best single-proof SN2 this session)
+  COST: vram_peak 30.9→33.1GB (+2.2GB shared leaked artifact — once, not per-proof; 80GB fits;
+        STWO_DIET_REBUILD_PREPROCESSED=1 kill switch restores rebuild for 24GB cards)
+
+First instance of the §20.2 persistent-compact-PCS-artifact pattern (north star). SUPERVISED pcs change —
+landed locally behind the byte-identity gate; upstream merge would need PCS-owner sign-off.
