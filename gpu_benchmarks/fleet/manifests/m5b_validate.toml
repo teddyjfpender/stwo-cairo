@@ -73,7 +73,7 @@ for k,v in sorted(tot.items(), key=lambda x:-x[1])[:14]:
 PY'''
 timeout_s = 7200
 gpu_bound = true
-must_match = ['merkle\\[']
+must_match = ['merkle.leaves']
 
 # Records under the new path (verify-gated internally).
 [[step]]

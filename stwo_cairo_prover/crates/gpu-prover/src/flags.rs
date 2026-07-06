@@ -63,10 +63,13 @@ pub const GPU_NATIVE_DEFAULTS: &[(&str, &str)] = &[
     // overlap on-device. Post-Merkle ledger: Write Base trace 4.08s over
     // ~5.9s of sequential lane spans is the #1 remaining lever.
     ("STWO_CUDA_STREAM_FANOUT", "1"),
-    // M5b: warm proves interpolate the opcode prefix + every finished builtin
-    // lane on a committer thread under the witness arms (per-lane batches,
-    // canonical reassembly, tree verified by identity at commit).
-    ("STWO_CUDA_PIPELINED_COMMIT", "1"),
+    // NOTE: STWO_CUDA_PIPELINED_COMMIT is intentionally NOT a default. M5b
+    // hardware A/B (pod sk60d6jcg5p4lu, within-session variance 2%): the
+    // per-lane committer helps the small PIE (SN2 ~0.3s) but is within noise
+    // or slightly negative on the 14M-step PIEs (its iFFT contends with the
+    // witness arms on a single stream). Overlap must PAY to default on — it
+    // does not here. The flag + code stay (U3 scaffolding) for when true
+    // multi-stream async makes it reliably pay.
 ];
 
 /// Apply [`GPU_NATIVE_DEFAULTS`] (unset variables only). Called once at

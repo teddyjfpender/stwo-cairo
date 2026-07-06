@@ -1,0 +1,61 @@
+{
+  "run_id": "20260706T083340Z.m5b-records",
+  "manifest": "m5b-records",
+  "pod": {
+    "id": "sk60d6jcg5p4lu",
+    "gpu": "H100 SXM",
+    "usd_hr": 3.29
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "73b8a08a228e",
+      "diff_sha256": "13148df3b1c7e2ce",
+      "dirty": true
+    },
+    "stwo-cairo": {
+      "rev": "acfa1bd45b72",
+      "diff_sha256": "7459053b0f315f37",
+      "dirty": true
+    }
+  },
+  "steps": [
+    {
+      "name": "m5b-sn3",
+      "rc": 0,
+      "seconds": 93.7,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "m5b-sn4",
+      "rc": 0,
+      "seconds": 93.5,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "m5b-sn1",
+      "rc": 0,
+      "seconds": 99.2,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "m5b-sustained",
+      "rc": 0,
+      "seconds": 35.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": true,
+  "wall_s": 337.8
+}
