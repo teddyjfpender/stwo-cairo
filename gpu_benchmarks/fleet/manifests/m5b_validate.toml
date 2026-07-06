@@ -1,0 +1,110 @@
+# M5b validation: per-lane pipelined commit (default-ON, first engagement of
+# the committer in gpu-native) + batched OODS + word-block Merkle span
+# decomposition. Byte identity gates; records + first sustained-pipeline number.
+#
+#   gpufleet run manifests/m5b_validate.toml --pod <ID> --skip-pregate --keep
+
+[meta]
+name = "m5b-validate"
+stop_on_failure = true
+
+[env]
+RUST_MIN_STACK = "4194304"
+STWO_JIT_MAX_KERNEL_INSTRS = "2048"
+STWO_JIT_CUBIN_CACHE = "1"
+GB = "/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench"
+SN = "/workspace/stwo-cairo/gpu_benchmarks/pie/sn"
+OUT = "/workspace/out"
+
+[[step]]
+name = "m5b-baseline"
+cmd = '''
+mkdir -p $OUT && rm -f $OUT/m5b_off.proof $OUT/m5b_on.proof
+STWO_DUMP_PROOF=$OUT/m5b_off.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --reps 1 --reuse-input 2>/dev/null | tail -2
+test -s $OUT/m5b_off.proof && echo M5B_BASELINE_OK'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['M5B_BASELINE_OK']
+
+# gpu-native: committer + batched OODS; identity + the A2 engagement marker +
+# the re-measured phase ledger.
+[[step]]
+name = "m5b-gpu-native"
+cmd = '''
+STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/m5b_on.proof \
+  $GB --pie $SN/SN_PIE_2.zip \
+  --backend cuda --engine gpu-native --reps 3 --reuse-input 2> $OUT/m5b_on.err \
+  > $OUT/m5b_on.json
+tail -1 $OUT/m5b_on.json
+grep -m1 'A2 engaged' $OUT/m5b_on.err
+python3 - <<'PY'
+import json
+docs=[d for d in (json.loads(l) for l in open('/workspace/out/m5b_on.json') if l.strip().startswith('{')) if 'phase_totals' in d]
+t=docs[-1]['phase_totals']
+for k in ['Write Base trace','Merkle','Commitment','Compute base trace commitment','Prove STARKs','Evaluate columns out of domain','prove_cairo']:
+    if k in t: print(f"span[{k}]={t[k]['total_ms']/1000:.3f}s")
+PY
+a=$(sha256sum $OUT/m5b_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/m5b_on.proof | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo M5B_PROOF_MATCH; else echo M5B_PROOF_MISMATCH; fi'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['A2 engaged', 'M5B_PROOF_MATCH']
+
+# Merkle decomposition (sync-timed, non-record rep).
+[[step]]
+name = "m5b-merkle-spans"
+cmd = '''
+STWO_MERKLE_SPANS=1 $GB --pie $SN/SN_PIE_2.zip --backend cuda --engine gpu-native \
+  --reps 2 --reuse-input 2> $OUT/m5b_ms.err | tail -1
+python3 - <<'PY'
+import re, collections
+tot=collections.Counter(); cnt=collections.Counter()
+lines=open('/workspace/out/m5b_ms.err').read().splitlines()
+# keep only the LAST rep's spans (after the last 'rep=' marker if present)
+for l in lines:
+    m=re.match(r'merkle_span\[(\w+)\]: cols=(\d+) log=(\d+) ms=([0-9.]+)', l)
+    if m:
+        key=f"{m.group(1)}/log{m.group(3)}" if m.group(1)=='leaves' else m.group(1)
+        tot[key]+=float(m.group(4)); cnt[key]+=1
+for k,v in sorted(tot.items(), key=lambda x:-x[1])[:14]:
+    print(f"merkle[{k}]: {v:.1f}ms over {cnt[k]} calls (2 reps)")
+PY'''
+timeout_s = 7200
+gpu_bound = true
+must_match = ['merkle\\[']
+
+# Records under the new path (verify-gated internally).
+[[step]]
+name = "m5b-sn3"
+cmd = '''
+$GB --pie $SN/SN_PIE_3.zip --backend cuda --engine gpu-native --reps 2 \
+  --reuse-input 2>/dev/null | tail -1'''
+timeout_s = 10800
+gpu_bound = true
+
+[[step]]
+name = "m5b-sn4"
+cmd = '''
+$GB --pie $SN/SN_PIE_4.zip --backend cuda --engine gpu-native --reps 2 \
+  --reuse-input 2>/dev/null | tail -1'''
+timeout_s = 10800
+gpu_bound = true
+
+[[step]]
+name = "m5b-sn1"
+cmd = '''
+$GB --pie $SN/SN_PIE_1.zip --backend cuda --engine gpu-native --reps 2 \
+  --reuse-input 2>/dev/null | tail -1'''
+timeout_s = 10800
+gpu_bound = true
+
+# First sustained-pipeline number on the new engine (M6's E2 harness).
+[[step]]
+name = "m5b-sustained"
+cmd = '''
+$GB --pie $SN/SN_PIE_2.zip --backend cuda --engine gpu-native \
+  --pipeline 3 --producers 3 --reuse-input 2>/dev/null | tail -3'''
+timeout_s = 10800
+gpu_bound = true
