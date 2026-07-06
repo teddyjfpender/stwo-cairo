@@ -607,3 +607,19 @@ structural — CUDA graphs (attack the F1 orchestration floor: 96% idle SM) and
 M6 two-proof pipelining (fill the idle; sustained already +36%). Leaf hash
 (512ms/rep) stays the top commit-path kernel target for a deeper occupancy
 pass. Session cost ~$3.
+
+
+## 2026-07-06 — M5b clean-host confirm + sustained producer sweep (H100 SXM sk60d6jcg5p4lu)
+
+Clean-host re-measure of the M5b build (batched OODS + leaf launch_bounds,
+committer off): SN_PIE_4 **9.89s / 1.421 useful MHz** — new record (was
+10.34/1.36). SN3 8.99/1.566, SN2 7.51/1.026, SN1 11.09/1.321 — within
+inter-session noise (~5-8%) of M5a.
+
+Sustained producer sweep (SN2, --pipeline=--producers in {1,2,4}): sustained
+useful **0.78-0.80 MHz, FLAT across producer count**, feed_starved=0. Pins the
+model: --pipeline/--producers is HOST-FEED OVERLAP (producers run VM+adapt for
+the next PIE while the GPU proves the current); proving is SERIAL on the GPU,
+so sustained is capped at single-proof MHz. Exceeding single needs TRUE
+two-proof GPU concurrency => needs the VRAM diet (streaming-LDE-into-leaf) so
+two proof states fit one card. Not producer tuning.
