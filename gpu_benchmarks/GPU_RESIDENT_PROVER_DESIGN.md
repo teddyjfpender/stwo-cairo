@@ -658,6 +658,33 @@ on macOS; pod validation batched into one session (running).
   → 10 MHz aggregate. The diet is thus the H100 pipelining gate, not just the
   4090 gate.
 
+## 11d. PRIORITY: classify GPU utilization before choosing the single-card lever
+
+`nvidia-smi utilization.gpu` (~55% observed) is the fraction of time at least
+one kernel is resident — it CONFLATES two cases with opposite fixes, so it must
+be split with Nsight before investing:
+
+- **Kernel gaps** ("no kernel running" for ~45% of wall) → fix = CUDA graphs +
+  device Fiat-Shamir (so FRI/decommit stay graphable) + hoisting all
+  challenge-independent work off the critical path + two-proof pipelining.
+- **Kernels active but low SM throughput** (~55% SM efficiency while running)
+  → fix = kernel quality: Merkle leaf-hash occupancy, NTT pass count, memory
+  traffic, register pressure.
+
+Measure with `nsys` (timeline: gap vs active fraction) + `ncu` (per-kernel SM
+throughput / occupancy / memory / registers). This classification decides the
+single-card investment.
+
+Strategic conclusion (holds either way): make Fiat-Shamir device-resident and
+graph-compatible and hoist challenge-independent work, but expect the highest
+SUSTAINED single-card utilization from **two-proof pipelining after the VRAM
+diet** (fill one proof's gaps with another proof's kernels) — NOT from
+parallelizing Fiat-Shamir inside a single proof (the serial spine, F5). The M5c
+diet (peak 42.5→30.8GB, byte-identical) now makes two proofs fit an 80GB card;
+its 3.6× single-proof regen cost is expected to hide under the concurrent
+proof's compute exactly to the extent the 45% is gaps — which is why the
+classification and M6 pipelining are the same investigation.
+
 ## 11c. Next-lever ranking (adversarial-review workflow, 2026-07-06)
 
 An 11-agent adversarial workflow reviewed the M5b changes (4/5 findings
