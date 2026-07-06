@@ -57,10 +57,16 @@ echo "== building (v3, pie-bench) =="
 # command ignores the caller's env — builds the wrong fatbin silently).
 ARCH_LIST="${STWO_CUDA_ARCH:-sm_86,sm_89}"
 echo "   arch: $ARCH_LIST"
+# Locally-resolved extra nvcc flags (e.g. -DSTWO_LEAF_MIN_BLOCKS=3 to sweep an
+# occupancy hint). Resolved here so the remote build sees the caller's env (a bare
+# remote ${VAR} in the single-quoted ssh body would ignore it). Forces a rebuild of
+# the touched .cu (rsync's source touch already invalidates), so a flag change takes.
+NVCC_FLAGS="${STWO_CUDA_NVCC_FLAGS:-}"
+[ -n "$NVCC_FLAGS" ] && echo "   nvcc_flags: $NVCC_FLAGS"
 $SSHB '. $HOME/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH
 cd /workspace/stwo-cairo/stwo_cairo_prover
 set -o pipefail
-STWO_CUDA_ARCH='"$ARCH_LIST"' RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench 2>&1 | grep -E "error|Finished" | tail -20
+STWO_CUDA_NVCC_FLAGS='"$NVCC_FLAGS"' STWO_CUDA_ARCH='"$ARCH_LIST"' RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench 2>&1 | grep -E "error|Finished" | tail -20
 # Surface a build failure instead of swallowing it behind a stale binary (the
 # prior `| tail -1` hid a parallel-feature compile error for hours).
 if [ "${PIPESTATUS[0]:-0}" != 0 ]; then echo "BUILD FAILED"; exit 1; fi
