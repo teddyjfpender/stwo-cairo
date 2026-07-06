@@ -658,3 +658,31 @@ gated on M6 (measure whether the regen hides under a concurrent proof) and/or
 reducing the regen cost (single cached regen / partial diet). Flag is opt-in
 (NOT a gpu-native default — it regresses single-card). Standing records unchanged
 (SN4 9.89s/1.42 is the current best single-card).
+
+## 2026-07-06 — RegenCache P1: batched decommit gather cuts the M5c diet cost 3.6x → 1.53x (H100 SXM)
+
+The streamed-LDE diet's 3.6x regression was pinned by a phase bisection (STWO_PVT
+eprintln timers — the bench-trace subscriber silently drops spans with unknown
+`class`) to ONE place: the decommit's per-row `at_unreduced` loop — queries×columns
+individual device readbacks — NOT composition, NOT quotients, NOT the re-LDE.
+`trees_decommit` was 17.3s of the ~21s Prove STARKs span; the re-LDE itself is only
+0.12s. The compact/stream_lde decommit had kept the per-element gather while the
+non-compact path already used the batched `gather_unreduced` (CUDA: one
+`cuda_gather` + one D2H). Routed the compact path through it (dedup rows, one gather
+per column).
+
+Result (SN_PIE_2, warm): **trees_decommit 17.3s → 1.26s**; **M5c prove 26.7s → 11.23s
+(3.6x → 1.53x vs non-diet 7.35s)**; **byte-identical (G_PROOF_MATCH)**; peak **31.6GB**
+(two proofs now fit an 80GB card). Hits the design's "<11s meaningful win" mark.
+
+The residual 1.53x (~3.9s over non-diet) is the inherent stream_lde regen —
+composition ExtendToEvalDomain (~0.9s), FRI-quotient Coeffs regen (~0.55s), the
+batched decommit re-LDE+gather (~0.7s) — the "regen because released" cost. Further
+reduction is the shared-lease (regen once across composition→quotients under a VRAM
+budget); this batched-gather fix is the biggest single lever and is landed.
+
+INFRASTRUCTURE FIX (critical): build_and_push had been serving a STALE binary for
+hours — rsync -t preserved local mtimes so cargo skipped rebuilding the stwo path-dep,
+and a parallel-feature compile error was hidden by the script's `| tail`. Now touches
+synced source + surfaces build failures. (Earlier "batched decommit didn't help" and
+"PVT absent" results were the stale binary; corrected here.)
