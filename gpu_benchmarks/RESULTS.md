@@ -513,7 +513,17 @@ vs the same-build legacy engine):
 | SN_PIE_3 | 14.08M | **12.43** | **1.133** (1.155 raw) | 13.98 / 1.007 | **+15%** |
 | SN_PIE_1 | 14.65M | **14.90** | **0.983** (1.001 raw) | 18.20 / 0.805 | **+24%** |
 
-First sub-10s Starknet OS proof (SN2 8.98s); SN1 joins SN3 above 1 MHz raw.
+| SN_PIE_4 | 14.06M | **11.45** | **1.228** (1.252 raw) | 14.92 / 0.942 | **+30%** |
+
+First sub-10s Starknet OS proof (SN2 8.98s); SN1/SN3/SN4 all above 1 MHz raw,
+SN4 the per-card best at 1.23 useful MHz.
+
+Phase ledger after the rewrite (SN2 warm rep, prove_cairo 8.77s):
+**Merkle 4.72s → 1.68s** — the #1 lever delivered. New ranking: Write Base
+trace 4.08s (wt: lane spans sum ~5.9s sequential; longest single lane 0.72s
+— multi-stream lane overlap is now the biggest single win), Commitment
+2.01s, Prove STARKs 1.98s. Road to sub-5s SN2 runs through M5 lane/tree
+overlap, not more hash work.
 
 Per-phase VRAM ledger (SN_PIE_2, used_high/pool): witness 32.4 →
 preprocessed_tree 26.7 → **base_commit 40.7 (peak)** → interaction_write 36.3

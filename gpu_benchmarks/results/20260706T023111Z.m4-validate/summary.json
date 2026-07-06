@@ -1,0 +1,61 @@
+{
+  "run_id": "20260706T023111Z.m4-validate",
+  "manifest": "m4-validate",
+  "pod": {
+    "id": "sk60d6jcg5p4lu",
+    "gpu": "H100 SXM",
+    "usd_hr": 3.29
+  },
+  "provenance": {
+    "stwo": {
+      "rev": "a427e9e452de",
+      "diff_sha256": "e3b0c44298fc1c14",
+      "dirty": false
+    },
+    "stwo-cairo": {
+      "rev": "f458335b11f7",
+      "diff_sha256": "08e986a8709011c0",
+      "dirty": true
+    }
+  },
+  "steps": [
+    {
+      "name": "m4-baseline",
+      "rc": 0,
+      "seconds": 26.4,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "m4-gpu-native",
+      "rc": 0,
+      "seconds": 40.6,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "m4-sn3",
+      "rc": 0,
+      "seconds": 43.0,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    },
+    {
+      "name": "m4-sn1",
+      "rc": 0,
+      "seconds": 49.9,
+      "passed": true,
+      "reasons": [],
+      "artifacts": [],
+      "gpu_idle_alarm": false
+    }
+  ],
+  "passed": true,
+  "wall_s": 175.4
+}

@@ -1,0 +1,18 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=2048; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; STWO_BENCH_TRACE=json STWO_VRAM_PHASES=1 STWO_DUMP_PROOF=$OUT/m4_on.proof \
+  $GB --pie $SN/SN_PIE_2.zip \
+  --backend cuda --engine gpu-native --reps 3 --reuse-input 2> $OUT/m4_on.err | tail -12
+grep 'vram_phase' $OUT/m4_on.err | tail -7
+grep -m1 'device mem count feed merged' $OUT/m4_on.err
+a=$(sha256sum $OUT/m4_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/m4_on.proof | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo M4_PROOF_MATCH; else echo M4_PROOF_MISMATCH; fi
+--8<-- output --8<--
+vram_phase[witness]: used_high=21.66GB reserved_high=21.91GB
+vram_phase[preprocessed_tree]: used_high=29.49GB reserved_high=30.60GB
+vram_phase[base_commit]: used_high=40.54GB reserved_high=40.57GB
+vram_phase[interaction_write]: used_high=36.16GB reserved_high=40.57GB
+vram_phase[interaction_commit]: used_high=37.24GB reserved_high=40.57GB
+vram_phase[stark_core]: used_high=34.23GB reserved_high=40.57GB
+jit_prove[assert_eq_opcode_imm]: device mem count feed merged 1 families
+M4_PROOF_MATCH

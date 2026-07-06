@@ -1,0 +1,5 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=2048; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; $GB --pie $SN/SN_PIE_1.zip --backend cuda --engine gpu-native --reps 2 \
+  --reuse-input 2>/dev/null | tail -4
+--8<-- output --8<--
+{"adapt_s":2.164,"backend":"cuda","bootloader_overhead_pct":1.847,"cycle_count":14915645,"engine":"gpu-native","fold_step":3,"gpu":"NVIDIA H100 80GB HBM3","host_mem_gb":2015.498,"mhz":1.001,"n":1,"n_queries":70,"nproc":22,"peak_rss_gb":10.244,"pie_n_steps":14645112,"pool_reserved_high_gb":73.585,"pool_used_high_gb":73.552,"pow_bits":26,"program":"SN_PIE_1.zip","proof_kb":3124.124,"prove_s_cold":17.905,"prove_s_warm":14.904,"security_bits":96,"steps_per_s":1000804.0,"useful_mhz":0.983,"verify_ms":22.712,"vm_s":9.974,"vram_end_gb":75.364,"vram_peak_gb":75.364}
