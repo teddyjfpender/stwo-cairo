@@ -26,6 +26,7 @@ OUT = "/workspace/out"
 name = "record-baseline"
 cmd = '''
 mkdir -p $OUT
+rm -f $OUT/deduce_off.proof $OUT/record_sn2.proof $OUT/sn2_slde.proof
 $GB --pie $SN/SN_PIE_2.zip --backend cuda --reps 1 --reuse-input > /dev/null 2>&1 || true
 STWO_DUMP_PROOF=$OUT/deduce_off.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
   --reps 1 --reuse-input 2>/dev/null | tail -3

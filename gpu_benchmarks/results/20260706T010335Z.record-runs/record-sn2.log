@@ -1,0 +1,8 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=2048; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; STWO_BENCH_TRACE=json STWO_DUMP_PROOF=$OUT/record_sn2.proof $GB --pie $SN/SN_PIE_2.zip --backend cuda \
+  --engine gpu-native --reps 3 --reuse-input 2> $OUT/record_sn2.err | tail -12
+a=$(sha256sum $OUT/deduce_off.proof | cut -d' ' -f1)
+b=$(sha256sum $OUT/record_sn2.proof | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then echo RECORD_SN2_PROOF_MATCH; else echo RECORD_SN2_PROOF_MISMATCH; fi
+--8<-- output --8<--
+RECORD_SN2_PROOF_MATCH

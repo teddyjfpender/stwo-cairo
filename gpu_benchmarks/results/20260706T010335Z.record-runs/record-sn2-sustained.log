@@ -1,0 +1,4 @@
+
+$ set -o pipefail; export RUST_MIN_STACK=4194304; export STWO_JIT_MAX_KERNEL_INSTRS=2048; export STWO_JIT_CUBIN_CACHE=1; export GB=/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench; export SN=/workspace/stwo-cairo/gpu_benchmarks/pie/sn; export OUT=/workspace/out; $GB --pie $SN/SN_PIE_2.zip --backend cuda --engine gpu-native --pipeline 3 \
+  --producers 3 --reuse-input 2>/dev/null | tail -6
+--8<-- output --8<--
