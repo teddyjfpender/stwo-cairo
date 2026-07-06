@@ -36,6 +36,11 @@ if [ "$SKIP_SYNC" = 0 ]; then
     --exclude="gpu_benchmarks/pie/sn/*.zip" \
     /Users/theodorepender/code/personal/stwo-cairo/ "root@$BHOST:/workspace/stwo-cairo/"
   $SSHB 'sed -i "s|/Users/theodorepender/code/personal/stwo|/workspace/stwo|g" /workspace/stwo-cairo/stwo_cairo_prover/Cargo.toml'
+  # rsync -t preserves LOCAL mtimes; if they predate the pod's build artifacts,
+  # cargo sees the path-dep source as up-to-date and SKIPS the rebuild (served a
+  # stale binary for hours — 2026-07-06). Bump mtimes past the artifacts so cargo
+  # always recompiles changed crates.
+  $SSHB 'find /workspace/stwo/crates /workspace/stwo-cairo/stwo_cairo_prover/crates -name "*.rs" -newermt "1970-01-01" -exec touch {} + 2>/dev/null; true'
 fi
 
 STWO_REV=$(git -C /Users/theodorepender/code/personal/stwo rev-parse --short HEAD)
@@ -54,7 +59,11 @@ ARCH_LIST="${STWO_CUDA_ARCH:-sm_86,sm_89}"
 echo "   arch: $ARCH_LIST"
 $SSHB '. $HOME/.cargo/env; export PATH=/usr/local/cuda/bin:$PATH
 cd /workspace/stwo-cairo/stwo_cairo_prover
-STWO_CUDA_ARCH='"$ARCH_LIST"' RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench 2>&1 | tail -1
+set -o pipefail
+STWO_CUDA_ARCH='"$ARCH_LIST"' RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench 2>&1 | grep -E "error|Finished" | tail -20
+# Surface a build failure instead of swallowing it behind a stale binary (the
+# prior `| tail -1` hid a parallel-feature compile error for hours).
+if [ "${PIPESTATUS[0]:-0}" != 0 ]; then echo "BUILD FAILED"; exit 1; fi
 ls -la target/release/gpu_bench'
 
 echo "== pushing to fleet =="
