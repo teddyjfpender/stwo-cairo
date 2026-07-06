@@ -296,27 +296,38 @@ where
         let stream_lde = flags::flag_on("STWO_CAIRO_STREAM_LDE") || stream_leaf_commit;
         let store_polynomials_coefficients =
             store_polynomials_coefficients || stream_leaf_commit || stream_lde;
-        // Owned rebuild under the memory-diet modes (compaction wants ownership;
-        // a borrowed cached tree would pin its evaluations for the whole prove),
-        // cached+borrowed otherwise — the legacy semantics exactly.
-        let preprocessed_tree: MaybeOwned<'_, CommitmentTreeProver<B, MC>> =
-            if low_memory || stream_lde {
-                MaybeOwned::Owned(phases::commit::build_preprocessed_tree(
-                    preprocessed_trace.clone(),
-                    twiddles,
-                    &pcs_config,
-                    store_polynomials_coefficients,
-                    &base_column_pool,
-                ))
-            } else {
-                MaybeOwned::Borrowed(self.preprocessed_tree(
-                    &preprocessed_trace,
-                    twiddles,
-                    &pcs_config,
-                    store_polynomials_coefficients,
-                    &base_column_pool,
-                ))
-            };
+        // The preprocessed tree is identical across proofs of the same AIR, so it is
+        // cached (leaked &'static) and borrowed. The pcs keeps a BORROWED tree's evals
+        // resident under stream_lde — commit_tree's release, the pre-quotient
+        // compaction, and decommit all skip borrowed trees (pcs/mod.rs:184/478/560) —
+        // so borrowing the cache is byte-identical (decommit reads the resident evals,
+        // same values) AND removes the ~1.2s/proof preprocessed rebuild the diet
+        // otherwise pays every prove. Cost: the (fixed, comparatively small)
+        // preprocessed evals stay resident. `low_memory` still rebuilds+releases
+        // (Owned) for the tightest-VRAM mode, and STWO_DIET_REBUILD_PREPROCESSED=1
+        // forces that under stream_lde too (e.g. a 24GB card where the retained preproc
+        // evals would not fit — the diet-compacted preprocessed cache is the follow-up
+        // that reclaims that VRAM without the rebuild, but needs a pcs decommit change).
+        let rebuild_preprocessed =
+            low_memory || (stream_lde && flags::flag_on("STWO_DIET_REBUILD_PREPROCESSED"));
+        let preprocessed_tree: MaybeOwned<'_, CommitmentTreeProver<B, MC>> = if rebuild_preprocessed
+        {
+            MaybeOwned::Owned(phases::commit::build_preprocessed_tree(
+                preprocessed_trace.clone(),
+                twiddles,
+                &pcs_config,
+                store_polynomials_coefficients,
+                &base_column_pool,
+            ))
+        } else {
+            MaybeOwned::Borrowed(self.preprocessed_tree(
+                &preprocessed_trace,
+                twiddles,
+                &pcs_config,
+                store_polynomials_coefficients,
+                &base_column_pool,
+            ))
+        };
 
         // ── Transcript spine ─────────────────────────────────────────────────
         let channel = &mut MC::C::default();

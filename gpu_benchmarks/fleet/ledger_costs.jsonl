@@ -64,3 +64,5 @@
 {"ts": "2026-07-06T14:36:30+00:00", "event": "stop", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29}
 {"ts": "2026-07-06T14:43:46+00:00", "event": "resume", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29}
 {"ts": "2026-07-06T15:14:32+00:00", "event": "stop", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29}
+{"ts": "2026-07-06T15:35:52+00:00", "event": "resume", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29}
+{"ts": "2026-07-06T15:47:13+00:00", "event": "stop", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29}
