@@ -269,7 +269,14 @@ where
 
         let base_column_pool = BaseColumnPool::new();
         let low_memory = flags::flag_on("STWO_CAIRO_LOW_MEMORY");
-        let stream_lde = flags::flag_on("STWO_CAIRO_STREAM_LDE");
+        // Streaming leaf commit (the VRAM diet) produces coeffs-retained,
+        // evals-released trees, so it REQUIRES the stream_lde downstream (quotients
+        // + decommit regenerate evaluations from coefficients) and store_coeffs.
+        // Force both when it is on so the pieces are consistent.
+        let stream_leaf_commit = flags::flag_on("STWO_CUDA_STREAM_LEAF_COMMIT");
+        let stream_lde = flags::flag_on("STWO_CAIRO_STREAM_LDE") || stream_leaf_commit;
+        let store_polynomials_coefficients =
+            store_polynomials_coefficients || stream_leaf_commit || stream_lde;
         // Owned rebuild under the memory-diet modes (compaction wants ownership;
         // a borrowed cached tree would pin its evaluations for the whole prove),
         // cached+borrowed otherwise — the legacy semantics exactly.

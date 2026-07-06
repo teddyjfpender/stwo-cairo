@@ -43,6 +43,11 @@ pub const FLAGS: &[FlagDef] = &[
         purpose: "legacy-shared: warm proves interpolate finished lanes on a committer thread under the witness phase",
         deletion_milestone: "M6 (the committer becomes the unconditional path)",
     },
+    FlagDef {
+        name: "STWO_CUDA_STREAM_LEAF_COMMIT",
+        purpose: "VRAM diet: build the Merkle leaf layer by LDE'ing base columns one group at a time (never all evals resident); forces stream_lde + store_coeffs downstream",
+        deletion_milestone: "M6 (becomes the unconditional commit path once the two-proof residency win is validated)",
+    },
 ];
 
 /// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed
