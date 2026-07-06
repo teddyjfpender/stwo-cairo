@@ -801,3 +801,21 @@ VALIDATED (SN_PIE_2, H100 sm_90, gpu-native, M5c diet):
   per-component wt: deltas are the reliable signal).
 Contrast the leaf-occupancy hint (flat): this is a real, byte-identical prove-side win. Remaining
 D→H→D: edge-builtin host mirrors (aggregator/blake_round recovery), opcode verify_instruction host feed.
+
+## 2026-07-06 — Preprocessed cache under the diet: naive borrow CRASHES (validated, reverted)
+
+Attempted the ~1.2s/proof warm win: pass the cached preprocessed tree as Borrowed under
+stream_lde (the pcs skips borrowed trees in commit_tree release / compaction / decommit,
+so it looked byte-identical + autonomous). VALIDATED ON POD → CRASH: cudaErrorIllegalAddress
+(utils.cu:228) in the resident-pipeline cache-HIT prove; the cached --reps 2 also failed on
+rep2. Root cause: the cached tree's device eval buffers are allocated from the PER-PROVE
+base_column_pool, which the diet's compaction give-back frees + reuses across proves → the
+leaked &'static tree holds DANGLING device pointers → illegal access on the second prove.
+This is precisely why the diet rebuilds Owned every prove. Reverted (stwo-cairo 34d1d21f).
+Same-binary A/B baseline (STWO_DIET_REBUILD_PREPROCESSED=1, the rebuild path): warm 11.407s,
+preproc commit 1198ms — correct + safe.
+
+The CORRECT fix (the reviewer's approach B) needs a diet-compacted preprocessed artifact with
+PERSISTENT (non-pool) buffers for its retained root+layers+coeffs, and a pcs decommit that
+regens a BORROWED released tree from coeffs (decommit's compact-regen path is Owned-only today,
+pcs/mod.rs:560) → SOUNDNESS-CRITICAL pcs change = SUPERVISED. Deferred to a scoped, approved change.
