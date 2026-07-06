@@ -13,6 +13,9 @@ stop_on_failure = true
 RUST_MIN_STACK = "4194304"
 STWO_JIT_MAX_KERNEL_INSTRS = "2048"
 STWO_JIT_CUBIN_CACHE = "1"
+# Resume-proof: $HOME cargo checkout (baked bootloader path) is wiped on
+# pod stop/resume; /workspace survives, so point the override there.
+STWO_BOOTLOADER_JSON = "/workspace/simple_bootloader_compiled.json"
 GB = "/workspace/stwo-cairo/stwo_cairo_prover/target/release/gpu_bench"
 SN = "/workspace/stwo-cairo/gpu_benchmarks/pie/sn"
 OUT = "/workspace/out"
