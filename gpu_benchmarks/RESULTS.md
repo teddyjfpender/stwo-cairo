@@ -566,3 +566,44 @@ Fleet math: 1.6 useful MHz/card on SN3 ⇒ **10 MHz aggregate at ~6-7 H100s**
 Housekeeping fixed this session: STWO_BOOTLOADER_JSON runtime override
 (resume-proof), pods.conf port refresh on resume, testkit merkle conformance
 pinning exact 16-word-block trees.
+
+## 2026-07-06 — M5b: batched OODS + committer A/B + leaf-hash launch_bounds (H100 SXM sk60d6jcg5p4lu, runs 20260706T080622Z + records)
+
+M5b landed three things and validated them with a WITHIN-SESSION A/B (this is
+the methodology point: the pod's inter-session variance is ~7-8%, but
+back-to-back within-session variance is only 2.1% — so A/B on the same pod
+state is the reliable measurement, cross-session absolute comparison is not).
+
+**Confirmed wins (within-session, byte-identical, verify-gated):**
+- **Batched OODS** (group columns by (log_size, folded point), one launch pair
+  + one D2H per group): SN3 9.519s vs 9.903s with it off = **−0.38s**. The
+  OODS span itself collapsed 0.56s → **0.076s** on SN2. A latent grid.y>65535
+  cap (adversarial-review finding) is guarded by chunking at 32768.
+- **Leaf-hash `__launch_bounds__`**: the Merkle-span decomposition (new
+  STWO_MERKLE_SPANS instrument) showed Merkle's 1.69s is **95% the log24 leaf
+  hash** (635ms/rep; interior only ~11ms across 130 calls) and ~20-50× off
+  both bandwidth and compute bounds = occupancy-bound. Capping registers via
+  launch_bounds raised resident warps: leaf hash **635ms/rep → 512ms/rep
+  (−19%)**, byte-identical.
+- **Per-lane pipelined committer: DISABLED from defaults.** A/B showed it helps
+  SN2 ~0.3s but is within-noise / slightly negative on the 14M PIEs (its iFFT
+  contends with the witness arms on one stream). Overlap must PAY to default
+  on — it doesn't here. Flag + code retained (U3 scaffolding).
+
+**Sustained pipelining improved: 0.543 → 0.741 useful MHz (+36%)** — the
+aggregate/throughput axis (the road to 10 MHz) is moving, though still below
+single-proof (1.05) so the residency work (M5 graphs) must land before
+pipelining fully pays.
+
+This session's pod ran ~7-8% slower than the M5a session (SN3 9.43 vs 8.78),
+so the M5a absolute records stand as the best measured numbers; the M5b levers
+are confirmed to improve on them by ~0.5s/proof (within-session), projecting
+SN3 to ~8.3s / ~1.7 useful MHz on a clean host. Standing records (M5a, warm
+useful MHz): SN2 7.39/1.04, SN3 8.78/1.60, SN4 10.34/1.36, SN1 10.81/1.36.
+
+**Verdict feeding M5/M6:** single-card intra-proof micro-levers are now
+sub-second and near the pod noise floor. The remaining big levers are
+structural — CUDA graphs (attack the F1 orchestration floor: 96% idle SM) and
+M6 two-proof pipelining (fill the idle; sustained already +36%). Leaf hash
+(512ms/rep) stays the top commit-path kernel target for a deeper occupancy
+pass. Session cost ~$3.
