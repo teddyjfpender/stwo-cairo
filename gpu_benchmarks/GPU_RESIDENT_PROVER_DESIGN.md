@@ -594,9 +594,14 @@ on macOS; pod validation batched into one session (running).
   sn2-aot-pack gate. gpu-native engine defaults = the composed device config.
 - **M2 tail deferred**: ffi_emit + stream sweep, memory/table components into
   the lane, witness-phase-owns-schedule — after the pod session's numbers.
-- **Pod session (in flight)**: M0 remainder + M1 engine parity + M2b DAG
-  interaction + M3 AOT gates (deduce_gate.toml, 15 steps), then
-  record_runs.toml (composed gpu-native on all four SN PIEs + sustained).
+- **Pod session COMPLETE (2026-07-06, 15/15 gates + records, $4.90)**: every
+  gate byte-identical; the DAG and AOT levers COMPOSE. Records (warm, useful
+  MHz): SN_PIE_2 10.76s/0.716 (+25%), SN_PIE_1 18.2s/0.805 (+113%),
+  SN_PIE_3 14.35s/0.981 (+151%), SN_PIE_4 14.92s/0.942 (+96%); sustained
+  0.543 with zero feed starvation. Two hardware-only AOT walls fixed
+  (offline-nvcc curandState in the fp256 embed; anonymous-namespace extern
+  linkage — the C13 class). VRAM: SN_PIE_1 DAG config peaked 75.4GB — the
+  M4 diet is now also an H100 requirement for 14M PIEs, not only a fleet one.
 
 ## 12. Effort and risk
 
