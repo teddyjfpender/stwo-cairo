@@ -685,6 +685,30 @@ its 3.6× single-proof regen cost is expected to hide under the concurrent
 proof's compute exactly to the extent the 45% is gaps — which is why the
 classification and M6 pipelining are the same investigation.
 
+### 11d.1 Classification status (evidence-based; precise Nsight pending a warm-cache profiling harness)
+
+The pod ships `ncu` (Nsight Compute 2022.3, CUDA 11.8) but NOT `nsys`, and ncu
+intercepts every one of the prove's thousands of JIT kernel launches on top of
+the ~4-min cold NVRTC compile a fresh resume pays — so a full-prove ncu/nsys
+capture is impractical without a dedicated warm-cache, targeted-capture harness.
+Classification from the strong existing evidence:
+
+- **Commit-path kernels = low SM throughput (occupancy-bound), NOT gaps.** The
+  log24 leaf hash is ~20-50x off BOTH the bandwidth and compute bounds (M5b),
+  and `__launch_bounds__` (a pure occupancy hint) cut it 19% — the signature of
+  register-pressure-limited occupancy (blake2s h[8]+m[16]+v[16] state starves
+  resident warps). Fix = kernel quality (occupancy, NTT pass count).
+- **Orchestration (witness / interaction / FRI phase boundaries) = gaps.** The
+  serial Fiat-Shamir spine (F5) forces phases to wait; host-side witness
+  generation runs while the GPU idles; per-phase D2H transcript drains. Fix =
+  device Fiat-Shamir + graphs + hoisting challenge-independent work + pipelining.
+
+So the ~55% is BOTH, phase-dependent. Actionable conclusion (unchanged):
+two-proof pipelining after the diet is the top sustained-util lever (fills the
+orchestration gaps with a second proof's kernels AND overlaps the M5c diet's
+regen passes). A precise per-kernel ncu occupancy number is a refinement, not a
+strategy change — deferred to a warm-cache targeted-capture harness.
+
 ## 11c. Next-lever ranking (adversarial-review workflow, 2026-07-06)
 
 An 11-agent adversarial workflow reviewed the M5b changes (4/5 findings
