@@ -296,27 +296,36 @@ where
         let stream_lde = flags::flag_on("STWO_CAIRO_STREAM_LDE") || stream_leaf_commit;
         let store_polynomials_coefficients =
             store_polynomials_coefficients || stream_leaf_commit || stream_lde;
-        // Owned rebuild under the memory-diet modes (compaction wants ownership;
-        // a borrowed cached tree would pin its evaluations for the whole prove),
-        // cached+borrowed otherwise — the legacy semantics exactly.
-        let preprocessed_tree: MaybeOwned<'_, CommitmentTreeProver<B, MC>> =
-            if low_memory || stream_lde {
-                MaybeOwned::Owned(phases::commit::build_preprocessed_tree(
-                    preprocessed_trace.clone(),
-                    twiddles,
-                    &pcs_config,
-                    store_polynomials_coefficients,
-                    &base_column_pool,
-                ))
-            } else {
-                MaybeOwned::Borrowed(self.preprocessed_tree(
-                    &preprocessed_trace,
-                    twiddles,
-                    &pcs_config,
-                    store_polynomials_coefficients,
-                    &base_column_pool,
-                ))
-            };
+        // Approach-B: under the diet (stream_lde) the preprocessed tree is a CACHED,
+        // borrowed persistent artifact — coeffs retained, evals size-0-released, Merkle
+        // layers/root owned+leaked. Its decommit routes through the coeff-regen path (the
+        // Borrowed arm in the pcs compaction match), never gathering the released evals, so
+        // caching it is byte-identical and removes the ~1.2s/proof rebuild. An Owned
+        // per-prove rebuild is kept only for pure low_memory (no diet — needs the eval
+        // release for tightest VRAM) or the STWO_DIET_REBUILD_PREPROCESSED kill switch
+        // (the A/B baseline + fallback). The cache key includes max_domain_log_size so a
+        // cached artifact is only ever served to a prove re-LDE'ing with the identical
+        // twiddle tree that built its coeffs+Merkle (the soundness guard).
+        let rebuild_owned = (low_memory && !stream_lde)
+            || (stream_lde && flags::flag_on("STWO_DIET_REBUILD_PREPROCESSED"));
+        let preprocessed_tree: MaybeOwned<'_, CommitmentTreeProver<B, MC>> = if rebuild_owned {
+            MaybeOwned::Owned(phases::commit::build_preprocessed_tree(
+                preprocessed_trace.clone(),
+                twiddles,
+                &pcs_config,
+                store_polynomials_coefficients,
+                &base_column_pool,
+            ))
+        } else {
+            MaybeOwned::Borrowed(self.preprocessed_tree(
+                &preprocessed_trace,
+                twiddles,
+                &pcs_config,
+                store_polynomials_coefficients,
+                &base_column_pool,
+                max_domain_log_size,
+            ))
+        };
 
         // ── Transcript spine ─────────────────────────────────────────────────
         let channel = &mut MC::C::default();
@@ -435,6 +444,7 @@ where
         pcs_config: &stwo::core::pcs::PcsConfig,
         store_polynomials_coefficients: bool,
         base_column_pool: &BaseColumnPool<B>,
+        max_domain_log_size: u32,
     ) -> &'static CommitmentTreeProver<B, MC> {
         let mut hasher = DefaultHasher::new();
         for id in preprocessed_trace.ids() {
@@ -444,6 +454,17 @@ where
         pcs_config.fri_config.log_blowup_factor.hash(&mut hasher);
         pcs_config.lifting_log_size.hash(&mut hasher);
         store_polynomials_coefficients.hash(&mut hasher);
+        // SOUNDNESS (approach-B): the cached artifact's coeffs + Merkle root/layers were
+        // built with the twiddle tree of THIS max_domain_log_size, and decommit re-LDEs
+        // from those coeffs using the same (log-size-keyed, leaked) twiddle tree. Keying on
+        // it guarantees the artifact is only ever served to a prove re-LDE'ing with the
+        // identical twiddle tree — a differently-sized prove is a cache MISS, never a
+        // decommit against a stale root (independent of unproven cross-size CUDA twiddle
+        // extraction; consistent with the tree_ptr fail-closed invariant in prove()).
+        max_domain_log_size.hash(&mut hasher);
+        // The diet determines the cached tree's eval state (size-0-released vs resident);
+        // never serve an evals-released artifact to a non-diet prove or vice versa.
+        flags::flag_on("STWO_CUDA_STREAM_LEAF_COMMIT").hash(&mut hasher);
         let key = hasher.finish();
 
         if let Some(tree) = self.preprocessed_trees.get(&key) {
@@ -456,6 +477,25 @@ where
             store_polynomials_coefficients,
             base_column_pool,
         );
+        // Crash guard + invariant 1: under the diet the cached artifact MUST carry
+        // coefficients (so decommit routes through the coeff-regen Borrowed arm, never the
+        // size-0 resident evals that caused the approach-A illegal-address crash) with its
+        // evals released. A bulk-fallback build leaving resident evals, or a coeff-less
+        // column, would silently re-enter the crash path on the cache hit.
+        #[cfg(debug_assertions)]
+        if flags::flag_on("STWO_CUDA_STREAM_LEAF_COMMIT") {
+            use stwo::prover::backend::Column;
+            for poly in &tree.polynomials {
+                debug_assert!(
+                    poly.coeffs.is_some(),
+                    "cached preprocessed artifact column missing coefficients under the diet"
+                );
+                debug_assert!(
+                    poly.evals.values.is_empty(),
+                    "cached preprocessed artifact retains resident evals under the diet"
+                );
+            }
+        }
         let leaked: &'static CommitmentTreeProver<B, MC> = Box::leak(Box::new(tree));
         self.preprocessed_trees.insert(key, leaked);
         leaked

@@ -48,6 +48,11 @@ pub const FLAGS: &[FlagDef] = &[
         purpose: "VRAM diet: build the Merkle leaf layer by LDE'ing base columns one group at a time (never all evals resident); forces stream_lde + store_coeffs downstream",
         deletion_milestone: "M6 (becomes the unconditional commit path once the two-proof residency win is validated)",
     },
+    FlagDef {
+        name: "STWO_DIET_REBUILD_PREPROCESSED",
+        purpose: "kill switch (approach-B): force an Owned per-prove rebuild of the preprocessed tree instead of the cached compact artifact — the A/B byte-identity baseline and safe fallback",
+        deletion_milestone: "M6 (retire once the cached artifact is the proven unconditional diet path)",
+    },
 ];
 
 /// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed
