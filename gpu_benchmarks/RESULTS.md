@@ -786,7 +786,8 @@ not leaf-hash occupancy. Next: close the D→H→D loop on the builtin lanes.
 The device witness lane core unconditionally D2H'd + host-repacked sub_words even when
 sub_flat is provably unused. Gated it (want_host_sub, mirror of want_host_lookup):
 skip the copy for all-count builtins (device_feed.require + no edge stash), keep it for
-edge producers / opcodes / shadow (fail-closed). Commits: stwo 9eea7846, stwo-cairo d7468b06.
+edge producers / opcodes / shadow (fail-closed). Commits: stwo 5544919f, stwo-cairo c2f70a5b
+(post-fmt-amend; the earlier 9eea7846/d7468b06 were the pre-amend hashes).
 
 VALIDATED (SN_PIE_2, H100 sm_90, gpu-native, M5c diet):
   BYTE-IDENTICAL: DAG_PROOF_MATCH_OK (DAG-on proof sha256 == host-lane-off reference; proof_kb 3006.636).
