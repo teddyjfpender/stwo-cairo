@@ -1164,3 +1164,80 @@ and build (or extend) the emitter.**
   (declaration-driven sub shapes, sibling-file type aliases, both feed-loop
   shapes — the round-21 lessons), and a generator change that alters emitted
   bytes bumps the relevant codegen version (C13).
+
+## 18. DESIGN REVISION (2026-07-06, post-M5c) — the card-resident work-conserving proof server
+
+M5c proved the memory thesis (peak 42.5→30.8GB, byte-identical) but exposed the
+real bottleneck: the diet, coupled to full `stream_lde`, costs **3.6×**
+single-proof (7.4→26.7s). The design target changes accordingly:
+
+> FROM: "make one dieted proof fast"
+> TO:   "run a card-resident proof server that keeps the GPU work-conserving
+>        across multiple `DeviceProofState`s, with the VRAM diet DECOUPLED from
+>        repeated eval regeneration."
+
+**Load-bearing correction to the 55%-util reasoning:** the M5c 3.6× is
+dominated by extra GPU *compute* (redundant coeff→eval regen NTT passes),
+NOT idle gaps. A work-conserving scheduler fills gaps, but it cannot hide work
+you created — two dieted proofs perfectly packed are GPU-bound at ~2× their
+combined active compute, WORSE than 2× non-diet. So pipelining alone is
+insufficient; the regen redundancy must be eliminated first.
+
+### Priority 1 (biggest immediate fix): decouple the diet from full stream_lde
+Split the two concepts that M5c fused:
+- `stream_lde_into_leaf_hash` — KEEP (fixes the commit peak). ✓ (M5c)
+- "release all evals and regenerate everywhere" — make it BUDGETED, not
+  unconditional.
+
+New abstraction: an **`EvaluationLease` / `RegenCache`** — regenerate a
+tree/domain ONCE, let composition + quotients + OODS/decommit consumers SHARE
+it, release at last use, enforce a per-card VRAM budget across all resident
+proof states. Turns M5c from "fits but 3.6× slower" into "fits with modest
+overhead." Aggressive form: never materialize full evals for some phases —
+fuse `coeffs → LDE tile → composition/quotient accumulator` so regenerated
+values STREAM through the consumer and never become a resident array.
+
+### Priority 2: M6 = a work-conserving GPU scheduler (NOT "two host threads racing")
+The scheduling unit is no longer "a proof" — it is "ready GPU work from any
+proof whose dependencies are satisfied." The scheduler owns: per-proof phase
+DAGs, stream priorities, VRAM admission control, graph replay, proof-state
+residency, eval-regeneration leases, Fiat-Shamir dependencies, work-stealing
+across proof states. Policy: proof A critical-path work → high-priority streams;
+proof B runs only challenge-independent/background work when A would idle;
+regen/NTT/Merkle chunked to yield at phase boundaries; kernels carry resource
+labels (`register-bound` / `HBM-bound` / `launch-bound` / `low-occupancy`) and
+the scheduler overlaps COMPLEMENTARY kernels (not two HBM-heavy ones).
+Success metric (2× SN2 M5c wall): **<14.8s** beats non-diet throughput;
+**<11s** meaningful win; **<8s** strong signal the 10 MHz direction is real.
+
+### Priority 3: redesign the leaf-hash kernel (occupancy-bound, confirmed)
+one-thread-per-leaf blake2s carries too much state (h[8]+m[16]+v[16]+temps).
+Prototype: warp-cooperative (one warp/half-warp per leaf, lanes hold pieces of
+v/m/h); 4/8-thread-per-leaf (less shuffle than full warp); chunked update with
+persistent midstate in global memory; and the limit-pusher —
+**hash-from-registers**: `NTT final output → blake2s update` instead of
+`NTT → HBM LDE array → blake2s reads HBM` (attacks BOTH VRAM and HBM traffic;
+soundness-adjacent → its own review).
+
+### Priority 4: device Fiat-Shamir + graphs (a MULTIPLIER, not a standalone win)
+Device FS does NOT remove the serial transcript dependency; it removes host
+drains and makes graph replay viable. GPU absorbs roots → derives challenges
+into device buffers → host mirrors for byte-equality → phase graphs replay with
+pointer rebinding → FRI/decommit eventually graphable. Improves the GAP side.
+
+### Priority 5: cross-proof batching
+Once two proof states exist, give some kernels a proof axis: same-shape NTT
+groups, same-log Merkle leaf kernels, OODS groups, small FRI kernels. For
+low-occupancy kernels, batching across proofs beats two separate launches.
+
+### Practical next move (sequenced)
+1. Measure naive two-proof M5c throughput.
+2. If 2-proof wall ≥ 14.8s on SN2 → pipelining alone insufficient (EXPECTED,
+   given the 3.6× is extra compute) → immediately prioritize RegenCache.
+3. Redo M6 with budgeted eval retention.
+4. In parallel, prototype the cooperative / hash-from-register leaf path.
+
+**The maximum-MHz architecture:** single-card, multi-proof, GPU-resident proof
+server + budgeted eval residency + streamed commit hashing + graph/device-FS
+orchestration. Parallelizing Fiat-Shamir itself is not the lever; scheduling
+around it and shrinking the work between barriers is.
