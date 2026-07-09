@@ -1,5 +1,17 @@
 # The Next GPU Optimizations — from "GPU-assisted" to a GPU-resident prover
 
+> **SUPERSEDED (2026-07-05) by `GPU_RESIDENT_PROVER_DESIGN.md`.** The user
+> ratified a total overhaul (decisions U1–U8): a new `gpu-prover` crate owns
+> orchestration, and the incremental plan below (the B2/B3/C/D/E workstreams in
+> §5/§7) is replaced by the strangler milestones M0–M7. Those workstreams
+> **shipped and were pod-validated** inside the milestones — B2→M2b, B3→M2a,
+> C→M3+M4, barrier-overlap→M5a, two-proof-pipelining harness→M6-a — so do not
+> re-plan from §7 here. The live status and the true remaining frontier (the
+> base_commit VRAM diet → M6 pipelining; M5 graphs + device channel) are in
+> `GPU_RESIDENT_PROVER_DESIGN.md` §11b. This file is retained for the as-built
+> analysis (§1–§4) and the taxonomy of taxes, which the overhaul incorporates
+> unchanged.
+
 Companion of `ENDGAME_ARCHITECTURE.md` (the bandwidth-floor argument and §-numbered
 workstreams) and `DEDUCE_DESIGN.md` (the computed-deduce lane). This document does
 three things: (1) states the AS-BUILT architecture precisely — where every phase
