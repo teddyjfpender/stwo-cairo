@@ -111,7 +111,9 @@ Every CUDA gate and performance invocation carries `--engine gpu-native` and
 `gpu_benchmarks/validate_architecture_record.py`; a stale binary or partial record is
 dropped unless it reports the exact `cuda-typed-pcs-driver-v1` tag, the required runtime
 mode, all seven starts and finishes exactly once, batched tree decommit, and complete
-telemetry.
+telemetry. It also rejects any AOT miss, runtime load/cache hit, or strict rejection;
+AOT loads and AOT cache hits remain explicit counters, including legitimate zeroes when
+no generated kernel ran, and the embedded AOT manifest hash must be non-zero.
 
 ## Reading `fleet_report.json`
 

@@ -956,6 +956,40 @@ pub struct InteractionClaimGenerator {
     log_size: u32,
     lookup_data: LookupData,
 }
+// === BEGIN relation_lookup_source_codegen ===
+crate::relation_lookup_source! {
+    memory_id_to_big_0: 30,
+    memory_id_to_big_1: 30,
+    memory_id_to_big_2: 30,
+    poseidon_full_round_chain_3: 33,
+    poseidon_full_round_chain_4: 33,
+    range_check_252_width_27_5: 11,
+    range_check_252_width_27_6: 11,
+    cube_252_7: 21,
+    range_check_3_3_3_3_3_8: 6,
+    range_check_3_3_3_3_3_9: 6,
+    cube_252_10: 21,
+    range_check_4_4_4_4_11: 5,
+    range_check_4_4_4_4_12: 5,
+    range_check_4_4_13: 3,
+    poseidon_3_partial_rounds_chain_14: 43,
+    poseidon_3_partial_rounds_chain_15: 43,
+    range_check_4_4_4_4_16: 5,
+    range_check_4_4_4_4_17: 5,
+    range_check_4_4_18: 3,
+    range_check_4_4_4_4_19: 5,
+    range_check_4_4_4_4_20: 5,
+    range_check_4_4_21: 3,
+    poseidon_full_round_chain_22: 33,
+    poseidon_full_round_chain_23: 33,
+    memory_id_to_big_24: 30,
+    memory_id_to_big_25: 30,
+    memory_id_to_big_26: 30,
+    poseidon_aggregator_27: 7,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+// === END relation_lookup_source_codegen ===
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,

@@ -213,6 +213,9 @@ pub struct InteractionClaimGenerator {
     pub ids: [Vec<PackedM31>; MEMORY_ADDRESS_TO_ID_SPLIT],
     pub multiplicities: [Vec<PackedM31>; MEMORY_ADDRESS_TO_ID_SPLIT],
 }
+// === BEGIN relation_lookup_source_codegen ===
+crate::relation_lookup_source_memory_address_to_id!();
+// === END relation_lookup_source_codegen ===
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,

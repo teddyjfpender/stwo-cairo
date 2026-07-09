@@ -22,5 +22,6 @@ pub mod preprocessed_trace_backend;
 pub mod proof_shape;
 mod proof_shape_generated;
 pub mod range_checks;
+pub mod relation_sources;
 pub mod utils;
 pub mod witness_eval;

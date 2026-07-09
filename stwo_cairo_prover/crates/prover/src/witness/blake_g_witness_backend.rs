@@ -58,6 +58,11 @@ use crate::witness::components::{
 };
 use crate::witness::exec_context::WitnessExecContext;
 use crate::witness::prelude::Mutex;
+use crate::witness::proof_shape::TracePartId;
+use crate::witness::relation_sources::{
+    DeviceRelationWord, RelationLookupSource, RelationLookupSourceExport, RelationLookupTransfer,
+    RelationSourceEncoding, RelationSourceError, RelationSourceId,
+};
 
 type Evals<B> = Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>;
 
@@ -80,7 +85,7 @@ const REL_BLAKE_G: u32 = 1139985212;
 pub trait BlakeGWitness: FromSimdColumns + LogupFinalizeBackend {
     /// Backend-resident state carried from the base-trace write to the interaction
     /// write (replaces the component's host lookup-data flow).
-    type InteractionGen: Send;
+    type InteractionGen: Send + RelationLookupSourceExport;
 
     /// Writes the blake_g base trace on `Self`, feeds the five verify_bitwise_xor
     /// multiplicity families, and returns the claim plus the interaction state.
@@ -140,6 +145,92 @@ pub struct DeviceBlakeGWitness {
 pub enum CudaBlakeGInteractionGen {
     Device(DeviceBlakeGWitness),
     Host(blake_g::InteractionClaimGenerator),
+}
+
+impl RelationLookupSourceExport for CudaBlakeGInteractionGen {
+    fn export_relation_lookup_sources(
+        self,
+        component: &'static str,
+        exec_context: &WitnessExecContext,
+    ) -> Result<Vec<RelationLookupSource>, RelationSourceError> {
+        match self {
+            Self::Host(gen) => gen.export_relation_lookup_sources(component, exec_context),
+            Self::Device(state) => {
+                let shape = exec_context.exact_relation_part(component, TracePartId::Main)?;
+                let id = RelationSourceId {
+                    component,
+                    part: shape.part,
+                };
+                let DeviceBlakeGWitness {
+                    cols,
+                    log_size: _,
+                    verify_host: _,
+                } = state;
+                let words = blake_g_projected_words(id, cols)?;
+                Ok(vec![RelationLookupSource::new(
+                    id,
+                    RelationSourceEncoding::LookupWords,
+                    shape,
+                    words.len(),
+                    RelationLookupTransfer::DeviceProjectedWords(words),
+                )?])
+            }
+        }
+    }
+}
+
+const BLAKE_G_TUPLE_COLUMNS: [(u32, [usize; 3]); 16] = [
+    (REL_XOR8, [53, 55, 18]),
+    (REL_XOR8, [14, 16, 19]),
+    (REL_XOR8B, [54, 56, 20]),
+    (REL_XOR8B, [15, 17, 21]),
+    (REL_XOR12, [57, 59, 28]),
+    (REL_XOR4, [24, 26, 29]),
+    (REL_XOR12, [58, 60, 30]),
+    (REL_XOR4, [25, 27, 31]),
+    (REL_XOR8, [61, 63, 38]),
+    (REL_XOR8, [34, 36, 39]),
+    (REL_XOR8B, [62, 64, 40]),
+    (REL_XOR8B, [35, 37, 41]),
+    (REL_XOR7, [65, 67, 48]),
+    (REL_XOR9, [44, 46, 49]),
+    (REL_XOR7, [66, 68, 50]),
+    (REL_XOR9, [45, 47, 51]),
+];
+const BLAKE_G_FINAL_COLUMNS: [usize; 20] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 32, 33, 69, 70, 42, 43, 71, 72,
+];
+
+fn blake_g_projected_words(
+    id: RelationSourceId,
+    cols: Vec<BaseFieldVec>,
+) -> Result<Vec<DeviceRelationWord>, RelationSourceError> {
+    if cols.len() != 73 {
+        return Err(RelationSourceError::DeviceColumnCount {
+            id,
+            expected: 73,
+            actual: cols.len(),
+        });
+    }
+    let mut cols: Vec<_> = cols.into_iter().map(Some).collect();
+    let mut words = Vec::with_capacity(87);
+    for (relation, indices) in BLAKE_G_TUPLE_COLUMNS {
+        words.push(DeviceRelationWord::Constant(relation));
+        words.extend(indices.map(|index| {
+            DeviceRelationWord::Column(cols[index].take().expect("unique blake_g column mapping"))
+        }));
+    }
+    words.push(DeviceRelationWord::Constant(REL_BLAKE_G));
+    words.extend(BLAKE_G_FINAL_COLUMNS.map(|index| {
+        DeviceRelationWord::Column(cols[index].take().expect("unique blake_g column mapping"))
+    }));
+    words.push(DeviceRelationWord::Constant(1));
+    words.push(DeviceRelationWord::Column(
+        cols[52].take().expect("unique blake_g column mapping"),
+    ));
+    debug_assert!(cols.into_iter().all(|column| column.is_none()));
+    debug_assert_eq!(words.len(), 87);
+    Ok(words)
 }
 
 impl BlakeGWitness for CudaBackend {
@@ -525,4 +616,23 @@ fn compare_values(label: &str, host: &[BaseField], device: &[BaseField]) -> bool
         host[first], device[first]
     );
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relation_projection_uses_every_device_column_exactly_once() {
+        let mut columns: Vec<_> = BLAKE_G_TUPLE_COLUMNS
+            .iter()
+            .flat_map(|(_, columns)| columns)
+            .copied()
+            .chain(BLAKE_G_FINAL_COLUMNS)
+            .chain([52])
+            .collect();
+        columns.sort_unstable();
+        assert_eq!(columns, (0..73).collect::<Vec<_>>());
+        assert_eq!(BLAKE_G_TUPLE_COLUMNS.len() * 4 + 1 + 20 + 2, 87);
+    }
 }

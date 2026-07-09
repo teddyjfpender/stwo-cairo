@@ -7,16 +7,25 @@
 use cairo_air::claims::CairoClaim;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
-use stwo_backend_cuda::CommitWorkspaceConfig;
+use stwo_backend_cuda::{
+    fri_workspace_requirements, CommitWorkspaceConfig, FriWorkspaceConfig, PreparedFriError,
+};
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
     PreProcessedTrace, PreProcessedTraceVariant,
 };
+use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId, TracePartShape};
 
 use crate::arena_plan::{
-    CommitmentGeometry, CommitmentTreeId, DecommitStrategy, ProofEpoch, ProtocolGeometry,
-    ProtocolIdentity,
+    BufferPurpose, CommitmentColumnSource, CommitmentGeometry, CommitmentTreeId, DecommitStrategy,
+    ProofEpoch, ProtocolGeometry, ProtocolIdentity, TranscriptGeometry,
 };
 use crate::plan::ProofPlan;
+use crate::relation::RelationTracePart;
+use crate::relation_execution::{RelationExecutionError, RelationExecutionPlan};
+use crate::relation_table::CAIRO_RELATION_GRAPH;
+use crate::schedule::TraceColumnCount;
+use crate::schedule_table::CAIRO_COMMITMENT_COMPONENT_ORDER;
+use crate::transcript_plan::CairoBlake2sTranscriptPlan;
 
 /// Stable identity for the ordinary Blake2s channel/proof format used by the
 /// Starknet block benchmark.  It is intentionally not a Rust `TypeId` or hash.
@@ -72,6 +81,48 @@ pub enum ProtocolPlanError {
         first_fold: u32,
         last_domain: u32,
     },
+    Fri(PreparedFriError),
+    Relation(RelationExecutionError),
+    ProofShapeNotExact,
+    MissingOrderedComponent(&'static str),
+    DuplicateOrderedComponent(&'static str),
+    OrderedComponentCoverage {
+        expected: usize,
+        actual: usize,
+    },
+    MissingRelationOutput {
+        component: &'static str,
+        part: TracePartId,
+    },
+    DuplicateRelationOutput {
+        component: &'static str,
+        part: TracePartId,
+    },
+    RelationOutputRowsMismatch {
+        component: &'static str,
+        part: TracePartId,
+        expected: u64,
+        actual: u32,
+    },
+    UnusedRelationOutput {
+        component: &'static str,
+        part: TracePartId,
+    },
+    InvalidTracePart {
+        component: &'static str,
+        part: TracePartId,
+    },
+    CommitmentColumnCountMismatch {
+        tree: CommitmentTreeId,
+        expected: usize,
+        actual: usize,
+    },
+    CommitmentColumnLogMismatch {
+        tree: CommitmentTreeId,
+        column: usize,
+        expected: u32,
+        actual: u32,
+    },
     SizeOverflow,
 }
 
@@ -96,6 +147,7 @@ pub fn plan_protocol_geometry(
     pcs: &PcsConfig,
     include_all_preprocessed_columns: bool,
     policy: ProtocolPlanPolicy,
+    transcript_plan: &CairoBlake2sTranscriptPlan,
 ) -> Result<ProtocolGeometry, ProtocolPlanError> {
     let claim_log_sizes = claim.log_sizes();
     plan_protocol_from_logs(
@@ -105,7 +157,245 @@ pub fn plan_protocol_geometry(
         pcs,
         include_all_preprocessed_columns,
         policy,
+        TranscriptGeometry {
+            schedule_key: transcript_plan.schedule_key(),
+            requirements: transcript_plan.schedule().requirements().clone(),
+        },
     )
+}
+
+/// One trace column in the exact unsorted order emitted by
+/// `CairoClaimGenerator::write_trace` and consumed by `CairoClaim::log_sizes`.
+///
+/// Prepared commitments reorder these columns stably by log size.  Keeping the
+/// pre-sort identity public is the checked hand-off from witness output into the
+/// arena: a caller may not infer component ownership from a raw column index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TraceCommitmentColumn {
+    pub source: CommitmentColumnSource,
+    pub log_size: u32,
+}
+
+/// Exact claim-order layouts for the two Cairo trace commitments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceCommitmentLayout {
+    pub base: Vec<TraceCommitmentColumn>,
+    pub interaction: Vec<TraceCommitmentColumn>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlannedRelationOutput {
+    component: &'static str,
+    part: TracePartId,
+    padded_rows: u32,
+    coordinates: usize,
+    consumed: bool,
+}
+
+pub fn trace_commitment_layout(
+    proof_plan: &ProofPlan,
+) -> Result<TraceCommitmentLayout, ProtocolPlanError> {
+    if !proof_plan.capture_ready() {
+        return Err(ProtocolPlanError::ProofShapeNotExact);
+    }
+    if CAIRO_COMMITMENT_COMPONENT_ORDER.len() != proof_plan.components.len() {
+        return Err(ProtocolPlanError::OrderedComponentCoverage {
+            expected: proof_plan.components.len(),
+            actual: CAIRO_COMMITMENT_COMPONENT_ORDER.len(),
+        });
+    }
+    for (index, &component) in CAIRO_COMMITMENT_COMPONENT_ORDER.iter().enumerate() {
+        if CAIRO_COMMITMENT_COMPONENT_ORDER[..index].contains(&component) {
+            return Err(ProtocolPlanError::DuplicateOrderedComponent(component));
+        }
+        if !proof_plan
+            .components
+            .iter()
+            .any(|candidate| candidate.node.id == component)
+        {
+            return Err(ProtocolPlanError::MissingOrderedComponent(component));
+        }
+    }
+
+    let relation_execution =
+        RelationExecutionPlan::from_proof_plan(proof_plan, &CAIRO_RELATION_GRAPH)
+            .map_err(ProtocolPlanError::Relation)?;
+    let relation_requirements = relation_execution
+        .requirements()
+        .map_err(ProtocolPlanError::Relation)?;
+    let mut relation_outputs = Vec::with_capacity(relation_requirements.instances.len());
+    for requirement in &relation_requirements.instances {
+        let batch = relation_execution
+            .batches
+            .get(requirement.batch_index)
+            .ok_or(ProtocolPlanError::SizeOverflow)?;
+        let part = match batch.trace_part {
+            RelationTracePart::Component => TracePartId::Main,
+            RelationTracePart::EachMemoryBig => TracePartId::MemoryBig(
+                u32::try_from(requirement.instance_index)
+                    .map_err(|_| ProtocolPlanError::SizeOverflow)?,
+            ),
+            RelationTracePart::MemorySmall => TracePartId::MemorySmall,
+        };
+        relation_outputs.push(PlannedRelationOutput {
+            component: batch.component,
+            part,
+            padded_rows: requirement.row_capacity,
+            coordinates: requirement.output_coordinate_count,
+            consumed: false,
+        });
+    }
+
+    let mut base = Vec::new();
+    let mut interaction = Vec::new();
+    for &component_id in CAIRO_COMMITMENT_COMPONENT_ORDER {
+        let component = proof_plan
+            .components
+            .iter()
+            .find(|component| component.node.id == component_id)
+            .ok_or(ProtocolPlanError::MissingOrderedComponent(component_id))?;
+        let RowResolution::Resolved(parts) = &component.runtime.rows else {
+            if matches!(component.runtime.rows, RowResolution::Absent) {
+                continue;
+            }
+            return Err(ProtocolPlanError::ProofShapeNotExact);
+        };
+        let mut parts = parts.clone();
+        parts.sort_unstable_by_key(|part| match part.part {
+            TracePartId::Main => (0u8, 0u32),
+            TracePartId::MemoryBig(index) => (1, index),
+            TracePartId::MemorySmall => (2, 0),
+        });
+        for part in parts {
+            let log_size = exact_log_size(component_id, part)?;
+            let base_columns = match (component.node.facts.trace_columns, part.part) {
+                (TraceColumnCount::Fixed(columns), TracePartId::Main) => columns,
+                (TraceColumnCount::SplitMemory { big, .. }, TracePartId::MemoryBig(_)) => big,
+                (TraceColumnCount::SplitMemory { small, .. }, TracePartId::MemorySmall) => small,
+                _ => {
+                    return Err(ProtocolPlanError::InvalidTracePart {
+                        component: component_id,
+                        part: part.part,
+                    })
+                }
+            };
+            base.extend((0..base_columns).map(|ordinal| TraceCommitmentColumn {
+                source: CommitmentColumnSource::Trace {
+                    component: component_id,
+                    part: part.part,
+                    purpose: BufferPurpose::BaseTrace,
+                    ordinal,
+                },
+                log_size,
+            }));
+
+            let mut matching = relation_outputs
+                .iter_mut()
+                .filter(|output| output.component == component_id && output.part == part.part);
+            let Some(output) = matching.next() else {
+                if component.node.facts.logup_columns.is_some()
+                    || matches!(
+                        component.node.facts.trace_columns,
+                        TraceColumnCount::SplitMemory { .. }
+                    )
+                {
+                    return Err(ProtocolPlanError::MissingRelationOutput {
+                        component: component_id,
+                        part: part.part,
+                    });
+                }
+                continue;
+            };
+            if matching.next().is_some() {
+                return Err(ProtocolPlanError::DuplicateRelationOutput {
+                    component: component_id,
+                    part: part.part,
+                });
+            }
+            if u64::from(output.padded_rows) != part.padded_rows {
+                return Err(ProtocolPlanError::RelationOutputRowsMismatch {
+                    component: component_id,
+                    part: part.part,
+                    expected: part.padded_rows,
+                    actual: output.padded_rows,
+                });
+            }
+            output.consumed = true;
+            interaction.extend(
+                (0..output.coordinates)
+                    .map(|coordinate| {
+                        Ok(TraceCommitmentColumn {
+                            source: CommitmentColumnSource::Trace {
+                                component: component_id,
+                                part: part.part,
+                                purpose: BufferPurpose::InteractionTrace,
+                                ordinal: u32::try_from(coordinate)
+                                    .map_err(|_| ProtocolPlanError::SizeOverflow)?,
+                            },
+                            log_size,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ProtocolPlanError>>()?,
+            );
+        }
+    }
+    if let Some(output) = relation_outputs.iter().find(|output| !output.consumed) {
+        return Err(ProtocolPlanError::UnusedRelationOutput {
+            component: output.component,
+            part: output.part,
+        });
+    }
+    Ok(TraceCommitmentLayout { base, interaction })
+}
+
+fn exact_log_size(component: &'static str, part: TracePartShape) -> Result<u32, ProtocolPlanError> {
+    if part.padded_rows == 0 || !part.padded_rows.is_power_of_two() {
+        return Err(ProtocolPlanError::InvalidTracePart {
+            component,
+            part: part.part,
+        });
+    }
+    Ok(part.padded_rows.ilog2())
+}
+
+fn validate_claim_logs(
+    tree: CommitmentTreeId,
+    planned: &[TraceCommitmentColumn],
+    actual: &[u32],
+) -> Result<(), ProtocolPlanError> {
+    if planned.len() != actual.len() {
+        return Err(ProtocolPlanError::CommitmentColumnCountMismatch {
+            tree,
+            expected: planned.len(),
+            actual: actual.len(),
+        });
+    }
+    for (column, (planned, &actual)) in planned.iter().zip(actual).enumerate() {
+        if planned.log_size != actual {
+            return Err(ProtocolPlanError::CommitmentColumnLogMismatch {
+                tree,
+                column,
+                expected: planned.log_size,
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn canonical_commit_columns(
+    mut columns: Vec<TraceCommitmentColumn>,
+) -> (Vec<Vec<u32>>, Vec<Vec<CommitmentColumnSource>>) {
+    columns.sort_by_key(|column| column.log_size);
+    let logs = columns
+        .chunks(16)
+        .map(|group| group.iter().map(|column| column.log_size).collect())
+        .collect();
+    let sources = columns
+        .chunks(16)
+        .map(|group| group.iter().map(|column| column.source).collect())
+        .collect();
+    (logs, sources)
 }
 
 fn plan_protocol_from_logs(
@@ -115,6 +405,7 @@ fn plan_protocol_from_logs(
     pcs: &PcsConfig,
     include_all_preprocessed_columns: bool,
     policy: ProtocolPlanPolicy,
+    transcript: TranscriptGeometry,
 ) -> Result<ProtocolGeometry, ProtocolPlanError> {
     if policy.channel_tag == 0 {
         return Err(ProtocolPlanError::UnboundChannel);
@@ -181,6 +472,21 @@ fn plan_protocol_from_logs(
     let composition_coefficient_log = lifting
         .checked_sub(blowup)
         .ok_or(ProtocolPlanError::SizeOverflow)?;
+    let TraceCommitmentLayout {
+        base: base_columns,
+        interaction: interaction_columns,
+    } = trace_commitment_layout(proof_plan)?;
+    validate_claim_logs(CommitmentTreeId::Base, &base_columns, &claim_log_sizes[0])?;
+    validate_claim_logs(
+        CommitmentTreeId::Interaction,
+        &interaction_columns,
+        &claim_log_sizes[1],
+    )?;
+    let (base_logs, base_sources) = canonical_commit_columns(base_columns);
+    let (interaction_logs, interaction_sources) = canonical_commit_columns(interaction_columns);
+    let composition_sources = (0..8)
+        .map(|ordinal| CommitmentColumnSource::Composition { ordinal })
+        .collect();
 
     let commit_config = |tree_lifting| CommitWorkspaceConfig {
         log_blowup_factor: blowup,
@@ -193,19 +499,22 @@ fn plan_protocol_from_logs(
             id: CommitmentTreeId::Base,
             created: ProofEpoch::BaseCommit,
             config: commit_config(base_lifting),
-            grouped_column_log_sizes: canonical_commit_groups(&claim_log_sizes[0]),
+            grouped_column_log_sizes: base_logs,
+            grouped_column_sources: base_sources,
         },
         CommitmentGeometry {
             id: CommitmentTreeId::Interaction,
             created: ProofEpoch::InteractionCommit,
             config: commit_config(interaction_lifting),
-            grouped_column_log_sizes: canonical_commit_groups(&claim_log_sizes[1]),
+            grouped_column_log_sizes: interaction_logs,
+            grouped_column_sources: interaction_sources,
         },
         CommitmentGeometry {
             id: CommitmentTreeId::Composition,
             created: ProofEpoch::CompositionCommit,
             config: commit_config(lifting),
             grouped_column_log_sizes: vec![vec![composition_coefficient_log; 8]],
+            grouped_column_sources: vec![composition_sources],
         },
     ];
 
@@ -245,6 +554,7 @@ fn plan_protocol_from_logs(
         n_queries: pcs.fri_config.n_queries,
         total_opened_columns,
         proof_capacity_words,
+        transcript,
         commitments,
         opened_tree_log_sizes,
         fri_layer_log_sizes,
@@ -253,6 +563,7 @@ fn plan_protocol_from_logs(
 
 /// Stable ascending leaf order, split into full 16-column Blake2s blocks and
 /// one final block.  Sorting is stable so equal-log columns retain claim order.
+#[cfg(test)]
 fn canonical_commit_groups(log_sizes: &[u32]) -> Vec<Vec<u32>> {
     let mut sorted = log_sizes.to_vec();
     sorted.sort_by_key(|log| *log);
@@ -267,36 +578,25 @@ pub fn fri_merkle_log_sizes(
     lifting_log_size: u32,
     config: FriConfig,
 ) -> Result<Vec<u32>, ProtocolPlanError> {
-    let last_domain_log = config
-        .log_last_layer_degree_bound
-        .checked_add(config.log_blowup_factor)
+    let twiddle_log_size = lifting_log_size
+        .checked_sub(1)
         .ok_or(ProtocolPlanError::SizeOverflow)?;
-    if config.fold_step == 0
-        || lifting_log_size <= config.fold_step
-        || lifting_log_size - config.fold_step < last_domain_log
-    {
-        return Err(ProtocolPlanError::InvalidFriGeometry {
-            lifting: lifting_log_size,
-            first_fold: config.fold_step,
-            last_domain: last_domain_log,
-        });
-    }
-    let packed_log = |domain_log: u32, fold_step: u32| {
-        if fold_step > 1 && domain_log >= 2 {
-            domain_log - 2
-        } else {
-            domain_log
-        }
-    };
-
-    let mut output = vec![packed_log(lifting_log_size, config.fold_step)];
-    let mut line_log = lifting_log_size - config.fold_step;
-    while line_log > last_domain_log {
-        let step = config.fold_step.min(line_log - last_domain_log);
-        output.push(packed_log(line_log, step));
-        line_log -= step;
-    }
-    Ok(output)
+    let requirements = fri_workspace_requirements(FriWorkspaceConfig {
+        fri: config,
+        circle_log_size: lifting_log_size,
+        twiddle_log_size,
+    })
+    .map_err(ProtocolPlanError::Fri)?;
+    Ok(requirements
+        .trees
+        .iter()
+        .map(|tree| {
+            tree.layers_bottom_up
+                .first()
+                .expect("prepared FRI trees always contain a leaf")
+                .log_size
+        })
+        .collect())
 }
 
 fn proof_capacity_words(
@@ -380,8 +680,15 @@ pub fn preprocessed_binding_hash(
 mod tests {
     use stwo::core::fri::FriConfig;
     use stwo::core::pcs::PcsConfig;
+    use stwo_backend_cuda::{
+        Blake2sTranscriptSchedule, TranscriptBoundaryId, TranscriptInputId, TranscriptOperation,
+        TranscriptOutputId, TranscriptStart,
+    };
     use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
     use stwo_cairo_prover::witness::cairo_claim_generator::CairoClaimGenerator;
+    use stwo_cairo_prover::witness::proof_shape::{
+        ProofShape, RuntimeComponentShape, TracePartShape,
+    };
 
     use super::*;
     use crate::plan::ProofPlan;
@@ -393,6 +700,55 @@ mod tests {
             pow_bits: 26,
             fri_config: FriConfig::new(0, 1, 70, fold_step),
             lifting_log_size: None,
+        }
+    }
+
+    fn memory_plan() -> ProofPlan {
+        let default = CairoClaimGenerator::default().proof_shape(None).unwrap();
+        let mut components = default.components().to_vec();
+        *components
+            .iter_mut()
+            .find(|component| component.id == "memory_id_to_big")
+            .unwrap() = RuntimeComponentShape::parts(
+            "memory_id_to_big",
+            vec![
+                TracePartShape {
+                    part: TracePartId::MemoryBig(0),
+                    n_real_rows: 17,
+                    padded_rows: 32,
+                },
+                TracePartShape {
+                    part: TracePartId::MemorySmall,
+                    n_real_rows: 9,
+                    padded_rows: 16,
+                },
+            ],
+        )
+        .unwrap();
+        let shape = ProofShape::new(components).unwrap();
+        ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap()
+    }
+
+    fn transcript_geometry() -> TranscriptGeometry {
+        let schedule = Blake2sTranscriptSchedule::new(
+            TranscriptStart::Default,
+            vec![
+                TranscriptOperation::MixFelts {
+                    boundary: TranscriptBoundaryId(1),
+                    source: TranscriptInputId(1),
+                    n_felts: 1,
+                },
+                TranscriptOperation::DrawSecureFelt {
+                    boundary: TranscriptBoundaryId(2),
+                    output: TranscriptOutputId(1),
+                },
+            ],
+            8,
+        )
+        .unwrap();
+        TranscriptGeometry {
+            schedule_key: schedule.protocol_key(),
+            requirements: schedule.requirements().clone(),
         }
     }
 
@@ -423,25 +779,34 @@ mod tests {
 
     #[test]
     fn exact_claim_logs_produce_all_four_opening_trees() {
-        let shape = CairoClaimGenerator::default().proof_shape(None).unwrap();
-        let plan =
-            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
+        let plan = memory_plan();
+        let TraceCommitmentLayout { base, interaction } = trace_commitment_layout(&plan).unwrap();
+        let claim_logs = vec![
+            base.iter().map(|column| column.log_size).collect(),
+            interaction.iter().map(|column| column.log_size).collect(),
+        ];
         let preprocessed = PreProcessedTrace::canonical();
         let geometry = plan_protocol_from_logs(
             &plan,
-            &[vec![19; 33], vec![19; 17]],
+            &claim_logs,
             &preprocessed,
             &pcs(3),
             false,
             ProtocolPlanPolicy::starknet_blake2s(0x1234),
+            transcript_geometry(),
         )
         .unwrap();
         assert_eq!(geometry.commitments.len(), 3);
         assert_eq!(geometry.opened_tree_log_sizes.len(), 4);
         assert_eq!(
             geometry.total_opened_columns,
-            preprocessed.log_sizes().len() + 58
+            preprocessed.log_sizes().len() + base.len() + interaction.len() + 8
         );
+        assert!(geometry.commitments.iter().all(|commitment| commitment
+            .grouped_column_sources
+            .iter()
+            .zip(&commitment.grouped_column_log_sizes)
+            .all(|(sources, logs)| sources.len() == logs.len())));
         assert_eq!(
             geometry.identity.relation_graph_hash,
             plan.relation_graph_hash
@@ -468,6 +833,7 @@ mod tests {
                 &config,
                 false,
                 ProtocolPlanPolicy::starknet_blake2s(0),
+                transcript_geometry(),
             ),
             Err(ProtocolPlanError::UnboundKernelManifest)
         );

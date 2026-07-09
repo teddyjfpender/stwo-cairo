@@ -1066,6 +1066,21 @@ pub struct InteractionClaimGenerator {
     log_size: u32,
     lookup_data: LookupData,
 }
+// === BEGIN relation_lookup_source_codegen ===
+crate::relation_lookup_source! {
+    verify_bitwise_xor_8_0: 4,
+    verify_bitwise_xor_8_1: 4,
+    verify_bitwise_xor_8_2: 4,
+    verify_bitwise_xor_8_3: 4,
+    verify_bitwise_xor_8_b_4: 4,
+    verify_bitwise_xor_8_b_5: 4,
+    verify_bitwise_xor_8_b_6: 4,
+    verify_bitwise_xor_8_b_7: 4,
+    triple_xor_32_8: 9,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+// === END relation_lookup_source_codegen ===
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,

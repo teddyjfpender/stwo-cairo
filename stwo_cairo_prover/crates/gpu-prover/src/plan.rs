@@ -95,6 +95,57 @@ impl ProofPlan {
     pub fn capture_ready(&self) -> bool {
         self.proof_shape.require_capture_ready().is_ok()
     }
+
+    /// Rebuilds the generated plan from the post-witness exact row ledger while
+    /// proving that no component, trace width/order, or preallocated capacity
+    /// changed. CUDA graph preparation must only consume the returned plan.
+    pub fn seal_exact_shape(
+        &self,
+        schedule: &'static Schedule,
+        relation_graph: &'static RelationGraph,
+        exact_shape: &ProofShape,
+    ) -> Result<Self, ProofPlanError> {
+        exact_shape
+            .require_capture_ready()
+            .map_err(ProofPlanError::Shape)?;
+
+        for component in &self.components {
+            let exact = exact_shape
+                .component(component.node.id)
+                .ok_or(ProofPlanError::MissingRuntimeComponent(component.node.id))?;
+            validate_sealed_runtime(&component.runtime, exact)?;
+        }
+
+        let sealed = Self::from_schedule(schedule, relation_graph, exact_shape)?;
+        if sealed.relation_graph_hash != self.relation_graph_hash {
+            return Err(ProofPlanError::SealedRelationGraphChanged {
+                expected: self.relation_graph_hash,
+                actual: sealed.relation_graph_hash,
+            });
+        }
+        if sealed.components.len() != self.components.len() {
+            return Err(ProofPlanError::SealedComponentCountChanged {
+                expected: self.components.len(),
+                actual: sealed.components.len(),
+            });
+        }
+        for (index, (expected, actual)) in
+            self.components.iter().zip(&sealed.components).enumerate()
+        {
+            if expected.node.id != actual.node.id {
+                return Err(ProofPlanError::SealedComponentOrderChanged {
+                    index,
+                    expected: expected.node.id,
+                    actual: actual.node.id,
+                });
+            }
+            if expected.node.facts != actual.node.facts {
+                return Err(ProofPlanError::SealedTraceGeometryChanged(expected.node.id));
+            }
+        }
+        debug_assert!(sealed.capture_ready());
+        Ok(sealed)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -128,6 +179,39 @@ pub enum ProofPlanError {
     CapacityUsesSplitProducer {
         producer: ComponentId,
         consumer: ComponentId,
+    },
+    SealedExpectedRowsPending(ComponentId),
+    SealedActualRowsNotExact(ComponentId),
+    SealedPresenceChanged(ComponentId),
+    SealedResolvedGeometryChanged(ComponentId),
+    SealedRowsBelowObserved {
+        component: ComponentId,
+        observed_rows: u64,
+        final_rows: u64,
+    },
+    SealedRowsExceedCapacity {
+        component: ComponentId,
+        final_rows: u64,
+        max_rows: u64,
+    },
+    SealedPaddingExceedsCapacity {
+        component: ComponentId,
+        final_padding: u64,
+        padded_capacity: u64,
+    },
+    SealedComponentCountChanged {
+        expected: usize,
+        actual: usize,
+    },
+    SealedComponentOrderChanged {
+        index: usize,
+        expected: ComponentId,
+        actual: ComponentId,
+    },
+    SealedTraceGeometryChanged(ComponentId),
+    SealedRelationGraphChanged {
+        expected: u64,
+        actual: u64,
     },
 }
 
@@ -186,6 +270,62 @@ fn validate_row_source(
         }
     }
     Ok(())
+}
+
+fn validate_sealed_runtime(
+    expected: &RuntimeComponentShape,
+    exact: &RuntimeComponentShape,
+) -> Result<(), ProofPlanError> {
+    match (&expected.rows, &exact.rows) {
+        (RowResolution::Absent, RowResolution::Absent) => Ok(()),
+        (RowResolution::Absent, _) | (_, RowResolution::Absent) => {
+            Err(ProofPlanError::SealedPresenceChanged(expected.id))
+        }
+        (RowResolution::Resolved(_), RowResolution::Resolved(_)) => {
+            if expected == exact {
+                Ok(())
+            } else {
+                Err(ProofPlanError::SealedResolvedGeometryChanged(expected.id))
+            }
+        }
+        (RowResolution::Pending { .. }, _) => {
+            Err(ProofPlanError::SealedExpectedRowsPending(expected.id))
+        }
+        (RowResolution::Bounded { bound, .. }, RowResolution::Resolved(parts)) => {
+            if parts.len() != 1 || parts[0].part != TracePartId::Main {
+                return Err(ProofPlanError::SealedResolvedGeometryChanged(expected.id));
+            }
+            let part = parts[0];
+            if part.n_real_rows < bound.observed_rows {
+                return Err(ProofPlanError::SealedRowsBelowObserved {
+                    component: expected.id,
+                    observed_rows: bound.observed_rows,
+                    final_rows: part.n_real_rows,
+                });
+            }
+            if part.n_real_rows > bound.max_rows {
+                return Err(ProofPlanError::SealedRowsExceedCapacity {
+                    component: expected.id,
+                    final_rows: part.n_real_rows,
+                    max_rows: bound.max_rows,
+                });
+            }
+            if part.padded_rows > bound.padded_capacity {
+                return Err(ProofPlanError::SealedPaddingExceedsCapacity {
+                    component: expected.id,
+                    final_padding: part.padded_rows,
+                    padded_capacity: bound.padded_capacity,
+                });
+            }
+            Ok(())
+        }
+        (RowResolution::Bounded { .. }, _) => {
+            Err(ProofPlanError::SealedActualRowsNotExact(expected.id))
+        }
+        (_, RowResolution::Pending { .. } | RowResolution::Bounded { .. }) => {
+            Err(ProofPlanError::SealedActualRowsNotExact(expected.id))
+        }
+    }
 }
 
 fn resolve_capacity_bounds(
@@ -370,5 +510,56 @@ mod tests {
             ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
         assert!(plan.arena_capacity_ready());
         assert!(plan.capture_ready());
+    }
+
+    #[test]
+    fn post_witness_seal_replaces_bound_with_exact_rows() {
+        let pre_shape = with_components(vec![
+            RuntimeComponentShape::uniform("blake_compress_opcode", 33, 64).unwrap(),
+            RuntimeComponentShape::pending(
+                "blake_round",
+                PendingRowsReason::WitnessRelationFeeds,
+                0,
+            ),
+        ]);
+        let capacity_plan =
+            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &pre_shape).unwrap();
+        let exact_shape = with_components(vec![
+            RuntimeComponentShape::uniform("blake_compress_opcode", 33, 64).unwrap(),
+            RuntimeComponentShape::uniform("blake_round", 640, 1024).unwrap(),
+        ]);
+
+        let sealed = capacity_plan
+            .seal_exact_shape(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &exact_shape)
+            .unwrap();
+        assert!(sealed.capture_ready());
+        assert_eq!(sealed.proof_shape(), &exact_shape);
+    }
+
+    #[test]
+    fn post_witness_seal_rejects_rows_beyond_generated_capacity() {
+        let pre_shape = with_components(vec![
+            RuntimeComponentShape::uniform("blake_compress_opcode", 33, 64).unwrap(),
+            RuntimeComponentShape::pending(
+                "blake_round",
+                PendingRowsReason::WitnessRelationFeeds,
+                0,
+            ),
+        ]);
+        let capacity_plan =
+            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &pre_shape).unwrap();
+        let exact_shape = with_components(vec![
+            RuntimeComponentShape::uniform("blake_compress_opcode", 33, 64).unwrap(),
+            RuntimeComponentShape::uniform("blake_round", 641, 1024).unwrap(),
+        ]);
+
+        assert!(matches!(
+            capacity_plan.seal_exact_shape(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &exact_shape),
+            Err(ProofPlanError::SealedRowsExceedCapacity {
+                component: "blake_round",
+                final_rows: 641,
+                max_rows: 640,
+            })
+        ));
     }
 }

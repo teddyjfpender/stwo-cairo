@@ -13,6 +13,8 @@ use tracing::{span, Level};
 
 use crate::plan::ProofPlan;
 use crate::prover::CairoWitnessBackend;
+use crate::relation_table::CAIRO_RELATION_GRAPH;
+use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::state::{DeviceProofState, WitnessOutput};
 
 pub fn run<B: CairoWitnessBackend>(
@@ -23,13 +25,27 @@ pub fn run<B: CairoWitnessBackend>(
     pipeline_twiddles: Option<&'static TwiddleTree<B>>,
 ) -> WitnessOutput<B> {
     let span = span!(Level::INFO, "Write Base trace").entered();
-    let device = DeviceProofState::new(witness_artifact_plan, proof_plan);
+    let mut device = DeviceProofState::new(witness_artifact_plan, proof_plan);
     let (trace, claim, interaction_generator) = generator.write_trace::<B>(
         &device.witness_exec_context,
         opt_n_id_to_big_components,
         pipeline_twiddles,
     );
     device.witness_exec_context.assert_witness_drained();
+    let exact_shape = device
+        .witness_exec_context
+        .seal_final_proof_shape()
+        .expect("post-witness component shape ledger is incomplete");
+    device.proof_plan = Arc::new(
+        device
+            .proof_plan
+            .seal_exact_shape(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &exact_shape)
+            .expect("post-witness component geometry violated the preplanned capacity"),
+    );
+    assert!(
+        device.proof_plan.capture_ready(),
+        "device proof plan must be exact before graph preparation"
+    );
     span.exit();
     WitnessOutput {
         trace,

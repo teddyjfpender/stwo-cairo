@@ -465,6 +465,9 @@ pub struct InteractionClaimGenerator {
     pub small_values: [Vec<PackedM31>; N_M31_IN_SMALL_FELT252],
     pub small_multiplicities: Vec<PackedM31>,
 }
+// === BEGIN relation_lookup_source_codegen ===
+crate::relation_lookup_source_memory_id_to_big!();
+// === END relation_lookup_source_codegen ===
 impl InteractionClaimGenerator {
     #[allow(clippy::type_complexity)]
     pub fn write_interaction_trace(

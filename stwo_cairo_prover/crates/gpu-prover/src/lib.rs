@@ -20,14 +20,23 @@ pub mod flags;
 pub mod graphs;
 pub mod phases;
 pub mod plan;
+pub mod protocol_discovery;
 pub mod protocol_plan;
 pub mod prover;
 pub mod relation;
 pub mod relation_execution;
 pub mod relation_table;
+pub mod resident_runtime;
+pub mod resident_sources;
 pub mod schedule;
 pub mod schedule_table;
 pub mod state;
+pub mod transcript_plan;
+pub mod workspace_cache;
 
 pub use prover::{CairoBackend, GpuCairoProver, GpuProverConfig};
 pub use stwo_backend_cuda::{CudaPcsDriverTelemetry, CudaPcsRuntimeMode};
+pub use workspace_cache::{
+    WorkspaceCache, WorkspaceCacheError, WorkspaceCacheTelemetry, WorkspaceKey,
+    WorkspaceMaterialization,
+};

@@ -56,10 +56,35 @@ def validate_record(record: dict[str, Any], required_mode: str) -> list[str]:
         "gpu_native_architecture_required": True,
         "gpu_pcs_required_runtime_mode": required_mode,
         "gpu_native_architecture_gate_passed": True,
+        "gpu_aot_misses": 0,
+        "gpu_aot_runtime_loads": 0,
+        "gpu_aot_runtime_cache_hits": 0,
+        "gpu_aot_strict_rejections": 0,
+        "gpu_aot_provenance_gate_passed": True,
     }
     for field, expected in required.items():
         if record.get(field) != expected:
             errors.append(f"{field}: expected {expected!r}, got {record.get(field)!r}")
+
+    for field in (
+        "gpu_aot_misses",
+        "gpu_aot_runtime_loads",
+        "gpu_aot_runtime_cache_hits",
+        "gpu_aot_strict_rejections",
+    ):
+        count = record.get(field)
+        if not isinstance(count, int) or isinstance(count, bool) or count != 0:
+            errors.append(f"{field}: expected integer 0, got {count!r}")
+
+    for field in ("gpu_aot_loads", "gpu_aot_cache_hits"):
+        count = record.get(field)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            errors.append(f"{field}: expected a non-negative reported count, got {count!r}")
+    manifest_hash = record.get("gpu_aot_manifest_hash")
+    if not isinstance(manifest_hash, int) or isinstance(manifest_hash, bool) or manifest_hash <= 0:
+        errors.append(
+            f"gpu_aot_manifest_hash: expected a non-zero embedded-pack identity, got {manifest_hash!r}"
+        )
 
     for field in ("gpu_pcs_stage_started", "gpu_pcs_stage_finished"):
         counts = record.get(field)
@@ -69,8 +94,9 @@ def validate_record(record: dict[str, Any], required_mode: str) -> list[str]:
         if set(counts) != set(STAGES):
             errors.append(f"{field}: expected stages {list(STAGES)!r}, got {sorted(counts)!r}")
         for stage in STAGES:
-            if counts.get(stage) != 1:
-                errors.append(f"{field}.{stage}: expected 1, got {counts.get(stage)!r}")
+            count = counts.get(stage)
+            if not isinstance(count, int) or isinstance(count, bool) or count != 1:
+                errors.append(f"{field}.{stage}: expected integer 1, got {count!r}")
     return errors
 
 

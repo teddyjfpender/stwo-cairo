@@ -190,6 +190,12 @@ struct LookupData {
 pub struct InteractionClaimGenerator {
     lookup_data: LookupData,
 }
+// === BEGIN relation_lookup_source_codegen ===
+crate::relation_lookup_source! {
+    range_check_3_3_3_3_3_0: 6,
+    mults_0: scalar,
+}
+// === END relation_lookup_source_codegen ===
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,

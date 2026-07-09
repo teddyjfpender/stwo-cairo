@@ -22,6 +22,7 @@ pub enum GraphSegment {
     IngestWitnessBaseCommit,
     InteractionCommit,
     CompositionQuotientCommit,
+    OodsEvaluation,
     FriLayer(u8),
     OodsQueriesDecommitAssemble,
 }

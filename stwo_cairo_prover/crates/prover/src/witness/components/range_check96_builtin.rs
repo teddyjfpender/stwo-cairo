@@ -253,6 +253,14 @@ pub struct InteractionClaimGenerator {
     log_size: u32,
     lookup_data: LookupData,
 }
+// === BEGIN relation_lookup_source_codegen ===
+crate::relation_lookup_source! {
+    memory_address_to_id_0: 3,
+    range_check_6_1: 2,
+    memory_id_to_big_2: 30,
+    mults_0: scalar,
+}
+// === END relation_lookup_source_codegen ===
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,

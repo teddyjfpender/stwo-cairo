@@ -12,6 +12,12 @@ use std::sync::{Arc, Mutex};
 
 use stwo_backend_cuda::BaseFieldVec;
 
+use super::proof_shape::{
+    ComponentId, ProofShape, ProofShapeError, RowResolution, RuntimeComponentShape, TracePartId,
+    TracePartShape,
+};
+use super::proof_shape_generated::FinalComponentShape;
+
 pub(crate) struct DeviceLookup {
     pub buffer: BaseFieldVec,
     pub n_rows: usize,
@@ -103,6 +109,214 @@ impl<K, T> Default for ProofScopedStash<K, T> {
     }
 }
 
+#[derive(Debug)]
+struct FinalShapeLedgerState {
+    observed: HashMap<ComponentId, RuntimeComponentShape>,
+    sealed: bool,
+}
+
+#[derive(Debug)]
+struct FinalShapeLedger {
+    expected: ProofShape,
+    state: Mutex<FinalShapeLedgerState>,
+}
+
+impl FinalShapeLedger {
+    fn new(expected: ProofShape) -> Self {
+        Self {
+            expected,
+            state: Mutex::new(FinalShapeLedgerState {
+                observed: HashMap::new(),
+                sealed: false,
+            }),
+        }
+    }
+
+    fn record(&self, actual: RuntimeComponentShape) -> Result<(), FinalShapeError> {
+        let expected = self
+            .expected
+            .component(actual.id)
+            .ok_or(FinalShapeError::UnknownComponent(actual.id))?;
+        validate_final_shape(expected, &actual)?;
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("final witness shape ledger mutex poisoned");
+        if state.sealed {
+            return Err(FinalShapeError::AlreadySealed);
+        }
+        if state.observed.insert(actual.id, actual).is_some() {
+            return Err(FinalShapeError::DuplicateComponent(expected.id));
+        }
+        Ok(())
+    }
+
+    fn seal(&self) -> Result<ProofShape, FinalShapeError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("final witness shape ledger mutex poisoned");
+        if state.sealed {
+            return Err(FinalShapeError::AlreadySealed);
+        }
+
+        let mut components = Vec::with_capacity(self.expected.components().len());
+        for expected in self.expected.components() {
+            match expected.rows {
+                RowResolution::Absent => {
+                    if state.observed.contains_key(expected.id) {
+                        return Err(FinalShapeError::UnexpectedPresent(expected.id));
+                    }
+                    components.push(expected.clone());
+                }
+                _ => components.push(
+                    state
+                        .observed
+                        .get(expected.id)
+                        .cloned()
+                        .ok_or(FinalShapeError::MissingComponent(expected.id))?,
+                ),
+            }
+        }
+        let shape = ProofShape::new(components).map_err(FinalShapeError::InvalidShape)?;
+        shape
+            .require_capture_ready()
+            .map_err(FinalShapeError::InvalidShape)?;
+        state.sealed = true;
+        Ok(shape)
+    }
+
+    fn exact_part(
+        &self,
+        component: ComponentId,
+        part: TracePartId,
+    ) -> Result<TracePartShape, FinalShapeError> {
+        let state = self
+            .state
+            .lock()
+            .expect("final witness shape ledger mutex poisoned");
+        if !state.sealed {
+            return Err(FinalShapeError::NotSealed);
+        }
+        let shape = state
+            .observed
+            .get(component)
+            .ok_or(FinalShapeError::MissingComponent(component))?;
+        let RowResolution::Resolved(parts) = &shape.rows else {
+            return Err(FinalShapeError::ActualRowsNotResolved(component));
+        };
+        parts
+            .iter()
+            .find(|shape| shape.part == part)
+            .copied()
+            .ok_or(FinalShapeError::MissingTracePart { component, part })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FinalShapeError {
+    NoPlannedShape,
+    NotSealed,
+    AlreadySealed,
+    UnknownComponent(ComponentId),
+    DuplicateComponent(ComponentId),
+    MissingComponent(ComponentId),
+    MissingTracePart {
+        component: ComponentId,
+        part: TracePartId,
+    },
+    UnexpectedPresent(ComponentId),
+    ExpectedRowsStillPending(ComponentId),
+    ActualRowsNotResolved(ComponentId),
+    ResolvedGeometryChanged {
+        component: ComponentId,
+        expected: RuntimeComponentShape,
+        actual: RuntimeComponentShape,
+    },
+    FinalRowsBelowObserved {
+        component: ComponentId,
+        observed_rows: u64,
+        final_rows: u64,
+    },
+    FinalRowsExceedCapacity {
+        component: ComponentId,
+        final_rows: u64,
+        max_rows: u64,
+    },
+    FinalPaddingExceedsCapacity {
+        component: ComponentId,
+        final_padding: u64,
+        padded_capacity: u64,
+    },
+    InvalidShape(ProofShapeError),
+}
+
+impl std::fmt::Display for FinalShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for FinalShapeError {}
+
+fn validate_final_shape(
+    expected: &RuntimeComponentShape,
+    actual: &RuntimeComponentShape,
+) -> Result<(), FinalShapeError> {
+    let RowResolution::Resolved(actual_parts) = &actual.rows else {
+        return Err(FinalShapeError::ActualRowsNotResolved(expected.id));
+    };
+    match &expected.rows {
+        RowResolution::Absent => Err(FinalShapeError::UnexpectedPresent(expected.id)),
+        RowResolution::Resolved(_) => {
+            if expected != actual {
+                return Err(FinalShapeError::ResolvedGeometryChanged {
+                    component: expected.id,
+                    expected: expected.clone(),
+                    actual: actual.clone(),
+                });
+            }
+            Ok(())
+        }
+        RowResolution::Pending { .. } => {
+            Err(FinalShapeError::ExpectedRowsStillPending(expected.id))
+        }
+        RowResolution::Bounded { bound, .. } => {
+            if actual_parts.len() != 1 || actual_parts[0].part != TracePartId::Main {
+                return Err(FinalShapeError::ResolvedGeometryChanged {
+                    component: expected.id,
+                    expected: expected.clone(),
+                    actual: actual.clone(),
+                });
+            }
+            let part = actual_parts[0];
+            if part.n_real_rows < bound.observed_rows {
+                return Err(FinalShapeError::FinalRowsBelowObserved {
+                    component: expected.id,
+                    observed_rows: bound.observed_rows,
+                    final_rows: part.n_real_rows,
+                });
+            }
+            if part.n_real_rows > bound.max_rows {
+                return Err(FinalShapeError::FinalRowsExceedCapacity {
+                    component: expected.id,
+                    final_rows: part.n_real_rows,
+                    max_rows: bound.max_rows,
+                });
+            }
+            if part.padded_rows > bound.padded_capacity {
+                return Err(FinalShapeError::FinalPaddingExceedsCapacity {
+                    component: expected.id,
+                    final_padding: part.padded_rows,
+                    padded_capacity: bound.padded_capacity,
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
 impl<K, T> ProofScopedStash<K, T>
 where
     K: Copy + Debug + Eq + Hash + Ord,
@@ -150,6 +364,7 @@ where
 #[derive(Default)]
 pub struct WitnessExecContext {
     plan: Option<Arc<WitnessArtifactPlan>>,
+    final_shape: Option<FinalShapeLedger>,
     device_lookups: ProofScopedStash<&'static str, DeviceLookup>,
     edges: ProofScopedStash<(&'static str, &'static str), DeviceEdge>,
 }
@@ -160,6 +375,80 @@ impl WitnessExecContext {
             plan: Some(plan),
             ..Self::default()
         }
+    }
+
+    pub fn planned_with_shape(plan: Arc<WitnessArtifactPlan>, shape: ProofShape) -> Self {
+        Self {
+            plan: Some(plan),
+            final_shape: Some(FinalShapeLedger::new(shape)),
+            ..Self::default()
+        }
+    }
+
+    /// Records the exact geometry at the last safe point: immediately before
+    /// the component generator is consumed. Legacy contexts have no proof plan
+    /// and deliberately skip this GPU graph-capture ledger.
+    pub(crate) fn record_final_component<G: FinalComponentShape>(
+        &self,
+        generator: &G,
+        opt_n_id_to_big_components: Option<usize>,
+    ) {
+        let Some(ledger) = &self.final_shape else {
+            return;
+        };
+        let device_feed_rows = self.device_feed_rows(G::COMPONENT);
+        assert!(
+            device_feed_rows == 0 || G::ACCEPTS_DEVICE_FEED_ROWS,
+            "component {} received a device edge but its generated row source does not accept one",
+            G::COMPONENT
+        );
+        let shape = generator
+            .final_component_shape(opt_n_id_to_big_components, device_feed_rows)
+            .expect("component final row geometry is invalid");
+        assert_eq!(
+            shape.id,
+            G::COMPONENT,
+            "generated final-shape trait reported the wrong component"
+        );
+        ledger
+            .record(shape)
+            .expect("component final row geometry violated its generated capacity contract");
+    }
+
+    /// Seals all generated component rows to exact values. Missing or duplicate
+    /// witness consumption fails closed before any CUDA graph can be prepared.
+    pub fn seal_final_proof_shape(&self) -> Result<ProofShape, FinalShapeError> {
+        self.final_shape
+            .as_ref()
+            .ok_or(FinalShapeError::NoPlannedShape)?
+            .seal()
+    }
+
+    /// Returns an authoritative component part only after the witness ledger is
+    /// sealed. Relation-source exports must never infer real rows from padding.
+    pub fn exact_relation_part(
+        &self,
+        component: ComponentId,
+        part: TracePartId,
+    ) -> Result<TracePartShape, FinalShapeError> {
+        self.final_shape
+            .as_ref()
+            .ok_or(FinalShapeError::NoPlannedShape)?
+            .exact_part(component, part)
+    }
+
+    fn device_feed_rows(&self, consumer: ComponentId) -> u64 {
+        self.edges
+            .0
+            .lock()
+            .expect("witness execution context mutex poisoned")
+            .values()
+            .filter(|edge| edge.plan.consumer == consumer)
+            .try_fold(0u64, |total, edge| {
+                let rows = u64::from(edge.plan.n_instances).checked_mul(edge.n_rows as u64)?;
+                total.checked_add(rows)
+            })
+            .unwrap_or_else(|| panic!("device feed row count overflow for {consumer}"))
     }
 
     fn require_component(&self, component: &'static str) {
@@ -274,6 +563,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::witness::components::blake_g;
+    use crate::witness::proof_shape::{CapacityBound, PendingRowsReason, TracePartShape};
 
     fn borrowed_empty_buffer() -> BaseFieldVec {
         BaseFieldVec::from_borrowed_ptr(std::ptr::null(), 0)
@@ -364,5 +655,77 @@ mod tests {
             assert_eq!(drops.load(Ordering::Relaxed), 0);
         }
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn final_shape_ledger_requires_every_present_component() {
+        let expected = ProofShape::new(vec![
+            RuntimeComponentShape::uniform("present", 7, 16).unwrap(),
+            RuntimeComponentShape::absent("absent"),
+        ])
+        .unwrap();
+        let ledger = FinalShapeLedger::new(expected);
+        assert_eq!(
+            ledger.seal(),
+            Err(FinalShapeError::MissingComponent("present"))
+        );
+    }
+
+    #[test]
+    fn exact_relation_parts_are_available_only_after_sealing() {
+        let component = RuntimeComponentShape::uniform("component", 9, 16).unwrap();
+        let ledger = FinalShapeLedger::new(ProofShape::new(vec![component.clone()]).unwrap());
+        ledger.record(component).unwrap();
+        assert_eq!(
+            ledger.exact_part("component", TracePartId::Main),
+            Err(FinalShapeError::NotSealed)
+        );
+        ledger.seal().unwrap();
+        assert_eq!(
+            ledger.exact_part("component", TracePartId::Main).unwrap(),
+            TracePartShape {
+                part: TracePartId::Main,
+                n_real_rows: 9,
+                padded_rows: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn generated_final_shape_counts_resident_device_edge_rows() {
+        let edge = PlannedDeviceEdge {
+            producer: "producer",
+            consumer: "blake_g",
+            word_base: 0,
+            words_per_instance: 6,
+            n_instances: 10,
+        };
+        let artifacts = Arc::new(WitnessArtifactPlan::new(
+            vec!["producer", "blake_g"],
+            vec![edge],
+        ));
+        let expected = ProofShape::new(vec![RuntimeComponentShape::bounded(
+            "blake_g",
+            PendingRowsReason::WitnessRelationFeeds,
+            CapacityBound {
+                observed_rows: 0,
+                max_rows: 160,
+                padded_capacity: 256,
+            },
+        )])
+        .unwrap();
+        let context = WitnessExecContext::planned_with_shape(artifacts, expected);
+        context.insert_edge(edge, borrowed_empty_buffer(), Vec::new(), 16);
+
+        context.record_final_component(&blake_g::ClaimGenerator::new(), None);
+        let sealed = context.seal_final_proof_shape().unwrap();
+        assert_eq!(
+            sealed.component("blake_g").unwrap().rows,
+            RowResolution::Resolved(vec![TracePartShape {
+                part: TracePartId::Main,
+                n_real_rows: 160,
+                padded_rows: 256,
+            }])
+        );
     }
 }

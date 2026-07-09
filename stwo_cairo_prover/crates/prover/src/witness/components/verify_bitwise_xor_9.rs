@@ -165,6 +165,12 @@ struct LookupData {
 pub struct InteractionClaimGenerator {
     lookup_data: LookupData,
 }
+// === BEGIN relation_lookup_source_codegen ===
+crate::relation_lookup_source! {
+    verify_bitwise_xor_9_0: 4,
+    mults_0: scalar,
+}
+// === END relation_lookup_source_codegen ===
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,

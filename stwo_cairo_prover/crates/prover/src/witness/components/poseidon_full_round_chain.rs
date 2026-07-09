@@ -1031,6 +1031,24 @@ pub struct InteractionClaimGenerator {
     log_size: u32,
     lookup_data: LookupData,
 }
+// === BEGIN relation_lookup_source_codegen ===
+crate::relation_lookup_source! {
+    cube_252_0: 21,
+    cube_252_1: 21,
+    cube_252_2: 21,
+    poseidon_round_keys_3: 32,
+    range_check_3_3_3_3_3_4: 6,
+    range_check_3_3_3_3_3_5: 6,
+    range_check_3_3_3_3_3_6: 6,
+    range_check_3_3_3_3_3_7: 6,
+    range_check_3_3_3_3_3_8: 6,
+    range_check_3_3_3_3_3_9: 6,
+    poseidon_full_round_chain_10: 33,
+    poseidon_full_round_chain_11: 33,
+    mults_0: scalar,
+    mults_1: scalar,
+}
+// === END relation_lookup_source_codegen ===
 impl InteractionClaimGenerator {
     pub fn write_interaction_trace(
         self,

@@ -372,7 +372,7 @@ fn lower_use(
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelationExecutionError {
     RelationGraphHashMismatch {
         proof_plan: u64,

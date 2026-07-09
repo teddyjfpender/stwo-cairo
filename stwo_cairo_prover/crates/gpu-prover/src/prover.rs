@@ -24,8 +24,8 @@ use stwo::prover::{
     CommitmentSchemeProver, CommitmentTreeProver, ProveExWithPcsDriverError, ProvingError,
 };
 use stwo_backend_cuda::{
-    aot, CudaBackend, CudaExecContext, CudaPcsDriverConfig, CudaPcsDriverError,
-    CudaPcsDriverTelemetry, CudaPcsRuntimeMode, CudaRuntimeError,
+    aot, CudaBackend, CudaPcsDriverConfig, CudaPcsDriverError, CudaPcsDriverTelemetry,
+    CudaPcsRuntimeMode, CudaRuntimeError,
 };
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_prover::prover::ProverParameters;
@@ -49,6 +49,9 @@ use crate::graphs::{GraphError, GraphWorkspace};
 use crate::schedule::ScheduleError;
 use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::state::{IngestOutput, WitnessOutput};
+use crate::workspace_cache::{
+    WorkspaceCache, WorkspaceCacheError, WorkspaceKey, WorkspaceMaterialization,
+};
 use crate::{flags, phases};
 
 /// Per-phase VRAM attribution (design §1.1 R5): when `STWO_VRAM_PHASES=1`,
@@ -128,6 +131,7 @@ pub enum GpuError {
     PcsDriver(CudaPcsDriverError),
     Runtime(CudaRuntimeError),
     Graph(GraphError),
+    WorkspaceCache(WorkspaceCacheError),
 }
 
 impl From<ProvingError> for GpuError {
@@ -169,6 +173,12 @@ impl From<GraphError> for GpuError {
     }
 }
 
+impl From<WorkspaceCacheError> for GpuError {
+    fn from(e: WorkspaceCacheError) -> Self {
+        GpuError::WorkspaceCache(e)
+    }
+}
+
 impl std::fmt::Display for GpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -178,6 +188,7 @@ impl std::fmt::Display for GpuError {
             GpuError::PcsDriver(e) => write!(f, "gpu-prover CUDA PCS driver error: {e}"),
             GpuError::Runtime(e) => write!(f, "gpu-prover CUDA runtime error: {e}"),
             GpuError::Graph(e) => write!(f, "gpu-prover CUDA graph error: {e}"),
+            GpuError::WorkspaceCache(e) => write!(f, "gpu-prover workspace cache error: {e}"),
         }
     }
 }
@@ -201,6 +212,9 @@ pub struct GpuProverConfig {
     pub vram_budget: Option<usize>,
     /// Proofs in flight (M6 unlocks 2 with admission control, design §8).
     pub pipeline_depth: usize,
+    /// Maximum exact shape/protocol workspaces retained. Capacity exhaustion
+    /// fails closed; captured graphs are never evicted implicitly.
+    pub workspace_cache_capacity: usize,
     pub channel: ChannelMode,
     /// Post-M6: no fallbacks, any device failure aborts the prove (U3).
     pub strict: bool,
@@ -212,6 +226,7 @@ impl Default for GpuProverConfig {
             device: 0,
             vram_budget: None,
             pipeline_depth: 1,
+            workspace_cache_capacity: 1,
             channel: ChannelMode::Host,
             strict: false,
         }
@@ -231,13 +246,10 @@ where
     CudaBackend: CairoBackend<MC>,
 {
     config: GpuProverConfig,
-    /// Isolated stream/pool reserved for the first proof-shape workspace. Once
-    /// the shape-derived arena is built this context moves into that arena.
-    runtime_context: Option<CudaExecContext>,
-    /// Materialized shape/protocol workspace. Until real PCS graph hooks are
-    /// installed, its presence disables detached proving rather than silently
-    /// ignoring the workspace.
-    graph_workspace: Option<GraphWorkspace>,
+    /// Stable, exact-key workspaces. Each materialization owns an isolated CUDA
+    /// context inside its arena; merely caching one does not activate resident
+    /// execution for a proof.
+    workspace_cache: WorkspaceCache,
     /// Architecture proof that the last successful gpu-native call used the
     /// concrete CUDA PCS state machine and completed every stage exactly once.
     last_pcs_telemetry: Option<CudaPcsDriverTelemetry>,
@@ -275,11 +287,10 @@ where
         // The gpu-native engine defaults to the composed device configuration
         // (explicit env, including =0 kill switches, always wins) — design §3.
         crate::flags::apply_gpu_native_defaults();
-        let runtime_context = CudaExecContext::new()?;
+        let workspace_cache = WorkspaceCache::new(config.workspace_cache_capacity)?;
         Ok(Self {
             config,
-            runtime_context: Some(runtime_context),
-            graph_workspace: None,
+            workspace_cache,
             last_pcs_telemetry: None,
             last_aot_stats: None,
             witness_artifact_plan,
@@ -300,44 +311,61 @@ where
         self.last_aot_stats
     }
 
+    pub fn workspace_cache(&self) -> &WorkspaceCache {
+        &self.workspace_cache
+    }
+
+    pub fn workspace_cache_mut(&mut self) -> &mut WorkspaceCache {
+        &mut self.workspace_cache
+    }
+
+    /// Compatibility view for the former single-workspace API. Multi-key
+    /// callers must use [`Self::graph_workspace_for`].
     pub fn graph_workspace(&self) -> Option<&GraphWorkspace> {
-        self.graph_workspace.as_ref()
+        self.workspace_cache.only()
+    }
+
+    pub fn graph_workspace_for(&self, key: WorkspaceKey) -> Option<&GraphWorkspace> {
+        self.workspace_cache.get(key)
+    }
+
+    pub fn graph_workspace_for_mut(&mut self, key: WorkspaceKey) -> Option<&mut GraphWorkspace> {
+        self.workspace_cache.get_mut(key)
     }
 
     /// Temporarily move the workspace out so real graph hooks may borrow its
     /// captured segments while [`Self::prove_with_pcs_driver_config`] mutably
     /// drives the prover. Reinstall it with [`Self::install_graph_workspace`].
     pub fn take_graph_workspace(&mut self) -> Option<GraphWorkspace> {
-        self.graph_workspace.take()
+        self.workspace_cache.take_only()
+    }
+
+    pub fn take_graph_workspace_for(&mut self, key: WorkspaceKey) -> Option<GraphWorkspace> {
+        self.workspace_cache.take(key)
     }
 
     pub fn install_graph_workspace(&mut self, workspace: GraphWorkspace) -> Result<(), GpuError> {
-        if self.graph_workspace.is_some() {
-            return Err(GpuError::Config(
-                "cannot replace a live graph workspace".to_string(),
-            ));
-        }
-        self.graph_workspace = Some(workspace);
+        self.workspace_cache.install(workspace)?;
         Ok(())
     }
 
-    /// Move this prover's isolated runtime context into a stable-address arena.
-    /// This only materializes ownership/liveness; it does not invent graph
-    /// captures or PCS hooks. [`Self::prove`] therefore fails closed until the
-    /// caller uses [`Self::prove_with_pcs_driver_config`] with real arena hooks.
+    /// Materialize or reuse the exact shape/protocol workspace. This establishes
+    /// stable ownership only; resident execution starts only when an explicit
+    /// arena-bound PCS configuration is passed to the prove path.
     pub fn materialize_graph_workspace(
         &mut self,
         plan: Arc<ProofArenaPlan>,
     ) -> Result<(), GpuError> {
-        if self.graph_workspace.is_some() {
-            return Err(GpuError::Config(
-                "graph workspace is already materialized".to_string(),
-            ));
-        }
-        let context = self.runtime_context.take().ok_or_else(|| {
-            GpuError::Config("proof runtime context was already consumed".to_string())
-        })?;
-        self.install_graph_workspace(GraphWorkspace::from_plan(context, plan)?)
+        self.materialize_or_reuse_graph_workspace(plan)?;
+        Ok(())
+    }
+
+    pub fn materialize_or_reuse_graph_workspace(
+        &mut self,
+        plan: Arc<ProofArenaPlan>,
+    ) -> Result<WorkspaceMaterialization, GpuError> {
+        let (_, materialization) = self.workspace_cache.materialize_or_reuse(plan)?;
+        Ok(materialization)
     }
 
     /// Prove one Cairo execution. Byte-identical to `prove_cairo::<CudaBackend, MC>` on the
@@ -356,13 +384,6 @@ where
         if self.config.strict {
             return Err(GpuError::Config(
                 "strict GPU-native mode requires an explicit arena-bound PCS configuration"
-                    .to_string(),
-            ));
-        }
-        if self.graph_workspace.is_some() {
-            return Err(GpuError::Config(
-                "a graph workspace is materialized but no real PCS graph hooks were supplied; \
-                 call prove_with_pcs_driver_config with an arena-bound configuration"
                     .to_string(),
             ));
         }

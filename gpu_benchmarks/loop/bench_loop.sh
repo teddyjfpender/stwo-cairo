@@ -484,12 +484,12 @@ synth_out() {
   # $1 name  $2 args  $3 destfile — deterministic-ish mock numbers keyed off the name.
   local name="$1" args="$2" dest="$3"
   local backend="cuda"; [[ "$args" == *"--backend simd"* ]] && backend="simd"
-  local architecture_fields='"engine":"legacy","gpu_pcs_driver_architecture":null,"gpu_pcs_runtime_mode":null,"gpu_pcs_stage_started":null,"gpu_pcs_stage_finished":null,"gpu_pcs_batched_tree_decommit":null,"gpu_pcs_driver_complete":null,"gpu_native_architecture_required":false,"gpu_pcs_required_runtime_mode":null,"gpu_native_architecture_gate_passed":null'
+  local architecture_fields='"engine":"legacy","gpu_pcs_driver_architecture":null,"gpu_pcs_runtime_mode":null,"gpu_pcs_stage_started":null,"gpu_pcs_stage_finished":null,"gpu_pcs_batched_tree_decommit":null,"gpu_pcs_driver_complete":null,"gpu_native_architecture_required":false,"gpu_pcs_required_runtime_mode":null,"gpu_native_architecture_gate_passed":null,"gpu_aot_loads":null,"gpu_aot_cache_hits":null,"gpu_aot_manifest_hash":null,"gpu_aot_misses":null,"gpu_aot_runtime_loads":null,"gpu_aot_runtime_cache_hits":null,"gpu_aot_strict_rejections":null,"gpu_aot_provenance_gate_passed":null'
   if [[ "$args" == *"--require-gpu-native-architecture"* ]]; then
     local runtime_report="DetachedEager"
     [[ "$GPU_PCS_RUNTIME_MODE" == "arena-graph" ]] && runtime_report="ArenaGraph"
     local stage_counts='{"OodsEvaluation":1,"QuotientAndCompaction":1,"FriCommitAndFold":1,"ProofOfWork":1,"FriQueryAndDecommit":1,"TreeDecommit":1,"Assembly":1}'
-    architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true'
+    architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true'
   fi
   local seed=$(( $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 40 ))
   local um um_median verified_reps=1

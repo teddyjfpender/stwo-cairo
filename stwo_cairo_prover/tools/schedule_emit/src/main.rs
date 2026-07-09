@@ -1124,7 +1124,7 @@ fn type_contains_claim_generator(ty: &syn::Type) -> Option<String> {
     None
 }
 
-fn parse_claim_components(file: &syn::File) -> BTreeSet<String> {
+fn parse_claim_components(file: &syn::File) -> (Vec<String>, BTreeSet<String>) {
     let aggregate = file
         .items
         .iter()
@@ -1136,16 +1136,22 @@ fn parse_claim_components(file: &syn::File) -> BTreeSet<String> {
     let syn::Fields::Named(fields) = &aggregate.fields else {
         panic!("CairoClaimGenerator must have named fields");
     };
-    let components: BTreeSet<_> = fields
+    let component_order: Vec<_> = fields
         .named
         .iter()
         .filter_map(|field| type_contains_claim_generator(&field.ty))
         .collect();
+    let components: BTreeSet<_> = component_order.iter().cloned().collect();
     assert!(
         !components.is_empty(),
         "CairoClaimGenerator component set is empty"
     );
-    components
+    assert_eq!(
+        component_order.len(),
+        components.len(),
+        "duplicate CairoClaimGenerator component field"
+    );
+    (component_order, components)
 }
 
 fn parse_usize_const(file: &syn::File, name: &str) -> Option<u32> {
@@ -1441,6 +1447,33 @@ fn emit_runtime_component(component: &str, source: RowSource) -> String {
     )
 }
 
+fn emit_final_runtime_component(component: &str, source: RowSource) -> String {
+    match source {
+        RowSource::DirectInputs => format!(
+            "{{\n                let n_real_rows = gen.inputs.len() as u64;\n                let padded_rows = padded_rows(\"{component}\", n_real_rows, N_LANES as u64)?;\n                RuntimeComponentShape::uniform(\"{component}\", n_real_rows, padded_rows)\n            }}"
+        ),
+        RowSource::StoredLogSize => format!(
+            "{{\n                let rows = rows_from_log_size(\"{component}\", gen.log_size)?;\n                RuntimeComponentShape::uniform(\"{component}\", rows, rows)\n            }}"
+        ),
+        RowSource::FixedLogSize(_) => format!(
+            "{{\n                let rows = rows_from_log_size(\"{component}\", cairo_air::components::{component}::LOG_SIZE)?;\n                RuntimeComponentShape::uniform(\"{component}\", rows, rows)\n            }}"
+        ),
+        RowSource::WitnessPackedInputs => format!(
+            "{{\n                let packed_rows = gen.packed_inputs.lock().expect(\"{component} packed-input mutex poisoned\").len() as u64;\n                let remainder_rows = gen.remainder_inputs.lock().expect(\"{component} remainder-input mutex poisoned\").len() as u64;\n                let n_real_rows = packed_rows\n                    .checked_mul(N_LANES as u64)\n                    .and_then(|rows| rows.checked_add(remainder_rows))\n                    .and_then(|rows| rows.checked_add(device_feed_rows))\n                    .ok_or(ProofShapeError::RowCountOverflow(\"{component}\"))?;\n                let padded_rows = padded_rows(\"{component}\", n_real_rows, N_LANES as u64)?;\n                RuntimeComponentShape::uniform(\"{component}\", n_real_rows, padded_rows)\n            }}"
+        ),
+        RowSource::WitnessMultiplicityMap => format!(
+            "{{\n                let n_real_rows = gen.mults.len() as u64;\n                let padded_rows = padded_rows(\"{component}\", n_real_rows, N_LANES as u64)?;\n                RuntimeComponentShape::uniform(\"{component}\", n_real_rows, padded_rows)\n            }}"
+        ),
+        RowSource::MemoryAddress => format!(
+            "{{\n                let split = cairo_air::components::memory_address_to_id::MEMORY_ADDRESS_TO_ID_SPLIT as u64;\n                let n_real_rows = (gen.table_size() as u64) / split;\n                let padded_rows = padded_rows(\"{component}\", n_real_rows, N_LANES as u64)?;\n                RuntimeComponentShape::uniform(\"{component}\", n_real_rows, padded_rows)\n            }}"
+        ),
+        RowSource::MemoryIdToBig => {
+            "{\n                let max_big_rows = rows_from_log_size(\n                    \"memory_id_to_big\",\n                    stwo_cairo_common::preprocessed_columns::preprocessed_trace::MAX_SEQUENCE_LOG_SIZE,\n                )? as usize;\n                let big_rows = gen.big_table_size();\n                let required_big_components = big_rows.div_ceil(max_big_rows);\n                let n_big_components = opt_n_id_to_big_components\n                    .unwrap_or(required_big_components);\n                if n_big_components < required_big_components {\n                    return Err(ProofShapeError::InvalidMemoryComponentCount {\n                        requested: n_big_components,\n                        required: required_big_components,\n                    });\n                }\n                let mut parts = Vec::with_capacity(n_big_components + 1);\n                for index in 0..n_big_components {\n                    let n_real_rows = if index < required_big_components {\n                        big_rows.saturating_sub(index * max_big_rows).min(max_big_rows)\n                    } else {\n                        N_LANES\n                    } as u64;\n                    let padded_rows = padded_rows(\n                        \"memory_id_to_big\",\n                        n_real_rows,\n                        N_LANES as u64,\n                    )?;\n                    parts.push(TracePartShape {\n                        part: TracePartId::MemoryBig(index as u32),\n                        n_real_rows,\n                        padded_rows,\n                    });\n                }\n                let small_real_rows = gen.small_table_size() as u64;\n                let small_padded_rows = padded_rows(\n                    \"memory_id_to_big\",\n                    small_real_rows,\n                    N_LANES as u64,\n                )?;\n                parts.push(TracePartShape {\n                    part: TracePartId::MemorySmall,\n                    n_real_rows: small_real_rows,\n                    padded_rows: small_padded_rows,\n                });\n                RuntimeComponentShape::parts(\"memory_id_to_big\", parts)\n            }"
+                .to_owned()
+        }
+    }
+}
+
 fn emit_proof_shape_source(nodes: &BTreeMap<String, Node>) -> String {
     let mut source = String::new();
     source.push_str(
@@ -1449,7 +1482,7 @@ fn emit_proof_shape_source(nodes: &BTreeMap<String, Node>) -> String {
          use stwo::prover::backend::simd::m31::N_LANES;\n\n\
          use super::cairo_claim_generator::CairoClaimGenerator;\n\
          use super::proof_shape::{\n\
-             padded_rows, rows_from_log_size, PendingRowsReason, ProofShape, ProofShapeError,\n\
+             padded_rows, rows_from_log_size, ComponentId, PendingRowsReason, ProofShape, ProofShapeError,\n\
              RuntimeComponentShape, TracePartId, TracePartShape,\n\
          };\n\n\
          impl CairoClaimGenerator {\n\
@@ -1465,7 +1498,46 @@ fn emit_proof_shape_source(nodes: &BTreeMap<String, Node>) -> String {
             node.static_facts.as_ref().unwrap().row_source,
         ));
     }
-    source.push_str("        ProofShape::new(components)\n    }\n}\n");
+    source.push_str("        ProofShape::new(components)\n    }\n}\n\n");
+    source.push_str(
+        "/// Generated exact row projection evaluated immediately before a component\n\
+         /// generator is consumed. The aggregate witness post-processor inserts one\n\
+         /// call per CairoClaimGenerator field; schedule drift is therefore checked.\n\
+         pub(crate) trait FinalComponentShape {\n\
+             const COMPONENT: ComponentId;\n\
+             const ACCEPTS_DEVICE_FEED_ROWS: bool;\n\
+             fn final_component_shape(\n\
+                 &self,\n\
+                 opt_n_id_to_big_components: Option<usize>,\n\
+                 device_feed_rows: u64,\n\
+             ) -> Result<RuntimeComponentShape, ProofShapeError>;\n\
+         }\n\n",
+    );
+    for (component, node) in nodes {
+        let exact =
+            emit_final_runtime_component(component, node.static_facts.as_ref().unwrap().row_source);
+        let accepts_device_feed_rows = matches!(
+            node.static_facts.as_ref().unwrap().row_source,
+            RowSource::WitnessPackedInputs
+        );
+        source.push_str(&format!(
+            "impl FinalComponentShape for super::components::{component}::ClaimGenerator {{\n\
+                 const COMPONENT: ComponentId = \"{component}\";\n\
+                 const ACCEPTS_DEVICE_FEED_ROWS: bool = {accepts_device_feed_rows};\n\
+                 fn final_component_shape(\n\
+                     &self,\n\
+                     opt_n_id_to_big_components: Option<usize>,\n\
+                     device_feed_rows: u64,\n\
+                 ) -> Result<RuntimeComponentShape, ProofShapeError> {{\n\
+                     let _ = opt_n_id_to_big_components;\n\
+                     let _ = device_feed_rows;\n\
+                     let gen = self;\n\
+                     let _ = gen;\n\
+                     {exact}\n\
+                 }}\n\
+             }}\n\n"
+        ));
+    }
     source
 }
 
@@ -1782,7 +1854,7 @@ fn main() -> ExitCode {
             .expect("parse device_feed.rs"),
     );
 
-    let claim_components = parse_claim_components(
+    let (claim_component_order, claim_components) = parse_claim_components(
         &syn::parse_file(
             &std::fs::read_to_string(&claim_generator_path).expect("read Cairo claim generator"),
         )
@@ -2020,6 +2092,14 @@ fn main() -> ExitCode {
          use crate::schedule::{\n    CapacityFeed, ComponentNode, ComponentRowSource, ComponentStaticFacts, CountFeed, InputEdge,\n    KernelIdentitySource, LogSizeSource, OutputEdge, Schedule, TraceColumnCount,\n};\n\n\
          pub static CAIRO_SCHEDULE: Schedule = Schedule { nodes: NODES };\n\n",
     );
+    s.push_str(
+        "/// Canonical base/interaction commitment order from CairoClaimGenerator fields.\n",
+    );
+    s.push_str("pub const CAIRO_COMMITMENT_COMPONENT_ORDER: &[&str] = &[\n");
+    for component in &claim_component_order {
+        s.push_str(&format!("    \"{component}\",\n"));
+    }
+    s.push_str("];\n\n");
     s.push_str("static NODES: &[ComponentNode] = &[\n");
     for (id, node) in &nodes {
         let facts = node.static_facts.as_ref().unwrap();
@@ -2183,6 +2263,24 @@ mod tests {
         assert_eq!(
             format_rust(&root, source).unwrap(),
             "use crate::schedule::{ComponentNode, CountFeed, InputEdge, LogSizeSource, OutputEdge, Schedule};\n"
+        );
+    }
+
+    #[test]
+    fn claim_component_order_preserves_field_declaration_order() {
+        let file = syn::parse_file(
+            "struct CairoClaimGenerator {\n\
+                 public_data: u8,\n\
+                 z_component: Option<z_component::ClaimGenerator>,\n\
+                 a_component: Option<a_component::ClaimGenerator>,\n\
+             }",
+        )
+        .unwrap();
+        let (order, components) = parse_claim_components(&file);
+        assert_eq!(order, vec!["z_component", "a_component"]);
+        assert_eq!(
+            components.into_iter().collect::<Vec<_>>(),
+            vec!["a_component", "z_component"]
         );
     }
 }

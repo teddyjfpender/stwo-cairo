@@ -63,6 +63,12 @@ use stwo_cairo_common::prover_types::cpu::FELT252_N_WORDS;
 use stwo_constraint_framework::LogupFinalizeBackend;
 
 use crate::witness::components::{memory_id_to_big, range_check_9_9};
+use crate::witness::exec_context::WitnessExecContext;
+use crate::witness::proof_shape::TracePartId;
+use crate::witness::relation_sources::{
+    DeviceRelationWord, RelationLookupSource, RelationLookupSourceExport, RelationLookupTransfer,
+    RelationSourceEncoding, RelationSourceError, RelationSourceId,
+};
 
 type Evals<B> = Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>;
 
@@ -94,7 +100,7 @@ pub type MemoryTraceResult<B> = (
 pub trait MemoryIdToBigWitness: FromSimdColumns + LogupFinalizeBackend {
     /// Backend-resident state carried from the base-trace write to the
     /// interaction write (replaces the component's `RawLogupTrace` flow).
-    type InteractionGen: Send;
+    type InteractionGen: Send + RelationLookupSourceExport;
 
     /// Writes the big/small memory base traces on `Self`, feeds the rc_9_9
     /// multiplicities, and returns the claims plus the interaction state.
@@ -170,6 +176,64 @@ pub struct DeviceMemoryWitness {
 pub enum CudaMemoryInteractionGen {
     Device(DeviceMemoryWitness),
     Host(memory_id_to_big::InteractionClaimGenerator),
+}
+
+impl RelationLookupSourceExport for CudaMemoryInteractionGen {
+    fn export_relation_lookup_sources(
+        self,
+        component: &'static str,
+        exec_context: &WitnessExecContext,
+    ) -> Result<Vec<RelationLookupSource>, RelationSourceError> {
+        match self {
+            Self::Host(gen) => gen.export_relation_lookup_sources(component, exec_context),
+            Self::Device(state) => {
+                let DeviceMemoryWitness {
+                    big_segments,
+                    small,
+                    verify_host: _,
+                } = state;
+                let mut sources = Vec::with_capacity(big_segments.len() + 1);
+                for (index, segment) in big_segments.into_iter().enumerate() {
+                    let part = TracePartId::MemoryBig(index as u32);
+                    let shape = exec_context.exact_relation_part(component, part)?;
+                    let DeviceMemorySegment {
+                        limbs,
+                        mults,
+                        log_size: _,
+                        id_offset,
+                    } = segment;
+                    let mut words: Vec<_> =
+                        limbs.into_iter().map(DeviceRelationWord::Column).collect();
+                    words.push(DeviceRelationWord::Column(mults));
+                    sources.push(RelationLookupSource::new(
+                        RelationSourceId { component, part },
+                        RelationSourceEncoding::MemoryIdToBig { id_offset },
+                        shape,
+                        words.len(),
+                        RelationLookupTransfer::DeviceProjectedWords(words),
+                    )?);
+                }
+                let part = TracePartId::MemorySmall;
+                let shape = exec_context.exact_relation_part(component, part)?;
+                let DeviceMemorySegment {
+                    limbs,
+                    mults,
+                    log_size: _,
+                    id_offset: _,
+                } = small;
+                let mut words: Vec<_> = limbs.into_iter().map(DeviceRelationWord::Column).collect();
+                words.push(DeviceRelationWord::Column(mults));
+                sources.push(RelationLookupSource::new(
+                    RelationSourceId { component, part },
+                    RelationSourceEncoding::MemoryIdToSmall,
+                    shape,
+                    words.len(),
+                    RelationLookupTransfer::DeviceProjectedWords(words),
+                )?);
+                Ok(sources)
+            }
+        }
+    }
 }
 
 impl MemoryIdToBigWitness for CudaBackend {

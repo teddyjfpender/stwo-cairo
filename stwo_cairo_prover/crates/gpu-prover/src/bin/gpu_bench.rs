@@ -76,6 +76,9 @@
 //!   gpu_pcs_batched_tree_decommit, gpu_pcs_driver_complete,
 //!   gpu_native_architecture_required, gpu_pcs_required_runtime_mode,
 //!   gpu_native_architecture_gate_passed,
+//!   gpu_aot_loads, gpu_aot_cache_hits, gpu_aot_manifest_hash, gpu_aot_misses,
+//!   gpu_aot_runtime_loads, gpu_aot_runtime_cache_hits,
+//!   gpu_aot_strict_rejections, gpu_aot_provenance_gate_passed,
 //!   verify_ms, proof_kb, peak_rss_gb, vram_end_gb, vram_peak_gb,
 //!   steps_per_s, mhz (proved basis), useful_mhz (pie_n_steps/warm; null for
 //!   --program), vm_s, adapt_s (from the last load), security_bits, n_queries,
@@ -333,6 +336,15 @@ fn enforce_gpu_native_architecture_invocation(backend: &str) {
     // Parse this before expensive input loading so an invalid future-mode request
     // fails immediately. The concrete telemetry comparison happens after proving.
     let _ = required_gpu_pcs_runtime_mode();
+    let manifest_hash = stwo_backend_cuda::aot::loaded_manifest_hash();
+    assert_ne!(
+        manifest_hash, 0,
+        "GPU-native architecture gate failed: embedded CUDA AOT kernel pack is missing"
+    );
+    // Select AOT-only lookup before constructing the prover or loading any generated
+    // kernel. Missing entries now fail at their first use; counters below remain the
+    // independent post-proof provenance contract.
+    stwo_backend_cuda::aot::require_loaded_kernels();
 }
 
 fn reject_gpu_native_architecture_gate_without_proof(mode: &str) {
@@ -906,6 +918,7 @@ fn gpu_native_aot_context(
         return json!({
             "gpu_aot_loads": null,
             "gpu_aot_cache_hits": null,
+            "gpu_aot_manifest_hash": null,
             "gpu_aot_misses": null,
             "gpu_aot_runtime_loads": null,
             "gpu_aot_runtime_cache_hits": null,
@@ -916,6 +929,7 @@ fn gpu_native_aot_context(
     json!({
         "gpu_aot_loads": stats.aot_loads,
         "gpu_aot_cache_hits": stats.aot_cache_hits,
+        "gpu_aot_manifest_hash": stwo_backend_cuda::aot::loaded_manifest_hash(),
         "gpu_aot_misses": stats.aot_misses,
         "gpu_aot_runtime_loads": stats.runtime_loads,
         "gpu_aot_runtime_cache_hits": stats.runtime_cache_hits,

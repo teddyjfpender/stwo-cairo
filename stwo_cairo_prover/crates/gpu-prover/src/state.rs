@@ -42,8 +42,12 @@ impl DeviceProofState {
         witness_artifact_plan: Arc<WitnessArtifactPlan>,
         proof_plan: Arc<ProofPlan>,
     ) -> Self {
+        let planned_shape = proof_plan.proof_shape().clone();
         Self {
-            witness_exec_context: WitnessExecContext::planned(witness_artifact_plan),
+            witness_exec_context: WitnessExecContext::planned_with_shape(
+                witness_artifact_plan,
+                planned_shape,
+            ),
             proof_plan,
         }
     }

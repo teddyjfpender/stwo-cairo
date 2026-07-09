@@ -812,6 +812,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:add_opcode").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<AddOpcodeLane>(
                             exec_context,
                             gen,
@@ -832,6 +833,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:add_opcode_small").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<AddOpcodeSmallLane>(
                             exec_context,
                             gen,
@@ -847,6 +849,7 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     add_ap_opcode_result = Some({
                         let _wt = tracing::info_span!("wt:add_ap_opcode").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             self.memory_address_to_id.as_ref().unwrap(),
                             self.memory_id_to_big.as_ref().unwrap(),
@@ -867,6 +870,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:assert_eq_opcode").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<AssertEqOpcodeLane>(
                             exec_context,
                             gen,
@@ -887,6 +891,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:assert_eq_opcode_imm").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<AssertEqOpcodeImmLane>(
                             exec_context,
                             gen,
@@ -907,6 +912,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:assert_eq_opcode_double_deref").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<AssertEqOpcodeDoubleDerefLane>(
                             exec_context,
                             gen,
@@ -922,6 +928,7 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     blake_compress_opcode_result = Some({
                         let _wt = tracing::info_span!("wt:blake_compress_opcode").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             self.memory_address_to_id.as_ref().unwrap(),
                             self.memory_id_to_big.as_ref().unwrap(),
@@ -944,6 +951,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:call_opcode_abs").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<CallOpcodeAbsLane>(
                             exec_context,
                             gen,
@@ -964,6 +972,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:call_opcode_rel_imm").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<CallOpcodeRelImmLane>(
                             exec_context,
                             gen,
@@ -979,6 +988,7 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     generic_opcode_result = Some({
                         let _wt = tracing::info_span!("wt:generic_opcode").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             self.memory_address_to_id.as_ref().unwrap(),
                             self.memory_id_to_big.as_ref().unwrap(),
@@ -1001,6 +1011,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jnz_opcode_non_taken").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<JnzOpcodeNonTakenLane>(
                             exec_context,
                             gen,
@@ -1021,6 +1032,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jnz_opcode_taken").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<JnzOpcodeTakenLane>(
                             exec_context,
                             gen,
@@ -1041,6 +1053,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jump_opcode_abs").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeAbsLane>(
                             exec_context,
                             gen,
@@ -1061,6 +1074,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jump_opcode_double_deref").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeDoubleDerefLane>(
                             exec_context,
                             gen,
@@ -1081,6 +1095,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jump_opcode_rel").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeRelLane>(
                             exec_context,
                             gen,
@@ -1101,6 +1116,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jump_opcode_rel_imm").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeRelImmLane>(
                             exec_context,
                             gen,
@@ -1116,6 +1132,7 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     mul_opcode_result = Some({
                         let _wt = tracing::info_span!("wt:mul_opcode").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             self.memory_address_to_id.as_ref().unwrap(),
                             self.memory_id_to_big.as_ref().unwrap(),
@@ -1130,6 +1147,7 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     mul_opcode_small_result = Some({
                         let _wt = tracing::info_span!("wt:mul_opcode_small").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             self.memory_address_to_id.as_ref().unwrap(),
                             self.memory_id_to_big.as_ref().unwrap(),
@@ -1144,6 +1162,7 @@ impl CairoClaimGenerator {
                 s.spawn(|_| {
                     qm_31_add_mul_opcode_result = Some({
                         let _wt = tracing::info_span!("wt:qm_31_add_mul_opcode").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             self.memory_address_to_id.as_ref().unwrap(),
                             self.memory_id_to_big.as_ref().unwrap(),
@@ -1163,6 +1182,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:ret_opcode").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         <B as OpcodeJitBackend>::lane_write_trace::<RetOpcodeLane>(
                             exec_context,
                             gen,
@@ -1501,6 +1521,7 @@ impl CairoClaimGenerator {
                 let tx = lane_tx.clone();
                 s.spawn(move |_| {
                     let _wt = tracing::info_span!("wt:verify_instruction").entered();
+                    exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                     let (trace, claim, interaction_gen) = gen.write_trace(
                         rc_7_2_5.unwrap(),
                         rc_4_3.unwrap(),
@@ -1528,9 +1549,10 @@ impl CairoClaimGenerator {
                     let blake_g_state = blake_g_gen;
                     if let Some(gen) = blake_round_gen {
                         let _wt = tracing::info_span!("wt:blake_round").entered();
-                        // blake_round goes through the [`BlakeRoundWitness`] backend hook:
-                        // SimdBackend runs the host writer; CudaBackend's device lane
-                        // (pod-gated) is born on device and feeds blake_g device-to-device.
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
+                                                                                               // blake_round goes through the [`BlakeRoundWitness`] backend hook:
+                                                                                               // SimdBackend runs the host writer; CudaBackend's device lane
+                                                                                               // (pod-gated) is born on device and feeds blake_g device-to-device.
                         let (trace, claim, interaction_gen) = <B as BlakeRoundWitness>::write_trace(
                             exec_context,
                             gen,
@@ -1549,6 +1571,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = blake_g_state {
                         let _wt = tracing::info_span!("wt:blake_g").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = <B as BlakeGWitness>::write_trace(
                             exec_context,
                             gen,
@@ -1563,6 +1586,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = sigma_gen {
                         let _wt = tracing::info_span!("wt:blake_round_sigma").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace();
                         *sigma_slot = Some((
                             send_or_keep(L_SIGMA, B::from_simd_evals(trace.to_evals()), &tx),
@@ -1572,6 +1596,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = triple_xor_32_gen {
                         let _wt = tracing::info_span!("wt:triple_xor_32").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(vbx_8.unwrap());
                         *txor_slot = Some((
                             send_or_keep(L_TRIPLE_XOR, B::from_simd_evals(trace.to_evals()), &tx),
@@ -1581,6 +1606,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = verify_bitwise_xor_12_gen {
                         let _wt = tracing::info_span!("wt:verify_bitwise_xor_12").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace();
                         *vbx12_slot = Some((
                             send_or_keep(L_XOR12, B::from_simd_evals(trace), &tx),
@@ -1602,6 +1628,7 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     if let Some(gen) = add_mod_builtin_gen {
                         let _wt = tracing::info_span!("wt:add_mod_builtin").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), id_state.unwrap());
                         *add_mod_slot = Some((
@@ -1612,6 +1639,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = bitwise_builtin_gen {
                         let _wt = tracing::info_span!("wt:bitwise_builtin").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             addr_state.unwrap(),
                             id_state.unwrap(),
@@ -1626,6 +1654,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = mul_mod_builtin_gen {
                         let _wt = tracing::info_span!("wt:mul_mod_builtin").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             addr_state.unwrap(),
                             id_state.unwrap(),
@@ -1641,6 +1670,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = range_check96_builtin_gen {
                         let _wt = tracing::info_span!("wt:range_check96_builtin").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), id_state.unwrap(), rc_6.unwrap());
                         *rc96_slot = Some((
@@ -1651,6 +1681,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = range_check_builtin_gen {
                         let _wt = tracing::info_span!("wt:range_check_builtin").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), id_state.unwrap());
                         *rcb_slot = Some((
@@ -1676,6 +1707,7 @@ impl CairoClaimGenerator {
                     let pts18_gen = pedersen_points_table_window_bits_18_gen;
                     if let Some(gen) = pedersen_builtin_gen {
                         let _wt = tracing::info_span!("wt:pedersen_builtin").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), agg18_gen.as_ref().unwrap());
                         *ped_slot = Some((
@@ -1687,6 +1719,7 @@ impl CairoClaimGenerator {
                     if let Some(gen) = agg18_gen {
                         let _wt =
                             tracing::info_span!("wt:pedersen_aggregator_window_bits_18").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
                             <B as PedersenAggregatorWindowBits18Witness>::write_trace(
                                 exec_context,
@@ -1701,6 +1734,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = ecm18_gen {
                         let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_18").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
                             <B as PartialEcMulWindowBits18Witness>::write_trace(
                                 exec_context,
@@ -1716,6 +1750,7 @@ impl CairoClaimGenerator {
                     if let Some(gen) = pts18_gen {
                         let _wt = tracing::info_span!("wt:pedersen_points_table_window_bits_18")
                             .entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace();
                         *pts18_slot = Some((
                             send_or_keep(L_PTS18, B::from_simd_evals(trace.to_evals()), &tx),
@@ -1740,6 +1775,7 @@ impl CairoClaimGenerator {
                     if let Some(gen) = pedersen_narrow_gen {
                         let _wt =
                             tracing::info_span!("wt:pedersen_builtin_narrow_windows").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), agg9_gen.as_ref().unwrap());
                         *narrow_slot = Some((
@@ -1751,6 +1787,7 @@ impl CairoClaimGenerator {
                     if let Some(gen) = agg9_gen {
                         let _wt =
                             tracing::info_span!("wt:pedersen_aggregator_window_bits_9").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             id_state.unwrap(),
                             rc_8.unwrap(),
@@ -1764,6 +1801,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = ecm9_gen {
                         let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_9").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             pts9_gen.as_ref().unwrap(),
                             rc_9_9.unwrap(),
@@ -1778,6 +1816,7 @@ impl CairoClaimGenerator {
                     if let Some(gen) = pts9_gen {
                         let _wt =
                             tracing::info_span!("wt:pedersen_points_table_window_bits_9").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace();
                         *pts9_slot = Some((
                             send_or_keep(L_PTS9, B::from_simd_evals(trace.to_evals()), &tx),
@@ -1797,6 +1836,7 @@ impl CairoClaimGenerator {
                     let ec_generic_gen = partial_ec_mul_generic_gen;
                     if let Some(gen) = ec_op_builtin_gen {
                         let _wt = tracing::info_span!("wt:ec_op_builtin").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             addr_state.unwrap(),
                             id_state.unwrap(),
@@ -1811,6 +1851,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = ec_generic_gen {
                         let _wt = tracing::info_span!("wt:partial_ec_mul_generic").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
                             <B as PartialEcMulGenericWitness>::write_trace(
                                 exec_context,
@@ -1846,6 +1887,7 @@ impl CairoClaimGenerator {
                     let rc252_gen = range_check_252_width_27_gen;
                     if let Some(gen) = poseidon_builtin_gen {
                         let _wt = tracing::info_span!("wt:poseidon_builtin").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(addr_state.unwrap(), pos_agg_gen.as_ref().unwrap());
                         *pos_b_slot = Some((
@@ -1856,6 +1898,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = pos_agg_gen {
                         let _wt = tracing::info_span!("wt:poseidon_aggregator").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             id_state.unwrap(),
                             pos_full_gen.as_ref().unwrap(),
@@ -1875,6 +1918,7 @@ impl CairoClaimGenerator {
                     if let Some(gen) = pos3_gen {
                         let _wt =
                             tracing::info_span!("wt:poseidon_3_partial_rounds_chain").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             keys_gen.as_ref().unwrap(),
                             cube_gen.as_ref().unwrap(),
@@ -1890,6 +1934,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = pos_full_gen {
                         let _wt = tracing::info_span!("wt:poseidon_full_round_chain").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace(
                             cube_gen.as_ref().unwrap(),
                             keys_gen.as_ref().unwrap(),
@@ -1903,6 +1948,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = cube_gen {
                         let _wt = tracing::info_span!("wt:cube_252").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = <B as Cube252Witness>::write_trace(
                             exec_context,
                             gen,
@@ -1915,6 +1961,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = keys_gen {
                         let _wt = tracing::info_span!("wt:poseidon_round_keys").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) = gen.write_trace();
                         *keys_slot = Some((
                             send_or_keep(L_KEYS, B::from_simd_evals(trace.to_evals()), &tx),
@@ -1924,6 +1971,7 @@ impl CairoClaimGenerator {
                     }
                     if let Some(gen) = rc252_gen {
                         let _wt = tracing::info_span!("wt:range_check_252_width_27").entered();
+                        exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
                             gen.write_trace(rc_9_9.unwrap(), rc_18.unwrap());
                         *rc252_slot = Some((
@@ -2009,6 +2057,7 @@ impl CairoClaimGenerator {
             .memory_address_to_id
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:memory_address_to_id").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace));
                 (claim, interaction_gen)
@@ -2018,6 +2067,7 @@ impl CairoClaimGenerator {
             .memory_id_to_big
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:memory_id_to_big").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 const LOG_MAX_BIG_SIZE: u32 = MAX_SEQUENCE_LOG_SIZE;
                 // The backend hook: SimdBackend runs the existing host writer;
                 // CudaBackend generates the columns on device and merges the
@@ -2040,6 +2090,7 @@ impl CairoClaimGenerator {
             .range_check_6
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_6").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2049,6 +2100,7 @@ impl CairoClaimGenerator {
             .range_check_8
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_8").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2058,6 +2110,7 @@ impl CairoClaimGenerator {
             .range_check_11
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_11").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2067,6 +2120,7 @@ impl CairoClaimGenerator {
             .range_check_12
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_12").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2076,6 +2130,7 @@ impl CairoClaimGenerator {
             .range_check_18
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_18").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2085,6 +2140,7 @@ impl CairoClaimGenerator {
             .range_check_20
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_20").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2094,6 +2150,7 @@ impl CairoClaimGenerator {
             .range_check_4_3
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_4_3").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2103,6 +2160,7 @@ impl CairoClaimGenerator {
             .range_check_4_4
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_4_4").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2112,6 +2170,7 @@ impl CairoClaimGenerator {
             .range_check_9_9
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_9_9").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2121,6 +2180,7 @@ impl CairoClaimGenerator {
             .range_check_7_2_5
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_7_2_5").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2130,6 +2190,7 @@ impl CairoClaimGenerator {
             .range_check_3_6_6_3
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_3_6_6_3").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2139,6 +2200,7 @@ impl CairoClaimGenerator {
             .range_check_4_4_4_4
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_4_4_4_4").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2148,6 +2210,7 @@ impl CairoClaimGenerator {
             .range_check_3_3_3_3_3
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:range_check_3_3_3_3_3").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2157,6 +2220,7 @@ impl CairoClaimGenerator {
             .verify_bitwise_xor_4
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:verify_bitwise_xor_4").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2166,6 +2230,7 @@ impl CairoClaimGenerator {
             .verify_bitwise_xor_7
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:verify_bitwise_xor_7").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2175,6 +2240,7 @@ impl CairoClaimGenerator {
             .verify_bitwise_xor_8
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:verify_bitwise_xor_8").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2184,6 +2250,7 @@ impl CairoClaimGenerator {
             .verify_bitwise_xor_9
             .map(|gen| {
                 let _wt = tracing::info_span!("wt:verify_bitwise_xor_9").entered();
+                exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                 let (trace, claim, interaction_gen) = gen.write_trace();
                 evals.extend(B::from_simd_evals(trace.to_evals()));
                 (claim, interaction_gen)
@@ -2445,6 +2512,429 @@ pub struct CairoInteractionClaimGenerator<B: MemoryIdToBigWitness + BlakeGWitnes
     pub verify_bitwise_xor_8: Option<verify_bitwise_xor_8::InteractionClaimGenerator>,
     pub verify_bitwise_xor_9: Option<verify_bitwise_xor_9::InteractionClaimGenerator>,
 }
+
+// === BEGIN relation_lookup_source_codegen ===
+impl<B: MemoryIdToBigWitness + BlakeGWitness> CairoInteractionClaimGenerator<B> {
+    /// Consumes every active interaction state into typed relation sources.
+    /// This is generated from the aggregate fields; component additions cannot
+    /// silently bypass the GPU-native relation layer.
+    pub fn into_relation_lookup_sources(
+        self,
+        exec_context: &WitnessExecContext,
+    ) -> Result<
+        crate::witness::relation_sources::CairoRelationSourceSet,
+        crate::witness::relation_sources::RelationSourceError,
+    > {
+        use crate::witness::relation_sources::RelationLookupSourceExport;
+
+        let mut sources = Vec::new();
+        if let Some(gen) = self.add_opcode {
+            sources.extend(gen.export_relation_lookup_sources(
+                "add_opcode",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.add_opcode_small {
+            sources.extend(gen.export_relation_lookup_sources(
+                "add_opcode_small",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.add_ap_opcode {
+            sources.extend(gen.export_relation_lookup_sources(
+                "add_ap_opcode",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.assert_eq_opcode {
+            sources.extend(gen.export_relation_lookup_sources(
+                "assert_eq_opcode",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.assert_eq_opcode_imm {
+            sources.extend(gen.export_relation_lookup_sources(
+                "assert_eq_opcode_imm",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.assert_eq_opcode_double_deref {
+            sources.extend(gen.export_relation_lookup_sources(
+                "assert_eq_opcode_double_deref",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.blake_compress_opcode {
+            sources.extend(gen.export_relation_lookup_sources(
+                "blake_compress_opcode",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.call_opcode_abs {
+            sources.extend(gen.export_relation_lookup_sources(
+                "call_opcode_abs",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.call_opcode_rel_imm {
+            sources.extend(gen.export_relation_lookup_sources(
+                "call_opcode_rel_imm",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.generic_opcode {
+            sources.extend(gen.export_relation_lookup_sources(
+                "generic_opcode",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.jnz_opcode_non_taken {
+            sources.extend(gen.export_relation_lookup_sources(
+                "jnz_opcode_non_taken",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.jnz_opcode_taken {
+            sources.extend(gen.export_relation_lookup_sources(
+                "jnz_opcode_taken",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.jump_opcode_abs {
+            sources.extend(gen.export_relation_lookup_sources(
+                "jump_opcode_abs",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.jump_opcode_double_deref {
+            sources.extend(gen.export_relation_lookup_sources(
+                "jump_opcode_double_deref",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.jump_opcode_rel {
+            sources.extend(gen.export_relation_lookup_sources(
+                "jump_opcode_rel",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.jump_opcode_rel_imm {
+            sources.extend(gen.export_relation_lookup_sources(
+                "jump_opcode_rel_imm",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.mul_opcode {
+            sources.extend(gen.export_relation_lookup_sources(
+                "mul_opcode",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.mul_opcode_small {
+            sources.extend(gen.export_relation_lookup_sources(
+                "mul_opcode_small",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.qm_31_add_mul_opcode {
+            sources.extend(gen.export_relation_lookup_sources(
+                "qm_31_add_mul_opcode",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.ret_opcode {
+            sources.extend(gen.export_relation_lookup_sources(
+                "ret_opcode",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.verify_instruction {
+            sources.extend(gen.export_relation_lookup_sources(
+                "verify_instruction",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.blake_round {
+            sources.extend(gen.export_relation_lookup_sources(
+                "blake_round",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.blake_g {
+            sources.extend(gen.export_relation_lookup_sources(
+                "blake_g",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.blake_round_sigma {
+            sources.extend(gen.export_relation_lookup_sources(
+                "blake_round_sigma",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.triple_xor_32 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "triple_xor_32",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.verify_bitwise_xor_12 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "verify_bitwise_xor_12",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.add_mod_builtin {
+            sources.extend(gen.export_relation_lookup_sources(
+                "add_mod_builtin",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.bitwise_builtin {
+            sources.extend(gen.export_relation_lookup_sources(
+                "bitwise_builtin",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.mul_mod_builtin {
+            sources.extend(gen.export_relation_lookup_sources(
+                "mul_mod_builtin",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.pedersen_builtin {
+            sources.extend(gen.export_relation_lookup_sources(
+                "pedersen_builtin",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.pedersen_builtin_narrow_windows {
+            sources.extend(gen.export_relation_lookup_sources(
+                "pedersen_builtin_narrow_windows",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.poseidon_builtin {
+            sources.extend(gen.export_relation_lookup_sources(
+                "poseidon_builtin",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check96_builtin {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check96_builtin",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_builtin {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_builtin",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.ec_op_builtin {
+            sources.extend(gen.export_relation_lookup_sources(
+                "ec_op_builtin",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.partial_ec_mul_generic {
+            sources.extend(gen.export_relation_lookup_sources(
+                "partial_ec_mul_generic",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.pedersen_aggregator_window_bits_18 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "pedersen_aggregator_window_bits_18",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.partial_ec_mul_window_bits_18 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "partial_ec_mul_window_bits_18",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.pedersen_points_table_window_bits_18 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "pedersen_points_table_window_bits_18",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.pedersen_aggregator_window_bits_9 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "pedersen_aggregator_window_bits_9",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.partial_ec_mul_window_bits_9 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "partial_ec_mul_window_bits_9",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.pedersen_points_table_window_bits_9 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "pedersen_points_table_window_bits_9",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.poseidon_aggregator {
+            sources.extend(gen.export_relation_lookup_sources(
+                "poseidon_aggregator",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.poseidon_3_partial_rounds_chain {
+            sources.extend(gen.export_relation_lookup_sources(
+                "poseidon_3_partial_rounds_chain",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.poseidon_full_round_chain {
+            sources.extend(gen.export_relation_lookup_sources(
+                "poseidon_full_round_chain",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.cube_252 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "cube_252",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.poseidon_round_keys {
+            sources.extend(gen.export_relation_lookup_sources(
+                "poseidon_round_keys",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_252_width_27 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_252_width_27",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.memory_address_to_id {
+            sources.extend(gen.export_relation_lookup_sources(
+                "memory_address_to_id",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.memory_id_to_big {
+            sources.extend(gen.export_relation_lookup_sources(
+                "memory_id_to_big",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_6 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_6",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_8 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_8",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_11 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_11",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_12 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_12",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_18 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_18",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_20 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_20",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_4_3 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_4_3",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_4_4 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_4_4",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_9_9 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_9_9",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_7_2_5 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_7_2_5",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_3_6_6_3 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_3_6_6_3",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_4_4_4_4 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_4_4_4_4",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.range_check_3_3_3_3_3 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "range_check_3_3_3_3_3",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.verify_bitwise_xor_4 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "verify_bitwise_xor_4",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.verify_bitwise_xor_7 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "verify_bitwise_xor_7",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.verify_bitwise_xor_8 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "verify_bitwise_xor_8",
+                exec_context,
+            )?);
+        }
+        if let Some(gen) = self.verify_bitwise_xor_9 {
+            sources.extend(gen.export_relation_lookup_sources(
+                "verify_bitwise_xor_9",
+                exec_context,
+            )?);
+        }
+        exec_context.assert_interaction_drained();
+        crate::witness::relation_sources::CairoRelationSourceSet::new(sources)
+    }
+}
+// === END relation_lookup_source_codegen ===
 
 impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractionClaimGenerator<B> {
     /// Writes the raw interaction fractions on the host (parallel across

@@ -562,7 +562,7 @@ synth_pod_out() {
   local runtime_report="DetachedEager"
   [[ "$GPU_PCS_RUNTIME_MODE" == "arena-graph" ]] && runtime_report="ArenaGraph"
   local stage_counts='{"OodsEvaluation":1,"QuotientAndCompaction":1,"FriCommitAndFold":1,"ProofOfWork":1,"FriQueryAndDecommit":1,"TreeDecommit":1,"Assembly":1}'
-  local architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true'
+  local architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true'
   if [[ "$stage" == "gate" ]]; then
     echo "{\"program\":\"gate_10t\",\"backend\":\"cuda\",${architecture_fields},\"verify_ms\":41.0,\"verified_reps\":2,\"proof_kb\":2897.5,\"proof_comparison_applicable\":true,\"proof_byte_equal\":true,\"proof_byte_equal_required\":true}" > "$dest"
     return 0
@@ -764,6 +764,10 @@ with open(manifest) as f:
             "gpu_pcs_driver_architecture": (rec or {}).get("gpu_pcs_driver_architecture"),
             "gpu_pcs_runtime_mode": (rec or {}).get("gpu_pcs_runtime_mode"),
             "gpu_native_architecture_gate_passed": (rec or {}).get("gpu_native_architecture_gate_passed"),
+            "gpu_aot_loads": (rec or {}).get("gpu_aot_loads"),
+            "gpu_aot_cache_hits": (rec or {}).get("gpu_aot_cache_hits"),
+            "gpu_aot_manifest_hash": (rec or {}).get("gpu_aot_manifest_hash"),
+            "gpu_aot_provenance_gate_passed": (rec or {}).get("gpu_aot_provenance_gate_passed"),
             "usd_per_mhz_hr": (round(usd_f / mhz, 4) if (usd_f and mhz) else None),
             "out_file": out or None,
         }

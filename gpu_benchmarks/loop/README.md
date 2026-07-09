@@ -141,7 +141,11 @@ output contract (`verified_reps=2`, equality applicable/required/true) and indep
 runs `validate_architecture_record.py`. That validator requires `backend=cuda`,
 `engine=gpu-native`, architecture `cuda-typed-pcs-driver-v1`, the selected runtime mode,
 all seven stage starts and finishes exactly once, batched tree decommit, and complete
-telemetry. It is also applied to every CUDA performance record, closing the stale-binary
+telemetry. Strict AOT provenance additionally requires `gpu_aot_misses`, runtime loads,
+runtime cache hits, and strict rejections all to be zero; AOT loads and cache hits are
+always reported (and may both be zero when no generated kernel was invoked), and the
+embedded AOT manifest hash must be non-zero. The validator is also applied to every
+CUDA performance record, closing the stale-binary
 case where an unknown CLI flag is silently ignored. A failed contract, verify, or crash
 aborts the run. **Performance is never reported from a build that failed the gate.**
 
