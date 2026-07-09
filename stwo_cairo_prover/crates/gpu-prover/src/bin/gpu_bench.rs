@@ -13,7 +13,9 @@
 //! Usage:
 //!   gpu_bench --program path/to/compiled.json --iterations N --backend cuda|simd \
 //!             [--engine legacy|gpu-native] \
-//!             [--reps 3] [--pipeline <depth>] [--reuse-input] [--adapt-only]
+//!             [--reps 3] [--pipeline <depth>] [--reuse-input] [--adapt-only] \
+//!             [--require-proof-byte-equal] [--require-gpu-native-architecture] \
+//!             [--require-gpu-pcs-runtime-mode detached-eager|arena-graph]
 //!   gpu_bench --pie a.zip[,b.zip,...] [--pie-copies N] [--pie-mode aggregate|rotate] \
 //!             [--producers N] --backend cuda|simd ...
 //!             (requires building with --features pie-bench)
@@ -28,6 +30,18 @@
 //! the whole list N times). `--reuse-input` clones one adapted ProverInput across reps
 //! instead of re-running VM+adapt per rep (costs one extra resident input copy).
 //! `--adapt-only` stops after VM+adapt and prints cycle count + overhead.
+//! `--require-proof-byte-equal` (or STWO_BENCH_REQUIRE_PROOF_BYTE_EQUAL=1) makes
+//! same-statement repetition byte drift or an inapplicable comparison a non-zero
+//! benchmark failure. Rotate-mode pipeline reps prove different statements, so their
+//! comparison and per-repetition throughput distribution are reported null.
+//! `--require-gpu-native-architecture` (or
+//! STWO_BENCH_REQUIRE_GPU_NATIVE_ARCHITECTURE=1) is a fail-closed benchmark gate:
+//! CUDA + gpu-native, the typed CUDA PCS driver, one start and finish for every
+//! protocol stage, batched tree decommit, and complete telemetry are all required.
+//! Its expected runtime mode defaults to `detached-eager` and can be selected with
+//! `--require-gpu-pcs-runtime-mode` (or
+//! STWO_BENCH_REQUIRE_GPU_PCS_RUNTIME_MODE). `arena-graph` is intentionally a strict
+//! future gate: it rejects today's detached runtime instead of claiming graph capture.
 //!
 //! PIPELINING (`--pipeline <depth>`, P5 in gpu_benchmarks/ROAD_TO_10MHZ.md) measures
 //! SUSTAINED throughput: producer threads run the host-only VM run + adapt for
@@ -53,7 +67,16 @@
 //! JSON SCHEMA (main record, one line per run):
 //!   program, backend, n, cycle_count (proved cycles), pie_n_steps (null for
 //!   --program), bootloader_overhead_pct (null for --program), prove_s_cold,
-//!   prove_s_warm, verify_ms, proof_kb, peak_rss_gb, vram_end_gb, vram_peak_gb,
+//!   prove_s_warm (legacy warm-best), prove_s_warm_best,
+//!   prove_s_warm_median, prove_s_warm_p95, mhz_median, useful_mhz_median,
+//!   throughput_distribution_applicable, proof_byte_equal,
+//!   proof_comparison_applicable, verified_reps,
+//!   gpu_pcs_driver_architecture, gpu_pcs_runtime_mode,
+//!   gpu_pcs_stage_started, gpu_pcs_stage_finished,
+//!   gpu_pcs_batched_tree_decommit, gpu_pcs_driver_complete,
+//!   gpu_native_architecture_required, gpu_pcs_required_runtime_mode,
+//!   gpu_native_architecture_gate_passed,
+//!   verify_ms, proof_kb, peak_rss_gb, vram_end_gb, vram_peak_gb,
 //!   steps_per_s, mhz (proved basis), useful_mhz (pie_n_steps/warm; null for
 //!   --program), vm_s, adapt_s (from the last load), security_bits, n_queries,
 //!   pow_bits, fold_step, gpu, nproc, host_mem_gb
@@ -86,9 +109,48 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo_cairo_adapter::adapter::adapt;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
-use stwo_cairo_gpu_prover::{CairoBackend, GpuCairoProver, GpuProverConfig};
+use stwo_cairo_gpu_prover::{
+    CudaPcsDriverTelemetry, CudaPcsRuntimeMode, GpuCairoProver, GpuProverConfig,
+};
 use stwo_cairo_prover::prover::{prove_cairo, ChannelHash, ProverParameters};
 use stwo_cairo_serialize::CairoSerialize;
+
+type BenchProof = CairoProof<<Blake2sMerkleChannel as MerkleChannel>::H>;
+type AotRuntimeStats = stwo_backend_cuda::aot::RuntimeStats;
+
+const REQUIRED_CUDA_PCS_ARCHITECTURE: &str = "cuda-typed-pcs-driver-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequiredCudaPcsRuntimeMode {
+    DetachedEager,
+    ArenaGraph,
+}
+
+impl RequiredCudaPcsRuntimeMode {
+    fn parse(value: &str) -> Self {
+        match value {
+            "detached-eager" => Self::DetachedEager,
+            "arena-graph" => Self::ArenaGraph,
+            other => panic!(
+                "--require-gpu-pcs-runtime-mode must be detached-eager or arena-graph, got {other}"
+            ),
+        }
+    }
+
+    const fn telemetry_mode(self) -> CudaPcsRuntimeMode {
+        match self {
+            Self::DetachedEager => CudaPcsRuntimeMode::DetachedEager,
+            Self::ArenaGraph => CudaPcsRuntimeMode::ArenaGraph,
+        }
+    }
+
+    const fn cli_name(self) -> &'static str {
+        match self {
+            Self::DetachedEager => "detached-eager",
+            Self::ArenaGraph => "arena-graph",
+        }
+    }
+}
 
 /// Prover engine: `legacy` (`prove_cairo` — the parity oracle) or `gpu-native`
 /// (`stwo-cairo-gpu-prover`, GPU_RESIDENT_PROVER_DESIGN.md §3).
@@ -96,32 +158,57 @@ fn engine() -> String {
     arg("--engine").unwrap_or_else(|| "legacy".to_string())
 }
 
-/// The gpu-native engine's persistent prover contexts (one per backend type): reps
-/// within a bench process share twiddle/preprocessed-tree caches, exactly as the
-/// legacy engine's process-global statics do — warm-rep numbers stay comparable
-/// across engines.
-static GPU_NATIVE_CUDA: OnceLock<
-    Mutex<GpuCairoProver<stwo_backend_cuda::CudaBackend, Blake2sMerkleChannel>>,
-> = OnceLock::new();
-static GPU_NATIVE_SIMD: OnceLock<Mutex<GpuCairoProver<SimdBackend, Blake2sMerkleChannel>>> =
+/// The GPU-native engine is deliberately CUDA-specific. SIMD remains the legacy
+/// reference oracle instead of masquerading as another implementation of the new
+/// orchestration architecture.
+static GPU_NATIVE_CUDA: OnceLock<Mutex<GpuCairoProver<Blake2sMerkleChannel>>> = OnceLock::new();
+static LAST_GPU_NATIVE_PCS_TELEMETRY: OnceLock<Mutex<Option<CudaPcsDriverTelemetry>>> =
     OnceLock::new();
+static LAST_GPU_NATIVE_AOT_STATS: OnceLock<Mutex<Option<AotRuntimeStats>>> = OnceLock::new();
 
-fn prove_gpu_native<B, MC>(
-    cell: &OnceLock<Mutex<GpuCairoProver<B, MC>>>,
+fn record_gpu_native_pcs_telemetry(telemetry: &CudaPcsDriverTelemetry) {
+    *LAST_GPU_NATIVE_PCS_TELEMETRY
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("gpu-native telemetry mutex poisoned") = Some(telemetry.clone());
+}
+
+fn record_gpu_native_aot_stats(stats: AotRuntimeStats) {
+    *LAST_GPU_NATIVE_AOT_STATS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("gpu-native AOT telemetry mutex poisoned") = Some(stats);
+}
+
+fn prove_gpu_native(
+    cell: &OnceLock<Mutex<GpuCairoProver<Blake2sMerkleChannel>>>,
     input: ProverInput,
     params: ProverParameters,
-) -> CairoProof<MC::H>
-where
-    B: CairoBackend<MC>,
-    MC: MerkleChannel + 'static,
-{
+) -> BenchProof {
     let prover = cell.get_or_init(|| {
         Mutex::new(GpuCairoProver::new(GpuProverConfig::default()).expect("gpu-native config"))
     });
     let mut prover = prover.lock().unwrap();
-    prover
+    let proof = prover
         .prove(input, params)
-        .expect("gpu-native prove failed")
+        .expect("gpu-native prove failed");
+    let telemetry = prover
+        .last_pcs_telemetry()
+        .expect("gpu-native prove returned without CUDA PCS architecture telemetry");
+    assert!(
+        telemetry.is_complete(),
+        "gpu-native CUDA PCS driver did not complete every architecture stage"
+    );
+    record_gpu_native_pcs_telemetry(telemetry);
+    let aot_stats = prover
+        .last_aot_stats()
+        .expect("gpu-native prove returned without CUDA AOT provenance telemetry");
+    if gpu_native_architecture_required() {
+        validate_strict_aot_provenance(Some(&aot_stats))
+            .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
+    }
+    record_gpu_native_aot_stats(aot_stats);
+    proof
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -134,6 +221,125 @@ fn arg(name: &str) -> Option<String> {
 /// Presence check for value-less boolean flags (`arg` would look at the next token).
 fn flag(name: &str) -> bool {
     std::env::args().any(|a| a == name)
+}
+
+fn gpu_native_architecture_required() -> bool {
+    flag("--require-gpu-native-architecture")
+        || std::env::var("STWO_BENCH_REQUIRE_GPU_NATIVE_ARCHITECTURE").as_deref() == Ok("1")
+}
+
+fn required_gpu_pcs_runtime_mode() -> RequiredCudaPcsRuntimeMode {
+    let value = arg("--require-gpu-pcs-runtime-mode")
+        .or_else(|| std::env::var("STWO_BENCH_REQUIRE_GPU_PCS_RUNTIME_MODE").ok())
+        .unwrap_or_else(|| "detached-eager".to_string());
+    RequiredCudaPcsRuntimeMode::parse(&value)
+}
+
+fn last_gpu_native_pcs_telemetry() -> Option<CudaPcsDriverTelemetry> {
+    LAST_GPU_NATIVE_PCS_TELEMETRY
+        .get()
+        .and_then(|telemetry| telemetry.lock().ok())
+        .and_then(|telemetry| telemetry.clone())
+}
+
+fn last_gpu_native_aot_stats() -> Option<AotRuntimeStats> {
+    LAST_GPU_NATIVE_AOT_STATS
+        .get()
+        .and_then(|stats| stats.lock().ok())
+        .and_then(|stats| *stats)
+}
+
+fn validate_strict_aot_provenance(stats: Option<&AotRuntimeStats>) -> Result<(), String> {
+    let stats = stats.ok_or_else(|| "CUDA AOT provenance telemetry is missing".to_string())?;
+    let rejected = [
+        ("aot_misses", stats.aot_misses),
+        ("runtime_loads", stats.runtime_loads),
+        ("runtime_cache_hits", stats.runtime_cache_hits),
+        ("strict_rejections", stats.strict_rejections),
+    ];
+    let nonzero = rejected
+        .into_iter()
+        .filter(|(_, count)| *count != 0)
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect::<Vec<_>>();
+    if nonzero.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "strict CUDA AOT provenance requires no fallback or rejection, got {}",
+            nonzero.join(" ")
+        ))
+    }
+}
+
+fn validate_gpu_native_architecture(
+    backend: &str,
+    selected_engine: &str,
+    expected_mode: RequiredCudaPcsRuntimeMode,
+    telemetry: Option<&CudaPcsDriverTelemetry>,
+) -> Result<(), String> {
+    if backend != "cuda" {
+        return Err(format!("backend must be cuda, got {backend}"));
+    }
+    if selected_engine != "gpu-native" {
+        return Err(format!("engine must be gpu-native, got {selected_engine}"));
+    }
+    let telemetry = telemetry.ok_or_else(|| "CUDA PCS telemetry is missing".to_string())?;
+    if telemetry.architecture != REQUIRED_CUDA_PCS_ARCHITECTURE {
+        return Err(format!(
+            "CUDA PCS architecture must be {REQUIRED_CUDA_PCS_ARCHITECTURE}, got {}",
+            telemetry.architecture
+        ));
+    }
+    if telemetry.runtime_mode != expected_mode.telemetry_mode() {
+        return Err(format!(
+            "CUDA PCS runtime mode must be {:?}, got {:?}",
+            expected_mode.telemetry_mode(),
+            telemetry.runtime_mode
+        ));
+    }
+    for stage in stwo::prover::pcs::proof_driver::PcsProofStage::ALL {
+        let index = stage.index();
+        let started = telemetry.stage_started[index];
+        let finished = telemetry.stage_finished[index];
+        if started != 1 || finished != 1 {
+            return Err(format!(
+                "CUDA PCS stage {stage:?} must start and finish exactly once, got started={started} finished={finished}"
+            ));
+        }
+    }
+    if !telemetry.batched_tree_decommit {
+        return Err("CUDA PCS batched tree decommit was not used".to_string());
+    }
+    if !telemetry.is_complete() {
+        return Err("CUDA PCS telemetry did not report complete".to_string());
+    }
+    Ok(())
+}
+
+fn enforce_gpu_native_architecture_invocation(backend: &str) {
+    if !gpu_native_architecture_required() {
+        return;
+    }
+    assert_eq!(
+        backend, "cuda",
+        "GPU-native architecture gate failed: backend must be cuda"
+    );
+    assert_eq!(
+        engine(),
+        "gpu-native",
+        "GPU-native architecture gate failed: engine must be gpu-native"
+    );
+    // Parse this before expensive input loading so an invalid future-mode request
+    // fails immediately. The concrete telemetry comparison happens after proving.
+    let _ = required_gpu_pcs_runtime_mode();
+}
+
+fn reject_gpu_native_architecture_gate_without_proof(mode: &str) {
+    assert!(
+        !gpu_native_architecture_required(),
+        "GPU-native architecture gate failed: {mode} exits without a proof or CUDA PCS telemetry"
+    );
 }
 
 fn peak_rss_gb() -> f64 {
@@ -430,7 +636,12 @@ fn load_pie_input(pie_paths: &[String], copies: usize) -> LoadedInput {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(env!("BOOTLOADER_JSON_PATH")));
     let bootloader_program = VmProgram::from_file(bootloader_path.as_path(), Some("main"))
-        .expect("Failed to load simple_bootloader_compiled.json");
+        .unwrap_or_else(|error| {
+            panic!(
+                "Failed to load bootloader JSON at {}: {error}",
+                bootloader_path.display()
+            )
+        });
 
     let cairo_run_config = RunMode::Proof {
         layout: LayoutName::all_cairo_stwo,
@@ -564,6 +775,34 @@ fn round3(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
 }
 
+fn throughput_mhz(work: Option<usize>, seconds: Option<f64>, applicable: bool) -> Option<f64> {
+    if !applicable {
+        return None;
+    }
+    Some(round3(work? as f64 / seconds? / 1e6))
+}
+
+/// Linearly interpolated quantile (the common R-7 definition). Keeping this local
+/// avoids pulling a statistics crate into the benchmark binary.
+fn quantile(samples: &[f64], q: f64) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    assert!((0.0..=1.0).contains(&q), "quantile must be in [0, 1]");
+    assert!(
+        samples.iter().all(|sample| sample.is_finite()),
+        "quantile samples must be finite"
+    );
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = q * (sorted.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    let weight = rank - lower as f64;
+    Some(sorted[lower] + (sorted[upper] - sorted[lower]) * weight)
+}
+
 /// Force the pedersen points tables (LazyLock statics) to initialize on the main
 /// thread before any parallel witness generation. Their initializer runs nested rayon
 /// joins; when rayon pool workers race the underlying Once during witness gen (pool
@@ -589,7 +828,17 @@ fn prewarm_pedersen_tables(variant: PreProcessedTraceVariant) {
 /// never compare records without these fields) and host fingerprint.
 fn record_context(backend: &str) -> serde_json::Value {
     let pcs = prover_params(PreProcessedTraceVariant::Canonical).pcs_config;
-    json!({
+    let architecture_required = gpu_native_architecture_required();
+    let required_mode = architecture_required.then(required_gpu_pcs_runtime_mode);
+    let telemetry = last_gpu_native_pcs_telemetry();
+    let aot_stats = last_gpu_native_aot_stats();
+    if let Some(required_mode) = required_mode {
+        validate_gpu_native_architecture(backend, &engine(), required_mode, telemetry.as_ref())
+            .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
+        validate_strict_aot_provenance(aot_stats.as_ref())
+            .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
+    }
+    let base = json!({
         "security_bits": pcs.security_bits(),
         "n_queries": pcs.fri_config.n_queries,
         "pow_bits": pcs.pow_bits,
@@ -598,6 +847,80 @@ fn record_context(backend: &str) -> serde_json::Value {
         "gpu": gpu_name(backend),
         "nproc": nproc(),
         "host_mem_gb": round3(host_mem_gb()),
+        "gpu_native_architecture_required": architecture_required,
+        "gpu_pcs_required_runtime_mode": required_mode.map(RequiredCudaPcsRuntimeMode::cli_name),
+        "gpu_native_architecture_gate_passed": architecture_required.then_some(true),
+    });
+    merge_json(
+        merge_json(base, gpu_native_pcs_context(telemetry.as_ref())),
+        gpu_native_aot_context(aot_stats.as_ref(), architecture_required),
+    )
+}
+
+/// Architecture evidence from the concrete CUDA PCS driver. These fields land
+/// in the benchmark's primary JSON record so the harness can reject a run that
+/// silently re-entered reference trait dispatch or skipped a protocol stage.
+fn gpu_native_pcs_context(telemetry: Option<&CudaPcsDriverTelemetry>) -> serde_json::Value {
+    let Some(telemetry) = telemetry.filter(|_| engine() == "gpu-native") else {
+        return json!({
+            "gpu_pcs_driver_architecture": null,
+            "gpu_pcs_runtime_mode": null,
+            "gpu_pcs_stage_started": null,
+            "gpu_pcs_stage_finished": null,
+            "gpu_pcs_batched_tree_decommit": null,
+            "gpu_pcs_driver_complete": null,
+        });
+    };
+    pcs_telemetry_json(telemetry)
+}
+
+fn pcs_telemetry_json(telemetry: &CudaPcsDriverTelemetry) -> serde_json::Value {
+    let stages_started = stwo::prover::pcs::proof_driver::PcsProofStage::ALL
+        .into_iter()
+        .map(|stage| {
+            (
+                format!("{stage:?}"),
+                json!(telemetry.stage_started[stage.index()]),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let stages_finished = stwo::prover::pcs::proof_driver::PcsProofStage::ALL
+        .into_iter()
+        .map(|stage| (format!("{stage:?}"), json!(telemetry.completed(stage))))
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "gpu_pcs_driver_architecture": telemetry.architecture,
+        "gpu_pcs_runtime_mode": format!("{:?}", telemetry.runtime_mode),
+        "gpu_pcs_stage_started": stages_started,
+        "gpu_pcs_stage_finished": stages_finished,
+        "gpu_pcs_batched_tree_decommit": telemetry.batched_tree_decommit,
+        "gpu_pcs_driver_complete": telemetry.is_complete(),
+    })
+}
+
+fn gpu_native_aot_context(
+    stats: Option<&AotRuntimeStats>,
+    architecture_required: bool,
+) -> serde_json::Value {
+    let Some(stats) = stats.filter(|_| engine() == "gpu-native") else {
+        return json!({
+            "gpu_aot_loads": null,
+            "gpu_aot_cache_hits": null,
+            "gpu_aot_misses": null,
+            "gpu_aot_runtime_loads": null,
+            "gpu_aot_runtime_cache_hits": null,
+            "gpu_aot_strict_rejections": null,
+            "gpu_aot_provenance_gate_passed": null,
+        });
+    };
+    json!({
+        "gpu_aot_loads": stats.aot_loads,
+        "gpu_aot_cache_hits": stats.aot_cache_hits,
+        "gpu_aot_misses": stats.aot_misses,
+        "gpu_aot_runtime_loads": stats.runtime_loads,
+        "gpu_aot_runtime_cache_hits": stats.runtime_cache_hits,
+        "gpu_aot_strict_rejections": stats.strict_rejections,
+        "gpu_aot_provenance_gate_passed": architecture_required.then_some(true),
     })
 }
 
@@ -614,7 +937,87 @@ struct RepOutcome {
     times: Vec<f64>,
     proof_size: usize,
     verify_ms: f64,
+    verified_reps: usize,
+    proof_byte_equal: Option<bool>,
     vram_peak_gb: f64,
+}
+
+struct ProofValidation {
+    proof_size: usize,
+    verify_ms: f64,
+    verified_reps: usize,
+    proof_byte_equal: Option<bool>,
+}
+
+fn initial_proof_byte_equal(compare_to_rep0: bool, proof_count: usize) -> Option<bool> {
+    (compare_to_rep0 && proof_count >= 2).then_some(true)
+}
+
+fn proof_byte_equal_gate_passes(required: bool, proof_byte_equal: Option<bool>) -> bool {
+    !required || proof_byte_equal == Some(true)
+}
+
+/// Serialize and verify every proof after the timed proving window. Exact byte
+/// comparison avoids treating a non-cryptographic hash collision as determinism.
+/// `dump_rep0` keeps STWO_DUMP_PROOF scoped to the standard and pipeline modes,
+/// matching its historical behavior. `compare_to_rep0` is false when reps are
+/// intentionally different statements (pipeline rotate mode).
+fn validate_proofs(
+    proofs: Vec<BenchProof>,
+    dump_rep0: bool,
+    compare_to_rep0: bool,
+) -> ProofValidation {
+    assert!(!proofs.is_empty(), "at least one proof is required");
+
+    let verified_reps = proofs.len();
+    let mut rep0_bytes = None;
+    let mut proof_size = 0;
+    let mut verify_ms = 0.0;
+    let mut proof_byte_equal = initial_proof_byte_equal(compare_to_rep0, verified_reps);
+    for (rep, proof) in proofs.into_iter().enumerate() {
+        let bytes = bincode::serialize(&proof).expect("serialize proof");
+        if rep == 0 {
+            proof_size = bytes.len();
+            if dump_rep0 {
+                if let Ok(path) = std::env::var("STWO_DUMP_PROOF") {
+                    std::fs::write(&path, &bytes).expect("write proof dump");
+                    eprintln!("proof dumped: {} bytes -> {path}", bytes.len());
+                }
+            }
+            rep0_bytes = Some(bytes);
+        } else {
+            if let Some(equal) = &mut proof_byte_equal {
+                *equal &= rep0_bytes.as_ref() == Some(&bytes);
+            }
+        }
+
+        let verify_start = Instant::now();
+        verify_cairo::<Blake2sMerkleChannel>(proof.into()).unwrap_or_else(|error| {
+            panic!("proof repetition {rep} failed verification: {error:?}")
+        });
+        if rep == 0 {
+            verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
+        }
+    }
+
+    ProofValidation {
+        proof_size,
+        verify_ms,
+        verified_reps,
+        proof_byte_equal,
+    }
+}
+
+fn proof_byte_equal_required() -> bool {
+    flag("--require-proof-byte-equal")
+        || std::env::var("STWO_BENCH_REQUIRE_PROOF_BYTE_EQUAL").as_deref() == Ok("1")
+}
+
+fn enforce_proof_byte_equal(proof_byte_equal: Option<bool>) {
+    assert!(
+        proof_byte_equal_gate_passes(proof_byte_equal_required(), proof_byte_equal),
+        "proof byte equality gate failed: comparison was unavailable or repetitions did not match repetition 0"
+    );
 }
 
 /// Prove `input` on `backend`, sampling VRAM in flight. Returns (proof, prove_s,
@@ -638,9 +1041,9 @@ macro_rules! prove_sampled {
             ("cuda", "gpu-native") => {
                 prove_gpu_native(&GPU_NATIVE_CUDA, $input, prover_params($variant))
             }
-            ("simd", "gpu-native") => {
-                prove_gpu_native(&GPU_NATIVE_SIMD, $input, prover_params($variant))
-            }
+            ("simd", "gpu-native") => panic!(
+                "gpu-native is a concrete CUDA proof runtime; use --engine legacy --backend simd for the reference oracle"
+            ),
             (backend, engine) => panic!("unknown backend/engine {backend}/{engine}"),
         };
         let elapsed = start.elapsed().as_secs_f64();
@@ -657,15 +1060,19 @@ fn print_main_record(
     cycle_count: usize,
     pie_n_steps: Option<usize>,
     outcome: &RepOutcome,
+    throughput_distribution_applicable: bool,
     vm_s: f64,
     adapt_s: f64,
 ) {
     let cold = outcome.times[0];
-    let warm = outcome.times[1..]
-        .iter()
-        .cloned()
-        .fold(f64::INFINITY, f64::min);
-    let warm = if warm.is_finite() { warm } else { cold };
+    let warm_samples = &outcome.times[1..];
+    let warm_best = quantile(warm_samples, 0.0);
+    let warm_median = quantile(warm_samples, 0.5);
+    let warm_p95 = quantile(warm_samples, 0.95);
+    // Compatibility: prove_s_warm has always meant the best post-cold sample,
+    // falling back to cold when --reps=1.
+    let warm = warm_best.unwrap_or(cold);
+    let warm_samples_rounded: Vec<_> = warm_samples.iter().copied().map(round3).collect();
     let (free, total) = stwo_backend_cuda::gpu_memory_info();
     let vram_end_gb = if total > 0 {
         (total - free) as f64 / 1e9
@@ -682,9 +1089,22 @@ fn print_main_record(
         "bootloader_overhead_pct": pie_n_steps.map(|s| {
             round3((cycle_count as f64 - s as f64) / s as f64 * 100.0)
         }),
+        "reps": outcome.times.len(),
+        "warm_sample_count": warm_samples.len(),
+        "prove_s_warm_samples_raw": warm_samples,
+        "prove_s_warm_samples_rounded": warm_samples_rounded,
         "prove_s_cold": round3(cold),
         "prove_s_warm": round3(warm),
+        "prove_s_warm_semantics": "legacy_best_post_cold_or_cold_when_no_warm_samples",
+        "prove_s_warm_best": warm_best.map(round3),
+        "prove_s_warm_median": warm_median.map(round3),
+        "prove_s_warm_p95": warm_p95.map(round3),
         "verify_ms": round3(outcome.verify_ms),
+        "verified_reps": outcome.verified_reps,
+        "proof_comparison_applicable": outcome.proof_byte_equal.is_some(),
+        "deterministic": outcome.proof_byte_equal,
+        "proof_byte_equal": outcome.proof_byte_equal,
+        "proof_byte_equal_required": proof_byte_equal_required(),
         "proof_kb": round3(outcome.proof_size as f64 / 1024.0),
         "peak_rss_gb": round3(peak_rss_gb()),
         "vram_end_gb": round3(vram_end_gb),
@@ -696,6 +1116,15 @@ fn print_main_record(
         "steps_per_s": (cycle_count as f64 / warm).round(),
         "mhz": round3(cycle_count as f64 / warm / 1e6),
         "useful_mhz": pie_n_steps.map(|s| round3(s as f64 / warm / 1e6)),
+        "throughput_distribution_applicable": throughput_distribution_applicable,
+        "mhz_median": throughput_mhz(
+            Some(cycle_count), warm_median, throughput_distribution_applicable),
+        "useful_mhz_median": throughput_mhz(
+            pie_n_steps, warm_median, throughput_distribution_applicable),
+        "mhz_at_warm_p95": throughput_mhz(
+            Some(cycle_count), warm_p95, throughput_distribution_applicable),
+        "useful_mhz_at_warm_p95": throughput_mhz(
+            pie_n_steps, warm_p95, throughput_distribution_applicable),
         "vm_s": round3(vm_s),
         "adapt_s": round3(adapt_s),
     });
@@ -714,8 +1143,9 @@ enum PieMode {
 /// `producers` threads pull rep indices from a shared counter, build the rep's input
 /// (aggregate: the whole task list; rotate: one PIE, round-robin), and feed a bounded
 /// channel of `depth`; the main thread proves each as it arrives. The total wall clock
-/// starts before the producers spawn, so pipeline fill counts. Proof-size capture and
-/// rep-0 verification run after the clock stops to keep the sustained window pure.
+/// starts before the producers spawn, so pipeline fill counts. Proof serialization,
+/// comparison, and verification run after the clock stops to keep the sustained
+/// window pure.
 /// M6-a resident two-proof throughput harness. Increment 1: prove N inputs
 /// SEQUENTIALLY (pre-loaded, so feed_starved=0) and report the two-proof-wall
 /// metrics the M6 gates are defined on. This is the baseline the stream-explicit
@@ -735,28 +1165,18 @@ fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
     let wall_start = Instant::now();
     let mut times = Vec::with_capacity(n);
     let mut vram_peak_gb = 0.0f64;
-    let mut proof_hashes: Vec<u64> = Vec::with_capacity(n);
-    let mut first_proof = None;
+    let mut proofs = Vec::with_capacity(n);
     for (i, input) in inputs.into_iter().enumerate() {
         let (proof, elapsed, rep_vram) = prove_sampled!(backend, input, variant);
         vram_peak_gb = vram_peak_gb.max(rep_vram);
         times.push(elapsed);
-        // Byte-equality proxy: same input => identical proof bytes across all N.
-        let bytes = bincode::serialize(&proof).expect("serialize proof");
-        proof_hashes.push(seahash_of(&bytes));
-        if i == 0 {
-            first_proof = Some(proof);
-        }
+        proofs.push(proof);
         eprintln!("resident_proof={i} prove_s={elapsed:.3}");
     }
     let wall_s = wall_start.elapsed().as_secs_f64();
 
-    // All N proofs prove the SAME statement => their bytes must be identical.
-    let byte_equal = proof_hashes.iter().all(|h| *h == proof_hashes[0]);
-    // Verify one proof in-run (outside the timed window).
-    if let Some(proof) = first_proof {
-        verify_cairo::<Blake2sMerkleChannel>(proof.into()).expect("resident proof verify");
-    }
+    // All N proofs prove the SAME statement. Validate outside the timed window.
+    let validation = validate_proofs(proofs, false, true);
 
     let per_proof_s = times.iter().sum::<f64>() / n as f64;
     let total_steps = pie_n_steps.map(|s| s * n);
@@ -774,12 +1194,17 @@ fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
                 "cycle_useful_mhz": round3((cycle_count * n) as f64 / wall_s / 1e6),
                 "vram_peak_gb": round3(vram_peak_gb),
                 "feed_starved_s": 0.0,
-                "proof_byte_equal": byte_equal,
+                "verified_reps": validation.verified_reps,
+                "proof_comparison_applicable": validation.proof_byte_equal.is_some(),
+                "deterministic": validation.proof_byte_equal,
+                "proof_byte_equal": validation.proof_byte_equal,
+                "proof_byte_equal_required": proof_byte_equal_required(),
                 "pie_n_steps": pie_n_steps,
             }),
             record_context(backend)
         )
     );
+    enforce_proof_byte_equal(validation.proof_byte_equal);
 }
 
 /// M6-a increment 2: TRUE two-proof concurrency — `N` host threads, each driving a
@@ -831,10 +1256,8 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
     // any unset GPU_NATIVE_DEFAULTS) and one-time CUDA init BEFORE spawning, so the
     // per-thread `new` calls find every default set and race no env writes.
     drop(
-        GpuCairoProver::<stwo_backend_cuda::CudaBackend, Blake2sMerkleChannel>::new(
-            GpuProverConfig::default(),
-        )
-        .expect("warm-up gpu prover"),
+        GpuCairoProver::<Blake2sMerkleChannel>::new(GpuProverConfig::default())
+            .expect("warm-up gpu prover"),
     );
 
     let loaded = source.load();
@@ -846,33 +1269,37 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
     let wall_start = Instant::now();
 
     // Each thread builds its own prover (prove() takes &mut self) and proves one
-    // proof; returns (prove_s, proof_hash). thread::scope joins all before returning.
-    let results: Vec<(f64, u64)> = std::thread::scope(|scope| {
+    // proof; returns (prove_s, proof). thread::scope joins all before returning.
+    let results: Vec<(f64, BenchProof)> = std::thread::scope(|scope| {
         let handles: Vec<_> = inputs
             .into_iter()
             .enumerate()
             .map(|(i, input)| {
                 scope.spawn(move || {
-                    let mut prover = GpuCairoProver::<
-                        stwo_backend_cuda::CudaBackend,
-                        Blake2sMerkleChannel,
-                    >::new(GpuProverConfig::default())
-                    .expect("per-thread gpu prover");
+                    let mut prover =
+                        GpuCairoProver::<Blake2sMerkleChannel>::new(GpuProverConfig::default())
+                            .expect("per-thread gpu prover");
                     let t = Instant::now();
                     let proof = prover
                         .prove(input, prover_params(variant))
                         .expect("concurrent prove failed");
-                    let elapsed = t.elapsed().as_secs_f64();
-                    let bytes = bincode::serialize(&proof).expect("serialize proof");
-                    let hash = seahash_of(&bytes);
-                    // Verify one proof (outside the per-proof timer; ~20ms, negligible
-                    // on the wall) to confirm the concurrent path produces valid proofs.
-                    if i == 0 {
-                        verify_cairo::<Blake2sMerkleChannel>(proof.into())
-                            .expect("concurrent proof verify");
+                    let telemetry = prover
+                        .last_pcs_telemetry()
+                        .expect("concurrent prove returned without CUDA PCS telemetry");
+                    assert!(telemetry.is_complete());
+                    record_gpu_native_pcs_telemetry(telemetry);
+                    let aot_stats = prover
+                        .last_aot_stats()
+                        .expect("concurrent prove returned without CUDA AOT telemetry");
+                    if gpu_native_architecture_required() {
+                        validate_strict_aot_provenance(Some(&aot_stats)).unwrap_or_else(|error| {
+                            panic!("GPU-native architecture gate failed: {error}")
+                        });
                     }
+                    record_gpu_native_aot_stats(aot_stats);
+                    let elapsed = t.elapsed().as_secs_f64();
                     eprintln!("concurrent_proof={i} prove_s={elapsed:.3}");
-                    (elapsed, hash)
+                    (elapsed, proof)
                 })
             })
             .collect();
@@ -885,12 +1312,17 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
     let wall_s = wall_start.elapsed().as_secs_f64();
     let vram_peak_gb = sampler.stop();
 
-    // Same statement proved N times => identical proof bytes.
-    let byte_equal = results.iter().all(|(_, h)| *h == results[0].1);
     let per_proof_s = results.iter().map(|(t, _)| *t).sum::<f64>() / n as f64;
     // serial_wall = what the same N proofs cost back-to-back; overlap_speedup =
     // how much the concurrency compressed that (1.0 = fully serialized, N = perfect).
     let serial_wall: f64 = results.iter().map(|(t, _)| *t).sum();
+    // Same statement proved N times: verify all and exact-compare their bytes after
+    // the timed concurrent window.
+    let validation = validate_proofs(
+        results.into_iter().map(|(_, proof)| proof).collect(),
+        false,
+        true,
+    );
     let total_steps = pie_n_steps.map(|s| s * n);
     println!(
         "{}",
@@ -908,22 +1340,17 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
                 "cycle_useful_mhz": round3((cycle_count * n) as f64 / wall_s / 1e6),
                 "vram_peak_gb": round3(vram_peak_gb),
                 "feed_starved_s": 0.0,
-                "proof_byte_equal": byte_equal,
+                "verified_reps": validation.verified_reps,
+                "proof_comparison_applicable": validation.proof_byte_equal.is_some(),
+                "deterministic": validation.proof_byte_equal,
+                "proof_byte_equal": validation.proof_byte_equal,
+                "proof_byte_equal_required": proof_byte_equal_required(),
                 "pie_n_steps": pie_n_steps,
             }),
             record_context(backend)
         )
     );
-}
-
-fn seahash_of(bytes: &[u8]) -> u64 {
-    // Cheap content hash for cross-proof byte-equality (no crypto needed here).
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+    enforce_proof_byte_equal(validation.proof_byte_equal);
 }
 
 fn run_pipelined(
@@ -994,7 +1421,7 @@ fn run_pipelined(
     let mut last_adapt_s = 0.0f64;
     let mut vram_peak_gb = 0.0f64;
     let mut times = Vec::new();
-    let mut first_proof = None;
+    let mut proofs = Vec::with_capacity(reps);
     for rep in 0..reps {
         let recv_start = Instant::now();
         let loaded = rx.recv().expect("producer threads died");
@@ -1018,9 +1445,7 @@ fn run_pipelined(
         let (proof, elapsed, rep_vram) = prove_sampled!(backend, loaded.input, variant);
         vram_peak_gb = vram_peak_gb.max(rep_vram);
         times.push(elapsed);
-        if rep == 0 {
-            first_proof = Some(proof);
-        }
+        proofs.push(proof);
         eprintln!("rep={rep} prove_s={elapsed:.3}");
         emit_phase_totals(rep);
     }
@@ -1029,24 +1454,16 @@ fn run_pipelined(
         handle.join().expect("producer thread panicked");
     }
 
-    // Rep-0 proof size + verification, outside the timed window.
-    let proof = first_proof.expect("--reps must be >= 1");
-    // Byte-equality harness: STWO_DUMP_PROOF=<path> serializes the proof so the
-    // device-lane ON vs OFF proofs can be `cmp`'d (witness-on-GPU kill-switch gate).
-    if let Ok(path) = std::env::var("STWO_DUMP_PROOF") {
-        let bytes = bincode::serialize(&proof).expect("serialize proof");
-        std::fs::write(&path, &bytes).expect("write proof dump");
-        eprintln!("proof dumped: {} bytes -> {path}", bytes.len());
-    }
-    let proof_size = bincode::serialized_size(&proof).unwrap() as usize;
-    let vstart = Instant::now();
-    verify_cairo::<Blake2sMerkleChannel>(proof.into()).unwrap();
-    let verify_ms = vstart.elapsed().as_secs_f64() * 1000.0;
+    // Validate every proof outside the sustained-throughput window. Rep 0 is still
+    // the proof written by STWO_DUMP_PROOF.
+    let validation = validate_proofs(proofs, true, pie_mode == PieMode::Aggregate);
 
     let outcome = RepOutcome {
         times,
-        proof_size,
-        verify_ms,
+        proof_size: validation.proof_size,
+        verify_ms: validation.verify_ms,
+        verified_reps: validation.verified_reps,
+        proof_byte_equal: validation.proof_byte_equal,
         vram_peak_gb,
     };
     print_main_record(
@@ -1056,6 +1473,7 @@ fn run_pipelined(
         rep0_cycle_count,
         rep0_pie_n_steps,
         &outcome,
+        pie_mode == PieMode::Aggregate,
         last_vm_s,
         last_adapt_s,
     );
@@ -1074,6 +1492,7 @@ fn run_pipelined(
                 .then(|| round3(total_pie_n_steps as f64 / total_s / 1e6)),
         })
     );
+    enforce_proof_byte_equal(outcome.proof_byte_equal);
 }
 
 /// Resolve the input source from CLI flags. `--program`/`--iterations` selects the
@@ -1238,10 +1657,12 @@ fn main() {
         _ => {}
     }
     let backend = arg("--backend").unwrap_or_else(|| "cuda".to_string());
+    enforce_gpu_native_architecture_invocation(&backend);
     let reps: usize = arg("--reps")
         .unwrap_or_else(|| "3".to_string())
         .parse()
         .unwrap();
+    assert!(reps >= 1, "--reps must be >= 1");
 
     let source = build_input_source();
     let program = source.label();
@@ -1251,6 +1672,7 @@ fn main() {
     // Useful for validating that large PIEs are accepted by the bootloader/adapter
     // without paying for a full (slow) SIMD prove locally.
     if flag("--adapt-only") || std::env::var("STWO_ADAPT_ONLY").as_deref() == Ok("1") {
+        reject_gpu_native_architecture_gate_without_proof("adapt-only mode");
         let loaded = source.load();
         let cycle_count = cycle_count_of(&loaded.input);
         println!(
@@ -1326,6 +1748,7 @@ fn main() {
     // states, then exit before proving (fast iteration). See
     // stwo_backend_cuda::exec_tables.
     if std::env::var("STWO_WITNESS_JIT_SELFTEST").as_deref() == Ok("1") {
+        reject_gpu_native_architecture_gate_without_proof("witness JIT self-test mode");
         // STWO_WITNESS_JIT_SOURCE=emitted: register the transformer-EMITTED full-width
         // writer recordings (strictly wider than the built-in hand decode-subsets:
         // e.g. add_opcode 103 columns vs 14) so the device selftest runs
@@ -1343,6 +1766,7 @@ fn main() {
     // built from the SAME device lookup words via the host path and the device
     // path (logup_pairs.cu + device finalize), byte-compared. Exits before proving.
     if std::env::var("STWO_DEVICE_INTERACTION_SELFTEST").as_deref() == Ok("1") {
+        reject_gpu_native_architecture_gate_without_proof("device interaction self-test mode");
         let ok = stwo_cairo_prover::witness::jit_witness_hook::run_device_interaction_selftest(
             &loaded.input,
         );
@@ -1371,8 +1795,7 @@ fn main() {
     };
 
     let mut times = Vec::new();
-    let mut proof_size = 0usize;
-    let mut verify_ms = 0.0f64;
+    let mut proofs = Vec::with_capacity(reps);
     let mut vram_peak_gb = 0.0f64;
     for rep in 0..reps {
         let input = match &reusable_input {
@@ -1386,26 +1809,17 @@ fn main() {
         let (proof, elapsed, rep_vram) = prove_sampled!(backend.as_str(), input, variant);
         vram_peak_gb = vram_peak_gb.max(rep_vram);
         times.push(elapsed);
-        if rep == 0 {
-            proof_size = bincode::serialized_size(&proof).unwrap() as usize;
-            // Byte-equality harness: STWO_DUMP_PROOF=<path> serializes the proof so the
-            // device-lane ON vs OFF proofs can be `cmp`'d (witness-on-GPU kill switch).
-            if let Ok(path) = std::env::var("STWO_DUMP_PROOF") {
-                let bytes = bincode::serialize(&proof).expect("serialize proof");
-                std::fs::write(&path, &bytes).expect("write proof dump");
-                eprintln!("proof dumped: {} bytes -> {path}", bytes.len());
-            }
-            let vstart = Instant::now();
-            verify_cairo::<Blake2sMerkleChannel>(proof.into()).unwrap();
-            verify_ms = vstart.elapsed().as_secs_f64() * 1000.0;
-        }
+        proofs.push(proof);
         eprintln!("rep={rep} prove_s={elapsed:.3}");
         emit_phase_totals(rep);
     }
+    let validation = validate_proofs(proofs, true, true);
     let outcome = RepOutcome {
         times,
-        proof_size,
-        verify_ms,
+        proof_size: validation.proof_size,
+        verify_ms: validation.verify_ms,
+        verified_reps: validation.verified_reps,
+        proof_byte_equal: validation.proof_byte_equal,
         vram_peak_gb,
     };
     print_main_record(
@@ -1415,9 +1829,210 @@ fn main() {
         cycle_count,
         pie_n_steps,
         &outcome,
+        true,
         last_vm_s,
         last_adapt_s,
     );
+    enforce_proof_byte_equal(outcome.proof_byte_equal);
     // Silence unused-import warnings when only one backend path is exercised.
     let _ = CairoSerialize::serialize as fn(&u64, &mut Vec<starknet_ff::FieldElement>);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        initial_proof_byte_equal, pcs_telemetry_json, proof_byte_equal_gate_passes, quantile,
+        throughput_mhz, validate_gpu_native_architecture, validate_strict_aot_provenance,
+        AotRuntimeStats, CudaPcsDriverTelemetry, CudaPcsRuntimeMode, RequiredCudaPcsRuntimeMode,
+        REQUIRED_CUDA_PCS_ARCHITECTURE,
+    };
+
+    fn complete_telemetry(runtime_mode: CudaPcsRuntimeMode) -> CudaPcsDriverTelemetry {
+        CudaPcsDriverTelemetry {
+            architecture: REQUIRED_CUDA_PCS_ARCHITECTURE,
+            runtime_mode,
+            stage_started: [1; 7],
+            stage_finished: [1; 7],
+            batched_tree_decommit: true,
+        }
+    }
+
+    #[test]
+    fn quantile_handles_empty_and_singleton_samples() {
+        assert_eq!(quantile(&[], 0.5), None);
+        assert_eq!(quantile(&[7.0], 0.0), Some(7.0));
+        assert_eq!(quantile(&[7.0], 0.95), Some(7.0));
+    }
+
+    #[test]
+    fn quantile_sorts_and_interpolates() {
+        let samples = [5.0, 1.0, 3.0, 2.0, 4.0];
+        assert_eq!(quantile(&samples, 0.0), Some(1.0));
+        assert_eq!(quantile(&samples, 0.5), Some(3.0));
+        assert!((quantile(&samples, 0.95).unwrap() - 4.8).abs() < f64::EPSILON * 8.0);
+        assert_eq!(quantile(&samples, 1.0), Some(5.0));
+    }
+
+    #[test]
+    fn mixed_statement_throughput_distribution_is_not_applicable() {
+        assert_eq!(throughput_mhz(Some(10_000_000), Some(2.0), false), None);
+        assert_eq!(throughput_mhz(Some(10_000_000), Some(2.0), true), Some(5.0));
+    }
+
+    #[test]
+    fn proof_equality_requires_two_comparable_proofs() {
+        assert_eq!(initial_proof_byte_equal(true, 1), None);
+        assert_eq!(initial_proof_byte_equal(false, 2), None);
+        assert_eq!(initial_proof_byte_equal(true, 2), Some(true));
+
+        assert!(proof_byte_equal_gate_passes(false, None));
+        assert!(proof_byte_equal_gate_passes(true, Some(true)));
+        assert!(!proof_byte_equal_gate_passes(true, None));
+        assert!(!proof_byte_equal_gate_passes(true, Some(false)));
+    }
+
+    #[test]
+    fn pcs_architecture_telemetry_is_machine_readable() {
+        let telemetry = complete_telemetry(CudaPcsRuntimeMode::DetachedEager);
+        let json = pcs_telemetry_json(&telemetry);
+        assert_eq!(json["gpu_pcs_driver_complete"], true);
+        assert_eq!(
+            json["gpu_pcs_driver_architecture"],
+            REQUIRED_CUDA_PCS_ARCHITECTURE
+        );
+        assert_eq!(json["gpu_pcs_stage_started"]["Assembly"], 1);
+        assert_eq!(json["gpu_pcs_stage_finished"]["Assembly"], 1);
+    }
+
+    #[test]
+    fn architecture_gate_accepts_only_complete_typed_cuda_telemetry() {
+        let telemetry = complete_telemetry(CudaPcsRuntimeMode::DetachedEager);
+        assert_eq!(
+            validate_gpu_native_architecture(
+                "cuda",
+                "gpu-native",
+                RequiredCudaPcsRuntimeMode::DetachedEager,
+                Some(&telemetry),
+            ),
+            Ok(())
+        );
+
+        for (backend, engine, telemetry, expected) in [
+            (
+                "simd",
+                "gpu-native",
+                Some(&telemetry),
+                "backend must be cuda",
+            ),
+            (
+                "cuda",
+                "legacy",
+                Some(&telemetry),
+                "engine must be gpu-native",
+            ),
+            ("cuda", "gpu-native", None, "telemetry is missing"),
+        ] {
+            let error = validate_gpu_native_architecture(
+                backend,
+                engine,
+                RequiredCudaPcsRuntimeMode::DetachedEager,
+                telemetry,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn architecture_gate_rejects_wrong_tag_mode_partial_duplicate_and_unbatched() {
+        let mut telemetry = complete_telemetry(CudaPcsRuntimeMode::DetachedEager);
+        telemetry.architecture = "legacy-cuda-driver";
+        assert!(validate_gpu_native_architecture(
+            "cuda",
+            "gpu-native",
+            RequiredCudaPcsRuntimeMode::DetachedEager,
+            Some(&telemetry),
+        )
+        .unwrap_err()
+        .contains("architecture must be"));
+
+        let telemetry = complete_telemetry(CudaPcsRuntimeMode::DetachedEager);
+        assert!(validate_gpu_native_architecture(
+            "cuda",
+            "gpu-native",
+            RequiredCudaPcsRuntimeMode::ArenaGraph,
+            Some(&telemetry),
+        )
+        .unwrap_err()
+        .contains("runtime mode must be ArenaGraph"));
+
+        let mut partial = complete_telemetry(CudaPcsRuntimeMode::DetachedEager);
+        partial.stage_finished[2] = 0;
+        assert!(validate_gpu_native_architecture(
+            "cuda",
+            "gpu-native",
+            RequiredCudaPcsRuntimeMode::DetachedEager,
+            Some(&partial),
+        )
+        .unwrap_err()
+        .contains("finish exactly once"));
+
+        let mut duplicate = complete_telemetry(CudaPcsRuntimeMode::DetachedEager);
+        duplicate.stage_started[4] = 2;
+        assert!(validate_gpu_native_architecture(
+            "cuda",
+            "gpu-native",
+            RequiredCudaPcsRuntimeMode::DetachedEager,
+            Some(&duplicate),
+        )
+        .unwrap_err()
+        .contains("started=2"));
+
+        let mut unbatched = complete_telemetry(CudaPcsRuntimeMode::DetachedEager);
+        unbatched.batched_tree_decommit = false;
+        assert!(validate_gpu_native_architecture(
+            "cuda",
+            "gpu-native",
+            RequiredCudaPcsRuntimeMode::DetachedEager,
+            Some(&unbatched),
+        )
+        .unwrap_err()
+        .contains("batched tree decommit"));
+    }
+
+    #[test]
+    fn strict_architecture_gate_allows_only_aot_loads_and_aot_cache_hits() {
+        let clean = AotRuntimeStats {
+            aot_loads: 3,
+            aot_cache_hits: 9,
+            ..AotRuntimeStats::default()
+        };
+        assert_eq!(validate_strict_aot_provenance(Some(&clean)), Ok(()));
+        assert!(validate_strict_aot_provenance(None)
+            .unwrap_err()
+            .contains("telemetry is missing"));
+
+        for field in [
+            "aot_misses",
+            "runtime_loads",
+            "runtime_cache_hits",
+            "strict_rejections",
+        ] {
+            let mut stats = clean;
+            match field {
+                "aot_misses" => stats.aot_misses = 1,
+                "runtime_loads" => stats.runtime_loads = 1,
+                "runtime_cache_hits" => stats.runtime_cache_hits = 1,
+                "strict_rejections" => stats.strict_rejections = 1,
+                _ => unreachable!(),
+            }
+            let error = validate_strict_aot_provenance(Some(&stats)).unwrap_err();
+            assert!(error.contains(field), "unexpected error: {error}");
+        }
+
+        assert_eq!(
+            validate_strict_aot_provenance(Some(&AotRuntimeStats::default())),
+            Ok(())
+        );
+    }
 }

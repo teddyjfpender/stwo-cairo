@@ -8,6 +8,7 @@ pub mod components;
 pub mod fast_deduction;
 #[macro_use]
 pub mod device_feed;
+pub mod exec_context;
 mod jit_flat_macros;
 pub mod jit_prove_backend;
 pub mod jit_witness_hook;
@@ -18,6 +19,8 @@ pub mod pedersen_witness_backend;
 pub mod prelude;
 pub mod preprocessed_trace;
 pub mod preprocessed_trace_backend;
+pub mod proof_shape;
+mod proof_shape_generated;
 pub mod range_checks;
 pub mod utils;
 pub mod witness_eval;

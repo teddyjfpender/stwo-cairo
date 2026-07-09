@@ -43,6 +43,7 @@ use crate::witness::components::{
     blake_g, blake_round, blake_round_sigma, memory_address_to_id, memory_id_to_big,
     range_check_7_2_5,
 };
+use crate::witness::exec_context::WitnessExecContext;
 
 type Evals<B> = Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>;
 
@@ -63,6 +64,7 @@ pub trait BlakeRoundWitness: FromSimdColumns {
     /// device execution tables from. `None` (or the Simd backend) → host writer.
     #[allow(clippy::too_many_arguments)]
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: blake_round::ClaimGenerator,
         blake_round_sigma_state: &blake_round_sigma::ClaimGenerator,
         memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
@@ -79,6 +81,7 @@ pub trait BlakeRoundWitness: FromSimdColumns {
 
 impl BlakeRoundWitness for SimdBackend {
     fn write_trace(
+        _exec_context: &WitnessExecContext,
         gen: blake_round::ClaimGenerator,
         blake_round_sigma_state: &blake_round_sigma::ClaimGenerator,
         memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
@@ -104,6 +107,7 @@ impl BlakeRoundWitness for SimdBackend {
 
 impl BlakeRoundWitness for CudaBackend {
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: blake_round::ClaimGenerator,
         blake_round_sigma_state: &blake_round_sigma::ClaimGenerator,
         memory_address_to_id_state: &memory_address_to_id::ClaimGenerator,
@@ -190,11 +194,15 @@ impl BlakeRoundWitness for CudaBackend {
                 let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<
                     crate::witness::jit_prove_backend::BlakeRoundLane,
                 >(
+                    exec_context,
                     crate::witness::jit_prove_backend::BuiltinInputs::HostCols(&cols),
                     n_real,
                     mem,
                     Some(plan),
-                    Some("blake_g_state"),
+                    Some(crate::witness::jit_prove_backend::DeviceEdgeTarget {
+                        component: "blake_g",
+                        feed_state: "blake_g_state",
+                    }),
                     |sub_flat, n_padded, skip| {
                         blake_round::feed_sub_inputs_from_flat(
                             sub_flat,

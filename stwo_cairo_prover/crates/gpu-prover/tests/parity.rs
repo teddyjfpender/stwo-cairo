@@ -1,17 +1,17 @@
 //! The M1 exit gate (design §9): the gpu-native pipeline's proof is BYTE-IDENTICAL
 //! to the legacy `prove_cairo` proof on the same input and parameters.
 //!
-//! Runs on SimdBackend so the gate is LOCAL (no CUDA required); the pod manifest
-//! runs the same A/B on CudaBackend via `gpu_bench --engine`. Warm-path parity
-//! (second prove reusing the persistent caches) is asserted too — the persistent
-//! context must not change bytes.
+//! This is intentionally CUDA-only now: the GPU-native prover no longer accepts a
+//! generic backend, while the legacy SIMD path remains available as a separate
+//! reference oracle. Warm-path parity (second prove reusing persistent caches) is
+//! asserted too — the persistent context must not change bytes.
 
 #![cfg(feature = "slow-tests")]
 
 use cairo_vm::types::layout_name::LayoutName;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-use stwo::prover::backend::simd::SimdBackend;
+use stwo_backend_cuda::CudaBackend;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
 use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
@@ -30,7 +30,11 @@ where
 }
 
 #[test]
-fn gpu_native_parity_simd() {
+fn gpu_native_parity_cuda() {
+    if stwo_backend_cuda::gpu_memory_info() == (0, 0) {
+        eprintln!("CUDA unavailable; full gpu-native parity runs in the combined hardware gate");
+        return;
+    }
     let compiled_program =
         get_compiled_cairo_program_path("test_prove_verify_all_opcode_components");
     let run_input = || {
@@ -52,12 +56,11 @@ fn gpu_native_parity_simd() {
         opt_n_id_to_big_components: None,
     };
 
-    let legacy = prove_cairo::<SimdBackend, Blake2sMerkleChannel>(run_input(), params).unwrap();
+    let legacy = prove_cairo::<CudaBackend, Blake2sMerkleChannel>(run_input(), params).unwrap();
     let legacy_felts = serialize_felts(&legacy);
 
     let mut prover =
-        GpuCairoProver::<SimdBackend, Blake2sMerkleChannel>::new(GpuProverConfig::default())
-            .unwrap();
+        GpuCairoProver::<Blake2sMerkleChannel>::new(GpuProverConfig::default()).unwrap();
     let native = prover.prove(run_input(), params).unwrap();
     assert_eq!(
         legacy_felts,

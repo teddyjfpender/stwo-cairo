@@ -14,17 +14,25 @@ use num_traits::Zero;
 use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::circle::CanonicCoset;
+use stwo::core::proof_of_work::GrindOps;
 use stwo::core::utils::MaybeOwned;
 use stwo::prover::backend::{BackendForChannel, FromSimdColumns};
 use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
-use stwo::prover::{CommitmentSchemeProver, CommitmentTreeProver, ProvingError};
+use stwo::prover::{
+    CommitmentSchemeProver, CommitmentTreeProver, ProveExWithPcsDriverError, ProvingError,
+};
+use stwo_backend_cuda::{
+    aot, CudaBackend, CudaExecContext, CudaPcsDriverConfig, CudaPcsDriverError,
+    CudaPcsDriverTelemetry, CudaPcsRuntimeMode, CudaRuntimeError,
+};
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_prover::prover::ProverParameters;
 use stwo_cairo_prover::witness::base_trace::BaseTrace;
 use stwo_cairo_prover::witness::blake_g_witness_backend::BlakeGWitness;
 use stwo_cairo_prover::witness::blake_round_witness_backend::BlakeRoundWitness;
+use stwo_cairo_prover::witness::exec_context::WitnessArtifactPlan;
 use stwo_cairo_prover::witness::jit_prove_backend::{Cube252Witness, OpcodeJitBackend};
 use stwo_cairo_prover::witness::memory_witness_backend::MemoryIdToBigWitness;
 use stwo_cairo_prover::witness::pedersen_witness_backend::{
@@ -36,6 +44,10 @@ use stwo_cairo_prover::witness::utils::witness_trace_cells;
 use stwo_constraint_framework::{FrameworkBackend, LogupFinalizeBackend};
 use tracing::{span, Level};
 
+use crate::arena_plan::ProofArenaPlan;
+use crate::graphs::{GraphError, GraphWorkspace};
+use crate::schedule::ScheduleError;
+use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::state::{IngestOutput, WitnessOutput};
 use crate::{flags, phases};
 
@@ -111,7 +123,11 @@ impl<MC: MerkleChannel, B> CairoBackend<MC> for B where
 pub enum GpuError {
     /// Invalid configuration (e.g. a pipeline depth this milestone doesn't support).
     Config(String),
+    Schedule(ScheduleError),
     Proving(ProvingError),
+    PcsDriver(CudaPcsDriverError),
+    Runtime(CudaRuntimeError),
+    Graph(GraphError),
 }
 
 impl From<ProvingError> for GpuError {
@@ -120,11 +136,48 @@ impl From<ProvingError> for GpuError {
     }
 }
 
+impl From<ScheduleError> for GpuError {
+    fn from(e: ScheduleError) -> Self {
+        GpuError::Schedule(e)
+    }
+}
+
+impl From<CudaRuntimeError> for GpuError {
+    fn from(e: CudaRuntimeError) -> Self {
+        GpuError::Runtime(e)
+    }
+}
+
+impl From<CudaPcsDriverError> for GpuError {
+    fn from(e: CudaPcsDriverError) -> Self {
+        GpuError::PcsDriver(e)
+    }
+}
+
+impl From<ProveExWithPcsDriverError<CudaPcsDriverError>> for GpuError {
+    fn from(e: ProveExWithPcsDriverError<CudaPcsDriverError>) -> Self {
+        match e {
+            ProveExWithPcsDriverError::Proving(error) => GpuError::Proving(error),
+            ProveExWithPcsDriverError::PcsDriver(error) => GpuError::PcsDriver(error),
+        }
+    }
+}
+
+impl From<GraphError> for GpuError {
+    fn from(e: GraphError) -> Self {
+        GpuError::Graph(e)
+    }
+}
+
 impl std::fmt::Display for GpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GpuError::Config(msg) => write!(f, "gpu-prover config error: {msg}"),
+            GpuError::Schedule(e) => write!(f, "gpu-prover schedule error: {e}"),
             GpuError::Proving(e) => write!(f, "gpu-prover proving error: {e}"),
+            GpuError::PcsDriver(e) => write!(f, "gpu-prover CUDA PCS driver error: {e}"),
+            GpuError::Runtime(e) => write!(f, "gpu-prover CUDA runtime error: {e}"),
+            GpuError::Graph(e) => write!(f, "gpu-prover CUDA graph error: {e}"),
         }
     }
 }
@@ -172,20 +225,34 @@ impl Default for GpuProverConfig {
 /// Cached trees are intentionally leaked (`&'static`), matching the legacy
 /// pipeline's process-global caches: bounded by the number of distinct sizes and
 /// preprocessed configurations per process, shared read-only across proves.
-pub struct GpuCairoProver<B, MC>
+pub struct GpuCairoProver<MC>
 where
-    B: CairoBackend<MC>,
     MC: MerkleChannel + 'static,
+    CudaBackend: CairoBackend<MC>,
 {
     config: GpuProverConfig,
-    twiddles: HashMap<u32, &'static TwiddleTree<B>>,
-    preprocessed_trees: HashMap<u64, &'static CommitmentTreeProver<B, MC>>,
+    /// Isolated stream/pool reserved for the first proof-shape workspace. Once
+    /// the shape-derived arena is built this context moves into that arena.
+    runtime_context: Option<CudaExecContext>,
+    /// Materialized shape/protocol workspace. Until real PCS graph hooks are
+    /// installed, its presence disables detached proving rather than silently
+    /// ignoring the workspace.
+    graph_workspace: Option<GraphWorkspace>,
+    /// Architecture proof that the last successful gpu-native call used the
+    /// concrete CUDA PCS state machine and completed every stage exactly once.
+    last_pcs_telemetry: Option<CudaPcsDriverTelemetry>,
+    /// Provenance of every generated CUDA kernel lookup during the last proof.
+    /// Strict mode accepts only embedded-AOT loads/hits.
+    last_aot_stats: Option<aot::RuntimeStats>,
+    witness_artifact_plan: Arc<WitnessArtifactPlan>,
+    twiddles: HashMap<u32, &'static TwiddleTree<CudaBackend>>,
+    preprocessed_trees: HashMap<u64, &'static CommitmentTreeProver<CudaBackend, MC>>,
 }
 
-impl<B, MC> GpuCairoProver<B, MC>
+impl<MC> GpuCairoProver<MC>
 where
-    B: CairoBackend<MC>,
     MC: MerkleChannel + 'static,
+    CudaBackend: CairoBackend<MC>,
 {
     pub fn new(config: GpuProverConfig) -> Result<Self, GpuError> {
         if config.pipeline_depth != 1 {
@@ -194,11 +261,28 @@ where
                 config.pipeline_depth
             )));
         }
+        if config.strict {
+            let manifest_hash = aot::loaded_manifest_hash();
+            if manifest_hash == 0 {
+                return Err(GpuError::Config(
+                    "strict GPU-native mode requires a non-empty embedded AOT kernel pack"
+                        .to_string(),
+                ));
+            }
+            aot::require_loaded_kernels();
+        }
+        let witness_artifact_plan = Arc::new(CAIRO_SCHEDULE.artifact_plan()?);
         // The gpu-native engine defaults to the composed device configuration
         // (explicit env, including =0 kill switches, always wins) — design §3.
         crate::flags::apply_gpu_native_defaults();
+        let runtime_context = CudaExecContext::new()?;
         Ok(Self {
             config,
+            runtime_context: Some(runtime_context),
+            graph_workspace: None,
+            last_pcs_telemetry: None,
+            last_aot_stats: None,
+            witness_artifact_plan,
             twiddles: HashMap::new(),
             preprocessed_trees: HashMap::new(),
         })
@@ -208,7 +292,55 @@ where
         &self.config
     }
 
-    /// Prove one Cairo execution. Byte-identical to `prove_cairo::<B, MC>` on the
+    pub fn last_pcs_telemetry(&self) -> Option<&CudaPcsDriverTelemetry> {
+        self.last_pcs_telemetry.as_ref()
+    }
+
+    pub fn last_aot_stats(&self) -> Option<aot::RuntimeStats> {
+        self.last_aot_stats
+    }
+
+    pub fn graph_workspace(&self) -> Option<&GraphWorkspace> {
+        self.graph_workspace.as_ref()
+    }
+
+    /// Temporarily move the workspace out so real graph hooks may borrow its
+    /// captured segments while [`Self::prove_with_pcs_driver_config`] mutably
+    /// drives the prover. Reinstall it with [`Self::install_graph_workspace`].
+    pub fn take_graph_workspace(&mut self) -> Option<GraphWorkspace> {
+        self.graph_workspace.take()
+    }
+
+    pub fn install_graph_workspace(&mut self, workspace: GraphWorkspace) -> Result<(), GpuError> {
+        if self.graph_workspace.is_some() {
+            return Err(GpuError::Config(
+                "cannot replace a live graph workspace".to_string(),
+            ));
+        }
+        self.graph_workspace = Some(workspace);
+        Ok(())
+    }
+
+    /// Move this prover's isolated runtime context into a stable-address arena.
+    /// This only materializes ownership/liveness; it does not invent graph
+    /// captures or PCS hooks. [`Self::prove`] therefore fails closed until the
+    /// caller uses [`Self::prove_with_pcs_driver_config`] with real arena hooks.
+    pub fn materialize_graph_workspace(
+        &mut self,
+        plan: Arc<ProofArenaPlan>,
+    ) -> Result<(), GpuError> {
+        if self.graph_workspace.is_some() {
+            return Err(GpuError::Config(
+                "graph workspace is already materialized".to_string(),
+            ));
+        }
+        let context = self.runtime_context.take().ok_or_else(|| {
+            GpuError::Config("proof runtime context was already consumed".to_string())
+        })?;
+        self.install_graph_workspace(GraphWorkspace::from_plan(context, plan)?)
+    }
+
+    /// Prove one Cairo execution. Byte-identical to `prove_cairo::<CudaBackend, MC>` on the
     /// same input and parameters — the parity gate (design §9) holds at every
     /// milestone; only WHERE and WHEN values are computed changes as the pipeline
     /// deepens.
@@ -221,6 +353,42 @@ where
         input: ProverInput,
         params: ProverParameters,
     ) -> Result<CairoProof<MC::H>, GpuError> {
+        if self.config.strict {
+            return Err(GpuError::Config(
+                "strict GPU-native mode requires an explicit arena-bound PCS configuration"
+                    .to_string(),
+            ));
+        }
+        if self.graph_workspace.is_some() {
+            return Err(GpuError::Config(
+                "a graph workspace is materialized but no real PCS graph hooks were supplied; \
+                 call prove_with_pcs_driver_config with an arena-bound configuration"
+                    .to_string(),
+            ));
+        }
+        let mut pcs_driver_config = CudaPcsDriverConfig::detached_eager();
+        self.prove_with_pcs_driver_config(input, params, &mut pcs_driver_config)
+    }
+
+    /// Explicit PCS-driver entry point. A future workspace integration constructs
+    /// `CudaPcsDriverConfig::arena_graph` with real captured-segment hooks and
+    /// enters here; the default [`Self::prove`] uses detached eager mode only when
+    /// no workspace has been materialized.
+    pub fn prove_with_pcs_driver_config(
+        &mut self,
+        input: ProverInput,
+        params: ProverParameters,
+        pcs_driver_config: &mut CudaPcsDriverConfig<'_>,
+    ) -> Result<CairoProof<MC::H>, GpuError> {
+        if self.config.strict && pcs_driver_config.runtime_mode() != CudaPcsRuntimeMode::ArenaGraph
+        {
+            return Err(GpuError::Config(
+                "strict GPU-native mode rejects detached PCS execution".to_string(),
+            ));
+        }
+        self.last_pcs_telemetry = None;
+        self.last_aot_stats = None;
+        aot::reset_runtime_stats();
         // Same top-level span name as the legacy engine: the phase-ledger tooling
         // keys on span names; the bench record's `engine` field disambiguates.
         let _span = span!(Level::INFO, "prove_cairo").entered();
@@ -257,7 +425,12 @@ where
         let IngestOutput {
             preprocessed_trace,
             generator,
-        } = phases::ingest::run(input, preprocessed_trace_variant);
+            proof_plan,
+        } = phases::ingest::run(
+            input,
+            preprocessed_trace_variant,
+            opt_n_id_to_big_components,
+        );
 
         // ── Phase: witness ───────────────────────────────────────────────────
         // Pipelined commit (M5b): on a WARM process the largest cached twiddle
@@ -278,7 +451,14 @@ where
             trace,
             claim,
             interaction_generator,
-        } = phases::witness::run::<B>(generator, opt_n_id_to_big_components, pipeline_twiddles);
+            device,
+        } = phases::witness::run::<CudaBackend>(
+            generator,
+            Arc::clone(&self.witness_artifact_plan),
+            proof_plan,
+            opt_n_id_to_big_components,
+            pipeline_twiddles,
+        );
         vram_phase_mark("witness");
 
         // ── Domain sizing + persistent caches ────────────────────────────────
@@ -308,30 +488,31 @@ where
         // twiddle tree that built its coeffs+Merkle (the soundness guard).
         let rebuild_owned = (low_memory && !stream_lde)
             || (stream_lde && flags::flag_on("STWO_DIET_REBUILD_PREPROCESSED"));
-        let preprocessed_tree: MaybeOwned<'_, CommitmentTreeProver<B, MC>> = if rebuild_owned {
-            MaybeOwned::Owned(phases::commit::build_preprocessed_tree(
-                preprocessed_trace.clone(),
-                twiddles,
-                &pcs_config,
-                store_polynomials_coefficients,
-                &base_column_pool,
-            ))
-        } else {
-            MaybeOwned::Borrowed(self.preprocessed_tree(
-                &preprocessed_trace,
-                twiddles,
-                &pcs_config,
-                store_polynomials_coefficients,
-                &base_column_pool,
-                max_domain_log_size,
-            ))
-        };
+        let preprocessed_tree: MaybeOwned<'_, CommitmentTreeProver<CudaBackend, MC>> =
+            if rebuild_owned {
+                MaybeOwned::Owned(phases::commit::build_preprocessed_tree(
+                    preprocessed_trace.clone(),
+                    twiddles,
+                    &pcs_config,
+                    store_polynomials_coefficients,
+                    &base_column_pool,
+                ))
+            } else {
+                MaybeOwned::Borrowed(self.preprocessed_tree(
+                    &preprocessed_trace,
+                    twiddles,
+                    &pcs_config,
+                    store_polynomials_coefficients,
+                    &base_column_pool,
+                    max_domain_log_size,
+                ))
+            };
 
         // ── Transcript spine ─────────────────────────────────────────────────
         let channel = &mut MC::C::default();
         channel.mix_felts(&[channel_salt.into()]);
         pcs_config.mix_into(channel);
-        let mut commitment_scheme = CommitmentSchemeProver::<B, MC>::with_memory_pool(
+        let mut commitment_scheme = CommitmentSchemeProver::<CudaBackend, MC>::with_memory_pool(
             pcs_config,
             twiddles,
             &base_column_pool,
@@ -362,7 +543,7 @@ where
                 // mid-process trace-size change (a stale tree would silently
                 // fork the proof).
                 assert_eq!(
-                    tree_ptr, twiddles as *const TwiddleTree<B> as usize,
+                    tree_ptr, twiddles as *const TwiddleTree<CudaBackend> as usize,
                     "STWO_CUDA_PIPELINED_COMMIT: committer tree is not the commitment tree \
                      (trace size changed mid-process)"
                 );
@@ -373,13 +554,13 @@ where
         span.exit();
         vram_phase_mark("base_commit");
 
-        let interaction_pow = B::grind(channel, INTERACTION_POW_BITS);
+        let interaction_pow = CudaBackend::grind(channel, INTERACTION_POW_BITS);
         channel.mix_u64(interaction_pow);
         let interaction_elements = CommonLookupElements::draw(channel);
 
         // ── Phase: interaction ───────────────────────────────────────────────
         let (interaction_trace_evals, interaction_claim) =
-            phases::interaction::run(interaction_generator, &interaction_elements);
+            phases::interaction::run(interaction_generator, &device, &interaction_elements);
         vram_phase_mark("interaction_write");
 
         tracing::info!(
@@ -400,7 +581,7 @@ where
         vram_phase_mark("interaction_commit");
 
         // ── Phase: STARK core (composition + FRI + PoW + decommit) ──────────
-        let proof = phases::stark::run(
+        let (proof, pcs_telemetry) = phases::stark::run(
             &claim,
             &interaction_elements,
             &interaction_claim,
@@ -408,7 +589,31 @@ where
             channel,
             commitment_scheme,
             include_all_preprocessed_columns,
+            pcs_driver_config,
         )?;
+
+        tracing::info!(
+            architecture = pcs_telemetry.architecture,
+            runtime_mode = ?pcs_telemetry.runtime_mode,
+            stage_finished = ?pcs_telemetry.stage_finished,
+            batched_tree_decommit = pcs_telemetry.batched_tree_decommit,
+            "CUDA PCS architecture telemetry"
+        );
+        self.last_pcs_telemetry = Some(pcs_telemetry);
+
+        let aot_stats = aot::runtime_stats();
+        if self.config.strict
+            && (aot_stats.aot_misses != 0
+                || aot_stats.runtime_loads != 0
+                || aot_stats.runtime_cache_hits != 0
+                || aot_stats.strict_rejections != 0)
+        {
+            return Err(GpuError::Config(format!(
+                "strict GPU-native AOT provenance failed: {aot_stats:?}"
+            )));
+        }
+        tracing::info!(?aot_stats, "CUDA AOT provenance telemetry");
+        self.last_aot_stats = Some(aot_stats);
 
         vram_phase_mark("stark_core");
 
@@ -424,10 +629,10 @@ where
 
     /// The twiddle tree for `log_size`, built once per prover instance and leaked
     /// (`&'static` — required by downstream borrows and the M6 committer pattern).
-    fn twiddle_tree(&mut self, log_size: u32) -> &'static TwiddleTree<B> {
+    fn twiddle_tree(&mut self, log_size: u32) -> &'static TwiddleTree<CudaBackend> {
         let _span = span!(Level::INFO, "Precompute Twiddles").entered();
         *self.twiddles.entry(log_size).or_insert_with(|| {
-            Box::leak(Box::new(B::precompute_twiddles(
+            Box::leak(Box::new(CudaBackend::precompute_twiddles(
                 CanonicCoset::new(log_size).circle_domain().half_coset,
             )))
         })
@@ -440,12 +645,12 @@ where
         preprocessed_trace: &Arc<
             stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace,
         >,
-        twiddles: &'static TwiddleTree<B>,
+        twiddles: &'static TwiddleTree<CudaBackend>,
         pcs_config: &stwo::core::pcs::PcsConfig,
         store_polynomials_coefficients: bool,
-        base_column_pool: &BaseColumnPool<B>,
+        base_column_pool: &BaseColumnPool<CudaBackend>,
         max_domain_log_size: u32,
-    ) -> &'static CommitmentTreeProver<B, MC> {
+    ) -> &'static CommitmentTreeProver<CudaBackend, MC> {
         let mut hasher = DefaultHasher::new();
         for id in preprocessed_trace.ids() {
             id.id.hash(&mut hasher);
@@ -496,7 +701,7 @@ where
                 );
             }
         }
-        let leaked: &'static CommitmentTreeProver<B, MC> = Box::leak(Box::new(tree));
+        let leaked: &'static CommitmentTreeProver<CudaBackend, MC> = Box::leak(Box::new(tree));
         self.preprocessed_trees.insert(key, leaked);
         leaked
     }

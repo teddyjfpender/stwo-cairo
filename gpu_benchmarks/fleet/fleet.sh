@@ -73,6 +73,13 @@
 #   STALL_SECS     Declare a pod stalled when its stderr size AND GPU util are both
 #                  frozen for this long (default 600).
 #   MAX_WAIT       Hard cap on waiting for the fleet (default 10800 = 3h).
+#   GATE_PIE       Remote correctness-gate PIE path. Explicitly point this at
+#                  .../pie/sn/SN_PIE_2.zip if the smaller 10-transfer PIE is absent.
+#   POD_BOOTLOADER_JSON Stable remote bootloader path preflighted and exported for
+#                  every gate/benchmark. Default: /workspace/bench_inputs/
+#                  simple_bootloader_compiled.json.
+#   GPU_PCS_RUNTIME_MODE Required typed CUDA PCS mode for every run: detached-eager
+#                  (default) or arena-graph (strict future gate).
 #
 # NOTE: only same-pod comparisons are meaningful (community-host variance). The
 # aggregate is a SUM across heterogeneous pods — a fleet capacity number, not a
@@ -83,14 +90,17 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration (all paths as variables, up top)
 # ---------------------------------------------------------------------------
-STWO_LOCAL="/Users/theodorepender/code/personal/stwo"
-CAIRO_LOCAL="/Users/theodorepender/code/personal/stwo-cairo"
-FLEET_DIR="${CAIRO_LOCAL}/gpu_benchmarks/fleet"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CAIRO_LOCAL="${CAIRO_LOCAL:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+STWO_LOCAL="${STWO_LOCAL:-${CAIRO_LOCAL}/../stwo}"
+FLEET_DIR="${SCRIPT_DIR}"
 LOOP_DIR="${CAIRO_LOCAL}/gpu_benchmarks/loop"
 BENCH_LOOP="${LOOP_DIR}/bench_loop.sh"
-RESULTS_DIR="${FLEET_DIR}/results"
+RESULTS_DIR="${RESULTS_DIR:-${FLEET_DIR}/results}"
 FLEET_CONF="${FLEET_CONF:-${FLEET_DIR}/fleet.conf}"
-REPORT="${FLEET_DIR}/fleet_report.json"
+REPORT="${REPORT:-${FLEET_DIR}/fleet_report.json}"
+INPUT_SHA256SUMS="${CAIRO_LOCAL}/gpu_benchmarks/pie/SHA256SUMS"
+ARCHITECTURE_CHECK="${CAIRO_LOCAL}/gpu_benchmarks/validate_architecture_record.py"
 
 # Pod repos + binary (identical layout to the loop).
 CAIRO_POD="/workspace/stwo-cairo"
@@ -100,7 +110,8 @@ POD_USER="root"
 
 # PIE inputs on the pod (already present, hash-verified — never synced).
 POD_SN_DIR="${CAIRO_POD}/gpu_benchmarks/pie/sn"
-POD_GATE_PIE="${CAIRO_POD}/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip"
+POD_GATE_PIE="${GATE_PIE:-${CAIRO_POD}/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip}"
+POD_BOOTLOADER_JSON="${POD_BOOTLOADER_JSON:-/workspace/bench_inputs/simple_bootloader_compiled.json}"
 
 # Pod scratch (outside the repo tree so no sync ever touches it).
 POD_RUN_DIR="/workspace/fleet_runs"
@@ -108,6 +119,8 @@ POD_RUN_DIR="/workspace/fleet_runs"
 # Prover knobs.
 RUST_MIN_STACK_VAL=4194304
 BENCH_ENV="${BENCH_ENV:-}"
+GPU_PCS_RUNTIME_MODE="${GPU_PCS_RUNTIME_MODE:-detached-eager}"
+GPU_NATIVE_ARGS="--engine gpu-native --require-gpu-native-architecture --require-gpu-pcs-runtime-mode ${GPU_PCS_RUNTIME_MODE}"
 
 # Rotate (pipeline) parameters.
 FLEET_REPS="${FLEET_REPS:-8}"
@@ -146,7 +159,18 @@ dry()  { echo "[DRY_RUN] $*" >&2; }
 warn() { echo "[fleet][WARN] $*" >&2; }
 die()  { echo "[fleet][FATAL] $*" >&2; exit 1; }
 
-usage() { sed -n '2,90p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,84p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit "${1:-0}"; }
+
+[[ -d "$CAIRO_LOCAL/.git" ]] || die "missing stwo-cairo checkout: $CAIRO_LOCAL"
+[[ -d "$STWO_LOCAL/.git" ]] || die "missing sibling stwo checkout: $STWO_LOCAL"
+[[ -f "$INPUT_SHA256SUMS" ]] || die "input checksum manifest missing: $INPUT_SHA256SUMS"
+[[ -f "$ARCHITECTURE_CHECK" ]] || die "architecture record validator missing: $ARCHITECTURE_CHECK"
+STWO_LOCAL="$(cd "$STWO_LOCAL" && pwd)"
+
+case "$GPU_PCS_RUNTIME_MODE" in
+  detached-eager|arena-graph) ;;
+  *) die "GPU_PCS_RUNTIME_MODE must be detached-eager or arena-graph (got '$GPU_PCS_RUNTIME_MODE')" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -176,6 +200,8 @@ if [[ -n "$BENCH_ENV" ]]; then
   for kv in $BENCH_ENV; do
     [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*$ ]] \
       || die "BENCH_ENV token '$kv' is not K=V (values must not contain spaces)"
+    [[ "${kv%%=*}" != "STWO_BOOTLOADER_JSON" ]] \
+      || die "STWO_BOOTLOADER_JSON is reserved; set POD_BOOTLOADER_JSON instead"
   done
 fi
 
@@ -290,6 +316,37 @@ pssh() {
     "${POD_USER}@${POD_HOSTS[$idx]}" "$@"
 }
 
+expected_sha256() {
+  awk -v file="$(basename "$1")" '$2 == file { print $1; exit }' "$INPUT_SHA256SUMS"
+}
+
+[[ -n "$(expected_sha256 "$POD_BOOTLOADER_JSON")" ]] \
+  || die "pinned bootloader checksum missing from $INPUT_SHA256SUMS: $(basename "$POD_BOOTLOADER_JSON")"
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else LC_ALL=C shasum -a 256; fi
+}
+
+preflight_pod_inputs() {
+  local idx="$1" path expected quoted_path quoted_expected
+  local remote_cmd='missing=0; hash_input() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d" " -f1; else LC_ALL=C shasum -a 256 "$1" | cut -d" " -f1; fi; };'
+  local -a paths=("$POD_BOOTLOADER_JSON") bench_paths=()
+  [[ "$SKIP_GATE" == "1" ]] || paths+=("$POD_GATE_PIE")
+  IFS=',' read -r -a bench_paths <<<"$PIE_LIST"
+  paths+=("${bench_paths[@]}")
+
+  for path in "${paths[@]}"; do
+    expected="$(expected_sha256 "$path")"
+    printf -v quoted_path '%q' "$path"
+    printf -v quoted_expected '%q' "$expected"
+    remote_cmd+=" path=${quoted_path}; expected=${quoted_expected}; if [ ! -f \"\$path\" ]; then echo \"MISSING required input: \$path\" >&2; missing=1; else actual=\$(hash_input \"\$path\"); echo \"\$actual  \$path\"; if [ -n \"\$expected\" ] && [ \"\$actual\" != \"\$expected\" ]; then echo \"SHA-256 mismatch: \$path (expected \$expected, got \$actual)\" >&2; missing=1; fi; fi;"
+  done
+  remote_cmd+=' exit $missing'
+
+  log "preflight[${POD_IDS[$idx]}]: required gate/benchmark fixtures and pinned bootloader"
+  pssh "$idx" "$remote_cmd"
+}
+
 # ---------------------------------------------------------------------------
 # (a) Provenance capture (shared across the whole fleet run)
 # ---------------------------------------------------------------------------
@@ -298,7 +355,7 @@ git_dirty() {
   local repo="$1"
   if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then echo "NOGIT"; return; fi
   if git -C "$repo" diff --quiet HEAD 2>/dev/null; then echo "clean"; return; fi
-  git -C "$repo" diff HEAD 2>/dev/null | shasum -a 256 | cut -c1-16
+  git -C "$repo" diff HEAD 2>/dev/null | sha256_stream | cut -c1-16
 }
 
 # ---------------------------------------------------------------------------
@@ -338,6 +395,7 @@ export RUST_MIN_STACK=${RUST_MIN_STACK_VAL}
 export STWO_BENCH_TRACE=json
 export STWO_JIT_LOG=1
 ${BENCH_ENV:+export ${BENCH_ENV}}
+export STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}'
 echo \$\$ > '${pod_pgid}'
 ./${BIN} ${args} > '${pod_out}' 2> '${pod_err}' &
 GB_PID=\$!
@@ -358,10 +416,10 @@ EOF
 poll_stage() {
   local stage="$1"; shift
   local -a active=("$@")
-  local -A done sig_at last_sig
+  local -a finished sig_at last_sig
   local idx tag pod_rc pod_err pod_pid pod_pgid st err_size gpu_util sig now waited=0
   local now0; now0="$(date +%s)"
-  for idx in "${active[@]}"; do done[$idx]=0; sig_at[$idx]="$now0"; last_sig[$idx]="__init__"; done
+  for idx in "${active[@]}"; do finished[$idx]=0; sig_at[$idx]="$now0"; last_sig[$idx]="__init__"; done
 
   # DRY_RUN: nothing is really running — resolve immediately (stall simulated at fetch).
   if [[ "$DRY_RUN" == "1" ]]; then
@@ -372,7 +430,7 @@ poll_stage() {
   while true; do
     local remaining=0
     for idx in "${active[@]}"; do
-      [[ "${done[$idx]}" == "1" ]] && continue
+      [[ "${finished[$idx]}" == "1" ]] && continue
       remaining=1
       tag="$(podtag "$idx" "$stage")"
       pod_rc="${POD_RUN_DIR}/${tag}.rc"
@@ -382,7 +440,7 @@ poll_stage() {
       st="$(pssh "$idx" "if [ -f '${pod_rc}' ]; then echo DONE; fi; \
              echo SIZE=\$(stat -c %s '${pod_err}' 2>/dev/null || echo 0); \
              echo GPU=\$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1); true" || true)"
-      if printf '%s\n' "$st" | grep -q '^DONE$'; then done[$idx]=1; continue; fi
+      if printf '%s\n' "$st" | grep -q '^DONE$'; then finished[$idx]=1; continue; fi
 
       err_size="$(printf '%s\n' "$st" | sed -n 's/^SIZE=//p' | head -1)"
       gpu_util="$(printf '%s\n' "$st" | sed -n 's/^GPU=//p' | head -1)"
@@ -405,7 +463,7 @@ poll_stage() {
                  if [ -n \"\$pgid\" ]; then kill -TERM -\"\$pgid\" 2>/dev/null; sleep 3; \
                  kill -KILL -\"\$pgid\" 2>/dev/null; fi; true" || true
         POD_RC[$idx]="STALLED"; POD_STALL[$idx]="$stall_file"
-        done[$idx]=1
+        finished[$idx]=1
         log "stall evidence for '${POD_IDS[$idx]}' written to ${stall_file}"
       fi
     done
@@ -455,6 +513,43 @@ fetch_pod() {
   POD_RC[$idx]="$rc"
 }
 
+# A stale pre-contract binary silently ignores unknown CLI flags. Exit status alone
+# therefore cannot prove that all gate repetitions were verified and compared.
+gate_contract_ok() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+record = None
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and "verified_reps" in candidate:
+                record = candidate
+except OSError as error:
+    print(f"gate contract: cannot read output: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+required = {
+    "verified_reps": 2,
+    "proof_comparison_applicable": True,
+    "proof_byte_equal_required": True,
+    "proof_byte_equal": True,
+}
+if record is None or any(record.get(key) != value for key, value in required.items()):
+    print(f"gate contract missing or false: expected {required}, got {record}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+architecture_contract_ok() {
+  python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE"
+}
+
 # ---------------------------------------------------------------------------
 # Synthetic per-pod output for DRY_RUN (main record + pipeline record for the
 # rotate stream, so aggregation has real numbers to chew on offline).
@@ -464,13 +559,17 @@ synth_pod_out() {
   local id="${POD_IDS[$idx]}"
   local seed=$(( $(printf '%s' "$id" | cksum | cut -d' ' -f1) % 60 ))
   local sum; sum="$(awk -v s="$seed" 'BEGIN{printf "%.3f", 1.4 + s/60.0}')"   # ~1.4–2.4
+  local runtime_report="DetachedEager"
+  [[ "$GPU_PCS_RUNTIME_MODE" == "arena-graph" ]] && runtime_report="ArenaGraph"
+  local stage_counts='{"OodsEvaluation":1,"QuotientAndCompaction":1,"FriCommitAndFold":1,"ProofOfWork":1,"FriQueryAndDecommit":1,"TreeDecommit":1,"Assembly":1}'
+  local architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true'
   if [[ "$stage" == "gate" ]]; then
-    echo "{\"program\":\"gate_10t\",\"backend\":\"cuda\",\"verify_ms\":41.0,\"proof_kb\":2897.5}" > "$dest"
+    echo "{\"program\":\"gate_10t\",\"backend\":\"cuda\",${architecture_fields},\"verify_ms\":41.0,\"verified_reps\":2,\"proof_kb\":2897.5,\"proof_comparison_applicable\":true,\"proof_byte_equal\":true,\"proof_byte_equal_required\":true}" > "$dest"
     return 0
   fi
   {
     echo "{\"rep\":0,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":17250.0}}}"
-    echo "{\"program\":\"SN_PIE_2.zip\",\"backend\":\"cuda\",\"n\":1,\"cycle_count\":7980000,\"pie_n_steps\":7706864,\"prove_s_warm\":31.6,\"verify_ms\":24.0,\"proof_kb\":3006.6,\"peak_rss_gb\":29.0,\"vram_peak_gb\":36.2,\"mhz\":0.244,\"useful_mhz\":${sum},\"security_bits\":96,\"n_queries\":70,\"pow_bits\":26,\"gpu\":\"${POD_GPUS[$idx]}\"}"
+    echo "{\"program\":\"SN_PIE_2.zip\",\"backend\":\"cuda\",${architecture_fields},\"n\":1,\"cycle_count\":7980000,\"pie_n_steps\":7706864,\"prove_s_warm\":31.6,\"prove_s_warm_median\":33.2,\"verify_ms\":24.0,\"proof_kb\":3006.6,\"peak_rss_gb\":29.0,\"vram_peak_gb\":36.2,\"mhz\":0.244,\"mhz_median\":0.232,\"useful_mhz\":${sum},\"useful_mhz_median\":$(awk -v m="$sum" 'BEGIN{printf "%.3f", m*0.95}'),\"security_bits\":96,\"n_queries\":70,\"pow_bits\":26,\"gpu\":\"${POD_GPUS[$idx]}\"}"
     echo "{\"pipeline\":${FLEET_DEPTH},\"producers\":${FLEET_PRODUCERS},\"pie_mode\":\"rotate\",\"reps\":${FLEET_REPS},\"total_s\":202.8,\"feed_starved_s\":0.0,\"sustained_steps_per_s\":$(awk -v m="$sum" 'BEGIN{printf "%.1f", m*1e6}'),\"sustained_mhz\":$(awk -v m="$sum" 'BEGIN{printf "%.3f", m*1.03}'),\"sustained_useful_mhz\":${sum}}"
   } > "$dest"
 }
@@ -495,6 +594,14 @@ run_stage() {
   poll_stage "$stage" "${active[@]}"
   for idx in "${active[@]}"; do
     fetch_pod "$idx" "$stage" "$args"
+    if [[ "$stage" == "gate" && "${POD_RC[$idx]}" == "0" ]] \
+       && ! gate_contract_ok "${POD_OUT[$idx]}"; then
+      POD_RC[$idx]="GATE_CONTRACT"
+    fi
+    if [[ "${POD_RC[$idx]}" == "0" && "$args" == *"--require-gpu-native-architecture"* ]] \
+       && ! architecture_contract_ok "${POD_OUT[$idx]}"; then
+      POD_RC[$idx]="ARCHITECTURE_CONTRACT"
+    fi
     case "${POD_RC[$idx]}" in
       0)       POD_STATUS[$idx]="ok" ;;
       STALLED) POD_STATUS[$idx]="stalled";
@@ -521,6 +628,8 @@ CAIRO_REV="$(git_rev "$CAIRO_LOCAL")"; CAIRO_DIRTY="$(git_dirty "$CAIRO_LOCAL")"
 log "=== fleet start: ${#POD_IDS[@]} pod(s), pies=${PIES}, reps=${FLEET_REPS} depth=${FLEET_DEPTH} producers=${FLEET_PRODUCERS}, dry=${DRY_RUN} ==="
 log "provenance: stwo=${STWO_REV:0:12} dirty=${STWO_DIRTY} | cairo=${CAIRO_REV:0:12} dirty=${CAIRO_DIRTY}"
 [[ -n "$BENCH_ENV" ]] && log "bench_env: ${BENCH_ENV} (recorded in the report; not comparable with clean runs)"
+log "bootloader: ${POD_BOOTLOADER_JSON} (pinned, exported for every launch)"
+log "GPU-native architecture gate: required mode=${GPU_PCS_RUNTIME_MODE}"
 [[ "$SKIP_GATE" == "1" ]] && warn "--skip-gate: correctness gate DISABLED — report will be marked UNGATED."
 
 # (b) Optional prep: reuse bench_loop.sh --gate-only per pod (sync + build + gate).
@@ -530,6 +639,8 @@ if [[ "$PREP" == "1" ]]; then
   for idx in "${!POD_IDS[@]}"; do
     log "prep[${POD_IDS[$idx]}] ..."
     if BENCH_POD_ID="${POD_IDS[$idx]}" DRY_RUN="$DRY_RUN" BENCH_ENV="$BENCH_ENV" \
+         GPU_PCS_RUNTIME_MODE="$GPU_PCS_RUNTIME_MODE" \
+         POD_BOOTLOADER_JSON="$POD_BOOTLOADER_JSON" \
          "$BENCH_LOOP" --gate-only >&2; then
       log "prep[${POD_IDS[$idx]}] OK"
     else
@@ -548,6 +659,12 @@ for idx in "${!POD_IDS[@]}"; do
   fi
 done
 
+for idx in "${!POD_IDS[@]}"; do
+  [[ "${POD_STATUS[$idx]}" == "pending" || "${POD_STATUS[$idx]}" == "ok" ]] || continue
+  preflight_pod_inputs "$idx" \
+    || die "required input missing on pod '${POD_IDS[$idx]}'; seed it explicitly or update GATE_PIE/--pies"
+done
+
 # (d) Correctness GATE on every pod concurrently (unless --skip-gate or --prep already
 #     gated). Gate-first discipline: perf is never reported for a pod that failed here.
 GATED="gated"
@@ -557,12 +674,12 @@ elif [[ "$PREP" == "1" ]]; then
   GATED="gated(prep)"
   log "=== gate: already run by --prep; skipping the standalone gate stage ==="
 else
-  GATE_ARGS="--pie ${POD_GATE_PIE} --backend cuda --reps 1 --reuse-input"
+  GATE_ARGS="--pie ${POD_GATE_PIE} --backend cuda ${GPU_NATIVE_ARGS} --reps 2 --reuse-input --require-proof-byte-equal"
   run_stage "gate" "$GATE_ARGS" "gate_failed"
 fi
 
 # (e) Benchmark: one rotate-mode pipelined stream per pod, all pods at once.
-BENCH_ARGS="--pie ${PIE_LIST} --backend cuda --reps ${FLEET_REPS} --pipeline ${FLEET_DEPTH} --producers ${FLEET_PRODUCERS} --pie-mode rotate"
+BENCH_ARGS="--pie ${PIE_LIST} --backend cuda ${GPU_NATIVE_ARGS} --reps ${FLEET_REPS} --pipeline ${FLEET_DEPTH} --producers ${FLEET_PRODUCERS} --pie-mode rotate"
 # Reset survivors to "pending" so run_stage re-activates exactly the gate survivors.
 for idx in "${!POD_IDS[@]}"; do [[ "${POD_STATUS[$idx]}" == "ok" ]] && POD_STATUS[$idx]="pending"; done
 run_stage "bench" "$BENCH_ARGS" "run_failed"
@@ -586,6 +703,7 @@ done
 FL_TS="$TS" FL_STWO_REV="$STWO_REV" FL_STWO_DIRTY="$STWO_DIRTY" \
 FL_CAIRO_REV="$CAIRO_REV" FL_CAIRO_DIRTY="$CAIRO_DIRTY" \
 FL_MANIFEST="$MANIFEST" FL_REPORT="$REPORT" FL_BENCH_ENV="$BENCH_ENV" \
+FL_GPU_PCS_RUNTIME_MODE="$GPU_PCS_RUNTIME_MODE" \
 FL_PIES="$PIES" FL_REPS="$FLEET_REPS" FL_DEPTH="$FLEET_DEPTH" FL_PRODUCERS="$FLEET_PRODUCERS" \
 FL_GATED="$GATED" FL_TARGET_LO="$TARGET_LO_MHZ" FL_TARGET_HI="$TARGET_HI_MHZ" \
 python3 - <<'PY'
@@ -615,11 +733,11 @@ def parse_out(path):
     return rec, pipe
 
 def pod_mhz(rec, pipe):
-    """Per-pod useful MHz: sustained (pipelined) if present, else single-prove useful_mhz."""
+    """Per-pod claim MHz: sustained pipeline rate, else fixed-statement median."""
     if pipe and pipe.get("sustained_useful_mhz") is not None:
         return pipe["sustained_useful_mhz"], "sustained_useful_mhz"
-    if rec and rec.get("useful_mhz") is not None:
-        return rec.get("useful_mhz"), "useful_mhz"
+    if rec and rec.get("useful_mhz_median") is not None:
+        return rec.get("useful_mhz_median"), "useful_mhz_median"
     return None, None
 
 pods = []
@@ -643,6 +761,9 @@ with open(manifest) as f:
             "useful_mhz": mhz, "mhz_basis": basis,
             "feed_starved_s": (pipe or {}).get("feed_starved_s"),
             "vram_peak_gb": (rec or {}).get("vram_peak_gb"),
+            "gpu_pcs_driver_architecture": (rec or {}).get("gpu_pcs_driver_architecture"),
+            "gpu_pcs_runtime_mode": (rec or {}).get("gpu_pcs_runtime_mode"),
+            "gpu_native_architecture_gate_passed": (rec or {}).get("gpu_native_architecture_gate_passed"),
             "usd_per_mhz_hr": (round(usd_f / mhz, 4) if (usd_f and mhz) else None),
             "out_file": out or None,
         }
@@ -686,6 +807,7 @@ report_obj = {
     "stwo_rev": os.environ["FL_STWO_REV"], "stwo_dirty": os.environ["FL_STWO_DIRTY"],
     "cairo_rev": os.environ["FL_CAIRO_REV"], "cairo_dirty": os.environ["FL_CAIRO_DIRTY"],
     "bench_env": os.environ.get("FL_BENCH_ENV", ""),
+    "gpu_pcs_runtime_mode_required": os.environ["FL_GPU_PCS_RUNTIME_MODE"],
     "gated": os.environ["FL_GATED"],
     "pies": os.environ["FL_PIES"],
     "reps": int(os.environ["FL_REPS"]),

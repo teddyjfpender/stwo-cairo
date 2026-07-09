@@ -56,6 +56,7 @@ use crate::witness::components::{
     blake_g, verify_bitwise_xor_12, verify_bitwise_xor_4, verify_bitwise_xor_7,
     verify_bitwise_xor_8, verify_bitwise_xor_9,
 };
+use crate::witness::exec_context::WitnessExecContext;
 use crate::witness::prelude::Mutex;
 
 type Evals<B> = Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>;
@@ -85,6 +86,7 @@ pub trait BlakeGWitness: FromSimdColumns + LogupFinalizeBackend {
     /// multiplicity families, and returns the claim plus the interaction state.
     /// Trace/claim bytes must be identical to the host writer's.
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: blake_g::ClaimGenerator,
         xor8: &verify_bitwise_xor_8::ClaimGenerator,
         xor12: &verify_bitwise_xor_12::ClaimGenerator,
@@ -105,6 +107,7 @@ impl BlakeGWitness for SimdBackend {
     type InteractionGen = blake_g::InteractionClaimGenerator;
 
     fn write_trace(
+        _exec_context: &WitnessExecContext,
         gen: blake_g::ClaimGenerator,
         xor8: &verify_bitwise_xor_8::ClaimGenerator,
         xor12: &verify_bitwise_xor_12::ClaimGenerator,
@@ -143,6 +146,7 @@ impl BlakeGWitness for CudaBackend {
     type InteractionGen = CudaBlakeGInteractionGen;
 
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: blake_g::ClaimGenerator,
         xor8: &verify_bitwise_xor_8::ClaimGenerator,
         xor12: &verify_bitwise_xor_12::ClaimGenerator,
@@ -154,11 +158,11 @@ impl BlakeGWitness for CudaBackend {
             // The blake_round producer may have stashed the edge and skipped
             // the host blake_g feed; rebuild the inputs from the stashed HOST
             // flat before the host writer runs (exactly-once feeds).
-            if let Some((_dev, sub_host, prod_rows)) =
-                crate::witness::jit_prove_backend::take_edge("blake_g_state")
-            {
+            if let Some(edge) = exec_context.take_edge("blake_round", "blake_g") {
                 crate::witness::components::blake_round::feed_blake_g_inputs_from_flat(
-                    &sub_host, prod_rows, &gen,
+                    &edge.host_flat,
+                    edge.n_rows,
+                    &gen,
                 );
             }
             let (trace, claim, interaction_gen) = gen.write_trace(xor8, xor12, xor4, xor7, xor9);
@@ -174,18 +178,23 @@ impl BlakeGWitness for CudaBackend {
         // straight from it; any failure rebuilds the generator's inputs on CPU
         // from the stashed HOST flat and falls through to the host-built path.
         let mut edge_inputs: Option<(stwo_backend_cuda::BaseFieldVec, usize)> = None;
-        if let Some((sub_dev, sub_host, prod_rows)) =
-            crate::witness::jit_prove_backend::take_edge("blake_g_state")
-        {
-            let n_rows_edge = 8 * prod_rows;
+        if let Some(edge) = exec_context.take_edge("blake_round", "blake_g") {
+            let plan = edge.plan;
+            assert_eq!(
+                plan.words_per_instance, 6,
+                "blake_g edge ABI requires six words per instance"
+            );
+            let n_rows_edge = plan.n_instances as usize * edge.n_rows;
             let column_length = std::cmp::max(n_rows_edge.next_power_of_two(), N_LANES);
-            let out = stwo_backend_cuda::BaseFieldVec::new_zeroes(column_length * 6);
+            let out = stwo_backend_cuda::BaseFieldVec::new_zeroes(
+                column_length * plan.words_per_instance as usize,
+            );
             let rc = unsafe {
                 stwo_backend_cuda_kernels::raw::stwo_blake_g_inputs_from_sub(
-                    sub_dev.device_ptr,
-                    prod_rows as u32,
-                    81,
-                    8,
+                    edge.buffer.device_ptr,
+                    edge.n_rows as u32,
+                    plan.word_base,
+                    plan.n_instances,
                     column_length as u32,
                     out.device_ptr.cast_mut(),
                 )
@@ -197,7 +206,9 @@ impl BlakeGWitness for CudaBackend {
                     "jit_prove[blake_g]: device edge interleave failed — rebuilding                      inputs from the stashed host flat"
                 );
                 crate::witness::components::blake_round::feed_blake_g_inputs_from_flat(
-                    &sub_host, prod_rows, &gen,
+                    &edge.host_flat,
+                    edge.n_rows,
+                    &gen,
                 );
             }
         }

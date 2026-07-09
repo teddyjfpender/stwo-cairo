@@ -12,9 +12,10 @@
 #                            loop/pod.conf); fall back to pod.conf values with a loud
 #                            warning if runpodctl fails. Never a hardcoded address.
 #   (a) capture provenance : both repos' git rev + sha256 of the working diff
-#   (b) sync to pod        : fast rsync delta, then re-apply the pod's Cargo.toml [patch]
+#   (b) sync to pod        : fast rsync delta; the portable Cargo.toml [patch] resolves
+#                            the sibling /workspace/stwo checkout directly
 #   (c) incremental build  : cargo build gpu_bench; abort loudly with the log tail
-#   (d) CORRECTNESS GATE   : 10-transfer PIE CUDA prove+verify FIRST, under the SAME
+#   (d) CORRECTNESS GATE   : configured gate PIE CUDA prove+verify FIRST, under the SAME
 #                            BENCH_ENV as the benchmarks. A failed verify or crash
 #                            aborts and writes a "gate_failed" ledger entry.
 #                            Performance is NEVER reported from a build that failed here.
@@ -27,7 +28,8 @@
 #   (g) append to ledger   : one JSON line per run to loop/ledger.jsonl, including
 #                            bench_env (a debug-env number is never confused with a
 #                            clean one)
-#   (h) human summary      : useful_mhz per run + delta vs the previous ledger entry
+#   (h) human summary      : useful_mhz_median per fixed-statement run (sustained
+#                            useful MHz for pipelines) + same-host delta
 #                            for the SAME run_name, SAME pod_gpu, SAME bench_env.
 #
 # Usage:
@@ -37,7 +39,8 @@
 # Flags:
 #   --pie SEL     Which SN PIE to benchmark: 1|2|3|4 (SN_PIE_<n>.zip) or 10t
 #                 (the 10-transfer PIE). Default: 2.
-#   --reps N      Repetitions per run (warm-best is reported). Default: 2.
+#   --reps N      Repetitions per fixed-statement run. Default: 6 = one cold +
+#                 five warm samples; published claims use the warm median.
 #   --full        Also benchmark SN_PIE_1/3/4 (CUDA) and run the rotate-mode fleet
 #                 (pipelined stream over all four PIEs).
 #   --simd        Add a same-host SIMD run of the selected PIE (CPU baseline).
@@ -59,6 +62,20 @@
 #   STALL_SECS    Declare a run stalled when its stderr size AND the GPU utilization
 #                 are both unchanged for this long (default 600).
 #   MAX_WAIT      Hard cap on waiting for one run (default 10800 = 3h).
+#   SN_PIE_SOURCE_DIR      Optional local directory containing SN_PIE_<n>.zip files.
+#                 Files are hash-checked and an explicit pod seed command is printed;
+#                 they are never uploaded automatically.
+#   GATE_PIE_SOURCE        Optional local gate PIE source, handled likewise.
+#   GATE_PIE       Remote correctness-gate PIE path. If the 10-transfer fixture is
+#                  unavailable, explicitly use .../pie/sn/SN_PIE_2.zip; verification
+#                  still runs on that larger fixture and is never silently skipped.
+#   BOOTLOADER_JSON_SOURCE Optional local simple_bootloader_compiled.json source.
+#                 Hash-checked and included in explicit seed commands only.
+#   POD_BOOTLOADER_JSON    Stable remote bootloader path exported for build and every
+#                 run. Default: /workspace/bench_inputs/simple_bootloader_compiled.json.
+#   GPU_PCS_RUNTIME_MODE   Required typed CUDA PCS mode for every CUDA run:
+#                 detached-eager (default) or arena-graph. The latter is a strict
+#                 future gate and currently rejects detached telemetry.
 #
 # NOTE: only same-pod comparisons are meaningful (community-host variance). See README.md.
 
@@ -68,36 +85,44 @@ set -euo pipefail
 # Configuration (all paths as variables, up top)
 # ---------------------------------------------------------------------------
 # Local repos + outputs.
-STWO_LOCAL="/Users/theodorepender/code/personal/stwo"
-CAIRO_LOCAL="/Users/theodorepender/code/personal/stwo-cairo"
-LOOP_DIR="${CAIRO_LOCAL}/gpu_benchmarks/loop"
-RESULTS_DIR="${LOOP_DIR}/results"
-LEDGER="${LOOP_DIR}/ledger.jsonl"
-POD_CONF="${LOOP_DIR}/pod.conf"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CAIRO_LOCAL="${CAIRO_LOCAL:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+STWO_LOCAL="${STWO_LOCAL:-${CAIRO_LOCAL}/../stwo}"
+LOOP_DIR="${SCRIPT_DIR}"
+RESULTS_DIR="${RESULTS_DIR:-${LOOP_DIR}/results}"
+LEDGER="${LEDGER:-${LOOP_DIR}/ledger.jsonl}"
+POD_CONF="${POD_CONF:-${LOOP_DIR}/pod.conf}"
+INPUT_SHA256SUMS="${CAIRO_LOCAL}/gpu_benchmarks/pie/SHA256SUMS"
+ARCHITECTURE_CHECK="${CAIRO_LOCAL}/gpu_benchmarks/validate_architecture_record.py"
+
+# Optional local input sources. They are validation/seed hints only: this script
+# never uploads fixtures or the bootloader implicitly.
+SN_PIE_SOURCE_DIR="${SN_PIE_SOURCE_DIR:-}"
+GATE_PIE_SOURCE="${GATE_PIE_SOURCE:-}"
+BOOTLOADER_JSON_SOURCE="${BOOTLOADER_JSON_SOURCE:-}"
 
 # Pod repos.
 STWO_POD="/workspace/stwo"
 CAIRO_POD="/workspace/stwo-cairo"
 POD_PROVER_DIR="${CAIRO_POD}/stwo_cairo_prover"
-POD_CARGO_TOML="${POD_PROVER_DIR}/Cargo.toml"
 BIN="target/release/gpu_bench"                      # relative to POD_PROVER_DIR
 POD_USER="root"
 
 # PIE inputs on the pod (already present, hash-verified — never synced).
 POD_SN_DIR="${CAIRO_POD}/gpu_benchmarks/pie/sn"
-POD_GATE_PIE="${CAIRO_POD}/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip"
+POD_GATE_PIE="${GATE_PIE:-${CAIRO_POD}/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip}"
+POD_BOOTLOADER_JSON="${POD_BOOTLOADER_JSON:-/workspace/bench_inputs/simple_bootloader_compiled.json}"
 
 # Pod scratch (outside the repo tree so rsync never touches it).
 POD_RUN_DIR="/workspace/bench_loop_runs"
 POD_BUILD_LOG="${POD_RUN_DIR}/build.log"
 
-# The [patch] path rewrite the pod copy needs (local Cargo.toml carries /Users/... paths).
-SED_PATCH='s|/Users/theodorepender/code/personal/stwo|/workspace/stwo|g'
-
 # Prover knobs.
 RUST_MIN_STACK_VAL=4194304
 BUILD_RUSTFLAGS="-C target-cpu=native"
 BENCH_ENV="${BENCH_ENV:-}"          # debug/bisect env, recorded in every ledger entry
+GPU_PCS_RUNTIME_MODE="${GPU_PCS_RUNTIME_MODE:-detached-eager}"
+GPU_NATIVE_ARGS="--engine gpu-native --require-gpu-native-architecture --require-gpu-pcs-runtime-mode ${GPU_PCS_RUNTIME_MODE}"
 
 # Fleet (rotate) run parameters.
 FLEET_REPS="${FLEET_REPS:-8}"
@@ -112,7 +137,7 @@ MAX_WAIT="${MAX_WAIT:-10800}"
 
 # Flag defaults.
 PIE_SEL="2"
-REPS="2"
+REPS="6"
 FULL=0
 SIMD=0
 SKIP_SYNC=0
@@ -138,7 +163,7 @@ dry()  { echo "[DRY_RUN] $*" >&2; }
 warn() { echo "[bench_loop][WARN] $*" >&2; }
 die()  { echo "[bench_loop][FATAL] $*" >&2; exit 1; }
 
-usage() { sed -n '2,66p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,77p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit "${1:-0}"; }
 
 # ---------------------------------------------------------------------------
 # (0) Pod resolution — never trust a hardcoded address; community pods churn.
@@ -227,6 +252,98 @@ pie_name() {
   esac
 }
 
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    LC_ALL=C shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else LC_ALL=C shasum -a 256; fi
+}
+
+expected_sha256() {
+  awk -v file="$(basename "$1")" '$2 == file { print $1; exit }' "$INPUT_SHA256SUMS"
+}
+
+check_local_input() {
+  local path="$1" label="$2" actual expected
+  [[ -f "$path" ]] || die "$label missing: $path"
+  actual="$(sha256_file "$path")"
+  expected="$(expected_sha256 "$path")"
+  [[ -z "$expected" || "$actual" == "$expected" ]] \
+    || die "$label SHA-256 mismatch: $path (expected $expected, got $actual)"
+  log "$label: $path sha256=$actual${expected:+ (manifest match)}"
+}
+
+required_sn_selectors() {
+  if [[ "$FULL" == "1" ]]; then
+    echo "1 2 3 4"
+  elif [[ "$PIE_SEL" != "10t" ]]; then
+    echo "$PIE_SEL"
+  fi
+}
+
+preflight_local_sources() {
+  local sel path
+  if [[ -n "$SN_PIE_SOURCE_DIR" ]]; then
+    [[ -d "$SN_PIE_SOURCE_DIR" ]] || die "SN_PIE_SOURCE_DIR not found: $SN_PIE_SOURCE_DIR"
+    for sel in $(required_sn_selectors); do
+      path="${SN_PIE_SOURCE_DIR}/SN_PIE_${sel}.zip"
+      check_local_input "$path" "local PIE source"
+    done
+  fi
+  if [[ -n "$GATE_PIE_SOURCE" ]]; then
+    check_local_input "$GATE_PIE_SOURCE" "local gate PIE source"
+  fi
+  if [[ -n "$BOOTLOADER_JSON_SOURCE" ]]; then
+    check_local_input "$BOOTLOADER_JSON_SOURCE" "local bootloader source"
+  fi
+}
+
+print_cmd() { printf '%q ' "$@"; }
+
+print_seed_commands() {
+  local target="${POD_USER}@${POD_HOST}" sel
+  local -a pie_sources=()
+  for sel in $(required_sn_selectors); do
+    [[ -n "$SN_PIE_SOURCE_DIR" ]] && pie_sources+=("${SN_PIE_SOURCE_DIR}/SN_PIE_${sel}.zip")
+  done
+  if [[ ${#pie_sources[@]} -eq 0 && -z "$GATE_PIE_SOURCE" && -z "$BOOTLOADER_JSON_SOURCE" ]]; then return; fi
+
+  log "validated local inputs are NOT uploaded automatically. Explicit seed commands:"
+  log "  $(print_cmd ssh "${SSH_OPTS[@]}" "$target" "mkdir -p '$POD_SN_DIR' '$(dirname "$POD_GATE_PIE")' '$(dirname "$POD_BOOTLOADER_JSON")'")"
+  if [[ ${#pie_sources[@]} -gt 0 ]]; then
+    log "  $(print_cmd rsync -av -e "$SSH_E" "${pie_sources[@]}" "${target}:${POD_SN_DIR}/")"
+  fi
+  [[ -n "$GATE_PIE_SOURCE" ]] && \
+    log "  $(print_cmd rsync -av -e "$SSH_E" "$GATE_PIE_SOURCE" "${target}:${POD_GATE_PIE}")"
+  if [[ -n "$BOOTLOADER_JSON_SOURCE" ]]; then
+    log "  $(print_cmd rsync -av -e "$SSH_E" "$BOOTLOADER_JSON_SOURCE" "${target}:${POD_BOOTLOADER_JSON}")"
+  fi
+}
+
+preflight_pod_inputs() {
+  local sel path expected quoted_path quoted_expected
+  local remote_cmd='missing=0; hash_input() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d" " -f1; else LC_ALL=C shasum -a 256 "$1" | cut -d" " -f1; fi; };'
+  local -a paths=("$POD_GATE_PIE" "$POD_BOOTLOADER_JSON")
+  for sel in $(required_sn_selectors); do paths+=("$(pie_path "$sel")"); done
+  for path in "${paths[@]}"; do
+    expected="$(expected_sha256 "$path")"
+    printf -v quoted_path '%q' "$path"
+    printf -v quoted_expected '%q' "$expected"
+    remote_cmd+=" path=${quoted_path}; expected=${quoted_expected}; if [ ! -f \"\$path\" ]; then echo \"MISSING required input: \$path\" >&2; missing=1; else actual=\$(hash_input \"\$path\"); echo \"\$actual  \$path\"; if [ -n \"\$expected\" ] && [ \"\$actual\" != \"\$expected\" ]; then echo \"SHA-256 mismatch: \$path (expected \$expected, got \$actual)\" >&2; missing=1; fi; fi;"
+  done
+  remote_cmd+=' exit $missing'
+
+  log "preflight: required gate/benchmark fixtures and pinned bootloader"
+  if ! run_ssh "$remote_cmd"; then
+    die "required pod input missing or unpinned; seed it explicitly or update the configured fixture paths, then retry"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -243,18 +360,36 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$REPS" =~ ^[0-9]+$ && "$REPS" -ge 1 ]] || die "--reps must be a positive integer"
+[[ "$REPS" =~ ^[0-9]+$ && "$REPS" -ge 2 ]] || die "--reps must be at least 2 so proof-byte equality can be checked"
 pie_path "$PIE_SEL" >/dev/null   # validates selector early
+
+[[ -d "$CAIRO_LOCAL/.git" ]] || die "missing stwo-cairo checkout: $CAIRO_LOCAL"
+[[ -d "$STWO_LOCAL/.git" ]] || die "missing sibling stwo checkout: $STWO_LOCAL"
+[[ -f "$INPUT_SHA256SUMS" ]] || die "input checksum manifest missing: $INPUT_SHA256SUMS"
+[[ -f "$ARCHITECTURE_CHECK" ]] || die "architecture record validator missing: $ARCHITECTURE_CHECK"
+[[ -n "$(expected_sha256 "$POD_BOOTLOADER_JSON")" ]] \
+  || die "pinned bootloader checksum missing from $INPUT_SHA256SUMS: $(basename "$POD_BOOTLOADER_JSON")"
+STWO_LOCAL="$(cd "$STWO_LOCAL" && pwd)"
+
+case "$GPU_PCS_RUNTIME_MODE" in
+  detached-eager|arena-graph) ;;
+  *) die "GPU_PCS_RUNTIME_MODE must be detached-eager or arena-graph (got '$GPU_PCS_RUNTIME_MODE')" ;;
+esac
 
 # Validate BENCH_ENV shape early: every token must be K=V (no spaces in values).
 if [[ -n "$BENCH_ENV" ]]; then
   for kv in $BENCH_ENV; do
     [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*$ ]] \
       || die "BENCH_ENV token '$kv' is not K=V (values must not contain spaces)"
+    [[ "${kv%%=*}" != "STWO_BOOTLOADER_JSON" ]] \
+      || die "STWO_BOOTLOADER_JSON is reserved; set POD_BOOTLOADER_JSON instead"
   done
 fi
 
+preflight_local_sources
 resolve_pod
+print_seed_commands
+preflight_pod_inputs
 
 # ---------------------------------------------------------------------------
 # (a) Provenance capture
@@ -266,7 +401,7 @@ git_dirty() {
   local repo="$1"
   if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then echo "NOGIT"; return; fi
   if git -C "$repo" diff --quiet HEAD 2>/dev/null; then echo "clean"; return; fi
-  git -C "$repo" diff HEAD 2>/dev/null | shasum -a 256 | cut -c1-16
+  git -C "$repo" diff HEAD 2>/dev/null | sha256_stream | cut -c1-16
 }
 
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -280,6 +415,8 @@ mkdir -p "$RESULTS_DIR"
 
 log "provenance: stwo=${STWO_REV:0:12} dirty=${STWO_DIRTY} | cairo=${CAIRO_REV:0:12} dirty=${CAIRO_DIRTY}"
 [[ -n "$BENCH_ENV" ]] && log "bench_env: ${BENCH_ENV} (recorded in every ledger entry)"
+log "bootloader: ${POD_BOOTLOADER_JSON} (pinned, exported for build and runs)"
+log "GPU-native architecture gate: required mode=${GPU_PCS_RUNTIME_MODE}"
 
 # ---------------------------------------------------------------------------
 # Discover pod GPU (read-only; drives the same-host comparison guard in the ledger)
@@ -293,7 +430,7 @@ fi
 log "pod GPU: ${POD_GPU}"
 
 # ---------------------------------------------------------------------------
-# (b) Sync + re-apply Cargo.toml patch
+# (b) Sync repositories
 # ---------------------------------------------------------------------------
 sync_repos() {
   log "rsync stwo -> pod (excludes target/.git)"
@@ -312,10 +449,6 @@ sync_repos() {
     -e "$SSH_E" \
     "${CAIRO_LOCAL}/" "${POD_USER}@${POD_HOST}:${CAIRO_POD}/"
 
-  # The rsync just overwrote the pod's patched Cargo.toml with the /Users/... local copy.
-  # Re-apply the pod path rewrite so the [patch] resolves to /workspace/stwo.
-  log "re-applying Cargo.toml [patch] rewrite on pod"
-  run_ssh "sed -i '${SED_PATCH}' '${POD_CARGO_TOML}'"
 }
 
 # ---------------------------------------------------------------------------
@@ -325,13 +458,14 @@ build_pod() {
   log "incremental build on pod (gpu_bench, --features pie-bench)"
   run_ssh "mkdir -p '${POD_RUN_DIR}'"
   if [[ "$DRY_RUN" == "1" ]]; then
-    dry "build: cargo build --release -p stwo-cairo-prover --bin gpu_bench --features pie-bench"
+    dry "build: STWO_BOOTLOADER_JSON=${POD_BOOTLOADER_JSON} cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench"
     return 0
   fi
   local out
   out="$(run_ssh "cd '${POD_PROVER_DIR}' && . \$HOME/.cargo/env 2>/dev/null; \
       PATH=/usr/local/cuda/bin:\$PATH RUSTFLAGS='${BUILD_RUSTFLAGS}' \
-      cargo build --release -p stwo-cairo-prover --bin gpu_bench --features pie-bench \
+      STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}' \
+      cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench \
       > '${POD_BUILD_LOG}' 2>&1; echo BUILD_EXIT=\$?")"
   local code
   code="$(printf '%s\n' "$out" | sed -n 's/.*BUILD_EXIT=\([0-9][0-9]*\).*/\1/p' | tail -1)"
@@ -350,12 +484,24 @@ synth_out() {
   # $1 name  $2 args  $3 destfile — deterministic-ish mock numbers keyed off the name.
   local name="$1" args="$2" dest="$3"
   local backend="cuda"; [[ "$args" == *"--backend simd"* ]] && backend="simd"
+  local architecture_fields='"engine":"legacy","gpu_pcs_driver_architecture":null,"gpu_pcs_runtime_mode":null,"gpu_pcs_stage_started":null,"gpu_pcs_stage_finished":null,"gpu_pcs_batched_tree_decommit":null,"gpu_pcs_driver_complete":null,"gpu_native_architecture_required":false,"gpu_pcs_required_runtime_mode":null,"gpu_native_architecture_gate_passed":null'
+  if [[ "$args" == *"--require-gpu-native-architecture"* ]]; then
+    local runtime_report="DetachedEager"
+    [[ "$GPU_PCS_RUNTIME_MODE" == "arena-graph" ]] && runtime_report="ArenaGraph"
+    local stage_counts='{"OodsEvaluation":1,"QuotientAndCompaction":1,"FriCommitAndFold":1,"ProofOfWork":1,"FriQueryAndDecommit":1,"TreeDecommit":1,"Assembly":1}'
+    architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true'
+  fi
   local seed=$(( $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 40 ))
-  local um; um="$(awk -v s="$seed" 'BEGIN{printf "%.3f", 1.4 + s/100.0}')"
+  local um um_median verified_reps=1
+  if [[ "$args" =~ --reps[[:space:]]+([0-9]+) ]]; then
+    verified_reps="${BASH_REMATCH[1]}"
+  fi
+  um="$(awk -v s="$seed" 'BEGIN{printf "%.3f", 1.4 + s/100.0}')"
+  um_median="$(awk -v s="$seed" 'BEGIN{printf "%.3f", 1.3 + s/100.0}')"
   {
     echo "{\"rep\":0,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":1234.5},\"fri\":{\"count\":1,\"total_ms\":567.8}}}"
     echo "{\"rep\":1,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":1201.2},\"fri\":{\"count\":1,\"total_ms\":560.1}}}"
-    echo "{\"program\":\"${name}.zip\",\"backend\":\"${backend}\",\"n\":1,\"cycle_count\":14600000,\"pie_n_steps\":12000000,\"bootloader_overhead_pct\":21.6,\"prove_s_cold\":9.9,\"prove_s_warm\":8.1,\"verify_ms\":42.0,\"proof_kb\":210.5,\"peak_rss_gb\":18.2,\"vram_end_gb\":6.1,\"vram_peak_gb\":11.3,\"steps_per_s\":1802469.0,\"mhz\":1.802,\"useful_mhz\":${um},\"vm_s\":30.2,\"adapt_s\":5.1,\"security_bits\":96,\"n_queries\":70,\"pow_bits\":26,\"fold_step\":3,\"gpu\":\"${POD_GPU}\",\"nproc\":32,\"host_mem_gb\":125.6}"
+    echo "{\"program\":\"${name}.zip\",\"backend\":\"${backend}\",${architecture_fields},\"n\":1,\"cycle_count\":14600000,\"pie_n_steps\":12000000,\"bootloader_overhead_pct\":21.6,\"prove_s_cold\":9.9,\"prove_s_warm\":8.1,\"prove_s_warm_median\":8.7,\"verify_ms\":42.0,\"verified_reps\":${verified_reps},\"proof_kb\":210.5,\"peak_rss_gb\":18.2,\"vram_end_gb\":6.1,\"vram_peak_gb\":11.3,\"steps_per_s\":1802469.0,\"mhz\":1.802,\"mhz_median\":1.678,\"useful_mhz\":${um},\"useful_mhz_median\":${um_median},\"proof_comparison_applicable\":true,\"proof_byte_equal\":true,\"proof_byte_equal_required\":true,\"vm_s\":30.2,\"adapt_s\":5.1,\"security_bits\":96,\"n_queries\":70,\"pow_bits\":26,\"fold_step\":3,\"gpu\":\"${POD_GPU}\",\"nproc\":32,\"host_mem_gb\":125.6}"
     if [[ "$args" == *"--pipeline"* ]]; then
       echo "{\"pipeline\":${FLEET_DEPTH},\"producers\":${FLEET_PRODUCERS},\"pie_mode\":\"rotate\",\"reps\":${FLEET_REPS},\"total_s\":80.5,\"feed_starved_s\":2.1,\"sustained_steps_per_s\":1450000.0,\"sustained_mhz\":1.45,\"sustained_useful_mhz\":$(awk -v s="$seed" 'BEGIN{printf "%.3f",1.1+s/100.0}')}"
     fi
@@ -420,6 +566,7 @@ export RUST_MIN_STACK=${RUST_MIN_STACK_VAL}
 export STWO_BENCH_TRACE=json
 export STWO_JIT_LOG=1
 ${BENCH_ENV:+export ${BENCH_ENV}}
+export STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}'
 echo \$\$ > '${pod_pgid}'
 ./${BIN} ${args} > '${pod_out}' 2> '${pod_err}' &
 GB_PID=\$!
@@ -488,6 +635,45 @@ EOF
   log "run '${name}' finished (rc=${LAST_RC})"
 }
 
+# A stale pre-contract binary silently ignores unknown CLI flags. Exit status alone
+# therefore cannot prove that all gate repetitions were verified and compared.
+gate_contract_ok() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+record = None
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and "verified_reps" in candidate:
+                record = candidate
+except OSError as error:
+    print(f"gate contract: cannot read output: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+required = {
+    "verified_reps": 2,
+    "proof_comparison_applicable": True,
+    "proof_byte_equal_required": True,
+    "proof_byte_equal": True,
+}
+if record is None or any(record.get(key) != value for key, value in required.items()):
+    print(f"gate contract missing or false: expected {required}, got {record}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+# The binary accepts flags by manual lookup, so an older binary can ignore an
+# unknown architecture flag and still exit zero. Validate the primary record too.
+architecture_contract_ok() {
+  python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE"
+}
+
 # ---------------------------------------------------------------------------
 # (g)+(h) Append a ledger line and print the human summary + delta.
 # status: ok | gate_failed | run_failed | stalled
@@ -532,15 +718,16 @@ def parse_lines(path):
 record, pipeline, phases = parse_lines(os.environ.get("LB_OUT", ""))
 
 # The comparison metric: sustained useful MHz for a pipelined (fleet) run, else the
-# per-run useful MHz from the main record.
+# warm-sample median for a fixed statement. Legacy warm-best useful_mhz is retained
+# in raw records for compatibility but is never a ranking or claim basis.
 def metric_of(rec, pipe):
     if pipe and pipe.get("sustained_useful_mhz") is not None:
-        return pipe["sustained_useful_mhz"]
-    if rec:
-        return rec.get("useful_mhz")
-    return None
+        return pipe["sustained_useful_mhz"], "sustained_useful_mhz"
+    if rec and rec.get("useful_mhz_median") is not None:
+        return rec["useful_mhz_median"], "useful_mhz_median"
+    return None, None
 
-new_metric = metric_of(record, pipeline)
+new_metric, new_basis = metric_of(record, pipeline)
 
 # Find the previous OK entry for the SAME run_name, SAME pod_gpu, and SAME bench_env.
 # Only same-pod comparisons are meaningful, and a number produced with debug env
@@ -559,7 +746,7 @@ try:
             if (e.get("run_name") == run and e.get("pod_gpu") == gpu
                     and e.get("status", "ok") == "ok"
                     and e.get("bench_env", "") == benv):
-                m = metric_of(e.get("record"), e.get("pipeline"))
+                m, _ = metric_of(e.get("record"), e.get("pipeline"))
                 if m is not None:
                     prev_metric = m
 except FileNotFoundError:
@@ -575,6 +762,7 @@ entry = {
     "run_name": run,
     "status": status,
     "bench_env": benv,
+    "mhz_basis": new_basis,
     "record": record,
     "phase_totals": phases,
 }
@@ -606,16 +794,15 @@ if status != "ok":
     detail = "stall_evidence + " if status == "stalled" else ""
     print(f"  {disp:<21} status={status}  (see ledger {detail}error_tail)")
 elif new_metric is None:
-    print(f"  {disp:<21} useful_mhz=n/a")
+    print(f"  {disp:<21} claim_mhz=n/a")
 else:
-    label = "sustained_useful_mhz" if (pipeline and pipeline.get('sustained_useful_mhz') is not None) else "useful_mhz"
     if prev_metric is None:
         delta = "(no prior same-pod same-env run)"
     else:
         pct = (new_metric - prev_metric) / prev_metric * 100.0 if prev_metric else 0.0
         delta = f"{pct:+.1f}% vs {prev_metric:.3f}"
     vram = (record or {}).get("vram_peak_gb", "?")
-    print(f"  {disp:<21} {label}={new_metric:.3f}  vram_peak_gb={vram}  {delta}")
+    print(f"  {disp:<21} {new_basis}={new_metric:.3f}  vram_peak_gb={vram}  {delta}")
 PY
 }
 
@@ -641,18 +828,24 @@ abort_stalled() {
 # (d) CORRECTNESS GATE — always first, under the SAME BENCH_ENV as the benchmarks
 # (a kill switch that changes behavior must be gated too; the launcher exports
 # BENCH_ENV for every run including this one).
-GATE_ARGS="--pie ${POD_GATE_PIE} --backend cuda --reps 1 --reuse-input"
-log "=== CORRECTNESS GATE: 10-transfer PIE CUDA prove+verify ==="
-run_bench "gate_10t" "$GATE_ARGS"
+GATE_ARGS="--pie ${POD_GATE_PIE} --backend cuda ${GPU_NATIVE_ARGS} --reps 2 --reuse-input --require-proof-byte-equal"
+log "=== CORRECTNESS GATE: ${POD_GATE_PIE} CUDA prove+verify ==="
+run_bench "gate_correctness" "$GATE_ARGS"
 if [[ "$LAST_RC" == "STALLED" ]]; then
-  abort_stalled "gate_10t"
+  abort_stalled "gate_correctness"
+fi
+if [[ "$LAST_RC" == "0" ]] && ! gate_contract_ok "$LAST_OUT"; then
+  LAST_RC="GATE_CONTRACT"
+fi
+if [[ "$LAST_RC" == "0" ]] && ! architecture_contract_ok "$LAST_OUT"; then
+  LAST_RC="ARCHITECTURE_CONTRACT"
 fi
 if [[ "$LAST_RC" != "0" ]]; then
-  warn "GATE FAILED (rc=${LAST_RC}) — verify failed or the prover crashed."
-  append_ledger "gate_failed" "$LAST_OUT" "${RESULTS_DIR}/${STAMP}.gate_10t.err" "gate_failed"
+  warn "GATE FAILED (rc=${LAST_RC}) — typed CUDA architecture plus two verified, byte-identical proofs were not demonstrated."
+  append_ledger "gate_failed" "$LAST_OUT" "${RESULTS_DIR}/${STAMP}.gate_correctness.err" "gate_failed"
   die "correctness gate failed — refusing to report any performance from this build."
 fi
-append_ledger "gate_10t" "$LAST_OUT" "${RESULTS_DIR}/${STAMP}.gate_10t.err" "ok"
+append_ledger "gate_correctness" "$LAST_OUT" "${RESULTS_DIR}/${STAMP}.gate_correctness.err" "ok"
 log "gate PASSED"
 
 if [[ "$GATE_ONLY" == "1" ]]; then
@@ -666,20 +859,20 @@ add_run() { RUN_NAMES+=("$1"); RUN_ARGS+=("$2"); }
 
 SEL_PATH="$(pie_path "$PIE_SEL")"
 SEL_NAME="$(pie_name "$PIE_SEL")"
-add_run "$SEL_NAME" "--pie ${SEL_PATH} --backend cuda --reps ${REPS} --reuse-input"
+add_run "$SEL_NAME" "--pie ${SEL_PATH} --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal"
 
 if [[ "$SIMD" == "1" ]]; then
-  add_run "${SEL_NAME}_simd" "--pie ${SEL_PATH} --backend simd --reps ${REPS} --reuse-input"
+  add_run "${SEL_NAME}_simd" "--pie ${SEL_PATH} --backend simd --reps ${REPS} --reuse-input --require-proof-byte-equal"
 fi
 
 if [[ "$FULL" == "1" ]]; then
   for s in 1 3 4; do
     nm="$(pie_name "$s")"
     [[ "$nm" == "$SEL_NAME" ]] && continue   # already queued as the selected PIE
-    add_run "$nm" "--pie $(pie_path "$s") --backend cuda --reps ${REPS} --reuse-input"
+    add_run "$nm" "--pie $(pie_path "$s") --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal"
   done
   FLEET_LIST="${POD_SN_DIR}/SN_PIE_1.zip,${POD_SN_DIR}/SN_PIE_2.zip,${POD_SN_DIR}/SN_PIE_3.zip,${POD_SN_DIR}/SN_PIE_4.zip"
-  add_run "SN_fleet_rotate" "--pie ${FLEET_LIST} --backend cuda --reps ${FLEET_REPS} --pipeline ${FLEET_DEPTH} --producers ${FLEET_PRODUCERS} --pie-mode rotate"
+  add_run "SN_fleet_rotate" "--pie ${FLEET_LIST} --backend cuda ${GPU_NATIVE_ARGS} --reps ${FLEET_REPS} --pipeline ${FLEET_DEPTH} --producers ${FLEET_PRODUCERS} --pie-mode rotate"
 fi
 
 log "=== benchmarking ${#RUN_NAMES[@]} run(s) ==="
@@ -692,6 +885,10 @@ for idx in "${!RUN_NAMES[@]}"; do
   run_bench "$nm" "$ar"
   if [[ "$LAST_RC" == "STALLED" ]]; then
     abort_stalled "$nm"
+  fi
+  if [[ "$LAST_RC" == "0" && "$ar" == *"--require-gpu-native-architecture"* ]] \
+     && ! architecture_contract_ok "$LAST_OUT"; then
+    LAST_RC="ARCHITECTURE_CONTRACT"
   fi
   if [[ "$LAST_RC" != "0" ]]; then
     warn "run '${nm}' failed (rc=${LAST_RC})"

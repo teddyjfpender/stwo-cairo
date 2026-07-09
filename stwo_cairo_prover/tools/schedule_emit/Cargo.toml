@@ -2,7 +2,9 @@
 # schedule table (GPU_RESIDENT_PROVER_DESIGN.md §17: schedule_emit). Parses the
 # transformer-emitted SUB_FEED_LAYOUT consts in the witness components plus the
 # COUNT_RELATIONS registry in device_feed.rs, and emits
-# crates/gpu-prover/src/schedule_table.rs — machine-written, --check drift-gated.
+# crates/gpu-prover/src/{schedule_table,relation_table}.rs plus the aggregate
+# crates/prover/src/witness/proof_shape_generated.rs projection — all
+# machine-written and --check drift-gated.
 # The empty [workspace] table makes this its own workspace root (same idiom as
 # tools/witness_genericize).
 [workspace]
@@ -18,4 +20,5 @@ name = "schedule_emit"
 path = "src/main.rs"
 
 [dependencies]
-syn = { version = "2", features = ["full", "extra-traits", "parsing"] }
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits", "parsing", "visit"] }

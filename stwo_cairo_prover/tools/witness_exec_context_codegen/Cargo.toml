@@ -1,0 +1,15 @@
+# Standalone post-processor for the AIR-generated cairo_claim_generator. Keeping
+# this outside the parent workspace lets the drift gate run without compiling the
+# prover and mirrors tools/witness_genericize / tools/schedule_emit.
+[workspace]
+
+[package]
+name = "witness_exec_context_codegen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "witness_exec_context_codegen"
+path = "src/main.rs"
+

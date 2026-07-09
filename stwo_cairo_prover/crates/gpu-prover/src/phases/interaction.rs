@@ -11,15 +11,20 @@ use stwo::prover::poly::BitReversedOrder;
 use tracing::{span, Level};
 
 use crate::prover::CairoWitnessBackend;
+use crate::state::DeviceProofState;
 
 #[allow(clippy::type_complexity)]
 pub fn run<B: CairoWitnessBackend>(
     interaction_generator: stwo_cairo_prover::witness::cairo_claim_generator::CairoInteractionClaimGenerator<B>,
+    device: &DeviceProofState,
     interaction_elements: &CommonLookupElements,
 ) -> (
     Vec<CircleEvaluation<B, stwo::core::fields::m31::BaseField, BitReversedOrder>>,
     CairoInteractionClaim,
 ) {
     let _span = span!(Level::INFO, "Write interaction trace").entered();
-    interaction_generator.write_interaction_trace(interaction_elements)
+    let output = interaction_generator
+        .write_interaction_trace(&device.witness_exec_context, interaction_elements);
+    device.witness_exec_context.assert_interaction_drained();
+    output
 }

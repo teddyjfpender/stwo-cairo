@@ -2,11 +2,13 @@
 """ledger_report.py — read loop/ledger.jsonl and print a human-readable table.
 
 Columns: ts, revs (stwo/cairo short + dirty marker), run_name ('!' = run had a
-non-default BENCH_ENV — debug/bisect, never compare with clean numbers), useful_mhz,
-vram_peak_gb, delta-vs-prev (same run_name AND same pod_gpu AND same bench_env — the
-only meaningful comparison; community-host variance makes cross-pod deltas noise).
+non-default BENCH_ENV — debug/bisect, never compare with clean numbers), claim_mhz,
+mhz_basis, vram_peak_gb, delta-vs-prev (same run_name AND same pod_gpu AND same
+bench_env — the only meaningful comparison; community-host variance makes cross-pod
+deltas noise).
 
-For a pipelined (fleet/rotate) entry the reported MHz is sustained_useful_mhz.
+For a fixed statement, claim_mhz is useful_mhz_median. For a pipelined fleet/rotate
+entry it is sustained_useful_mhz. Legacy warm-best useful_mhz is never ranked.
 
 Usage:
   ./ledger_report.py [--ledger PATH] [--run RUN_NAME] [--phases RUN_NAME]
@@ -43,13 +45,12 @@ def load(path):
 
 
 def metric_of(entry):
-    """The comparison metric: sustained useful MHz for a pipelined run, else the
-    per-run useful MHz from the main record."""
+    """Return the auditable claim metric and its explicit basis."""
     pipe = entry.get("pipeline")
     if pipe and pipe.get("sustained_useful_mhz") is not None:
-        return pipe["sustained_useful_mhz"], True
+        return pipe["sustained_useful_mhz"], "sustained_useful_mhz"
     rec = entry.get("record") or {}
-    return rec.get("useful_mhz"), False
+    return rec.get("useful_mhz_median"), "useful_mhz_median"
 
 
 def short(rev):
@@ -77,7 +78,7 @@ def table(entries):
         gpu = e.get("pod_gpu", "?")
         benv = e.get("bench_env") or ""
         status = e.get("status", "ok")
-        m, sustained = metric_of(e)
+        m, basis = metric_of(e)
         rec = e.get("record") or {}
         vram = rec.get("vram_peak_gb")
         key = (run, gpu, benv)
@@ -96,20 +97,23 @@ def table(entries):
             "ts": e.get("ts", "?"),
             "revs": revs_col(e),
             "run": run + ("!" if benv else ""),
-            "mhz": ("" if m is None else f"{m:.3f}") + ("~" if sustained else ""),
+            "mhz": "" if m is None else f"{m:.3f}",
+            "basis": basis if m is not None else "n/a",
             "vram": "" if vram is None else f"{vram:.2f}",
             "delta": delta,
         })
 
-    hdr = ("ts", "revs", "run_name", "useful_mhz", "vram_gb", "delta")
+    hdr = ("ts", "revs", "run_name", "claim_mhz", "mhz_basis", "vram_gb", "delta")
     widths = [max(len(hdr[i]), *(len(str(r[k])) for r in rows)) if rows else len(hdr[i])
-              for i, k in enumerate(["ts", "revs", "run", "mhz", "vram", "delta"])]
+              for i, k in enumerate(["ts", "revs", "run", "mhz", "basis", "vram", "delta"])]
     fmt = "  ".join("{:<" + str(w) + "}" for w in widths)
     print(fmt.format(*hdr))
     print("  ".join("-" * w for w in widths))
     for r in rows:
-        print(fmt.format(r["ts"], r["revs"], r["run"], r["mhz"], r["vram"], r["delta"]))
-    print("\n(~ = sustained_useful_mhz from a pipelined run; * = dirty working tree;")
+        print(fmt.format(r["ts"], r["revs"], r["run"], r["mhz"], r["basis"], r["vram"], r["delta"]))
+    print("\n(fixed statements use useful_mhz_median; pipelines use sustained_useful_mhz;")
+    print(" legacy useful_mhz is warm-best compatibility data and is never ranked;")
+    print(" * = dirty working tree;")
     print(" ! = non-default BENCH_ENV (debug/bisect run) — never compare with clean numbers;")
     print(" delta is vs the previous SAME-run_name SAME-pod SAME-bench_env entry only.)")
 

@@ -46,8 +46,16 @@ fn main() {
         .expect("manifest_path has no parent")
         .to_path_buf();
 
-    let bootloader_path =
-        pkg_dir.join("resources/compiled_programs/bootloaders/simple_bootloader_compiled.json");
+    let bootloader_path = std::env::var_os("STWO_BOOTLOADER_JSON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            pkg_dir.join("resources/compiled_programs/bootloaders/simple_bootloader_compiled.json")
+        });
+    assert!(
+        bootloader_path.is_file(),
+        "bootloader JSON not found: {}",
+        bootloader_path.display()
+    );
 
     println!(
         "cargo:rustc-env=BOOTLOADER_JSON_PATH={}",
@@ -55,6 +63,7 @@ fn main() {
     );
 
     // Re-run if the dependency tree changes.
+    println!("cargo:rerun-if-env-changed=STWO_BOOTLOADER_JSON");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=Cargo.lock");
 }

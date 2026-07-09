@@ -65,6 +65,7 @@ use crate::witness::components::{
     pedersen_aggregator_window_bits_18, pedersen_points_table_window_bits_18, range_check_20,
     range_check_8, range_check_9_9,
 };
+use crate::witness::exec_context::WitnessExecContext;
 
 type Evals<B> = Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>;
 
@@ -149,6 +150,7 @@ fn warn_device_pending(lane: PedersenLane) {
 /// Backend hook for the `partial_ec_mul_generic` base-trace write.
 pub trait PartialEcMulGenericWitness: FromSimdColumns {
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: partial_ec_mul_generic::ClaimGenerator,
         range_check_8: &range_check_8::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
@@ -164,6 +166,7 @@ pub trait PartialEcMulGenericWitness: FromSimdColumns {
 /// Backend hook for the `partial_ec_mul_window_bits_18` base-trace write.
 pub trait PartialEcMulWindowBits18Witness: FromSimdColumns {
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: partial_ec_mul_window_bits_18::ClaimGenerator,
         pedersen_points_table: &pedersen_points_table_window_bits_18::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
@@ -181,6 +184,7 @@ pub trait PedersenAggregatorWindowBits18Witness: FromSimdColumns {
     /// `jit_memory`: the prover-input memory the D′ witness-JIT lane resolves its
     /// device execution tables from. `None` (or the Simd backend) → host writer.
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: pedersen_aggregator_window_bits_18::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         range_check_8: &range_check_8::ClaimGenerator,
@@ -197,6 +201,7 @@ pub trait PedersenAggregatorWindowBits18Witness: FromSimdColumns {
 
 impl PartialEcMulGenericWitness for SimdBackend {
     fn write_trace(
+        _exec_context: &WitnessExecContext,
         gen: partial_ec_mul_generic::ClaimGenerator,
         range_check_8: &range_check_8::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
@@ -219,6 +224,7 @@ impl PartialEcMulGenericWitness for SimdBackend {
 
 impl PartialEcMulWindowBits18Witness for SimdBackend {
     fn write_trace(
+        _exec_context: &WitnessExecContext,
         gen: partial_ec_mul_window_bits_18::ClaimGenerator,
         pedersen_points_table: &pedersen_points_table_window_bits_18::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
@@ -241,6 +247,7 @@ impl PartialEcMulWindowBits18Witness for SimdBackend {
 
 impl PedersenAggregatorWindowBits18Witness for SimdBackend {
     fn write_trace(
+        _exec_context: &WitnessExecContext,
         gen: pedersen_aggregator_window_bits_18::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         range_check_8: &range_check_8::ClaimGenerator,
@@ -269,6 +276,7 @@ impl PedersenAggregatorWindowBits18Witness for SimdBackend {
 
 impl PartialEcMulGenericWitness for CudaBackend {
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: partial_ec_mul_generic::ClaimGenerator,
         range_check_8: &range_check_8::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
@@ -336,6 +344,7 @@ impl PartialEcMulGenericWitness for CudaBackend {
                 let launched = crate::witness::jit_prove_backend::all_count_builtin_write_trace::<
                     crate::witness::jit_prove_backend::PartialEcMulGenericLane,
                 >(
+                    exec_context,
                     &cols,
                     n_real,
                     mem,
@@ -363,6 +372,7 @@ impl PartialEcMulGenericWitness for CudaBackend {
 
 impl PartialEcMulWindowBits18Witness for CudaBackend {
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: partial_ec_mul_window_bits_18::ClaimGenerator,
         pedersen_points_table: &pedersen_points_table_window_bits_18::ClaimGenerator,
         range_check_9_9: &range_check_9_9::ClaimGenerator,
@@ -382,11 +392,13 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
         // rebuilds the inputs on CPU from the stashed HOST flat (the edge-gate
         // math) so feeds stay exactly-once with no pair rerun.
         if let Some(mem) = jit_memory {
-            if let Some((sub_dev, sub_host, prod_rows)) =
-                crate::witness::jit_prove_backend::take_edge("partial_ec_mul_window_bits_18_state")
-            {
+            if let Some(edge) = exec_context.take_edge(
+                "pedersen_aggregator_window_bits_18",
+                "partial_ec_mul_window_bits_18",
+            ) {
                 use stwo::prover::backend::simd::m31::N_LANES;
-                let n_real = 28 * prod_rows;
+                let edge_plan = edge.plan;
+                let n_real = edge_plan.n_instances as usize * edge.n_rows;
                 let padded = std::cmp::max(n_real.next_power_of_two(), N_LANES);
                 let host_tail: Vec<Vec<u32>> = vec![
                     (0..padded).map(|r| u32::from(r < n_real)).collect(),
@@ -415,12 +427,18 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
                     require: true,
                 };
                 let launched = stwo_backend_cuda::exec_tables::witness_edge_gather(
-                    &sub_dev, prod_rows, 7, 72, 28, padded,
+                    &edge.buffer,
+                    edge.n_rows,
+                    edge_plan.word_base as usize,
+                    edge_plan.words_per_instance as usize,
+                    edge_plan.n_instances as usize,
+                    padded,
                 )
                 .and_then(|device_cols| {
                     crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<
                         crate::witness::jit_prove_backend::PartialEcMulW18Lane,
                     >(
+                        exec_context,
                         crate::witness::jit_prove_backend::BuiltinInputs::Edge {
                             device_cols,
                             host_tail: host_tail.clone(),
@@ -443,7 +461,9 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
                              rebuilding inputs from the stashed host flat"
                         );
                         pedersen_aggregator_window_bits_18::feed_w18_inputs_from_flat(
-                            &sub_host, prod_rows, &gen,
+                            &edge.host_flat,
+                            edge.n_rows,
+                            &gen,
                         );
                     }
                 }
@@ -497,6 +517,7 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
                 let launched = crate::witness::jit_prove_backend::all_count_builtin_write_trace::<
                     crate::witness::jit_prove_backend::PartialEcMulW18Lane,
                 >(
+                    exec_context,
                     &cols,
                     n_real,
                     mem,
@@ -524,6 +545,7 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
 
 impl PedersenAggregatorWindowBits18Witness for CudaBackend {
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: pedersen_aggregator_window_bits_18::ClaimGenerator,
         memory_id_to_big: &memory_id_to_big::ClaimGenerator,
         range_check_8: &range_check_8::ClaimGenerator,
@@ -595,11 +617,15 @@ impl PedersenAggregatorWindowBits18Witness for CudaBackend {
                 let launched = crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<
                     crate::witness::jit_prove_backend::PedersenAggregatorW18Lane,
                 >(
+                    exec_context,
                     crate::witness::jit_prove_backend::BuiltinInputs::HostCols(&cols),
                     n_real,
                     mem,
                     Some(plan),
-                    Some("partial_ec_mul_window_bits_18_state"),
+                    Some(crate::witness::jit_prove_backend::DeviceEdgeTarget {
+                        component: "partial_ec_mul_window_bits_18",
+                        feed_state: "partial_ec_mul_window_bits_18_state",
+                    }),
                     |sub_flat, n_padded, skip| {
                         pedersen_aggregator_window_bits_18::feed_sub_inputs_from_flat(
                             sub_flat,

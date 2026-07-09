@@ -48,6 +48,7 @@ use crate::witness::components::{
     jnz_opcode_taken, jump_opcode_abs, jump_opcode_double_deref, jump_opcode_rel,
     jump_opcode_rel_imm, memory_address_to_id, memory_id_to_big, ret_opcode, verify_instruction,
 };
+use crate::witness::exec_context::{PlannedDeviceEdge, WitnessExecContext};
 use crate::witness::witness_eval::recording::RecordingOutput;
 
 type Evals<B> = Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>;
@@ -65,15 +66,6 @@ pub(crate) fn device_interaction_enabled() -> bool {
 /// lanes' resident sub buffers (gpu-native composed default; explicit =0 wins).
 fn mem_count_feeds_enabled() -> bool {
     std::env::var("STWO_CUDA_MEM_COUNT_FEEDS").as_deref() == Ok("1")
-}
-
-type DeviceLookupStash = std::sync::Mutex<
-    std::collections::HashMap<&'static str, (stwo_backend_cuda::BaseFieldVec, usize, usize)>,
->;
-
-fn device_lookup_stash() -> &'static DeviceLookupStash {
-    static STASH: std::sync::OnceLock<DeviceLookupStash> = std::sync::OnceLock::new();
-    STASH.get_or_init(Default::default)
 }
 
 fn lane_enabled(label: &str) -> bool {
@@ -265,7 +257,8 @@ pub trait OpcodeJitBackend: FromSimdColumns + Sized {
     /// True when this component's device lookup buffer is stashed (the host
     /// interaction write can be skipped entirely — `device_interaction` WILL
     /// produce the trace or panic; there is deliberately no silent fallback).
-    fn device_interaction_pending<C: OpcodeLaneSpec>() -> bool {
+    fn device_interaction_pending<C: OpcodeLaneSpec>(exec_context: &WitnessExecContext) -> bool {
+        let _ = exec_context;
         false
     }
 
@@ -274,24 +267,32 @@ pub trait OpcodeJitBackend: FromSimdColumns + Sized {
     /// + proven finalize) and return it with the claimed sum. `None` = use the
     /// host `write_interaction_trace` path.
     fn device_interaction<C: OpcodeLaneSpec>(
+        exec_context: &WitnessExecContext,
         elements: &cairo_air::relations::CommonLookupElements,
     ) -> Option<(Evals<Self>, stwo::core::fields::qm31::SecureField)> {
+        let _ = exec_context;
         let _ = elements;
         None
     }
 
     /// Builtin-lane variants of the §6a hooks (same stash, `BuiltinLaneSpec`-keyed).
-    fn builtin_device_interaction_pending<C: BuiltinLaneSpec>() -> bool {
+    fn builtin_device_interaction_pending<C: BuiltinLaneSpec>(
+        exec_context: &WitnessExecContext,
+    ) -> bool {
+        let _ = exec_context;
         false
     }
     fn builtin_device_interaction<C: BuiltinLaneSpec>(
+        exec_context: &WitnessExecContext,
         elements: &cairo_air::relations::CommonLookupElements,
     ) -> Option<(Evals<Self>, stwo::core::fields::qm31::SecureField)> {
+        let _ = exec_context;
         let _ = elements;
         None
     }
 
     fn lane_write_trace<C: OpcodeLaneSpec>(
+        exec_context: &WitnessExecContext,
         gen: C::Gen,
         addr_state: &memory_address_to_id::ClaimGenerator,
         id_state: &memory_id_to_big::ClaimGenerator,
@@ -302,6 +303,7 @@ pub trait OpcodeJitBackend: FromSimdColumns + Sized {
 
 impl OpcodeJitBackend for SimdBackend {
     fn lane_write_trace<C: OpcodeLaneSpec>(
+        _exec_context: &WitnessExecContext,
         gen: C::Gen,
         addr_state: &memory_address_to_id::ClaimGenerator,
         id_state: &memory_id_to_big::ClaimGenerator,
@@ -313,15 +315,15 @@ impl OpcodeJitBackend for SimdBackend {
 }
 
 impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
-    fn device_interaction_pending<C: OpcodeLaneSpec>() -> bool {
-        device_lookup_stash().lock().unwrap().contains_key(C::LABEL)
+    fn device_interaction_pending<C: OpcodeLaneSpec>(exec_context: &WitnessExecContext) -> bool {
+        exec_context.has_device_lookup(C::LABEL)
     }
 
     fn device_interaction<C: OpcodeLaneSpec>(
+        exec_context: &WitnessExecContext,
         elements: &cairo_air::relations::CommonLookupElements,
     ) -> Option<(Evals<Self>, stwo::core::fields::qm31::SecureField)> {
-        let (lookup_dev, n_rows, n_real) =
-            device_lookup_stash().lock().unwrap().remove(C::LABEL)?;
+        let lookup = exec_context.take_device_lookup(C::LABEL)?;
         let t0 = std::time::Instant::now();
         // Resolved from the EMITTED per-column facts (gate-proven by the host
         // mirror against the generated writer) — no derivation rules.
@@ -329,9 +331,9 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
             crate::witness::logup_descs::resolve_logup_descs(C::lookup_fields(), C::logup_descs());
         let max_w = crate::witness::logup_descs::max_tuple_width(&descs);
         let out = stwo_backend_cuda::logup_pairs::device_interaction_from_flats(
-            lookup_dev.device_ptr,
-            n_rows,
-            n_real,
+            lookup.buffer.device_ptr,
+            lookup.n_rows,
+            lookup.n_real,
             &descs,
             &elements.alpha_powers()[..max_w],
             elements.z(),
@@ -340,7 +342,7 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
             eprintln!(
                 "jit_interaction[{}]: device logup {} rows x {} cols in {:.1} ms",
                 C::LABEL,
-                n_rows,
+                lookup.n_rows,
                 descs.len(),
                 t0.elapsed().as_secs_f64() * 1e3
             );
@@ -356,23 +358,25 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
         }
     }
 
-    fn builtin_device_interaction_pending<C: BuiltinLaneSpec>() -> bool {
-        device_lookup_stash().lock().unwrap().contains_key(C::LABEL)
+    fn builtin_device_interaction_pending<C: BuiltinLaneSpec>(
+        exec_context: &WitnessExecContext,
+    ) -> bool {
+        exec_context.has_device_lookup(C::LABEL)
     }
 
     fn builtin_device_interaction<C: BuiltinLaneSpec>(
+        exec_context: &WitnessExecContext,
         elements: &cairo_air::relations::CommonLookupElements,
     ) -> Option<(Evals<Self>, stwo::core::fields::qm31::SecureField)> {
-        let (lookup_dev, n_rows, n_real) =
-            device_lookup_stash().lock().unwrap().remove(C::LABEL)?;
+        let lookup = exec_context.take_device_lookup(C::LABEL)?;
         let t0 = std::time::Instant::now();
         let descs =
             crate::witness::logup_descs::resolve_logup_descs(C::lookup_fields(), C::logup_descs());
         let max_w = crate::witness::logup_descs::max_tuple_width(&descs);
         let out = stwo_backend_cuda::logup_pairs::device_interaction_from_flats(
-            lookup_dev.device_ptr,
-            n_rows,
-            n_real,
+            lookup.buffer.device_ptr,
+            lookup.n_rows,
+            lookup.n_real,
             &descs,
             &elements.alpha_powers()[..max_w],
             elements.z(),
@@ -381,7 +385,7 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
             eprintln!(
                 "jit_interaction[{}]: device logup {} rows x {} cols in {:.1} ms",
                 C::LABEL,
-                n_rows,
+                lookup.n_rows,
                 descs.len(),
                 t0.elapsed().as_secs_f64() * 1e3
             );
@@ -398,6 +402,7 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
     }
 
     fn lane_write_trace<C: OpcodeLaneSpec>(
+        exec_context: &WitnessExecContext,
         gen: C::Gen,
         addr_state: &memory_address_to_id::ClaimGenerator,
         id_state: &memory_id_to_big::ClaimGenerator,
@@ -461,10 +466,12 @@ impl OpcodeJitBackend for stwo_backend_cuda::CudaBackend {
             // igen below is an EMPTY placeholder that the device path replaces
             // (if the device path were to fail, the empty interaction trace fails
             // composition loudly — never silently wrong).
-            device_lookup_stash().lock().unwrap().insert(
+            exec_context.insert_device_lookup(
                 C::LABEL,
                 // No ENABLER mult source in opcode descriptors; n_real unused.
-                (out.lookup_dev, out.column_length, out.column_length),
+                out.lookup_dev,
+                out.column_length,
+                out.column_length,
             );
             C::igen_from_flats(out.log_size, &[], 0)
         } else {
@@ -844,25 +851,6 @@ pub(crate) fn edges_enabled() -> bool {
     std::env::var("STWO_CUDA_WITNESS_EDGES").as_deref() == Ok("1")
 }
 
-/// The B3 edge stash: producer label-keyed (BY CONSUMER edge key) device sub
-/// buffer + its HOST flat mirror + the producer's padded row count. The host
-/// flat makes every consumer-side failure recoverable on CPU (rebuild the
-/// inputs with the edge-gate math) — exactly-once feeds with no pair rerun.
-type EdgeStash = std::sync::Mutex<
-    std::collections::HashMap<&'static str, (stwo_backend_cuda::BaseFieldVec, Vec<u32>, usize)>,
->;
-fn edge_stash() -> &'static EdgeStash {
-    static STASH: std::sync::OnceLock<EdgeStash> = std::sync::OnceLock::new();
-    STASH.get_or_init(Default::default)
-}
-
-/// Pop a stashed edge for `consumer_key` (one-shot per prove).
-pub(crate) fn take_edge(
-    consumer_key: &'static str,
-) -> Option<(stwo_backend_cuda::BaseFieldVec, Vec<u32>, usize)> {
-    edge_stash().lock().unwrap().remove(consumer_key)
-}
-
 /// The consumer-side input source for a builtin launch.
 pub(crate) enum BuiltinInputs<'a> {
     /// Host-built slot columns (uploaded by the launch).
@@ -888,6 +876,65 @@ pub(crate) struct DeviceFeedPlan<'a> {
     pub require: bool,
 }
 
+/// One producer edge selected for device transport. `component` is the canonical
+/// schedule node id; `feed_state` is the generated claim-generator parameter whose
+/// host feed must be skipped while the edge is live.
+#[derive(Clone, Copy)]
+pub(crate) struct DeviceEdgeTarget {
+    pub component: &'static str,
+    pub feed_state: &'static str,
+}
+
+fn planned_device_edge<C: BuiltinLaneSpec>(
+    target: DeviceEdgeTarget,
+    layout: &'static [(&'static str, usize, &'static str, u32, usize, usize)],
+) -> PlannedDeviceEdge {
+    let mut word_base = None;
+    let mut words_per_instance = None;
+    let mut n_instances = 0usize;
+    for &(component, instance, state, _relation, base, words) in layout {
+        if state != target.feed_state {
+            continue;
+        }
+        assert_eq!(
+            component, target.component,
+            "device edge target component disagrees with SUB_FEED_LAYOUT"
+        );
+        assert_eq!(
+            instance, n_instances,
+            "device edge instances are not contiguous in SUB_FEED_LAYOUT"
+        );
+        match (word_base, words_per_instance) {
+            (None, None) => {
+                word_base = Some(base);
+                words_per_instance = Some(words);
+            }
+            (Some(first), Some(width)) => {
+                assert_eq!(
+                    words, width,
+                    "device edge width varies across SUB_FEED_LAYOUT instances"
+                );
+                assert_eq!(
+                    base,
+                    first + n_instances * width,
+                    "device edge words are not contiguous in SUB_FEED_LAYOUT"
+                );
+            }
+            _ => unreachable!(),
+        }
+        n_instances += 1;
+    }
+    PlannedDeviceEdge {
+        producer: C::LABEL,
+        consumer: target.component,
+        word_base: u32::try_from(word_base.expect("device edge missing from SUB_FEED_LAYOUT"))
+            .expect("device edge word base exceeds u32"),
+        words_per_instance: u32::try_from(words_per_instance.unwrap())
+            .expect("device edge width exceeds u32"),
+        n_instances: u32::try_from(n_instances).expect("device edge instance count exceeds u32"),
+    }
+}
+
 /// Generic builtin device write: validate the recording against the spec, launch
 /// it on the caller-built slot columns, and rebuild (trace, claim, igen); the
 /// caller then applies its component-specific sub feeds via `feed(sub_flat,
@@ -899,6 +946,7 @@ pub(crate) struct DeviceFeedPlan<'a> {
 /// (`want_host_lookup = true`); extending the device-interaction stash to the
 /// builtin specs is a separate, separately-gated step.
 pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
+    exec_context: &WitnessExecContext,
     input_cols: &[Vec<u32>],
     n_real: usize,
     mem: &Arc<Memory>,
@@ -906,6 +954,7 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
     feed: impl FnOnce(&[u32], usize, &[&'static str]),
 ) -> Option<(Evals<stwo_backend_cuda::CudaBackend>, C::Claim, C::IGen)> {
     builtin_cuda_write_trace_from::<C>(
+        exec_context,
         BuiltinInputs::HostCols(input_cols),
         n_real,
         mem,
@@ -918,11 +967,12 @@ pub(crate) fn builtin_cuda_write_trace<C: BuiltinLaneSpec>(
 /// Full-generality builtin device write (host cols OR device edge inputs;
 /// optional producer-side edge stash under `stash_edge`).
 pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
+    exec_context: &WitnessExecContext,
     inputs: BuiltinInputs<'_>,
     n_real: usize,
     mem: &Arc<Memory>,
     device_feed: Option<DeviceFeedPlan<'_>>,
-    stash_edge: Option<&'static str>,
+    stash_edge: Option<DeviceEdgeTarget>,
     feed: impl FnOnce(&[u32], usize, &[&'static str]),
 ) -> Option<(Evals<stwo_backend_cuda::CudaBackend>, C::Claim, C::IGen)> {
     if !lane_enabled(C::LABEL) || !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
@@ -999,6 +1049,7 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
     );
 
     let want_host_lookup = !device_interaction_enabled();
+    let feed_layout = device_feed.as_ref().map(|plan| plan.layout);
     // Skip the (largest) sub-word D2H + host repack when `sub_flat` is provably
     // unused: an all-count builtin (device_feed present + `require`, so every count
     // is device-fed and the host `feed` closure is a no-op) with no producer edge
@@ -1067,10 +1118,7 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
         // interaction time; the empty placeholder igen is replaced by the device
         // path — if that path were to fail, the empty interaction trace fails
         // composition loudly, never silently wrong.
-        device_lookup_stash()
-            .lock()
-            .unwrap()
-            .insert(C::LABEL, (lookup_dev, column_length, n_real));
+        exec_context.insert_device_lookup(C::LABEL, lookup_dev, column_length, n_real);
         C::igen_from_flats(log_size, n_real, &[], 0)
     } else {
         C::igen_from_flats(log_size, n_real, &lookup_flat, column_length)
@@ -1127,16 +1175,18 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
     // consumer's state key to the skip set — its input-list feed happens as the
     // consumer's device inputs (or the consumer rebuilds from the stashed HOST
     // flat on any failure; exactly-once either way).
-    if let Some(consumer_key) = stash_edge {
+    if let Some(target) = stash_edge {
         if edges_enabled() {
-            edge_stash()
-                .lock()
-                .unwrap()
-                .insert(consumer_key, (sub_dev, sub_flat.clone(), column_length));
-            device_fed.push(consumer_key);
+            let edge = planned_device_edge::<C>(
+                target,
+                feed_layout.expect("device edge requires a generated feed layout"),
+            );
+            exec_context.insert_edge(edge, sub_dev, sub_flat.clone(), column_length);
+            device_fed.push(target.feed_state);
             eprintln!(
-                "jit_prove[{}]: stashed device edge for {consumer_key}",
-                C::LABEL
+                "jit_prove[{}]: stashed device edge for {}",
+                C::LABEL,
+                target.component
             );
         }
     }
@@ -1318,6 +1368,7 @@ impl BuiltinLaneSpec for Cube252Lane {
 /// (first-packed-row replication) flattened to slot columns.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn all_count_builtin_write_trace<C: BuiltinLaneSpec>(
+    exec_context: &WitnessExecContext,
     cols: &[Vec<u32>],
     n_real: usize,
     mem: &Arc<Memory>,
@@ -1333,12 +1384,19 @@ pub(crate) fn all_count_builtin_write_trace<C: BuiltinLaneSpec>(
         sizes: &|_| None,
         require: true,
     };
-    builtin_cuda_write_trace::<C>(cols, n_real, mem, Some(plan), |_sub, _n, fed| {
-        debug_assert!(
-            !fed.is_empty(),
-            "require-mode feed reached with nothing fed"
-        );
-    })
+    builtin_cuda_write_trace::<C>(
+        exec_context,
+        cols,
+        n_real,
+        mem,
+        Some(plan),
+        |_sub, _n, fed| {
+            debug_assert!(
+                !fed.is_empty(),
+                "require-mode feed reached with nothing fed"
+            );
+        },
+    )
 }
 
 use crate::witness::components::{range_check_20, range_check_9_9};
@@ -1349,6 +1407,7 @@ use crate::witness::components::{range_check_20, range_check_9_9};
 /// REQUIRED, host-writer fallback on any unavailability).
 pub trait Cube252Witness: FromSimdColumns {
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: cube_252::ClaimGenerator,
         range_check_9_9_state: &range_check_9_9::ClaimGenerator,
         range_check_20_state: &range_check_20::ClaimGenerator,
@@ -1362,6 +1421,7 @@ pub trait Cube252Witness: FromSimdColumns {
 
 impl Cube252Witness for SimdBackend {
     fn write_trace(
+        _exec_context: &WitnessExecContext,
         gen: cube_252::ClaimGenerator,
         range_check_9_9_state: &range_check_9_9::ClaimGenerator,
         range_check_20_state: &range_check_20::ClaimGenerator,
@@ -1378,6 +1438,7 @@ impl Cube252Witness for SimdBackend {
 
 impl Cube252Witness for stwo_backend_cuda::CudaBackend {
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: cube_252::ClaimGenerator,
         range_check_9_9_state: &range_check_9_9::ClaimGenerator,
         range_check_20_state: &range_check_20::ClaimGenerator,
@@ -1420,6 +1481,7 @@ impl Cube252Witness for stwo_backend_cuda::CudaBackend {
                     other => panic!("unexpected count family {other}"),
                 };
                 let launched = all_count_builtin_write_trace::<Cube252Lane>(
+                    exec_context,
                     &cols,
                     n_real,
                     mem,

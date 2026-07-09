@@ -8,6 +8,8 @@
 //! metadata, hand-writing it is the data-entry class of bug the transformer work
 //! already eliminated twice).
 
+use stwo_cairo_prover::witness::exec_context::{PlannedDeviceEdge, WitnessArtifactPlan};
+
 /// Stable component identity: the component's module name as the transformer and
 /// the phase ledger already use it (e.g. `"add_opcode"`, `"partial_ec_mul_window_bits_18"`).
 pub type ComponentId = &'static str;
@@ -68,6 +70,16 @@ pub struct CountFeed {
     pub n_relations: u32,
 }
 
+/// A generated row-capacity contribution. Each producer row contributes
+/// `n_instances` packed relation inputs to the consumer. Unlike [`OutputEdge`],
+/// this fact does not claim that a device word-range transport exists; it is
+/// available for every generated `SubComponentInputs` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapacityFeed {
+    pub from: ComponentId,
+    pub n_instances: u32,
+}
+
 /// The pinned input-column slot layout `[flat 0..K | enabler | iota | mults..]`
 /// the builtin lane validates before launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,13 +90,62 @@ pub struct SlotLayout {
     pub n_mults: u32,
 }
 
+/// Base-trace width emitted from cairo-air. `memory_id_to_big` is the sole
+/// aggregate generator that expands to a variable number of big-memory traces
+/// plus one small-memory trace, so its two AIR widths remain explicit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceColumnCount {
+    Fixed(u32),
+    SplitMemory { big: u32, small: u32 },
+}
+
+/// Mechanically established source of a component's runtime row geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentRowSource {
+    /// Final adapter-provided `inputs.len()`; padded to a SIMD power of two.
+    DirectInputs,
+    /// A generator-owned `log_size` field.
+    StoredLogSize,
+    /// AIR-fixed table size.
+    FixedLogSize(u32),
+    /// Inputs or unique multiplicity keys are still added by upstream witness
+    /// writers. The pre-witness shape must remain explicitly unresolved.
+    WitnessRelationFeeds,
+    /// Split memory-address table formula.
+    MemoryAddress,
+    /// Variable big-memory components plus the small-memory component.
+    MemoryIdToBig,
+}
+
+/// A semantic witness recording exists and can produce the eventual AOT key.
+/// The key itself is not emitted by `schedule_emit`: it belongs to kernel_emit's
+/// recording/compiler manifest and must not be guessed from source labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelIdentitySource {
+    None,
+    RecordedWitness,
+}
+
+/// Static component facts derived from generated witness and cairo-air sources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentStaticFacts {
+    pub trace_columns: TraceColumnCount,
+    pub lookup_words: Option<u32>,
+    pub sub_words: Option<u32>,
+    pub logup_columns: Option<u32>,
+    pub row_source: ComponentRowSource,
+    pub kernel_identity: KernelIdentitySource,
+}
+
 /// One row of the schedule table (design §16.3).
 #[derive(Clone, Copy, Debug)]
 pub struct ComponentNode {
     pub id: ComponentId,
+    pub facts: ComponentStaticFacts,
     pub kernel: Option<KernelKey>,
     pub log_size: LogSizeSource,
     pub inputs: &'static [InputEdge],
+    pub capacity_inputs: &'static [CapacityFeed],
     pub outputs: &'static [OutputEdge],
     pub counts: &'static [CountFeed],
     pub slots: Option<SlotLayout>,
@@ -107,11 +168,49 @@ pub enum ScheduleError {
     Cycle(ComponentId),
 }
 
+impl std::fmt::Display for ScheduleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for ScheduleError {}
+
 pub struct Schedule {
     pub nodes: &'static [ComponentNode],
 }
 
 impl Schedule {
+    /// The schedule facts consumed by live per-proof witness artifact transport.
+    /// This is the first production consumer of the generated table: device lookup
+    /// labels and producer-edge geometry fail closed against these facts.
+    pub fn artifact_plan(&self) -> Result<WitnessArtifactPlan, ScheduleError> {
+        self.validate()?;
+        let components = self.nodes.iter().map(|node| node.id).collect();
+        let edges = self
+            .nodes
+            .iter()
+            .flat_map(|consumer| {
+                consumer.inputs.iter().filter_map(|input| match input {
+                    InputEdge::Producer {
+                        of,
+                        word_base,
+                        words_per_instance,
+                        n_instances,
+                    } => Some(PlannedDeviceEdge {
+                        producer: *of,
+                        consumer: consumer.id,
+                        word_base: *word_base,
+                        words_per_instance: *words_per_instance,
+                        n_instances: *n_instances,
+                    }),
+                    InputEdge::ExecTables | InputEdge::DeviceTable(_) => None,
+                })
+            })
+            .collect();
+        Ok(WitnessArtifactPlan::new(components, edges))
+    }
+
     /// Topological levels: nodes whose producer edges are all satisfied by earlier
     /// levels. Level order is the stream plan and (at M5) the graph capture order.
     pub fn levels(&self) -> Result<Vec<Vec<ComponentId>>, ScheduleError> {
@@ -127,7 +226,10 @@ impl Schedule {
                     n.inputs.iter().all(|e| match e {
                         InputEdge::Producer { of, .. } => placed.contains(of),
                         _ => true,
-                    })
+                    }) && n
+                        .capacity_inputs
+                        .iter()
+                        .all(|feed| placed.contains(&feed.from))
                 })
                 .map(|n| n.id)
                 .collect();
@@ -161,6 +263,14 @@ impl Schedule {
         // Dangling edges + width agreement (each consumer Producer edge must have a
         // matching OutputEdge on the producer).
         for n in self.nodes {
+            for feed in n.capacity_inputs {
+                if find(feed.from).is_none() {
+                    return Err(ScheduleError::DanglingEdge {
+                        from: feed.from,
+                        to: n.id,
+                    });
+                }
+            }
             for e in n.inputs {
                 if let InputEdge::Producer {
                     of,
@@ -218,6 +328,9 @@ impl Schedule {
                     dfs(nodes, of, visiting, done)?;
                 }
             }
+            for feed in node.capacity_inputs {
+                dfs(nodes, feed.from, visiting, done)?;
+            }
             visiting.retain(|v| *v != id);
             done.push(id);
             Ok(())
@@ -252,9 +365,18 @@ mod tests {
     const NODES: &[ComponentNode] = &[
         ComponentNode {
             id: "pedersen_aggregator_window_bits_18",
+            facts: ComponentStaticFacts {
+                trace_columns: TraceColumnCount::Fixed(206),
+                lookup_words: Some(396),
+                sub_words: Some(2023),
+                logup_columns: Some(6),
+                row_source: ComponentRowSource::WitnessRelationFeeds,
+                kernel_identity: KernelIdentitySource::RecordedWitness,
+            },
             kernel: None,
             log_size: LogSizeSource::FromStates,
             inputs: &[InputEdge::ExecTables],
+            capacity_inputs: &[],
             outputs: AGG_OUT,
             counts: &[CountFeed {
                 family: "rc_8",
@@ -269,9 +391,21 @@ mod tests {
         },
         ComponentNode {
             id: "partial_ec_mul_window_bits_18",
+            facts: ComponentStaticFacts {
+                trace_columns: TraceColumnCount::Fixed(297),
+                lookup_words: Some(498),
+                sub_words: Some(169),
+                logup_columns: Some(65),
+                row_source: ComponentRowSource::WitnessRelationFeeds,
+                kernel_identity: KernelIdentitySource::RecordedWitness,
+            },
             kernel: None,
             log_size: LogSizeSource::FromProducer("pedersen_aggregator_window_bits_18"),
             inputs: W18_IN,
+            capacity_inputs: &[CapacityFeed {
+                from: "pedersen_aggregator_window_bits_18",
+                n_instances: 28,
+            }],
             outputs: &[],
             counts: &[],
             slots: Some(SlotLayout {

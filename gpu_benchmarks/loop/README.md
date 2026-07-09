@@ -6,7 +6,7 @@ impossible to confuse which code produced which number.
 
 ```
 cd gpu_benchmarks/loop
-./bench_loop.sh                 # gate + benchmark SN_PIE_2, 2 reps, on the pod
+./bench_loop.sh                 # gate + SN_PIE_2: 1 cold + 5 warm proofs on the pod
 ./ledger_report.py              # read the ledger back as a table
 ```
 
@@ -17,22 +17,22 @@ cd gpu_benchmarks/loop
                  resolves ip/port/key at runtime (pod id from BENCH_POD_ID or
                  pod.conf); falls back to pod.conf FALLBACK_* with a loud warning
 (a) provenance   both repos' git HEAD + sha256 of the working diff  (see below)
-(b) sync         rsync stwo + stwo-cairo to the pod (fast delta), then re-apply
-                 the pod's Cargo.toml [patch] rewrite that rsync just clobbered
+(b) sync         rsync stwo + stwo-cairo to the pod (fast delta); Cargo's relative
+                 [patch] resolves the sibling /workspace/stwo checkout directly
 (c) build        incremental `cargo build ... gpu_bench --features pie-bench`;
                  a compile error aborts LOUDLY with the tail of the build log and
                  writes NO ledger entry
-(d) GATE         10-transfer PIE, CUDA prove + verify, FIRST — under the SAME
-                 BENCH_ENV as the benchmarks. A failed verify or a crash aborts
-                 the whole run and writes a `gate_failed` ledger entry
+(d) GATE         10-transfer PIE, two gpu-native CUDA proofs + verify + proof-byte
+                 equality + typed PCS architecture contract, FIRST — under the SAME
+                 BENCH_ENV as the benchmarks. A failure writes `gate_failed`
 (e) benchmark    the selected PIE(s), STWO_BENCH_TRACE=json, STWO_JIT_LOG=1
                  (always on — cold JIT-compile visibility catches hangs),
                  RUST_MIN_STACK=4M, --reuse-input, launched detached
                  (nohup+setsid) on the pod and polled with STALL DETECTION
 (f) pull         each run's stdout (main record + per-rep phase_totals) back
 (g) ledger       one JSON line per run appended to `ledger.jsonl` (incl. bench_env)
-(h) summary      useful_mhz per run + delta vs the previous ledger entry for the
-                 SAME run_name, SAME pod_gpu, and SAME bench_env
+(h) summary      useful_mhz_median for fixed statements (sustained_useful_mhz for
+                 pipelines) + delta vs the previous SAME-run/host/env entry
 ```
 
 ## Usage
@@ -45,7 +45,7 @@ cd gpu_benchmarks/loop
 | Flag          | Meaning                                                                 |
 |---------------|-------------------------------------------------------------------------|
 | `--pie SEL`   | Which PIE to benchmark: `1..4` = `SN_PIE_<n>.zip`, `10t` = 10-transfer. Default `2`. |
-| `--reps N`    | Reps per run (warm-best reported). Default `2`.                         |
+| `--reps N`    | Fixed-statement proofs (minimum 2). Published default `6`: one cold + five warm; the warm median is reported. |
 | `--full`      | Also benchmark `SN_PIE_1/3/4` (CUDA) **and** run the rotate-mode fleet (pipelined stream over all four PIEs — the production one-pod-proving-a-block-stream shape). |
 | `--simd`      | Add a same-host SIMD run of the selected PIE (CPU baseline).            |
 | `--skip-sync` | Skip rsync **and** build; benchmark the binary already on the pod.      |
@@ -56,13 +56,17 @@ cd gpu_benchmarks/loop
 | Var             | Default    | Meaning                                                     |
 |-----------------|------------|-------------------------------------------------------------|
 | `BENCH_POD_ID`  | (pod.conf) | Pod id, overrides `POD_ID` in `pod.conf`.                   |
-| `BENCH_ENV`     | (empty)    | `"K=V K=V ..."` exported verbatim into **every** gpu_bench invocation (gate included) and **recorded in every ledger entry**. For debug bisects: `STWO_CUDA_DISABLE_STREAMS`, `STWO_CUDA_MEMORY_WITNESS`, `STWO_CUDA_DEBUG_SYNC`, `CUDA_LAUNCH_BLOCKING`, `STWO_JIT_LOG`, ... Values must not contain spaces. |
+| `BENCH_ENV`     | (empty)    | `"K=V K=V ..."` exported verbatim into **every** gpu_bench invocation (gate included) and **recorded in every ledger entry**. `STWO_BOOTLOADER_JSON` is reserved; use `POD_BOOTLOADER_JSON`. |
+| `GPU_PCS_RUNTIME_MODE` | `detached-eager` | Required typed CUDA PCS runtime mode for every CUDA gate and performance run. `arena-graph` is accepted as a strict future requirement, but rejects today's detached runtime; it does not claim graph capture exists. |
 | `DRY_RUN=1`     | `0`        | Echo every ssh/rsync instead of executing, and fabricate run output so the provenance → ledger → summary path still runs for real. Use to trace logic offline. |
 | `FAKE_STALL`    | (unset)    | (DRY_RUN only) name of a run to simulate as stalled — exercises the stall → evidence → ledger → abort path. |
 | `POLL_INTERVAL` | `15`       | Seconds between pod poll checks.                            |
 | `STALL_SECS`    | `600`      | Stall detector window (see below).                          |
 | `MAX_WAIT`      | `10800`    | Hard cap on waiting for one run (3h backstop).              |
 | `FLEET_REPS` / `FLEET_DEPTH` / `FLEET_PRODUCERS` | `8` / `3` / `4` | Fleet (rotate) pipeline knobs. |
+| `GATE_PIE` | 10-transfer PIE on pod | Explicit remote gate fixture. Use `/workspace/stwo-cairo/gpu_benchmarks/pie/sn/SN_PIE_2.zip` when the smaller fixture is unavailable; verification still runs. |
+| `POD_BOOTLOADER_JSON` | `/workspace/bench_inputs/simple_bootloader_compiled.json` | Stable remote path. Its manifest-pinned file is required and SHA-256 preflighted, exported during build, and exported for every launch. |
+| `SN_PIE_SOURCE_DIR` / `GATE_PIE_SOURCE` / `BOOTLOADER_JSON_SOURCE` | (unset) | Optional local sources to checksum and print explicit seed commands for. They are never uploaded automatically. |
 
 ## Pod resolution (`pod.conf`)
 
@@ -99,9 +103,11 @@ A mystery hang becomes a self-documenting ledger row.
 
 Table columns: `ts`, `revs` (stwo/cairo short + `*` when the tree was dirty),
 `run_name` (`!` = the run had a non-default `BENCH_ENV` — a debug/bisect number, never
-compare it with clean numbers), `useful_mhz` (a trailing `~` means it is
-`sustained_useful_mhz` from a pipelined fleet run), `vram_gb`, and `delta` vs the
-previous **same-run, same-pod, same-bench_env** entry.
+compare it with clean numbers), `claim_mhz`, its explicit `mhz_basis`
+(`useful_mhz_median` for fixed statements or `sustained_useful_mhz` for pipelines),
+`vram_gb`, and `delta` vs the previous **same-run, same-pod, same-bench_env** entry.
+Legacy warm-best `useful_mhz` remains in raw output for compatibility and is never
+used for a claim, ranking, or delta.
 
 ## Provenance model — why a number is never ambiguous
 
@@ -117,7 +123,8 @@ Every ledger entry records, at the moment of the run:
 - `bench_env` — the exact `BENCH_ENV` the run executed under (empty for clean runs).
   A number produced with debug sync or disabled streams is permanently marked as such.
 - `record` — the harness's own self-describing JSON (security config, host fingerprint,
-  timings, VRAM, `useful_mhz`, …). `phase_totals` — the per-rep `STWO_BENCH_TRACE=json`
+  timings, VRAM, `useful_mhz_median`, proof-byte equality, typed CUDA PCS architecture,
+  runtime mode, and exact seven-stage start/finish counts). `phase_totals` — the per-rep `STWO_BENCH_TRACE=json`
   span breakdown. Fleet runs additionally carry a `pipeline` object (sustained numbers).
 - `status` — `ok`, `gate_failed`, `run_failed`, or `stalled` (with `stall_evidence`).
 
@@ -126,16 +133,21 @@ Every ledger entry records, at the moment of the run:
 
 ## The gate-first rule
 
-The correctness gate (10-transfer PIE, CUDA prove **and** verify) always runs before any
+The correctness gate (configured PIE, two gpu-native CUDA proofs, verify, required
+proof-byte equality, and typed PCS architecture) always runs before any
 performance benchmark, **under the same `BENCH_ENV` as the benchmarks** — a kill switch
-that changes prover behavior must be correctness-gated too. A failed verify or a crash
-aborts the run and records a `gate_failed` entry. **Performance is never reported from a
-build that failed the gate** — a fast but wrong prover is worthless, and the ledger must
-never contain a misleading fast number attached to a broken build.
+that changes prover behavior must be correctness-gated too. The harness validates the
+output contract (`verified_reps=2`, equality applicable/required/true) and independently
+runs `validate_architecture_record.py`. That validator requires `backend=cuda`,
+`engine=gpu-native`, architecture `cuda-typed-pcs-driver-v1`, the selected runtime mode,
+all seven stage starts and finishes exactly once, batched tree decommit, and complete
+telemetry. It is also applied to every CUDA performance record, closing the stale-binary
+case where an unknown CLI flag is silently ignored. A failed contract, verify, or crash
+aborts the run. **Performance is never reported from a build that failed the gate.**
 
 ## ⚠️ Only same-pod comparisons are meaningful
 
-`useful_mhz` depends heavily on the host (GPU model, CPU, memory bandwidth, and shared
+`useful_mhz_median` depends heavily on the host (GPU model, CPU, memory bandwidth, and shared
 tenancy on a community pod). The delta computed by both `bench_loop.sh` and
 `ledger_report.py` is deliberately scoped to the **same `run_name` AND the same
 `pod_gpu` AND the same `bench_env`**. Do **not** read a delta across different GPUs — it
@@ -146,11 +158,13 @@ baseline.
 
 - Pod identity: `pod.conf` (`POD_ID` + fallback endpoint); resolution via `runpodctl`.
 - Repos on the pod: `/workspace/stwo`, `/workspace/stwo-cairo`.
-- The pod's `stwo_cairo_prover/Cargo.toml` `[patch]` points at `/workspace/stwo`; the
-  local copy points at `/Users/...`. rsync overwrites it every sync, so the script
-  re-applies the `sed` rewrite immediately after every sync.
+- `stwo_cairo_prover/Cargo.toml` uses portable relative `[patch]` paths to the sibling
+  `stwo` checkout; the same manifest resolves locally and under `/workspace` on a pod.
 - PIE inputs (`SN_PIE_*.zip`, the 10-transfer zip) already live on the pod and are
   **never** synced (rsync excludes them).
+- The bootloader lives at stable `POD_BOOTLOADER_JSON`; its pinned checksum must match
+  `gpu_benchmarks/pie/SHA256SUMS` before sync/build/run. If absent, provide
+  `BOOTLOADER_JSON_SOURCE` to print the explicit seed command.
 - `target/` and `.git/` are excluded from rsync; the build is incremental (~1-2 min).
 - Run scratch (launcher scripts, stdout/err, pid/pgid/rc sentinels, build log) lives in
   `/workspace/bench_loop_runs` on the pod, outside the repo tree.
@@ -163,6 +177,7 @@ sync + build would disturb the in-flight round's source tree.
 | File               | Role                                                            |
 |--------------------|-----------------------------------------------------------------|
 | `bench_loop.sh`    | The one command (steps 0 + a–h above).                          |
+| `../validate_architecture_record.py` | Fail-closed validator for pulled gpu_bench architecture evidence. |
 | `ledger_report.py` | Read `ledger.jsonl` as a table / phase trend (stdlib only).     |
 | `pod.conf`         | Pod id + fallback endpoint (edit when the pod moves).           |
 | `ledger.jsonl`     | The persistent ledger (created on first run; one JSON per line).|

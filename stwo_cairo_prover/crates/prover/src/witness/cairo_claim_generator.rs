@@ -28,6 +28,7 @@ use crate::witness::base_trace::BaseTrace;
 use crate::witness::blake_g_witness_backend::BlakeGWitness;
 use crate::witness::blake_round_witness_backend::BlakeRoundWitness;
 use crate::witness::components::*;
+use crate::witness::exec_context::WitnessExecContext; // witness_exec_context_codegen
 use crate::witness::jit_prove_backend::{
     AddOpcodeLane, AddOpcodeSmallLane, AssertEqOpcodeDoubleDerefLane, AssertEqOpcodeImmLane,
     AssertEqOpcodeLane, BlakeRoundLane, CallOpcodeAbsLane, CallOpcodeRelImmLane, Cube252Lane,
@@ -767,6 +768,7 @@ impl CairoClaimGenerator {
             + PolyOps,
     >(
         mut self,
+        exec_context: &WitnessExecContext,
         opt_n_id_to_big_components: Option<usize>,
         // Stage A″ (pipelined commit): when `Some`, the opcode-prefix columns are
         // interpolated on a committer thread with this twiddle tree WHILE the serial
@@ -811,7 +813,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:add_opcode").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<AddOpcodeLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -826,7 +833,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:add_opcode_small").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<AddOpcodeSmallLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -856,7 +868,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:assert_eq_opcode").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<AssertEqOpcodeLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -871,7 +888,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:assert_eq_opcode_imm").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<AssertEqOpcodeImmLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -886,7 +908,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:assert_eq_opcode_double_deref").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<AssertEqOpcodeDoubleDerefLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -918,7 +945,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:call_opcode_abs").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<CallOpcodeAbsLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -933,7 +965,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:call_opcode_rel_imm").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<CallOpcodeRelImmLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -965,7 +1002,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jnz_opcode_non_taken").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<JnzOpcodeNonTakenLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -980,7 +1022,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jnz_opcode_taken").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<JnzOpcodeTakenLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -995,7 +1042,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jump_opcode_abs").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeAbsLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -1010,7 +1062,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jump_opcode_double_deref").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeDoubleDerefLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -1025,7 +1082,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jump_opcode_rel").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeRelLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -1040,7 +1102,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:jump_opcode_rel_imm").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<JumpOpcodeRelImmLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -1097,7 +1164,12 @@ impl CairoClaimGenerator {
                     *result_slot = Some({
                         let _wt = tracing::info_span!("wt:ret_opcode").entered();
                         <B as OpcodeJitBackend>::lane_write_trace::<RetOpcodeLane>(
-                            gen, addr_state, id_state, vi_state, jit_memory,
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            jit_memory,
                         )
                     });
                 });
@@ -1460,6 +1532,7 @@ impl CairoClaimGenerator {
                         // SimdBackend runs the host writer; CudaBackend's device lane
                         // (pod-gated) is born on device and feeds blake_g device-to-device.
                         let (trace, claim, interaction_gen) = <B as BlakeRoundWitness>::write_trace(
+                            exec_context,
                             gen,
                             sigma_gen.as_ref().unwrap(),
                             addr_state.unwrap(),
@@ -1477,6 +1550,7 @@ impl CairoClaimGenerator {
                     if let Some(gen) = blake_g_state {
                         let _wt = tracing::info_span!("wt:blake_g").entered();
                         let (trace, claim, interaction_gen) = <B as BlakeGWitness>::write_trace(
+                            exec_context,
                             gen,
                             vbx_8.unwrap(),
                             verify_bitwise_xor_12_gen.as_ref().unwrap(),
@@ -1615,6 +1689,7 @@ impl CairoClaimGenerator {
                             tracing::info_span!("wt:pedersen_aggregator_window_bits_18").entered();
                         let (trace, claim, interaction_gen) =
                             <B as PedersenAggregatorWindowBits18Witness>::write_trace(
+                                exec_context,
                                 gen,
                                 id_state.unwrap(),
                                 rc_8.unwrap(),
@@ -1628,6 +1703,7 @@ impl CairoClaimGenerator {
                         let _wt = tracing::info_span!("wt:partial_ec_mul_window_bits_18").entered();
                         let (trace, claim, interaction_gen) =
                             <B as PartialEcMulWindowBits18Witness>::write_trace(
+                                exec_context,
                                 gen,
                                 pts18_gen.as_ref().unwrap(),
                                 rc_9_9.unwrap(),
@@ -1737,6 +1813,7 @@ impl CairoClaimGenerator {
                         let _wt = tracing::info_span!("wt:partial_ec_mul_generic").entered();
                         let (trace, claim, interaction_gen) =
                             <B as PartialEcMulGenericWitness>::write_trace(
+                                exec_context,
                                 gen,
                                 rc_8.unwrap(),
                                 rc_9_9.unwrap(),
@@ -1827,6 +1904,7 @@ impl CairoClaimGenerator {
                     if let Some(gen) = cube_gen {
                         let _wt = tracing::info_span!("wt:cube_252").entered();
                         let (trace, claim, interaction_gen) = <B as Cube252Witness>::write_trace(
+                            exec_context,
                             gen,
                             rc_9_9.unwrap(),
                             rc_20.unwrap(),
@@ -2378,6 +2456,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
     /// computed from the device-resident limb columns (witness-on-GPU P1).
     pub fn write_interaction_trace(
         self,
+        exec_context: &WitnessExecContext,
         common_lookup_elements: &CommonLookupElements,
     ) -> (
         Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
@@ -2454,7 +2533,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
 
         scope(|s| {
             if let Some(gen) = self.add_opcode {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<AddOpcodeLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<AddOpcodeLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2464,7 +2545,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.add_opcode_small {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<AddOpcodeSmallLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<AddOpcodeSmallLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2480,7 +2563,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.assert_eq_opcode {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<AssertEqOpcodeLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<AssertEqOpcodeLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2490,7 +2575,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.assert_eq_opcode_imm {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<AssertEqOpcodeImmLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<AssertEqOpcodeImmLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2502,7 +2589,8 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             if let Some(gen) = self.assert_eq_opcode_double_deref {
                 if <B as OpcodeJitBackend>::device_interaction_pending::<
                     AssertEqOpcodeDoubleDerefLane,
-                >() {
+                >(exec_context)
+                {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2518,7 +2606,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.call_opcode_abs {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<CallOpcodeAbsLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<CallOpcodeAbsLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2528,7 +2618,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.call_opcode_rel_imm {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<CallOpcodeRelImmLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<CallOpcodeRelImmLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2544,7 +2636,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.jnz_opcode_non_taken {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<JnzOpcodeNonTakenLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JnzOpcodeNonTakenLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2554,7 +2648,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.jnz_opcode_taken {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<JnzOpcodeTakenLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JnzOpcodeTakenLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2564,7 +2660,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.jump_opcode_abs {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeAbsLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeAbsLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2575,6 +2673,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             }
             if let Some(gen) = self.jump_opcode_double_deref {
                 if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeDoubleDerefLane>(
+                    exec_context,
                 ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
@@ -2585,7 +2684,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.jump_opcode_rel {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeRelLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeRelLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2595,7 +2696,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.jump_opcode_rel_imm {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeRelImmLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<JumpOpcodeRelImmLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2622,7 +2725,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.ret_opcode {
-                if <B as OpcodeJitBackend>::device_interaction_pending::<RetOpcodeLane>() {
+                if <B as OpcodeJitBackend>::device_interaction_pending::<RetOpcodeLane>(
+                    exec_context,
+                ) {
                     drop(gen); // device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2638,7 +2743,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.blake_round {
-                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<BlakeRoundLane>() {
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<BlakeRoundLane>(
+                    exec_context,
+                ) {
                     drop(gen); // §6a: the device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2730,7 +2837,8 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             if let Some(gen) = self.partial_ec_mul_generic {
                 if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<
                     PartialEcMulGenericLane,
-                >() {
+                >(exec_context)
+                {
                     drop(gen); // §6a: the device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2742,7 +2850,8 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             if let Some(gen) = self.pedersen_aggregator_window_bits_18 {
                 if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<
                     PedersenAggregatorW18Lane,
-                >() {
+                >(exec_context)
+                {
                     drop(gen); // §6a: the device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2753,6 +2862,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             }
             if let Some(gen) = self.partial_ec_mul_window_bits_18 {
                 if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<PartialEcMulW18Lane>(
+                    exec_context,
                 ) {
                     drop(gen); // §6a: the device path owns this component's interaction
                 } else {
@@ -2805,7 +2915,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.cube_252 {
-                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<Cube252Lane>() {
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<Cube252Lane>(
+                    exec_context,
+                ) {
                     drop(gen); // §6a: the device path owns this component's interaction
                 } else {
                     s.spawn(|_| {
@@ -2944,8 +3056,10 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         });
 
         let add_opcode_interaction_claim = if let Some((trace, claimed_sum)) =
-            <B as OpcodeJitBackend>::device_interaction::<AddOpcodeLane>(common_lookup_elements)
-        {
+            <B as OpcodeJitBackend>::device_interaction::<AddOpcodeLane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
             evals.extend(trace);
             Some(cairo_air::components::add_opcode::InteractionClaim { claimed_sum })
         } else {
@@ -2957,6 +3071,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         };
         let add_opcode_small_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<AddOpcodeSmallLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -2975,6 +3090,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         });
         let assert_eq_opcode_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<AssertEqOpcodeLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -2988,6 +3104,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         };
         let assert_eq_opcode_imm_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<AssertEqOpcodeImmLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3001,6 +3118,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         };
         let assert_eq_opcode_double_deref_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<AssertEqOpcodeDoubleDerefLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3023,8 +3141,10 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 build_claim(claimed_sum)
             });
         let call_opcode_abs_interaction_claim = if let Some((trace, claimed_sum)) =
-            <B as OpcodeJitBackend>::device_interaction::<CallOpcodeAbsLane>(common_lookup_elements)
-        {
+            <B as OpcodeJitBackend>::device_interaction::<CallOpcodeAbsLane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
             evals.extend(trace);
             Some(cairo_air::components::call_opcode_abs::InteractionClaim { claimed_sum })
         } else {
@@ -3036,6 +3156,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         };
         let call_opcode_rel_imm_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<CallOpcodeRelImmLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3054,6 +3175,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         });
         let jnz_opcode_non_taken_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<JnzOpcodeNonTakenLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3067,6 +3189,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         };
         let jnz_opcode_taken_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<JnzOpcodeTakenLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3079,8 +3202,10 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             })
         };
         let jump_opcode_abs_interaction_claim = if let Some((trace, claimed_sum)) =
-            <B as OpcodeJitBackend>::device_interaction::<JumpOpcodeAbsLane>(common_lookup_elements)
-        {
+            <B as OpcodeJitBackend>::device_interaction::<JumpOpcodeAbsLane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
             evals.extend(trace);
             Some(cairo_air::components::jump_opcode_abs::InteractionClaim { claimed_sum })
         } else {
@@ -3092,6 +3217,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         };
         let jump_opcode_double_deref_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<JumpOpcodeDoubleDerefLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3104,8 +3230,10 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             })
         };
         let jump_opcode_rel_interaction_claim = if let Some((trace, claimed_sum)) =
-            <B as OpcodeJitBackend>::device_interaction::<JumpOpcodeRelLane>(common_lookup_elements)
-        {
+            <B as OpcodeJitBackend>::device_interaction::<JumpOpcodeRelLane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
             evals.extend(trace);
             Some(cairo_air::components::jump_opcode_rel::InteractionClaim { claimed_sum })
         } else {
@@ -3117,6 +3245,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         };
         let jump_opcode_rel_imm_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<JumpOpcodeRelImmLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3146,8 +3275,10 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 build_claim(claimed_sum)
             });
         let ret_opcode_interaction_claim = if let Some((trace, claimed_sum)) =
-            <B as OpcodeJitBackend>::device_interaction::<RetOpcodeLane>(common_lookup_elements)
-        {
+            <B as OpcodeJitBackend>::device_interaction::<RetOpcodeLane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
             evals.extend(trace);
             Some(cairo_air::components::ret_opcode::InteractionClaim { claimed_sum })
         } else {
@@ -3165,6 +3296,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             });
         let blake_round_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::builtin_device_interaction::<BlakeRoundLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3249,6 +3381,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         });
         let partial_ec_mul_generic_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::builtin_device_interaction::<PartialEcMulGenericLane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3265,6 +3398,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             claimed_sum,
         )) =
             <B as OpcodeJitBackend>::builtin_device_interaction::<PedersenAggregatorW18Lane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3282,6 +3416,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
         };
         let partial_ec_mul_window_bits_18_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::builtin_device_interaction::<PartialEcMulW18Lane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);
@@ -3341,6 +3476,7 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
             });
         let cube_252_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::builtin_device_interaction::<Cube252Lane>(
+                exec_context,
                 common_lookup_elements,
             ) {
             evals.extend(trace);

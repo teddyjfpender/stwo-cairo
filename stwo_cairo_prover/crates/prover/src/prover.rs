@@ -36,6 +36,7 @@ use crate::utils::cairo_provers;
 use crate::witness::base_trace::BaseTrace;
 use crate::witness::cairo::create_cairo_claim_generator;
 use crate::witness::cairo_claim_generator::CairoInteractionClaimGenerator;
+use crate::witness::exec_context::WitnessExecContext;
 use crate::witness::utils::witness_trace_cells;
 
 mod json {
@@ -175,13 +176,17 @@ where
 
     // Run Cairo.
     let cairo_claim_generator = create_cairo_claim_generator(input, preprocessed_trace.clone());
+    let witness_exec_context = WitnessExecContext::default();
     // Base trace.
     let span = span!(Level::INFO, "Write Base trace").entered();
     // Stage A″: on a warm process this is the twiddle tree the previous prove cached
     // (None on the first prove or when the gate is off) — see `pipelined_commit_twiddles`.
     let pipeline_twiddles = pipelined_commit_twiddles::<B>();
-    let (trace, claim, interaction_generator) =
-        cairo_claim_generator.write_trace::<B>(opt_n_id_to_big_components, pipeline_twiddles);
+    let (trace, claim, interaction_generator) = cairo_claim_generator.write_trace::<B>(
+        &witness_exec_context,
+        opt_n_id_to_big_components,
+        pipeline_twiddles,
+    );
     span.exit();
 
     // The maximal log trace size (without blowup factor) is the maximum over preprocessed trace
@@ -282,6 +287,7 @@ where
         trace,
         claim,
         interaction_generator,
+        witness_exec_context,
         prover_params,
     )
 }
@@ -315,13 +321,17 @@ where
 
     // Run Cairo.
     let cairo_claim_generator = create_cairo_claim_generator(input, preprocessed_trace.clone());
+    let witness_exec_context = WitnessExecContext::default();
     // Base trace.
     let span = span!(Level::INFO, "Write Base trace").entered();
     // The caller-supplied `twiddles` here is not `'static`, so it can't back the
     // Stage A″ committer thread; this precompute variant always uses the byte-identical
     // `BaseTrace::Evals` path. (It also currently has no callers.)
-    let (trace, claim, interaction_generator) =
-        cairo_claim_generator.write_trace::<B>(prover_params.opt_n_id_to_big_components, None);
+    let (trace, claim, interaction_generator) = cairo_claim_generator.write_trace::<B>(
+        &witness_exec_context,
+        prover_params.opt_n_id_to_big_components,
+        None,
+    );
     span.exit();
 
     prove_cairo_common::<B, MC>(
@@ -332,6 +342,7 @@ where
         trace,
         claim,
         interaction_generator,
+        witness_exec_context,
         prover_params,
     )
 }
@@ -344,6 +355,7 @@ fn prove_cairo_common<'a, B, MC>(
     trace: BaseTrace<B>,
     claim: CairoClaim,
     interaction_generator: CairoInteractionClaimGenerator<B>,
+    witness_exec_context: WitnessExecContext,
     prover_params: ProverParameters,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
@@ -438,7 +450,7 @@ where
     // Interaction trace.
     let span = span!(Level::INFO, "Write interaction trace").entered();
     let (interaction_trace_evals, interaction_claim) =
-        interaction_generator.write_interaction_trace(&interaction_elements);
+        interaction_generator.write_interaction_trace(&witness_exec_context, &interaction_elements);
     span.exit();
 
     tracing::info!(

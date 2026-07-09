@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use cairo_air::cairo_components::CairoComponents;
 use cairo_air::relations::CommonLookupElements;
@@ -30,6 +31,7 @@ use stwo::core::channel::Blake2sChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo_backend_cuda::aot;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
 use stwo_cairo_gpu_prover::{phases, state};
 use stwo_cairo_prover::witness::jit_prove_backend::all_lane_recordings;
 
@@ -79,16 +81,29 @@ fn run_fixture(
     let state::IngestOutput {
         preprocessed_trace,
         generator,
-    } = phases::ingest::run(input, variant);
+        proof_plan,
+    } = phases::ingest::run(input, variant, None);
     let state::WitnessOutput {
         trace: _trace,
         claim,
         interaction_generator,
-    } = phases::witness::run::<SimdBackend>(generator, None, None);
+        device,
+    } = phases::witness::run::<SimdBackend>(
+        generator,
+        Arc::new(
+            CAIRO_SCHEDULE
+                .artifact_plan()
+                .expect("valid Cairo schedule"),
+        ),
+        proof_plan,
+        None,
+        None,
+    );
     // Any elements work: the lowering hoists them into parameters; hashes are
     // statement-independent.
     let elements = CommonLookupElements::draw(&mut Blake2sChannel::default());
-    let (_evals, interaction_claim) = phases::interaction::run(interaction_generator, &elements);
+    let (_evals, interaction_claim) =
+        phases::interaction::run(interaction_generator, &device, &elements);
     let components = CairoComponents::new(
         &claim,
         &elements,

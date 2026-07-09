@@ -36,9 +36,11 @@ cat fleet_report.json                                                 # the aggr
                  gate). Reuses the loop wholesale; a pod that fails prep is dropped.
 (c) resolve      `runpodctl ssh info <id>` per pod -> ip/port/key; falls back to the
                  fb_* columns with a loud warning (may be stale) — never hardcoded.
-(d) GATE         unless --skip-gate: 10-transfer PIE CUDA prove+verify on EVERY pod
+(d) GATE         unless --skip-gate: 10-transfer PIE gpu-native CUDA prove+verify on EVERY pod
                  concurrently. A pod that fails is dropped and marked gate_failed;
-                 its performance is NEVER reported (gate-first, like the loop).
+                 its performance is NEVER reported (gate-first, like the loop). The
+                 gate proves twice and requires byte-identical proofs; the emitted
+                 JSON must also prove the typed CUDA PCS architecture completed.
 (e) benchmark    one rotate-mode pipelined stream per pod (--pie a,b,c,d --pipeline D
                  --producers P --pie-mode rotate), launched detached (nohup+setsid)
                  on all pods at once, polled together. STWO_BENCH_TRACE=json,
@@ -81,6 +83,8 @@ dropped) — and does **not** modify `bench_loop.sh`.
 | `FLEET_CONF` / `FLEET_ONLY`                | (—)     | Roster path / single pod id (overridden by `--conf` / `--only`). |
 | `FLEET_REPS` / `FLEET_DEPTH` / `FLEET_PRODUCERS` | `8`/`3`/`4` | Rotate stream knobs. |
 | `BENCH_ENV`                                | (empty) | `"K=V K=V ..."` exported into every `gpu_bench` invocation (gate + benchmark) on every pod, and recorded in the report. Debug bisects (`STWO_CUDA_DISABLE_STREAMS=1`, ...). No spaces in values. |
+| `GPU_PCS_RUNTIME_MODE`                     | `detached-eager` | Required typed CUDA PCS runtime mode. `arena-graph` is a strict future gate and currently rejects detached telemetry; it does not claim ArenaGraph is ready. |
+| `POD_BOOTLOADER_JSON`                      | `/workspace/bench_inputs/simple_bootloader_compiled.json` | Stable remote bootloader path, manifest-pinned and SHA-256 preflighted on every participating pod, then exported for every launch. |
 | `DRY_RUN=1`                                | `0`     | Echo every ssh instead of executing; fabricate per-pod output so the whole roster→launch→poll→aggregate→report path runs offline. |
 | `FAKE_STALL`                               | (unset) | (DRY_RUN only) pod id to simulate as stalled — exercises the stall→drop path. |
 | `POLL_INTERVAL` / `STALL_SECS` / `MAX_WAIT`| `15`/`600`/`10800` | Poll cadence / stall window / hard cap (same semantics as the loop). |
@@ -101,6 +105,13 @@ the bisect surface:
 
 A pod that fails its gate, fails to launch, or stalls is **dropped from the aggregate**
 and recorded with its status — never silently averaged into the fleet number.
+
+Every CUDA gate and performance invocation carries `--engine gpu-native` and
+`--require-gpu-native-architecture`. After pulling stdout, the fleet independently runs
+`gpu_benchmarks/validate_architecture_record.py`; a stale binary or partial record is
+dropped unless it reports the exact `cuda-typed-pcs-driver-v1` tag, the required runtime
+mode, all seven starts and finishes exactly once, batched tree decommit, and complete
+telemetry.
 
 ## Reading `fleet_report.json`
 
@@ -125,7 +136,8 @@ and recorded with its status — never silently averaged into the fleet number.
 
 - **per-pod `useful_mhz`** is `sustained_useful_mhz` from the pod's pipeline record
   (the sustained, feed-fed rate — the honest fleet capacity), or the single-prove
-  `useful_mhz` if a pod somehow produced no pipeline record.
+  `useful_mhz_median` if a pod somehow produced no pipeline record. Legacy warm-best
+  `useful_mhz` is never an aggregate or ranking fallback.
 - **`aggregate_useful_mhz`** = Σ per-pod useful MHz over pods with `status:"ok"` only.
 - **`total_usd_per_hr`** = Σ `usd_per_hr` over those same ok pods (so `$/MHz-hr` is
   honest — you do not pay for a stalled pod's MHz because it contributed none).
@@ -183,12 +195,17 @@ real numbers as W3/P2/P3 land.
 - `n_queries=70` / `pow_bits=26` (96-bit) config throughout — never compare against
   NitrooZK's `n_queries=3` figures (KNOWN_ISSUES.md).
 - Raw per-pod stdout/err and any stall evidence land in `fleet/results/`.
+- A copied binary never depends on a builder-local Cargo cache path:
+  `build_and_push.sh` builds with the stable `POD_BOOTLOADER_JSON`, preflights or seeds
+  its pinned file on the builder, copies it with the binary, and verifies it on each
+  destination. Set `BOOTLOADER_JSON_SOURCE` when the builder needs seeding.
 
 ## Files
 
 | File                | Role                                                            |
 |---------------------|-----------------------------------------------------------------|
 | `fleet.sh`          | The concurrent orchestrator (steps 0 + a–h above).              |
+| `build_and_push.sh` | Build once; distribute the portable binary, pinned bootloader, and JIT cache. |
 | `pod_provision.sh`  | `runpodctl` create/list/terminate/ssh-info helpers.             |
 | `fleet.conf`        | Pod roster (edit to add/remove/disable pods).                   |
 | `fleet_report.json` | Latest aggregate report (overwritten each run).                 |

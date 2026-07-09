@@ -15,11 +15,19 @@
 //! is the exit gate; speed work starts at M2 (witness DAG), M3 (AOT kernels),
 //! M4 (commit fusion), M5 (graphs + device channel), M6 (pipelining).
 
+pub mod arena_plan;
 pub mod flags;
+pub mod graphs;
 pub mod phases;
+pub mod plan;
+pub mod protocol_plan;
 pub mod prover;
+pub mod relation;
+pub mod relation_execution;
+pub mod relation_table;
 pub mod schedule;
 pub mod schedule_table;
 pub mod state;
 
 pub use prover::{CairoBackend, GpuCairoProver, GpuProverConfig};
+pub use stwo_backend_cuda::{CudaPcsDriverTelemetry, CudaPcsRuntimeMode};
