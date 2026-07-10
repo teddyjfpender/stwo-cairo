@@ -103,7 +103,9 @@ GATES = (
             "--test",
             "prepared_relation_native",
         ),
-        1,
+        # 2x2 launch-mode matrix: {ThreeStage, Fused} bodies x {Segmented,
+        # Scan} tails, each eager/captured/mutated-replay byte-identical.
+        4,
     ),
     (
         "prepared_witness_eager_capture_cpu_reference",
