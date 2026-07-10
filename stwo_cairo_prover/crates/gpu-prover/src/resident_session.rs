@@ -1103,6 +1103,22 @@ mod tests {
             aggregator < partial_chain,
             "producer must be planned before its consumer"
         );
+
+        // The runtime fails closed on any fixed-multiplicity coverage gap or
+        // feed blocker; both are plan-level facts, so pin them here instead of
+        // twenty minutes into a hardware parity run.
+        let multiplicities =
+            crate::multiplicity_pipeline::plan_graph_a_multiplicities(&exact_plan).unwrap();
+        assert!(
+            multiplicities.coverage_gaps.is_empty(),
+            "fixed-multiplicity coverage gaps: {:?}",
+            multiplicities.coverage_gaps
+        );
+        assert!(
+            multiplicities.blockers.is_empty(),
+            "multiplicity feed blockers: {:?}",
+            multiplicities.blockers
+        );
     }
 
     fn pcs(lifting_log_size: Option<u32>) -> PcsConfig {

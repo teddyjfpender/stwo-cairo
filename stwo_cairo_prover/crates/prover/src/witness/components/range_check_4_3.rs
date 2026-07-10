@@ -35,6 +35,20 @@ impl ClaimGenerator {
         }
     }
 
+    pub fn input_to_row_lut(&self) -> Vec<u32> {
+        const LUT_SIZE: usize = 1 << 7;
+        assert_eq!(
+            self.input_to_row.len(),
+            LUT_SIZE,
+            "input_to_row map does not cover the full tuple space"
+        );
+        let mut lut = vec![0u32; LUT_SIZE];
+        for (k, &row) in &self.input_to_row {
+            lut[((k[0].0 as usize) << 3) | (k[1].0 as usize)] = row as u32;
+        }
+        lut
+    }
+
     pub fn write_trace(
         self,
     ) -> (

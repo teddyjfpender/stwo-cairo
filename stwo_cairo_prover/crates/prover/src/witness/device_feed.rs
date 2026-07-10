@@ -20,9 +20,9 @@ use std::sync::Arc;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 
 use crate::witness::components::{
-    blake_round_sigma, range_check_3_3_3_3_3, range_check_4_4, range_check_4_4_4_4,
-    range_check_7_2_5, range_check_9_9, verify_bitwise_xor_4, verify_bitwise_xor_7,
-    verify_bitwise_xor_8, verify_bitwise_xor_9,
+    blake_round_sigma, poseidon_round_keys, range_check_3_3_3_3_3, range_check_4_3,
+    range_check_4_4, range_check_4_4_4_4, range_check_7_2_5, range_check_9_9, verify_bitwise_xor_4,
+    verify_bitwise_xor_7, verify_bitwise_xor_8, verify_bitwise_xor_9,
 };
 
 /// One count-style relation family the driver knows how to feed: how to key it
@@ -227,6 +227,24 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         kind: 0,
         key_offset: 0,
     },
+    CountRelation {
+        state_param: "poseidon_round_keys_state",
+        word_bits: &[6],
+        table_size: 1 << 6,
+        n_relations: 1,
+        needs_lut: true,
+        kind: 0,
+        key_offset: 0,
+    },
+    CountRelation {
+        state_param: "range_check_4_3_state",
+        word_bits: &[4, 3],
+        table_size: 1 << 7,
+        n_relations: 1,
+        needs_lut: true,
+        kind: 0,
+        key_offset: 0,
+    },
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -265,6 +283,12 @@ pub fn canonical_count_lut(
         }
         "blake_round_sigma_state" => {
             blake_round_sigma::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "poseidon_round_keys_state" => {
+            poseidon_round_keys::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "range_check_4_3_state" => {
+            range_check_4_3::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
         }
         "verify_bitwise_xor_4_state" => {
             verify_bitwise_xor_4::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()

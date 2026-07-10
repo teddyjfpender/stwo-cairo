@@ -125,6 +125,37 @@ fn sn2_profile_fixture_is_strict_resident_admissible_under_canonical() {
     }
 }
 
+/// The runtime fails closed on fixed-multiplicity coverage gaps and feed
+/// blockers; both are plan-level facts, so the SN2-shape fixture pins them on
+/// any machine before hardware ever runs.
+#[test]
+fn sn2_profile_fixture_plans_complete_multiplicity_coverage() {
+    let input = run_and_adapt(
+        &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .unwrap();
+    let ingest = phases::ingest::run(input, PreProcessedTraceVariant::Canonical, None);
+    let exact = ingest
+        .proof_plan
+        .strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)
+        .unwrap();
+    let multiplicities =
+        stwo_cairo_gpu_prover::multiplicity_pipeline::plan_graph_a_multiplicities(&exact).unwrap();
+    assert!(
+        multiplicities.coverage_gaps.is_empty(),
+        "fixed-multiplicity coverage gaps: {:?}",
+        multiplicities.coverage_gaps
+    );
+    assert!(
+        multiplicities.blockers.is_empty(),
+        "multiplicity feed blockers: {:?}",
+        multiplicities.blockers
+    );
+}
+
 /// The interim poseidon fixture stays admissible under its variant so the
 /// currently counted hardware gate keeps its meaning while the SN2-profile
 /// fixture lands.
