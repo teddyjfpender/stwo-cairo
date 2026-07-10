@@ -446,14 +446,14 @@ log "pod GPU: ${POD_GPU}"
 # (b) Sync repositories
 # ---------------------------------------------------------------------------
 sync_repos() {
-  log "rsync stwo -> pod (excludes target/.git)"
-  run_rsync -az --partial --no-owner --no-group \
+  log "rsync stwo -> pod (excludes target/.git; --delete: stale kernels break the auto-collecting build)"
+  run_rsync -azc --delete --partial --no-owner --no-group \
     --exclude=target --exclude=.git \
     -e "$SSH_E" \
     "${STWO_LOCAL}/" "${POD_USER}@${POD_HOST}:${STWO_POD}/"
 
   log "rsync stwo-cairo -> pod (excludes target/.git/PIE zips/ledger)"
-  run_rsync -az --partial --no-owner --no-group \
+  run_rsync -azc --delete --partial --no-owner --no-group \
     --exclude=target --exclude=.git \
     --exclude='gpu_benchmarks/pie/sn/*.zip' \
     --exclude='gpu_benchmarks/pie/*.zip' \
@@ -477,6 +477,7 @@ build_pod() {
   local out
   out="$(run_ssh "cd '${POD_PROVER_DIR}' && . \$HOME/.cargo/env 2>/dev/null; \
       PATH=/usr/local/cuda/bin:\$PATH RUSTFLAGS='${BUILD_RUSTFLAGS}' \
+      STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache \
       STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}' \
       cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench \
       > '${POD_BUILD_LOG}' 2>&1; echo BUILD_EXIT=\$?")"
@@ -545,6 +546,7 @@ PY
 cd '${CAIRO_POD}'
 . "\$HOME/.cargo/env" 2>/dev/null || true
 export PATH=/usr/local/cuda/bin:\$PATH
+export STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache
 python3 gpu_benchmarks/run_cuda_soundness_gate.py \
   --stwo '${STWO_POD}' --runtime-mode '${GPU_PCS_RUNTIME_MODE}' \
   --output '${POD_SOUNDNESS_GATE}'
