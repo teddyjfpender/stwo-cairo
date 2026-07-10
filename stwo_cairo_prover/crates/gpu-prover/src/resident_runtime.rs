@@ -2482,8 +2482,17 @@ impl<'a> ResidentGraphRuntime<'a> {
                     .ok_or(ResidentRuntimeError::PreparedEcOpCoverage(
                         "partial_ec_mul_generic consumer",
                     ))?;
+                // The ec_op writer materializes 127 partial-input columns:
+                // the 126 the consumer recording binds (data + enabler) plus
+                // the plan-owned one-past-end iota column the witness kernel
+                // computes in-kernel and never binds (see the 126-input
+                // contract in recorded_witness_inputs and the iota slot in
+                // arena_plan's ec_op workspace).
                 if partial.native_input_producer != Some("ec_op_builtin")
-                    || partial.slots.input_columns != planned.slots.partial_input_columns
+                    || planned.slots.partial_input_columns.len()
+                        != partial.slots.input_columns.len() + 1
+                    || planned.slots.partial_input_columns[..partial.slots.input_columns.len()]
+                        != partial.slots.input_columns[..]
                 {
                     return Err(ResidentRuntimeError::PreparedEcOpCoverage(
                         "direct partial_ec_mul_generic provenance",

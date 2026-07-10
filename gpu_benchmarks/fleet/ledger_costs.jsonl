@@ -72,3 +72,4 @@
 {"ts": "2026-07-06T19:32:08+00:00", "event": "stop", "pod_id": "sk60d6jcg5p4lu", "gpu": "H100 SXM", "usd_hr": 3.29}
 {"ts": "2026-07-10T13:18:04+00:00", "event": "resume", "pod_id": "9wxsb3p361mtb1", "gpu": "H100 SXM", "usd_hr": 2.99}
 {"ts": "2026-07-10T19:59:18+00:00", "event": "stop", "pod_id": "9wxsb3p361mtb1", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-10T20:58:25+00:00", "event": "create", "pod_id": "hmi6q8t4htnud2", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "phase-c gates + first SN2 resident bench"}

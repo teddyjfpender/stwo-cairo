@@ -1,0 +1,107 @@
+{
+  "schema": "stwo.cuda.soundness-gate.v2",
+  "timestamp_utc": "2026-07-10T22:03:19.362960+00:00",
+  "stwo": "/workspace/stwo",
+  "stwo_git_head": null,
+  "stwo_git_dirty": false,
+  "stwo_worktree_hash": "33c2da2f369cc6a117055a71d327f41de48fe448131a6a62c936189bf2d3e4c3",
+  "stwo_cairo": "/workspace/stwo-cairo",
+  "stwo_cairo_git_head": null,
+  "stwo_cairo_git_dirty": false,
+  "stwo_cairo_worktree_hash": "33c2da2f369cc6a117055a71d327f41de48fe448131a6a62c936189bf2d3e4c3",
+  "runtime_mode": "arena-graph",
+  "gates": [
+    {
+      "name": "cuda_link_required",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "cuda_required"
+      ],
+      "cwd": "/workspace/stwo",
+      "rust_min_stack": 16777216,
+      "exit_code": 0,
+      "executed_tests": 3,
+      "required_tests": 3,
+      "passed": true
+    },
+    {
+      "name": "backend_conformance_both_channels",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "conformance"
+      ],
+      "cwd": "/workspace/stwo",
+      "rust_min_stack": 16777216,
+      "exit_code": 0,
+      "executed_tests": 2,
+      "required_tests": 2,
+      "passed": true
+    },
+    {
+      "name": "prepared_commit_eager_capture_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_commit_native"
+      ],
+      "cwd": "/workspace/stwo",
+      "rust_min_stack": 16777216,
+      "exit_code": 0,
+      "executed_tests": 2,
+      "required_tests": 2,
+      "passed": true
+    },
+    {
+      "name": "prepared_fri_eager_capture_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_fri_native"
+      ],
+      "cwd": "/workspace/stwo",
+      "rust_min_stack": 16777216,
+      "exit_code": 101,
+      "executed_tests": 0,
+      "required_tests": 1,
+      "passed": false,
+      "output_tail": [
+        "   Compiling stwo-backend-cuda v2.2.0 (/workspace/stwo/crates/backend-cuda)",
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.61s",
+        "     Running tests/prepared_fri_native.rs (target/debug/deps/prepared_fri_native-60a1784ed4947d35)",
+        "",
+        "running 1 test",
+        "",
+        "thread 'eager_and_capture_match' panicked at crates/backend-cuda/tests/prepared_fri_native.rs:329:9:",
+        "assertion `left == right` failed",
+        "  left: 7a713c70ed5b06a1331e098d735b610c678c7d92d0f03b8733b2142ce9f04ce2",
+        " right: 9fc31d91a9de9586ea3e31b917c432faa8b3bd92f1cece9069ac221c06fc12fc",
+        "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+        "test eager_and_capture_match ... FAILED",
+        "",
+        "failures:",
+        "",
+        "failures:",
+        "    eager_and_capture_match",
+        "",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s",
+        "",
+        "error: test failed, to rerun pass `-p stwo-backend-cuda --test prepared_fri_native`"
+      ]
+    }
+  ],
+  "passed": false
+}
