@@ -281,8 +281,14 @@ def run_gate(stwo: Path, name: str, command: tuple[str, ...], expected: int) -> 
         actual_command = command[:manifest_index] + command[manifest_index + 2 :]
     env = dict(os.environ)
     env.setdefault("RUST_MIN_STACK", str(16 * 1024 * 1024))
+    # The whole-proof gate builds full resident sessions (SN2-profile arenas
+    # are ~15 GiB each plus the pedersen points table); four concurrent
+    # sessions exhaust an 80 GiB device, so that target runs serially.
+    extra_args: tuple[str, ...] = ("--", "--nocapture")
+    if name == STRICT_RESIDENT_GATE:
+        extra_args = ("--", "--nocapture", "--test-threads=1")
     process = subprocess.run(
-        actual_command + ("--", "--nocapture"),
+        actual_command + extra_args,
         cwd=cwd,
         env=env,
         text=True,
