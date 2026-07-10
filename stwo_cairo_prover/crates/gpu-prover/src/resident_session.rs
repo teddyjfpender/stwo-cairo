@@ -1067,7 +1067,7 @@ mod tests {
             )
             .unwrap();
         require_strict_resident_witness_coverage(&exact_plan).unwrap();
-        let _planned_claim = planned_cairo_claim(&ingest.generator, &exact_plan).unwrap();
+        let planned_claim = planned_cairo_claim(&ingest.generator, &exact_plan).unwrap();
         let recorded = recorded_witness_inputs_for_plan(&ingest.generator, &exact_plan).unwrap();
         recorded.require_resolved().unwrap();
 
@@ -1118,6 +1118,342 @@ mod tests {
             multiplicities.blockers.is_empty(),
             "multiplicity feed blockers: {:?}",
             multiplicities.blockers
+        );
+
+        // `plan_resident_protocol` itself is manifest-blocked off-CUDA (the
+        // embedded AOT pack hashes to zero), but arena geometry never depends
+        // on that hash: rebuild the identical protocol/arena plan with a fake
+        // nonzero policy and replicate the physical slot-length validation that
+        // `PreparedWitnessInput{Gather,Seed,Compact}::prepare` performs on
+        // hardware. This pins the plan↔kernel-ABI slot contract host-side, so
+        // a drift fails here in seconds instead of surfacing as an opaque
+        // `SlotSizeMismatch` at H100 session prep.
+        let session_pcs = PcsConfig::default();
+        let lifting_log_size = resident_lifting_log_size(&planned_claim, session_pcs).unwrap();
+        let discovery = discover_protocol_transcript_shape(
+            &planned_claim,
+            &exact_plan,
+            &ingest.preprocessed_trace,
+            &session_pcs,
+            lifting_log_size,
+            false,
+        )
+        .unwrap();
+        let transcript = plan_cairo_blake2s_transcript(
+            &planned_claim,
+            session_pcs,
+            discovery.lifting_log_size,
+            discovery.dynamic_transcript_shape(),
+        )
+        .unwrap();
+        let policy = ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048);
+        let zero_interaction_claim =
+            schema_zero_interaction_claim_for_composition(&planned_claim).unwrap();
+        let composition = plan_cairo_composition(
+            &planned_claim,
+            &CommonLookupElements::dummy(),
+            &zero_interaction_claim,
+            &ingest.preprocessed_trace.ids(),
+            policy.composition_max_kernel_instrs,
+        )
+        .unwrap();
+        let protocol = plan_protocol_geometry(
+            &exact_plan,
+            &planned_claim,
+            &ingest.preprocessed_trace,
+            &session_pcs,
+            false,
+            policy,
+            &transcript,
+            &discovery,
+            &composition,
+        )
+        .unwrap();
+        let memory = &recorded.execution_memory;
+        let arena = ProofArenaPlan::build_with_execution_tables(
+            &exact_plan,
+            &protocol,
+            &composition,
+            ExecutionTableGeometry::new(
+                memory.address_to_id.len(),
+                memory.f252_values.len(),
+                memory.small_values.len(),
+            ),
+        )
+        .unwrap();
+        assert_witness_input_slots_satisfy_prepare(&arena);
+    }
+
+    /// Host mirror of the slot validation in stwo's
+    /// `PreparedWitnessInput{Gather,Seed,Compact}::prepare` and the recorded
+    /// host-column ingest: every workspace slot handed to the witness-input
+    /// kernels is `DeviceArena::bind`-ed as a WHOLE physical slot. The arena
+    /// pools disjoint-lifetime buffers into one slot sized to the largest
+    /// sharer, so the contract is CAPACITY — each slot must hold at least the
+    /// kernel-ABI requirement recomputed at runtime (the kernels touch exactly
+    /// the required extent and never the pooled surplus). Any shortfall here
+    /// is exactly the `SlotSizeMismatch`/`SourceRowsMismatch`/`SourceTooSmall`
+    /// the H100 raises during `ResidentGraphRuntime::prepare`.
+    fn assert_witness_input_slots_satisfy_prepare(arena: &ProofArenaPlan) {
+        use stwo_backend_cuda::ArenaSlotId;
+
+        let mut failures = Vec::new();
+        let mut check_slot = |failures: &mut Vec<String>,
+                              component: &str,
+                              kind: &str,
+                              label: String,
+                              id: ArenaSlotId,
+                              required: usize| {
+            match arena.layout().slot(id) {
+                None => failures.push(format!(
+                    "{component} {kind} {label}: slot {id:?} missing from the arena layout"
+                )),
+                Some(spec) if spec.len_words < required => failures.push(format!(
+                    "{component} {kind} {label}: slot {id:?} has {} words, \
+                         requirements need at least {required}",
+                    spec.len_words
+                )),
+                Some(_) => {}
+            }
+        };
+        let check_sources =
+            |failures: &mut Vec<String>,
+             component: &str,
+             kind: &str,
+             sources: &[crate::arena_plan::ArenaBinding],
+             edges: &[stwo_backend_cuda::WitnessInputGatherEdgePlan]| {
+                for (index, (source, plan)) in sources.iter().zip(edges).enumerate() {
+                    let Some(spec) = arena.layout().slot(source.physical) else {
+                        failures.push(format!(
+                            "{component} {kind} source[{index}]: slot {:?} missing from the arena \
+                         layout",
+                            source.physical
+                        ));
+                        continue;
+                    };
+                    if spec.len_words % plan.edge.producer_rows != 0 {
+                        failures.push(format!(
+                            "{component} {kind} source[{index}]: slot {:?} has {} words, not a \
+                         multiple of {} producer rows",
+                            source.physical, spec.len_words, plan.edge.producer_rows
+                        ));
+                    }
+                    if spec.len_words < plan.required_source_words {
+                        failures.push(format!(
+                            "{component} {kind} source[{index}]: slot {:?} has {} words, edge \
+                         requires {}",
+                            source.physical, spec.len_words, plan.required_source_words
+                        ));
+                    }
+                }
+            };
+
+        for component in &arena.witness().components {
+            // The prepared writer (and, for host-fed components, the recorded
+            // column ingest) reads exactly `input_column_words[i]` words from
+            // each input column's slot base regardless of how the column is
+            // materialized.
+            for (ordinal, (&id, &words)) in component
+                .slots
+                .input_columns
+                .iter()
+                .zip(&component.requirements.input_column_words)
+                .enumerate()
+            {
+                check_slot(
+                    &mut failures,
+                    component.component,
+                    "writer",
+                    format!("input_column[{ordinal}]"),
+                    id,
+                    words,
+                );
+            }
+            if let Some(gather) = &component.input_gather {
+                let requirements = &gather.requirements;
+                check_slot(
+                    &mut failures,
+                    component.component,
+                    "input_gather",
+                    "source_pointers".to_owned(),
+                    gather.slots.source_pointers,
+                    requirements.source_pointer_words,
+                );
+                check_slot(
+                    &mut failures,
+                    component.component,
+                    "input_gather",
+                    "descriptors".to_owned(),
+                    gather.slots.descriptors,
+                    requirements.descriptor_words,
+                );
+                check_slot(
+                    &mut failures,
+                    component.component,
+                    "input_gather",
+                    "output_pointers".to_owned(),
+                    gather.slots.output_pointers,
+                    requirements.output_pointer_words,
+                );
+                for (ordinal, (&id, &words)) in gather
+                    .slots
+                    .consumer_input_columns
+                    .iter()
+                    .zip(&requirements.consumer_input_column_words)
+                    .enumerate()
+                {
+                    check_slot(
+                        &mut failures,
+                        component.component,
+                        "input_gather",
+                        format!("input_column[{ordinal}]"),
+                        id,
+                        words,
+                    );
+                }
+                check_sources(
+                    &mut failures,
+                    component.component,
+                    "input_gather",
+                    &gather.sources,
+                    &requirements.edges,
+                );
+            }
+            if let Some(seed) = &component.input_seed {
+                let requirements = &seed.requirements;
+                check_slot(
+                    &mut failures,
+                    component.component,
+                    "input_seed",
+                    "scalar_values".to_owned(),
+                    seed.slots.scalar_values,
+                    requirements.scalar_words,
+                );
+                check_slot(
+                    &mut failures,
+                    component.component,
+                    "input_seed",
+                    "output_pointers".to_owned(),
+                    seed.slots.output_pointers,
+                    requirements.output_pointer_words,
+                );
+                for (ordinal, (&id, &words)) in seed
+                    .slots
+                    .consumer_input_columns
+                    .iter()
+                    .zip(&requirements.consumer_input_column_words)
+                    .enumerate()
+                {
+                    check_slot(
+                        &mut failures,
+                        component.component,
+                        "input_seed",
+                        format!("input_column[{ordinal}]"),
+                        id,
+                        words,
+                    );
+                }
+            }
+            if let Some(compact) = &component.input_compact {
+                let requirements = &compact.requirements;
+                let scratch = [
+                    (
+                        "source_pointers",
+                        compact.slots.source_pointers,
+                        requirements.source_pointer_words,
+                    ),
+                    (
+                        "descriptors",
+                        compact.slots.descriptors,
+                        requirements.descriptor_words,
+                    ),
+                    (
+                        "output_pointers",
+                        compact.slots.output_pointers,
+                        requirements.output_pointer_words,
+                    ),
+                    (
+                        "tuple_scratch",
+                        compact.slots.tuple_scratch,
+                        requirements.tuple_scratch_words,
+                    ),
+                    (
+                        "sort_keys_a",
+                        compact.slots.sort_keys_a,
+                        requirements.sort_key_words,
+                    ),
+                    (
+                        "sort_keys_b",
+                        compact.slots.sort_keys_b,
+                        requirements.sort_key_words,
+                    ),
+                    (
+                        "sort_indices_a",
+                        compact.slots.sort_indices_a,
+                        requirements.sort_index_words,
+                    ),
+                    (
+                        "sort_indices_b",
+                        compact.slots.sort_indices_b,
+                        requirements.sort_index_words,
+                    ),
+                    ("run_heads", compact.slots.run_heads, requirements.run_words),
+                    (
+                        "run_positions",
+                        compact.slots.run_positions,
+                        requirements.run_words,
+                    ),
+                    ("n_unique", compact.slots.n_unique, 1),
+                    (
+                        "sort_temp",
+                        compact.slots.sort_temp,
+                        requirements.sort_temp_words,
+                    ),
+                    (
+                        "scan_temp",
+                        compact.slots.scan_temp,
+                        requirements.scan_temp_words,
+                    ),
+                ];
+                for (label, id, words) in scratch {
+                    check_slot(
+                        &mut failures,
+                        component.component,
+                        "input_compact",
+                        label.to_owned(),
+                        id,
+                        words,
+                    );
+                }
+                for (ordinal, (&id, &words)) in compact
+                    .slots
+                    .consumer_input_columns
+                    .iter()
+                    .zip(&requirements.consumer_input_column_words)
+                    .enumerate()
+                {
+                    check_slot(
+                        &mut failures,
+                        component.component,
+                        "input_compact",
+                        format!("input_column[{ordinal}]"),
+                        id,
+                        words,
+                    );
+                }
+                check_sources(
+                    &mut failures,
+                    component.component,
+                    "input_compact",
+                    &compact.sources,
+                    &requirements.edges,
+                );
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "witness input slots would fail resident prepare on hardware:\n{}",
+            failures.join("\n")
         );
     }
 

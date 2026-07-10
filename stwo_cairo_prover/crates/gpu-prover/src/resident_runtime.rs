@@ -1476,12 +1476,26 @@ impl<'a> ResidentGraphRuntime<'a> {
                 }
                 seen_columns.push(source.ordinal);
                 let destination = destinations[source.ordinal];
-                if destination.len_words() != source.words.len() {
+                // The prepared writer reads exactly `row_count` words from each
+                // input column's slot base, and the arena may pool the backing
+                // slot larger than that (whole-slot binds over disjoint
+                // lifetimes). Pin the host payload to the writer requirement —
+                // not the pooled slot length — and fail closed on capacity.
+                let required_words = prepared.writer.row_count();
+                if source.words.len() != required_words {
                     return Err(ResidentRuntimeError::WitnessInputRowCount {
                         component: input.component,
                         column: source.ordinal,
-                        expected: destination.len_words(),
+                        expected: required_words,
                         actual: source.words.len(),
+                    });
+                }
+                if destination.len_words() < required_words {
+                    return Err(ResidentRuntimeError::WitnessInputRowCount {
+                        component: input.component,
+                        column: source.ordinal,
+                        expected: required_words,
+                        actual: destination.len_words(),
                     });
                 }
                 let bytes = source

@@ -126,24 +126,27 @@ fn strict_resident_cold_and_warm_proofs_match_simd_bytes() {
     let params = resident_params();
     let reference_input = resident_input();
     assert_capture_safe_fixture(&reference_input, params);
-    let expected = serialize_felts(
-        &prove_cairo::<SimdBackend, Blake2sMerkleChannel>(reference_input, params).unwrap(),
-    );
 
+    // Resident session prep and proving run before the ~20-minute SIMD
+    // reference so a session/prepare failure surfaces in about a minute.
     let mut config = GpuProverConfig::default();
     config.strict = true;
     let mut prover = GpuCairoProver::<Blake2sMerkleChannel>::new(config).unwrap();
     let cold = prover
         .prove_resident_blake2s(resident_input(), params)
         .unwrap();
+    let warm = prover
+        .prove_resident_blake2s(resident_input(), params)
+        .unwrap();
+
+    let expected = serialize_felts(
+        &prove_cairo::<SimdBackend, Blake2sMerkleChannel>(reference_input, params).unwrap(),
+    );
     assert_eq!(
         expected,
         serialize_felts(&cold),
         "cold resident proof drifted"
     );
-    let warm = prover
-        .prove_resident_blake2s(resident_input(), params)
-        .unwrap();
     assert_eq!(
         expected,
         serialize_felts(&warm),
@@ -178,23 +181,28 @@ fn strict_resident_same_shape_changed_memory_matches_second_simd_proof() {
         };
     }
 
-    let expected_first = serialize_felts(
-        &prove_cairo::<SimdBackend, Blake2sMerkleChannel>(first.clone(), params).unwrap(),
-    );
-    let expected_second = serialize_felts(
-        &prove_cairo::<SimdBackend, Blake2sMerkleChannel>(second.clone(), params).unwrap(),
-    );
+    // Resident session prep and proving run before the two SIMD reference
+    // proofs so a session/prepare failure surfaces in about a minute.
+    let mut config = GpuProverConfig::default();
+    config.strict = true;
+    let mut prover = GpuCairoProver::<Blake2sMerkleChannel>::new(config).unwrap();
+    let resident_first = prover
+        .prove_resident_blake2s(first.clone(), params)
+        .unwrap();
+    let resident_second = prover
+        .prove_resident_blake2s(second.clone(), params)
+        .unwrap();
+
+    let expected_first =
+        serialize_felts(&prove_cairo::<SimdBackend, Blake2sMerkleChannel>(first, params).unwrap());
+    let expected_second =
+        serialize_felts(&prove_cairo::<SimdBackend, Blake2sMerkleChannel>(second, params).unwrap());
     assert_ne!(
         expected_first, expected_second,
         "changed compact memory did not affect the reference proof"
     );
 
-    let mut config = GpuProverConfig::default();
-    config.strict = true;
-    let mut prover = GpuCairoProver::<Blake2sMerkleChannel>::new(config).unwrap();
-    let resident_first = prover.prove_resident_blake2s(first, params).unwrap();
     assert_eq!(expected_first, serialize_felts(&resident_first));
-    let resident_second = prover.prove_resident_blake2s(second, params).unwrap();
     assert_eq!(
         expected_second,
         serialize_felts(&resident_second),
@@ -221,16 +229,19 @@ fn strict_resident_poseidon_graph_a_matches_simd_bytes() {
     let params = resident_params();
     let reference_input = resident_input();
     assert_capture_safe_fixture(&reference_input, params);
-    let expected = serialize_felts(
-        &prove_cairo::<SimdBackend, Blake2sMerkleChannel>(reference_input, params).unwrap(),
-    );
 
+    // Resident session prep and proving run before the ~20-minute SIMD
+    // reference so a session/prepare failure surfaces in about a minute.
     let mut config = GpuProverConfig::default();
     config.strict = true;
     let mut prover = GpuCairoProver::<Blake2sMerkleChannel>::new(config).unwrap();
     let actual = prover
         .prove_resident_blake2s(resident_input(), params)
         .unwrap();
+
+    let expected = serialize_felts(
+        &prove_cairo::<SimdBackend, Blake2sMerkleChannel>(reference_input, params).unwrap(),
+    );
     assert_eq!(
         expected,
         serialize_felts(&actual),
@@ -253,17 +264,31 @@ fn strict_resident_mirrored_transcript_matches_host_channel() {
     let params = resident_params();
     let reference_input = resident_input();
     assert_capture_safe_fixture(&reference_input, params);
+
+    // The first mirrored resident proof (and with it all session prep) runs
+    // before the ~20-minute SIMD reference so a session/prepare failure
+    // surfaces in about a minute; the reference is still computed exactly once
+    // before the three comparison rounds.
+    let mut config = GpuProverConfig::default();
+    config.strict = true;
+    let mut prover = GpuCairoProver::<Blake2sMerkleChannel>::new(config).unwrap();
+    let mut first_mirrored = Some(
+        prover
+            .prove_resident_blake2s_with_transcript_mirror(resident_input(), params)
+            .unwrap(),
+    );
+
     let expected = serialize_felts(
         &prove_cairo::<SimdBackend, Blake2sMerkleChannel>(reference_input, params).unwrap(),
     );
 
-    let mut config = GpuProverConfig::default();
-    config.strict = true;
-    let mut prover = GpuCairoProver::<Blake2sMerkleChannel>::new(config).unwrap();
     for round in 0..3 {
-        let mirrored = prover
-            .prove_resident_blake2s_with_transcript_mirror(resident_input(), params)
-            .unwrap();
+        let mirrored = match first_mirrored.take() {
+            Some(mirrored) => mirrored,
+            None => prover
+                .prove_resident_blake2s_with_transcript_mirror(resident_input(), params)
+                .unwrap(),
+        };
         assert_eq!(
             expected,
             serialize_felts(&mirrored.proof),
