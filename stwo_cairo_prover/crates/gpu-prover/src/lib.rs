@@ -47,10 +47,13 @@ pub mod transcript_plan;
 pub mod workspace_cache;
 
 pub use prepared_composition::{
-    composition_workspace_requirements, CompositionArenaSlotRequirement,
+    composition_workspace_requirements, composition_workspace_requirements_with_mode,
+    default_composition_launch_mode, pack_composition_wide_groups, CompositionArenaSlotRequirement,
     CompositionCoefficientSource, CompositionDeviceInputs, CompositionExtParamBinding,
-    CompositionTraceTopology, CompositionWorkspaceRequirements, CompositionWorkspaceSlots,
-    PreparedCompositionError, PreparedCompositionGraph, COMPOSITION_POINTER_ALIGNMENT_WORDS,
+    CompositionLaunchMode, CompositionTraceTopology, CompositionWideGroup,
+    CompositionWorkspaceRequirements, CompositionWorkspaceSlots, PreparedCompositionError,
+    PreparedCompositionGraph, COMPOSITION_POINTER_ALIGNMENT_WORDS,
+    COMPOSITION_WIDE_SMALL_MAX_EVALUATION_LOG,
 };
 pub use prover::{
     CairoBackend, GpuCairoProver, GpuProverConfig, MirroredResidentBlake2sProof,

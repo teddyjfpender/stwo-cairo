@@ -380,6 +380,34 @@ fn plan_resident_protocol(
     include_all_preprocessed_columns: bool,
     execution_table_geometry: Option<ExecutionTableGeometry>,
 ) -> Result<PlannedResidentProtocol, ResidentSessionError> {
+    let protocol_policy = ProtocolPlanPolicy::loaded_starknet_blake2s()?;
+    plan_resident_protocol_with_policy(
+        claim,
+        proof_plan,
+        preprocessed_trace,
+        pcs,
+        include_all_preprocessed_columns,
+        execution_table_geometry,
+        protocol_policy,
+    )
+}
+
+/// [`plan_resident_protocol`] with the protocol-plan policy supplied by the
+/// caller instead of resolved from the embedded AOT pack. The proving sessions
+/// always go through [`plan_resident_protocol`] (loaded manifest, fail-closed);
+/// this seam exists for the host-only preflight planner, which reuses the exact
+/// planning path on machines whose binary carries no AOT pack (the manifest
+/// hash never feeds arena geometry — see
+/// `poseidon_fixture_recorded_lanes_match_arena_witness_plan`).
+fn plan_resident_protocol_with_policy(
+    claim: &CairoClaim,
+    proof_plan: &ProofPlan,
+    preprocessed_trace: &PreProcessedTrace,
+    pcs: PcsConfig,
+    include_all_preprocessed_columns: bool,
+    execution_table_geometry: Option<ExecutionTableGeometry>,
+    protocol_policy: ProtocolPlanPolicy,
+) -> Result<PlannedResidentProtocol, ResidentSessionError> {
     let lifting_log_size = resident_lifting_log_size(claim, pcs)?;
     let discovery = discover_protocol_transcript_shape(
         claim,
@@ -395,7 +423,6 @@ fn plan_resident_protocol(
         discovery.lifting_log_size,
         discovery.dynamic_transcript_shape(),
     )?;
-    let protocol_policy = ProtocolPlanPolicy::loaded_starknet_blake2s()?;
     let zero_interaction_claim = schema_zero_interaction_claim_for_composition(claim)?;
     let composition = plan_cairo_composition(
         claim,
@@ -1026,6 +1053,158 @@ pub fn with_resident_session_from_generator<R>(
     Ok((result, telemetry))
 }
 
+/// How the preflight bound the [`ProtocolPlanPolicy`]: to the AOT pack embedded
+/// in this binary (exact, what an H100 proving run would use) or to the probe
+/// placeholder used when the binary carries no pack (arena geometry is
+/// unaffected by the manifest hash; the composition kernel cap is recorded so a
+/// divergence from the loaded pack is visible in the report).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreflightManifestPolicy {
+    Loaded {
+        kernel_manifest_hash: u64,
+        composition_max_kernel_instrs: usize,
+    },
+    Fake {
+        kernel_manifest_hash: u64,
+        composition_max_kernel_instrs: usize,
+    },
+}
+
+/// Failure surface of [`plan_resident_preflight`]: every variant is exactly the
+/// fail-closed error the strict resident session (or its Graph-A multiplicity
+/// prepare) would raise on hardware.
+#[derive(Debug)]
+pub enum ResidentPreflightError {
+    Session(ResidentSessionError),
+    Multiplicity(crate::multiplicity_pipeline::GraphAMultiplicityPlanError),
+}
+
+impl From<ResidentSessionError> for ResidentPreflightError {
+    fn from(value: ResidentSessionError) -> Self {
+        Self::Session(value)
+    }
+}
+
+impl From<crate::multiplicity_pipeline::GraphAMultiplicityPlanError> for ResidentPreflightError {
+    fn from(value: crate::multiplicity_pipeline::GraphAMultiplicityPlanError) -> Self {
+        Self::Multiplicity(value)
+    }
+}
+
+/// Host-only output of [`plan_resident_preflight`]: everything the resident
+/// session plans before the first CUDA allocation, for VRAM/coverage triage.
+pub struct ResidentPreflightReport {
+    /// Component ids present in the exact plan, in plan order.
+    pub present_components: Vec<&'static str>,
+    /// Present components whose witness writer is capture-safe (strict
+    /// coverage passed, so this equals `present_components` — retained so the
+    /// report stays honest if coverage semantics ever widen).
+    pub capture_safe_components: Vec<&'static str>,
+    /// Recorded (AOT) witness lanes, in ingest order.
+    pub recorded_lanes: Vec<&'static str>,
+    /// Graph-A multiplicity/feed plan; `coverage_gaps`/`blockers` are the
+    /// fail-closed facts the runtime enforces at prepare.
+    pub multiplicities: crate::multiplicity_pipeline::GraphAMultiplicityPlan,
+    /// The full arena plan the workspace cache would materialize.
+    pub arena: Arc<ProofArenaPlan>,
+    pub transcript_segments: usize,
+    pub manifest_policy: PreflightManifestPolicy,
+}
+
+/// Plan the strict resident session end-to-end WITHOUT touching CUDA: the same
+/// fail-closed pipeline as [`with_resident_session_from_generator`] up to (and
+/// including) the full arena plan — ingest artifacts in, exact plan, strict
+/// witness coverage, planned claim, recorded witness inputs (`require_resolved`),
+/// Graph-A multiplicity plan, protocol/arena plan. Any `Err` is byte-for-byte
+/// the error the session would fail closed with on hardware. Dev tooling only
+/// (`arena_preflight`); proving sessions never call this.
+pub fn plan_resident_preflight(
+    generator: &CairoClaimGenerator,
+    capacity_plan: &ProofPlan,
+    preprocessed_trace: &PreProcessedTrace,
+    pcs: PcsConfig,
+    include_all_preprocessed_columns: bool,
+) -> Result<ResidentPreflightReport, ResidentPreflightError> {
+    let exact_plan = capacity_plan
+        .strict_resident_exact(
+            &crate::schedule_table::CAIRO_SCHEDULE,
+            &crate::relation_table::CAIRO_RELATION_GRAPH,
+        )
+        .map_err(ResidentSessionError::from)?;
+    require_strict_resident_witness_coverage(&exact_plan).map_err(ResidentSessionError::from)?;
+    let planned_claim =
+        planned_cairo_claim(generator, &exact_plan).map_err(ResidentSessionError::from)?;
+    let recorded = recorded_witness_inputs_for_plan(generator, &exact_plan)
+        .map_err(ResidentSessionError::from)?;
+    recorded
+        .require_resolved()
+        .map_err(ResidentSessionError::from)?;
+    let multiplicities = crate::multiplicity_pipeline::plan_graph_a_multiplicities(&exact_plan)?;
+
+    let (protocol_policy, manifest_policy) = match ProtocolPlanPolicy::loaded_starknet_blake2s() {
+        Ok(policy) => (
+            policy,
+            PreflightManifestPolicy::Loaded {
+                kernel_manifest_hash: policy.kernel_manifest_hash,
+                composition_max_kernel_instrs: policy.composition_max_kernel_instrs,
+            },
+        ),
+        Err(ProtocolPlanError::UnboundKernelManifest)
+        | Err(ProtocolPlanError::UnboundCompositionKernelCap) => {
+            // Off-CUDA probe trick (see the fixture parity test above): geometry
+            // never reads the manifest hash, only the composition kernel cap.
+            let policy = ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048);
+            (
+                policy,
+                PreflightManifestPolicy::Fake {
+                    kernel_manifest_hash: policy.kernel_manifest_hash,
+                    composition_max_kernel_instrs: policy.composition_max_kernel_instrs,
+                },
+            )
+        }
+        Err(other) => return Err(ResidentSessionError::from(other).into()),
+    };
+    let memory = &recorded.execution_memory;
+    let planned = plan_resident_protocol_with_policy(
+        &planned_claim,
+        &exact_plan,
+        preprocessed_trace,
+        pcs,
+        include_all_preprocessed_columns,
+        Some(ExecutionTableGeometry::new(
+            memory.address_to_id.len(),
+            memory.f252_values.len(),
+            memory.small_values.len(),
+        )),
+        protocol_policy,
+    )?;
+
+    let present_components: Vec<&'static str> = exact_plan
+        .components
+        .iter()
+        .filter(|component| component.runtime.is_present())
+        .map(|component| component.node.id)
+        .collect();
+    let capture_safe_components: Vec<&'static str> = exact_plan
+        .components
+        .iter()
+        .filter(|component| component.runtime.is_present())
+        .filter(|component| component.node.facts.witness_writer.is_capture_safe())
+        .map(|component| component.node.id)
+        .collect();
+    let recorded_lanes: Vec<&'static str> =
+        recorded.lanes.iter().map(|lane| lane.component).collect();
+    Ok(ResidentPreflightReport {
+        present_components,
+        capture_safe_components,
+        recorded_lanes,
+        multiplicities,
+        arena: planned.arena,
+        transcript_segments: planned.transcript.segments().len(),
+        manifest_policy,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use stwo::core::fri::FriConfig;
@@ -1182,6 +1361,49 @@ mod tests {
         )
         .unwrap();
         assert_witness_input_slots_satisfy_prepare(&arena);
+
+        // Parity with the packaged preflight: `plan_resident_preflight` (the
+        // pipeline the `arena_preflight` binary runs) must reproduce this
+        // manual plan exactly — same fake-policy fallback off-CUDA, same
+        // lanes, same coverage verdicts, same arena geometry — so the JSON
+        // the tool prints for an SN-scale input is the plan the H100 session
+        // would materialize.
+        let preflight = plan_resident_preflight(
+            &ingest.generator,
+            &ingest.proof_plan,
+            &ingest.preprocessed_trace,
+            session_pcs,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            preflight.manifest_policy,
+            PreflightManifestPolicy::Fake {
+                kernel_manifest_hash: 0x1234,
+                composition_max_kernel_instrs: 2048,
+            },
+            "off-CUDA the preflight must bind the probe placeholder policy"
+        );
+        assert_eq!(preflight.recorded_lanes, lanes);
+        assert_eq!(
+            preflight.present_components, preflight.capture_safe_components,
+            "strict coverage passed, so every present component is capture-safe"
+        );
+        assert!(preflight.multiplicities.coverage_gaps.is_empty());
+        assert!(preflight.multiplicities.blockers.is_empty());
+        assert_eq!(preflight.arena.total_words(), arena.total_words());
+        for epoch in crate::arena_plan::ProofEpoch::ALL {
+            assert_eq!(
+                preflight.arena.high_water_words(epoch),
+                arena.high_water_words(epoch),
+                "high-water drift at {epoch:?}"
+            );
+        }
+        assert_eq!(preflight.arena.bindings().len(), arena.bindings().len());
+        assert_eq!(
+            preflight.arena.logical_buffers().len(),
+            arena.logical_buffers().len()
+        );
     }
 
     /// Host mirror of the slot validation in stwo's

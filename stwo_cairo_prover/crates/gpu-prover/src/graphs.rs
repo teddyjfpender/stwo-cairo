@@ -15,7 +15,21 @@ use stwo_backend_cuda::{
 };
 use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
 
-use crate::arena_plan::{ArenaPlanError, LogicalBufferId, ProofArenaPlan};
+use crate::arena_plan::{ArenaBinding, ArenaPlanError, LogicalBufferId, ProofArenaPlan};
+
+/// Bind a plan binding against its stable arena, truncated to the binding's
+/// logical length. The colorer pools epoch-disjoint logical buffers into one
+/// physical slot sized to the LARGEST sharer, so `DeviceArena::bind` alone
+/// returns whole-slot slices whose `len_words()` is the pooled maximum. Every
+/// resident bind of an [`ArenaBinding`] must go through here (or
+/// [`GraphWorkspace::bind`]) so kernel extents, memsets, and END-relative
+/// indexing only ever observe the logical requirement.
+pub(crate) fn bind_arena_binding(
+    arena: &DeviceArena,
+    binding: ArenaBinding,
+) -> Result<ArenaSlice, ArenaError> {
+    Ok(arena.bind(binding.physical)?.truncated(binding.len_words))
+}
 
 /// True Fiat-Shamir boundaries in the Cairo proof protocol. `FriLayer` is keyed
 /// per layer because each root determines the next folding challenge.
@@ -333,15 +347,17 @@ impl GraphWorkspace {
         }
     }
 
-    /// Bind a logical identity to its stable physical slot. The returned length
-    /// is the logical capacity; the underlying slice may be larger because a
-    /// disjoint-lifetime buffer reuses the same physical range.
+    /// Bind a logical identity to its stable physical slot. The returned slice
+    /// is truncated to the logical capacity: a disjoint-lifetime buffer may
+    /// share (and enlarge) the physical range, but that pooled surplus must
+    /// never leak into kernel extents, so `slice.len_words()` always equals
+    /// the returned logical length.
     pub fn bind(&self, logical: LogicalBufferId) -> Result<(ArenaSlice, usize), GraphError> {
         let binding = self
             .plan
             .binding(logical)
             .ok_or(ArenaPlanError::MissingBinding(logical))?;
-        Ok((self.arena.bind(binding.physical)?, binding.len_words))
+        Ok((bind_arena_binding(&self.arena, binding)?, binding.len_words))
     }
 
     pub fn graph(&self, key: GraphKey) -> Option<Ref<'_, PhaseGraph>> {

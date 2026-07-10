@@ -141,6 +141,29 @@ impl BufferLifetime {
     pub const fn overlaps(self, other: Self) -> bool {
         self.first as u8 <= other.last as u8 && other.first as u8 <= self.last as u8
     }
+
+    /// Bitmask with one bit per [`ProofEpoch`] discriminant, set for every
+    /// epoch in this inclusive lifetime.
+    ///
+    /// A lifetime is exactly the contiguous range `first..=last` (`new`
+    /// rejects `first > last`, `at` sets both). For two contiguous inclusive
+    /// ranges `A = [a1, a2]` and `B = [b1, b2]`:
+    ///
+    /// `mask(A) & mask(B) != 0`
+    ///   iff some epoch bit `e` is set in both masks
+    ///   iff some epoch `e` satisfies `a1 <= e <= a2` and `b1 <= e <= b2`
+    ///   iff `a1 <= b2 && b1 <= a2`
+    ///   iff `A.overlaps(B)`.
+    ///
+    /// Because bitwise-or distributes over "has a common bit", a union of
+    /// masks intersects `mask(B)` iff at least one constituent mask does, so a
+    /// per-slot mask union replaces a per-lifetime overlap scan exactly.
+    pub fn epoch_mask(self) -> u16 {
+        // 12 proof epochs fit bits 0..=11; the shift below needs headroom.
+        const _: () = assert!(ProofEpoch::ALL.len() <= 16);
+        debug_assert!(self.first as u8 <= self.last as u8);
+        ((1u32 << (self.last as u8 + 1)) - (1u32 << (self.first as u8))) as u16
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -2662,10 +2685,7 @@ impl ProofArenaPlan {
     }
 
     pub fn binding(&self, logical: LogicalBufferId) -> Option<ArenaBinding> {
-        self.bindings
-            .iter()
-            .find(|binding| binding.logical == logical)
-            .copied()
+        find_binding(&self.bindings, logical).ok()
     }
 
     pub fn high_water_words(&self, epoch: ProofEpoch) -> usize {
@@ -6416,17 +6436,30 @@ fn append_decommit_buffers(
     })
 }
 
+/// Binding lookup shared by the resolve/validate phases. `color_logical_buffers`
+/// returns bindings sorted by logical id (one binding per logical buffer), so a
+/// binary search finds the unique entry in `O(log n)`; if a caller ever passes
+/// an unsorted slice, fall back to the original linear scan so the result is
+/// identical in every case.
+fn find_binding(
+    bindings: &[ArenaBinding],
+    id: LogicalBufferId,
+) -> Result<ArenaBinding, ArenaPlanError> {
+    if let Ok(index) = bindings.binary_search_by_key(&id, |binding| binding.logical) {
+        return Ok(bindings[index]);
+    }
+    bindings
+        .iter()
+        .find(|binding| binding.logical == id)
+        .copied()
+        .ok_or(ArenaPlanError::MissingBinding(id))
+}
+
 fn resolve_commitment_slots(
     logical: LogicalCommitWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedCommitment, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let groups = logical
         .groups
@@ -6523,13 +6556,7 @@ fn resolve_preprocessed_slots(
     logical: LogicalPreprocessedWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedPreprocessedWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let columns = logical
         .columns
         .into_iter()
@@ -6565,13 +6592,7 @@ fn resolve_composition_slots(
     logical: LogicalCompositionWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedCompositionWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let slots = CompositionWorkspaceSlots {
         descriptors: physical(logical.descriptors)?,
@@ -6683,13 +6704,7 @@ fn resolve_oods_slots(
     logical: LogicalOodsWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedOodsWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let slots = OodsWorkspaceSlots {
         source_pointers: physical(logical.source_pointers)?,
@@ -6753,13 +6768,7 @@ fn resolve_quotient_numerator_slots(
     logical: LogicalQuotientNumeratorWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedQuotientNumeratorWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let slots = QuotientNumeratorWorkspaceSlots {
         runtime_terms: physical(logical.runtime_terms)?,
@@ -6859,13 +6868,7 @@ fn resolve_quotient_slots(
     logical: LogicalQuotientWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedQuotientWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let slots = QuotientWorkspaceSlots {
         sample_points: physical(logical.sample_points)?,
@@ -6957,13 +6960,7 @@ fn resolve_fri_slots(
     logical: LogicalFriWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedFriWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let slots = FriWorkspaceSlots {
         evaluation_ping: physical(logical.evaluation_ping)?,
@@ -7034,13 +7031,7 @@ fn resolve_final_fri_pow_slots(
     logical: LogicalFinalFriPowWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedFinalFriPowWorkspace, ArenaPlanError> {
-    let physical = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .map(|binding| binding.physical)
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let physical = |id: LogicalBufferId| find_binding(bindings, id).map(|binding| binding.physical);
     let final_slots = FriFinalWorkspaceSlots {
         coefficients: physical(logical.final_coefficients)?,
         degree_error: physical(logical.final_degree_error)?,
@@ -7080,13 +7071,7 @@ fn resolve_decommit_slots(
     logical: LogicalDecommitWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedDecommitWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let trees = logical
         .trees
@@ -7192,13 +7177,7 @@ fn resolve_transcript_slots(
     logical: LogicalTranscriptWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedTranscriptWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let slots = Blake2sTranscriptWorkspaceSlots {
         state: physical(logical.state)?,
@@ -7231,13 +7210,7 @@ fn resolve_execution_table_slots(
     logical: LogicalExecutionTablesWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedExecutionTablesWorkspace, ArenaPlanError> {
-    let physical = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .map(|binding| binding.physical)
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let physical = |id: LogicalBufferId| find_binding(bindings, id).map(|binding| binding.physical);
     let slots = ExecutionTablesWorkspaceSlots {
         raw_addr_to_id: physical(logical.raw_addr_to_id)?,
         raw_f252_words: physical(logical.raw_f252_words)?,
@@ -7269,13 +7242,7 @@ fn resolve_ec_op_slots(
     logical: LogicalEcOpWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedEcOpWorkspace, ArenaPlanError> {
-    let physical = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .map(|binding| binding.physical)
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let physical = |id: LogicalBufferId| find_binding(bindings, id).map(|binding| binding.physical);
     let slots = EcOpWorkspaceSlots {
         trace_columns: logical
             .trace_columns
@@ -7309,13 +7276,7 @@ fn resolve_witness_slots(
     execution_tables: Option<&PlannedExecutionTablesWorkspace>,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedWitnessWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let components = logical
         .components
@@ -7476,13 +7437,7 @@ fn resolve_graph_a_multiplicity_slots(
     logical: LogicalGraphAMultiplicityWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedGraphAMultiplicityWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let multiplicities = logical
         .multiplicities
@@ -7611,13 +7566,7 @@ fn resolve_relation_slots(
     logical: LogicalRelationWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedRelationWorkspace, ArenaPlanError> {
-    let binding = |id: LogicalBufferId| {
-        bindings
-            .iter()
-            .find(|binding| binding.logical == id)
-            .copied()
-            .ok_or(ArenaPlanError::MissingBinding(id))
-    };
+    let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let slots = RelationGraphSlots {
         descriptors: physical(logical.descriptors)?,
@@ -7670,8 +7619,25 @@ fn checked_pow2(log_size: u32) -> Result<usize, ArenaPlanError> {
 struct ColoredSlot {
     id: ArenaSlotId,
     len_words: usize,
+    /// Union of [`BufferLifetime::epoch_mask`] over every buffer pooled into
+    /// this slot. A candidate buffer is compatible iff its own epoch mask is
+    /// disjoint from this union: the union intersects the candidate's mask iff
+    /// at least one pooled lifetime's mask does, and per-lifetime mask
+    /// intersection is exactly [`BufferLifetime::overlaps`] (see the proof on
+    /// `epoch_mask`). This makes the compatibility check `O(1)` per slot
+    /// instead of `O(lifetimes)` while selecting the identical candidate.
+    occupied_epochs: u16,
+    /// Kept only to cross-check the mask filter against the original
+    /// per-lifetime overlap scan in debug builds.
+    #[cfg(debug_assertions)]
     lifetimes: Vec<(LogicalBufferId, BufferLifetime)>,
 }
+
+/// Number of leading buffers (in coloring order) whose slot selection is
+/// re-derived with the original per-lifetime overlap scan and asserted equal
+/// to the epoch-mask selection in debug builds.
+#[cfg(debug_assertions)]
+const COLORING_REFERENCE_CHECK_BUFFERS: usize = 256;
 
 fn color_logical_buffers(
     logical: &[LogicalBuffer],
@@ -7690,14 +7656,11 @@ fn color_logical_buffers(
     let mut bindings = Vec::with_capacity(logical.len());
     for index in order {
         let buffer = &logical[index];
+        let buffer_mask = buffer.lifetime.epoch_mask();
         let candidate = slots
             .iter()
             .enumerate()
-            .filter(|(_, slot)| {
-                slot.lifetimes
-                    .iter()
-                    .all(|&(_, lifetime)| !lifetime.overlaps(buffer.lifetime))
-            })
+            .filter(|(_, slot)| slot.occupied_epochs & buffer_mask == 0)
             .min_by_key(|(_, slot)| {
                 (
                     buffer.len_words.saturating_sub(slot.len_words),
@@ -7706,6 +7669,33 @@ fn color_logical_buffers(
                 )
             })
             .map(|(index, _)| index);
+        // The mask filter must admit exactly the slots the per-lifetime
+        // overlap scan admitted; the selection key is untouched, so equal
+        // candidate sets imply an identical choice. Cross-check the first
+        // buffers against the original scan in debug builds.
+        #[cfg(debug_assertions)]
+        if bindings.len() < COLORING_REFERENCE_CHECK_BUFFERS {
+            let reference = slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| {
+                    slot.lifetimes
+                        .iter()
+                        .all(|&(_, lifetime)| !lifetime.overlaps(buffer.lifetime))
+                })
+                .min_by_key(|(_, slot)| {
+                    (
+                        buffer.len_words.saturating_sub(slot.len_words),
+                        slot.len_words.max(buffer.len_words),
+                        slot.id,
+                    )
+                })
+                .map(|(index, _)| index);
+            debug_assert_eq!(
+                candidate, reference,
+                "epoch-mask slot selection diverged from the per-lifetime overlap scan"
+            );
+        }
         let slot_index = match candidate {
             Some(index) => index,
             None => {
@@ -7715,6 +7705,8 @@ fn color_logical_buffers(
                 slots.push(ColoredSlot {
                     id,
                     len_words: 0,
+                    occupied_epochs: 0,
+                    #[cfg(debug_assertions)]
                     lifetimes: Vec::new(),
                 });
                 slots.len() - 1
@@ -7722,6 +7714,8 @@ fn color_logical_buffers(
         };
         let slot = &mut slots[slot_index];
         slot.len_words = slot.len_words.max(buffer.len_words);
+        slot.occupied_epochs |= buffer_mask;
+        #[cfg(debug_assertions)]
         slot.lifetimes.push((buffer.id, buffer.lifetime));
         bindings.push(ArenaBinding {
             logical: buffer.id,
@@ -7760,48 +7754,96 @@ fn validate_aliases(
     logical: &[LogicalBuffer],
     bindings: &[ArenaBinding],
 ) -> Result<(), ArenaPlanError> {
-    for (index, first) in logical.iter().enumerate() {
-        let first_binding = bindings
-            .iter()
-            .find(|binding| binding.logical == first.id)
-            .ok_or(ArenaPlanError::MissingBinding(first.id))?;
-        for second in &logical[index + 1..] {
-            let second_binding = bindings
-                .iter()
-                .find(|binding| binding.logical == second.id)
-                .ok_or(ArenaPlanError::MissingBinding(second.id))?;
-            if first_binding.physical == second_binding.physical
-                && first.lifetime.overlaps(second.lifetime)
-            {
-                return Err(ArenaPlanError::AliasedLiveBuffers {
-                    physical: first_binding.physical,
-                    first: first.id,
-                    second: second.id,
-                });
+    // Semantically identical to the previous all-pairs scan (for each pair
+    // `(i, j)` with `i < j` in `logical` order, error on the lexicographically
+    // first same-slot live overlap), but grouped per physical slot so the work
+    // is `O(n log n + sum(group^2))` instead of `O(n^2)` pairs each paying a
+    // linear binding lookup. Valid colorings bound every group by the epoch
+    // count (disjoint inclusive ranges over 12 epochs), so the pairwise stage
+    // is effectively linear.
+    let Some(first) = logical.first() else {
+        return Ok(());
+    };
+    // The old scan resolved buffer 0's binding, then each later binding right
+    // before its `(0, j)` pair check. Reproduce that order: a missing binding
+    // at position `m` surfaces as `MissingBinding(m)` unless an aliased
+    // `(0, k)` pair with `k < m` precedes it.
+    let first_binding = find_binding(bindings, first.id)?;
+    let mut resolved = Vec::with_capacity(logical.len());
+    resolved.push(first_binding);
+    for buffer in &logical[1..] {
+        match find_binding(bindings, buffer.id) {
+            Ok(binding) => resolved.push(binding),
+            Err(missing) => {
+                for (candidate, binding) in logical[1..resolved.len()].iter().zip(&resolved[1..]) {
+                    if binding.physical == first_binding.physical
+                        && first.lifetime.overlaps(candidate.lifetime)
+                    {
+                        return Err(ArenaPlanError::AliasedLiveBuffers {
+                            physical: first_binding.physical,
+                            first: first.id,
+                            second: candidate.id,
+                        });
+                    }
+                }
+                return Err(missing);
             }
         }
+    }
+    let mut groups: BTreeMap<ArenaSlotId, Vec<usize>> = BTreeMap::new();
+    for (index, binding) in resolved.iter().enumerate() {
+        groups.entry(binding.physical).or_default().push(index);
+    }
+    // Scanning each group's indices (ascending, as inserted) yields that
+    // group's lexicographically first violating pair; the winner across groups
+    // is the pair the all-pairs scan reported.
+    let mut earliest: Option<(usize, usize)> = None;
+    for group in groups.values() {
+        'group: for (position, &first_index) in group.iter().enumerate() {
+            for &second_index in &group[position + 1..] {
+                if logical[first_index]
+                    .lifetime
+                    .overlaps(logical[second_index].lifetime)
+                {
+                    if earliest.is_none_or(|pair| (first_index, second_index) < pair) {
+                        earliest = Some((first_index, second_index));
+                    }
+                    break 'group;
+                }
+            }
+        }
+    }
+    if let Some((first_index, second_index)) = earliest {
+        return Err(ArenaPlanError::AliasedLiveBuffers {
+            physical: resolved[first_index].physical,
+            first: logical[first_index].id,
+            second: logical[second_index].id,
+        });
     }
     Ok(())
 }
 
 fn high_water_at(epoch: ProofEpoch, logical: &[LogicalBuffer], bindings: &[ArenaBinding]) -> usize {
-    let mut physical = Vec::<ArenaSlotId>::new();
+    // Identical to summing, over the distinct physical slots with a live
+    // buffer at `epoch`, the largest bound length on each slot — but with the
+    // per-slot maxima computed in one pass instead of rescanning `bindings`
+    // for every newly seen slot.
+    let mut slot_capacity = BTreeMap::<ArenaSlotId, usize>::new();
+    for binding in bindings {
+        let capacity = slot_capacity.entry(binding.physical).or_insert(0);
+        *capacity = (*capacity).max(binding.len_words);
+    }
+    let mut physical = BTreeSet::<ArenaSlotId>::new();
     let mut words = 0usize;
     for buffer in logical
         .iter()
         .filter(|buffer| buffer.lifetime.contains(epoch))
     {
-        let binding = bindings
-            .iter()
-            .find(|binding| binding.logical == buffer.id)
+        let binding = find_binding(bindings, buffer.id)
             .expect("bindings are complete before high-water computation");
-        if !physical.contains(&binding.physical) {
-            physical.push(binding.physical);
-            words += bindings
-                .iter()
-                .filter(|candidate| candidate.physical == binding.physical)
-                .map(|candidate| candidate.len_words)
-                .max()
+        if physical.insert(binding.physical) {
+            words += slot_capacity
+                .get(&binding.physical)
                 .expect("the active binding belongs to its physical slot");
         }
     }
@@ -7865,6 +7907,151 @@ mod tests {
         assert!(specs
             .iter()
             .all(|spec| spec.offset_words % ARENA_ALIGNMENT_WORDS == 0));
+    }
+
+    /// The colorer's `O(1)` epoch-bitmask compatibility check must equal the
+    /// per-lifetime `BufferLifetime::overlaps` scan it replaced, for every
+    /// pair of valid inclusive epoch ranges (exhaustive over first/last in
+    /// `ProofEpoch::ALL` on both sides, i.e. the full 12x12x12x12 space; the
+    /// inverted first > last combinations are exactly the ones
+    /// `BufferLifetime::new` rejects).
+    #[test]
+    fn epoch_mask_intersection_equals_lifetime_overlap_for_all_ranges() {
+        let mut ranges = Vec::new();
+        for first in ProofEpoch::ALL {
+            for last in ProofEpoch::ALL {
+                match BufferLifetime::new(first, last) {
+                    Ok(lifetime) => ranges.push(lifetime),
+                    Err(_) => assert!(first > last),
+                }
+            }
+        }
+        assert_eq!(ranges.len(), 12 * 13 / 2);
+        for &a in &ranges {
+            for &b in &ranges {
+                assert_eq!(
+                    a.epoch_mask() & b.epoch_mask() != 0,
+                    a.overlaps(b),
+                    "mask intersection diverges from overlaps for {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Verbatim copy of the pre-bitmask coloring loop: the compatibility
+    /// filter scans every lifetime already pooled into a slot. Kept as the
+    /// reference the optimized colorer must match bit-for-bit, because slot
+    /// ids, insertion order, and specs are part of plan identity.
+    fn reference_color_logical_buffers(
+        logical: &[LogicalBuffer],
+    ) -> (Vec<ArenaBinding>, Vec<ArenaSlotSpec>, usize) {
+        struct ReferenceSlot {
+            id: ArenaSlotId,
+            len_words: usize,
+            lifetimes: Vec<BufferLifetime>,
+        }
+        let mut order: Vec<usize> = (0..logical.len()).collect();
+        order.sort_unstable_by_key(|&index| {
+            let buffer = &logical[index];
+            (
+                buffer.lifetime.first,
+                core::cmp::Reverse(buffer.len_words),
+                buffer.id,
+            )
+        });
+        let mut slots: Vec<ReferenceSlot> = Vec::new();
+        let mut bindings = Vec::with_capacity(logical.len());
+        for index in order {
+            let buffer = &logical[index];
+            let candidate = slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| {
+                    slot.lifetimes
+                        .iter()
+                        .all(|&lifetime| !lifetime.overlaps(buffer.lifetime))
+                })
+                .min_by_key(|(_, slot)| {
+                    (
+                        buffer.len_words.saturating_sub(slot.len_words),
+                        slot.len_words.max(buffer.len_words),
+                        slot.id,
+                    )
+                })
+                .map(|(index, _)| index);
+            let slot_index = candidate.unwrap_or_else(|| {
+                slots.push(ReferenceSlot {
+                    id: ArenaSlotId(u32::try_from(slots.len() + 1).unwrap()),
+                    len_words: 0,
+                    lifetimes: Vec::new(),
+                });
+                slots.len() - 1
+            });
+            let slot = &mut slots[slot_index];
+            slot.len_words = slot.len_words.max(buffer.len_words);
+            slot.lifetimes.push(buffer.lifetime);
+            bindings.push(ArenaBinding {
+                logical: buffer.id,
+                physical: slot.id,
+                len_words: buffer.len_words,
+            });
+        }
+        bindings.sort_unstable_by_key(|binding| binding.logical);
+        let mut offset = 0usize;
+        let mut specs = Vec::with_capacity(slots.len());
+        for slot in slots {
+            offset = align_up(offset, ARENA_ALIGNMENT_WORDS).unwrap();
+            specs.push(ArenaSlotSpec {
+                id: slot.id,
+                offset_words: offset,
+                len_words: slot.len_words,
+                alignment_words: ARENA_ALIGNMENT_WORDS,
+            });
+            offset += slot.len_words;
+        }
+        (
+            bindings,
+            specs,
+            align_up(offset, ARENA_ALIGNMENT_WORDS).unwrap(),
+        )
+    }
+
+    /// The optimized colorer must reproduce the reference coloring exactly —
+    /// same slot ids, same bindings, same specs, same total — across a
+    /// deterministic population that exercises pooling, ties, and every epoch
+    /// range shape well past the debug-only cross-check window.
+    #[test]
+    fn bitmask_coloring_matches_reference_coloring_exactly() {
+        let mut state = 0x243f_6a88_85a3_08d3u64; // deterministic LCG
+        let mut next = move |bound: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        let mut logical = Vec::new();
+        for id in 0..2048u32 {
+            let first = ProofEpoch::ALL[next(12) as usize];
+            let last = ProofEpoch::ALL[(first as u64 + next(12 - first as u64)) as usize];
+            // Small word-length pool so best-fit ties are common.
+            let words = 1 + next(7) as usize * 64;
+            logical.push(LogicalBuffer {
+                id: LogicalBufferId(id),
+                component: None,
+                part: None,
+                purpose: BufferPurpose::CommitLdeTile,
+                ordinal: id,
+                len_words: words,
+                lifetime: BufferLifetime::new(first, last).unwrap(),
+            });
+        }
+        let (bindings, specs, total) = color_logical_buffers(&logical).unwrap();
+        let (expected_bindings, expected_specs, expected_total) =
+            reference_color_logical_buffers(&logical);
+        assert_eq!(bindings, expected_bindings);
+        assert_eq!(specs, expected_specs);
+        assert_eq!(total, expected_total);
+        validate_aliases(&logical, &bindings).unwrap();
     }
 
     #[test]

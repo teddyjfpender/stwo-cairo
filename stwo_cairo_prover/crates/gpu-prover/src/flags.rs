@@ -53,6 +53,11 @@ pub const FLAGS: &[FlagDef] = &[
         purpose: "kill switch (approach-B): force an Owned per-prove rebuild of the preprocessed tree instead of the cached compact artifact — the A/B byte-identity baseline and safe fallback",
         deletion_milestone: "M6 (retire once the cached artifact is the proven unconditional diet path)",
     },
+    FlagDef {
+        name: "STWO_CUDA_COMPOSITION_WIDE",
+        purpose: "resident Graph C width: fan small composition components (evaluation rows <= 2^18) across component lanes inside capture so their LDE+eval kernels co-schedule; per-group private LDE-tile regions keep the topology race-free and byte-identical",
+        deletion_milestone: "M6 (becomes the unconditional Graph C shape once the H100 A/B shows the width win)",
+    },
 ];
 
 /// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed

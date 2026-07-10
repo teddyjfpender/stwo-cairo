@@ -37,7 +37,9 @@ use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
 use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
 
 use crate::arena_plan::{BufferPurpose, CommitmentColumnSource, CommitmentTreeId};
-use crate::graphs::{GraphCaptureStatus, GraphError, GraphSegment, GraphWorkspace};
+use crate::graphs::{
+    bind_arena_binding, GraphCaptureStatus, GraphError, GraphSegment, GraphWorkspace,
+};
 use crate::multiplicity_pipeline::{FixedMultiplicityCoverageGap, MultiplicityFeedBlocker};
 use crate::proof_bundle::{
     ResidentProofBundle, ResidentProofBundleError, ResidentProofBundleLayout,
@@ -903,7 +905,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             let sources = gather
                                 .sources
                                 .iter()
-                                .map(|binding| arena.bind(binding.physical))
+                                .map(|&binding| bind_arena_binding(arena, binding))
                                 .collect::<Result<Vec<_>, _>>()?;
                             let edges = gather
                                 .requirements
@@ -941,7 +943,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             let sources = compact
                                 .sources
                                 .iter()
-                                .map(|binding| arena.bind(binding.physical))
+                                .map(|&binding| bind_arena_binding(arena, binding))
                                 .collect::<Result<Vec<_>, _>>()?;
                             PreparedWitnessInputCompactGraph::prepare(
                                 arena,
@@ -981,7 +983,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                 let destinations = planned
                     .multiplicities
                     .iter()
-                    .map(|(_, binding)| arena.bind(binding.physical))
+                    .map(|&(_, binding)| bind_arena_binding(arena, binding))
                     .collect::<Result<Vec<_>, _>>()?;
                 let clear = PreparedWitnessFeedClearGraph::prepare(
                     arena,
@@ -1005,7 +1007,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             .collect::<Result<Vec<_>, _>>()?;
                         let graph = PreparedWitnessFeedGraph::prepare(
                             arena,
-                            arena.bind(feed.source.physical)?,
+                            bind_arena_binding(arena, feed.source)?,
                             feed.plan.row_count,
                             feed.plan.sub_words_per_row,
                             &feed.plan.descriptors,
@@ -1023,13 +1025,13 @@ impl<'a> ResidentGraphRuntime<'a> {
                         let sources = fixed
                             .sources
                             .iter()
-                            .map(|binding| arena.bind(binding.physical))
+                            .map(|&binding| bind_arena_binding(arena, binding))
                             .collect::<Result<Vec<_>, _>>()?;
                         PreparedFixedTableGraph::prepare_contiguous(
                             arena,
                             fixed.plan.materializer.config(),
                             &sources,
-                            arena.bind(fixed.multiplicity.physical)?,
+                            bind_arena_binding(arena, fixed.multiplicity)?,
                             &fixed.slots,
                         )
                         .map_err(ResidentRuntimeError::from)
@@ -1052,15 +1054,14 @@ impl<'a> ResidentGraphRuntime<'a> {
                                     role: "runtime multiplicity destination",
                                 })
                                 .and_then(|(_, binding)| {
-                                    arena
-                                        .bind(binding.physical)
+                                    bind_arena_binding(arena, *binding)
                                         .map_err(ResidentRuntimeError::from)
                                 })
                         };
                         let address_outputs = memory
                             .address_outputs
                             .iter()
-                            .map(|binding| arena.bind(binding.physical))
+                            .map(|&binding| bind_arena_binding(arena, binding))
                             .collect::<Result<Vec<_>, _>>()?;
                         let big_outputs = memory
                             .big_parts
@@ -1068,7 +1069,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             .map(|part| {
                                 part.outputs
                                     .iter()
-                                    .map(|binding| arena.bind(binding.physical))
+                                    .map(|&binding| bind_arena_binding(arena, binding))
                                     .collect::<Result<Vec<_>, _>>()
                             })
                             .collect::<Result<Vec<_>, _>>()?;
@@ -1086,7 +1087,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             .small_part
                             .outputs
                             .iter()
-                            .map(|binding| arena.bind(binding.physical))
+                            .map(|&binding| bind_arena_binding(arena, binding))
                             .collect::<Result<Vec<_>, _>>()?;
                         PreparedMemoryBaseTraceGraph::prepare(
                             arena,
@@ -1180,11 +1181,11 @@ impl<'a> ResidentGraphRuntime<'a> {
             .ok_or(ResidentRuntimeError::MissingPreparedCommitment(
                 CommitmentTreeId::Preprocessed,
             ))?;
-        let fixed_preprocessed_root = arena.bind(fixed_preprocessed.root.physical)?;
+        let fixed_preprocessed_root = bind_arena_binding(arena, fixed_preprocessed.root)?;
         let fixed_preprocessed_retained_layers = fixed_preprocessed
             .retained_layers_bottom_up
             .iter()
-            .map(|binding| arena.bind(binding.physical))
+            .map(|&binding| bind_arena_binding(arena, binding))
             .collect::<Result<Vec<_>, _>>()?;
         let mut commitments = Vec::with_capacity(workspace.plan().commitments().len() - 1);
         for planned in workspace
@@ -1194,7 +1195,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             .filter(|planned| planned.id != CommitmentTreeId::Preprocessed)
         {
             let groups = commitment_groups(workspace, planned)?;
-            let twiddles = arena.bind(planned.twiddles.physical)?;
+            let twiddles = bind_arena_binding(arena, planned.twiddles)?;
             let retained_evaluations = planned
                 .retained_evaluation_groups
                 .iter()
@@ -1204,7 +1205,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .map(|columns| {
                             columns
                                 .iter()
-                                .map(|binding| arena.bind(binding.physical))
+                                .map(|&binding| bind_arena_binding(arena, binding))
                                 .collect::<Result<Vec<_>, _>>()
                                 .map(|columns| CommitEvaluationGroup { columns })
                         })
@@ -1231,7 +1232,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         let oods = ResidentOodsPipeline::prepare(workspace)?;
 
         let fri_plan = workspace.plan().fri();
-        let fri_input = arena.bind(fri_plan.input_values.physical)?;
+        let fri_input = bind_arena_binding(arena, fri_plan.input_values)?;
         if fri_input.id() != oods.quotient().output_evaluation().id()
             || fri_input.len_words() != oods.quotient().output_evaluation().len_words()
         {
@@ -1241,7 +1242,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             arena,
             fri_plan.config,
             oods.quotient().output_evaluation(),
-            arena.bind(fri_plan.twiddles.physical)?,
+            bind_arena_binding(arena, fri_plan.twiddles)?,
             &fri_plan.slots,
         )?;
         let transcript_input = |semantic: CairoTranscriptInput| {
@@ -1256,7 +1257,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             arena,
             fri_plan.config,
             fri.final_evaluation(),
-            arena.bind(fri_plan.twiddles.physical)?,
+            bind_arena_binding(arena, fri_plan.twiddles)?,
             transcript_input(CairoTranscriptInput::FriLastLayerPolynomial)?,
             final_plan.final_slots,
         )?;
@@ -1275,7 +1276,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             final_plan.query_pow_slots,
         )?;
         let decommit_plan = workspace.plan().decommit();
-        let raw_queries = arena.bind(decommit_plan.raw_queries.physical)?;
+        let raw_queries = bind_arena_binding(arena, decommit_plan.raw_queries)?;
         let query_output_id = CairoTranscriptOutput::QueryPositions.id()?;
         let transcript_queries = transcript_outputs
             .iter()
@@ -1299,16 +1300,16 @@ impl<'a> ResidentGraphRuntime<'a> {
             arena,
             decommit_plan.config.clone(),
             raw_queries,
-            Some(arena.bind(decommit_plan.lde_twiddles.physical)?),
+            Some(bind_arena_binding(arena, decommit_plan.lde_twiddles)?),
             &decommit_sources,
             &decommit_plan.slots,
         )?;
         require_same_slice(
             "decommit assembly does not match the planned final ABI",
             decommit.assembly_slice(),
-            arena.bind(decommit_plan.assembly.physical)?,
+            bind_arena_binding(arena, decommit_plan.assembly)?,
         )?;
-        let proof_bundle = arena.bind(decommit_plan.proof_bundle.physical)?;
+        let proof_bundle = bind_arena_binding(arena, decommit_plan.proof_bundle)?;
         if decommit_plan.proof_bundle.len_words != decommit_plan.proof_bundle_layout.total_words
             || proof_bundle.len_words() < decommit_plan.proof_bundle_layout.total_words
         {
@@ -3403,7 +3404,7 @@ fn resident_decommit_sources(
                             require_same_slice(
                                 "retained trace evaluation binding differs from commit output",
                                 actual,
-                                arena.bind(expected.physical)?,
+                                bind_arena_binding(arena, *expected)?,
                             )?;
                         }
                         actual
@@ -3419,7 +3420,7 @@ fn resident_decommit_sources(
         let expected_layers = planned
             .retained_layers_bottom_up
             .iter()
-            .map(|binding| arena.bind(binding.physical))
+            .map(|&binding| bind_arena_binding(arena, binding))
             .collect::<Result<Vec<_>, _>>()?;
         let (root, retained_layers_bottom_up) = if planned.id == CommitmentTreeId::Preprocessed {
             (fixed_preprocessed_root, fixed_preprocessed_layers.to_vec())
@@ -3494,16 +3495,33 @@ fn resident_decommit_sources(
         }
         let retained_layers_bottom_up = fri.tree_layers_bottom_up(fri_tree_index)?.to_vec();
         let planned_layers = &workspace.plan().fri().slots.trees[fri_tree_index].layers_bottom_up;
-        if retained_layers_bottom_up.len() != planned_layers.len() {
+        let planned_layer_words =
+            &workspace.plan().fri().requirements.trees[fri_tree_index].layers_bottom_up;
+        if retained_layers_bottom_up.len() != planned_layers.len()
+            || retained_layers_bottom_up.len() != planned_layer_words.len()
+        {
             return Err(ResidentRuntimeError::DecommitTopologyMismatch(
                 "FRI retained-layer count differs from the arena plan",
             ));
         }
-        for (&actual, &planned_slot) in retained_layers_bottom_up.iter().zip(planned_layers) {
+        for ((&actual, &planned_slot), layer) in retained_layers_bottom_up
+            .iter()
+            .zip(planned_layers)
+            .zip(planned_layer_words)
+        {
+            // The physical slot may be pooled larger than the logical layer;
+            // compare against the plan's logical extent, mirroring the
+            // truncated slice the commit graph's binder returned.
+            let planned = arena.bind(planned_slot)?;
+            if planned.len_words() < layer.words {
+                return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                    "FRI retained-layer slot is smaller than its planned extent",
+                ));
+            }
             require_same_slice(
                 "FRI retained-layer binding differs from its commit graph",
                 actual,
-                arena.bind(planned_slot)?,
+                planned.truncated(layer.words),
             )?;
         }
         require_same_slice(
@@ -3602,7 +3620,7 @@ fn arena_relation_sources(
                         instance_index: requirement.instance_index,
                         ordinal,
                     })?;
-                let source = workspace.arena().bind(binding.physical)?;
+                let source = bind_arena_binding(workspace.arena(), binding)?;
                 require_resident_source(workspace, source)?;
                 Ok(source)
             })
@@ -3625,12 +3643,12 @@ fn transcript_bindings(
     let inputs = planned
         .inputs
         .iter()
-        .map(|&(id, binding)| Ok((id, workspace.arena().bind(binding.physical)?)))
+        .map(|&(id, binding)| Ok((id, bind_arena_binding(workspace.arena(), binding)?)))
         .collect::<Result<Vec<_>, ResidentRuntimeError>>()?;
     let outputs = planned
         .outputs
         .iter()
-        .map(|&(id, binding)| Ok((id, workspace.arena().bind(binding.physical)?)))
+        .map(|&(id, binding)| Ok((id, bind_arena_binding(workspace.arena(), binding)?)))
         .collect::<Result<Vec<_>, ResidentRuntimeError>>()?;
     Ok((inputs, outputs))
 }

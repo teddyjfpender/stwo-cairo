@@ -29,6 +29,110 @@ const POINTER_WORDS: usize = core::mem::size_of::<usize>().div_ceil(WORD_BYTES);
 
 pub const COMPOSITION_POINTER_ALIGNMENT_WORDS: usize = core::mem::align_of::<usize>() / WORD_BYTES;
 
+/// Static membership bound for the wide launch mode: a component is "small"
+/// iff `evaluation_log_size <= 18` (at most 2^18 evaluation rows).
+///
+/// Rationale (documented per the Step-3.3 plan): the generated constraint
+/// kernels launch 128-thread blocks, so a 2^18-row component is at most 2048
+/// blocks — about one scheduling wave on an H100 (132 SMs x ~16 resident
+/// 128-thread blocks ~= 2112 block slots). Such a kernel can never fill the
+/// card alone and only benefits from co-scheduling with its peers; anything
+/// larger runs multiple waves and saturates the card by itself, so it keeps
+/// its dedicated serial launch exactly as today.
+pub const COMPOSITION_WIDE_SMALL_MAX_EVALUATION_LOG: u32 = 18;
+
+/// Selects the stream topology [`PreparedCompositionGraph::launch`] enqueues.
+///
+/// Byte identity: both modes launch the exact same kernels with the exact same
+/// inputs. `Wide` changes only (a) which stream each small component's
+/// LDE+eval pair is recorded on and (b) each small group's private LDE-tile
+/// region. Every accumulator element still receives its contributions from
+/// the same components in the same plan order (an accumulator is keyed by
+/// `evaluation_log_size`, membership is decided by `evaluation_log_size`, and
+/// one group is never split across lanes), so the per-element read-modify-
+/// write sequence — and therefore every output byte — is unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompositionLaunchMode {
+    /// Every component's LDE + eval kernels enqueue in plan order on the main
+    /// stream through one shared LDE tile (today's behavior; default).
+    Serial,
+    /// Small components (see [`COMPOSITION_WIDE_SMALL_MAX_EVALUATION_LOG`])
+    /// are grouped by `evaluation_log_size`, given private LDE-tile regions,
+    /// and fanned across the context's component lanes via fork/join so their
+    /// kernels co-schedule inside the captured graph. Large components keep
+    /// their dedicated main-stream launches, overlapping the small lanes.
+    /// Opt-in via `STWO_CUDA_COMPOSITION_WIDE=1`.
+    Wide,
+}
+
+/// `STWO_CUDA_COMPOSITION_WIDE=1` opts [`PreparedCompositionGraph::prepare`]
+/// and the arena plan into the wide topology. Read once per process
+/// (`OnceLock`) so plan sizing, eager launch, capture, and replay all observe
+/// one mode. Default OFF: the serial topology stays the proven path.
+pub fn default_composition_launch_mode() -> CompositionLaunchMode {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| crate::flags::flag_on("STWO_CUDA_COMPOSITION_WIDE")) {
+        CompositionLaunchMode::Wide
+    } else {
+        CompositionLaunchMode::Serial
+    }
+}
+
+/// One wide-mode scheduling unit: every small component sharing one
+/// `evaluation_log_size` (and therefore one accumulator). Members are in plan
+/// order — the accumulator's exact serial-mode read-modify-write order — and a
+/// group is always assigned to a single lane, so the shared-accumulator
+/// updates can never race and never reorder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionWideGroup {
+    pub evaluation_log_size: u32,
+    /// Component indices into [`CompositionWorkspaceRequirements::components`],
+    /// in plan order.
+    pub members: Vec<usize>,
+    /// Deterministic packing weight: approximate words touched by the group
+    /// (rows x (columns + accumulator coordinates) per member).
+    pub weight_words: u64,
+    /// Private LDE-tile region shared by the group's members (they serialize
+    /// in-lane, exactly like today's global tile reuse).
+    pub tile_offset_words: usize,
+    pub tile_len_words: usize,
+}
+
+/// Deterministically pack wide groups onto `lane_count` component lanes:
+/// heaviest group first onto the least-loaded lane, ties broken by
+/// `evaluation_log_size` then lane index (the same greedy shape as the
+/// witness segment's `pack_weighted_lane_level`). Returns `lanes[lane] ->
+/// group indices` in assignment order.
+pub fn pack_composition_wide_groups(
+    groups: &[CompositionWideGroup],
+    lane_count: usize,
+) -> Vec<Vec<usize>> {
+    let mut order = (0..groups.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        groups[right]
+            .weight_words
+            .cmp(&groups[left].weight_words)
+            .then_with(|| {
+                groups[left]
+                    .evaluation_log_size
+                    .cmp(&groups[right].evaluation_log_size)
+            })
+    });
+    let mut lanes = vec![Vec::new(); lane_count];
+    let mut loads = vec![0u64; lane_count];
+    for group in order {
+        let lane = loads
+            .iter()
+            .enumerate()
+            .min_by_key(|&(lane, &load)| (load, lane))
+            .map(|(lane, _)| lane)
+            .expect("lane count checked nonzero");
+        loads[lane] = loads[lane].saturating_add(groups[group].weight_words);
+        lanes[lane].push(group);
+    }
+    lanes
+}
+
 /// One resident coefficient column. Logical slot identities keep the topology
 /// address-free; [`PreparedCompositionGraph::prepare`] performs every binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,14 +157,17 @@ pub struct CompositionExtParamBinding {
 
 /// Dynamic proof inputs. Values are produced by transcript/claim device stages;
 /// this graph never materializes their host-side oracle values.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct CompositionDeviceInputs {
     pub random_coefficient: ArenaSlotId,
     pub forward_twiddles: ArenaSlotId,
     pub inverse_twiddles: ArenaSlotId,
-    /// Stable challenge slices produced by [`PreparedRelationGraph`].
-    pub relation_z: ArenaSlotId,
-    pub relation_alpha_powers: ArenaSlotId,
+    /// Stable challenge slices produced by `PreparedRelationGraph`. These are
+    /// logically-truncated slices, not slot ids: the alpha-power count is
+    /// derived from `relation_alpha_powers.len_words()`, which must be the
+    /// logical challenge extent and never a pooled physical slot length.
+    pub relation_z: ArenaSlice,
+    pub relation_alpha_powers: ArenaSlice,
     /// One entry per Cairo component, in composition-plan order. A claimed-sum
     /// source is present exactly when that component has a
     /// [`CompositionExtParamSource::ClaimedSumScaled`] slot.
@@ -109,6 +216,11 @@ pub struct CompositionComponentRequirements {
     pub ext_param_words: usize,
     pub random_coefficient_offset: usize,
     pub accumulator_offset_words: usize,
+    /// Word offset of this component's evaluation region inside the shared
+    /// LDE tile. Always zero in [`CompositionLaunchMode::Serial`]; in `Wide`,
+    /// each small group gets a private disjoint region so concurrent lanes
+    /// never alias, while large (serial) components keep offset zero.
+    pub lde_tile_offset_words: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +254,15 @@ pub struct CompositionWorkspaceRequirements {
     pub inverse_twiddle_words: usize,
     pub dynamic_ext_param_count: usize,
     pub claimed_sum_count: usize,
+    /// The launch mode these requirements were computed for. `Wide` changes
+    /// only `lde_tile_words`, per-component `lde_tile_offset_words`, and the
+    /// scheduling metadata below; everything else is mode-independent.
+    pub mode: CompositionLaunchMode,
+    /// Wide-mode scheduling units (empty in `Serial` mode).
+    pub wide_groups: Vec<CompositionWideGroup>,
+    /// Components enqueued serially on the main stream, in plan order. In
+    /// `Serial` mode this is every component; in `Wide` mode, the large ones.
+    pub serial_components: Vec<usize>,
     pub components: Vec<CompositionComponentRequirements>,
     pub accumulators: Vec<CompositionAccumulatorRequirements>,
     zero_words: usize,
@@ -336,6 +457,9 @@ pub enum PreparedCompositionError {
         kernel: usize,
         cache_key: u64,
     },
+    /// Wide mode requires at least one component lane on the execution
+    /// context; fail closed rather than silently degrading the topology.
+    NoComponentLanes,
     CudaStatus {
         operation: &'static str,
         status: i32,
@@ -365,10 +489,25 @@ impl From<CudaRuntimeError> for PreparedCompositionError {
     }
 }
 
-/// Compute exact workspace geometry and source selection without touching CUDA.
+/// Compute exact workspace geometry and source selection without touching
+/// CUDA, in the process-default launch mode (see
+/// [`default_composition_launch_mode`]). The arena plan and
+/// [`PreparedCompositionGraph::prepare`] both call this, so their geometry
+/// always agrees within a process.
 pub fn composition_workspace_requirements(
     plan: &CompositionPlan,
     trace: &CompositionTraceTopology,
+) -> Result<CompositionWorkspaceRequirements, PreparedCompositionError> {
+    composition_workspace_requirements_with_mode(plan, trace, default_composition_launch_mode())
+}
+
+/// Mode-explicit form of [`composition_workspace_requirements`]. Parity tests
+/// use this to exercise both modes in one invocation; production callers go
+/// through the env-default wrapper.
+pub fn composition_workspace_requirements_with_mode(
+    plan: &CompositionPlan,
+    trace: &CompositionTraceTopology,
+    mode: CompositionLaunchMode,
 ) -> Result<CompositionWorkspaceRequirements, PreparedCompositionError> {
     if plan.components.is_empty() || plan.total_constraints == 0 {
         return Err(PreparedCompositionError::EmptyPlan);
@@ -429,7 +568,6 @@ pub fn composition_workspace_requirements(
     }
 
     let mut expected_random_offset = 0usize;
-    let mut lde_tile_words = 0usize;
     let mut components = Vec::with_capacity(plan.components.len());
     for (component_index, component) in plan.components.iter().enumerate() {
         validate_component_program(component_index, component, expected_random_offset)?;
@@ -457,11 +595,6 @@ pub fn composition_workspace_requirements(
             }
         }
         let row_count = pow2(component.evaluation_log_size)?;
-        lde_tile_words = lde_tile_words.max(
-            row_count
-                .checked_mul(sources.len())
-                .ok_or(PreparedCompositionError::SizeOverflow)?,
-        );
         let expected_denominators = pow2(component.evaluation_log_size - component.trace_log_size)?;
         if component.denominator_inverses.len() != expected_denominators {
             return Err(PreparedCompositionError::DenominatorCount {
@@ -489,9 +622,11 @@ pub fn composition_workspace_requirements(
             accumulator_offset_words: *accumulator_offsets
                 .get(&component.evaluation_log_size)
                 .expect("evaluation log was collected"),
+            lde_tile_offset_words: 0,
         });
     }
     debug_assert_eq!(expected_random_offset, plan.total_constraints);
+    let (lde_tile_words, wide_groups, serial_components) = lde_tile_layout(mode, &mut components)?;
 
     let mut descriptor = DescriptorAllocator::default();
     let zero_words = descriptor.take(SECURE_WORDS, SECURE_WORDS)?;
@@ -560,6 +695,9 @@ pub fn composition_workspace_requirements(
         inverse_twiddle_words: max_rows / 2,
         dynamic_ext_param_count,
         claimed_sum_count,
+        mode,
+        wide_groups,
+        serial_components,
         components,
         accumulators,
         zero_words,
@@ -571,6 +709,77 @@ pub fn composition_workspace_requirements(
         claimed_sum_pointers,
         component_descriptors,
     })
+}
+
+fn component_lde_footprint_words(
+    component: &CompositionComponentRequirements,
+) -> Result<usize, PreparedCompositionError> {
+    component
+        .row_count
+        .checked_mul(component.sources.len())
+        .ok_or(PreparedCompositionError::SizeOverflow)
+}
+
+/// Size the shared LDE tile and (in wide mode) assign each small group its
+/// private region. Serial: every offset stays zero and the tile is the single
+/// largest footprint — exactly today's reuse. Wide: large components share
+/// the leading `[0, max_large)` region (they stay serial on the main stream,
+/// so reuse is safe), then each group of small components gets one region
+/// sized for its largest member (members serialize in-lane, so in-group reuse
+/// mirrors the serial tile discipline). Regions of distinct groups are
+/// disjoint because their lanes execute concurrently.
+fn lde_tile_layout(
+    mode: CompositionLaunchMode,
+    components: &mut [CompositionComponentRequirements],
+) -> Result<(usize, Vec<CompositionWideGroup>, Vec<usize>), PreparedCompositionError> {
+    let mut lde_tile_words = 0usize;
+    if mode == CompositionLaunchMode::Serial {
+        for component in components.iter() {
+            lde_tile_words = lde_tile_words.max(component_lde_footprint_words(component)?);
+        }
+        return Ok((lde_tile_words, Vec::new(), (0..components.len()).collect()));
+    }
+
+    let mut serial_components = Vec::new();
+    let mut grouped = BTreeMap::<u32, Vec<usize>>::new();
+    for (index, component) in components.iter().enumerate() {
+        if component.evaluation_log_size <= COMPOSITION_WIDE_SMALL_MAX_EVALUATION_LOG {
+            grouped
+                .entry(component.evaluation_log_size)
+                .or_default()
+                .push(index);
+        } else {
+            serial_components.push(index);
+            lde_tile_words = lde_tile_words.max(component_lde_footprint_words(component)?);
+        }
+    }
+    let mut wide_groups = Vec::with_capacity(grouped.len());
+    for (evaluation_log_size, members) in grouped {
+        let mut tile_len_words = 0usize;
+        let mut weight_words = 0u64;
+        for &member in &members {
+            let component = &components[member];
+            tile_len_words = tile_len_words.max(component_lde_footprint_words(component)?);
+            weight_words = weight_words.saturating_add(
+                (component.row_count as u64)
+                    .saturating_mul((component.sources.len() + SECURE_COORDINATES) as u64),
+            );
+        }
+        for &member in &members {
+            components[member].lde_tile_offset_words = lde_tile_words;
+        }
+        wide_groups.push(CompositionWideGroup {
+            evaluation_log_size,
+            members,
+            weight_words,
+            tile_offset_words: lde_tile_words,
+            tile_len_words,
+        });
+        lde_tile_words = lde_tile_words
+            .checked_add(tile_len_words)
+            .ok_or(PreparedCompositionError::SizeOverflow)?;
+    }
+    Ok((lde_tile_words, wide_groups, serial_components))
 }
 
 fn validate_component_program(
@@ -798,10 +1007,15 @@ pub struct PreparedCompositionGraph<'a> {
     _claimed_sums: Vec<ArenaSlice>,
     composition_coefficients: [ArenaSlice; SPLIT_COORDINATES],
     components: Vec<PreparedComponent>,
+    /// Wide-mode fanout: `lane_components[lane]` holds component indices in
+    /// enqueue order (group-contiguous, members in plan order). Empty in
+    /// serial mode, so the serial launch path performs no fork/join at all.
+    lane_components: Vec<Vec<usize>>,
 }
 
 impl<'a> PreparedCompositionGraph<'a> {
-    #[allow(clippy::too_many_arguments)]
+    /// Prepare in the process-default launch mode (see
+    /// [`default_composition_launch_mode`]).
     pub fn prepare(
         arena: &'a DeviceArena,
         plan: &CompositionPlan,
@@ -809,7 +1023,45 @@ impl<'a> PreparedCompositionGraph<'a> {
         inputs: &CompositionDeviceInputs,
         slots: &CompositionWorkspaceSlots,
     ) -> Result<Self, PreparedCompositionError> {
-        let requirements = composition_workspace_requirements(plan, trace)?;
+        Self::prepare_with_mode(
+            arena,
+            plan,
+            trace,
+            inputs,
+            slots,
+            default_composition_launch_mode(),
+        )
+    }
+
+    /// Mode-explicit form of [`PreparedCompositionGraph::prepare`]. Parity
+    /// tests use this to run both stream topologies in one invocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_mode(
+        arena: &'a DeviceArena,
+        plan: &CompositionPlan,
+        trace: &CompositionTraceTopology,
+        inputs: &CompositionDeviceInputs,
+        slots: &CompositionWorkspaceSlots,
+        mode: CompositionLaunchMode,
+    ) -> Result<Self, PreparedCompositionError> {
+        let requirements = composition_workspace_requirements_with_mode(plan, trace, mode)?;
+        let lane_components = if requirements.wide_groups.is_empty() {
+            Vec::new()
+        } else {
+            let lane_count = arena.context().lane_count();
+            if lane_count == 0 {
+                return Err(PreparedCompositionError::NoComponentLanes);
+            }
+            pack_composition_wide_groups(&requirements.wide_groups, lane_count)
+                .into_iter()
+                .map(|groups| {
+                    groups
+                        .into_iter()
+                        .flat_map(|group| requirements.wide_groups[group].members.iter().copied())
+                        .collect()
+                })
+                .collect()
+        };
         if inputs.ext_params.len() != requirements.components.len() {
             return Err(PreparedCompositionError::ExtParamBindingCount {
                 expected: requirements.components.len(),
@@ -886,8 +1138,8 @@ impl<'a> PreparedCompositionGraph<'a> {
             inputs.random_coefficient,
             inputs.forward_twiddles,
             inputs.inverse_twiddles,
-            inputs.relation_z,
-            inputs.relation_alpha_powers,
+            inputs.relation_z.id(),
+            inputs.relation_alpha_powers.id(),
         ] {
             if writable_ids.contains(&input) {
                 return Err(PreparedCompositionError::InputAliasesWritableWorkspace(
@@ -895,9 +1147,9 @@ impl<'a> PreparedCompositionGraph<'a> {
                 ));
             }
         }
-        if inputs.relation_z == inputs.relation_alpha_powers {
+        if inputs.relation_z.id() == inputs.relation_alpha_powers.id() {
             return Err(PreparedCompositionError::RelationChallengeSourcesAlias(
-                inputs.relation_z,
+                inputs.relation_z.id(),
             ));
         }
         for &claimed_sum in inputs.claimed_sums.iter().flatten() {
@@ -908,9 +1160,22 @@ impl<'a> PreparedCompositionGraph<'a> {
             }
         }
 
-        let relation_z = bind_minimum(arena, inputs.relation_z, SECURE_WORDS)?;
+        // The relation graph binds these to their logical challenge extents;
+        // the kernel reads exactly one QM31 z value and
+        // `len_words() / SECURE_WORDS` alpha powers, so the caller's slice
+        // length is load-bearing and must never be a pooled slot length.
+        let relation_z = require_input_min(arena, inputs.relation_z, SECURE_WORDS)?;
         let relation_alpha_powers =
-            bind_minimum(arena, inputs.relation_alpha_powers, SECURE_WORDS)?;
+            require_input_min(arena, inputs.relation_alpha_powers, SECURE_WORDS)?;
+        if relation_alpha_powers.len_words() % SECURE_WORDS != 0 {
+            return Err(PreparedCompositionError::SlotTooSmall {
+                slot: relation_alpha_powers.id(),
+                required_words: relation_alpha_powers
+                    .len_words()
+                    .next_multiple_of(SECURE_WORDS),
+                actual_words: relation_alpha_powers.len_words(),
+            });
+        }
         let alpha_power_count = relation_alpha_powers.len_words() / SECURE_WORDS;
 
         if aot::loaded_manifest_hash() == 0 {
@@ -975,6 +1240,7 @@ impl<'a> PreparedCompositionGraph<'a> {
                     lde_tile.as_u32_ptr().add(
                         source_index
                             .checked_mul(row_count)
+                            .and_then(|words| words.checked_add(component.lde_tile_offset_words))
                             .ok_or(PreparedCompositionError::SizeOverflow)?,
                     )
                 };
@@ -1206,6 +1472,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             _claimed_sums: claimed_sums,
             composition_coefficients,
             components: prepared_components,
+            lane_components,
         })
     }
 
@@ -1267,74 +1534,65 @@ impl<'a> PreparedCompositionGraph<'a> {
             )
         })?;
 
-        let twiddle_words = u32::try_from(self.forward_twiddles.len_words())
-            .map_err(|_| PreparedCompositionError::SizeOverflow)?;
-        for (component_index, (plan_component, component)) in self
-            .requirements
-            .components
-            .iter()
-            .zip(&self.components)
-            .enumerate()
-        {
-            check_status("composition_trace_lde", unsafe {
-                raw::stwo_lde_n2b_columns_on(
-                    descriptor_ptr
-                        .add(component.coefficient_pointers)
-                        .cast::<*const u32>(),
-                    descriptor_ptr.add(component.coefficient_sizes),
-                    descriptor_ptr
-                        .add(component.evaluation_pointers)
-                        .cast::<*mut u32>(),
-                    component.evaluation_log_size,
-                    component.column_count,
-                    self.forward_twiddles.as_u32_ptr(),
-                    twiddle_words,
-                    1u32 << (component.evaluation_log_size - 1),
-                    stream,
-                )
-            })?;
-
-            let row_count = component.row_count as usize;
-            let accumulator = unsafe {
-                self.accumulators
-                    .as_u32_ptr()
-                    .add(component.accumulator_offset_words)
-            };
-            for (kernel_index, kernel) in component.kernels.iter().enumerate() {
-                let rc_base = plan_component
-                    .random_coefficient_offset
-                    .checked_add(kernel.rc_base as usize)
-                    .and_then(|offset| u32::try_from(offset).ok())
-                    .ok_or(PreparedCompositionError::SizeOverflow)?;
-                let launched = unsafe {
-                    raw::stwo_cuda_jit_eval_fused_on(
-                        kernel.source.as_ptr(),
-                        kernel.name.as_ptr(),
-                        kernel.cache_key,
-                        descriptor_ptr.add(component.evaluation_pointers),
-                        descriptor_ptr.add(component.interaction_offsets),
-                        descriptor_ptr.add(self.requirements.zero_words),
-                        component.ext_params,
-                        self.random_coefficient_powers.as_u32_ptr(),
-                        descriptor_ptr.add(component.denominator_inverses),
-                        accumulator,
-                        accumulator.add(row_count),
-                        accumulator.add(2 * row_count),
-                        accumulator.add(3 * row_count),
-                        component.row_count,
-                        component.trace_log_size,
-                        rc_base,
-                        false,
-                        stream,
-                    )
-                };
-                if !launched {
-                    return Err(PreparedCompositionError::KernelLaunchMiss {
-                        component: component_index,
-                        kernel: kernel_index,
-                        cache_key: kernel.cache_key,
-                    });
+        if self.lane_components.iter().all(|lane| lane.is_empty()) {
+            // Serial topology: identical call sequence to the historical
+            // launch path — plan order on the main stream, no fork/join.
+            for &component in &self.requirements.serial_components {
+                self.enqueue_component(component, stream)?;
+            }
+        } else {
+            // Wide topology: fork the active component lanes off the main
+            // stream (recording the graph dependency on the prelude above),
+            // enqueue each lane's small groups, run the large components on
+            // the main stream so they overlap the lanes, then join every
+            // forked lane before the accumulator lift below. Lanes are always
+            // rejoined, even on a mid-enqueue error.
+            let active_lanes = self
+                .lane_components
+                .iter()
+                .enumerate()
+                .filter_map(|(lane, components)| (!components.is_empty()).then_some(lane))
+                .collect::<Vec<_>>();
+            let mut forked = Vec::with_capacity(active_lanes.len());
+            let mut first_error = None;
+            for &lane in &active_lanes {
+                match context.fork_lane(lane) {
+                    Ok(launch) => forked.push((lane, launch)),
+                    Err(error) => {
+                        first_error = Some(PreparedCompositionError::from(error));
+                        break;
+                    }
                 }
+            }
+            if first_error.is_none() {
+                'lanes: for &(lane, launch) in &forked {
+                    for &component in &self.lane_components[lane] {
+                        if let Err(error) =
+                            self.enqueue_component(component, launch.stream_raw().as_ptr())
+                        {
+                            first_error = Some(error);
+                            break 'lanes;
+                        }
+                    }
+                }
+            }
+            if first_error.is_none() {
+                for &component in &self.requirements.serial_components {
+                    if let Err(error) = self.enqueue_component(component, stream) {
+                        first_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            for (lane, _) in forked {
+                if let Err(error) = context.join_lane(lane) {
+                    if first_error.is_none() {
+                        first_error = Some(PreparedCompositionError::from(error));
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
             }
         }
 
@@ -1401,6 +1659,83 @@ impl<'a> PreparedCompositionGraph<'a> {
         Ok(())
     }
 
+    /// Enqueue one component's trace LDE and constraint-eval kernels on
+    /// `stream`. Kernel arguments are identical regardless of the stream (the
+    /// per-component evaluation pointers already carry the mode's tile
+    /// offsets), so serial and wide launches differ only in stream placement.
+    fn enqueue_component(
+        &self,
+        component_index: usize,
+        stream: *mut c_void,
+    ) -> Result<(), PreparedCompositionError> {
+        let descriptor_ptr = self.descriptors.as_u32_ptr();
+        let requirement = &self.requirements.components[component_index];
+        let component = &self.components[component_index];
+        let twiddle_words = u32::try_from(self.forward_twiddles.len_words())
+            .map_err(|_| PreparedCompositionError::SizeOverflow)?;
+        check_status("composition_trace_lde", unsafe {
+            raw::stwo_lde_n2b_columns_on(
+                descriptor_ptr
+                    .add(component.coefficient_pointers)
+                    .cast::<*const u32>(),
+                descriptor_ptr.add(component.coefficient_sizes),
+                descriptor_ptr
+                    .add(component.evaluation_pointers)
+                    .cast::<*mut u32>(),
+                component.evaluation_log_size,
+                component.column_count,
+                self.forward_twiddles.as_u32_ptr(),
+                twiddle_words,
+                1u32 << (component.evaluation_log_size - 1),
+                stream,
+            )
+        })?;
+
+        let row_count = component.row_count as usize;
+        let accumulator = unsafe {
+            self.accumulators
+                .as_u32_ptr()
+                .add(component.accumulator_offset_words)
+        };
+        for (kernel_index, kernel) in component.kernels.iter().enumerate() {
+            let rc_base = requirement
+                .random_coefficient_offset
+                .checked_add(kernel.rc_base as usize)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .ok_or(PreparedCompositionError::SizeOverflow)?;
+            let launched = unsafe {
+                raw::stwo_cuda_jit_eval_fused_on(
+                    kernel.source.as_ptr(),
+                    kernel.name.as_ptr(),
+                    kernel.cache_key,
+                    descriptor_ptr.add(component.evaluation_pointers),
+                    descriptor_ptr.add(component.interaction_offsets),
+                    descriptor_ptr.add(self.requirements.zero_words),
+                    component.ext_params,
+                    self.random_coefficient_powers.as_u32_ptr(),
+                    descriptor_ptr.add(component.denominator_inverses),
+                    accumulator,
+                    accumulator.add(row_count),
+                    accumulator.add(2 * row_count),
+                    accumulator.add(3 * row_count),
+                    component.row_count,
+                    component.trace_log_size,
+                    rc_base,
+                    false,
+                    stream,
+                )
+            };
+            if !launched {
+                return Err(PreparedCompositionError::KernelLaunchMiss {
+                    component: component_index,
+                    kernel: kernel_index,
+                    cache_key: kernel.cache_key,
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn requirements(&self) -> &CompositionWorkspaceRequirements {
         &self.requirements
     }
@@ -1462,7 +1797,9 @@ fn bind_slot(
             requirement.id,
         )));
     }
-    Ok(slice)
+    // Pooled slots may be larger than any single logical buffer; expose only
+    // the logical extent so memsets and kernel sizes never see the surplus.
+    Ok(slice.truncated(requirement.len_words))
 }
 
 fn bind_minimum(
@@ -1474,6 +1811,27 @@ fn bind_minimum(
     if slice.len_words() < required_words {
         return Err(PreparedCompositionError::SlotTooSmall {
             slot: id,
+            required_words,
+            actual_words: slice.len_words(),
+        });
+    }
+    // Pooled slots may be larger than any single logical buffer; expose only
+    // the logical extent so twiddle sizes and kernel extents derived from
+    // `len_words()` are the logical requirement, never the pooled maximum.
+    Ok(slice.truncated(required_words))
+}
+
+/// Validate a caller-provided logical slice against a minimum extent. The
+/// slice is returned as provided: its length is the caller's logical extent,
+/// already truncated at bind time, and downstream counts derive from it.
+fn require_input_min(
+    _arena: &DeviceArena,
+    slice: ArenaSlice,
+    required_words: usize,
+) -> Result<ArenaSlice, PreparedCompositionError> {
+    if slice.len_words() < required_words {
+        return Err(PreparedCompositionError::SlotTooSmall {
+            slot: slice.id(),
             required_words,
             actual_words: slice.len_words(),
         });
@@ -1620,7 +1978,12 @@ mod tests {
                 component("b", 4, 6, 3, 2, vec![1], 0..2, 1..3),
             ],
         };
-        let requirements = composition_workspace_requirements(&plan, &trace()).unwrap();
+        let requirements = composition_workspace_requirements_with_mode(
+            &plan,
+            &trace(),
+            CompositionLaunchMode::Serial,
+        )
+        .unwrap();
         assert_eq!(requirements.components[0].interaction_offsets, [0, 2, 5]);
         assert_eq!(
             requirements.components[0]
@@ -1645,6 +2008,145 @@ mod tests {
         );
         assert_eq!(requirements.random_power_words, 5 * SECURE_WORDS);
         assert_eq!(requirements.output_coefficient_words, 1 << 6);
+        assert_eq!(requirements.serial_components, vec![0, 1]);
+        assert!(requirements.wide_groups.is_empty());
+        assert!(requirements
+            .components
+            .iter()
+            .all(|component| component.lde_tile_offset_words == 0));
+    }
+
+    #[test]
+    fn wide_mode_partitions_small_groups_with_disjoint_private_tile_regions() {
+        // Eval logs 7, 6, 7: all small (<= COMPOSITION_WIDE_SMALL_MAX_EVALUATION_LOG),
+        // so two groups form (log 6, log 7) and no serial component remains.
+        let plan = CompositionPlan {
+            max_kernel_instrs: 2048,
+            total_constraints: 6,
+            max_evaluation_log_size: 7,
+            components: vec![
+                component("a", 5, 7, 2, 0, vec![2, 0], 1..4, 0..2),
+                component("b", 4, 6, 3, 2, vec![1], 0..2, 1..3),
+                component("c", 5, 7, 1, 5, vec![0], 0..1, 0..1),
+            ],
+        };
+        let serial = composition_workspace_requirements_with_mode(
+            &plan,
+            &trace(),
+            CompositionLaunchMode::Serial,
+        )
+        .unwrap();
+        let wide = composition_workspace_requirements_with_mode(
+            &plan,
+            &trace(),
+            CompositionLaunchMode::Wide,
+        )
+        .unwrap();
+
+        // Mode changes only tile layout and scheduling metadata.
+        assert_eq!(wide.components.len(), serial.components.len());
+        for (wide_component, serial_component) in wide.components.iter().zip(&serial.components) {
+            let mut normalized = wide_component.clone();
+            normalized.lde_tile_offset_words = 0;
+            assert_eq!(&normalized, serial_component);
+        }
+        assert_eq!(wide.accumulators, serial.accumulators);
+        assert_eq!(wide.descriptor_words, serial.descriptor_words);
+
+        assert!(wide.serial_components.is_empty());
+        assert_eq!(wide.wide_groups.len(), 2);
+        let group_6 = &wide.wide_groups[0];
+        let group_7 = &wide.wide_groups[1];
+        assert_eq!(group_6.evaluation_log_size, 6);
+        assert_eq!(group_6.members, vec![1]);
+        assert_eq!(group_7.evaluation_log_size, 7);
+        assert_eq!(group_7.members, vec![0, 2], "members stay in plan order");
+
+        // Regions: group 6 first (BTreeMap ascending), sized by its largest
+        // member; group 7 after it; every member carries its group's offset.
+        assert_eq!(group_6.tile_offset_words, 0);
+        // Component b selects 1 preprocessed + 2 base + 2 interaction columns.
+        assert_eq!(group_6.tile_len_words, 5 * (1 << 6));
+        assert_eq!(group_7.tile_offset_words, group_6.tile_len_words);
+        assert_eq!(group_7.tile_len_words, 7 * (1 << 7));
+        assert_eq!(wide.components[1].lde_tile_offset_words, 0);
+        assert_eq!(
+            wide.components[0].lde_tile_offset_words,
+            group_7.tile_offset_words
+        );
+        assert_eq!(
+            wide.components[2].lde_tile_offset_words,
+            group_7.tile_offset_words
+        );
+        assert_eq!(
+            wide.lde_tile_words,
+            group_6.tile_len_words + group_7.tile_len_words
+        );
+        assert!(wide.lde_tile_words >= serial.lde_tile_words);
+    }
+
+    #[test]
+    fn wide_mode_keeps_large_components_serial_on_the_shared_leading_region() {
+        // Eval log 20 > threshold: stays serial at offset zero; the small
+        // log-7 group is placed after the large footprint.
+        let plan = CompositionPlan {
+            max_kernel_instrs: 2048,
+            total_constraints: 3,
+            max_evaluation_log_size: 20,
+            components: vec![
+                component("large", 19, 20, 2, 0, vec![0], 0..1, 0..1),
+                component("small", 5, 7, 1, 2, vec![0], 0..1, 0..1),
+            ],
+        };
+        let wide = composition_workspace_requirements_with_mode(
+            &plan,
+            &trace(),
+            CompositionLaunchMode::Wide,
+        )
+        .unwrap();
+        assert_eq!(wide.serial_components, vec![0]);
+        assert_eq!(wide.components[0].lde_tile_offset_words, 0);
+        let large_footprint = 3 * (1usize << 20);
+        assert_eq!(wide.wide_groups.len(), 1);
+        assert_eq!(wide.wide_groups[0].members, vec![1]);
+        assert_eq!(wide.wide_groups[0].tile_offset_words, large_footprint);
+        assert_eq!(wide.components[1].lde_tile_offset_words, large_footprint);
+        assert_eq!(
+            wide.lde_tile_words,
+            large_footprint + wide.wide_groups[0].tile_len_words
+        );
+    }
+
+    #[test]
+    fn wide_group_packing_is_deterministic_and_balances_by_weight() {
+        let group = |log: u32, members: Vec<usize>, weight: u64| CompositionWideGroup {
+            evaluation_log_size: log,
+            members,
+            weight_words: weight,
+            tile_offset_words: 0,
+            tile_len_words: 0,
+        };
+        let groups = vec![
+            group(6, vec![0], 10),
+            group(7, vec![1], 40),
+            group(8, vec![2], 30),
+            group(9, vec![3], 10),
+        ];
+        let lanes = pack_composition_wide_groups(&groups, 2);
+        // Heaviest (40 -> lane 0), then 30 -> lane 1, then the two 10s: the
+        // log-6 group precedes the log-9 group (tie broken by eval log), so
+        // it lands on lane 1 (load 30 < 40) and log-9 lands on lane 0.
+        assert_eq!(lanes, vec![vec![1, 3], vec![2, 0]]);
+        assert_eq!(
+            lanes,
+            pack_composition_wide_groups(&groups, 2),
+            "packing must be a pure function of its inputs"
+        );
+        // One lane: everything serializes in weight order.
+        assert_eq!(
+            pack_composition_wide_groups(&groups, 1),
+            vec![vec![1, 2, 0, 3]]
+        );
     }
 
     #[test]

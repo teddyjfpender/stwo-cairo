@@ -110,8 +110,12 @@ pub(crate) fn prepare_resident_composition<'a>(
         random_coefficient: planned.random_coefficient.physical,
         forward_twiddles: planned.forward_twiddles.physical,
         inverse_twiddles: planned.inverse_twiddles.physical,
-        relation_z: relation.z_source().id(),
-        relation_alpha_powers: relation.alpha_powers_source().id(),
+        // Pass the relation graph's logically-truncated challenge slices, not
+        // slot ids: the composition alpha-power count derives from the slice
+        // length, which must be the logical challenge extent even when the
+        // physical slot is pooled larger.
+        relation_z: relation.z_source(),
+        relation_alpha_powers: relation.alpha_powers_source(),
         claimed_sums,
         ext_params: planned.ext_param_bindings(),
     };

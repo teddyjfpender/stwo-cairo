@@ -24,7 +24,7 @@ use stwo_cairo_serialize::CairoSerialize;
 // The all-opcode fixture intentionally calls `generic()`, whose indirect JNZ is
 // one real `generic_opcode` row. Keep that statement as the generic-writer oracle;
 // strict resident parity uses this broad, capture-safe opcode + Poseidon statement.
-const STRICT_RESIDENT_FIXTURE: &str = "test_prove_verify_poseidon_builtin";
+const STRICT_RESIDENT_FIXTURE: &str = "test_prove_verify_sn2_profile";
 
 fn resident_input() -> ProverInput {
     run_and_adapt(
@@ -40,7 +40,7 @@ fn resident_params() -> ProverParameters {
     ProverParameters {
         channel_hash: ChannelHash::Blake2s,
         pcs_config: PcsConfig::default(),
-        preprocessed_trace: PreProcessedTraceVariant::CanonicalWithoutPedersen,
+        preprocessed_trace: PreProcessedTraceVariant::Canonical,
         channel_salt: 0,
         store_polynomials_coefficients: true,
         include_all_preprocessed_columns: false,
@@ -95,13 +95,24 @@ fn assert_capture_safe_fixture(input: &ProverInput, params: ProverParameters) {
         "poseidon_aggregator",
         "poseidon_full_round_chain",
         "poseidon_3_partial_rounds_chain",
+        "pedersen_builtin",
+        "pedersen_aggregator_window_bits_18",
+        "partial_ec_mul_window_bits_18",
+        "partial_ec_mul_generic",
+        "bitwise_builtin",
+        "range_check_builtin",
     ] {
         assert!(
             recorded.contains(&required),
             "strict resident fixture lost recorded component {required}: {recorded:?}"
         );
     }
-    for required in ["memory_address_to_id", "memory_id_to_big"] {
+    for required in [
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "ec_op_builtin",
+        "pedersen_points_table_window_bits_18",
+    ] {
         assert!(
             present
                 .iter()

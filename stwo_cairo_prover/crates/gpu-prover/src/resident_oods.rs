@@ -280,7 +280,9 @@ fn bind_logical(
             actual_words: slice.len_words(),
         });
     }
-    Ok(slice)
+    // The physical slot may be pooled larger than this logical buffer; expose
+    // only the logical extent so downstream sizes never see the surplus.
+    Ok(slice.truncated(binding.len_words))
 }
 
 fn require_same_slice(
