@@ -45,7 +45,7 @@ GATES = (
             "--test",
             "prepared_commit_native",
         ),
-        1,
+        2,
     ),
     (
         "prepared_fri_eager_capture_reference",
@@ -167,7 +167,7 @@ GATES = (
             "--test",
             "prepared_witness_feed_native",
         ),
-        1,
+        2,
     ),
     (
         "prepared_witness_input_gather_and_compact_eager_capture_cpu_reference",
@@ -205,7 +205,7 @@ GATES = (
             "--test",
             "prepared_composition_native",
         ),
-        1,
+        2,
     ),
     (
         "strict_resident_whole_proof_simd_byte_identity",
