@@ -74,8 +74,7 @@
 #   POD_BOOTLOADER_JSON    Stable remote bootloader path exported for build and every
 #                 run. Default: /workspace/bench_inputs/simple_bootloader_compiled.json.
 #   GPU_PCS_RUNTIME_MODE   Required typed CUDA PCS mode for every CUDA run:
-#                 detached-eager (default) or arena-graph. The latter is a strict
-#                 future gate and currently rejects detached telemetry.
+#                 arena-graph (default) or detached-eager (migration diagnostics).
 #
 # NOTE: only same-pod comparisons are meaningful (community-host variance). See README.md.
 
@@ -94,6 +93,7 @@ LEDGER="${LEDGER:-${LOOP_DIR}/ledger.jsonl}"
 POD_CONF="${POD_CONF:-${LOOP_DIR}/pod.conf}"
 INPUT_SHA256SUMS="${CAIRO_LOCAL}/gpu_benchmarks/pie/SHA256SUMS"
 ARCHITECTURE_CHECK="${CAIRO_LOCAL}/gpu_benchmarks/validate_architecture_record.py"
+SOUNDNESS_RUNNER="${CAIRO_LOCAL}/gpu_benchmarks/run_cuda_soundness_gate.py"
 
 # Optional local input sources. They are validation/seed hints only: this script
 # never uploads fixtures or the bootloader implicitly.
@@ -116,12 +116,13 @@ POD_BOOTLOADER_JSON="${POD_BOOTLOADER_JSON:-/workspace/bench_inputs/simple_bootl
 # Pod scratch (outside the repo tree so rsync never touches it).
 POD_RUN_DIR="/workspace/bench_loop_runs"
 POD_BUILD_LOG="${POD_RUN_DIR}/build.log"
+POD_SOUNDNESS_GATE="${POD_RUN_DIR}/cuda-soundness-gate.json"
 
 # Prover knobs.
 RUST_MIN_STACK_VAL=4194304
 BUILD_RUSTFLAGS="-C target-cpu=native"
 BENCH_ENV="${BENCH_ENV:-}"          # debug/bisect env, recorded in every ledger entry
-GPU_PCS_RUNTIME_MODE="${GPU_PCS_RUNTIME_MODE:-detached-eager}"
+GPU_PCS_RUNTIME_MODE="${GPU_PCS_RUNTIME_MODE:-arena-graph}"
 GPU_NATIVE_ARGS="--engine gpu-native --require-gpu-native-architecture --require-gpu-pcs-runtime-mode ${GPU_PCS_RUNTIME_MODE}"
 
 # Fleet (rotate) run parameters.
@@ -367,6 +368,7 @@ pie_path "$PIE_SEL" >/dev/null   # validates selector early
 [[ -d "$STWO_LOCAL/.git" ]] || die "missing sibling stwo checkout: $STWO_LOCAL"
 [[ -f "$INPUT_SHA256SUMS" ]] || die "input checksum manifest missing: $INPUT_SHA256SUMS"
 [[ -f "$ARCHITECTURE_CHECK" ]] || die "architecture record validator missing: $ARCHITECTURE_CHECK"
+[[ -f "$SOUNDNESS_RUNNER" ]] || die "CUDA soundness runner missing: $SOUNDNESS_RUNNER"
 [[ -n "$(expected_sha256 "$POD_BOOTLOADER_JSON")" ]] \
   || die "pinned bootloader checksum missing from $INPUT_SHA256SUMS: $(basename "$POD_BOOTLOADER_JSON")"
 STWO_LOCAL="$(cd "$STWO_LOCAL" && pwd)"
@@ -395,13 +397,24 @@ preflight_pod_inputs
 # (a) Provenance capture
 # ---------------------------------------------------------------------------
 git_rev() { git -C "$1" rev-parse HEAD 2>/dev/null || echo "UNKNOWN"; }
-# sha256 of the working-tree diff vs HEAD (staged + unstaged, tracked files). "clean"
-# when there is no diff. Makes every ledger entry traceable even with uncommitted work.
+# sha256 of tracked changes plus untracked paths/content. "clean" only when the
+# complete source tree matches HEAD, so newly generated CUDA files are not invisible.
 git_dirty() {
   local repo="$1"
   if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then echo "NOGIT"; return; fi
-  if git -C "$repo" diff --quiet HEAD 2>/dev/null; then echo "clean"; return; fi
-  git -C "$repo" diff HEAD 2>/dev/null | sha256_stream | cut -c1-16
+  if git -C "$repo" diff --quiet HEAD 2>/dev/null &&
+     [[ -z "$(git -C "$repo" ls-files --others --exclude-standard | head -1)" ]]; then
+    echo "clean"
+    return
+  fi
+  (
+    git -C "$repo" diff --binary HEAD -- 2>/dev/null
+    git -C "$repo" ls-files --others --exclude-standard -z |
+      while IFS= read -r -d '' path; do
+        printf 'untracked\0%s\0' "$path"
+        cat "$repo/$path"
+      done
+  ) | sha256_stream | cut -c1-16
 }
 
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -434,13 +447,13 @@ log "pod GPU: ${POD_GPU}"
 # ---------------------------------------------------------------------------
 sync_repos() {
   log "rsync stwo -> pod (excludes target/.git)"
-  run_rsync -az --partial \
+  run_rsync -az --partial --no-owner --no-group \
     --exclude=target --exclude=.git \
     -e "$SSH_E" \
     "${STWO_LOCAL}/" "${POD_USER}@${POD_HOST}:${STWO_POD}/"
 
   log "rsync stwo-cairo -> pod (excludes target/.git/PIE zips/ledger)"
-  run_rsync -az --partial \
+  run_rsync -az --partial --no-owner --no-group \
     --exclude=target --exclude=.git \
     --exclude='gpu_benchmarks/pie/sn/*.zip' \
     --exclude='gpu_benchmarks/pie/*.zip' \
@@ -477,6 +490,62 @@ build_pod() {
   log "build OK"
 }
 
+# Native cfg-gated tests can exit zero after executing nothing. Run the counted
+# differential suite on the pod and retain its JSON artifact before any proof or
+# performance claim from this build.
+run_cuda_soundness_gate() {
+  LOCAL_SOUNDNESS_GATE="${RESULTS_DIR}/${STAMP}.cuda-soundness-gate.json"
+  log "CUDA soundness gate: counted native differential targets"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    dry "python3 gpu_benchmarks/run_cuda_soundness_gate.py --stwo ${STWO_POD} --runtime-mode ${GPU_PCS_RUNTIME_MODE} --output ${POD_SOUNDNESS_GATE}"
+    PYTHONPATH="$(dirname "$ARCHITECTURE_CHECK")" \
+      STWO_HEAD="$STWO_REV" STWO_CAIRO_HEAD="$CAIRO_REV" \
+      RUNTIME_MODE="$GPU_PCS_RUNTIME_MODE" \
+      python3 - "$LOCAL_SOUNDNESS_GATE" <<'PY'
+import json, os, sys
+from run_cuda_soundness_gate import gates_for_runtime_mode
+
+runtime_mode = os.environ["RUNTIME_MODE"]
+gates = gates_for_runtime_mode(runtime_mode)
+
+artifact = {
+    "schema": "stwo.cuda.soundness-gate.v2",
+    "dry_run": True,
+    "stwo_git_head": os.environ["STWO_HEAD"],
+    "stwo_cairo_git_head": os.environ["STWO_CAIRO_HEAD"],
+    "stwo_worktree_hash": "0" * 64,
+    "stwo_cairo_worktree_hash": "0" * 64,
+    "runtime_mode": runtime_mode,
+    "passed": True,
+    "gates": [
+        {"name": name, "command": list(command), "exit_code": 0,
+         "executed_tests": required,
+         "required_tests": required, "passed": True}
+        for name, command, required in gates
+    ],
+}
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump(artifact, stream)
+    stream.write("\n")
+PY
+    return 0
+  fi
+  local out code
+  out="$(run_ssh "cd '${CAIRO_POD}' && . \$HOME/.cargo/env 2>/dev/null; \
+      PATH=/usr/local/cuda/bin:\$PATH \
+      python3 gpu_benchmarks/run_cuda_soundness_gate.py \
+      --stwo '${STWO_POD}' --runtime-mode '${GPU_PCS_RUNTIME_MODE}' \
+      --output '${POD_SOUNDNESS_GATE}'; \
+      echo SOUNDNESS_EXIT=\$?")"
+  code="$(printf '%s\n' "$out" | sed -n 's/.*SOUNDNESS_EXIT=\([0-9][0-9]*\).*/\1/p' | tail -1)"
+  run_ssh "cat '${POD_SOUNDNESS_GATE}' 2>/dev/null" > "$LOCAL_SOUNDNESS_GATE" || true
+  if [[ "$code" != "0" ]]; then
+    warn "CUDA soundness gate failed (exit=${code:-?}); artifact: ${LOCAL_SOUNDNESS_GATE}"
+    return 1
+  fi
+  log "CUDA soundness gate PASSED: ${LOCAL_SOUNDNESS_GATE}"
+}
+
 # ---------------------------------------------------------------------------
 # Synthetic run output for DRY_RUN (exercises the ledger/summary path offline)
 # ---------------------------------------------------------------------------
@@ -489,7 +558,7 @@ synth_out() {
     local runtime_report="DetachedEager"
     [[ "$GPU_PCS_RUNTIME_MODE" == "arena-graph" ]] && runtime_report="ArenaGraph"
     local stage_counts='{"OodsEvaluation":1,"QuotientAndCompaction":1,"FriCommitAndFold":1,"ProofOfWork":1,"FriQueryAndDecommit":1,"TreeDecommit":1,"Assembly":1}'
-    architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true'
+    architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"gpu_host_syncs":1,"gpu_graph_launches":8,"gpu_kernel_launches":72,"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25'
   fi
   local seed=$(( $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 40 ))
   local um um_median verified_reps=1
@@ -671,7 +740,8 @@ PY
 # The binary accepts flags by manual lookup, so an older binary can ignore an
 # unknown architecture flag and still exit zero. Validate the primary record too.
 architecture_contract_ok() {
-  python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE"
+  python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE" \
+    --soundness-gate "$LOCAL_SOUNDNESS_GATE"
 }
 
 # ---------------------------------------------------------------------------
@@ -816,6 +886,10 @@ if [[ "$SKIP_SYNC" == "1" ]]; then
 else
   sync_repos
   build_pod
+fi
+
+if ! run_cuda_soundness_gate; then
+  die "counted CUDA soundness suite failed — refusing to launch the proof gate."
 fi
 
 # Abort helper for a stalled run: self-documenting ledger entry with evidence, then die.

@@ -16,12 +16,13 @@ use num_traits::Zero;
 use serde_json::{Map, Value};
 use stwo::core::air::Components;
 use stwo::core::circle::{CirclePoint, SECURE_FIELD_CIRCLE_GEN};
+use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
 use stwo::core::pcs::utils::try_get_lifting_log_size;
 use stwo::core::pcs::{PcsConfig, TreeVec};
 use stwo::core::poly::circle::CanonicCoset;
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId};
-use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
 use crate::plan::ProofPlan;
 use crate::relation_execution::{RelationExecutionError, RelationExecutionPlan};
@@ -39,8 +40,32 @@ pub struct ProtocolTranscriptDiscovery {
     /// Coefficient-domain log sizes of the prepared partial numerators, in the
     /// exact sample-point order consumed by `compute_quotients_and_combine`.
     pub partial_numerator_log_sizes: Vec<u32>,
+    /// Every PCS column in exact tree/column order, including columns with an
+    /// empty mask. The fixed offsets are relative to the transcript-derived
+    /// OODS point and are guaranteed to lie on the base-field circle.
+    pub oods_topology: DiscoveredOodsTopology,
     pub lifting_log_size: u32,
     pub max_log_degree_bound: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveredOodsTopology {
+    /// Number of columns in preprocessed, base, interaction and composition
+    /// trees respectively. This makes flattening reversible without relying on
+    /// ambient claim state.
+    pub tree_column_counts: Vec<usize>,
+    pub columns: Vec<DiscoveredOodsColumn>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveredOodsColumn {
+    pub tree: usize,
+    pub column: usize,
+    pub coefficient_log_size: u32,
+    /// Shape-discovery points used to reproduce STWO quotient grouping.
+    pub shape_points: Vec<CirclePoint<SecureField>>,
+    /// Base-field circle offsets used by the prepared CUDA OODS evaluator.
+    pub offset_points: Vec<CirclePoint<BaseField>>,
 }
 
 impl ProtocolTranscriptDiscovery {
@@ -77,6 +102,10 @@ pub enum ProtocolDiscoveryError {
         claim: usize,
         relation_plan: usize,
     },
+    InteractionClaimValueCount {
+        expected: usize,
+        actual: usize,
+    },
     InvalidLiftingLogSize {
         lifting: u32,
         required: u32,
@@ -87,10 +116,18 @@ pub enum ProtocolDiscoveryError {
         points: usize,
         log_sizes: usize,
     },
+    InvalidClaimTreeCount(usize),
+    InvalidPreprocessedMaskArity(usize),
+    NonBaseMaskOffset {
+        tree: usize,
+        column: usize,
+        mask: usize,
+    },
     SampledColumnExceedsLifting {
         coefficient_log_size: u32,
         max_log_degree_bound: u32,
     },
+    InvalidCanonicCosetLogSize(u32),
     ComponentConstruction,
     SizeOverflow,
     Relation(RelationExecutionError),
@@ -117,7 +154,7 @@ impl From<RelationExecutionError> for ProtocolDiscoveryError {
 pub fn discover_protocol_transcript_shape(
     claim: &CairoClaim,
     proof_plan: &ProofPlan,
-    preprocessed_column_ids: &[PreProcessedColumnId],
+    preprocessed_trace: &PreProcessedTrace,
     pcs: &PcsConfig,
     split_composition_log_size: u32,
     include_all_preprocessed_columns: bool,
@@ -151,7 +188,7 @@ pub fn discover_protocol_transcript_shape(
     let topology = protocol_mask_topology(
         claim,
         &interaction_claim,
-        preprocessed_column_ids,
+        preprocessed_trace,
         max_log_degree_bound,
         include_all_preprocessed_columns,
     )?;
@@ -171,12 +208,15 @@ pub fn discover_protocol_transcript_shape(
         lifting_log_size,
         pcs.fri_config.log_blowup_factor,
     )?;
+    let oods_topology =
+        discovered_oods_topology(&topology.sample_points, &topology.coefficient_log_sizes)?;
 
     Ok(ProtocolTranscriptDiscovery {
         interaction_claim_felts,
         oods_sampled_value_felts,
         sampled_value_felts_by_tree,
         partial_numerator_log_sizes,
+        oods_topology,
         lifting_log_size,
         max_log_degree_bound,
     })
@@ -190,36 +230,56 @@ struct ProtocolMaskTopology {
 fn protocol_mask_topology(
     claim: &CairoClaim,
     interaction_claim: &CairoInteractionClaim,
-    preprocessed_column_ids: &[PreProcessedColumnId],
+    preprocessed_trace: &PreProcessedTrace,
     max_log_degree_bound: u32,
     include_all_preprocessed_columns: bool,
 ) -> Result<ProtocolMaskTopology, ProtocolDiscoveryError> {
-    let (mut sample_points, mut coefficient_log_sizes) = catch_unwind(AssertUnwindSafe(|| {
+    let preprocessed_column_ids = preprocessed_trace.ids();
+    let mut sample_points = catch_unwind(AssertUnwindSafe(|| {
         let cairo_components = CairoComponents::new(
             claim,
             &CommonLookupElements::dummy(),
             interaction_claim,
-            preprocessed_column_ids,
+            &preprocessed_column_ids,
         );
         let components = Components {
             components: cairo_components.components(),
             n_preprocessed_columns: preprocessed_column_ids.len(),
         };
-        (
-            components.mask_points(
-                SECURE_FIELD_CIRCLE_GEN,
-                max_log_degree_bound,
-                include_all_preprocessed_columns,
-            ),
-            components.column_log_sizes(),
+        components.mask_points(
+            SECURE_FIELD_CIRCLE_GEN,
+            max_log_degree_bound,
+            include_all_preprocessed_columns,
         )
     }))
     .map_err(|_| ProtocolDiscoveryError::ComponentConstruction)?;
-    if sample_points.len() != TRACE_TREE_COUNT || coefficient_log_sizes.len() != TRACE_TREE_COUNT {
+    if sample_points.len() != TRACE_TREE_COUNT {
         return Err(ProtocolDiscoveryError::InvalidMaskTreeCount(
             sample_points.len(),
         ));
     }
+    if let Some(arity) = sample_points[0]
+        .iter()
+        .map(Vec::len)
+        .find(|&arity| arity > 1)
+    {
+        return Err(ProtocolDiscoveryError::InvalidPreprocessedMaskArity(arity));
+    }
+
+    // CairoClaim::log_sizes is the exact base/interaction commitment-column
+    // order. Fixed columns use their real coefficient logs: the prepared OODS
+    // graph needs the exact source size even when a column's mask is empty.
+    let claim_log_sizes = claim.log_sizes();
+    if claim_log_sizes.len() != TRACE_TREE_COUNT - 1 {
+        return Err(ProtocolDiscoveryError::InvalidClaimTreeCount(
+            claim_log_sizes.len(),
+        ));
+    }
+    let mut coefficient_log_sizes = TreeVec(vec![
+        preprocessed_trace.log_sizes(),
+        claim_log_sizes[0].clone(),
+        claim_log_sizes[1].clone(),
+    ]);
     for (tree, (points, log_sizes)) in sample_points
         .iter()
         .zip(coefficient_log_sizes.iter())
@@ -241,6 +301,71 @@ fn protocol_mask_topology(
     Ok(ProtocolMaskTopology {
         sample_points,
         coefficient_log_sizes,
+    })
+}
+
+fn discovered_oods_topology(
+    sample_points: &TreeVec<Vec<Vec<CirclePoint<SecureField>>>>,
+    coefficient_log_sizes: &TreeVec<Vec<u32>>,
+) -> Result<DiscoveredOodsTopology, ProtocolDiscoveryError> {
+    if sample_points.len() != coefficient_log_sizes.len() {
+        return Err(ProtocolDiscoveryError::InvalidMaskTreeCount(
+            sample_points.len(),
+        ));
+    }
+
+    let tree_column_counts = sample_points.iter().map(Vec::len).collect::<Vec<_>>();
+    let mut columns = Vec::with_capacity(tree_column_counts.iter().sum());
+    for (tree, (points_by_column, logs_by_column)) in sample_points
+        .iter()
+        .zip(coefficient_log_sizes.iter())
+        .enumerate()
+    {
+        if points_by_column.len() != logs_by_column.len() {
+            return Err(ProtocolDiscoveryError::InvalidMaskColumnCount {
+                tree,
+                points: points_by_column.len(),
+                log_sizes: logs_by_column.len(),
+            });
+        }
+        for (column, (shape_points, &coefficient_log_size)) in
+            points_by_column.iter().zip(logs_by_column).enumerate()
+        {
+            let mut offset_points = Vec::with_capacity(shape_points.len());
+            for (mask, &shape_point) in shape_points.iter().enumerate() {
+                let offset = shape_point - SECURE_FIELD_CIRCLE_GEN;
+                let x =
+                    offset
+                        .x
+                        .try_into()
+                        .map_err(|_| ProtocolDiscoveryError::NonBaseMaskOffset {
+                            tree,
+                            column,
+                            mask,
+                        })?;
+                let y =
+                    offset
+                        .y
+                        .try_into()
+                        .map_err(|_| ProtocolDiscoveryError::NonBaseMaskOffset {
+                            tree,
+                            column,
+                            mask,
+                        })?;
+                offset_points.push(CirclePoint { x, y });
+            }
+            columns.push(DiscoveredOodsColumn {
+                tree,
+                column,
+                coefficient_log_size,
+                shape_points: shape_points.clone(),
+                offset_points,
+            });
+        }
+    }
+    Ok(DiscoveredOodsTopology {
+        tree_column_counts,
+        columns,
     })
 }
 
@@ -266,7 +391,9 @@ fn partial_numerator_log_sizes(
             sample_points.len(),
         ));
     }
-    let lifting_domain_generator = CanonicCoset::new(lifting_log_size).step();
+    let lifting_domain_generator = CanonicCoset::try_new(lifting_log_size)
+        .map_err(|_| ProtocolDiscoveryError::InvalidCanonicCosetLogSize(lifting_log_size))?
+        .step();
     let max_log_degree_bound = lifting_log_size
         .checked_sub(log_blowup_factor)
         .ok_or(ProtocolDiscoveryError::SizeOverflow)?;
@@ -410,6 +537,127 @@ fn schema_zero_interaction_claim(
         ));
     }
     Ok((interaction_claim, claim_schema))
+}
+
+/// Schema-derived interaction shape for statement-independent composition
+/// lowering. This reuses the same round-trip coverage validation as transcript
+/// discovery, so a new Cairo claim field cannot silently disappear from AOT
+/// planning.
+pub(crate) fn schema_zero_interaction_claim_for_composition(
+    claim: &CairoClaim,
+) -> Result<CairoInteractionClaim, ProtocolDiscoveryError> {
+    schema_zero_interaction_claim(claim).map(|(interaction, _)| interaction)
+}
+
+/// Rehydrate the canonical Cairo interaction claim from the resident relation
+/// graph's flat output. This is a mechanical host decoder after the single
+/// proof download: it performs no transcript or protocol computation.
+pub(crate) fn interaction_claim_from_flattened(
+    claim: &CairoClaim,
+    claimed_sums: &[SecureField],
+) -> Result<CairoInteractionClaim, ProtocolDiscoveryError> {
+    let (zero_claim, _) = schema_zero_interaction_claim(claim)?;
+    let Value::Object(mut fields) = serde_json::to_value(zero_claim)
+        .map_err(|error| ProtocolDiscoveryError::Schema(error.to_string()))?
+    else {
+        return Err(ProtocolDiscoveryError::Schema(
+            "CairoInteractionClaim did not serialize as an object".into(),
+        ));
+    };
+    let mut values = claimed_sums.iter().copied();
+    let mut consumed = 0usize;
+
+    for &component in crate::schedule_table::CAIRO_COMMITMENT_COMPONENT_ORDER {
+        let Some(field) = fields.get_mut(component) else {
+            return Err(ProtocolDiscoveryError::Schema(format!(
+                "missing interaction field {component}"
+            )));
+        };
+        if field.is_null() {
+            continue;
+        }
+        let Value::Object(interaction) = field else {
+            return Err(ProtocolDiscoveryError::Schema(format!(
+                "interaction field {component} is not an object"
+            )));
+        };
+
+        if component == "memory_id_to_big" {
+            let big_count = interaction
+                .get("big_claimed_sums")
+                .and_then(Value::as_array)
+                .ok_or(ProtocolDiscoveryError::InvalidMemoryClaim)?
+                .len();
+            let mut big_values = Vec::with_capacity(big_count);
+            let mut total = SecureField::zero();
+            for _ in 0..big_count {
+                let value =
+                    values
+                        .next()
+                        .ok_or(ProtocolDiscoveryError::InteractionClaimValueCount {
+                            expected: consumed + 1,
+                            actual: claimed_sums.len(),
+                        })?;
+                consumed += 1;
+                total += value;
+                big_values.push(
+                    serde_json::to_value(value)
+                        .map_err(|error| ProtocolDiscoveryError::Schema(error.to_string()))?,
+                );
+            }
+            interaction.insert("big_claimed_sums".into(), Value::Array(big_values));
+            interaction.insert(
+                "claimed_sum".into(),
+                serde_json::to_value(total)
+                    .map_err(|error| ProtocolDiscoveryError::Schema(error.to_string()))?,
+            );
+
+            if let Some(Value::Object(small)) = fields.get_mut("memory_id_to_small") {
+                let value =
+                    values
+                        .next()
+                        .ok_or(ProtocolDiscoveryError::InteractionClaimValueCount {
+                            expected: consumed + 1,
+                            actual: claimed_sums.len(),
+                        })?;
+                consumed += 1;
+                small.insert(
+                    "claimed_sum".into(),
+                    serde_json::to_value(value)
+                        .map_err(|error| ProtocolDiscoveryError::Schema(error.to_string()))?,
+                );
+            }
+            continue;
+        }
+
+        let value = values
+            .next()
+            .ok_or(ProtocolDiscoveryError::InteractionClaimValueCount {
+                expected: consumed + 1,
+                actual: claimed_sums.len(),
+            })?;
+        consumed += 1;
+        interaction.insert(
+            "claimed_sum".into(),
+            serde_json::to_value(value)
+                .map_err(|error| ProtocolDiscoveryError::Schema(error.to_string()))?,
+        );
+    }
+    if consumed != claimed_sums.len() {
+        return Err(ProtocolDiscoveryError::InteractionClaimValueCount {
+            expected: consumed,
+            actual: claimed_sums.len(),
+        });
+    }
+
+    let interaction: CairoInteractionClaim = serde_json::from_value(Value::Object(fields))
+        .map_err(|error| ProtocolDiscoveryError::Schema(error.to_string()))?;
+    if interaction.flatten_interaction_claim() != claimed_sums {
+        return Err(ProtocolDiscoveryError::Schema(
+            "interaction claim did not round-trip the resident claimed sums".into(),
+        ));
+    }
+    Ok(interaction)
 }
 
 fn validate_claim_against_plan(
@@ -734,7 +982,7 @@ mod tests {
                 let discovered = discover_protocol_transcript_shape(
                     &claim,
                     &plan,
-                    &preprocessed.ids(),
+                    &preprocessed,
                     &pcs(),
                     26,
                     include_all,
@@ -768,7 +1016,36 @@ mod tests {
                     .collect::<Vec<usize>>();
                 assert_eq!(discovered.oods_sampled_value_felts, actual_count);
                 assert_eq!(discovered.sampled_value_felts_by_tree, actual_by_tree);
-                let mut coefficient_log_sizes = components.column_log_sizes();
+                assert_eq!(
+                    discovered.oods_topology.tree_column_counts,
+                    sample_points.0.iter().map(Vec::len).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    discovered
+                        .oods_topology
+                        .columns
+                        .iter()
+                        .map(|column| column.shape_points.len())
+                        .sum::<usize>(),
+                    actual_count
+                );
+                for column in &discovered.oods_topology.columns {
+                    assert_eq!(column.shape_points.len(), column.offset_points.len());
+                    for (&shape_point, &offset_point) in
+                        column.shape_points.iter().zip(&column.offset_points)
+                    {
+                        assert_eq!(
+                            SECURE_FIELD_CIRCLE_GEN + offset_point.into_ef(),
+                            shape_point
+                        );
+                    }
+                }
+                let claim_log_sizes = claim.log_sizes();
+                let mut coefficient_log_sizes = TreeVec(vec![
+                    preprocessed.log_sizes(),
+                    claim_log_sizes[0].clone(),
+                    claim_log_sizes[1].clone(),
+                ]);
                 coefficient_log_sizes.push(vec![
                     discovered.max_log_degree_bound;
                     COMPOSITION_SAMPLE_FELTS
@@ -797,22 +1074,61 @@ mod tests {
     }
 
     #[test]
-    fn discovery_rejects_a_claim_plan_presence_mismatch() {
+    fn resident_claimed_sums_round_trip_through_the_cairo_claim_schema() {
+        for n_big in [1, 3] {
+            let plan = representative_plan(n_big);
+            let claim = claim_for_plan(&plan);
+            let count = schema_zero_interaction_claim(&claim)
+                .unwrap()
+                .0
+                .flatten_interaction_claim()
+                .len();
+            let claimed_sums = (0..count)
+                .map(|index| {
+                    let word = u32::try_from(index + 1).unwrap();
+                    SecureField::from_u32_unchecked(word, word + 1, word + 2, word + 3)
+                })
+                .collect::<Vec<_>>();
+            let interaction = interaction_claim_from_flattened(&claim, &claimed_sums).unwrap();
+            assert_eq!(interaction.flatten_interaction_claim(), claimed_sums);
+
+            assert!(matches!(
+                interaction_claim_from_flattened(&claim, &claimed_sums[..count - 1]),
+                Err(ProtocolDiscoveryError::InteractionClaimValueCount { .. })
+            ));
+            let mut extra = claimed_sums.clone();
+            extra.push(SecureField::zero());
+            assert!(matches!(
+                interaction_claim_from_flattened(&claim, &extra),
+                Err(ProtocolDiscoveryError::InteractionClaimValueCount { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_a_split_memory_presence_mismatch() {
         let plan = representative_plan(1);
-        let mut claim = claim_for_plan(&plan);
-        claim.add_opcode = None;
+        let claim = claim_for_plan(&plan);
+        let Value::Object(mut fields) = serde_json::to_value(claim).unwrap() else {
+            unreachable!()
+        };
+        fields.insert("memory_id_to_small".into(), Value::Null);
+        let claim = serde_json::from_value(Value::Object(fields)).unwrap();
         assert!(matches!(
             discover_protocol_transcript_shape(
                 &claim,
                 &plan,
-                &PreProcessedTrace::canonical().ids(),
+                &PreProcessedTrace::canonical(),
                 &pcs(),
                 26,
                 false,
             ),
-            Err(ProtocolDiscoveryError::ClaimPlanPresenceMismatch(
-                "add_opcode"
-            ))
+            Err(ProtocolDiscoveryError::MemoryPartCountMismatch {
+                claim_big: 1,
+                plan_big: 1,
+                claim_small: false,
+                plan_small: true,
+            })
         ));
     }
 }

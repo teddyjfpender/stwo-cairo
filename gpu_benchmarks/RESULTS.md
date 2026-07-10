@@ -848,3 +848,24 @@ VALIDATED (SN_PIE_2, H100 sm_90, gpu-native diet):
 
 First instance of the §20.2 persistent-compact-PCS-artifact pattern (north star). SUPERVISED pcs change —
 landed locally behind the byte-identity gate; upstream merge would need PCS-owner sign-off.
+
+## 2026-07-09 — Protocol-adjacent bumps retroactively separated for review
+
+The anonymous STWO `4e5582c3` / `b36f6734` and stwo-cairo `0c86a0f6` /
+`f16a52cb` bumps mixed large architecture work with four soundness-adjacent seams.
+Their review boundaries are restored under `gpu_benchmarks/reviews/`: PCS proof-driver
+move, CUDA typed-driver default, device Blake2s transcript, and live batched tree
+decommit gather. Each package now records ground truth, supervised surface,
+invariants, counted gates, rollback, and pod admission independently.
+
+Two migration-only same-binary rollback controls now exist:
+
+- `STWO_CUDA_PCS_REFERENCE=1` selects the shared reference PCS orchestration.
+- `STWO_CUDA_DECOMMIT_GATHER_REFERENCE=1` selects per-column raw-word gathers.
+
+Strict GPU-native construction rejects both controls, so neither can silently weaken
+an architecture benchmark. The CUDA soundness runner is fail-closed on executed-test
+counts and now includes native eager/capture/CPU gates for commit, quotient, OODS,
+quotient numerator, final FRI/PoW, dynamic decommit, device transcript, composition,
+and (once compiled) relation. No local macOS run is recorded as native execution;
+these are mandatory counted gates for the next H100 admission.

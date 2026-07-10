@@ -57,7 +57,7 @@ cd gpu_benchmarks/loop
 |-----------------|------------|-------------------------------------------------------------|
 | `BENCH_POD_ID`  | (pod.conf) | Pod id, overrides `POD_ID` in `pod.conf`.                   |
 | `BENCH_ENV`     | (empty)    | `"K=V K=V ..."` exported verbatim into **every** gpu_bench invocation (gate included) and **recorded in every ledger entry**. `STWO_BOOTLOADER_JSON` is reserved; use `POD_BOOTLOADER_JSON`. |
-| `GPU_PCS_RUNTIME_MODE` | `detached-eager` | Required typed CUDA PCS runtime mode for every CUDA gate and performance run. `arena-graph` is accepted as a strict future requirement, but rejects today's detached runtime; it does not claim graph capture exists. |
+| `GPU_PCS_RUNTIME_MODE` | `arena-graph` | Required typed CUDA PCS runtime mode for every CUDA gate and performance run. `detached-eager` remains migration diagnostics only. |
 | `DRY_RUN=1`     | `0`        | Echo every ssh/rsync instead of executing, and fabricate run output so the provenance → ledger → summary path still runs for real. Use to trace logic offline. |
 | `FAKE_STALL`    | (unset)    | (DRY_RUN only) name of a run to simulate as stalled — exercises the stall → evidence → ledger → abort path. |
 | `POLL_INTERVAL` | `15`       | Seconds between pod poll checks.                            |
@@ -115,7 +115,7 @@ Every ledger entry records, at the moment of the run:
 
 - `stwo_rev`, `cairo_rev` — `git rev-parse HEAD` of each repo.
 - `stwo_dirty`, `cairo_dirty` — `"clean"` if the working tree matches HEAD, otherwise
-  the first 16 hex of `sha256(git diff HEAD)`. This makes a run reproducible **even with
+  the first 16 hex of a hash over tracked changes and untracked path/content. This makes a run reproducible **even with
   uncommitted work**: the same rev + same dirty hash == the same source. A changed
   number with an unchanged (rev, dirty) pair on the same pod is a real signal; a changed
   dirty hash tells you the source moved.
@@ -128,10 +128,16 @@ Every ledger entry records, at the moment of the run:
   span breakdown. Fleet runs additionally carry a `pipeline` object (sustained numbers).
 - `status` — `ok`, `gate_failed`, `run_failed`, or `stalled` (with `stall_evidence`).
 
-**Caveat:** `git diff` does not capture *untracked* files. Add new files to the index
-(`git add -N`) if you need them reflected in the dirty hash.
+The dirty hash includes tracked changes plus untracked paths and file contents, so
+new generated CUDA sources are bound without modifying the local Git index.
 
 ## The gate-first rule
+
+Before the PIE correctness gate, a counted native CUDA suite must pass for the
+requested runtime. `detached-eager` requires every live and prepared-operation
+conformance target; `arena-graph` additionally requires strict resident
+whole-proof byte identity. A detached benchmark therefore cannot hide a live-path
+CUDA failure, while an unfinished resident graph cannot masquerade as admitted.
 
 The correctness gate (configured PIE, two gpu-native CUDA proofs, verify, required
 proof-byte equality, and typed PCS architecture) always runs before any

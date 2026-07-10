@@ -23,6 +23,10 @@ use crate::witness::fast_deduction::blake::{PackedBlakeG, PackedBlakeRoundSigma}
 use crate::witness::fast_deduction::pedersen::{
     PackedPartialEcMulWindowBits18, PackedPedersenPointsTableWindowBits18,
 };
+use crate::witness::fast_deduction::poseidon::{
+    PackedCube252, PackedPoseidon3PartialRoundsChain, PackedPoseidonFullRoundChain,
+    PackedPoseidonRoundKeys,
+};
 use crate::witness::prelude::*;
 use crate::witness::witness_eval::{WitnessEval, FELT_N_LIMBS, SLOT_AP, SLOT_FP, SLOT_PC};
 
@@ -326,6 +330,9 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
             simd: a.simd * b.simd,
         }
     }
+    fn u32_xor(&mut self, a: PackedUInt32, b: PackedUInt32) -> PackedUInt32 {
+        a ^ b
+    }
     fn u32_and_imm(&mut self, a: PackedUInt32, mask: u32) -> PackedUInt32 {
         a & PackedUInt32::broadcast(UInt32::from(mask))
     }
@@ -373,6 +380,56 @@ impl<const N: usize> WitnessEval for SimdWitnessEval<'_, '_, N> {
     #[inline(always)]
     fn deduce_blake_round_sigma(&mut self, round: PackedM31) -> [PackedM31; 16] {
         PackedBlakeRoundSigma::deduce_output(round)
+    }
+
+    #[inline(always)]
+    fn deduce_poseidon_round_keys(&mut self, round: PackedM31) -> [[PackedM31; 10]; 3] {
+        PackedPoseidonRoundKeys::deduce_output([round])
+            .map(|felt| std::array::from_fn(|word| felt.get_m31(word)))
+    }
+
+    #[inline(always)]
+    fn deduce_cube_252(&mut self, input: [PackedM31; 10]) -> [PackedM31; 10] {
+        let output = PackedCube252::deduce_output(PackedFelt252Width27::from_limbs(input));
+        std::array::from_fn(|word| output.get_m31(word))
+    }
+
+    #[inline(always)]
+    fn deduce_poseidon_full_round_chain(
+        &mut self,
+        chain: PackedM31,
+        round: PackedM31,
+        state: [[PackedM31; 10]; 3],
+    ) -> (PackedM31, PackedM31, [[PackedM31; 10]; 3]) {
+        let (chain, round, state) = PackedPoseidonFullRoundChain::deduce_output((
+            chain,
+            round,
+            state.map(PackedFelt252Width27::from_limbs),
+        ));
+        (
+            chain,
+            round,
+            state.map(|felt| std::array::from_fn(|word| felt.get_m31(word))),
+        )
+    }
+
+    #[inline(always)]
+    fn deduce_poseidon_3_partial_rounds_chain(
+        &mut self,
+        chain: PackedM31,
+        round: PackedM31,
+        state: [[PackedM31; 10]; 4],
+    ) -> (PackedM31, PackedM31, [[PackedM31; 10]; 4]) {
+        let (chain, round, state) = PackedPoseidon3PartialRoundsChain::deduce_output((
+            chain,
+            round,
+            state.map(PackedFelt252Width27::from_limbs),
+        ));
+        (
+            chain,
+            round,
+            state.map(|felt| std::array::from_fn(|word| felt.get_m31(word))),
+        )
     }
 
     // ---- Effects ---------------------------------------------------------------

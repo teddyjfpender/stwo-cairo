@@ -30,11 +30,14 @@ use crate::witness::blake_round_witness_backend::BlakeRoundWitness;
 use crate::witness::components::*;
 use crate::witness::exec_context::WitnessExecContext; // witness_exec_context_codegen
 use crate::witness::jit_prove_backend::{
-    AddOpcodeLane, AddOpcodeSmallLane, AssertEqOpcodeDoubleDerefLane, AssertEqOpcodeImmLane,
-    AssertEqOpcodeLane, BlakeRoundLane, CallOpcodeAbsLane, CallOpcodeRelImmLane, Cube252Lane,
-    Cube252Witness, JnzOpcodeNonTakenLane, JnzOpcodeTakenLane, JumpOpcodeAbsLane,
-    JumpOpcodeDoubleDerefLane, JumpOpcodeRelImmLane, JumpOpcodeRelLane, OpcodeJitBackend,
-    PartialEcMulGenericLane, PartialEcMulW18Lane, PedersenAggregatorW18Lane, RetOpcodeLane,
+    AddApOpcodeLane, AddOpcodeLane, AddOpcodeSmallLane, AssertEqOpcodeDoubleDerefLane,
+    AssertEqOpcodeImmLane, AssertEqOpcodeLane, BlakeCompressOpcodeLane, BlakeRoundLane,
+    CallOpcodeAbsLane, CallOpcodeRelImmLane, Cube252Lane, Cube252Witness, JnzOpcodeNonTakenLane,
+    JnzOpcodeTakenLane, JumpOpcodeAbsLane, JumpOpcodeDoubleDerefLane, JumpOpcodeRelImmLane,
+    JumpOpcodeRelLane, MulOpcodeLane, MulOpcodeSmallLane, OpcodeJitBackend,
+    PartialEcMulGenericLane, PartialEcMulW18Lane, PedersenAggregatorW18Lane,
+    RangeCheck252Width27Lane, RecordedFlatWitness, RetOpcodeLane, TripleXor32Lane,
+    VerifyInstructionLane,
 };
 use crate::witness::memory_witness_backend::MemoryIdToBigWitness;
 use crate::witness::pedersen_witness_backend::{
@@ -46,8 +49,8 @@ use crate::witness::pedersen_witness_backend::{
 pub struct CairoClaimGenerator {
     pub public_data: PublicData,
     pub add_opcode: Option<add_opcode::ClaimGenerator>,
-    /// Adapter memory retained for the JIT-witness prove lane (set in
-    /// `fill_components` when `STWO_CUDA_WITNESS_JIT_PROVE=1`; None otherwise).
+    /// Adapter memory retained for prepared resident witness planning. This Arc
+    /// is also the legacy JIT lane's execution-table source when that lane is on.
     pub jit_memory: Option<Arc<Memory>>,
     pub add_opcode_small: Option<add_opcode_small::ClaimGenerator>,
     pub add_ap_opcode: Option<add_ap_opcode::ClaimGenerator>,
@@ -131,12 +134,10 @@ impl CairoClaimGenerator {
         memory: Arc<Memory>,
         preprocessed_trace: Arc<PreProcessedTrace>,
     ) {
-        // Retain the adapter memory for the JIT-witness prove lane (device execution
-        // tables are built from it at write_trace time). Opt-in only — the Arc is
-        // cheap, but keeping the reference alive past adapt is a deliberate choice.
-        if std::env::var("STWO_CUDA_WITNESS_JIT_PROVE").as_deref() == Ok("1") {
-            self.jit_memory = Some(memory.clone());
-        }
+        // Prepared resident planning happens before any legacy writer or env-gated
+        // lane executes, so retain the immutable adapter memory unconditionally.
+        // This is one Arc; SIMD execution is otherwise unchanged.
+        self.jit_memory = Some(memory.clone());
         let Self {
             jit_memory: _,
             add_opcode: add_opcode_ref,
@@ -760,6 +761,7 @@ impl CairoClaimGenerator {
         B: MemoryIdToBigWitness
             + BlakeGWitness
             + OpcodeJitBackend
+            + RecordedFlatWitness
             + BlakeRoundWitness
             + crate::witness::jit_prove_backend::Cube252Witness
             + PartialEcMulGenericWitness
@@ -846,18 +848,27 @@ impl CairoClaimGenerator {
                 });
             }
             if let Some(gen) = self.add_ap_opcode {
-                s.spawn(|_| {
-                    add_ap_opcode_result = Some({
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let rc18_state = self.range_check_18.as_ref().unwrap();
+                let rc11_state = self.range_check_11.as_ref().unwrap();
+                let result_slot = &mut add_ap_opcode_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
                         let _wt = tracing::info_span!("wt:add_ap_opcode").entered();
                         exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                            self.memory_address_to_id.as_ref().unwrap(),
-                            self.memory_id_to_big.as_ref().unwrap(),
-                            self.verify_instruction.as_ref().unwrap(),
-                            self.range_check_18.as_ref().unwrap(),
-                            self.range_check_11.as_ref().unwrap(),
-                        );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                        <B as RecordedFlatWitness>::write_add_ap_opcode(
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            rc18_state,
+                            rc11_state,
+                            jit_memory,
+                        )
                     });
                 });
             }
@@ -925,20 +936,31 @@ impl CairoClaimGenerator {
                 });
             }
             if let Some(gen) = self.blake_compress_opcode {
-                s.spawn(|_| {
-                    blake_compress_opcode_result = Some({
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let rc725_state = self.range_check_7_2_5.as_ref().unwrap();
+                let xor8_state = self.verify_bitwise_xor_8.as_ref().unwrap();
+                let round_state = self.blake_round.as_ref().unwrap();
+                let triple_xor_state = self.triple_xor_32.as_ref().unwrap();
+                let result_slot = &mut blake_compress_opcode_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
                         let _wt = tracing::info_span!("wt:blake_compress_opcode").entered();
                         exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                            self.memory_address_to_id.as_ref().unwrap(),
-                            self.memory_id_to_big.as_ref().unwrap(),
-                            self.verify_instruction.as_ref().unwrap(),
-                            self.range_check_7_2_5.as_ref().unwrap(),
-                            self.verify_bitwise_xor_8.as_ref().unwrap(),
-                            self.blake_round.as_ref().unwrap(),
-                            self.triple_xor_32.as_ref().unwrap(),
-                        );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                        <B as RecordedFlatWitness>::write_blake_compress_opcode(
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            rc725_state,
+                            xor8_state,
+                            round_state,
+                            triple_xor_state,
+                            jit_memory,
+                        )
                     });
                 });
             }
@@ -1129,32 +1151,48 @@ impl CairoClaimGenerator {
                 });
             }
             if let Some(gen) = self.mul_opcode {
-                s.spawn(|_| {
-                    mul_opcode_result = Some({
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let rc20_state = self.range_check_20.as_ref().unwrap();
+                let result_slot = &mut mul_opcode_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
                         let _wt = tracing::info_span!("wt:mul_opcode").entered();
                         exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                            self.memory_address_to_id.as_ref().unwrap(),
-                            self.memory_id_to_big.as_ref().unwrap(),
-                            self.verify_instruction.as_ref().unwrap(),
-                            self.range_check_20.as_ref().unwrap(),
-                        );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                        <B as RecordedFlatWitness>::write_mul_opcode(
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            rc20_state,
+                            jit_memory,
+                        )
                     });
                 });
             }
             if let Some(gen) = self.mul_opcode_small {
-                s.spawn(|_| {
-                    mul_opcode_small_result = Some({
+                let jit_memory = self.jit_memory.as_ref();
+                let addr_state = self.memory_address_to_id.as_ref().unwrap();
+                let id_state = self.memory_id_to_big.as_ref().unwrap();
+                let vi_state = self.verify_instruction.as_ref().unwrap();
+                let rc11_state = self.range_check_11.as_ref().unwrap();
+                let result_slot = &mut mul_opcode_small_result;
+                s.spawn(move |_| {
+                    *result_slot = Some({
                         let _wt = tracing::info_span!("wt:mul_opcode_small").entered();
                         exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
-                        let (trace, claim, interaction_gen) = gen.write_trace(
-                            self.memory_address_to_id.as_ref().unwrap(),
-                            self.memory_id_to_big.as_ref().unwrap(),
-                            self.verify_instruction.as_ref().unwrap(),
-                            self.range_check_11.as_ref().unwrap(),
-                        );
-                        (B::from_simd_evals(trace.to_evals()), claim, interaction_gen)
+                        <B as RecordedFlatWitness>::write_mul_opcode_small(
+                            exec_context,
+                            gen,
+                            addr_state,
+                            id_state,
+                            vi_state,
+                            rc11_state,
+                            jit_memory,
+                        )
                     });
                 });
             }
@@ -1522,17 +1560,17 @@ impl CairoClaimGenerator {
                 s.spawn(move |_| {
                     let _wt = tracing::info_span!("wt:verify_instruction").entered();
                     exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
-                    let (trace, claim, interaction_gen) = gen.write_trace(
-                        rc_7_2_5.unwrap(),
-                        rc_4_3.unwrap(),
-                        addr_state.unwrap(),
-                        id_state.unwrap(),
-                    );
-                    *slot = Some((
-                        send_or_keep(L_VI, B::from_simd_evals(trace.to_evals()), &tx),
-                        claim,
-                        interaction_gen,
-                    ));
+                    let (trace, claim, interaction_gen) =
+                        <B as RecordedFlatWitness>::write_verify_instruction(
+                            exec_context,
+                            gen,
+                            rc_7_2_5.unwrap(),
+                            rc_4_3.unwrap(),
+                            addr_state.unwrap(),
+                            id_state.unwrap(),
+                            jit_memory,
+                        );
+                    *slot = Some((send_or_keep(L_VI, trace, &tx), claim, interaction_gen));
                 });
             }
 
@@ -1597,9 +1635,15 @@ impl CairoClaimGenerator {
                     if let Some(gen) = triple_xor_32_gen {
                         let _wt = tracing::info_span!("wt:triple_xor_32").entered();
                         exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
-                        let (trace, claim, interaction_gen) = gen.write_trace(vbx_8.unwrap());
+                        let (trace, claim, interaction_gen) =
+                            <B as RecordedFlatWitness>::write_triple_xor_32(
+                                exec_context,
+                                gen,
+                                vbx_8.unwrap(),
+                                jit_memory,
+                            );
                         *txor_slot = Some((
-                            send_or_keep(L_TRIPLE_XOR, B::from_simd_evals(trace.to_evals()), &tx),
+                            send_or_keep(L_TRIPLE_XOR, trace, &tx),
                             claim,
                             interaction_gen,
                         ));
@@ -1973,12 +2017,15 @@ impl CairoClaimGenerator {
                         let _wt = tracing::info_span!("wt:range_check_252_width_27").entered();
                         exec_context.record_final_component(&gen, opt_n_id_to_big_components); // final_shape_ledger_codegen
                         let (trace, claim, interaction_gen) =
-                            gen.write_trace(rc_9_9.unwrap(), rc_18.unwrap());
-                        *rc252_slot = Some((
-                            send_or_keep(L_RC252, B::from_simd_evals(trace.to_evals()), &tx),
-                            claim,
-                            interaction_gen,
-                        ));
+                            <B as RecordedFlatWitness>::write_range_check_252_width_27(
+                                exec_context,
+                                gen,
+                                rc_9_9.unwrap(),
+                                rc_18.unwrap(),
+                                jit_memory,
+                            );
+                        *rc252_slot =
+                            Some((send_or_keep(L_RC252, trace, &tx), claim, interaction_gen));
                     }
                 });
             }
@@ -2074,6 +2121,7 @@ impl CairoClaimGenerator {
                 // rc_9_9 counts BEFORE range_check_9_9 writes its trace below.
                 let (big_traces, small_trace, claim, interaction_gen) =
                     <B as MemoryIdToBigWitness>::write_trace(
+                        exec_context,
                         gen,
                         self.range_check_9_9.as_ref().unwrap(),
                         LOG_MAX_BIG_SIZE,
@@ -2529,220 +2577,132 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness> CairoInteractionClaimGenerator<B> 
 
         let mut sources = Vec::new();
         if let Some(gen) = self.add_opcode {
-            sources.extend(gen.export_relation_lookup_sources(
-                "add_opcode",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("add_opcode", exec_context)?);
         }
         if let Some(gen) = self.add_opcode_small {
-            sources.extend(gen.export_relation_lookup_sources(
-                "add_opcode_small",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("add_opcode_small", exec_context)?);
         }
         if let Some(gen) = self.add_ap_opcode {
-            sources.extend(gen.export_relation_lookup_sources(
-                "add_ap_opcode",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("add_ap_opcode", exec_context)?);
         }
         if let Some(gen) = self.assert_eq_opcode {
-            sources.extend(gen.export_relation_lookup_sources(
-                "assert_eq_opcode",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("assert_eq_opcode", exec_context)?);
         }
         if let Some(gen) = self.assert_eq_opcode_imm {
-            sources.extend(gen.export_relation_lookup_sources(
-                "assert_eq_opcode_imm",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("assert_eq_opcode_imm", exec_context)?);
         }
         if let Some(gen) = self.assert_eq_opcode_double_deref {
-            sources.extend(gen.export_relation_lookup_sources(
-                "assert_eq_opcode_double_deref",
-                exec_context,
-            )?);
+            sources.extend(
+                gen.export_relation_lookup_sources("assert_eq_opcode_double_deref", exec_context)?,
+            );
         }
         if let Some(gen) = self.blake_compress_opcode {
-            sources.extend(gen.export_relation_lookup_sources(
-                "blake_compress_opcode",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("blake_compress_opcode", exec_context)?);
         }
         if let Some(gen) = self.call_opcode_abs {
-            sources.extend(gen.export_relation_lookup_sources(
-                "call_opcode_abs",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("call_opcode_abs", exec_context)?);
         }
         if let Some(gen) = self.call_opcode_rel_imm {
-            sources.extend(gen.export_relation_lookup_sources(
-                "call_opcode_rel_imm",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("call_opcode_rel_imm", exec_context)?);
         }
         if let Some(gen) = self.generic_opcode {
-            sources.extend(gen.export_relation_lookup_sources(
-                "generic_opcode",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("generic_opcode", exec_context)?);
         }
         if let Some(gen) = self.jnz_opcode_non_taken {
-            sources.extend(gen.export_relation_lookup_sources(
-                "jnz_opcode_non_taken",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("jnz_opcode_non_taken", exec_context)?);
         }
         if let Some(gen) = self.jnz_opcode_taken {
-            sources.extend(gen.export_relation_lookup_sources(
-                "jnz_opcode_taken",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("jnz_opcode_taken", exec_context)?);
         }
         if let Some(gen) = self.jump_opcode_abs {
-            sources.extend(gen.export_relation_lookup_sources(
-                "jump_opcode_abs",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("jump_opcode_abs", exec_context)?);
         }
         if let Some(gen) = self.jump_opcode_double_deref {
-            sources.extend(gen.export_relation_lookup_sources(
-                "jump_opcode_double_deref",
-                exec_context,
-            )?);
+            sources.extend(
+                gen.export_relation_lookup_sources("jump_opcode_double_deref", exec_context)?,
+            );
         }
         if let Some(gen) = self.jump_opcode_rel {
-            sources.extend(gen.export_relation_lookup_sources(
-                "jump_opcode_rel",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("jump_opcode_rel", exec_context)?);
         }
         if let Some(gen) = self.jump_opcode_rel_imm {
-            sources.extend(gen.export_relation_lookup_sources(
-                "jump_opcode_rel_imm",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("jump_opcode_rel_imm", exec_context)?);
         }
         if let Some(gen) = self.mul_opcode {
-            sources.extend(gen.export_relation_lookup_sources(
-                "mul_opcode",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("mul_opcode", exec_context)?);
         }
         if let Some(gen) = self.mul_opcode_small {
-            sources.extend(gen.export_relation_lookup_sources(
-                "mul_opcode_small",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("mul_opcode_small", exec_context)?);
         }
         if let Some(gen) = self.qm_31_add_mul_opcode {
-            sources.extend(gen.export_relation_lookup_sources(
-                "qm_31_add_mul_opcode",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("qm_31_add_mul_opcode", exec_context)?);
         }
         if let Some(gen) = self.ret_opcode {
-            sources.extend(gen.export_relation_lookup_sources(
-                "ret_opcode",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("ret_opcode", exec_context)?);
         }
         if let Some(gen) = self.verify_instruction {
-            sources.extend(gen.export_relation_lookup_sources(
-                "verify_instruction",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("verify_instruction", exec_context)?);
         }
         if let Some(gen) = self.blake_round {
-            sources.extend(gen.export_relation_lookup_sources(
-                "blake_round",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("blake_round", exec_context)?);
         }
         if let Some(gen) = self.blake_g {
-            sources.extend(gen.export_relation_lookup_sources(
-                "blake_g",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("blake_g", exec_context)?);
         }
         if let Some(gen) = self.blake_round_sigma {
-            sources.extend(gen.export_relation_lookup_sources(
-                "blake_round_sigma",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("blake_round_sigma", exec_context)?);
         }
         if let Some(gen) = self.triple_xor_32 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "triple_xor_32",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("triple_xor_32", exec_context)?);
         }
         if let Some(gen) = self.verify_bitwise_xor_12 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "verify_bitwise_xor_12",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("verify_bitwise_xor_12", exec_context)?);
         }
         if let Some(gen) = self.add_mod_builtin {
-            sources.extend(gen.export_relation_lookup_sources(
-                "add_mod_builtin",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("add_mod_builtin", exec_context)?);
         }
         if let Some(gen) = self.bitwise_builtin {
-            sources.extend(gen.export_relation_lookup_sources(
-                "bitwise_builtin",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("bitwise_builtin", exec_context)?);
         }
         if let Some(gen) = self.mul_mod_builtin {
-            sources.extend(gen.export_relation_lookup_sources(
-                "mul_mod_builtin",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("mul_mod_builtin", exec_context)?);
         }
         if let Some(gen) = self.pedersen_builtin {
-            sources.extend(gen.export_relation_lookup_sources(
-                "pedersen_builtin",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("pedersen_builtin", exec_context)?);
         }
         if let Some(gen) = self.pedersen_builtin_narrow_windows {
-            sources.extend(gen.export_relation_lookup_sources(
-                "pedersen_builtin_narrow_windows",
-                exec_context,
-            )?);
+            sources.extend(
+                gen.export_relation_lookup_sources(
+                    "pedersen_builtin_narrow_windows",
+                    exec_context,
+                )?,
+            );
         }
         if let Some(gen) = self.poseidon_builtin {
-            sources.extend(gen.export_relation_lookup_sources(
-                "poseidon_builtin",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("poseidon_builtin", exec_context)?);
         }
         if let Some(gen) = self.range_check96_builtin {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check96_builtin",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("range_check96_builtin", exec_context)?);
         }
         if let Some(gen) = self.range_check_builtin {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_builtin",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("range_check_builtin", exec_context)?);
         }
         if let Some(gen) = self.ec_op_builtin {
-            sources.extend(gen.export_relation_lookup_sources(
-                "ec_op_builtin",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("ec_op_builtin", exec_context)?);
         }
         if let Some(gen) = self.partial_ec_mul_generic {
-            sources.extend(gen.export_relation_lookup_sources(
-                "partial_ec_mul_generic",
-                exec_context,
-            )?);
+            sources.extend(
+                gen.export_relation_lookup_sources("partial_ec_mul_generic", exec_context)?,
+            );
         }
         if let Some(gen) = self.pedersen_aggregator_window_bits_18 {
             sources.extend(gen.export_relation_lookup_sources(
@@ -2751,10 +2711,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness> CairoInteractionClaimGenerator<B> 
             )?);
         }
         if let Some(gen) = self.partial_ec_mul_window_bits_18 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "partial_ec_mul_window_bits_18",
-                exec_context,
-            )?);
+            sources.extend(
+                gen.export_relation_lookup_sources("partial_ec_mul_window_bits_18", exec_context)?,
+            );
         }
         if let Some(gen) = self.pedersen_points_table_window_bits_18 {
             sources.extend(gen.export_relation_lookup_sources(
@@ -2769,10 +2728,9 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness> CairoInteractionClaimGenerator<B> 
             )?);
         }
         if let Some(gen) = self.partial_ec_mul_window_bits_9 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "partial_ec_mul_window_bits_9",
-                exec_context,
-            )?);
+            sources.extend(
+                gen.export_relation_lookup_sources("partial_ec_mul_window_bits_9", exec_context)?,
+            );
         }
         if let Some(gen) = self.pedersen_points_table_window_bits_9 {
             sources.extend(gen.export_relation_lookup_sources(
@@ -2781,154 +2739,98 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness> CairoInteractionClaimGenerator<B> 
             )?);
         }
         if let Some(gen) = self.poseidon_aggregator {
-            sources.extend(gen.export_relation_lookup_sources(
-                "poseidon_aggregator",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("poseidon_aggregator", exec_context)?);
         }
         if let Some(gen) = self.poseidon_3_partial_rounds_chain {
-            sources.extend(gen.export_relation_lookup_sources(
-                "poseidon_3_partial_rounds_chain",
-                exec_context,
-            )?);
+            sources.extend(
+                gen.export_relation_lookup_sources(
+                    "poseidon_3_partial_rounds_chain",
+                    exec_context,
+                )?,
+            );
         }
         if let Some(gen) = self.poseidon_full_round_chain {
-            sources.extend(gen.export_relation_lookup_sources(
-                "poseidon_full_round_chain",
-                exec_context,
-            )?);
+            sources.extend(
+                gen.export_relation_lookup_sources("poseidon_full_round_chain", exec_context)?,
+            );
         }
         if let Some(gen) = self.cube_252 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "cube_252",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("cube_252", exec_context)?);
         }
         if let Some(gen) = self.poseidon_round_keys {
-            sources.extend(gen.export_relation_lookup_sources(
-                "poseidon_round_keys",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("poseidon_round_keys", exec_context)?);
         }
         if let Some(gen) = self.range_check_252_width_27 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_252_width_27",
-                exec_context,
-            )?);
+            sources.extend(
+                gen.export_relation_lookup_sources("range_check_252_width_27", exec_context)?,
+            );
         }
         if let Some(gen) = self.memory_address_to_id {
-            sources.extend(gen.export_relation_lookup_sources(
-                "memory_address_to_id",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("memory_address_to_id", exec_context)?);
         }
         if let Some(gen) = self.memory_id_to_big {
-            sources.extend(gen.export_relation_lookup_sources(
-                "memory_id_to_big",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("memory_id_to_big", exec_context)?);
         }
         if let Some(gen) = self.range_check_6 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_6",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("range_check_6", exec_context)?);
         }
         if let Some(gen) = self.range_check_8 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_8",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("range_check_8", exec_context)?);
         }
         if let Some(gen) = self.range_check_11 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_11",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("range_check_11", exec_context)?);
         }
         if let Some(gen) = self.range_check_12 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_12",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("range_check_12", exec_context)?);
         }
         if let Some(gen) = self.range_check_18 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_18",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("range_check_18", exec_context)?);
         }
         if let Some(gen) = self.range_check_20 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_20",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("range_check_20", exec_context)?);
         }
         if let Some(gen) = self.range_check_4_3 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_4_3",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("range_check_4_3", exec_context)?);
         }
         if let Some(gen) = self.range_check_4_4 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_4_4",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("range_check_4_4", exec_context)?);
         }
         if let Some(gen) = self.range_check_9_9 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_9_9",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("range_check_9_9", exec_context)?);
         }
         if let Some(gen) = self.range_check_7_2_5 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_7_2_5",
-                exec_context,
-            )?);
+            sources.extend(gen.export_relation_lookup_sources("range_check_7_2_5", exec_context)?);
         }
         if let Some(gen) = self.range_check_3_6_6_3 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_3_6_6_3",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("range_check_3_6_6_3", exec_context)?);
         }
         if let Some(gen) = self.range_check_4_4_4_4 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_4_4_4_4",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("range_check_4_4_4_4", exec_context)?);
         }
         if let Some(gen) = self.range_check_3_3_3_3_3 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "range_check_3_3_3_3_3",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("range_check_3_3_3_3_3", exec_context)?);
         }
         if let Some(gen) = self.verify_bitwise_xor_4 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "verify_bitwise_xor_4",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("verify_bitwise_xor_4", exec_context)?);
         }
         if let Some(gen) = self.verify_bitwise_xor_7 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "verify_bitwise_xor_7",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("verify_bitwise_xor_7", exec_context)?);
         }
         if let Some(gen) = self.verify_bitwise_xor_8 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "verify_bitwise_xor_8",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("verify_bitwise_xor_8", exec_context)?);
         }
         if let Some(gen) = self.verify_bitwise_xor_9 {
-            sources.extend(gen.export_relation_lookup_sources(
-                "verify_bitwise_xor_9",
-                exec_context,
-            )?);
+            sources
+                .extend(gen.export_relation_lookup_sources("verify_bitwise_xor_9", exec_context)?);
         }
         exec_context.assert_interaction_drained();
         crate::witness::relation_sources::CairoRelationSourceSet::new(sources)
@@ -3047,10 +2949,16 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.add_ap_opcode {
-                s.spawn(|_| {
-                    add_ap_opcode_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<AddApOpcodeLane>(
+                    exec_context,
+                ) {
+                    drop(gen);
+                } else {
+                    s.spawn(|_| {
+                        add_ap_opcode_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.assert_eq_opcode {
                 if <B as OpcodeJitBackend>::device_interaction_pending::<AssertEqOpcodeLane>(
@@ -3090,10 +2998,17 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.blake_compress_opcode {
-                s.spawn(|_| {
-                    blake_compress_opcode_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<
+                    BlakeCompressOpcodeLane,
+                >(exec_context)
+                {
+                    drop(gen); // device path owns this component's interaction
+                } else {
+                    s.spawn(|_| {
+                        blake_compress_opcode_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.call_opcode_abs {
                 if <B as OpcodeJitBackend>::device_interaction_pending::<CallOpcodeAbsLane>(
@@ -3198,15 +3113,28 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.mul_opcode {
-                s.spawn(|_| {
-                    mul_opcode_result = Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<MulOpcodeLane>(
+                    exec_context,
+                ) {
+                    drop(gen);
+                } else {
+                    s.spawn(|_| {
+                        mul_opcode_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.mul_opcode_small {
-                s.spawn(|_| {
-                    mul_opcode_small_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<MulOpcodeSmallLane>(
+                    exec_context,
+                ) {
+                    drop(gen);
+                } else {
+                    s.spawn(|_| {
+                        mul_opcode_small_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.qm_31_add_mul_opcode {
                 s.spawn(|_| {
@@ -3227,10 +3155,17 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 }
             }
             if let Some(gen) = self.verify_instruction {
-                s.spawn(|_| {
-                    verify_instruction_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<
+                    VerifyInstructionLane,
+                >(exec_context)
+                {
+                    drop(gen);
+                } else {
+                    s.spawn(|_| {
+                        verify_instruction_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.blake_round {
                 if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<BlakeRoundLane>(
@@ -3259,10 +3194,16 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.triple_xor_32 {
-                s.spawn(|_| {
-                    triple_xor_32_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<TripleXor32Lane>(
+                    exec_context,
+                ) {
+                    drop(gen);
+                } else {
+                    s.spawn(|_| {
+                        triple_xor_32_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.verify_bitwise_xor_12 {
                 s.spawn(|_| {
@@ -3422,10 +3363,17 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 });
             }
             if let Some(gen) = self.range_check_252_width_27 {
-                s.spawn(|_| {
-                    range_check_252_width_27_result =
-                        Some(gen.write_interaction_trace(common_lookup_elements));
-                });
+                if <B as OpcodeJitBackend>::builtin_device_interaction_pending::<
+                    RangeCheck252Width27Lane,
+                >(exec_context)
+                {
+                    drop(gen);
+                } else {
+                    s.spawn(|_| {
+                        range_check_252_width_27_result =
+                            Some(gen.write_interaction_trace(common_lookup_elements));
+                    });
+                }
             }
             if let Some(gen) = self.memory_address_to_id {
                 s.spawn(|_| {
@@ -3573,11 +3521,20 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 build_claim(claimed_sum)
             })
         };
-        let add_ap_opcode_interaction_claim = add_ap_opcode_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+        let add_ap_opcode_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<AddApOpcodeLane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
             evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+            Some(cairo_air::components::add_ap_opcode::InteractionClaim { claimed_sum })
+        } else {
+            add_ap_opcode_result.map(|(raw, build_claim)| {
+                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            })
+        };
         let assert_eq_opcode_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<AssertEqOpcodeLane>(
                 exec_context,
@@ -3624,12 +3581,20 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 build_claim(claimed_sum)
             })
         };
-        let blake_compress_opcode_interaction_claim =
+        let blake_compress_opcode_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<BlakeCompressOpcodeLane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::blake_compress_opcode::InteractionClaim { claimed_sum })
+        } else {
             blake_compress_opcode_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
+            })
+        };
         let call_opcode_abs_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::device_interaction::<CallOpcodeAbsLane>(
                 exec_context,
@@ -3747,17 +3712,34 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 build_claim(claimed_sum)
             })
         };
-        let mul_opcode_interaction_claim = mul_opcode_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+        let mul_opcode_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<MulOpcodeLane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
             evals.extend(trace);
-            build_claim(claimed_sum)
-        });
-        let mul_opcode_small_interaction_claim =
+            Some(cairo_air::components::mul_opcode::InteractionClaim { claimed_sum })
+        } else {
+            mul_opcode_result.map(|(raw, build_claim)| {
+                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            })
+        };
+        let mul_opcode_small_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<MulOpcodeSmallLane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::mul_opcode_small::InteractionClaim { claimed_sum })
+        } else {
             mul_opcode_small_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
+            })
+        };
         let qm_31_add_mul_opcode_interaction_claim =
             qm_31_add_mul_opcode_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -3778,12 +3760,20 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 build_claim(claimed_sum)
             })
         };
-        let verify_instruction_interaction_claim =
+        let verify_instruction_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<VerifyInstructionLane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::verify_instruction::InteractionClaim { claimed_sum })
+        } else {
             verify_instruction_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
+            })
+        };
         let blake_round_interaction_claim = if let Some((trace, claimed_sum)) =
             <B as OpcodeJitBackend>::builtin_device_interaction::<BlakeRoundLane>(
                 exec_context,
@@ -3808,11 +3798,20 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let triple_xor_32_interaction_claim = triple_xor_32_result.map(|(raw, build_claim)| {
-            let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+        let triple_xor_32_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<TripleXor32Lane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
             evals.extend(trace);
-            build_claim(claimed_sum)
-        });
+            Some(cairo_air::components::triple_xor_32::InteractionClaim { claimed_sum })
+        } else {
+            triple_xor_32_result.map(|(raw, build_claim)| {
+                let (trace, claimed_sum) = B::finalize_raw_logup(raw);
+                evals.extend(trace);
+                build_claim(claimed_sum)
+            })
+        };
         let verify_bitwise_xor_12_interaction_claim =
             verify_bitwise_xor_12_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
@@ -3984,12 +3983,20 @@ impl<B: MemoryIdToBigWitness + BlakeGWitness + OpcodeJitBackend> CairoInteractio
                 evals.extend(trace);
                 build_claim(claimed_sum)
             });
-        let range_check_252_width_27_interaction_claim =
+        let range_check_252_width_27_interaction_claim = if let Some((trace, claimed_sum)) =
+            <B as OpcodeJitBackend>::builtin_device_interaction::<RangeCheck252Width27Lane>(
+                exec_context,
+                common_lookup_elements,
+            ) {
+            evals.extend(trace);
+            Some(cairo_air::components::range_check_252_width_27::InteractionClaim { claimed_sum })
+        } else {
             range_check_252_width_27_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);
                 evals.extend(trace);
                 build_claim(claimed_sum)
-            });
+            })
+        };
         let memory_address_to_id_interaction_claim =
             memory_address_to_id_result.map(|(raw, build_claim)| {
                 let (trace, claimed_sum) = B::finalize_raw_logup(raw);

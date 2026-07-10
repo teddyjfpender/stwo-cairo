@@ -17,7 +17,8 @@
 //! statement constants into parameters, so any statement emits the same
 //! kernels; a component absent from every fixture FAILS the run (loud gap).
 //!
-//! Usage: kernel_emit [--stwo-root <path>] [--max-instrs N] [--check]
+//! Usage: kernel_emit [--stwo-root <path>] [--max-instrs N]
+//!                    [--input-bincode <adapted-input>]... [--check]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -30,16 +31,22 @@ use cairo_vm::types::layout_name::LayoutName;
 use stwo::core::channel::Blake2sChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo_backend_cuda::aot;
+use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
 use stwo_cairo_gpu_prover::{phases, state};
 use stwo_cairo_prover::witness::jit_prove_backend::all_lane_recordings;
 
 fn arg(name: &str) -> Option<String> {
+    args(name).into_iter().next()
+}
+
+fn args(name: &str) -> Vec<String> {
     let args: Vec<String> = std::env::args().collect();
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1).cloned())
+    args.windows(2)
+        .filter(|pair| pair[0] == name)
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 
 /// Per-kernel instruction cap for AOT constraint lowering. MUST MATCH the
@@ -78,6 +85,16 @@ fn run_fixture(
     )
     .expect("run_and_adapt fixture");
 
+    run_input(input, variant, out, covered, max_instrs);
+}
+
+fn run_input(
+    input: ProverInput,
+    variant: PreProcessedTraceVariant,
+    out: &mut Vec<Emitted>,
+    covered: &mut BTreeMap<String, bool>,
+    max_instrs: usize,
+) {
     let state::IngestOutput {
         preprocessed_trace,
         generator,
@@ -275,6 +292,20 @@ fn main() -> ExitCode {
         &mut covered,
         max_instrs,
     );
+    for input_path in args("--input-bincode") {
+        eprintln!("kernel_emit: adapted input {input_path} (Canonical)");
+        let bytes = std::fs::read(&input_path)
+            .unwrap_or_else(|error| panic!("read adapted input {input_path}: {error}"));
+        let input = bincode::deserialize(&bytes)
+            .unwrap_or_else(|error| panic!("decode adapted input {input_path}: {error}"));
+        run_input(
+            input,
+            PreProcessedTraceVariant::Canonical,
+            &mut out,
+            &mut covered,
+            max_instrs,
+        );
+    }
     let missing: Vec<&String> = covered
         .iter()
         .filter(|(_, &c)| !c)
@@ -318,6 +349,10 @@ fn main() -> ExitCode {
     files.insert(
         "aot_manifest.json".to_string(),
         serde_json::to_string_pretty(&manifest).unwrap() + "\n",
+    );
+    files.insert(
+        "aot_constraint_max_instrs.txt".to_string(),
+        format!("{max_instrs}\n"),
     );
 
     if check {

@@ -1,12 +1,13 @@
 //! Gates for the GENERATED schedule table (design §16.3): structural validity,
-//! real topological depth, and pins of the two hardware-certified device edges —
+//! real topological depth, and pins of the device-resident producer edges —
 //! if regeneration ever changes these, the transformer metadata changed and the
 //! gather kernels' addressing must be re-verified.
 
 use std::collections::BTreeSet;
 
 use stwo_cairo_gpu_prover::schedule::{
-    InputEdge, KernelIdentitySource, ScheduleError, TraceColumnCount,
+    InputEdge, KernelIdentitySource, ScheduleError, TraceColumnCount, WitnessWriterKind,
+    WitnessWriterReadiness,
 };
 use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
 
@@ -19,6 +20,47 @@ fn generated_schedule_validates() {
     assert!(levels.len() >= 2, "expected a multi-level DAG: {levels:?}");
     let placed: usize = levels.iter().map(|l| l.len()).sum();
     assert_eq!(placed, CAIRO_SCHEDULE.nodes.len());
+}
+
+#[test]
+fn native_ec_op_is_weighted_before_its_direct_consumer() {
+    let levels = CAIRO_SCHEDULE.levels().unwrap();
+    let level_of = |component| {
+        levels
+            .iter()
+            .position(|level| level.contains(&component))
+            .unwrap()
+    };
+    let ec_level = level_of("ec_op_builtin");
+    assert!(ec_level < level_of("partial_ec_mul_generic"));
+    assert!(
+        levels[ec_level].iter().any(|component| {
+            CAIRO_SCHEDULE
+                .nodes
+                .iter()
+                .find(|node| node.id == *component)
+                .is_some_and(|node| {
+                    node.id != "ec_op_builtin"
+                        && node.facts.witness_writer.kind == WitnessWriterKind::RecordedAot
+                })
+        }),
+        "EC-op has no prepared recorded same-level work to overlap"
+    );
+    for component in ["ec_op_builtin", "memory_address_to_id", "memory_id_to_big"] {
+        let writer = CAIRO_SCHEDULE
+            .nodes
+            .iter()
+            .find(|node| node.id == component)
+            .unwrap()
+            .facts
+            .witness_writer;
+        assert_eq!(writer.kind, WitnessWriterKind::NativeCuda, "{component}");
+        assert_eq!(
+            writer.readiness,
+            WitnessWriterReadiness::CaptureSafe,
+            "{component}"
+        );
+    }
 }
 
 #[test]
@@ -76,8 +118,70 @@ fn producer_edge(consumer: &str, of: &str) -> (u32, u32, u32) {
         .unwrap_or_else(|| panic!("{consumer} has no producer edge from {of}"))
 }
 
-/// The two device edges certified on hardware (round-27/28): their addressing is
-/// baked into the gather kernels' launch parameters.
+fn ordered_producer_edges(consumer: &str) -> Vec<(&'static str, u32, u32, u32)> {
+    CAIRO_SCHEDULE
+        .nodes
+        .iter()
+        .find(|node| node.id == consumer)
+        .unwrap_or_else(|| panic!("{consumer} missing from schedule"))
+        .inputs
+        .iter()
+        .filter_map(|edge| match edge {
+            InputEdge::Producer {
+                of,
+                word_base,
+                words_per_instance,
+                n_instances,
+            } => Some((*of, *word_base, *words_per_instance, *n_instances)),
+            InputEdge::ExecTables | InputEdge::DeviceTable(_) => None,
+        })
+        .collect()
+}
+
+/// These consumers are `Mutex<Vec<_>>`, not multisets. Arm S appends producer
+/// outputs in aggregator, partial-round, full-round order, and the prepared
+/// gather must retain that byte-significant row order (including its first-row
+/// padding source).
+#[test]
+fn poseidon_vec_consumer_edges_match_legacy_append_order() {
+    assert_eq!(
+        ordered_producer_edges("cube_252"),
+        [
+            ("poseidon_aggregator", 282, 10, 2),
+            ("poseidon_3_partial_rounds_chain", 1, 10, 3),
+            ("poseidon_full_round_chain", 0, 10, 3),
+        ],
+    );
+    assert_eq!(
+        ordered_producer_edges("range_check_252_width_27"),
+        [
+            ("poseidon_aggregator", 262, 10, 2),
+            ("poseidon_3_partial_rounds_chain", 61, 10, 3),
+        ],
+    );
+    for consumer in ["cube_252", "range_check_252_width_27"] {
+        let node = CAIRO_SCHEDULE
+            .nodes
+            .iter()
+            .find(|node| node.id == consumer)
+            .unwrap();
+        assert_eq!(
+            node.capacity_inputs
+                .iter()
+                .map(|feed| (feed.from, feed.n_instances))
+                .collect::<Vec<_>>(),
+            ordered_producer_edges(consumer)
+                .into_iter()
+                .map(|(producer, _, _, n_instances)| (producer, n_instances))
+                .collect::<Vec<_>>(),
+            "{consumer} capacity order drifted from materialization order",
+        );
+    }
+}
+
+/// Device-edge addressing is part of the prepared gather/compact ABI.  Pin the
+/// hardware-certified legacy edges plus the Poseidon Graph-A chain so schedule
+/// regeneration cannot silently retarget a captured graph.
 #[test]
 fn certified_edges_pinned() {
     assert_eq!(
@@ -92,6 +196,21 @@ fn certified_edges_pinned() {
         producer_edge("blake_g", "blake_round"),
         (81, 6, 8),
         "blake_round→blake_g edge changed"
+    );
+    assert_eq!(
+        producer_edge("poseidon_aggregator", "poseidon_builtin"),
+        (6, 6, 1),
+        "poseidon_builtin→aggregator compact edge changed"
+    );
+    assert_eq!(
+        producer_edge("poseidon_full_round_chain", "poseidon_aggregator"),
+        (6, 32, 8),
+        "poseidon_aggregator→full-round edge changed"
+    );
+    assert_eq!(
+        producer_edge("poseidon_3_partial_rounds_chain", "poseidon_aggregator"),
+        (342, 42, 27),
+        "poseidon_aggregator→partial-round edge changed"
     );
 }
 
@@ -147,6 +266,14 @@ fn lane_recordings_are_schedule_nodes() {
             node.facts.kernel_identity,
             KernelIdentitySource::RecordedWitness
         );
+        assert_eq!(
+            node.facts.witness_writer.kind,
+            WitnessWriterKind::RecordedAot
+        );
+        assert_eq!(
+            node.facts.witness_writer.readiness,
+            WitnessWriterReadiness::CaptureSafe
+        );
         let TraceColumnCount::Fixed(trace_columns) = node.facts.trace_columns else {
             panic!("recorded lane {label} has a split trace")
         };
@@ -163,4 +290,14 @@ fn lane_recordings_are_schedule_nodes() {
         );
         assert!(program.n_cols > 0, "{label}: empty recording");
     }
+    let labels = recordings
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"blake_g"));
+    assert!(labels.contains(&"qm_31_add_mul_opcode"));
+    assert!(labels.contains(&"poseidon_builtin"));
+    assert!(labels.contains(&"poseidon_aggregator"));
+    assert!(labels.contains(&"poseidon_full_round_chain"));
+    assert!(labels.contains(&"poseidon_3_partial_rounds_chain"));
 }

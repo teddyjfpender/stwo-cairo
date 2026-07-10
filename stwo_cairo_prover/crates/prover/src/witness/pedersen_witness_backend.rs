@@ -53,7 +53,6 @@ use cairo_air::components::partial_ec_mul_generic::Claim as PartialEcMulGenericC
 use cairo_air::components::partial_ec_mul_window_bits_18::Claim as PartialEcMulW18Claim;
 use cairo_air::components::pedersen_aggregator_window_bits_18::Claim as PedersenAggregatorW18Claim;
 use stwo::core::fields::m31::BaseField;
-use stwo::prover::backend::simd::m31::N_LANES;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::FromSimdColumns;
 use stwo::prover::poly::circle::CircleEvaluation;
@@ -292,43 +291,7 @@ impl PartialEcMulGenericWitness for CudaBackend {
         // enabler | iota]`. ALL its relations are count-style — the device feed
         // is REQUIRED; any unavailability falls back to the host writer below.
         if let Some(mem) = jit_memory {
-            use stwo::prover::backend::simd::m31::N_LANES;
-            let packed: Vec<partial_ec_mul_generic::PackedInputType> =
-                gen.packed_inputs.lock().unwrap().clone();
-            let remainder_empty = gen.remainder_inputs.lock().unwrap().is_empty();
-            if !packed.is_empty() && remainder_empty {
-                let n_vec_rows = packed.len();
-                let n_real = n_vec_rows * N_LANES;
-                let packed_size = n_vec_rows.next_power_of_two();
-                let size = packed_size * N_LANES;
-                let mut padded = packed;
-                padded.resize(packed_size, *padded.first().unwrap());
-                let mut cols: Vec<Vec<u32>> = vec![Vec::with_capacity(size); 127];
-                for p in &padded {
-                    let a0 = p.0.to_array();
-                    let a1 = p.1.to_array();
-                    let tail = p.2 .3.to_array();
-                    for l in 0..N_LANES {
-                        cols[0].push(a0[l].0);
-                        cols[1].push(a1[l].0);
-                        for i in 0..10 {
-                            cols[2 + i].push(p.2 .0.get_m31(i).to_array()[l].0);
-                        }
-                        for (fi, f) in p.2 .1.iter().enumerate() {
-                            for i in 0..28 {
-                                cols[12 + fi * 28 + i].push(f.get_m31(i).to_array()[l].0);
-                            }
-                        }
-                        for (fi, f) in p.2 .2.iter().enumerate() {
-                            for i in 0..28 {
-                                cols[68 + fi * 28 + i].push(f.get_m31(i).to_array()[l].0);
-                            }
-                        }
-                        cols[124].push(tail[l].0);
-                    }
-                }
-                cols[125] = (0..size).map(|r| u32::from(r < n_real)).collect();
-                cols[126] = (0..size).map(|r| r as u32).collect();
+            if let Ok(inputs) = <crate::witness::jit_prove_backend::PartialEcMulGenericLane as crate::witness::jit_prove_backend::BuiltinLaneSpec>::input_columns(&gen) {
                 let lut_for = |family: &'static str| -> Vec<u32> {
                     match family {
                         "range_check_9_9_state" => range_check_9_9.input_to_row_lut(),
@@ -345,8 +308,8 @@ impl PartialEcMulGenericWitness for CudaBackend {
                     crate::witness::jit_prove_backend::PartialEcMulGenericLane,
                 >(
                     exec_context,
-                    &cols,
-                    n_real,
+                    &inputs.columns,
+                    inputs.n_real,
                     mem,
                     partial_ec_mul_generic::SUB_FEED_LAYOUT,
                     &lut_for,
@@ -388,9 +351,28 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
         // 14 windows, acc0 x28, acc1 x28 | enabler | iota]`. ALL relations are
         // count-style (points table included) — device feed REQUIRED.
         // B3 edge consumer: the aggregator's lane stashed its device sub buffer
-        // (and skipped the host w18 feed). Prefer the device gather; any failure
-        // rebuilds the inputs on CPU from the stashed HOST flat (the edge-gate
-        // math) so feeds stay exactly-once with no pair rerun.
+        // (and skipped the host w18 feed). The certified edge is fail-closed and
+        // has no recovery D2H; the env-off path never creates the edge and keeps
+        // the ordinary host feed.
+        if jit_memory.is_none() {
+            if let Some(edge) = exec_context.take_edge(
+                "pedersen_aggregator_window_bits_18",
+                "partial_ec_mul_window_bits_18",
+            ) {
+                let host_flat = edge.host_flat.as_deref().unwrap_or_else(|| {
+                    panic!(
+                        "jit_prove[partial_ec_mul_window_bits_18]: certified device edge has no \
+                         execution memory; host recovery is disabled (set \
+                         STWO_CUDA_WITNESS_EDGES=0 to use the rollback path)"
+                    )
+                });
+                pedersen_aggregator_window_bits_18::feed_w18_inputs_from_flat(
+                    host_flat,
+                    edge.n_rows,
+                    &gen,
+                );
+            }
+        }
         if let Some(mem) = jit_memory {
             if let Some(edge) = exec_context.take_edge(
                 "pedersen_aggregator_window_bits_18",
@@ -453,15 +435,20 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
                 match launched {
                     Some(out) => return out,
                     None => {
-                        // Recoverable: rebuild the generator's inputs from the
-                        // stashed HOST flat, then fall through to the normal
-                        // paths (device host-cols lane, then the host writer).
+                        let host_flat = edge.host_flat.as_deref().unwrap_or_else(|| {
+                            panic!(
+                                "jit_prove[partial_ec_mul_window_bits_18]: certified \
+                                 pedersen_aggregator_window_bits_18 device edge failed; host \
+                                 recovery is disabled (set STWO_CUDA_WITNESS_EDGES=0 to use the \
+                                 rollback path)"
+                            )
+                        });
                         eprintln!(
                             "jit_prove[partial_ec_mul_window_bits_18]: device edge failed — \
-                             rebuilding inputs from the stashed host flat"
+                             rebuilding inputs from the retained host flat"
                         );
                         pedersen_aggregator_window_bits_18::feed_w18_inputs_from_flat(
-                            &edge.host_flat,
+                            host_flat,
                             edge.n_rows,
                             &gen,
                         );
@@ -470,36 +457,7 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
             }
         }
         if let Some(mem) = jit_memory {
-            use stwo::prover::backend::simd::m31::N_LANES;
-            let packed: Vec<partial_ec_mul_window_bits_18::PackedInputType> =
-                gen.packed_inputs.lock().unwrap().clone();
-            let remainder_empty = gen.remainder_inputs.lock().unwrap().is_empty();
-            if !packed.is_empty() && remainder_empty {
-                let n_vec_rows = packed.len();
-                let n_real = n_vec_rows * N_LANES;
-                let packed_size = n_vec_rows.next_power_of_two();
-                let size = packed_size * N_LANES;
-                let mut padded = packed;
-                padded.resize(packed_size, *padded.first().unwrap());
-                let mut cols: Vec<Vec<u32>> = vec![Vec::with_capacity(size); 74];
-                for p in &padded {
-                    let a0 = p.0.to_array();
-                    let a1 = p.1.to_array();
-                    for l in 0..N_LANES {
-                        cols[0].push(a0[l].0);
-                        cols[1].push(a1[l].0);
-                        for (wi, w) in p.2 .0.iter().enumerate() {
-                            cols[2 + wi].push(w.to_array()[l].0);
-                        }
-                        for (fi, f) in p.2 .1.iter().enumerate() {
-                            for i in 0..28 {
-                                cols[16 + fi * 28 + i].push(f.get_m31(i).to_array()[l].0);
-                            }
-                        }
-                    }
-                }
-                cols[72] = (0..size).map(|r| u32::from(r < n_real)).collect();
-                cols[73] = (0..size).map(|r| r as u32).collect();
+            if let Ok(inputs) = <crate::witness::jit_prove_backend::PartialEcMulW18Lane as crate::witness::jit_prove_backend::BuiltinLaneSpec>::input_columns(&gen) {
                 let lut_for = |family: &'static str| -> Vec<u32> {
                     match family {
                         "range_check_9_9_state" => range_check_9_9.input_to_row_lut(),
@@ -518,8 +476,8 @@ impl PartialEcMulWindowBits18Witness for CudaBackend {
                     crate::witness::jit_prove_backend::PartialEcMulW18Lane,
                 >(
                     exec_context,
-                    &cols,
-                    n_real,
+                    &inputs.columns,
+                    inputs.n_real,
                     mem,
                     partial_ec_mul_window_bits_18::SUB_FEED_LAYOUT,
                     &lut_for,
@@ -563,32 +521,7 @@ impl PedersenAggregatorWindowBits18Witness for CudaBackend {
         // BITS_18)`; any unavailability falls back to the host writer below
         // (this block only READS `gen`, so the fallback stays valid).
         if let Some(mem) = jit_memory {
-            use std::sync::atomic::Ordering;
-            let mut inputs_mults = gen
-                .mults
-                .iter()
-                .map(|entry| {
-                    (
-                        *entry.key(),
-                        BaseField::from_u32_unchecked(entry.value().load(Ordering::Relaxed)),
-                    )
-                })
-                .collect::<Vec<_>>();
-            inputs_mults.sort_by_key(|(input, _)| input.0);
-            let (mut inputs, mut mults) = inputs_mults.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
-            let n_real = inputs.len();
-            if n_real > 0 {
-                let size = std::cmp::max(n_real.next_power_of_two(), N_LANES);
-                inputs.resize(size, *inputs.first().unwrap());
-                mults.resize(size, BaseField::from_u32_unchecked(0));
-                let cols: Vec<Vec<u32>> = vec![
-                    inputs.iter().map(|i| i.0[0].0).collect(),
-                    inputs.iter().map(|i| i.0[1].0).collect(),
-                    inputs.iter().map(|i| i.1 .0).collect(),
-                    (0..size).map(|r| u32::from(r < n_real)).collect(),
-                    (0..size).map(|r| r as u32).collect(),
-                    mults.iter().map(|m| m.0).collect(),
-                ];
+            if let Ok(inputs) = <crate::witness::jit_prove_backend::PedersenAggregatorW18Lane as crate::witness::jit_prove_backend::BuiltinLaneSpec>::input_columns(&gen) {
                 let lut_for = |family: &'static str| -> Vec<u32> {
                     panic!("aggregator count feed needs no LUT, got {family}")
                 };
@@ -618,14 +551,16 @@ impl PedersenAggregatorWindowBits18Witness for CudaBackend {
                     crate::witness::jit_prove_backend::PedersenAggregatorW18Lane,
                 >(
                     exec_context,
-                    crate::witness::jit_prove_backend::BuiltinInputs::HostCols(&cols),
-                    n_real,
+                    crate::witness::jit_prove_backend::BuiltinInputs::HostCols(&inputs.columns),
+                    inputs.n_real,
                     mem,
                     Some(plan),
-                    Some(crate::witness::jit_prove_backend::DeviceEdgeTarget {
-                        component: "partial_ec_mul_window_bits_18",
-                        feed_state: "partial_ec_mul_window_bits_18_state",
-                    }),
+                    Some(
+                        crate::witness::jit_prove_backend::DeviceEdgeTarget::fail_closed(
+                            "partial_ec_mul_window_bits_18",
+                            "partial_ec_mul_window_bits_18_state",
+                        ),
+                    ),
                     |sub_flat, n_padded, skip| {
                         pedersen_aggregator_window_bits_18::feed_sub_inputs_from_flat(
                             sub_flat,

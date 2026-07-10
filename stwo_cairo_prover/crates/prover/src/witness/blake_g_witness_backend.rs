@@ -246,12 +246,22 @@ impl BlakeGWitness for CudaBackend {
         xor9: &verify_bitwise_xor_9::ClaimGenerator,
     ) -> (Evals<Self>, BlakeGClaim, Self::InteractionGen) {
         if !device_lane_enabled() {
-            // The blake_round producer may have stashed the edge and skipped
-            // the host blake_g feed; rebuild the inputs from the stashed HOST
-            // flat before the host writer runs (exactly-once feeds).
+            exec_context.host_witness_fallback(
+                "blake_g",
+                "custom CUDA blake_g writer is disabled or unavailable",
+            );
+            // A recoverable edge may rebuild the inputs before the host writer.
+            // Certified hostless edges reject this mismatched switch combination.
             if let Some(edge) = exec_context.take_edge("blake_round", "blake_g") {
+                let host_flat = edge.host_flat.as_deref().unwrap_or_else(|| {
+                    panic!(
+                        "jit_prove[blake_g]: certified blake_round device edge requires the CUDA \
+                         blake_g consumer; host recovery is disabled (set \
+                         STWO_CUDA_WITNESS_EDGES=0 to use the rollback path)"
+                    )
+                });
                 crate::witness::components::blake_round::feed_blake_g_inputs_from_flat(
-                    &edge.host_flat,
+                    host_flat,
                     edge.n_rows,
                     &gen,
                 );
@@ -266,8 +276,8 @@ impl BlakeGWitness for CudaBackend {
 
         // B3 edge consumer: blake_round's lane stashed its device sub buffer
         // (and skipped the host blake_g feed). Build the row-major input buffer
-        // straight from it; any failure rebuilds the generator's inputs on CPU
-        // from the stashed HOST flat and falls through to the host-built path.
+        // straight from it; the certified edge has no recovery D2H, so a CUDA
+        // consumer failure is fatal and cannot silently replay work on the CPU.
         let mut edge_inputs: Option<(stwo_backend_cuda::BaseFieldVec, usize)> = None;
         if let Some(edge) = exec_context.take_edge("blake_round", "blake_g") {
             let plan = edge.plan;
@@ -277,6 +287,62 @@ impl BlakeGWitness for CudaBackend {
             );
             let n_rows_edge = plan.n_instances as usize * edge.n_rows;
             let column_length = std::cmp::max(n_rows_edge.next_power_of_two(), N_LANES);
+            let destinations = exec_context.take_resident_witness_destination(
+                "blake_g",
+                TracePartId::Main,
+                BG_N_TRACE,
+                column_length,
+                blake_g::N_LOOKUP_WORDS * column_length,
+                blake_g::N_SUB_INPUT_WORDS * column_length,
+            );
+            if let Some(destinations) = destinations {
+                let context = destinations.context;
+                device::write_trace_from_sub_into_on(
+                    &edge.buffer,
+                    edge.n_rows,
+                    plan.word_base as usize,
+                    plan.n_instances as usize,
+                    n_rows_edge,
+                    column_length,
+                    &destinations.trace,
+                    &destinations.lookup,
+                    &destinations.sub,
+                    context,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("strict arena-native blake_g launch failed: {error}")
+                });
+                context.sync().unwrap_or_else(|error| {
+                    panic!("strict arena-native blake_g fence failed: {error}")
+                });
+                exec_context.record_resident_witness_launch();
+                let cols = resident_blake_columns(
+                    &destinations.trace,
+                    &destinations.lookup,
+                    column_length,
+                );
+                exec_context.host_witness_fallback(
+                    "blake_g",
+                    "verify_bitwise_xor multiplicity accumulation is not device-resident",
+                );
+                feed_xor_counts(&cols, column_length, xor8, xor12, xor4, xor7, xor9);
+                let log_size = column_length.ilog2();
+                let domain = CanonicCoset::new(log_size).circle_domain();
+                let trace = destinations
+                    .trace
+                    .into_iter()
+                    .map(|column| CircleEvaluation::new(domain, column))
+                    .collect();
+                return (
+                    trace,
+                    BlakeGClaim { log_size },
+                    CudaBlakeGInteractionGen::Device(DeviceBlakeGWitness {
+                        cols,
+                        log_size,
+                        verify_host: None,
+                    }),
+                );
+            }
             let out = stwo_backend_cuda::BaseFieldVec::new_zeroes(
                 column_length * plan.words_per_instance as usize,
             );
@@ -293,11 +359,19 @@ impl BlakeGWitness for CudaBackend {
             if rc == 0 {
                 edge_inputs = Some((out, n_rows_edge));
             } else {
+                let host_flat = edge.host_flat.as_deref().unwrap_or_else(|| {
+                    panic!(
+                        "jit_prove[blake_g]: certified device-edge interleave failed; host \
+                         recovery is disabled (set STWO_CUDA_WITNESS_EDGES=0 to use the rollback \
+                         path)"
+                    )
+                });
                 eprintln!(
-                    "jit_prove[blake_g]: device edge interleave failed — rebuilding                      inputs from the stashed host flat"
+                    "jit_prove[blake_g]: device edge interleave failed — rebuilding inputs from \
+                     the retained host flat"
                 );
                 crate::witness::components::blake_round::feed_blake_g_inputs_from_flat(
-                    &edge.host_flat,
+                    host_flat,
                     edge.n_rows,
                     &gen,
                 );
@@ -353,20 +427,64 @@ impl BlakeGWitness for CudaBackend {
             }
         }
         let inputs_dev = BaseFieldVec::from_vec(words);
-        let cols = device::write_trace(&inputs_dev, n_rows, column_length);
+        let destinations = exec_context.take_resident_witness_destination(
+            "blake_g",
+            TracePartId::Main,
+            BG_N_TRACE,
+            column_length,
+            blake_g::N_LOOKUP_WORDS * column_length,
+            blake_g::N_SUB_INPUT_WORDS * column_length,
+        );
+        let (cols, resident_trace) = if let Some(destinations) = destinations {
+            let context = destinations.context;
+            device::write_trace_into_on(
+                &inputs_dev,
+                n_rows,
+                column_length,
+                &destinations.trace,
+                &destinations.lookup,
+                &destinations.sub,
+                context,
+            )
+            .unwrap_or_else(|error| panic!("arena-native blake_g launch failed: {error}"));
+            context
+                .sync()
+                .unwrap_or_else(|error| panic!("arena-native blake_g fence failed: {error}"));
+            exec_context.record_resident_witness_launch();
+            let cols =
+                resident_blake_columns(&destinations.trace, &destinations.lookup, column_length);
+            (cols, Some(destinations.trace))
+        } else {
+            (
+                device::write_trace(&inputs_dev, n_rows, column_length),
+                None,
+            )
+        };
 
         // In verify mode the host writer feeds the real xor generators (below); in
         // production the device count tables are merged instead.
+        if resident_trace.is_some() {
+            exec_context.host_witness_fallback(
+                "blake_g",
+                "verify_bitwise_xor multiplicity accumulation is not device-resident",
+            );
+        }
         if !verify {
             feed_xor_counts(&cols, column_length, xor8, xor12, xor4, xor7, xor9);
         }
 
         // Committed base trace: D2D clones of cols[0..53] (originals stay in state).
         let domain = CanonicCoset::new(log_size).circle_domain();
-        let trace: Evals<Self> = cols[..BG_N_TRACE]
-            .iter()
-            .map(|c| CircleEvaluation::new(domain, c.clone()))
-            .collect();
+        let trace: Evals<Self> = match resident_trace {
+            Some(trace) => trace
+                .into_iter()
+                .map(|column| CircleEvaluation::new(domain, column))
+                .collect(),
+            None => cols[..BG_N_TRACE]
+                .iter()
+                .map(|c| CircleEvaluation::new(domain, c.clone()))
+                .collect(),
+        };
         let claim = BlakeGClaim { log_size };
 
         let verify_host = host_inputs.map(|inp| {
@@ -449,6 +567,44 @@ impl BlakeGWitness for CudaBackend {
             }
         }
     }
+}
+
+/// Rebuild the legacy 73-column interaction view without copying: committed
+/// columns point at BaseTrace, while the 20 auxiliary columns point at their
+/// canonical occurrence in the arena's word-major LookupInputs buffer.
+fn resident_blake_columns(
+    trace: &[BaseFieldVec],
+    lookup: &BaseFieldVec,
+    column_length: usize,
+) -> Vec<BaseFieldVec> {
+    assert_eq!(trace.len(), BG_N_TRACE);
+    let mut columns = trace
+        .iter()
+        .map(|column| BaseFieldVec::from_borrowed_ptr(column.device_ptr, column_length))
+        .collect::<Vec<_>>();
+    for column in BG_N_TRACE..device::BG_N_COLS {
+        let word = blake_g_lookup_word_for_column(column)
+            .unwrap_or_else(|| panic!("blake_g auxiliary column {column} has no lookup view"));
+        columns.push(BaseFieldVec::from_borrowed_ptr(
+            unsafe { lookup.device_ptr.add(word * column_length) },
+            column_length,
+        ));
+    }
+    columns
+}
+
+fn blake_g_lookup_word_for_column(column: usize) -> Option<usize> {
+    for (tuple, (_, tuple_columns)) in BLAKE_G_TUPLE_COLUMNS.iter().enumerate() {
+        for (word, &candidate) in tuple_columns.iter().enumerate() {
+            if candidate == column {
+                return Some(tuple * 4 + 1 + word);
+            }
+        }
+    }
+    BLAKE_G_FINAL_COLUMNS
+        .iter()
+        .position(|&candidate| candidate == column)
+        .map(|word| 65 + word)
 }
 
 fn device_lane_enabled() -> bool {
@@ -616,6 +772,20 @@ fn compare_values(label: &str, host: &[BaseField], device: &[BaseField]) -> bool
         host[first], device[first]
     );
     false
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+
+    #[test]
+    fn every_auxiliary_column_has_a_canonical_lookup_view() {
+        let words = (BG_N_TRACE..device::BG_N_COLS)
+            .map(|column| blake_g_lookup_word_for_column(column).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(words.len(), device::BG_N_AUX);
+        assert!(words.iter().all(|&word| word < blake_g::N_LOOKUP_WORDS));
+    }
 }
 
 #[cfg(test)]

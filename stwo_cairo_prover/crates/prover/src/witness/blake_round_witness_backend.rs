@@ -125,36 +125,126 @@ impl BlakeRoundWitness for CudaBackend {
         // `[chain, round, 16 raw message words, mp | enabler | iota]`. Gated by
         // `STWO_CUDA_WITNESS_JIT_PROVE(_BLAKE_ROUND)`; any unavailability falls
         // back to the host writer below (this block only READS `gen`).
+        //
+        // Source edge: blake_compress_opcode emits ten exact 19-word BlakeRound
+        // inputs per padded producer row. Consume those columns in place; the
+        // generator intentionally remains empty on this path. This upstream edge
+        // still carries its recovery mirror until it receives the same
+        // conformance certification as the two downstream resident edges.
         if let Some(mem) = jit_memory {
-            use stwo::prover::backend::simd::m31::N_LANES;
-            let packed: Vec<blake_round::PackedInputType> =
-                gen.packed_inputs.lock().unwrap().clone();
-            let remainder_empty = gen.remainder_inputs.lock().unwrap().is_empty();
-            if !packed.is_empty() && remainder_empty {
-                // Replicate the host preamble EXACTLY: n_rows counts every lane of
-                // the pre-pad packed rows; padding repeats the first PACKED row.
-                let n_vec_rows = packed.len();
-                let n_real = n_vec_rows * N_LANES;
-                let packed_size = n_vec_rows.next_power_of_two();
-                let size = packed_size * N_LANES;
-                let mut padded = packed;
-                padded.resize(packed_size, *padded.first().unwrap());
-                let mut cols: Vec<Vec<u32>> = vec![Vec::with_capacity(size); 21];
-                for p in &padded {
-                    let chain = p.0.to_array();
-                    let round = p.1.to_array();
-                    let mp = p.2 .1.to_array();
-                    for l in 0..N_LANES {
-                        cols[0].push(chain[l].0);
-                        cols[1].push(round[l].0);
-                        for (wi, w) in p.2 .0.iter().enumerate() {
-                            cols[2 + wi].push(w.simd.as_array()[l]);
-                        }
-                        cols[18].push(mp[l].0);
+            if let Some(edge) = exec_context.take_edge("blake_compress_opcode", "blake_round") {
+                let edge_plan = edge.plan;
+                assert_eq!(
+                    edge_plan.words_per_instance, 19,
+                    "blake_round edge ABI requires nineteen words per instance"
+                );
+                assert_eq!(
+                    edge_plan.n_instances, 10,
+                    "blake_compress_opcode must emit ten Blake rounds per row"
+                );
+                let n_real = edge_plan.n_instances as usize * edge.n_rows;
+                let padded = std::cmp::max(
+                    n_real.next_power_of_two(),
+                    stwo::prover::backend::simd::m31::N_LANES,
+                );
+                let host_tail = vec![
+                    (0..padded).map(|row| u32::from(row < n_real)).collect(),
+                    (0..padded).map(|row| row as u32).collect(),
+                ];
+                let lut_for = |family: &'static str| -> Vec<u32> {
+                    match family {
+                        "range_check_7_2_5_state" => range_check_7_2_5_state.input_to_row_lut(),
+                        "blake_round_sigma_state" => blake_round_sigma_state.input_to_row_lut(),
+                        other => panic!("unexpected LUT family {other}"),
                     }
+                };
+                let merge = |family: &'static str, counts: &[u32]| match family {
+                    "range_check_7_2_5_state" => range_check_7_2_5_state.add_count_tables(counts),
+                    "blake_round_sigma_state" => blake_round_sigma_state.add_count_tables(counts),
+                    "memory_address_to_id_state" => {
+                        memory_address_to_id_state.add_count_tables(counts)
+                    }
+                    "memory_id_to_big_state" => memory_id_to_big_state.add_big_count_tables(counts),
+                    "memory_id_to_big_state#small" => {
+                        memory_id_to_big_state.add_small_count_tables(counts)
+                    }
+                    other => panic!("unexpected count family {other}"),
+                };
+                let sizes = |family: &'static str| match family {
+                    "memory_address_to_id_state" => {
+                        Some((memory_address_to_id_state.table_size(), 0))
+                    }
+                    "memory_id_to_big_state" => Some((
+                        memory_id_to_big_state.big_table_size(),
+                        memory_id_to_big_state.small_table_size(),
+                    )),
+                    _ => None,
+                };
+                let plan = crate::witness::jit_prove_backend::DeviceFeedPlan {
+                    layout: blake_round::SUB_FEED_LAYOUT,
+                    lut_for: &lut_for,
+                    merge: &merge,
+                    sizes: &sizes,
+                    require: false,
+                };
+                let launched = stwo_backend_cuda::exec_tables::witness_edge_gather(
+                    &edge.buffer,
+                    edge.n_rows,
+                    edge_plan.word_base as usize,
+                    edge_plan.words_per_instance as usize,
+                    edge_plan.n_instances as usize,
+                    padded,
+                )
+                .and_then(|device_cols| {
+                    crate::witness::jit_prove_backend::builtin_cuda_write_trace_from::<
+                        crate::witness::jit_prove_backend::BlakeRoundLane,
+                    >(
+                        exec_context,
+                        crate::witness::jit_prove_backend::BuiltinInputs::Edge {
+                            device_cols,
+                            host_tail,
+                        },
+                        n_real,
+                        mem,
+                        Some(plan),
+                        Some(
+                            crate::witness::jit_prove_backend::DeviceEdgeTarget::fail_closed(
+                                "blake_g",
+                                "blake_g_state",
+                            ),
+                        ),
+                        |sub_flat, n_padded, skip| {
+                            blake_round::feed_sub_inputs_from_flat(
+                                sub_flat,
+                                n_padded,
+                                blake_round_sigma_state,
+                                memory_address_to_id_state,
+                                memory_id_to_big_state,
+                                range_check_7_2_5_state,
+                                blake_g_state,
+                                skip,
+                            );
+                        },
+                    )
+                });
+                if let Some(out) = launched {
+                    return out;
                 }
-                cols[19] = (0..size).map(|r| u32::from(r < n_real)).collect();
-                cols[20] = (0..size).map(|r| r as u32).collect();
+                eprintln!(
+                    "jit_prove[blake_round]: blake_compress_opcode device edge failed - \
+                     rebuilding inputs from the stashed host flat"
+                );
+                crate::witness::jit_prove_backend::feed_blake_round_inputs_from_blake_compress_flat(
+                    edge.host_flat.as_deref().expect(
+                        "recoverable blake_compress_opcode -> blake_round edge lost its host mirror",
+                    ),
+                    edge.n_rows,
+                    &gen,
+                );
+            }
+        }
+        if let Some(mem) = jit_memory {
+            if let Ok(inputs) = <crate::witness::jit_prove_backend::BlakeRoundLane as crate::witness::jit_prove_backend::BuiltinLaneSpec>::input_columns(&gen) {
                 let lut_for = |family: &'static str| -> Vec<u32> {
                     match family {
                         "range_check_7_2_5_state" => range_check_7_2_5_state.input_to_row_lut(),
@@ -195,14 +285,16 @@ impl BlakeRoundWitness for CudaBackend {
                     crate::witness::jit_prove_backend::BlakeRoundLane,
                 >(
                     exec_context,
-                    crate::witness::jit_prove_backend::BuiltinInputs::HostCols(&cols),
-                    n_real,
+                    crate::witness::jit_prove_backend::BuiltinInputs::HostCols(&inputs.columns),
+                    inputs.n_real,
                     mem,
                     Some(plan),
-                    Some(crate::witness::jit_prove_backend::DeviceEdgeTarget {
-                        component: "blake_g",
-                        feed_state: "blake_g_state",
-                    }),
+                    Some(
+                        crate::witness::jit_prove_backend::DeviceEdgeTarget::fail_closed(
+                            "blake_g",
+                            "blake_g_state",
+                        ),
+                    ),
                     |sub_flat, n_padded, skip| {
                         blake_round::feed_sub_inputs_from_flat(
                             sub_flat,

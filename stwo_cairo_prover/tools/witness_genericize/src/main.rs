@@ -191,6 +191,10 @@ enum Shape {
     /// reconstructs it with `PackedFelt252::from_limbs` — the exact inverse for
     /// canonical limbs, so the receiving component sees the identical felt value.
     Felt,
+    /// A `PackedFelt252Width27` value transported as its ten canonical 27-bit M31
+    /// words. This is deliberately distinct from [`Shape::Felt`]: the two layouts
+    /// are not interchangeable even though they represent the same field.
+    FeltW27,
     Tuple(Vec<Shape>),
     Array(Vec<Shape>),
 }
@@ -200,6 +204,7 @@ impl Shape {
         match self {
             Shape::Scalar | Shape::U32 => 1,
             Shape::Felt => FELT252_LIMBS,
+            Shape::FeltW27 => FELTW27_LIMBS,
             Shape::Tuple(v) | Shape::Array(v) => v.iter().map(Shape::scalar_count).sum(),
         }
     }
@@ -473,12 +478,11 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
             return fa;
         }
     };
-    if binders.len() != 4 {
+    if binders.len() != 3 && binders.len() != 4 {
         fa.file_skip = Some(Skip {
             category: "skeleton",
             detail: format!(
-                "unsupported skeleton: {}-tuple closure `({})` (preprocessed/table \
-                 iterate or no per-row input)",
+                "unsupported skeleton: {}-tuple closure `({})`",
                 binders.len(),
                 binders.join(", ")
             ),
@@ -488,8 +492,12 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
     let row_name = binders[0].clone();
     let lookup_name = binders[1].clone();
     let sub_name = binders[2].clone();
-    let input_name = binders[3].clone();
-    if !input_name.ends_with("_input") {
+    let has_per_row_input = binders.len() == 4;
+    let input_name = binders
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| "__no_per_row_input".to_string());
+    if has_per_row_input && !input_name.ends_with("_input") {
         fa.file_skip = Some(Skip {
             category: "skeleton",
             detail: format!("4th closure binder `{input_name}` is not `<name>_input`"),
@@ -538,7 +546,16 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
     fa.n_sub_words = sub_slots.iter().map(|s| s.shape.scalar_count()).sum();
 
     // Parse the packed-input type alias so the input binder's projections can be typed.
-    let input_ty = parse_input_type(&file);
+    let input_ty = if has_per_row_input {
+        parse_input_type(&file)
+    } else {
+        Ty::Unknown
+    };
+    let scalar_params = if has_per_row_input {
+        Vec::new()
+    } else {
+        scalar_u32_params(writer)
+    };
 
     // Run the lowering (collects skips + builds SSA).
     let mut lw = Lowerer::new(
@@ -549,6 +566,8 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
         big_state,
         input_name.clone(),
         input_ty,
+        has_per_row_input,
+        scalar_params,
         row_index_name,
         row_name,
         lookup_name,
@@ -583,6 +602,24 @@ fn analyze_file(path: &Path, build_block: bool) -> FileAnalysis {
     }
 
     fa
+}
+
+/// Stored-log-size writers have no per-row input vector. Their only statement
+/// metadata is a compact u32 scalar (normally the builtin segment start), which
+/// is assigned a recorder input slot in signature order. `log_size` controls
+/// geometry and is never a row value.
+fn scalar_u32_params(f: &ItemFn) -> Vec<String> {
+    f.sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            let FnArg::Typed(arg) = arg else { return None };
+            let Pat::Ident(name) = &*arg.pat else {
+                return None;
+            };
+            (name.ident != "log_size" && tok_str(&arg.ty) == "u32").then(|| name.ident.to_string())
+        })
+        .collect()
 }
 
 /// Extract the `&memory_address_to_id::ClaimGenerator` / `&memory_id_to_big::ClaimGenerator`
@@ -770,7 +807,9 @@ fn parse_logup_descs(file: &syn::File) -> Option<Vec<LogupDescFact>> {
             if first.method != "par_iter_mut" {
                 return;
             }
-            let fields: Vec<String> = elems.map(|e| lookup_field(e)).collect::<Option<_>>()
+            let fields: Vec<String> = elems
+                .map(|e| lookup_field(e))
+                .collect::<Option<_>>()
                 .unwrap_or_default();
             if fields.is_empty() {
                 return;
@@ -802,32 +841,68 @@ fn parse_logup_descs(file: &syn::File) -> Option<Vec<LogupDescFact>> {
 
             let fact = match (num.as_str(), fields.len()) {
                 ("denom0**mult1+denom1**mult0", 4) => (
-                    fields[0].clone(), fields[2].clone(), false,
-                    fields[1].clone(), fields[3].clone(), false,
+                    fields[0].clone(),
+                    fields[2].clone(),
+                    false,
+                    fields[1].clone(),
+                    fields[3].clone(),
+                    false,
                 ),
                 ("denom0+denom1", 2) => (
-                    fields[0].clone(), "1".into(), false,
-                    fields[1].clone(), "1".into(), false,
+                    fields[0].clone(),
+                    "1".into(),
+                    false,
+                    fields[1].clone(),
+                    "1".into(),
+                    false,
                 ),
                 ("denom1**mult0-denom0**mult1", 4) => (
-                    fields[0].clone(), fields[2].clone(), false,
-                    fields[1].clone(), fields[3].clone(), true,
+                    fields[0].clone(),
+                    fields[2].clone(),
+                    false,
+                    fields[1].clone(),
+                    fields[3].clone(),
+                    true,
                 ),
                 ("denom0**mult1-denom1**mult0", 4) => (
-                    fields[0].clone(), fields[2].clone(), true,
-                    fields[1].clone(), fields[3].clone(), false,
+                    fields[0].clone(),
+                    fields[2].clone(),
+                    true,
+                    fields[1].clone(),
+                    fields[3].clone(),
+                    false,
                 ),
                 ("denom0*enabler_col.packed_at(i)+denom1", 2) => (
-                    fields[0].clone(), "1".into(), false,
-                    fields[1].clone(), "enabler".into(), false,
+                    fields[0].clone(),
+                    "1".into(),
+                    false,
+                    fields[1].clone(),
+                    "enabler".into(),
+                    false,
                 ),
                 ("(-mult).into()", 2) => (
-                    fields[0].clone(), fields[1].clone(), true,
-                    String::new(), String::new(), false,
+                    fields[0].clone(),
+                    fields[1].clone(),
+                    true,
+                    String::new(),
+                    String::new(),
+                    false,
+                ),
+                ("(mult).into()", 2) | ("mult.into()", 2) => (
+                    fields[0].clone(),
+                    fields[1].clone(),
+                    false,
+                    String::new(),
+                    String::new(),
+                    false,
                 ),
                 ("-PackedQM31::one()*enabler_col.packed_at(i)", 1) => (
-                    fields[0].clone(), "enabler".into(), true,
-                    String::new(), String::new(), false,
+                    fields[0].clone(),
+                    "enabler".into(),
+                    true,
+                    String::new(),
+                    String::new(),
+                    false,
                 ),
                 _ => {
                     self.failed = Some(format!(
@@ -903,8 +978,7 @@ fn parse_feed_map(file: &syn::File) -> std::collections::BTreeMap<String, (Strin
                                 if mc.method == "add_packed_inputs" {
                                     if let Expr::Path(p) = strip_parens(&mc.receiver) {
                                         if let Some(rel) = mc.args.last().and_then(int_lit) {
-                                            self.map
-                                                .insert(field.clone(), (tok_str(&p.path), rel));
+                                            self.map.insert(field.clone(), (tok_str(&p.path), rel));
                                         }
                                     }
                                 }
@@ -936,10 +1010,7 @@ fn parse_feed_map(file: &syn::File) -> std::collections::BTreeMap<String, (Strin
                                 Expr::MethodCall(mc) if mc.method == "add_packed_inputs" => {
                                     if let Expr::Path(p) = strip_parens(&mc.receiver) {
                                         if let Some(rel) = mc.args.last().and_then(int_lit) {
-                                            self.map.insert(
-                                                field.clone(),
-                                                (tok_str(&p.path), rel),
-                                            );
+                                            self.map.insert(field.clone(), (tok_str(&p.path), rel));
                                         }
                                     }
                                 }
@@ -953,10 +1024,8 @@ fn parse_feed_map(file: &syn::File) -> std::collections::BTreeMap<String, (Strin
                                             c.args.first().map(strip_parens),
                                             c.args.last().and_then(int_lit),
                                         ) {
-                                            self.map.insert(
-                                                field.clone(),
-                                                (tok_str(&sp.path), rel),
-                                            );
+                                            self.map
+                                                .insert(field.clone(), (tok_str(&sp.path), rel));
                                         }
                                     }
                                 }
@@ -1111,6 +1180,7 @@ fn shape_from_syn_type(ty: &Type, dir: Option<&Path>) -> Option<Shape> {
                 "PackedM31" => Some(Shape::Scalar),
                 "PackedUInt32" => Some(Shape::U32),
                 "PackedFelt252" => Some(Shape::Felt),
+                "PackedFelt252Width27" => Some(Shape::FeltW27),
                 // `<component>::PackedInputType` — resolve by parsing the SIBLING
                 // component file's alias (the transformer runs over the components
                 // dir, so the sibling is on disk next to the current file).
@@ -1153,6 +1223,7 @@ fn ty_to_shape(ty: &Ty) -> Option<Shape> {
         Ty::M31 => Some(Shape::Scalar),
         Ty::U32 => Some(Shape::U32),
         Ty::Felt252 => Some(Shape::Felt),
+        Ty::FeltW27 | Ty::FeltW27Limbs => Some(Shape::FeltW27),
         Ty::Tuple(v) => Some(Shape::Tuple(
             v.iter().map(ty_to_shape).collect::<Option<Vec<_>>>()?,
         )),
@@ -1430,6 +1501,7 @@ fn receiver_label(recv: &Expr) -> String {
 // Lowerer — the finite rewrite table (SSA flattening + type inference + effects)
 // ======================================================================================
 
+#[derive(Clone)]
 enum Target {
     Temp,
     Named(Ident),
@@ -1446,6 +1518,10 @@ struct Lowerer {
     addr_state: Option<String>,
     big_state: Option<String>,
     input_name: String,
+    /// Whether the Rayon closure carries a generated packed input value.
+    has_per_row_input: bool,
+    /// Compact statement scalars mapped to recorder input slots in signature order.
+    scalar_params: BTreeMap<String, usize>,
     /// Type of the 4th closure binder (`<comp>_input`), parsed from `PackedInputType`.
     /// Seeds input-projection typing (`.N` / `[i]` / `.get_m31(i)`).
     input_ty: Ty,
@@ -1506,6 +1582,8 @@ impl Lowerer {
         big_state: Option<String>,
         input_name: String,
         input_ty: Ty,
+        has_per_row_input: bool,
+        scalar_params: Vec<String>,
         row_index_name: String,
         row_name: String,
         lookup_name: String,
@@ -1525,6 +1603,12 @@ impl Lowerer {
             big_state,
             input_name,
             input_ty,
+            has_per_row_input,
+            scalar_params: scalar_params
+                .into_iter()
+                .enumerate()
+                .map(|(slot, name)| (name, slot))
+                .collect(),
             row_index_name,
             row_name,
             lookup_name,
@@ -1714,6 +1798,100 @@ impl Lowerer {
         Some(self.bind(target, quote! { eval.deduce_blake_g([ #(#toks),* ]) }))
     }
 
+    /// `blake_round_state.deduce_output((chain, round, ([state; 16], ptr)))`
+    /// as the recorder's complete, execution-table-backed Blake round. This is
+    /// deliberately shape-exact: any generated AIR drift stays a loud skip.
+    fn lower_blake_round_deduce(
+        &mut self,
+        arg: &Expr,
+        target: Target,
+    ) -> Option<(Ty, TokenStream)> {
+        let Expr::Tuple(ExprTuple { elems, .. }) = strip_parens(arg) else {
+            return None;
+        };
+        let [chain_e, round_e, state_e] = elems.iter().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let Expr::Tuple(ExprTuple {
+            elems: state_parts, ..
+        }) = strip_parens(state_e)
+        else {
+            return None;
+        };
+        let [words_e, pointer_e] = state_parts.iter().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let Expr::Array(ExprArray { elems: words, .. }) = strip_parens(words_e) else {
+            return None;
+        };
+        if words.len() != 16 {
+            return None;
+        }
+
+        let (chain_ty, chain) = self.lower_node(strip_parens(chain_e), Target::Temp);
+        self.require_m31(&chain_ty, "blake round chain", chain_e);
+        let (round_ty, round) = self.lower_node(strip_parens(round_e), Target::Temp);
+        self.require_m31(&round_ty, "blake round index", round_e);
+        let state: Vec<TokenStream> = words
+            .iter()
+            .map(|word| {
+                let (ty, tok) = self.lower_node(strip_parens(word), Target::Temp);
+                if !ty.is_u32() {
+                    self.skip(
+                        "deduce_output",
+                        format!(
+                            "blake round state word is not u32: `{}` ({ty:?})",
+                            tok_str(word)
+                        ),
+                    );
+                }
+                self.u32ish_value(ty, tok)
+            })
+            .collect();
+        let (pointer_ty, pointer) = self.lower_node(strip_parens(pointer_e), Target::Temp);
+        self.require_m31(&pointer_ty, "blake round message pointer", pointer_e);
+
+        let ty = Ty::Tuple(vec![
+            Ty::M31,
+            Ty::M31,
+            Ty::Tuple(vec![Ty::Array(Box::new(Ty::U32), 16), Ty::M31]),
+        ]);
+        let tok = self.bind(
+            target,
+            quote! { eval.deduce_blake_round(#chain, #round, [ #(#state),* ], #pointer) },
+        );
+        Some((ty, tok))
+    }
+
+    /// `PackedTripleXor32::deduce_output([a,b,c])` as two recorder-native
+    /// u32 XOR instructions.
+    fn lower_triple_xor_deduce(
+        &mut self,
+        call: &syn::ExprCall,
+        target: Target,
+    ) -> Option<TokenStream> {
+        let Expr::Array(ExprArray { elems, .. }) = strip_parens(call.args.first()?) else {
+            return None;
+        };
+        if elems.len() != 3 {
+            return None;
+        }
+        let args: Vec<TokenStream> = elems
+            .iter()
+            .map(|word| {
+                let (ty, tok) = self.lower_node(strip_parens(word), Target::Temp);
+                if !ty.is_u32() {
+                    self.skip(
+                        "deduce_output",
+                        format!("triple xor input is not u32: `{}` ({ty:?})", tok_str(word)),
+                    );
+                }
+                self.u32ish_value(ty, tok)
+            })
+            .collect();
+        Some(self.bind(target, quote! { eval.deduce_triple_xor_32([ #(#args),* ]) }))
+    }
+
     /// `PackedPedersenPointsTableWindowBits18::deduce_output([index])` as a REAL
     /// `eval.deduce_pedersen_points_table_w18(index)` call.
     fn lower_points_table_deduce(
@@ -1733,6 +1911,88 @@ impl Lowerer {
         Some(self.bind(
             target,
             quote! { eval.deduce_pedersen_points_table_w18(#idx) },
+        ))
+    }
+
+    fn lower_w27_value(&mut self, expr: &Expr, context: &'static str) -> TokenStream {
+        let (ty, tok) = self.lower_node(strip_parens(expr), Target::Temp);
+        match ty {
+            Ty::FeltW27Limbs => tok,
+            other => {
+                self.skip(
+                    "deduce_output",
+                    format!(
+                        "{context} is not a materialized W27 value: `{}` ({other:?})",
+                        tok_str(expr)
+                    ),
+                );
+                quote! { WG_SKIP }
+            }
+        }
+    }
+
+    /// `PackedPoseidonRoundKeys::deduce_output([round])` as the compact
+    /// Poseidon-round-key computed deduce. The result stays as three arrays of ten
+    /// W27 words; no width conversion is hidden at this boundary.
+    fn lower_poseidon_round_keys_deduce(
+        &mut self,
+        call: &syn::ExprCall,
+        target: Target,
+    ) -> Option<TokenStream> {
+        let Expr::Array(ExprArray { elems, .. }) = strip_parens(call.args.first()?) else {
+            return None;
+        };
+        if elems.len() != 1 {
+            return None;
+        }
+        let (ty, round) = self.lower_node(strip_parens(&elems[0]), Target::Temp);
+        self.require_m31(&ty, "poseidon round-key index", &elems[0]);
+        Some(self.bind(target, quote! { eval.deduce_poseidon_round_keys(#round) }))
+    }
+
+    /// `PackedCube252::deduce_output(w27)` as the compact ten-word computed deduce.
+    fn lower_poseidon_cube_deduce(
+        &mut self,
+        call: &syn::ExprCall,
+        target: Target,
+    ) -> Option<TokenStream> {
+        let input = call.args.first()?;
+        let words = self.lower_w27_value(input, "poseidon cube input");
+        Some(self.bind(target, quote! { eval.deduce_cube_252(#words) }))
+    }
+
+    /// Shared exact parser for `(chain, round, [W27; N])` Poseidon chain calls.
+    fn lower_poseidon_chain_deduce(
+        &mut self,
+        call: &syn::ExprCall,
+        target: Target,
+        state_words: usize,
+        method: &str,
+    ) -> Option<TokenStream> {
+        let Expr::Tuple(ExprTuple { elems, .. }) = strip_parens(call.args.first()?) else {
+            return None;
+        };
+        let [chain_e, round_e, state_e] = elems.iter().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let Expr::Array(ExprArray { elems: state, .. }) = strip_parens(state_e) else {
+            return None;
+        };
+        if state.len() != state_words {
+            return None;
+        }
+        let (chain_ty, chain) = self.lower_node(strip_parens(chain_e), Target::Temp);
+        self.require_m31(&chain_ty, "poseidon chain id", chain_e);
+        let (round_ty, round) = self.lower_node(strip_parens(round_e), Target::Temp);
+        self.require_m31(&round_ty, "poseidon chain round", round_e);
+        let state = state
+            .iter()
+            .map(|word| self.lower_w27_value(word, "poseidon chain state"))
+            .collect::<Vec<_>>();
+        let method = Ident::new(method, Span::call_site());
+        Some(self.bind(
+            target,
+            quote! { eval.#method(#chain, #round, [ #(#state),* ]) },
         ))
     }
 
@@ -2128,7 +2388,16 @@ impl Lowerer {
     fn lower_agg_elem(&mut self, e: &Expr) -> (Ty, TokenStream) {
         match strip_parens(e) {
             Expr::Tuple(_) | Expr::Array(_) => self.lower_aggregate(e),
-            other => self.lower_node(other, Target::Temp),
+            other => {
+                let (ty, tok) = self.lower_node(other, Target::Temp);
+                match ty {
+                    Ty::ConstU32(v) => {
+                        let value = self.u32ish_value(Ty::ConstU32(v), tok);
+                        (Ty::U32, value)
+                    }
+                    _ => (ty, tok),
+                }
+            }
         }
     }
 
@@ -2204,6 +2473,10 @@ impl Lowerer {
         }
         if let Some(limbs) = self.felt_consts.get(&name).copied() {
             return self.felt_const_value(target, limbs);
+        }
+        if let Some(&slot) = self.scalar_params.get(&name) {
+            let slot = u32_lit(slot as u32);
+            return self.emit_op(target, Ty::M31, quote! { eval.input(#slot) });
         }
         if name == self.input_name {
             return self.input_leaf(target);
@@ -2474,6 +2747,20 @@ impl Lowerer {
             }
             "deduce_output" => {
                 let recv = tok_str(strip_parens(&mc.receiver));
+                if recv == "blake_round_state" {
+                    let Some(arg) = mc.args.first() else {
+                        self.skip("expr", "missing blake round argument".to_string());
+                        return (Ty::Unknown, quote! { WG_SKIP });
+                    };
+                    if let Some(out) = self.lower_blake_round_deduce(arg, target) {
+                        return out;
+                    }
+                    self.skip(
+                        "deduce_output",
+                        "blake_round_state.deduce_output shape changed".to_string(),
+                    );
+                    return (Ty::Unknown, quote! { WG_SKIP });
+                }
                 // Aggregate-aware: builtin deduce args are tuples; lower their leaves
                 // for real (the deduce itself skips below for non-mem receivers).
                 let (_at, atok) = match mc.args.first() {
@@ -2542,6 +2829,29 @@ impl Lowerer {
                 return (Ty::Unknown, quote! { WG_SKIP });
             }
         };
+        if path == "PackedM31 :: broadcast" {
+            let Some(Expr::Call(inner)) = call.args.first().map(strip_parens) else {
+                self.skip("call", "PackedM31::broadcast without M31::from".to_string());
+                return (Ty::Unknown, quote! { WG_SKIP });
+            };
+            let Expr::Path(inner_path) = &*inner.func else {
+                self.skip(
+                    "call",
+                    "PackedM31::broadcast non-path inner call".to_string(),
+                );
+                return (Ty::Unknown, quote! { WG_SKIP });
+            };
+            if tok_str(&inner_path.path) == "M31 :: from" {
+                if let Some(arg) = inner.args.first() {
+                    if let Expr::Path(path) = strip_parens(arg) {
+                        let name = tok_str(&path.path);
+                        if self.scalar_params.contains_key(&name) {
+                            return self.lower_path(path, target);
+                        }
+                    }
+                }
+            }
+        }
         match path.as_str() {
             "PackedUInt16 :: from_m31" => {
                 let (_t, a) = self.lower_arg(call.args.first());
@@ -2674,9 +2984,11 @@ impl Lowerer {
                 // census-only.
                 let (at, atok) = self.lower_arg(call.args.first());
                 match at {
-                    Ty::FeltW27Limbs => {
-                        self.emit_op(target, Ty::Felt252, quote! { eval.felt_from_w27_words(#atok) })
-                    }
+                    Ty::FeltW27Limbs => self.emit_op(
+                        target,
+                        Ty::Felt252,
+                        quote! { eval.felt_from_w27_words(#atok) },
+                    ),
                     Ty::FeltW27 => self.w27_site(Ty::Felt252),
                     other => {
                         self.skip(
@@ -2780,6 +3092,61 @@ impl Lowerer {
                     self.require_m31(&rt, "sigma deduce round", &call.args[0]);
                     let tok = self.bind(target, quote! { eval.deduce_blake_round_sigma(#rtok) });
                     return (known_deduce_output_ty(p).expect("Sigma in table"), tok);
+                }
+                if p == "PackedTripleXor32 :: deduce_output" {
+                    if let Some(tok) = self.lower_triple_xor_deduce(call, target) {
+                        return (Ty::U32, tok);
+                    }
+                    for a in &call.args {
+                        let _ = self.lower_aggregate(a);
+                    }
+                    self.skip(
+                        "deduce_output",
+                        "PackedTripleXor32::deduce_output shape changed".to_string(),
+                    );
+                    return (Ty::Unknown, quote! { WG_SKIP });
+                }
+                if p == "PackedPoseidonRoundKeys :: deduce_output" {
+                    if let Some(tok) = self.lower_poseidon_round_keys_deduce(call, target.clone()) {
+                        return (
+                            known_deduce_output_ty(p).expect("poseidon round keys in table"),
+                            tok,
+                        );
+                    }
+                }
+                if p == "PackedCube252 :: deduce_output" {
+                    if let Some(tok) = self.lower_poseidon_cube_deduce(call, target.clone()) {
+                        return (
+                            known_deduce_output_ty(p).expect("poseidon cube in table"),
+                            tok,
+                        );
+                    }
+                }
+                if p == "PackedPoseidonFullRoundChain :: deduce_output" {
+                    if let Some(tok) = self.lower_poseidon_chain_deduce(
+                        call,
+                        target.clone(),
+                        3,
+                        "deduce_poseidon_full_round_chain",
+                    ) {
+                        return (
+                            known_deduce_output_ty(p).expect("poseidon full chain in table"),
+                            tok,
+                        );
+                    }
+                }
+                if p == "PackedPoseidon3PartialRoundsChain :: deduce_output" {
+                    if let Some(tok) = self.lower_poseidon_chain_deduce(
+                        call,
+                        target.clone(),
+                        4,
+                        "deduce_poseidon_3_partial_rounds_chain",
+                    ) {
+                        return (
+                            known_deduce_output_ty(p).expect("poseidon partial chain in table"),
+                            tok,
+                        );
+                    }
                 }
                 // Census-only / unknown deduces: lower the args for REAL first
                 // (tuple/array shapes route through lower_aggregate, so their
@@ -2934,8 +3301,22 @@ impl Lowerer {
                 if lt.is_u16() && rt.is_u16() {
                     return self.emit_op(target, Ty::U16, quote! { eval.u16_xor(#ltok, #rtok) });
                 }
+                if lt.is_u16() {
+                    if let Ty::ConstU16(k) = rt {
+                        let r = self.materialize_u16_const(k);
+                        return self.emit_op(target, Ty::U16, quote! { eval.u16_xor(#ltok, #r) });
+                    }
+                }
+                if rt.is_u16() {
+                    if let Ty::ConstU16(k) = lt {
+                        let l = self.materialize_u16_const(k);
+                        return self.emit_op(target, Ty::U16, quote! { eval.u16_xor(#l, #rtok) });
+                    }
+                }
                 if lt.is_u32() && rt.is_u32() {
-                    return self.u32_site(Ty::U32);
+                    let l = self.u32ish_value(lt, ltok);
+                    let r = self.u32ish_value(rt, rtok);
+                    return self.emit_op(target, Ty::U32, quote! { eval.u32_xor(#l, #r) });
                 }
                 self.skip("binop", format!("`^` on {:?}/{:?}", lt, rt));
                 (Ty::Unknown, quote! { WG_SKIP })
@@ -3084,6 +3465,13 @@ impl Lowerer {
                     // Full-32-bit sub element (blake words): one raw word, stored via
                     // the u32 effect (the flat transport is raw lanes).
                     Ty::U32 => vec![SubLeaf { tok, u32: true }],
+                    Ty::ConstU32(v) => {
+                        let value = self.u32ish_value(Ty::ConstU32(v), tok);
+                        vec![SubLeaf {
+                            tok: value,
+                            u32: true,
+                        }]
+                    }
                     // Felt-valued sub element: 28 flat limb words (the canonical
                     // decomposition; the driver's `from_limbs` reconstruction is the
                     // exact inverse, so the receiver sees the identical felt).
@@ -3103,6 +3491,15 @@ impl Lowerer {
                             m31(tok)
                         })
                         .collect(),
+                    Ty::FeltW27Limbs => {
+                        let words = self.bind(Target::Temp, quote! { #tok });
+                        (0..FELTW27_LIMBS)
+                            .map(|j| {
+                                let jl = usize_lit(j);
+                                m31(self.bind(Target::Temp, quote! { #words[#jl] }))
+                            })
+                            .collect()
+                    }
                     _ => {
                         self.require_m31(&ty, "sub-input word", other);
                         vec![m31(tok)]
@@ -3237,8 +3634,23 @@ fn build_marked_block(
          /// (statement-independent — recorded once). EXTENDED ops (if any) surface in\n\
          /// `RecordingOutput::poison_ops` — the honest ISA-V2 census, not a failure."
     ));
-    let record_ctor: TokenStream = if matches!(lw.input_ty, Ty::Unknown) {
-        quote! { RecordingWitnessEval::new(#component) }
+    let record_ctor: TokenStream = if !lw.has_per_row_input && !lw.scalar_params.is_empty() {
+        // Stored-log-size writer: compact statement scalars occupy 0..K; the
+        // prepared input seed graph materializes those constants plus the
+        // enabler/iota tail directly in arena input columns.
+        let k = u32_lit(lw.scalar_params.len() as u32);
+        let ki = u32_lit(lw.scalar_params.len() as u32 + 1);
+        quote! { RecordingWitnessEval::with_slots(#component, #k, Some(#ki)) }
+    } else if matches!(lw.input_ty, Ty::Unknown) {
+        if lw.uses_iota {
+            // CasmState occupies slots 0..3 (pc/ap/fp/enabler). A rare opcode
+            // writer such as blake_compress_opcode also reads `Seq`; bind its
+            // explicit iota column at slot 4 instead of poisoning the entire
+            // dependent recording through the opcode-default `None` slot.
+            quote! { RecordingWitnessEval::with_slots(#component, 3, Some(4)) }
+        } else {
+            quote! { RecordingWitnessEval::new(#component) }
+        }
     } else {
         // Builtin slot layout: flat input words 0..K, enabler = K, iota = K+1 (when
         // the body reads it). The device lane MUST feed its input columns in this
@@ -3486,7 +3898,15 @@ fn generic_simd_tokens(component: &str, lw: &Lowerer, writer: &ItemFn) -> TokenS
     // lane). Builtin writers flatten their typed input tuple into the flat input
     // words IN SLOT ORDER — the exact depth-first order the transformer's
     // `Ty::InputAt` slot map assigned, so `eval.input(k)` reads word k.
-    let eval_input: TokenStream = if matches!(lw.input_ty, Ty::Unknown) {
+    let eval_input: TokenStream = if !lw.has_per_row_input {
+        let mut scalar_params = lw.scalar_params.iter().collect::<Vec<_>>();
+        scalar_params.sort_unstable_by_key(|(_, slot)| **slot);
+        let scalar_ids = scalar_params
+            .into_iter()
+            .map(|(name, _)| Ident::new(name, Span::call_site()))
+            .collect::<Vec<_>>();
+        quote! { vec![ #(Simd::splat(#scalar_ids)),* ] }
+    } else if matches!(lw.input_ty, Ty::Unknown) {
         quote! { #input_id }
     } else {
         // Builtin flat input words, IN SLOT ORDER: [flattened inputs (0..K), a zero
@@ -3539,14 +3959,8 @@ fn generic_simd_tokens(component: &str, lw: &Lowerer, writer: &ItemFn) -> TokenS
         quote! { let enabler_col = Enabler::new(0); }
     };
 
-    quote! {
-        #[allow(clippy::type_complexity)]
-        #[allow(unused_variables)]
-        #[allow(dead_code)]
-        fn write_trace_generic_simd(#inputs) #output {
-            #(#preamble)*
-            #enabler_fallback
-
+    let row_loop = if lw.has_per_row_input {
+        quote! {
             (
                 trace.par_iter_mut(),
                 #lookup_id.par_iter_mut(),
@@ -3574,6 +3988,47 @@ fn generic_simd_tokens(component: &str, lw: &Lowerer, writer: &ItemFn) -> TokenS
                     let sw = eval.sub_scratch();
                     #(#reconstruct_sub)*
                 });
+        }
+    } else {
+        quote! {
+            (
+                trace.par_iter_mut(),
+                #lookup_id.par_iter_mut(),
+                #sub_id.par_iter_mut(),
+            )
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(row_index, (#row_id, #lookup_id, #sub_id))| {
+                    let mut eval = SimdWitnessEval::new(
+                        #row_id,
+                        #addr_id,
+                        #big_id,
+                        #eval_input,
+                        row_index,
+                        &enabler_col,
+                        N_LOOKUP_WORDS,
+                        N_SUB_INPUT_WORDS,
+                    );
+                    #row_body_fn(&mut eval);
+
+                    let lw = eval.lookup_scratch();
+                    #(#reconstruct_lookup)*
+
+                    let sw = eval.sub_scratch();
+                    #(#reconstruct_sub)*
+                });
+        }
+    };
+
+    quote! {
+        #[allow(clippy::type_complexity)]
+        #[allow(unused_variables)]
+        #[allow(dead_code)]
+        fn write_trace_generic_simd(#inputs) #output {
+            #(#preamble)*
+            #enabler_fallback
+
+            #row_loop
 
             (trace, #lookup_id, #sub_id)
         }
@@ -3681,6 +4136,18 @@ fn rebuild_shape(shape: &Shape, idx: &mut usize) -> TokenStream {
                 .collect();
             quote! { PackedFelt252::from_limbs([ #(#limbs),* ]) }
         }
+        Shape::FeltW27 => {
+            // Ten consecutive canonical 27-bit words. Each word is below M31::P,
+            // so the raw transport can be reconstructed without reduction.
+            let limbs: Vec<TokenStream> = (0..FELTW27_LIMBS)
+                .map(|_| {
+                    let i = usize_lit(*idx);
+                    *idx += 1;
+                    quote! { unsafe { PackedM31::from_simd_unchecked(sw[#i]) } }
+                })
+                .collect();
+            quote! { PackedFelt252Width27::from_limbs([ #(#limbs),* ]) }
+        }
         Shape::Tuple(v) => {
             let parts: Vec<TokenStream> = v.iter().map(|s| rebuild_shape(s, idx)).collect();
             quote! { ( #(#parts),* ) }
@@ -3776,6 +4243,12 @@ fn shape_projection(shape: &Shape, base: TokenStream) -> Vec<TokenStream> {
                 quote! { #base.get_m31(#lit).into_simd() }
             })
             .collect(),
+        Shape::FeltW27 => (0..FELTW27_LIMBS)
+            .map(|j| {
+                let lit = usize_lit(j);
+                quote! { #base.get_m31(#lit).into_simd() }
+            })
+            .collect(),
         Shape::Tuple(v) => {
             let mut out = Vec::new();
             for (i, s) in v.iter().enumerate() {
@@ -3850,10 +4323,9 @@ fn generic_simd_diff_fn_tokens(writer: &ItemFn, file: &syn::File) -> TokenStream
             }
         }
     }
-    let rest = &names[1..];
-    let rest_first: Vec<TokenStream> = names[1..]
+    let first_call: Vec<TokenStream> = names
         .iter()
-        .zip(&by_value[1..])
+        .zip(&by_value)
         .map(|(n, bv)| {
             if *bv {
                 quote! { #n.clone() }
@@ -3862,11 +4334,12 @@ fn generic_simd_diff_fn_tokens(writer: &ItemFn, file: &syn::File) -> TokenStream
             }
         })
         .collect();
+    let second_call = &names;
     quote! {
         #[cfg(test)]
         pub(crate) fn generic_simd_diff(#inputs) -> GenericSimdDiff {
-            let (trace_o, ld_o, sci_o) = write_trace_simd(inputs.clone(), #(#rest_first),*);
-            let (trace_g, ld_g, sci_g) = write_trace_generic_simd(inputs, #(#rest),*);
+            let (trace_o, ld_o, sci_o) = write_trace_simd(#(#first_call),*);
+            let (trace_g, ld_g, sci_g) = write_trace_generic_simd(#(#second_call),*);
 
             let log_size = trace_o.log_size();
             let orig_rows = (0..(1usize << log_size))
@@ -4077,6 +4550,20 @@ fn known_deduce_output_ty(path: &str) -> Option<Ty> {
         | "PackedPedersenPointsTableWindowBits9 :: deduce_output" => Some(felt2()),
         "PackedBlakeG :: deduce_output" => Some(Ty::Array(Box::new(Ty::U32), 4)),
         "PackedBlakeRoundSigma :: deduce_output" => Some(Ty::Array(Box::new(Ty::M31), 16)),
+        "PackedPoseidonRoundKeys :: deduce_output" => {
+            Some(Ty::Array(Box::new(Ty::FeltW27Limbs), 3))
+        }
+        "PackedCube252 :: deduce_output" => Some(Ty::FeltW27Limbs),
+        "PackedPoseidonFullRoundChain :: deduce_output" => Some(Ty::Tuple(vec![
+            Ty::M31,
+            Ty::M31,
+            Ty::Array(Box::new(Ty::FeltW27Limbs), 3),
+        ])),
+        "PackedPoseidon3PartialRoundsChain :: deduce_output" => Some(Ty::Tuple(vec![
+            Ty::M31,
+            Ty::M31,
+            Ty::Array(Box::new(Ty::FeltW27Limbs), 4),
+        ])),
         _ => None,
     }
 }
@@ -4347,6 +4834,12 @@ fn run_census(files: &[PathBuf]) -> ExitCode {
     let handled: BTreeSet<&str> = [
         "memory_address_to_id_state.deduce_output",
         "memory_id_to_big_state.deduce_output",
+        "blake_round_state.deduce_output",
+        "PackedTripleXor32::deduce_output",
+        "PackedPoseidonRoundKeys::deduce_output",
+        "PackedCube252::deduce_output",
+        "PackedPoseidonFullRoundChain::deduce_output",
+        "PackedPoseidon3PartialRoundsChain::deduce_output",
     ]
     .into_iter()
     .collect();
@@ -4647,6 +5140,8 @@ mod tests {
             Some("memory_id_to_big_state".to_string()),
             "add_opcode_input".to_string(),
             input_ty,
+            true,
+            vec![],
             "row_index".to_string(),
             "row".to_string(),
             "lookup_data".to_string(),
@@ -4831,6 +5326,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn poseidon_deduces_lower_to_compact_width27_hooks() {
+        let w27 = Ty::FeltW27;
+        let input_ty = Ty::Tuple(vec![Ty::M31, Ty::M31, Ty::Array(Box::new(w27), 4)]);
+        let body = "let keys = PackedPoseidonRoundKeys::deduce_output([add_opcode_input.1]); \
+             let cube = PackedCube252::deduce_output(add_opcode_input.2[0]); \
+             let full = PackedPoseidonFullRoundChain::deduce_output((add_opcode_input.0, \
+                 add_opcode_input.1, [add_opcode_input.2[0], add_opcode_input.2[1], \
+                 add_opcode_input.2[2]])); \
+             let partial = PackedPoseidon3PartialRoundsChain::deduce_output((add_opcode_input.0, \
+                 add_opcode_input.1, [add_opcode_input.2[0], add_opcode_input.2[1], \
+                 add_opcode_input.2[2], add_opcode_input.2[3]])); \
+             let a = keys[0].get_m31(9); let b = cube.get_m31(0); \
+             let c = full.2[2].get_m31(5); let d = partial.2[3].get_m31(7);";
+        let lw = lower_snippet_full(&[], BTreeMap::new(), input_ty, body, vec![]);
+        assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
+        assert_eq!(lw.deduce_sites, 0);
+        assert_eq!(lw.w27_sites, 0);
+        let source = lw.out.iter().map(ToString::to_string).collect::<String>();
+        for hook in [
+            "deduce_poseidon_round_keys",
+            "deduce_cube_252",
+            "deduce_poseidon_full_round_chain",
+            "deduce_poseidon_3_partial_rounds_chain",
+        ] {
+            assert!(source.contains(hook), "missing {hook}: {source}");
+        }
+    }
+
     /// An UNHOOKED known-signature deduce (W9) stays census-only: result typed (so
     /// projections resolve skip-free) but `deduce_sites` counts it and blocks emission.
     #[test]
@@ -4879,6 +5403,31 @@ mod tests {
         assert!(body.contains("eval . u32_high ("), "body: {body}");
         assert_eq!(lw.env["z"], Ty::M31);
         assert_eq!(lw.env["w"], Ty::M31);
+    }
+
+    #[test]
+    fn blake_compress_deduces_lower_to_existing_recorder_ops() {
+        let words = vec!["u"; 16].join(", ");
+        let body = format!(
+            "let u = PackedUInt32::from_m31(add_opcode_input.pc); \
+             let round = blake_round_state.deduce_output((add_opcode_input.pc, \
+             add_opcode_input.ap, ([{words}], add_opcode_input.fp))); \
+             let xor = PackedTripleXor32::deduce_output([round.2.0[0], \
+             round.2.0[8], u]); \
+             let low = xor.low().as_m31();"
+        );
+        let lw = lower_snippet(&[], &body);
+        assert!(lw.skips.is_empty(), "skips: {:?}", lw.skips);
+        assert_eq!(lw.deduce_sites, 0);
+        assert_eq!(lw.u32_sites, 0);
+        assert_eq!(lw.env["low"], Ty::M31);
+        let body = lw.out.iter().map(|t| t.to_string()).collect::<String>();
+        assert!(body.contains("eval . deduce_blake_round ("), "body: {body}");
+        assert!(
+            body.contains("eval . deduce_triple_xor_32 ("),
+            "body: {body}"
+        );
+        assert!(!body.contains("WG_"), "body: {body}");
     }
 
     #[test]
@@ -5164,7 +5713,10 @@ mod tests {
         assert_eq!(lw.w27_sites, 0);
         assert_eq!(lw.input_sites, 0);
         let body = lw.out.iter().map(|t| t.to_string()).collect::<String>();
-        assert!(body.contains("eval . felt_from_w27_words ("), "body: {body}");
+        assert!(
+            body.contains("eval . felt_from_w27_words ("),
+            "body: {body}"
+        );
         assert!(body.contains("eval . input ("), "body: {body}");
     }
 

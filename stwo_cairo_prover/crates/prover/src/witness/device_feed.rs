@@ -15,6 +15,16 @@
 //! Driven entirely by the transformer-emitted `SUB_FEED_LAYOUT` facts:
 //! `(field, instance, state param, relation_index, word_base, words/instance)`.
 
+use std::sync::Arc;
+
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
+
+use crate::witness::components::{
+    blake_round_sigma, range_check_3_3_3_3_3, range_check_4_4, range_check_4_4_4_4,
+    range_check_7_2_5, range_check_9_9, verify_bitwise_xor_4, verify_bitwise_xor_7,
+    verify_bitwise_xor_8, verify_bitwise_xor_9,
+};
+
 /// One count-style relation family the driver knows how to feed: how to key it
 /// (per-word bit widths folded MSB-first, exactly the host tuple order) and
 /// whether the key needs the consumer's `input_to_row` LUT (the actual
@@ -37,7 +47,9 @@ pub struct CountRelation {
     /// Descriptor kind: 0 = fold(+offset)(+LUT); 1 = MEM-ID DECODE
     /// (memory_id_to_big: tag = id >> 30 → big/small tables, val = low 30 bits;
     /// DEFAULT_ID skipped; the small table is a SECOND counts slot named
-    /// `"<state_param>#small"`).
+    /// `"<state_param>#small"`); 2 = canonical dependent XOR LUT keyed by
+    /// `(a << bits) | b` after checking the recorded third word is `a ^ b`;
+    /// 3 = xor12's closed-form 16-column expanded table.
     pub kind: u32,
     /// Signed key offset applied after the fold (memory_address_to_id feeds
     /// addresses; rows are `addr - 1`).
@@ -162,6 +174,51 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         key_offset: 0,
     },
     CountRelation {
+        state_param: "verify_bitwise_xor_4_state",
+        word_bits: &[4, 4, 4],
+        table_size: 1 << 8,
+        n_relations: 1,
+        needs_lut: true,
+        kind: 2,
+        key_offset: 0,
+    },
+    CountRelation {
+        state_param: "verify_bitwise_xor_7_state",
+        word_bits: &[7, 7, 7],
+        table_size: 1 << 14,
+        n_relations: 1,
+        needs_lut: true,
+        kind: 2,
+        key_offset: 0,
+    },
+    CountRelation {
+        state_param: "verify_bitwise_xor_8_state",
+        word_bits: &[8, 8, 8],
+        table_size: 1 << 16,
+        n_relations: 2,
+        needs_lut: true,
+        kind: 2,
+        key_offset: 0,
+    },
+    CountRelation {
+        state_param: "verify_bitwise_xor_9_state",
+        word_bits: &[9, 9, 9],
+        table_size: 1 << 18,
+        n_relations: 1,
+        needs_lut: true,
+        kind: 2,
+        key_offset: 0,
+    },
+    CountRelation {
+        state_param: "verify_bitwise_xor_12_state",
+        word_bits: &[12, 12, 12],
+        table_size: 1 << 20,
+        n_relations: 16,
+        needs_lut: false,
+        kind: 3,
+        key_offset: 0,
+    },
+    CountRelation {
         state_param: "blake_round_sigma_state",
         word_bits: &[4],
         table_size: 16,
@@ -171,6 +228,60 @@ pub const COUNT_RELATIONS: &[CountRelation] = &[
         key_offset: 0,
     },
 ];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnsupportedCanonicalCountLut(pub &'static str);
+
+impl core::fmt::Display for UnsupportedCanonicalCountLut {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "no canonical count-feed LUT provider for {}", self.0)
+    }
+}
+
+impl std::error::Error for UnsupportedCanonicalCountLut {}
+
+/// Build the exact input-to-preprocessed-row permutation used by the host
+/// consumer. Callers only request families marked `needs_lut` in
+/// [`COUNT_RELATIONS`]; an unregistered family fails closed.
+pub fn canonical_count_lut(
+    state_param: &'static str,
+    preprocessed_trace: Arc<PreProcessedTrace>,
+) -> Result<Vec<u32>, UnsupportedCanonicalCountLut> {
+    let lut = match state_param {
+        "range_check_9_9_state" => {
+            range_check_9_9::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "range_check_4_4_state" => {
+            range_check_4_4::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "range_check_4_4_4_4_state" => {
+            range_check_4_4_4_4::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "range_check_3_3_3_3_3_state" => {
+            range_check_3_3_3_3_3::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "range_check_7_2_5_state" => {
+            range_check_7_2_5::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "blake_round_sigma_state" => {
+            blake_round_sigma::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "verify_bitwise_xor_4_state" => {
+            verify_bitwise_xor_4::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "verify_bitwise_xor_7_state" => {
+            verify_bitwise_xor_7::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "verify_bitwise_xor_8_state" => {
+            verify_bitwise_xor_8::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        "verify_bitwise_xor_9_state" => {
+            verify_bitwise_xor_9::ClaimGenerator::new(preprocessed_trace).input_to_row_lut()
+        }
+        _ => return Err(UnsupportedCanonicalCountLut(state_param)),
+    };
+    Ok(lut)
+}
 
 /// Pure-Rust mirror of `witness_feed_counts_kernel` — the SAME descriptors,
 /// fold, LUT indirection, and bounds behavior, over the word-major flats. The
@@ -206,6 +317,34 @@ pub fn host_feed_counts(
                     }
                     _ => {}
                 }
+                continue;
+            }
+            if kind == 2 {
+                let bits = e[2];
+                let mask = (1u32 << bits) - 1;
+                let a = sub_flat[word_base * n_rows + row];
+                let b = sub_flat[(word_base + 1) * n_rows + row];
+                let c = sub_flat[(word_base + 2) * n_rows + row];
+                if (a | b | c) > mask || c != (a ^ b) {
+                    continue;
+                }
+                let key = ((a << bits) | b) as usize;
+                let idx = luts[e[9] as usize][key] as usize;
+                if idx < table_size {
+                    counts[e[10] as usize][e[7] as usize * table_size + idx] += 1;
+                }
+                continue;
+            }
+            if kind == 3 {
+                let a = sub_flat[word_base * n_rows + row];
+                let b = sub_flat[(word_base + 1) * n_rows + row];
+                let c = sub_flat[(word_base + 2) * n_rows + row];
+                if (a | b | c) >= (1 << 12) || c != (a ^ b) {
+                    continue;
+                }
+                let column = ((a >> 10) << 2) | (b >> 10);
+                let table_row = ((a & 0x3ff) << 10) | (b & 0x3ff);
+                counts[e[10] as usize][column as usize * table_size + table_row as usize] += 1;
                 continue;
             }
             let mut key: u64 = 0;
@@ -418,5 +557,61 @@ mod tests {
         let layout: &[(&str, usize, &str, u32, usize, usize)] =
             &[("rc", 0, "range_check_9_9_state", 0, 0, 3)];
         let _ = build_feed_descriptors(layout, &[RC99]);
+    }
+
+    #[test]
+    fn runtime_memory_and_xor_descriptors_are_not_skipped() {
+        let layout: &[(&str, usize, &str, u32, usize, usize)] = &[
+            ("addr", 0, "memory_address_to_id_state", 0, 0, 1),
+            ("id", 0, "memory_id_to_big_state", 0, 1, 1),
+            ("xor8", 0, "verify_bitwise_xor_8_state", 1, 2, 3),
+            ("xor12", 0, "verify_bitwise_xor_12_state", 0, 5, 3),
+        ];
+        let (descriptors, luts, counts, sizes) =
+            build_feed_descriptors_sized(layout, COUNT_RELATIONS, &|state| match state {
+                "memory_address_to_id_state" => Some((256, 0)),
+                "memory_id_to_big_state" => Some((80, 16)),
+                _ => None,
+            });
+        assert_eq!(descriptors.len(), 4 * WFC_DESC_STRIDE);
+        assert_eq!(luts, ["verify_bitwise_xor_8_state"]);
+        assert_eq!(
+            counts,
+            [
+                "memory_address_to_id_state",
+                "memory_id_to_big_state",
+                "memory_id_to_big_state#small",
+                "verify_bitwise_xor_8_state",
+                "verify_bitwise_xor_12_state",
+            ]
+        );
+        assert_eq!(sizes, [256, 80, 16, 2 * (1 << 16), 16 * (1 << 20)]);
+        assert_eq!(descriptors[11], 0);
+        assert_eq!(descriptors[WFC_DESC_STRIDE + 11], 1);
+        assert_eq!(descriptors[2 * WFC_DESC_STRIDE + 11], 2);
+        assert_eq!(descriptors[3 * WFC_DESC_STRIDE + 11], 3);
+    }
+
+    #[test]
+    fn host_xor_feed_validates_result_and_uses_pair_key() {
+        let relation = CountRelation {
+            state_param: "verify_bitwise_xor_4_state",
+            word_bits: &[4, 4, 4],
+            table_size: 1 << 8,
+            n_relations: 1,
+            needs_lut: true,
+            kind: 2,
+            key_offset: 0,
+        };
+        let layout = [("xor", 0, relation.state_param, 0, 0, 3)];
+        let (descriptors, ..) = build_feed_descriptors(&layout, &[relation]);
+        let rows = 3;
+        let source = vec![1, 2, 3, 4, 5, 6, 5, 7, 0];
+        let lut = (0..256u32).rev().collect::<Vec<_>>();
+        let mut counts = vec![vec![0u32; 256]];
+        host_feed_counts(&source, rows, &descriptors, &[lut], &mut counts);
+        assert_eq!(counts[0].iter().sum::<u32>(), 2);
+        assert_eq!(counts[0][255 - ((1 << 4) | 4)], 1);
+        assert_eq!(counts[0][255 - ((2 << 4) | 5)], 1);
     }
 }

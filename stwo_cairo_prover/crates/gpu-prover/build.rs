@@ -2,6 +2,20 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // Native CUDA integration targets are compiled only when the sibling STWO
+    // kernel archive is available. Declare the build-script cfg so CPU checks
+    // do not hide a misspelled gate behind `unexpected_cfgs` warnings.
+    println!("cargo:rustc-check-cfg=cfg(stwo_cuda_link)");
+    println!("cargo:rerun-if-env-changed=STWO_CUDA_NVCC");
+    let nvcc = std::env::var("STWO_CUDA_NVCC").unwrap_or_else(|_| "nvcc".to_string());
+    if Command::new(nvcc)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        println!("cargo:rustc-cfg=stwo_cuda_link");
+    }
+
     // The bootloader JSON is only needed for the CairoPie ingestion path in
     // gpu_bench, which is compiled solely under the `pie-bench` feature. When the
     // feature is off, cairo-program-runner-lib is not in the dependency tree, so we

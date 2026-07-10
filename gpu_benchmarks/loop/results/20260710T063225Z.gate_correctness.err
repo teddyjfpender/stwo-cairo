@@ -1,0 +1,108 @@
+stwo witness-JIT: registered dynamic program component=jump_opcode_double_deref instrs=246
+stwo witness-JIT: registered dynamic program component=mul_opcode instrs=1955
+stwo witness-JIT: registered dynamic program component=jnz_opcode_non_taken instrs=137
+stwo witness-JIT: registered dynamic program component=jump_opcode_rel instrs=192
+stwo witness-JIT: registered dynamic program component=call_opcode_abs instrs=252
+stwo witness-JIT: registered dynamic program component=call_opcode_rel_imm instrs=237
+stwo witness-JIT: registered dynamic program component=add_ap_opcode instrs=211
+stwo witness-JIT: registered dynamic program component=mul_opcode_small instrs=395
+stwo witness-JIT: registered dynamic program component=jump_opcode_rel_imm instrs=149
+stwo witness-JIT: registered dynamic program component=blake_compress_opcode instrs=4843
+stwo witness-JIT: registered dynamic program component=assert_eq_opcode_imm instrs=112
+stwo witness-JIT: registered dynamic program component=ret_opcode instrs=168
+stwo witness-JIT: registered dynamic program component=jnz_opcode_taken instrs=318
+stwo witness-JIT: registered dynamic program component=assert_eq_opcode instrs=151
+stwo witness-JIT: registered dynamic program component=add_opcode instrs=483
+stwo witness-JIT: registered dynamic program component=add_opcode_small instrs=428
+stwo witness-JIT: registered dynamic program component=assert_eq_opcode_double_deref instrs=223
+STWO_CUDA_STREAM_FANOUT: B2 engaged - witness lanes fanning out across 4 pool streams (fork/join bridged per lane)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_a2cb569f891013bf key=8960ed0c4f5471f1 (embedded sm_90 cubin)
+jit_prove[jump_opcode_double_deref]: device witness 358 real rows (log_size 9) in 99.7 ms
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_ce0ddfc37a60580e key=8a9b635b3632951d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_e17e872ded26ebd1 key=f4f9f2d99d1f754c (embedded sm_90 cubin)
+jit_prove[call_opcode_rel_imm]: device witness 258007 real rows (log_size 18) in 111.2 ms
+jit_prove[assert_eq_opcode_imm]: device witness 478552 real rows (log_size 19) in 114.6 ms
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_1ab1e90dff938797 key=eb01372078a125a5 (embedded sm_90 cubin)
+jit_prove[jnz_opcode_non_taken]: device witness 115005 real rows (log_size stwo JIT: AOT pack hit kernel=stwo_jit_witness_c7457acb39874135 key=e2a113da6c12dbaf (embedded sm_90 cubin)
+17) in 124.1 ms
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_d94540f2fd219001 key=0e3ee6a4b1a9e377 (embedded sm_90 cubin)
+jit_prove[jump_opcode_rel]: device witness 903 real rows (log_size 10) in 126.0 ms
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_a290ddc144ee416a key=a6039b6bff8b22ef (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_7db50b96e3fbaedb key=db5eefc5907d751e (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_d467876d34b895c1 key=84dc774d59dbf259 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_3343f9826788070c key=f2d4eb1d843bd30f (embedded sm_90 cubin)
+jit_prove[call_opcode_abs]: device witness 359 real rows (log_size 9) in 142.7 ms
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_c4b01b327c2ce2a3 key=d6388950568aa2f2 (embedded sm_90 cubin)
+jit_prove[add_ap_opcode]: device witness 402083 real rows (log_size 19) in 143.6 ms
+jit_prove[ret_opcode]: device witness 258366 real rows (log_size 18) in 148.0 ms
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_06f670fcbec124d8 key=ac724c0d449fc233 (embedded sm_90 cubin)
+jit_prove[jump_opcode_rel_imm]: device witness 356937 real rows (log_size 19) in 157.4 ms
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_643d6ea7402e00f9 key=cc48471aab297a13 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_b37424b6011f268e key=5b26608f6340c08f (embedded sm_90 cubin)
+jit_prove[mul_opcode_small]: device witness 379774 real rows (log_size 19) in 175.0 ms
+jit_prove[assert_eq_opcode_imm]: device mem count feed merged 1 families
+jit_prove[call_opcode_rel_imm]: device mem count feed merged 2 families
+jit_prove[jump_opcode_double_deref]: device mem count feed merged 2 families
+jit_prove[jump_opcode_rel]: device mem count feed merged 2 families
+jit_prove[assert_eq_opcode]: device witness 957056 real rows (log_size 20) in 199.4 ms
+jit_prove[jnz_opcode_non_taken]: device mem count feed merged 2 families
+jit_prove[add_ap_opcode]: device count feed merged 5 relation families
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_b2fee5fd862cd589 key=8944d004f312cf06 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_1535458b582bc8dc key=bdb4bcf37e519bb9 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_e1a1073e17a88ffa key=88f4119771434863 (embedded sm_90 cubin)
+jit_prove[jump_opcode_rel_imm]: device mem count feed merged 2 families
+jit_prove[call_opcode_abs]: device mem count feed merged 2 families
+jit_prove[ret_opcode]: device mem count feed merged 2 families
+jit_prove[assert_eq_opcode_double_deref]: device witness 1798509 real rows (log_size 21) in 247.5 ms
+jit_prove[mul_opcode_small]: device count feed merged 4 relation families
+jit_prove[mul_opcode]: device witness 130858 real rows (log_size 17) in 250.6 ms
+jit_prove[jnz_opcode_taken]: device witness 569029 real rows (log_size 20) in 252.1 ms
+jit_prove[add_opcode_small]: device witness 1579491 real rows (log_size 21) in 266.4 ms
+jit_prove[assert_eq_opcode]: device mem count feed merged 1 families
+jit_prove[add_opcode]: device witness 651967 real rows (log_size 20) in 297.4 ms
+jit_prove[add_opcode_small]: device mem count feed merged 2 families
+jit_prove[blake_compress_opcode]: device witness 40143 real rows (log_size 16) in 318.9 ms
+jit_prove[assert_eq_opcode_double_deref]: device mem count feed merged 2 families
+jit_prove[jnz_opcode_taken]: device mem count feed merged 2 families
+jit_prove[add_opcode]: device mem count feed merged 2 families
+jit_prove[blake_compress_opcode]: device count feed merged 4 relation families
+jit_prove[mul_opcode]: device count feed merged 4 relation families
+jit_prove[blake_compress_opcode]: stashed device edge for blake_round (host recovery mirror retained)
+stwo witness-JIT: registered dynamic program component=blake_round instrs=2178
+stwo witness-JIT: registered dynamic program component=verify_instruction instrs=123
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_17255b30022f129d key=dbe595d1b96f44f3 (embedded sm_90 cubin)
+jit_prove[verify_instruction]: device witness 51638 real rows (log_size 16) in 17.7 ms
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_f18358c8a451335f key=525f7feff197f98f (embedded sm_90 cubin)
+jit_prove[blake_round]: device witness 655360 real rows (log_size 20) in 26.0 ms
+jit_prove[verify_instruction]: device count feed merged 4 relation families
+jit_prove[blake_round]: device count feed merged 5 relation families
+jit_prove[blake_round]: stashed device edge for blake_g (host recovery mirror skipped)
+
+thread '<unnamed>' panicked at crates/prover/src/witness/components/blake_round.rs:6979:5:
+assertion `left == right` failed: sub layout drift
+  left: 0
+ right: 135266304
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+pedersen table: registered HOST-BUILT table on device (56 cols x 8388608 rows, borrowed mode)
+stwo witness-JIT: registered dynamic program component=pedersen_aggregator_window_bits_18 instrs=5005
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_b0eb28f739a39f20 key=f971534fb6886595 (embedded sm_90 cubin)
+jit_prove[pedersen_aggregator_window_bits_18]: device witness 18258 real rows (log_size 15) in 280.2 ms
+jit_prove[pedersen_aggregator_window_bits_18]: device count feed merged 3 relation families
+jit_prove[pedersen_aggregator_window_bits_18]: stashed device edge for partial_ec_mul_window_bits_18 (host recovery mirror skipped)
+
+thread '<unnamed>' panicked at crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:15136:5:
+assertion `left == right` failed: sub layout drift
+  left: 0
+ right: 66289664
+stwo witness-JIT: registered dynamic program component=cube_252 instrs=3619
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_22ad07ddaf1c1605 key=97cc1dd4a54b4ab1 (embedded sm_90 cubin)
+jit_prove[cube_252]: device witness 499712 real rows (log_size 19) in 9.3 ms
+jit_prove[cube_252]: device count feed merged 2 relation families
+stwo witness-JIT: registered dynamic program component=range_check_252_width_27 instrs=289
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_ad984cdbe607f973 key=4f0444b9eef90425 (embedded sm_90 cubin)
+stwo witness-JIT: registered dynamic program component=partial_ec_mul_generic instrs=17000
+jit_prove[range_check_252_width_27]: device witness 401408 real rows (log_size 19) in 26.9 ms
+jit_prove[range_check_252_width_27]: device count feed merged 2 relation families
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_945de91f8879d0ac key=3352e08a617734bc (embedded sm_90 cubin)
+jit_prove[partial_ec_mul_generic]: device witness 258048 real rows (log_size 18) in 44.7 ms
+jit_prove[partial_ec_mul_generic]: device count feed merged 3 relation families

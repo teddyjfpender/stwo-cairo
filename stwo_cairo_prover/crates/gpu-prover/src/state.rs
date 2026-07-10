@@ -14,7 +14,9 @@ use stwo_cairo_prover::witness::blake_g_witness_backend::BlakeGWitness;
 use stwo_cairo_prover::witness::cairo_claim_generator::{
     CairoClaimGenerator, CairoInteractionClaimGenerator,
 };
-use stwo_cairo_prover::witness::exec_context::{WitnessArtifactPlan, WitnessExecContext};
+use stwo_cairo_prover::witness::exec_context::{
+    ResidentWitnessPlan, WitnessArtifactPlan, WitnessExecContext,
+};
 use stwo_cairo_prover::witness::memory_witness_backend::MemoryIdToBigWitness;
 
 use crate::plan::ProofPlan;
@@ -47,6 +49,22 @@ impl DeviceProofState {
             witness_exec_context: WitnessExecContext::planned_with_shape(
                 witness_artifact_plan,
                 planned_shape,
+            ),
+            proof_plan,
+        }
+    }
+
+    pub fn new_resident(
+        witness_artifact_plan: Arc<WitnessArtifactPlan>,
+        proof_plan: Arc<ProofPlan>,
+        resident_witness: ResidentWitnessPlan,
+    ) -> Self {
+        let planned_shape = proof_plan.proof_shape().clone();
+        Self {
+            witness_exec_context: WitnessExecContext::planned_with_resident_witness(
+                witness_artifact_plan,
+                planned_shape,
+                resident_witness,
             ),
             proof_plan,
         }

@@ -2,35 +2,59 @@
 //!
 //! This module does not infer Cairo trace order. Commitment sources come from
 //! the plan's canonical identities; generated relation layouts bind their own
-//! trace/lookup columns. Only the quotient evaluation at the FRI seam remains a
-//! typed caller binding until the resident quotient graph lands.
+//! trace/lookup columns. OODS sampling, numerator construction and quotient-to-
+//! FRI binding are one checked resident pipeline.
 
 use core::ffi::c_void;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo_backend_cuda::{
-    ArenaError, ArenaSlice, CommitCoefficientColumn, CommitCoefficientGroup, CudaRuntimeError,
-    DeviceTranscriptError, PreparedBlake2sTranscript, PreparedCommitError, PreparedCommitGraph,
-    PreparedFriError, PreparedFriGraph, PreparedRelationGraph, RelationChallenges,
-    RelationGraphError, RelationInstanceSources, RelationSourceLayout, TranscriptInputBinding,
-    TranscriptInputId, TranscriptOutputBinding, TranscriptOutputId, TranscriptSegmentCursor,
+    ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitEvaluationGroup,
+    CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
+    DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError, ExecutionTablesHostData,
+    FriDecommitOwnedSources, MemoryBaseTracePart, PreparedBlake2sPowError, PreparedBlake2sPowGraph,
+    PreparedBlake2sTranscript, PreparedCommitError, PreparedCommitGraph, PreparedDecommitError,
+    PreparedDecommitGraph, PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
+    PreparedExecutionTablesError, PreparedExecutionTablesGraph,
+    PreparedExecutionTablesIngestTelemetry, PreparedFixedTableError, PreparedFixedTableGraph,
+    PreparedFriError, PreparedFriFinalError, PreparedFriFinalGraph, PreparedFriGraph,
+    PreparedInterpolationError, PreparedInterpolationGraph, PreparedMemoryBaseTraceError,
+    PreparedMemoryBaseTraceGraph, PreparedRelationGraph, PreparedWitnessError,
+    PreparedWitnessFeedClearGraph, PreparedWitnessFeedError, PreparedWitnessFeedGraph,
+    PreparedWitnessGraph, PreparedWitnessInputCompactGraph, PreparedWitnessInputGatherError,
+    PreparedWitnessInputGatherGraph, PreparedWitnessInputSeedGraph, PreparedWitnessMode,
+    RelationChallenges, RelationGraphError, RelationInstanceSources, RelationSourceLayout,
+    TraceDecommitSources, TraceSourceGroup, TranscriptInputBinding, TranscriptInputId,
+    TranscriptMirrorReport, TranscriptOutputBinding, TranscriptOutputId, TranscriptSegmentCursor,
     TranscriptSegmentStart,
 };
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
+use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
 use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
 
-use crate::arena_plan::{
-    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedCommitment,
+use crate::arena_plan::{BufferPurpose, CommitmentColumnSource, CommitmentTreeId};
+use crate::graphs::{GraphCaptureStatus, GraphError, GraphSegment, GraphWorkspace};
+use crate::multiplicity_pipeline::{FixedMultiplicityCoverageGap, MultiplicityFeedBlocker};
+use crate::proof_bundle::{
+    ResidentProofBundle, ResidentProofBundleError, ResidentProofBundleLayout,
 };
-use crate::graphs::{GraphError, GraphSegment, GraphWorkspace, PhaseGraph};
 use crate::relation::RelationTracePart;
 use crate::relation_execution::RelationBatchKey;
+use crate::resident_composition::{prepare_resident_composition, ResidentCompositionError};
+use crate::resident_oods::{ResidentOodsError, ResidentOodsPipeline};
+use crate::resident_sources::{
+    commitment_groups, prepare_commitment_interpolation, ResidentSourceStageError,
+};
+use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::transcript_plan::{
     CairoBlake2sTranscriptPlan, CairoTranscriptInput, CairoTranscriptOutput,
     CairoTranscriptSegment, TranscriptPlanError, TranscriptSegmentPlan,
 };
+use crate::{PreparedCompositionError, PreparedCompositionGraph};
 
 /// Complete cache identity of one materialized resident workspace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,18 +74,6 @@ impl ResidentWorkspaceIdentity {
     }
 }
 
-/// The four-coordinate quotient evaluation consumed by prepared FRI.
-#[derive(Clone, Copy, Debug)]
-pub struct ResidentFriBinding {
-    pub input_evaluation: ArenaSlice,
-}
-
-/// The quotient/FRI seam is the only source identity not yet carried by
-/// `ProofArenaPlan`; every relation and commitment column is auto-bound.
-pub struct ResidentSourceBindings {
-    pub fri: ResidentFriBinding,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResidentClaimedSum {
     pub batch: RelationBatchKey,
@@ -75,6 +87,77 @@ pub struct ResidentClaimedSum {
 pub struct InteractionTranscriptBoundary {
     pub root: Blake2sHash,
     pub claimed_sums: Vec<ResidentClaimedSum>,
+}
+
+struct ResidentProofBundleSources {
+    commitments: [ArenaSlice; 4],
+    interaction_claim: ArenaSlice,
+    interaction_pow: ArenaSlice,
+    sampled_values: ArenaSlice,
+    fri_commitments: Vec<ArenaSlice>,
+    final_line_poly: ArenaSlice,
+    query_pow: ArenaSlice,
+    decommitment: ArenaSlice,
+}
+
+pub struct ResidentWitnessInput<'a> {
+    pub component: &'static str,
+    pub columns: &'a [ResidentWitnessInputColumn<'a>],
+    pub seed_scalars: Option<&'a [u32]>,
+}
+
+pub struct ResidentWitnessInputColumn<'a> {
+    pub ordinal: usize,
+    pub words: &'a [u32],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResidentWitnessIngestReport {
+    pub components: usize,
+    pub columns: usize,
+    pub h2d_bytes: usize,
+    pub h2d_copies: usize,
+    pub sync_calls: usize,
+}
+
+/// Machine-checkable host-boundary budget for one warm resident replay. Setup,
+/// compact-input ingest and the final proof copy are measured separately; the
+/// transcript-bounded graph hot path itself must not cross PCIe or synchronize.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentHotPathBudget {
+    pub expected_graph_launches: u64,
+    pub max_kernel_launches: u64,
+    pub expected_sync_calls: u64,
+    pub max_h2d_bytes: u64,
+    pub expected_d2h_bytes: u64,
+    pub max_allocations: u64,
+    pub max_graph_submit_gap_ns: u64,
+}
+
+impl ResidentHotPathBudget {
+    pub const fn graph_only(expected_graph_launches: u64) -> Self {
+        Self {
+            expected_graph_launches,
+            max_kernel_launches: u64::MAX,
+            expected_sync_calls: 0,
+            max_h2d_bytes: 0,
+            expected_d2h_bytes: 0,
+            max_allocations: 0,
+            max_graph_submit_gap_ns: u64::MAX,
+        }
+    }
+
+    pub const fn final_bundle(expected_graph_launches: u64, d2h_bytes: u64) -> Self {
+        Self {
+            expected_graph_launches,
+            max_kernel_launches: 99,
+            expected_sync_calls: 1,
+            max_h2d_bytes: 0,
+            expected_d2h_bytes: d2h_bytes,
+            max_allocations: 0,
+            max_graph_submit_gap_ns: 49_999_999,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -96,6 +179,7 @@ pub enum ResidentRuntimeError {
         ordinal: u32,
     },
     MissingPreparedCommitment(CommitmentTreeId),
+    FixedPreprocessedCommitmentNotReady,
     TranscriptScheduleMismatch {
         expected: u64,
         actual: u64,
@@ -115,19 +199,88 @@ pub enum ResidentRuntimeError {
         actual_words: usize,
     },
     UnknownTranscriptRelationComponent(&'static str),
+    WitnessInputCoverage {
+        expected: usize,
+        actual: usize,
+    },
+    PreparedWitnessCoverage {
+        expected: usize,
+        actual: usize,
+    },
+    PreparedWitnessCaptureContract {
+        component: &'static str,
+        role: &'static str,
+    },
+    PreparedFixedTableCoverage {
+        expected: usize,
+        actual: usize,
+    },
+    PreparedFixedTableCaptureContract {
+        component: &'static str,
+        role: &'static str,
+    },
+    IncompleteFixedMultiplicityCoverage(Vec<FixedMultiplicityCoverageGap>),
+    UnsupportedMultiplicityFeeds(Vec<MultiplicityFeedBlocker>),
+    MissingPreprocessedTraceForMultiplicity,
+    CanonicalMultiplicityLut(&'static str),
+    MissingPreparedExecutionTables,
+    UnexpectedPreparedExecutionTables,
+    MissingPreparedEcOpSegment,
+    UnexpectedPreparedEcOpSegment,
+    PreparedEcOpCoverage(&'static str),
+    DuplicateWitnessInput(&'static str),
+    DuplicateWitnessInputColumn {
+        component: &'static str,
+        ordinal: usize,
+    },
+    UnexpectedGatheredWitnessHostInput(&'static str),
+    MissingPreparedWitness(&'static str),
+    WitnessInputColumnCount {
+        component: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    WitnessInputRowCount {
+        component: &'static str,
+        column: usize,
+        expected: usize,
+        actual: usize,
+    },
     StaleRelationChallenges,
     StaleFriChallenge(usize),
+    HotPathBudgetExceeded {
+        budget: ResidentHotPathBudget,
+        actual: CudaExecTelemetry,
+    },
     FriRoundOutOfOrder {
         expected: usize,
         actual: usize,
     },
     FriRoundIndexTooLarge(usize),
+    SizeOverflow,
     Arena(ArenaError),
     Cuda(CudaRuntimeError),
     Graph(GraphError),
     Commit(PreparedCommitError),
+    Interpolation(PreparedInterpolationError),
+    SourceStage(ResidentSourceStageError),
+    CompositionBinding(ResidentCompositionError),
+    Composition(PreparedCompositionError),
+    Oods(ResidentOodsError),
     Fri(PreparedFriError),
+    FriFinal(PreparedFriFinalError),
+    Pow(PreparedBlake2sPowError),
+    Decommit(PreparedDecommitError),
+    ProofBundle(ResidentProofBundleError),
+    DecommitTopologyMismatch(&'static str),
     Relation(RelationGraphError),
+    ExecutionTables(PreparedExecutionTablesError),
+    EcOp(PreparedEcOpError),
+    WitnessInputGather(PreparedWitnessInputGatherError),
+    Witness(PreparedWitnessError),
+    WitnessFeed(PreparedWitnessFeedError),
+    FixedTable(PreparedFixedTableError),
+    MemoryBaseTrace(PreparedMemoryBaseTraceError),
     DeviceTranscript(DeviceTranscriptError),
     TranscriptPlan(TranscriptPlanError),
 }
@@ -164,15 +317,111 @@ impl From<PreparedCommitError> for ResidentRuntimeError {
     }
 }
 
+impl From<PreparedInterpolationError> for ResidentRuntimeError {
+    fn from(value: PreparedInterpolationError) -> Self {
+        Self::Interpolation(value)
+    }
+}
+
+impl From<ResidentSourceStageError> for ResidentRuntimeError {
+    fn from(value: ResidentSourceStageError) -> Self {
+        Self::SourceStage(value)
+    }
+}
+
+impl From<ResidentCompositionError> for ResidentRuntimeError {
+    fn from(value: ResidentCompositionError) -> Self {
+        Self::CompositionBinding(value)
+    }
+}
+
+impl From<PreparedCompositionError> for ResidentRuntimeError {
+    fn from(value: PreparedCompositionError) -> Self {
+        Self::Composition(value)
+    }
+}
+
 impl From<PreparedFriError> for ResidentRuntimeError {
     fn from(value: PreparedFriError) -> Self {
         Self::Fri(value)
     }
 }
 
+impl From<PreparedFriFinalError> for ResidentRuntimeError {
+    fn from(value: PreparedFriFinalError) -> Self {
+        Self::FriFinal(value)
+    }
+}
+
+impl From<PreparedBlake2sPowError> for ResidentRuntimeError {
+    fn from(value: PreparedBlake2sPowError) -> Self {
+        Self::Pow(value)
+    }
+}
+
+impl From<PreparedDecommitError> for ResidentRuntimeError {
+    fn from(value: PreparedDecommitError) -> Self {
+        Self::Decommit(value)
+    }
+}
+
+impl From<ResidentProofBundleError> for ResidentRuntimeError {
+    fn from(value: ResidentProofBundleError) -> Self {
+        Self::ProofBundle(value)
+    }
+}
+
+impl From<ResidentOodsError> for ResidentRuntimeError {
+    fn from(value: ResidentOodsError) -> Self {
+        Self::Oods(value)
+    }
+}
+
 impl From<RelationGraphError> for ResidentRuntimeError {
     fn from(value: RelationGraphError) -> Self {
         Self::Relation(value)
+    }
+}
+
+impl From<PreparedExecutionTablesError> for ResidentRuntimeError {
+    fn from(value: PreparedExecutionTablesError) -> Self {
+        Self::ExecutionTables(value)
+    }
+}
+
+impl From<PreparedEcOpError> for ResidentRuntimeError {
+    fn from(value: PreparedEcOpError) -> Self {
+        Self::EcOp(value)
+    }
+}
+
+impl From<PreparedWitnessError> for ResidentRuntimeError {
+    fn from(value: PreparedWitnessError) -> Self {
+        Self::Witness(value)
+    }
+}
+
+impl From<PreparedWitnessInputGatherError> for ResidentRuntimeError {
+    fn from(value: PreparedWitnessInputGatherError) -> Self {
+        Self::WitnessInputGather(value)
+    }
+}
+
+impl From<PreparedWitnessFeedError> for ResidentRuntimeError {
+    fn from(value: PreparedWitnessFeedError) -> Self {
+        Self::WitnessFeed(value)
+    }
+}
+
+impl From<PreparedFixedTableError> for ResidentRuntimeError {
+    fn from(value: PreparedFixedTableError) -> Self {
+        Self::FixedTable(value)
+    }
+}
+
+impl From<PreparedMemoryBaseTraceError> for ResidentRuntimeError {
+    fn from(value: PreparedMemoryBaseTraceError) -> Self {
+        Self::MemoryBaseTrace(value)
     }
 }
 
@@ -191,8 +440,19 @@ impl From<TranscriptPlanError> for ResidentRuntimeError {
 #[derive(Debug)]
 enum ResidentLaunchError {
     Commit(PreparedCommitError),
+    Interpolation(PreparedInterpolationError),
+    Composition(PreparedCompositionError),
+    Oods(ResidentOodsError),
     Fri(PreparedFriError),
+    FriFinal(PreparedFriFinalError),
+    Pow(PreparedBlake2sPowError),
+    Decommit(PreparedDecommitError),
     Relation(RelationGraphError),
+    ExecutionTables(PreparedExecutionTablesError),
+    WitnessFeed(PreparedWitnessFeedError),
+    FixedTable(PreparedFixedTableError),
+    MemoryBaseTrace(PreparedMemoryBaseTraceError),
+    WitnessLanes(WitnessLaneLaunchError),
     Transcript(DeviceTranscriptError),
     Cuda(CudaRuntimeError),
     Binding(&'static str),
@@ -202,8 +462,31 @@ impl core::fmt::Display for ResidentLaunchError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Commit(error) => write!(f, "resident commitment launch rejected: {error}"),
+            Self::Interpolation(error) => {
+                write!(f, "resident interpolation launch rejected: {error}")
+            }
+            Self::Composition(error) => {
+                write!(f, "resident composition launch rejected: {error}")
+            }
+            Self::Oods(error) => write!(f, "resident OODS/quotient launch rejected: {error}"),
             Self::Fri(error) => write!(f, "resident FRI launch rejected: {error}"),
+            Self::FriFinal(error) => write!(f, "resident final FRI launch rejected: {error}"),
+            Self::Pow(error) => write!(f, "resident Blake2s PoW launch rejected: {error}"),
+            Self::Decommit(error) => write!(f, "resident decommit launch rejected: {error}"),
             Self::Relation(error) => write!(f, "resident relation launch rejected: {error}"),
+            Self::ExecutionTables(error) => {
+                write!(f, "resident execution-table launch rejected: {error}")
+            }
+            Self::WitnessFeed(error) => {
+                write!(f, "resident witness multiplicity feed rejected: {error}")
+            }
+            Self::FixedTable(error) => {
+                write!(f, "resident fixed-table materializer rejected: {error}")
+            }
+            Self::MemoryBaseTrace(error) => {
+                write!(f, "resident memory base trace rejected: {error}")
+            }
+            Self::WitnessLanes(error) => write!(f, "resident witness lanes rejected: {error}"),
             Self::Transcript(error) => write!(f, "resident transcript launch rejected: {error}"),
             Self::Cuda(error) => write!(f, "resident CUDA handoff rejected: {error}"),
             Self::Binding(role) => write!(f, "resident transcript binding rejected: {role}"),
@@ -213,17 +496,315 @@ impl core::fmt::Display for ResidentLaunchError {
 
 impl std::error::Error for ResidentLaunchError {}
 
-/// Prepared proof primitives and their captured transcript-bounded subgraphs.
-///
-/// Captures are declared first so graph executables are destroyed before the
-/// prepared launch descriptions. The workspace itself is borrowed, so its slab,
-/// stream, and pool necessarily outlive every captured pointer.
+/// Prepared proof primitives bound to workspace-owned transcript subgraphs.
+/// The workspace outlives the runtime and keeps exact-key graph executables
+/// resident across proof sessions.
+struct PreparedResidentWitness<'a> {
+    component: &'static str,
+    native_input_producer: Option<&'static str>,
+    input_gather: Option<PreparedWitnessInputGatherGraph<'a>>,
+    input_seed: Option<PreparedWitnessInputSeedGraph<'a>>,
+    input_compact: Option<PreparedWitnessInputCompactGraph<'a>>,
+    writer: PreparedWitnessGraph<'a>,
+}
+
+#[derive(Debug)]
+enum WitnessLaneLaunchError {
+    Cuda(CudaRuntimeError),
+    EcOp(PreparedEcOpError),
+    Input(PreparedWitnessInputGatherError),
+    Writer(PreparedWitnessError),
+    Feed(PreparedWitnessFeedError),
+}
+
+impl core::fmt::Display for WitnessLaneLaunchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for WitnessLaneLaunchError {}
+
+impl From<WitnessLaneLaunchError> for ResidentRuntimeError {
+    fn from(value: WitnessLaneLaunchError) -> Self {
+        match value {
+            WitnessLaneLaunchError::Cuda(error) => Self::Cuda(error),
+            WitnessLaneLaunchError::EcOp(error) => Self::EcOp(error),
+            WitnessLaneLaunchError::Input(error) => Self::WitnessInputGather(error),
+            WitnessLaneLaunchError::Writer(error) => Self::Witness(error),
+            WitnessLaneLaunchError::Feed(error) => Self::WitnessFeed(error),
+        }
+    }
+}
+
+/// Pack each dependency level onto fixed proof-owned streams. Long writers are
+/// placed first on the least-loaded lane; ties are stable by component name.
+/// The result is capture topology, not runtime scheduling policy.
+fn pack_weighted_lane_level(
+    mut components: Vec<(usize, u64, &'static str)>,
+    lane_count: usize,
+) -> Vec<Vec<usize>> {
+    components.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(right.2)));
+    let mut lanes = vec![Vec::new(); lane_count];
+    let mut loads = vec![0u64; lane_count];
+    for (component, work, _) in components {
+        let lane = loads
+            .iter()
+            .enumerate()
+            .min_by_key(|&(lane, &load)| (load, lane))
+            .map(|(lane, _)| lane)
+            .expect("lane count checked");
+        loads[lane] = loads[lane].saturating_add(work);
+        lanes[lane].push(component);
+    }
+    lanes
+}
+
+fn plan_witness_lane_levels(
+    witness: &[PreparedResidentWitness<'_>],
+    ec_op: Option<&PreparedEcOpGraph<'_>>,
+    lane_count: usize,
+) -> Result<Vec<Vec<Vec<usize>>>, ResidentRuntimeError> {
+    if witness.is_empty() && ec_op.is_none() {
+        return Ok(Vec::new());
+    }
+    if lane_count == 0 {
+        return Err(ResidentRuntimeError::PreparedWitnessCaptureContract {
+            component: witness
+                .first()
+                .map_or("ec_op_builtin", |entry| entry.component),
+            role: "proof execution context has no component lanes",
+        });
+    }
+
+    let mut by_component = witness
+        .iter()
+        .enumerate()
+        .map(|(index, prepared)| (prepared.component, index))
+        .collect::<BTreeMap<_, _>>();
+    let native_ec_op_index = witness.len();
+    if ec_op.is_some()
+        && by_component
+            .insert("ec_op_builtin", native_ec_op_index)
+            .is_some()
+    {
+        return Err(ResidentRuntimeError::PreparedWitnessCaptureContract {
+            component: "ec_op_builtin",
+            role: "native EC-op duplicates a recorded witness component",
+        });
+    }
+    let task_count = witness.len() + usize::from(ec_op.is_some());
+    if by_component.len() != task_count {
+        return Err(ResidentRuntimeError::PreparedWitnessCaptureContract {
+            component: "<duplicate>",
+            role: "prepared witness component appears more than once",
+        });
+    }
+
+    let schedule_levels = CAIRO_SCHEDULE.levels().map_err(|_| {
+        ResidentRuntimeError::PreparedWitnessCaptureContract {
+            component: "<schedule>",
+            role: "generated component dependency schedule is invalid",
+        }
+    })?;
+    let mut seen = vec![false; task_count];
+    let mut result = Vec::new();
+    for level in schedule_levels {
+        let components = level
+            .into_iter()
+            .filter_map(|component| by_component.get(component).copied())
+            .collect::<Vec<_>>();
+        if components.is_empty() {
+            continue;
+        }
+        let lanes = pack_weighted_lane_level(
+            components
+                .iter()
+                .map(|&component| {
+                    if component == native_ec_op_index {
+                        (
+                            component,
+                            ec_op.expect("native task was indexed").estimated_work(),
+                            "ec_op_builtin",
+                        )
+                    } else {
+                        (
+                            component,
+                            witness[component].writer.estimated_work(),
+                            witness[component].component,
+                        )
+                    }
+                })
+                .collect(),
+            lane_count,
+        );
+        for component in components {
+            seen[component] = true;
+        }
+        result.push(lanes);
+    }
+    if seen.iter().any(|seen| !seen) {
+        let component = seen
+            .iter()
+            .position(|seen| !seen)
+            .map(|index| {
+                if index == native_ec_op_index {
+                    "ec_op_builtin"
+                } else {
+                    witness[index].component
+                }
+            })
+            .unwrap_or("<missing>");
+        return Err(ResidentRuntimeError::PreparedWitnessCaptureContract {
+            component,
+            role: "prepared witness component is absent from generated schedule",
+        });
+    }
+    Ok(result)
+}
+
+fn enqueue_witness_lane_levels(
+    arena: &stwo_backend_cuda::DeviceArena,
+    witness: &[PreparedResidentWitness<'_>],
+    ec_op: Option<&PreparedEcOpGraph<'_>>,
+    levels: &[Vec<Vec<usize>>],
+    multiplicity: Option<&PreparedResidentMultiplicity<'_>>,
+) -> Result<(), WitnessLaneLaunchError> {
+    let context = arena.context();
+    for level in levels {
+        let active_lanes = level
+            .iter()
+            .enumerate()
+            .filter_map(|(lane, components)| (!components.is_empty()).then_some(lane))
+            .collect::<Vec<_>>();
+        let mut forked = Vec::with_capacity(active_lanes.len());
+        let mut first_error = None;
+        for &lane in &active_lanes {
+            match context.fork_lane(lane) {
+                Ok(launch) => forked.push((lane, launch)),
+                Err(error) => {
+                    first_error = Some(WitnessLaneLaunchError::Cuda(error));
+                    break;
+                }
+            }
+        }
+        if first_error.is_none() {
+            for &(lane, launch) in &forked {
+                for &component in &level[lane] {
+                    if component == witness.len() {
+                        let launched = ec_op
+                            .expect("native EC-op task was planned")
+                            .launch_on(launch)
+                            .map_err(WitnessLaneLaunchError::EcOp);
+                        if let Err(error) = launched {
+                            first_error = Some(error);
+                            break;
+                        }
+                        continue;
+                    }
+                    let graph = &witness[component];
+                    let launched = (|| {
+                        if let Some(seed) = &graph.input_seed {
+                            seed.launch_on(launch)
+                                .map_err(WitnessLaneLaunchError::Input)?;
+                        }
+                        if let Some(gather) = &graph.input_gather {
+                            gather
+                                .launch_on(launch)
+                                .map_err(WitnessLaneLaunchError::Input)?;
+                        }
+                        if let Some(compact) = &graph.input_compact {
+                            compact
+                                .launch_on(launch)
+                                .map_err(WitnessLaneLaunchError::Input)?;
+                        }
+                        graph
+                            .writer
+                            .launch_on(launch)
+                            .map_err(WitnessLaneLaunchError::Writer)?;
+                        if let Some((_, feed)) = multiplicity.and_then(|multiplicity| {
+                            multiplicity
+                                .feeds
+                                .iter()
+                                .find(|(producer, _)| *producer == graph.component)
+                        }) {
+                            feed.launch_on(launch)
+                                .map_err(WitnessLaneLaunchError::Feed)?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = launched {
+                        first_error = Some(error);
+                        break;
+                    }
+                }
+                if first_error.is_some() {
+                    break;
+                }
+            }
+        }
+        for (lane, _) in forked {
+            if let Err(error) = context.join_lane(lane) {
+                if first_error.is_none() {
+                    first_error = Some(WitnessLaneLaunchError::Cuda(error));
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+struct PreparedResidentMultiplicity<'a> {
+    clear: PreparedWitnessFeedClearGraph<'a>,
+    feeds: Vec<(&'static str, PreparedWitnessFeedGraph<'a>)>,
+    fixed_tables: Vec<PreparedFixedTableGraph<'a>>,
+    memory_traces: Option<PreparedMemoryBaseTraceGraph<'a>>,
+}
+
+fn slice_matches_slot(slice: ArenaSlice, slot: ArenaSlotId, required_words: usize) -> bool {
+    slice.id() == slot && slice.len_words() >= required_words
+}
+
+fn slices_match_slots(
+    slices: &[ArenaSlice],
+    slots: &[ArenaSlotId],
+    required_words: &[usize],
+) -> bool {
+    slices.len() == slots.len()
+        && slices.len() == required_words.len()
+        && slices
+            .iter()
+            .zip(slots)
+            .zip(required_words)
+            .all(|((&slice, &slot), &words)| slice_matches_slot(slice, slot, words))
+}
+
 pub struct ResidentGraphRuntime<'a> {
-    captures: HashMap<GraphSegment, PhaseGraph>,
+    execution_tables: Option<PreparedExecutionTablesGraph<'a>>,
+    execution_tables_ingest: Option<PreparedExecutionTablesIngestTelemetry>,
+    ec_op: Option<PreparedEcOpGraph<'a>>,
+    ec_op_ingest: Option<PreparedEcOpIngestTelemetry>,
+    witness: Vec<PreparedResidentWitness<'a>>,
+    witness_lane_levels: Vec<Vec<Vec<usize>>>,
+    multiplicity: Option<PreparedResidentMultiplicity<'a>>,
     commitments: Vec<(CommitmentTreeId, PreparedCommitGraph<'a>)>,
+    base_interpolation: PreparedInterpolationGraph<'a>,
+    fixed_preprocessed_root: ArenaSlice,
+    fixed_preprocessed_retained_layers: Vec<ArenaSlice>,
     relation: PreparedRelationGraph<'a>,
+    interaction_interpolation: PreparedInterpolationGraph<'a>,
     interaction_claim_sources: Vec<ArenaSlice>,
+    composition: PreparedCompositionGraph<'a>,
+    oods: ResidentOodsPipeline<'a>,
     fri: PreparedFriGraph<'a>,
+    fri_final: PreparedFriFinalGraph<'a>,
+    interaction_pow: PreparedBlake2sPowGraph<'a>,
+    query_pow: PreparedBlake2sPowGraph<'a>,
+    decommit: PreparedDecommitGraph<'a>,
+    proof_bundle: ArenaSlice,
     transcript: PreparedBlake2sTranscript<'a>,
     transcript_inputs: Vec<(TranscriptInputId, ArenaSlice)>,
     transcript_outputs: Vec<(TranscriptOutputId, ArenaSlice)>,
@@ -247,9 +828,11 @@ impl<'a> ResidentGraphRuntime<'a> {
     pub fn prepare(
         workspace: &'a GraphWorkspace,
         expected_identity: ResidentWorkspaceIdentity,
-        bindings: ResidentSourceBindings,
         setup_relation_challenges: RelationChallenges<'_>,
         transcript_plan: &CairoBlake2sTranscriptPlan,
+        execution_tables_host: Option<ExecutionTablesHostData<'_>>,
+        ec_op_segment_start: Option<usize>,
+        preprocessed_trace: Option<Arc<PreProcessedTrace>>,
     ) -> Result<Self, ResidentRuntimeError> {
         let actual_identity = ResidentWorkspaceIdentity::of(workspace);
         if expected_identity != actual_identity {
@@ -257,6 +840,24 @@ impl<'a> ResidentGraphRuntime<'a> {
                 expected: expected_identity,
                 actual: actual_identity,
             });
+        }
+        if !workspace.preprocessed_commitment_ready() {
+            return Err(ResidentRuntimeError::FixedPreprocessedCommitmentNotReady);
+        }
+        if let Some(planned) = workspace.plan().multiplicity() {
+            if !planned.coverage_complete() {
+                return Err(ResidentRuntimeError::IncompleteFixedMultiplicityCoverage(
+                    planned.coverage_gaps.clone(),
+                ));
+            }
+            if !planned.blockers.is_empty() {
+                return Err(ResidentRuntimeError::UnsupportedMultiplicityFeeds(
+                    planned.blockers.clone(),
+                ));
+            }
+            if preprocessed_trace.is_none() {
+                return Err(ResidentRuntimeError::MissingPreprocessedTraceForMultiplicity);
+            }
         }
 
         let relation_sources = arena_relation_sources(workspace)?;
@@ -266,9 +867,277 @@ impl<'a> ResidentGraphRuntime<'a> {
         {
             require_resident_source(workspace, *source)?;
         }
-        require_resident_source(workspace, bindings.fri.input_evaluation)?;
 
         let arena = workspace.arena();
+        let (execution_tables, execution_tables_ingest, execution_tables_view) =
+            match (workspace.plan().execution_tables(), execution_tables_host) {
+                (Some(planned), Some(host)) => {
+                    let prepared = PreparedExecutionTablesGraph::prepare(
+                        arena,
+                        &planned.requirements,
+                        &planned.slots,
+                    )?;
+                    let ingest = prepared.ingest(host)?;
+                    let view = prepared.view()?;
+                    (Some(prepared), Some(ingest), Some(view))
+                }
+                (Some(_), None) => {
+                    return Err(ResidentRuntimeError::MissingPreparedExecutionTables)
+                }
+                (None, Some(_)) => {
+                    return Err(ResidentRuntimeError::UnexpectedPreparedExecutionTables)
+                }
+                (None, None) => (None, None, None),
+            };
+        let witness = match execution_tables_view {
+            Some(tables) => workspace
+                .plan()
+                .witness()
+                .components
+                .iter()
+                .map(|component| {
+                    let input_gather = component
+                        .input_gather
+                        .as_ref()
+                        .map(|gather| {
+                            let sources = gather
+                                .sources
+                                .iter()
+                                .map(|binding| arena.bind(binding.physical))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let edges = gather
+                                .requirements
+                                .edges
+                                .iter()
+                                .map(|edge| edge.edge)
+                                .collect::<Vec<_>>();
+                            PreparedWitnessInputGatherGraph::prepare(
+                                arena,
+                                &sources,
+                                &edges,
+                                gather.requirements.include_enabler,
+                                gather.requirements.include_iota,
+                                &gather.slots,
+                            )
+                            .map_err(ResidentRuntimeError::from)
+                        })
+                        .transpose()?;
+                    let input_seed = component
+                        .input_seed
+                        .as_ref()
+                        .map(|seed| {
+                            PreparedWitnessInputSeedGraph::prepare(
+                                arena,
+                                &seed.requirements,
+                                &seed.slots,
+                            )
+                            .map_err(ResidentRuntimeError::from)
+                        })
+                        .transpose()?;
+                    let input_compact = component
+                        .input_compact
+                        .as_ref()
+                        .map(|compact| {
+                            let sources = compact
+                                .sources
+                                .iter()
+                                .map(|binding| arena.bind(binding.physical))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            PreparedWitnessInputCompactGraph::prepare(
+                                arena,
+                                &sources,
+                                &compact.requirements,
+                                &compact.slots,
+                            )
+                            .map_err(ResidentRuntimeError::from)
+                        })
+                        .transpose()?;
+                    let writer = PreparedWitnessGraph::prepare_with_execution_tables(
+                        arena,
+                        &component.program,
+                        component.requirements.row_count,
+                        &component.requirements.multiplicity_column_words,
+                        tables,
+                        &component.slots,
+                        PreparedWitnessMode::RequireEmbeddedAot,
+                    )
+                    .map_err(ResidentRuntimeError::from)?;
+                    Ok::<_, ResidentRuntimeError>(PreparedResidentWitness {
+                        component: component.component,
+                        native_input_producer: component.native_input_producer,
+                        input_gather,
+                        input_seed,
+                        input_compact,
+                        writer,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
+        let multiplicity = match workspace.plan().multiplicity() {
+            Some(planned) => {
+                let preprocessed_trace = preprocessed_trace
+                    .ok_or(ResidentRuntimeError::MissingPreprocessedTraceForMultiplicity)?;
+                let destinations = planned
+                    .multiplicities
+                    .iter()
+                    .map(|(_, binding)| arena.bind(binding.physical))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let clear = PreparedWitnessFeedClearGraph::prepare(
+                    arena,
+                    &destinations,
+                    planned.clear_slots,
+                )?;
+                let feeds = planned
+                    .feeds
+                    .iter()
+                    .map(|feed| {
+                        let luts = feed
+                            .plan
+                            .lut_families
+                            .iter()
+                            .map(|&family| {
+                                canonical_count_lut(family, Arc::clone(&preprocessed_trace))
+                                    .map_err(|_| {
+                                        ResidentRuntimeError::CanonicalMultiplicityLut(family)
+                                    })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let graph = PreparedWitnessFeedGraph::prepare(
+                            arena,
+                            arena.bind(feed.source.physical)?,
+                            feed.plan.row_count,
+                            feed.plan.sub_words_per_row,
+                            &feed.plan.descriptors,
+                            &luts,
+                            &feed.plan.requirements.multiplicity_words,
+                            &feed.slots,
+                        )?;
+                        Ok::<_, ResidentRuntimeError>((feed.plan.producer, graph))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let fixed_tables = planned
+                    .fixed_tables
+                    .iter()
+                    .map(|fixed| {
+                        let sources = fixed
+                            .sources
+                            .iter()
+                            .map(|binding| arena.bind(binding.physical))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        PreparedFixedTableGraph::prepare_contiguous(
+                            arena,
+                            fixed.plan.materializer.config(),
+                            &sources,
+                            arena.bind(fixed.multiplicity.physical)?,
+                            &fixed.slots,
+                        )
+                        .map_err(ResidentRuntimeError::from)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let memory_traces = planned
+                    .memory_traces
+                    .as_ref()
+                    .map(|memory| {
+                        let execution = execution_tables
+                            .as_ref()
+                            .ok_or(ResidentRuntimeError::MissingPreparedExecutionTables)?;
+                        let multiplicity = |name| {
+                            planned
+                                .multiplicities
+                                .iter()
+                                .find(|(candidate, _)| *candidate == name)
+                                .ok_or(ResidentRuntimeError::PreparedFixedTableCaptureContract {
+                                    component: "memory_id_to_big",
+                                    role: "runtime multiplicity destination",
+                                })
+                                .and_then(|(_, binding)| {
+                                    arena
+                                        .bind(binding.physical)
+                                        .map_err(ResidentRuntimeError::from)
+                                })
+                        };
+                        let address_outputs = memory
+                            .address_outputs
+                            .iter()
+                            .map(|binding| arena.bind(binding.physical))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let big_outputs = memory
+                            .big_parts
+                            .iter()
+                            .map(|part| {
+                                part.outputs
+                                    .iter()
+                                    .map(|binding| arena.bind(binding.physical))
+                                    .collect::<Result<Vec<_>, _>>()
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let big_parts = memory
+                            .big_parts
+                            .iter()
+                            .zip(&big_outputs)
+                            .map(|(part, outputs)| MemoryBaseTracePart {
+                                source_offset: part.source_offset,
+                                row_count: part.row_count,
+                                outputs,
+                            })
+                            .collect::<Vec<_>>();
+                        let small_outputs = memory
+                            .small_part
+                            .outputs
+                            .iter()
+                            .map(|binding| arena.bind(binding.physical))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        PreparedMemoryBaseTraceGraph::prepare(
+                            arena,
+                            execution,
+                            multiplicity("memory_address_to_id")?,
+                            memory.plan.address_count_words,
+                            memory.plan.address_rows,
+                            &address_outputs,
+                            multiplicity("memory_id_to_big")?,
+                            memory.plan.big_count_words,
+                            &big_parts,
+                            multiplicity("memory_id_to_big#small")?,
+                            memory.plan.small_count_words,
+                            MemoryBaseTracePart {
+                                source_offset: memory.small_part.source_offset,
+                                row_count: memory.small_part.row_count,
+                                outputs: &small_outputs,
+                            },
+                        )
+                        .map_err(ResidentRuntimeError::from)
+                    })
+                    .transpose()?;
+                Some(PreparedResidentMultiplicity {
+                    clear,
+                    feeds,
+                    fixed_tables,
+                    memory_traces,
+                })
+            }
+            None => None,
+        };
+        let (ec_op, ec_op_ingest) = match (workspace.plan().ec_op(), ec_op_segment_start) {
+            (Some(planned), Some(segment_start)) => {
+                let execution = execution_tables
+                    .as_ref()
+                    .ok_or(ResidentRuntimeError::MissingPreparedExecutionTables)?;
+                let prepared = PreparedEcOpGraph::prepare(
+                    arena,
+                    execution.view()?,
+                    &planned.requirements,
+                    &planned.slots,
+                )?;
+                let ingest = prepared.ingest_segment_start(segment_start)?;
+                (Some(prepared), Some(ingest))
+            }
+            (Some(_), None) => return Err(ResidentRuntimeError::MissingPreparedEcOpSegment),
+            (None, Some(_)) => return Err(ResidentRuntimeError::UnexpectedPreparedEcOpSegment),
+            (None, None) => (None, None),
+        };
+        let witness_lane_levels =
+            plan_witness_lane_levels(&witness, ec_op.as_ref(), arena.context().lane_count())?;
         let planned_transcript = workspace.plan().transcript();
         if planned_transcript.schedule_key != transcript_plan.schedule_key() {
             return Err(ResidentRuntimeError::TranscriptScheduleMismatch {
@@ -303,39 +1172,177 @@ impl<'a> ResidentGraphRuntime<'a> {
             setup_relation_challenges,
         )?;
         let interaction_claim_sources = interaction_outputs_in_cairo_order(workspace, &relation)?;
+        let composition = prepare_resident_composition(workspace, &relation)?;
 
-        let mut commitments = Vec::with_capacity(workspace.plan().commitments().len());
-        for planned in workspace.plan().commitments() {
+        let fixed_preprocessed = workspace
+            .plan()
+            .commitment(CommitmentTreeId::Preprocessed)
+            .ok_or(ResidentRuntimeError::MissingPreparedCommitment(
+                CommitmentTreeId::Preprocessed,
+            ))?;
+        let fixed_preprocessed_root = arena.bind(fixed_preprocessed.root.physical)?;
+        let fixed_preprocessed_retained_layers = fixed_preprocessed
+            .retained_layers_bottom_up
+            .iter()
+            .map(|binding| arena.bind(binding.physical))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut commitments = Vec::with_capacity(workspace.plan().commitments().len() - 1);
+        for planned in workspace
+            .plan()
+            .commitments()
+            .iter()
+            .filter(|planned| planned.id != CommitmentTreeId::Preprocessed)
+        {
             let groups = commitment_groups(workspace, planned)?;
             let twiddles = arena.bind(planned.twiddles.physical)?;
+            let retained_evaluations = planned
+                .retained_evaluation_groups
+                .iter()
+                .map(|group| {
+                    group
+                        .as_ref()
+                        .map(|columns| {
+                            columns
+                                .iter()
+                                .map(|binding| arena.bind(binding.physical))
+                                .collect::<Result<Vec<_>, _>>()
+                                .map(|columns| CommitEvaluationGroup { columns })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, ArenaError>>()?;
             commitments.push((
                 planned.id,
-                PreparedCommitGraph::prepare(
+                PreparedCommitGraph::prepare_with_retained_evaluations(
                     arena,
                     planned.config,
                     &groups,
                     twiddles,
                     &planned.slots,
+                    &retained_evaluations,
                 )?,
             ));
         }
+        let base_interpolation =
+            prepare_commitment_interpolation(workspace, CommitmentTreeId::Base)?;
+        let interaction_interpolation =
+            prepare_commitment_interpolation(workspace, CommitmentTreeId::Interaction)?;
+
+        let oods = ResidentOodsPipeline::prepare(workspace)?;
 
         let fri_plan = workspace.plan().fri();
+        let fri_input = arena.bind(fri_plan.input_values.physical)?;
+        if fri_input.id() != oods.quotient().output_evaluation().id()
+            || fri_input.len_words() != oods.quotient().output_evaluation().len_words()
+        {
+            return Err(ResidentRuntimeError::TranscriptRequirementsMismatch);
+        }
         let fri = PreparedFriGraph::prepare(
             arena,
             fri_plan.config,
-            bindings.fri.input_evaluation,
+            oods.quotient().output_evaluation(),
             arena.bind(fri_plan.twiddles.physical)?,
             &fri_plan.slots,
         )?;
+        let transcript_input = |semantic: CairoTranscriptInput| {
+            let id = semantic.id()?;
+            transcript_inputs
+                .iter()
+                .find_map(|&(candidate, slice)| (candidate == id).then_some(slice))
+                .ok_or(ResidentRuntimeError::MissingTranscriptInput(id))
+        };
+        let final_plan = workspace.plan().final_fri_pow();
+        let fri_final = PreparedFriFinalGraph::prepare(
+            arena,
+            fri_plan.config,
+            fri.final_evaluation(),
+            arena.bind(fri_plan.twiddles.physical)?,
+            transcript_input(CairoTranscriptInput::FriLastLayerPolynomial)?,
+            final_plan.final_slots,
+        )?;
+        let interaction_pow = PreparedBlake2sPowGraph::prepare(
+            arena,
+            transcript.state(),
+            final_plan.interaction_pow_bits,
+            transcript_input(CairoTranscriptInput::InteractionPowNonce)?,
+            final_plan.interaction_pow_slots,
+        )?;
+        let query_pow = PreparedBlake2sPowGraph::prepare(
+            arena,
+            transcript.state(),
+            final_plan.query_pow_bits,
+            transcript_input(CairoTranscriptInput::QueryPowNonce)?,
+            final_plan.query_pow_slots,
+        )?;
+        let decommit_plan = workspace.plan().decommit();
+        let raw_queries = arena.bind(decommit_plan.raw_queries.physical)?;
+        let query_output_id = CairoTranscriptOutput::QueryPositions.id()?;
+        let transcript_queries = transcript_outputs
+            .iter()
+            .find_map(|&(id, slice)| (id == query_output_id).then_some(slice))
+            .ok_or(ResidentRuntimeError::MissingTranscriptOutput(
+                query_output_id,
+            ))?;
+        require_same_slice(
+            "decommit queries are not the transcript output",
+            raw_queries,
+            transcript_queries,
+        )?;
+        let decommit_sources = resident_decommit_sources(
+            workspace,
+            &commitments,
+            fixed_preprocessed_root,
+            &fixed_preprocessed_retained_layers,
+            &fri,
+        )?;
+        let decommit = PreparedDecommitGraph::prepare(
+            arena,
+            decommit_plan.config.clone(),
+            raw_queries,
+            Some(arena.bind(decommit_plan.lde_twiddles.physical)?),
+            &decommit_sources,
+            &decommit_plan.slots,
+        )?;
+        require_same_slice(
+            "decommit assembly does not match the planned final ABI",
+            decommit.assembly_slice(),
+            arena.bind(decommit_plan.assembly.physical)?,
+        )?;
+        let proof_bundle = arena.bind(decommit_plan.proof_bundle.physical)?;
+        if decommit_plan.proof_bundle.len_words != decommit_plan.proof_bundle_layout.total_words
+            || proof_bundle.len_words() < decommit_plan.proof_bundle_layout.total_words
+        {
+            return Err(ResidentRuntimeError::TranscriptBindingTooSmall {
+                role: "resident proof bundle",
+                required_words: decommit_plan.proof_bundle_layout.total_words,
+                actual_words: proof_bundle.len_words(),
+            });
+        }
         let fri_rounds = fri.round_count();
 
-        Ok(Self {
-            captures: HashMap::new(),
+        let runtime = Self {
+            execution_tables,
+            execution_tables_ingest,
+            ec_op,
+            ec_op_ingest,
+            witness,
+            witness_lane_levels,
+            multiplicity,
             commitments,
+            base_interpolation,
+            fixed_preprocessed_root,
+            fixed_preprocessed_retained_layers,
             relation,
+            interaction_interpolation,
             interaction_claim_sources,
+            composition,
+            oods,
             fri,
+            fri_final,
+            interaction_pow,
+            query_pow,
+            decommit,
+            proof_bundle,
             transcript,
             transcript_inputs,
             transcript_outputs,
@@ -350,11 +1357,188 @@ impl<'a> ResidentGraphRuntime<'a> {
             fri_challenge_generations: vec![0; fri_rounds],
             launched_fri_challenge_generations: vec![0; fri_rounds],
             next_fri_round: None,
-        })
+        };
+        // Preparing every descriptor is not enough: require the fully bound
+        // runtime to match the strict schedule one-for-one before it can escape
+        // this constructor.  This includes producer gather/compaction sources,
+        // writer destinations and embedded-AOT identity.
+        runtime.require_prepared_witness_coverage()?;
+        Ok(runtime)
     }
 
     pub const fn identity(&self) -> ResidentWorkspaceIdentity {
         self.identity
+    }
+
+    pub const fn execution_tables_ingest_telemetry(
+        &self,
+    ) -> Option<PreparedExecutionTablesIngestTelemetry> {
+        self.execution_tables_ingest
+    }
+
+    pub const fn ec_op_ingest_telemetry(&self) -> Option<PreparedEcOpIngestTelemetry> {
+        self.ec_op_ingest
+    }
+
+    /// Upload the complete compact input set before capture/replay. Every copy
+    /// targets a stable arena column; one setup fence protects the borrowed host
+    /// vectors, and hot-path telemetry is reset only after this boundary.
+    pub fn upload_witness_inputs_at_ingest(
+        &self,
+        inputs: &[ResidentWitnessInput<'_>],
+    ) -> Result<ResidentWitnessIngestReport, ResidentRuntimeError> {
+        if inputs.len() != self.witness.len() {
+            return Err(ResidentRuntimeError::WitnessInputCoverage {
+                expected: self.witness.len(),
+                actual: inputs.len(),
+            });
+        }
+        let mut seen = Vec::with_capacity(inputs.len());
+        let mut report = ResidentWitnessIngestReport {
+            components: inputs.len(),
+            ..ResidentWitnessIngestReport::default()
+        };
+        for input in inputs {
+            if seen.contains(&input.component) {
+                return Err(ResidentRuntimeError::DuplicateWitnessInput(input.component));
+            }
+            seen.push(input.component);
+            let prepared = self
+                .witness
+                .iter()
+                .find(|prepared| prepared.component == input.component)
+                .ok_or(ResidentRuntimeError::MissingPreparedWitness(
+                    input.component,
+                ))?;
+            let destinations = prepared.writer.input_columns();
+            if (prepared.input_gather.is_some()
+                || prepared.input_seed.is_some()
+                || prepared.input_compact.is_some()
+                || prepared.native_input_producer.is_some())
+                && !input.columns.is_empty()
+            {
+                return Err(ResidentRuntimeError::UnexpectedGatheredWitnessHostInput(
+                    input.component,
+                ));
+            }
+            if prepared.input_gather.is_none()
+                && prepared.input_seed.is_none()
+                && prepared.input_compact.is_none()
+                && prepared.native_input_producer.is_none()
+                && destinations.len() != input.columns.len()
+            {
+                return Err(ResidentRuntimeError::WitnessInputColumnCount {
+                    component: input.component,
+                    expected: destinations.len(),
+                    actual: input.columns.len(),
+                });
+            }
+            match (&prepared.input_seed, input.seed_scalars) {
+                (Some(seed), Some(values)) => {
+                    seed.ingest_scalars(values)?;
+                    let bytes = values
+                        .len()
+                        .checked_mul(core::mem::size_of::<u32>())
+                        .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                    report.columns += values.len();
+                    report.h2d_copies += usize::from(!values.is_empty());
+                    report.h2d_bytes = report
+                        .h2d_bytes
+                        .checked_add(bytes)
+                        .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(ResidentRuntimeError::WitnessInputColumnCount {
+                        component: input.component,
+                        expected: prepared
+                            .input_seed
+                            .as_ref()
+                            .map_or(0, |seed| seed.requirements().scalar_words),
+                        actual: input.seed_scalars.map_or(0, <[u32]>::len),
+                    })
+                }
+            }
+            let mut seen_columns = Vec::with_capacity(input.columns.len());
+            for source in input.columns {
+                if source.ordinal >= destinations.len() {
+                    return Err(ResidentRuntimeError::WitnessInputColumnCount {
+                        component: input.component,
+                        expected: destinations.len(),
+                        actual: source.ordinal + 1,
+                    });
+                }
+                if seen_columns.contains(&source.ordinal) {
+                    return Err(ResidentRuntimeError::DuplicateWitnessInputColumn {
+                        component: input.component,
+                        ordinal: source.ordinal,
+                    });
+                }
+                seen_columns.push(source.ordinal);
+                let destination = destinations[source.ordinal];
+                if destination.len_words() != source.words.len() {
+                    return Err(ResidentRuntimeError::WitnessInputRowCount {
+                        component: input.component,
+                        column: source.ordinal,
+                        expected: destination.len_words(),
+                        actual: source.words.len(),
+                    });
+                }
+                let bytes = source
+                    .words
+                    .len()
+                    .checked_mul(core::mem::size_of::<u32>())
+                    .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                unsafe {
+                    self.workspace.arena().context().memcpy_h2d_async(
+                        destination.as_void_ptr(),
+                        source.words.as_ptr().cast(),
+                        bytes,
+                    )?;
+                }
+                report.columns += 1;
+                report.h2d_copies += 1;
+                report.h2d_bytes = report
+                    .h2d_bytes
+                    .checked_add(bytes)
+                    .ok_or(ResidentRuntimeError::SizeOverflow)?;
+            }
+        }
+        self.workspace.arena().context().sync()?;
+        report.sync_calls = 1;
+        Ok(report)
+    }
+
+    /// Reset counters after setup/input staging and immediately before a warm
+    /// replay. This makes the resident acceptance gate independent of one-time
+    /// descriptor uploads and graph instantiation.
+    pub fn begin_hot_path_telemetry(&self) {
+        self.workspace.arena().context().reset_telemetry();
+    }
+
+    pub fn hot_path_telemetry(&self) -> CudaExecTelemetry {
+        self.workspace.arena().context().telemetry()
+    }
+
+    pub fn require_hot_path_budget(
+        &self,
+        budget: ResidentHotPathBudget,
+    ) -> Result<CudaExecTelemetry, ResidentRuntimeError> {
+        let actual = self.hot_path_telemetry();
+        if actual.graph_launches != budget.expected_graph_launches
+            || actual.graph_launches == 0
+            || actual.graph_launches >= 100
+            || actual.kernel_launches == 0
+            || actual.kernel_launches > budget.max_kernel_launches
+            || actual.sync_calls != budget.expected_sync_calls
+            || actual.h2d_bytes > budget.max_h2d_bytes
+            || actual.d2h_bytes != budget.expected_d2h_bytes
+            || actual.allocations > budget.max_allocations
+            || actual.graph_submit_gap_ns_max > budget.max_graph_submit_gap_ns
+        {
+            return Err(ResidentRuntimeError::HotPathBudgetExceeded { budget, actual });
+        }
+        Ok(actual)
     }
 
     pub fn begin_transcript_generation(
@@ -419,6 +1603,20 @@ impl<'a> ResidentGraphRuntime<'a> {
     pub fn require_transcript_complete(&self) -> Result<(), ResidentRuntimeError> {
         self.transcript_cursor.require_complete()?;
         Ok(())
+    }
+
+    /// Correctness-only U4 gate. This performs compact D2H snapshot reads and a
+    /// host Blake2s replay, so callers must invoke it after (and outside) the
+    /// resident hot-path telemetry window. The backend verifier checks every
+    /// scheduled boundary and every device-drawn output fail-closed.
+    pub fn verify_transcript_mirror_correctness_only(
+        &self,
+    ) -> Result<TranscriptMirrorReport, ResidentRuntimeError> {
+        let report = self.transcript.verify_mirror()?;
+        if report.boundaries_verified != self.transcript.schedule().operations().len() {
+            return Err(ResidentRuntimeError::TranscriptRequirementsMismatch);
+        }
+        Ok(report)
     }
 
     pub fn transcript_input(
@@ -498,7 +1696,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         commitment: CommitmentTreeId,
         semantic: CairoTranscriptInput,
     ) -> Result<(), ResidentRuntimeError> {
-        let source = self.commitment(commitment)?.root_slice();
+        let source = self.commitment_root_slice(commitment)?;
         let destination = self.transcript_input(semantic)?;
         self.copy_transcript_words("commitment_root", source, destination, 8)
     }
@@ -584,40 +1782,92 @@ impl<'a> ResidentGraphRuntime<'a> {
             .ok_or(ResidentRuntimeError::MissingPreparedCommitment(
                 CommitmentTreeId::Base,
             ))?;
-        let transcript_segment =
-            self.transcript_segment_index(CairoTranscriptSegment::BootstrapAndLookup)?;
-        let range = self.transcript_segments[transcript_segment]
+        let bootstrap_segment =
+            self.transcript_segment_index(CairoTranscriptSegment::BootstrapThroughBase)?;
+        let pow_segment =
+            self.transcript_segment_index(CairoTranscriptSegment::InteractionPowAndLookup)?;
+        let bootstrap_range = self.transcript_segments[bootstrap_segment]
+            .operation_range
+            .clone();
+        let pow_range = self.transcript_segments[pow_segment]
             .operation_range
             .clone();
         let root_destination = self.transcript_input(CairoTranscriptInput::BaseRoot)?;
         let lookup_output = self.transcript_output(CairoTranscriptOutput::CommonLookupElements)?;
+        let execution_tables = self.execution_tables.as_ref();
+        let ec_op = self.ec_op.as_ref();
+        let witness = &self.witness;
+        let witness_lane_levels = &self.witness_lane_levels;
+        let multiplicity = self.multiplicity.as_ref();
+        let interpolation = &self.base_interpolation;
         let commitment = &self.commitments[commitment_index].1;
         let root_source = commitment.root_slice();
         let transcript = &self.transcript;
+        let interaction_pow = &self.interaction_pow;
         let relation = &self.relation;
+        let workspace = self.workspace;
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
-        let graph = PhaseGraph::capture(
-            self.workspace.key(GraphSegment::IngestWitnessBaseCommit),
-            self.workspace.arena(),
-            |arena| {
+        let capture = capture_with_cursor_rollback(cursor, |cursor| {
+            workspace.capture_segment(GraphSegment::IngestWitnessBaseCommit, |arena| {
+                if let Some(execution_tables) = execution_tables {
+                    execution_tables
+                        .launch()
+                        .map_err(ResidentLaunchError::ExecutionTables)?;
+                }
+                if let Some(multiplicity) = multiplicity {
+                    multiplicity
+                        .clear
+                        .launch()
+                        .map_err(ResidentLaunchError::WitnessFeed)?;
+                }
+                enqueue_witness_lane_levels(
+                    arena,
+                    witness,
+                    ec_op,
+                    witness_lane_levels,
+                    multiplicity,
+                )
+                .map_err(ResidentLaunchError::WitnessLanes)?;
+                if let Some(multiplicity) = multiplicity {
+                    if let Some(memory) = &multiplicity.memory_traces {
+                        memory
+                            .launch()
+                            .map_err(ResidentLaunchError::MemoryBaseTrace)?;
+                    }
+                    for fixed in &multiplicity.fixed_tables {
+                        fixed.launch().map_err(ResidentLaunchError::FixedTable)?;
+                    }
+                }
+                interpolation
+                    .launch()
+                    .map_err(ResidentLaunchError::Interpolation)?;
                 commitment.launch().map_err(ResidentLaunchError::Commit)?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
                 transcript
                     .launch_segment(
                         cursor,
                         generation,
-                        range,
+                        bootstrap_range,
                         TranscriptSegmentStart::Initialize,
+                    )
+                    .map_err(ResidentLaunchError::Transcript)?;
+                interaction_pow.launch().map_err(ResidentLaunchError::Pow)?;
+                transcript
+                    .launch_segment(
+                        cursor,
+                        generation,
+                        pow_range,
+                        TranscriptSegmentStart::Resume,
                     )
                     .map_err(ResidentLaunchError::Transcript)?;
                 relation
                     .expand_challenges_from_transcript(lookup_output)
                     .map_err(ResidentLaunchError::Relation)
-            },
-        )?;
-        self.captures
-            .insert(GraphSegment::IngestWitnessBaseCommit, graph);
+            })
+        })?;
+        self.admit_reused_transcript_segment(capture, bootstrap_segment)?;
+        self.admit_reused_transcript_segment(capture, pow_segment)?;
         Ok(())
     }
 
@@ -638,25 +1888,28 @@ impl<'a> ResidentGraphRuntime<'a> {
         let root_destination = self.transcript_input(CairoTranscriptInput::InteractionRoot)?;
         let claim_sources = &self.interaction_claim_sources;
         let relation = &self.relation;
+        let interpolation = &self.interaction_interpolation;
         let commitment = &self.commitments[commitment_index].1;
         let root_source = commitment.root_slice();
         let transcript = &self.transcript;
+        let workspace = self.workspace;
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
-        let graph = PhaseGraph::capture(
-            self.workspace.key(GraphSegment::InteractionCommit),
-            self.workspace.arena(),
-            |arena| {
+        let capture = capture_with_cursor_rollback(cursor, |cursor| {
+            workspace.capture_segment(GraphSegment::InteractionCommit, |arena| {
                 relation.launch().map_err(ResidentLaunchError::Relation)?;
+                interpolation
+                    .launch()
+                    .map_err(ResidentLaunchError::Interpolation)?;
                 commitment.launch().map_err(ResidentLaunchError::Commit)?;
                 enqueue_claimed_sums(arena, claim_sources, claim_destination)?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
                 transcript
                     .launch_segment(cursor, generation, range, TranscriptSegmentStart::Resume)
                     .map_err(ResidentLaunchError::Transcript)
-            },
-        )?;
-        self.captures.insert(GraphSegment::InteractionCommit, graph);
+            })
+        })?;
+        self.admit_reused_transcript_segment(capture, transcript_segment)?;
         Ok(())
     }
 
@@ -677,21 +1930,25 @@ impl<'a> ResidentGraphRuntime<'a> {
         let commitment = &self.commitments[commitment_index].1;
         let root_source = commitment.root_slice();
         let transcript = &self.transcript;
+        let composition = &self.composition;
+        let oods = &self.oods;
+        let workspace = self.workspace;
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
-        let graph = PhaseGraph::capture(
-            self.workspace.key(GraphSegment::CompositionQuotientCommit),
-            self.workspace.arena(),
-            |arena| {
+        let capture = capture_with_cursor_rollback(cursor, |cursor| {
+            workspace.capture_segment(GraphSegment::CompositionQuotientCommit, |arena| {
+                composition
+                    .launch()
+                    .map_err(ResidentLaunchError::Composition)?;
                 commitment.launch().map_err(ResidentLaunchError::Commit)?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
                 transcript
                     .launch_segment(cursor, generation, range, TranscriptSegmentStart::Resume)
-                    .map_err(ResidentLaunchError::Transcript)
-            },
-        )?;
-        self.captures
-            .insert(GraphSegment::CompositionQuotientCommit, graph);
+                    .map_err(ResidentLaunchError::Transcript)?;
+                oods.launch_oods().map_err(ResidentLaunchError::Oods)
+            })
+        })?;
+        self.admit_reused_transcript_segment(capture, transcript_segment)?;
         Ok(())
     }
 
@@ -705,18 +1962,20 @@ impl<'a> ResidentGraphRuntime<'a> {
             .operation_range
             .clone();
         let transcript = &self.transcript;
+        let oods = &self.oods;
+        let workspace = self.workspace;
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
-        let graph = PhaseGraph::capture(
-            self.workspace.key(GraphSegment::OodsEvaluation),
-            self.workspace.arena(),
-            |_| {
+        let capture = capture_with_cursor_rollback(cursor, |cursor| {
+            workspace.capture_segment(GraphSegment::OodsEvaluation, |_| {
                 transcript
                     .launch_segment(cursor, generation, range, TranscriptSegmentStart::Resume)
-                    .map_err(ResidentLaunchError::Transcript)
-            },
-        )?;
-        self.captures.insert(GraphSegment::OodsEvaluation, graph);
+                    .map_err(ResidentLaunchError::Transcript)?;
+                oods.launch_numerator_and_quotient()
+                    .map_err(ResidentLaunchError::Oods)
+            })
+        })?;
+        self.admit_reused_transcript_segment(capture, transcript_segment)?;
         Ok(())
     }
 
@@ -733,21 +1992,20 @@ impl<'a> ResidentGraphRuntime<'a> {
         let challenge_destination = self.fri.round_challenge_slice(0)?;
         let fri = &self.fri;
         let transcript = &self.transcript;
+        let workspace = self.workspace;
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
-        let graph = PhaseGraph::capture(
-            self.workspace.key(GraphSegment::FriLayer(0)),
-            self.workspace.arena(),
-            |arena| {
+        let capture = capture_with_cursor_rollback(cursor, |cursor| {
+            workspace.capture_segment(GraphSegment::FriLayer(0), |arena| {
                 fri.launch_first_tree().map_err(ResidentLaunchError::Fri)?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
                 transcript
                     .launch_segment(cursor, generation, range, TranscriptSegmentStart::Resume)
                     .map_err(ResidentLaunchError::Transcript)?;
                 enqueue_copy_words(arena, challenge_source, challenge_destination, 4)
-            },
-        )?;
-        self.captures.insert(GraphSegment::FriLayer(0), graph);
+            })
+        })?;
+        self.admit_reused_transcript_segment(capture, transcript_segment)?;
         Ok(())
     }
 
@@ -769,6 +2027,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                 let transcript_segment =
                     self.transcript_segment_index(CairoTranscriptSegment::FriLayer(layer))?;
                 Ok::<_, ResidentRuntimeError>((
+                    transcript_segment,
                     self.transcript_segments[transcript_segment]
                         .operation_range
                         .clone(),
@@ -781,16 +2040,17 @@ impl<'a> ResidentGraphRuntime<'a> {
             .transpose()?;
         let fri = &self.fri;
         let transcript = &self.transcript;
+        let workspace = self.workspace;
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
-        let graph = PhaseGraph::capture(
-            self.workspace.key(segment),
-            self.workspace.arena(),
-            |arena| {
+        let reused_transcript_segment = transcript_tail.as_ref().map(|tail| tail.0);
+        let capture = capture_with_cursor_rollback(cursor, |cursor| {
+            workspace.capture_segment(segment, |arena| {
                 fri.launch_round(round_index)
                     .map(|_| ())
                     .map_err(ResidentLaunchError::Fri)?;
                 if let Some((
+                    _,
                     range,
                     root_source,
                     root_destination,
@@ -804,42 +2064,75 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .map_err(ResidentLaunchError::Transcript)?;
                     enqueue_copy_words(arena, challenge_source, challenge_destination, 4)?;
                 }
-                Ok(())
-            },
-        )?;
-        self.captures.insert(segment, graph);
+                Ok::<(), ResidentLaunchError>(())
+            })
+        })?;
+        if let Some(transcript_segment) = reused_transcript_segment {
+            self.admit_reused_transcript_segment(capture, transcript_segment)?;
+        }
         Ok(())
     }
 
     pub fn capture_final_transcript_boundary(&mut self) -> Result<(), ResidentRuntimeError> {
-        let transcript_segment =
-            self.transcript_segment_index(CairoTranscriptSegment::FriLastLayerAndQueries)?;
-        let range = self.transcript_segments[transcript_segment]
+        let last_layer_segment =
+            self.transcript_segment_index(CairoTranscriptSegment::FriLastLayer)?;
+        let query_segment =
+            self.transcript_segment_index(CairoTranscriptSegment::QueryPowAndPositions)?;
+        let last_layer_range = self.transcript_segments[last_layer_segment]
+            .operation_range
+            .clone();
+        let query_range = self.transcript_segments[query_segment]
             .operation_range
             .clone();
         let transcript = &self.transcript;
-        let query_source = self.transcript_output(CairoTranscriptOutput::QueryPositions)?;
-        let (query_destination, query_words) = self.query_indices_destination()?;
+        let fri_final = &self.fri_final;
+        let query_pow = &self.query_pow;
+        let fri = &self.fri;
+        let decommit = &self.decommit;
+        let proof_bundle_sources = self.proof_bundle_sources()?;
+        let proof_bundle = self.proof_bundle;
+        let proof_bundle_layout = self.workspace.plan().decommit().proof_bundle_layout.clone();
+        let trace_tree_count = self.workspace.plan().commitments().len();
+        let workspace = self.workspace;
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
-        let graph = PhaseGraph::capture(
-            self.workspace
-                .key(GraphSegment::OodsQueriesDecommitAssemble),
-            self.workspace.arena(),
-            |arena| {
+        let capture = capture_with_cursor_rollback(cursor, |cursor| {
+            workspace.capture_segment(GraphSegment::OodsQueriesDecommitAssemble, |arena| {
+                fri_final.launch().map_err(ResidentLaunchError::FriFinal)?;
                 transcript
-                    .launch_segment(cursor, generation, range, TranscriptSegmentStart::Resume)
+                    .launch_segment(
+                        cursor,
+                        generation,
+                        last_layer_range,
+                        TranscriptSegmentStart::Resume,
+                    )
                     .map_err(ResidentLaunchError::Transcript)?;
-                enqueue_copy_words(arena, query_source, query_destination, query_words)
-            },
-        )?;
-        self.captures
-            .insert(GraphSegment::OodsQueriesDecommitAssemble, graph);
+                query_pow.launch().map_err(ResidentLaunchError::Pow)?;
+                transcript
+                    .launch_segment(
+                        cursor,
+                        generation,
+                        query_range,
+                        TranscriptSegmentStart::Resume,
+                    )
+                    .map_err(ResidentLaunchError::Transcript)?;
+                enqueue_decommit_tail(fri, decommit, trace_tree_count)?;
+                enqueue_proof_bundle(
+                    arena,
+                    &proof_bundle_sources,
+                    proof_bundle,
+                    &proof_bundle_layout,
+                )
+            })
+        })?;
+        self.admit_reused_transcript_segment(capture, last_layer_segment)?;
+        self.admit_reused_transcript_segment(capture, query_segment)?;
         Ok(())
     }
 
     pub fn capture_all_prepared_subgraphs(&mut self) -> Result<(), ResidentRuntimeError> {
-        self.begin_transcript_generation(1)?;
+        let generation = next_capture_generation(&self.transcript_cursor)?;
+        self.begin_transcript_generation(generation)?;
         self.capture_base_commit_only()?;
         self.capture_interaction_relation_and_commit()?;
         self.capture_composition_commit_only()?;
@@ -854,8 +2147,11 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn replay_base_commit_only(&mut self) -> Result<(), ResidentRuntimeError> {
-        let segment = self.transcript_segment_index(CairoTranscriptSegment::BootstrapAndLookup)?;
-        self.admit_transcript_segment_replay(segment)?;
+        let bootstrap =
+            self.transcript_segment_index(CairoTranscriptSegment::BootstrapThroughBase)?;
+        let pow = self.transcript_segment_index(CairoTranscriptSegment::InteractionPowAndLookup)?;
+        self.admit_transcript_segment_replay(bootstrap)?;
+        self.admit_transcript_segment_replay(pow)?;
         self.replay(GraphSegment::IngestWitnessBaseCommit)?;
         self.relation_challenge_generation = self
             .relation_challenge_generation
@@ -934,11 +2230,363 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn replay_final_transcript_boundary(&mut self) -> Result<(), ResidentRuntimeError> {
-        let transcript_segment =
-            self.transcript_segment_index(CairoTranscriptSegment::FriLastLayerAndQueries)?;
-        self.admit_transcript_segment_replay(transcript_segment)?;
+        let last_layer = self.transcript_segment_index(CairoTranscriptSegment::FriLastLayer)?;
+        let queries =
+            self.transcript_segment_index(CairoTranscriptSegment::QueryPowAndPositions)?;
+        self.admit_transcript_segment_replay(last_layer)?;
+        self.admit_transcript_segment_replay(queries)?;
         self.replay(GraphSegment::OodsQueriesDecommitAssemble)?;
         self.require_transcript_complete()
+    }
+
+    /// Replay the complete transcript-bounded proof DAG. The only host loop is
+    /// over true FRI challenge boundaries; component and relation work remains
+    /// inside the captured graphs.
+    pub fn replay_all_prepared_subgraphs(
+        &mut self,
+        generation: u64,
+    ) -> Result<(), ResidentRuntimeError> {
+        self.begin_transcript_generation(generation)?;
+        self.replay_base_commit_only()?;
+        self.replay_interaction_relation_and_commit()?;
+        self.replay_composition_commit_only()?;
+        self.replay_oods_transcript_boundary()?;
+        self.replay_fri_first_tree()?;
+        for round in 0..self.fri.round_count() {
+            self.replay_fri_round(round)?;
+        }
+        self.replay_final_transcript_boundary()
+    }
+
+    pub fn captured_graph_count(&self) -> usize {
+        self.workspace.graph_count()
+    }
+
+    pub fn prepared_witness_graph_count(&self) -> usize {
+        self.witness.len()
+    }
+
+    pub fn require_prepared_witness_coverage(&self) -> Result<(), ResidentRuntimeError> {
+        let planned = &self.workspace.plan().witness().components;
+        if self.witness.len() != planned.len() {
+            return Err(ResidentRuntimeError::PreparedWitnessCoverage {
+                expected: planned.len(),
+                actual: self.witness.len(),
+            });
+        }
+        for (prepared, planned) in self.witness.iter().zip(planned) {
+            let reject = |role| ResidentRuntimeError::PreparedWitnessCaptureContract {
+                component: planned.component,
+                role,
+            };
+            if prepared.component != planned.component {
+                return Err(reject("component identity"));
+            }
+            if prepared.native_input_producer != planned.native_input_producer {
+                return Err(reject("native input provenance"));
+            }
+            if prepared.writer.kernel_identity().mode != PreparedWitnessMode::RequireEmbeddedAot {
+                return Err(reject("embedded AOT mode"));
+            }
+            if !slices_match_slots(
+                prepared.writer.output_columns(),
+                &planned.slots.output_columns,
+                &planned.requirements.output_column_words,
+            ) {
+                return Err(reject("base trace destinations"));
+            }
+            if !slice_matches_slot(
+                prepared.writer.lookup_words(),
+                planned.slots.lookup_words,
+                planned.requirements.lookup_words,
+            ) {
+                return Err(reject("lookup destination"));
+            }
+            if !slice_matches_slot(
+                prepared.writer.sub_words(),
+                planned.slots.sub_words,
+                planned.requirements.sub_words,
+            ) {
+                return Err(reject("subcomponent destination"));
+            }
+            match (
+                &prepared.input_gather,
+                &planned.input_gather,
+                &prepared.input_seed,
+                &planned.input_seed,
+                &prepared.input_compact,
+                &planned.input_compact,
+            ) {
+                (None, None, None, None, None, None) => {
+                    if !slices_match_slots(
+                        prepared.writer.input_columns(),
+                        &planned.slots.input_columns,
+                        &planned.requirements.input_column_words,
+                    ) {
+                        return Err(reject("ingested input columns"));
+                    }
+                }
+                (Some(gather), Some(planned_gather), None, None, None, None) => {
+                    if !slices_match_slots(
+                        gather.consumer_input_columns(),
+                        &planned.slots.input_columns,
+                        &planned.requirements.input_column_words,
+                    ) || gather
+                        .consumer_input_columns()
+                        .iter()
+                        .map(|slice| slice.id())
+                        .ne(prepared
+                            .writer
+                            .input_columns()
+                            .iter()
+                            .map(|slice| slice.id()))
+                        || gather
+                            .sources()
+                            .iter()
+                            .map(|slice| slice.id())
+                            .ne(planned_gather.sources.iter().map(|source| source.physical))
+                    {
+                        return Err(reject("device-edge input gather"));
+                    }
+                }
+                (None, None, Some(seed), Some(planned_seed), None, None) => {
+                    let [seed_scalars, seed_pointers] = seed.descriptor_slices();
+                    if !slices_match_slots(
+                        seed.consumer_input_columns(),
+                        &planned.slots.input_columns,
+                        &planned.requirements.input_column_words,
+                    ) || seed
+                        .consumer_input_columns()
+                        .iter()
+                        .map(|slice| slice.id())
+                        .ne(prepared
+                            .writer
+                            .input_columns()
+                            .iter()
+                            .map(|slice| slice.id()))
+                        || seed.requirements() != &planned_seed.requirements
+                        || seed_scalars.id() != planned_seed.slots.scalar_values
+                        || seed_pointers.id() != planned_seed.slots.output_pointers
+                    {
+                        return Err(reject("device-seeded input columns"));
+                    }
+                }
+                (None, None, None, None, Some(compact), Some(planned_compact)) => {
+                    let [source_pointers, descriptors, output_pointers] =
+                        compact.descriptor_slices();
+                    let [tuple_scratch, sort_keys_a, sort_keys_b, sort_indices_a, sort_indices_b, run_heads, run_positions, n_unique, sort_temp, scan_temp] =
+                        compact.scratch_slices();
+                    let slots = &planned_compact.slots;
+                    if !slices_match_slots(
+                        compact.consumer_input_columns(),
+                        &planned.slots.input_columns,
+                        &planned.requirements.input_column_words,
+                    ) || compact
+                        .consumer_input_columns()
+                        .iter()
+                        .map(|slice| slice.id())
+                        .ne(prepared
+                            .writer
+                            .input_columns()
+                            .iter()
+                            .map(|slice| slice.id()))
+                        || compact.requirements() != &planned_compact.requirements
+                        || compact
+                            .sources()
+                            .iter()
+                            .map(|slice| slice.id())
+                            .ne(planned_compact.sources.iter().map(|source| source.physical))
+                        || source_pointers.id() != slots.source_pointers
+                        || descriptors.id() != slots.descriptors
+                        || output_pointers.id() != slots.output_pointers
+                        || tuple_scratch.id() != slots.tuple_scratch
+                        || sort_keys_a.id() != slots.sort_keys_a
+                        || sort_keys_b.id() != slots.sort_keys_b
+                        || sort_indices_a.id() != slots.sort_indices_a
+                        || sort_indices_b.id() != slots.sort_indices_b
+                        || run_heads.id() != slots.run_heads
+                        || run_positions.id() != slots.run_positions
+                        || n_unique.id() != slots.n_unique
+                        || sort_temp.id() != slots.sort_temp
+                        || scan_temp.id() != slots.scan_temp
+                    {
+                        return Err(reject("device-compacted input columns"));
+                    }
+                }
+                _ => return Err(reject("input preparation presence")),
+            }
+        }
+
+        match (&self.ec_op, self.workspace.plan().ec_op()) {
+            (Some(prepared), Some(planned)) => {
+                if !CAIRO_SCHEDULE.nodes.iter().any(|node| {
+                    node.id == "ec_op_builtin"
+                        && node.facts.witness_writer.kind
+                            == crate::schedule::WitnessWriterKind::NativeCuda
+                        && node.facts.witness_writer.is_capture_safe()
+                }) {
+                    return Err(ResidentRuntimeError::PreparedEcOpCoverage(
+                        "schedule capability",
+                    ));
+                }
+                if !slices_match_slots(
+                    prepared.trace_columns(),
+                    &planned.slots.trace_columns,
+                    &planned.requirements.trace_column_words,
+                ) || !slice_matches_slot(
+                    prepared.lookup_words(),
+                    planned.slots.lookup_words,
+                    planned.requirements.lookup_words,
+                ) || !slices_match_slots(
+                    prepared.partial_input_columns(),
+                    &planned.slots.partial_input_columns,
+                    &planned.requirements.partial_input_column_words,
+                ) || prepared.segment_start_source().id() != planned.slots.segment_start
+                    || prepared
+                        .multiplicity_destinations()
+                        .into_iter()
+                        .map(|slice| slice.id())
+                        .ne([
+                            planned.slots.address_counts,
+                            planned.slots.big_counts,
+                            planned.slots.small_counts,
+                            planned.slots.range_check_8_counts,
+                        ])
+                {
+                    return Err(ResidentRuntimeError::PreparedEcOpCoverage(
+                        "arena destination binding",
+                    ));
+                }
+                let partial = self
+                    .workspace
+                    .plan()
+                    .witness()
+                    .components
+                    .iter()
+                    .find(|component| component.component == "partial_ec_mul_generic")
+                    .ok_or(ResidentRuntimeError::PreparedEcOpCoverage(
+                        "partial_ec_mul_generic consumer",
+                    ))?;
+                if partial.native_input_producer != Some("ec_op_builtin")
+                    || partial.slots.input_columns != planned.slots.partial_input_columns
+                {
+                    return Err(ResidentRuntimeError::PreparedEcOpCoverage(
+                        "direct partial_ec_mul_generic provenance",
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ResidentRuntimeError::PreparedEcOpCoverage(
+                    "prepared graph presence",
+                ))
+            }
+        }
+
+        let expected_fixed = self
+            .workspace
+            .plan()
+            .multiplicity()
+            .map_or(0, |multiplicity| multiplicity.fixed_tables.len());
+        let actual_fixed = self
+            .multiplicity
+            .as_ref()
+            .map_or(0, |multiplicity| multiplicity.fixed_tables.len());
+        if actual_fixed != expected_fixed {
+            return Err(ResidentRuntimeError::PreparedFixedTableCoverage {
+                expected: expected_fixed,
+                actual: actual_fixed,
+            });
+        }
+        if let Some(planned_multiplicity) = self.workspace.plan().multiplicity() {
+            let prepared_multiplicity = self.multiplicity.as_ref().ok_or(
+                ResidentRuntimeError::PreparedFixedTableCoverage {
+                    expected: expected_fixed,
+                    actual: 0,
+                },
+            )?;
+            for (prepared, planned) in prepared_multiplicity
+                .fixed_tables
+                .iter()
+                .zip(&planned_multiplicity.fixed_tables)
+            {
+                let reject = |role| ResidentRuntimeError::PreparedFixedTableCaptureContract {
+                    component: planned.plan.component,
+                    role,
+                };
+                if prepared
+                    .source_columns()
+                    .iter()
+                    .map(|slice| slice.id())
+                    .ne(planned.sources.iter().map(|source| source.physical))
+                {
+                    return Err(reject("preprocessed sources"));
+                }
+                if prepared.multiplicity_slab().is_none_or(|slice| {
+                    !slice_matches_slot(
+                        slice,
+                        planned.multiplicity.physical,
+                        planned.plan.slab_words,
+                    )
+                }) {
+                    return Err(reject("multiplicity slab"));
+                }
+                if prepared
+                    .trace_outputs()
+                    .iter()
+                    .map(|slice| slice.id())
+                    .ne(planned.slots.trace_outputs.iter().copied())
+                {
+                    return Err(reject("base trace destinations"));
+                }
+                let lookup_words = planned
+                    .plan
+                    .row_count
+                    .checked_mul(prepared.requirements().lookup_output_count)
+                    .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                if prepared.lookup_output_slab().is_none_or(|slice| {
+                    !slice_matches_slot(slice, planned.slots.lookup_output, lookup_words)
+                }) {
+                    return Err(reject("lookup destination"));
+                }
+            }
+            let prepared_memory = prepared_multiplicity.memory_traces.is_some();
+            let planned_memory = planned_multiplicity.memory_traces.is_some();
+            if prepared_memory != planned_memory {
+                return Err(ResidentRuntimeError::PreparedFixedTableCaptureContract {
+                    component: "memory_address_to_id+memory_id_to_big",
+                    role: "PreparedMemoryBaseTraceGraph presence",
+                });
+            }
+            if planned_memory
+                && !["memory_address_to_id", "memory_id_to_big"]
+                    .into_iter()
+                    .all(|component| {
+                        CAIRO_SCHEDULE.nodes.iter().any(|node| {
+                            node.id == component
+                                && node.facts.witness_writer.kind
+                                    == crate::schedule::WitnessWriterKind::NativeCuda
+                                && node.facts.witness_writer.is_capture_safe()
+                        })
+                    })
+            {
+                return Err(ResidentRuntimeError::PreparedFixedTableCaptureContract {
+                    component: "memory_address_to_id+memory_id_to_big",
+                    role: "schedule capability is not backed by PreparedMemoryBaseTraceGraph",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn workspace_proof_bundle_bytes(&self) -> Option<u64> {
+        self.workspace
+            .plan()
+            .decommit()
+            .proof_bundle_layout
+            .total_words
+            .checked_mul(core::mem::size_of::<u32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
     }
 
     /// Host-channel migration path. Device transcript mode writes directly to
@@ -989,13 +2637,39 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn launch_base_commit_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        if let Some(execution_tables) = &self.execution_tables {
+            execution_tables.launch()?;
+        }
+        if let Some(multiplicity) = &self.multiplicity {
+            multiplicity.clear.launch()?;
+        }
+        enqueue_witness_lane_levels(
+            self.workspace.arena(),
+            &self.witness,
+            self.ec_op.as_ref(),
+            &self.witness_lane_levels,
+            self.multiplicity.as_ref(),
+        )?;
+        if let Some(multiplicity) = &self.multiplicity {
+            if let Some(memory) = &multiplicity.memory_traces {
+                memory.launch()?;
+            }
+            for fixed in &multiplicity.fixed_tables {
+                fixed.launch()?;
+            }
+        }
+        self.base_interpolation.launch()?;
         self.commitment(CommitmentTreeId::Base)?.launch()?;
         self.stage_commitment_root_for_transcript(
             CommitmentTreeId::Base,
             CairoTranscriptInput::BaseRoot,
         )?;
-        let segment = self.transcript_segment_index(CairoTranscriptSegment::BootstrapAndLookup)?;
-        self.launch_transcript_segment_eager(segment)?;
+        let bootstrap =
+            self.transcript_segment_index(CairoTranscriptSegment::BootstrapThroughBase)?;
+        let pow = self.transcript_segment_index(CairoTranscriptSegment::InteractionPowAndLookup)?;
+        self.launch_transcript_segment_eager(bootstrap)?;
+        self.interaction_pow.launch()?;
+        self.launch_transcript_segment_eager(pow)?;
         self.publish_relation_challenges_from_transcript()?;
         Ok(())
     }
@@ -1005,6 +2679,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             return Err(ResidentRuntimeError::StaleRelationChallenges);
         }
         self.relation.launch()?;
+        self.interaction_interpolation.launch()?;
         self.commitment(CommitmentTreeId::Interaction)?.launch()?;
         self.stage_interaction_claim_for_transcript()?;
         self.stage_commitment_root_for_transcript(
@@ -1019,6 +2694,7 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn launch_composition_commit_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.composition.launch()?;
         self.commitment(CommitmentTreeId::Composition)?.launch()?;
         self.stage_commitment_root_for_transcript(
             CommitmentTreeId::Composition,
@@ -1027,13 +2703,16 @@ impl<'a> ResidentGraphRuntime<'a> {
         let transcript_segment =
             self.transcript_segment_index(CairoTranscriptSegment::CompositionAndOods)?;
         self.launch_transcript_segment_eager(transcript_segment)?;
+        self.oods.launch_oods()?;
         Ok(())
     }
 
     pub fn launch_oods_transcript_boundary_eager(&mut self) -> Result<(), ResidentRuntimeError> {
         let transcript_segment =
             self.transcript_segment_index(CairoTranscriptSegment::OodsAndQuotient)?;
-        self.launch_transcript_segment_eager(transcript_segment)
+        self.launch_transcript_segment_eager(transcript_segment)?;
+        self.oods.launch_numerator_and_quotient()?;
+        Ok(())
     }
 
     pub fn launch_fri_first_tree_eager(&mut self) -> Result<(), ResidentRuntimeError> {
@@ -1076,17 +2755,30 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn launch_final_transcript_boundary_eager(&mut self) -> Result<(), ResidentRuntimeError> {
-        let transcript_segment =
-            self.transcript_segment_index(CairoTranscriptSegment::FriLastLayerAndQueries)?;
-        self.launch_transcript_segment_eager(transcript_segment)?;
-        let query_source = self.transcript_output(CairoTranscriptOutput::QueryPositions)?;
-        let (query_destination, query_words) = self.query_indices_destination()?;
-        self.copy_transcript_words(
-            "query_positions",
-            query_source,
-            query_destination,
-            query_words,
-        )?;
+        let last_layer = self.transcript_segment_index(CairoTranscriptSegment::FriLastLayer)?;
+        let queries =
+            self.transcript_segment_index(CairoTranscriptSegment::QueryPowAndPositions)?;
+        self.fri_final.launch()?;
+        self.launch_transcript_segment_eager(last_layer)?;
+        self.query_pow.launch()?;
+        self.launch_transcript_segment_eager(queries)?;
+        self.decommit.launch_query_normalization()?;
+        let trace_tree_count = self.workspace.plan().commitments().len();
+        for tree_index in 0..trace_tree_count {
+            self.decommit.launch_trace_tree(tree_index)?;
+        }
+        for tree_index in 0..self.fri.tree_count() {
+            self.decommit
+                .launch_fri_tree(trace_tree_count + tree_index)?;
+        }
+        let sources = self.proof_bundle_sources()?;
+        enqueue_proof_bundle(
+            self.workspace.arena(),
+            &sources,
+            self.proof_bundle,
+            &self.workspace.plan().decommit().proof_bundle_layout,
+        )
+        .map_err(|error| ResidentRuntimeError::Graph(GraphError::Enqueue(Box::new(error))))?;
         self.require_transcript_complete()
     }
 
@@ -1094,7 +2786,19 @@ impl<'a> ResidentGraphRuntime<'a> {
         &self,
         id: CommitmentTreeId,
     ) -> Result<Blake2sHash, ResidentRuntimeError> {
-        Ok(self.commitment(id)?.read_root_at_transcript_boundary()?)
+        if id != CommitmentTreeId::Preprocessed {
+            return Ok(self.commitment(id)?.read_root_at_transcript_boundary()?);
+        }
+        let mut root = Blake2sHash::default();
+        unsafe {
+            self.workspace.arena().context().memcpy_d2h_async(
+                root.0.as_mut_ptr().cast(),
+                self.fixed_preprocessed_root.as_void_ptr().cast_const(),
+                core::mem::size_of::<Blake2sHash>(),
+            )?;
+        }
+        self.workspace.arena().context().sync()?;
+        Ok(root)
     }
 
     pub fn read_interaction_transcript_boundary(
@@ -1154,6 +2858,76 @@ impl<'a> ResidentGraphRuntime<'a> {
             .output_tree)
     }
 
+    pub fn proof_assembly_shape(&self) -> &Blake2sProofAssemblyShape {
+        &self.workspace.plan().decommit().proof_shape
+    }
+
+    fn proof_bundle_sources(&self) -> Result<ResidentProofBundleSources, ResidentRuntimeError> {
+        let commitments = [
+            self.commitment_root_slice(CommitmentTreeId::Preprocessed)?,
+            self.commitment_root_slice(CommitmentTreeId::Base)?,
+            self.commitment_root_slice(CommitmentTreeId::Interaction)?,
+            self.commitment_root_slice(CommitmentTreeId::Composition)?,
+        ];
+        let fri_commitments = (0..self.fri.tree_count())
+            .map(|tree| self.fri.tree_root(tree).map_err(ResidentRuntimeError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ResidentProofBundleSources {
+            commitments,
+            interaction_claim: self.transcript_input(CairoTranscriptInput::InteractionClaim)?,
+            interaction_pow: self.interaction_pow.nonce_destination(),
+            sampled_values: self.transcript_input(CairoTranscriptInput::OodsSampledValues)?,
+            fri_commitments,
+            final_line_poly: self.fri_final.transcript_destination(),
+            query_pow: self.query_pow.nonce_destination(),
+            decommitment: self.decommit.assembly_slice(),
+        })
+    }
+
+    /// The production host boundary: one contiguous D2H copy followed by the
+    /// proof stream's sole hot synchronization.
+    pub fn read_proof_bundle_once(&self) -> Result<ResidentProofBundle, ResidentRuntimeError> {
+        let planned = self.workspace.plan().decommit();
+        let words = planned.proof_bundle_layout.total_words;
+        let mut host = vec![0u32; words];
+        unsafe {
+            self.workspace.arena().context().memcpy_d2h_async(
+                host.as_mut_ptr().cast(),
+                self.proof_bundle.as_void_ptr().cast_const(),
+                words.checked_mul(core::mem::size_of::<u32>()).ok_or(
+                    ResidentRuntimeError::TranscriptBindingTooSmall {
+                        role: "resident proof bundle",
+                        required_words: words,
+                        actual_words: self.proof_bundle.len_words(),
+                    },
+                )?,
+            )?;
+        }
+        self.workspace.arena().context().sync()?;
+        Ok(ResidentProofBundle::decode(
+            host,
+            &planned.proof_bundle_layout,
+            &planned.proof_shape,
+        )?)
+    }
+
+    /// Resident compact decommit ABI. The production final-bundle copier must
+    /// include this slice in its one D2H transfer instead of calling the
+    /// standalone read helper below.
+    pub fn decommit_assembly_slice(&self) -> ArenaSlice {
+        self.decommit.assembly_slice()
+    }
+
+    pub fn decommit_assembly_capacity_words(&self) -> usize {
+        self.decommit.requirements().assembly_words
+    }
+
+    /// Migration/test boundary. Production proof assembly uses the single
+    /// proof-bundle D2H and then calls `DecommitAssembly::decode` on its prefix.
+    pub fn read_decommit_assembly_once(&self) -> Result<DecommitAssembly, ResidentRuntimeError> {
+        Ok(self.decommit.read_assembly_once()?)
+    }
+
     fn commitment(
         &self,
         id: CommitmentTreeId,
@@ -1164,6 +2938,28 @@ impl<'a> ResidentGraphRuntime<'a> {
             .ok_or(ResidentRuntimeError::MissingPreparedCommitment(id))
     }
 
+    pub fn commitment_root_slice(
+        &self,
+        id: CommitmentTreeId,
+    ) -> Result<ArenaSlice, ResidentRuntimeError> {
+        if id == CommitmentTreeId::Preprocessed {
+            Ok(self.fixed_preprocessed_root)
+        } else {
+            Ok(self.commitment(id)?.root_slice())
+        }
+    }
+
+    pub fn commitment_retained_layers_bottom_up(
+        &self,
+        id: CommitmentTreeId,
+    ) -> Result<&[ArenaSlice], ResidentRuntimeError> {
+        if id == CommitmentTreeId::Preprocessed {
+            Ok(&self.fixed_preprocessed_retained_layers)
+        } else {
+            Ok(self.commitment(id)?.retained_layers_bottom_up())
+        }
+    }
+
     fn transcript_segment_index(
         &self,
         semantic: CairoTranscriptSegment,
@@ -1172,15 +2968,6 @@ impl<'a> ResidentGraphRuntime<'a> {
             .iter()
             .position(|segment| segment.segment == semantic)
             .ok_or(ResidentRuntimeError::MissingTranscriptSegment(semantic))
-    }
-
-    fn query_indices_destination(&self) -> Result<(ArenaSlice, usize), ResidentRuntimeError> {
-        let (logical, _) = self
-            .workspace
-            .plan()
-            .find(None, None, BufferPurpose::QueryIndices, 0)
-            .ok_or(ResidentRuntimeError::TranscriptRequirementsMismatch)?;
-        Ok(self.workspace.bind(logical.id)?)
     }
 
     fn copy_transcript_words(
@@ -1223,12 +3010,18 @@ impl<'a> ResidentGraphRuntime<'a> {
         Ok(())
     }
 
+    fn admit_reused_transcript_segment(
+        &mut self,
+        capture: GraphCaptureStatus,
+        transcript_segment: usize,
+    ) -> Result<(), ResidentRuntimeError> {
+        admit_on_graph_reuse(capture, || {
+            self.admit_transcript_segment_replay(transcript_segment)
+        })
+    }
+
     fn replay(&self, segment: GraphSegment) -> Result<(), ResidentRuntimeError> {
-        let graph = self
-            .captures
-            .get(&segment)
-            .ok_or(GraphError::MissingSegment(segment))?;
-        graph.replay(self.workspace.arena())?;
+        self.workspace.replay_segment(segment)?;
         Ok(())
     }
 
@@ -1242,6 +3035,37 @@ impl<'a> ResidentGraphRuntime<'a> {
         }
         Ok(())
     }
+}
+
+fn admit_on_graph_reuse<E>(
+    capture: GraphCaptureStatus,
+    admit: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    if capture.is_reused() {
+        admit()?;
+    }
+    Ok(())
+}
+
+fn capture_with_cursor_rollback<T, E>(
+    cursor: &mut TranscriptSegmentCursor,
+    capture: impl FnOnce(&mut TranscriptSegmentCursor) -> Result<T, E>,
+) -> Result<T, E> {
+    let checkpoint = cursor.clone();
+    match capture(cursor) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            *cursor = checkpoint;
+            Err(error)
+        }
+    }
+}
+
+fn next_capture_generation(cursor: &TranscriptSegmentCursor) -> Result<u64, ResidentRuntimeError> {
+    cursor
+        .generation()
+        .checked_add(1)
+        .ok_or(ResidentRuntimeError::SizeOverflow)
 }
 
 fn enqueue_copy_words(
@@ -1267,6 +3091,123 @@ fn enqueue_copy_words(
                 bytes,
             )
             .map_err(ResidentLaunchError::Cuda)?;
+    }
+    Ok(())
+}
+
+fn enqueue_proof_bundle(
+    arena: &stwo_backend_cuda::DeviceArena,
+    sources: &ResidentProofBundleSources,
+    destination: ArenaSlice,
+    layout: &ResidentProofBundleLayout,
+) -> Result<(), ResidentLaunchError> {
+    if destination.len_words() < layout.total_words
+        || layout.commitments.len() != sources.commitments.len() * 8
+        || layout.fri_commitments.len() != sources.fri_commitments.len() * 8
+    {
+        return Err(ResidentLaunchError::Binding("resident proof bundle layout"));
+    }
+    for (index, source) in sources.commitments.iter().copied().enumerate() {
+        let start = layout.commitments.start + index * 8;
+        enqueue_bundle_range(arena, source, destination, start, 8)?;
+    }
+    enqueue_bundle_range(
+        arena,
+        sources.interaction_claim,
+        destination,
+        layout.interaction_claim.start,
+        layout.interaction_claim.len(),
+    )?;
+    enqueue_bundle_range(
+        arena,
+        sources.interaction_pow,
+        destination,
+        layout.interaction_pow.start,
+        layout.interaction_pow.len(),
+    )?;
+    enqueue_bundle_range(
+        arena,
+        sources.sampled_values,
+        destination,
+        layout.sampled_values.start,
+        layout.sampled_values.len(),
+    )?;
+    for (index, source) in sources.fri_commitments.iter().copied().enumerate() {
+        let start = layout.fri_commitments.start + index * 8;
+        enqueue_bundle_range(arena, source, destination, start, 8)?;
+    }
+    enqueue_bundle_range(
+        arena,
+        sources.final_line_poly,
+        destination,
+        layout.final_line_poly.start,
+        layout.final_line_poly.len(),
+    )?;
+    enqueue_bundle_range(
+        arena,
+        sources.query_pow,
+        destination,
+        layout.query_pow.start,
+        layout.query_pow.len(),
+    )?;
+    enqueue_bundle_range(
+        arena,
+        sources.decommitment,
+        destination,
+        layout.decommitment.start,
+        layout.decommitment.len(),
+    )
+}
+
+fn enqueue_bundle_range(
+    arena: &stwo_backend_cuda::DeviceArena,
+    source: ArenaSlice,
+    destination: ArenaSlice,
+    destination_offset_words: usize,
+    words: usize,
+) -> Result<(), ResidentLaunchError> {
+    let destination_end = destination_offset_words
+        .checked_add(words)
+        .ok_or(ResidentLaunchError::Binding("proof bundle offset overflow"))?;
+    if source.len_words() < words || destination.len_words() < destination_end {
+        return Err(ResidentLaunchError::Binding("proof bundle copy capacity"));
+    }
+    let bytes = words
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(ResidentLaunchError::Binding("proof bundle byte overflow"))?;
+    unsafe {
+        arena
+            .context()
+            .memcpy_d2d_async(
+                destination
+                    .as_u32_ptr()
+                    .add(destination_offset_words)
+                    .cast(),
+                source.as_void_ptr().cast_const(),
+                bytes,
+            )
+            .map_err(ResidentLaunchError::Cuda)?;
+    }
+    Ok(())
+}
+
+fn enqueue_decommit_tail(
+    fri: &PreparedFriGraph<'_>,
+    decommit: &PreparedDecommitGraph<'_>,
+    trace_tree_count: usize,
+) -> Result<(), ResidentLaunchError> {
+    decommit
+        .launch_query_normalization()
+        .map_err(ResidentLaunchError::Decommit)?;
+    for tree_index in 0..trace_tree_count {
+        decommit
+            .launch_trace_tree(tree_index)
+            .map_err(ResidentLaunchError::Decommit)?;
+    }
+    for tree_index in 0..fri.tree_count() {
+        decommit
+            .launch_fri_tree(trace_tree_count + tree_index)
+            .map_err(ResidentLaunchError::Decommit)?;
     }
     Ok(())
 }
@@ -1342,49 +3283,245 @@ fn interaction_outputs_in_cairo_order(
         .collect())
 }
 
-fn commitment_groups(
+fn resident_decommit_sources(
     workspace: &GraphWorkspace,
-    planned: &PlannedCommitment,
-) -> Result<Vec<CommitCoefficientGroup>, ResidentRuntimeError> {
-    planned
-        .grouped_column_sources
-        .iter()
-        .zip(&planned.grouped_column_log_sizes)
-        .map(|(sources, logs)| {
-            let columns = sources
-                .iter()
-                .zip(logs)
-                .map(|(&source, &log_size)| {
-                    let binding = match source {
-                        CommitmentColumnSource::Trace {
-                            component,
-                            part,
-                            purpose,
-                            ordinal,
-                        } => workspace
-                            .plan()
-                            .find(Some(component), Some(part), purpose, ordinal)
-                            .map(|(_, binding)| binding),
-                        CommitmentColumnSource::Composition { ordinal } => workspace
-                            .plan()
-                            .find(None, None, BufferPurpose::CompositionCoefficients, ordinal)
-                            .map(|(_, binding)| binding),
+    commitments: &[(CommitmentTreeId, PreparedCommitGraph<'_>)],
+    fixed_preprocessed_root: ArenaSlice,
+    fixed_preprocessed_layers: &[ArenaSlice],
+    fri: &PreparedFriGraph<'_>,
+) -> Result<Vec<DecommitTreeSources>, ResidentRuntimeError> {
+    let arena = workspace.arena();
+    let planned_decommit = workspace.plan().decommit();
+    let mut sources = Vec::with_capacity(planned_decommit.config.trees.len());
+    for (tree_index, planned) in workspace.plan().commitments().iter().enumerate() {
+        let Some(DecommitTreeGeometry::Trace(geometry)) =
+            planned_decommit.config.trees.get(tree_index)
+        else {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "trace commitment/decommit order differs",
+            ));
+        };
+        let expected_role = match planned.id {
+            CommitmentTreeId::Preprocessed => stwo_backend_cuda::TraceTreeRole::Preprocessed,
+            CommitmentTreeId::Base => stwo_backend_cuda::TraceTreeRole::Base,
+            CommitmentTreeId::Interaction => stwo_backend_cuda::TraceTreeRole::Interaction,
+            CommitmentTreeId::Composition => stwo_backend_cuda::TraceTreeRole::Composition,
+            CommitmentTreeId::Fri(_) => {
+                return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                    "FRI commitment appeared in the trace prefix",
+                ));
+            }
+        };
+        if geometry.role != expected_role
+            || geometry.leaf_log_size != planned.config.lifting_log_size
+            || geometry.unretained_bottom_layers != planned.config.unretained_bottom_layers
+            || geometry.groups.len() != planned.grouped_column_log_sizes.len()
+        {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "trace commitment/decommit geometry differs",
+            ));
+        }
+        let prepared_commitment = commitments
+            .iter()
+            .find_map(|(id, graph)| (*id == planned.id).then_some(graph));
+        if planned.id != CommitmentTreeId::Preprocessed && prepared_commitment.is_none() {
+            return Err(ResidentRuntimeError::MissingPreparedCommitment(planned.id));
+        }
+        let commit_groups = commitment_groups(workspace, planned)?;
+        let groups = commit_groups
+            .into_iter()
+            .zip(&geometry.groups)
+            .enumerate()
+            .map(|(group_index, (group, geometry))| {
+                if group.columns.len() != geometry.columns.len()
+                    || group
+                        .columns
+                        .iter()
+                        .zip(&geometry.columns)
+                        .any(|(column, geometry)| column.log_size != geometry.coefficient_log_size)
+                {
+                    return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                        "trace decommit columns differ from prepared commit columns",
+                    ));
+                }
+                let planned_retained = planned.retained_evaluation_groups.get(group_index).ok_or(
+                    ResidentRuntimeError::DecommitTopologyMismatch(
+                        "trace retained-evaluation plan differs from decommit geometry",
+                    ),
+                )?;
+                let columns = match geometry.mode {
+                    stwo_backend_cuda::DecommitSourceMode::RecomputeQueriedLde => {
+                        if planned_retained.is_some() {
+                            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                                "recomputed trace group owns an unexpected retained evaluation",
+                            ));
+                        }
+                        group
+                            .columns
+                            .into_iter()
+                            .map(|column| DecommitColumnSource::Coefficients(column.coefficients))
+                            .collect()
                     }
-                    .ok_or(ResidentRuntimeError::MissingCommitmentSource {
-                        id: planned.id,
-                        source,
-                    })?;
-                    let coefficients = workspace.arena().bind(binding.physical)?;
-                    require_resident_source(workspace, coefficients)?;
-                    Ok(CommitCoefficientColumn {
-                        coefficients,
-                        log_size,
-                    })
-                })
-                .collect::<Result<Vec<_>, ResidentRuntimeError>>()?;
-            Ok(CommitCoefficientGroup { columns })
-        })
-        .collect()
+                    stwo_backend_cuda::DecommitSourceMode::ResidentEvaluations => {
+                        let graph = prepared_commitment.ok_or(
+                            ResidentRuntimeError::DecommitTopologyMismatch(
+                                "fixed preprocessed tree cannot use per-proof retained LDEs",
+                            ),
+                        )?;
+                        let actual = graph
+                            .retained_evaluations()
+                            .get(group_index)
+                            .and_then(Option::as_ref)
+                            .ok_or(ResidentRuntimeError::DecommitTopologyMismatch(
+                                "prepared commitment did not retain its planned evaluation group",
+                            ))?;
+                        let expected = planned_retained.as_ref().ok_or(
+                            ResidentRuntimeError::DecommitTopologyMismatch(
+                                "resident trace group has no arena binding",
+                            ),
+                        )?;
+                        if actual.len() != expected.len() {
+                            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                                "retained trace evaluation width differs from the arena plan",
+                            ));
+                        }
+                        for (&actual, expected) in actual.iter().zip(expected) {
+                            require_same_slice(
+                                "retained trace evaluation binding differs from commit output",
+                                actual,
+                                arena.bind(expected.physical)?,
+                            )?;
+                        }
+                        actual
+                            .iter()
+                            .copied()
+                            .map(DecommitColumnSource::ResidentEvaluation)
+                            .collect()
+                    }
+                };
+                Ok(TraceSourceGroup { columns })
+            })
+            .collect::<Result<Vec<_>, ResidentRuntimeError>>()?;
+        let expected_layers = planned
+            .retained_layers_bottom_up
+            .iter()
+            .map(|binding| arena.bind(binding.physical))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (root, retained_layers_bottom_up) = if planned.id == CommitmentTreeId::Preprocessed {
+            (fixed_preprocessed_root, fixed_preprocessed_layers.to_vec())
+        } else {
+            let graph = prepared_commitment
+                .ok_or(ResidentRuntimeError::MissingPreparedCommitment(planned.id))?;
+            (
+                graph.root_slice(),
+                graph.retained_layers_bottom_up().to_vec(),
+            )
+        };
+        if retained_layers_bottom_up.len() != expected_layers.len() {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "trace retained-layer count differs from the arena plan",
+            ));
+        }
+        for (actual, expected) in retained_layers_bottom_up
+            .iter()
+            .copied()
+            .zip(expected_layers)
+        {
+            require_same_slice(
+                "trace retained-layer binding differs from prepared commitment",
+                actual,
+                expected,
+            )?;
+        }
+        let Some(last_layer) = retained_layers_bottom_up.last().copied() else {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "trace commitment has no retained root",
+            ));
+        };
+        require_same_slice(
+            "trace retained root differs from prepared commitment root",
+            last_layer,
+            root,
+        )?;
+        sources.push(DecommitTreeSources::Trace(TraceDecommitSources {
+            groups,
+            retained_layers_bottom_up,
+        }));
+    }
+
+    let trace_count = workspace.plan().commitments().len();
+    if fri.tree_count() + trace_count != planned_decommit.config.trees.len()
+        || fri.tree_count() != workspace.plan().fri().requirements.trees.len()
+    {
+        return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+            "FRI tree count differs from decommitment",
+        ));
+    }
+    for fri_tree_index in 0..fri.tree_count() {
+        let Some(DecommitTreeGeometry::Fri(geometry)) = planned_decommit
+            .config
+            .trees
+            .get(trace_count + fri_tree_index)
+        else {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "FRI decommit suffix order differs",
+            ));
+        };
+        if geometry.fri_tree_index as usize != fri_tree_index {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "FRI decommit ordinal differs",
+            ));
+        }
+        let evaluation = fri.tree_evaluation(fri_tree_index)?;
+        if evaluation.log_size != geometry.evaluation_log_size {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "FRI evaluation height differs from decommitment",
+            ));
+        }
+        let retained_layers_bottom_up = fri.tree_layers_bottom_up(fri_tree_index)?.to_vec();
+        let planned_layers = &workspace.plan().fri().slots.trees[fri_tree_index].layers_bottom_up;
+        if retained_layers_bottom_up.len() != planned_layers.len() {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "FRI retained-layer count differs from the arena plan",
+            ));
+        }
+        for (&actual, &planned_slot) in retained_layers_bottom_up.iter().zip(planned_layers) {
+            require_same_slice(
+                "FRI retained-layer binding differs from its commit graph",
+                actual,
+                arena.bind(planned_slot)?,
+            )?;
+        }
+        require_same_slice(
+            "FRI retained root differs from its commit root",
+            *retained_layers_bottom_up.last().ok_or(
+                ResidentRuntimeError::DecommitTopologyMismatch(
+                    "FRI commitment has no retained root",
+                ),
+            )?,
+            fri.tree_root(fri_tree_index)?,
+        )?;
+        sources.push(DecommitTreeSources::Fri(FriDecommitOwnedSources {
+            evaluation: evaluation.values,
+            coordinate_stride: evaluation.coordinate_stride,
+            retained_layers_bottom_up,
+        }));
+    }
+    Ok(sources)
+}
+
+fn require_same_slice(
+    role: &'static str,
+    actual: ArenaSlice,
+    expected: ArenaSlice,
+) -> Result<(), ResidentRuntimeError> {
+    if actual.id() != expected.id()
+        || actual.as_u32_ptr() != expected.as_u32_ptr()
+        || actual.len_words() != expected.len_words()
+    {
+        return Err(ResidentRuntimeError::DecommitTopologyMismatch(role));
+    }
+    Ok(())
 }
 
 fn arena_relation_sources(
@@ -1518,6 +3655,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn witness_level_packing_is_deterministic_and_balances_long_writers() {
+        assert_eq!(
+            pack_weighted_lane_level(vec![(0, 10, "a"), (1, 8, "b"), (2, 7, "c"), (3, 3, "d")], 2,),
+            vec![vec![0, 3], vec![1, 2]],
+        );
+        assert_eq!(
+            pack_weighted_lane_level(vec![(7, 5, "z"), (6, 5, "a")], 2),
+            vec![vec![6], vec![7]],
+        );
+    }
+
+    #[test]
     fn fri_segments_reserve_zero_for_the_original_tree() {
         assert_eq!(fri_round_segment(0).unwrap(), GraphSegment::FriLayer(1));
         assert_eq!(fri_round_segment(254).unwrap(), GraphSegment::FriLayer(255));
@@ -1541,5 +3690,70 @@ mod tests {
                 ..first
             }
         );
+    }
+
+    #[test]
+    fn cached_capture_still_advances_host_transcript_admission() {
+        let admissions = std::cell::Cell::new(0);
+        admit_on_graph_reuse(GraphCaptureStatus::Captured, || {
+            admissions.set(admissions.get() + 1);
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .unwrap();
+        admit_on_graph_reuse(GraphCaptureStatus::Reused, || {
+            admissions.set(admissions.get() + 1);
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .unwrap();
+        assert_eq!(admissions.get(), 1);
+    }
+
+    #[test]
+    fn failed_capture_rolls_back_transcript_cursor_and_can_retry() {
+        use stwo_backend_cuda::{
+            Blake2sTranscriptSchedule, TranscriptBoundaryId, TranscriptInputId,
+            TranscriptOperation, TranscriptStart,
+        };
+
+        let schedule = Blake2sTranscriptSchedule::new(
+            TranscriptStart::Default,
+            vec![TranscriptOperation::MixU32s {
+                boundary: TranscriptBoundaryId(1),
+                source: TranscriptInputId(1),
+                n_words: 1,
+            }],
+            8,
+        )
+        .unwrap();
+        let mut cursor = TranscriptSegmentCursor::new(&schedule);
+        let first_generation = next_capture_generation(&cursor).unwrap();
+        assert_eq!(first_generation, 1);
+        cursor.begin_generation(first_generation).unwrap();
+        let checkpoint = cursor.clone();
+
+        let failed = capture_with_cursor_rollback(&mut cursor, |cursor| {
+            cursor
+                .admit_segment(&schedule, 1, 0..1, TranscriptSegmentStart::Initialize)
+                .unwrap();
+            Err::<(), _>("injected post-transcript capture failure")
+        });
+        assert_eq!(failed, Err("injected post-transcript capture failure"));
+        assert_eq!(cursor, checkpoint);
+
+        let retry_generation = next_capture_generation(&cursor).unwrap();
+        assert_eq!(retry_generation, 2);
+        cursor.begin_generation(retry_generation).unwrap();
+        capture_with_cursor_rollback(&mut cursor, |cursor| {
+            cursor
+                .admit_segment(
+                    &schedule,
+                    retry_generation,
+                    0..1,
+                    TranscriptSegmentStart::Initialize,
+                )
+                .map_err(|_| "retry admission failed")
+        })
+        .unwrap();
+        assert!(cursor.is_complete());
     }
 }

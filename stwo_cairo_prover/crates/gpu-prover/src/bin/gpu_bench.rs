@@ -114,6 +114,7 @@ use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_gpu_prover::{
     CudaPcsDriverTelemetry, CudaPcsRuntimeMode, GpuCairoProver, GpuProverConfig,
+    ResidentSessionTelemetry,
 };
 use stwo_cairo_prover::prover::{prove_cairo, ChannelHash, ProverParameters};
 use stwo_cairo_serialize::CairoSerialize;
@@ -168,6 +169,8 @@ static GPU_NATIVE_CUDA: OnceLock<Mutex<GpuCairoProver<Blake2sMerkleChannel>>> = 
 static LAST_GPU_NATIVE_PCS_TELEMETRY: OnceLock<Mutex<Option<CudaPcsDriverTelemetry>>> =
     OnceLock::new();
 static LAST_GPU_NATIVE_AOT_STATS: OnceLock<Mutex<Option<AotRuntimeStats>>> = OnceLock::new();
+static LAST_GPU_NATIVE_SESSION_TELEMETRY: OnceLock<Mutex<Option<ResidentSessionTelemetry>>> =
+    OnceLock::new();
 
 fn record_gpu_native_pcs_telemetry(telemetry: &CudaPcsDriverTelemetry) {
     *LAST_GPU_NATIVE_PCS_TELEMETRY
@@ -183,18 +186,28 @@ fn record_gpu_native_aot_stats(stats: AotRuntimeStats) {
         .expect("gpu-native AOT telemetry mutex poisoned") = Some(stats);
 }
 
+fn record_gpu_native_session_telemetry(telemetry: &ResidentSessionTelemetry) {
+    *LAST_GPU_NATIVE_SESSION_TELEMETRY
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("gpu-native session telemetry mutex poisoned") = Some(telemetry.clone());
+}
+
 fn prove_gpu_native(
     cell: &OnceLock<Mutex<GpuCairoProver<Blake2sMerkleChannel>>>,
     input: ProverInput,
     params: ProverParameters,
 ) -> BenchProof {
     let prover = cell.get_or_init(|| {
-        Mutex::new(GpuCairoProver::new(GpuProverConfig::default()).expect("gpu-native config"))
+        Mutex::new(GpuCairoProver::new(gpu_native_prover_config()).expect("gpu-native config"))
     });
     let mut prover = prover.lock().unwrap();
-    let proof = prover
-        .prove(input, params)
-        .expect("gpu-native prove failed");
+    let proof = if prover.config().strict {
+        prover.prove_resident_blake2s(input, params)
+    } else {
+        prover.prove(input, params)
+    }
+    .expect("gpu-native prove failed");
     let telemetry = prover
         .last_pcs_telemetry()
         .expect("gpu-native prove returned without CUDA PCS architecture telemetry");
@@ -203,6 +216,9 @@ fn prove_gpu_native(
         "gpu-native CUDA PCS driver did not complete every architecture stage"
     );
     record_gpu_native_pcs_telemetry(telemetry);
+    if let Some(session) = prover.last_resident_session_telemetry() {
+        record_gpu_native_session_telemetry(session);
+    }
     let aot_stats = prover
         .last_aot_stats()
         .expect("gpu-native prove returned without CUDA AOT provenance telemetry");
@@ -212,6 +228,13 @@ fn prove_gpu_native(
     }
     record_gpu_native_aot_stats(aot_stats);
     proof
+}
+
+fn gpu_native_prover_config() -> GpuProverConfig {
+    let mut config = GpuProverConfig::default();
+    config.strict = gpu_native_architecture_required()
+        && required_gpu_pcs_runtime_mode() == RequiredCudaPcsRuntimeMode::ArenaGraph;
+    config
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -234,8 +257,25 @@ fn gpu_native_architecture_required() -> bool {
 fn required_gpu_pcs_runtime_mode() -> RequiredCudaPcsRuntimeMode {
     let value = arg("--require-gpu-pcs-runtime-mode")
         .or_else(|| std::env::var("STWO_BENCH_REQUIRE_GPU_PCS_RUNTIME_MODE").ok())
-        .unwrap_or_else(|| "detached-eager".to_string());
+        .unwrap_or_else(|| "arena-graph".to_string());
     RequiredCudaPcsRuntimeMode::parse(&value)
+}
+
+fn performance_claim_admissible() -> bool {
+    performance_claim_admissible_for(
+        &engine(),
+        gpu_native_architecture_required(),
+        required_gpu_pcs_runtime_mode(),
+    )
+}
+
+fn performance_claim_admissible_for(
+    selected_engine: &str,
+    architecture_required: bool,
+    mode: RequiredCudaPcsRuntimeMode,
+) -> bool {
+    selected_engine != "gpu-native"
+        || (architecture_required && mode == RequiredCudaPcsRuntimeMode::ArenaGraph)
 }
 
 fn last_gpu_native_pcs_telemetry() -> Option<CudaPcsDriverTelemetry> {
@@ -250,6 +290,26 @@ fn last_gpu_native_aot_stats() -> Option<AotRuntimeStats> {
         .get()
         .and_then(|stats| stats.lock().ok())
         .and_then(|stats| *stats)
+}
+
+fn last_gpu_native_session_telemetry() -> Option<ResidentSessionTelemetry> {
+    LAST_GPU_NATIVE_SESSION_TELEMETRY
+        .get()
+        .and_then(|telemetry| telemetry.lock().ok())
+        .and_then(|telemetry| telemetry.clone())
+}
+
+fn validate_resident_session_architecture(
+    required_mode: RequiredCudaPcsRuntimeMode,
+    telemetry: Option<&ResidentSessionTelemetry>,
+) -> Result<(), String> {
+    if required_mode == RequiredCudaPcsRuntimeMode::DetachedEager {
+        return Ok(());
+    }
+    telemetry
+        .ok_or_else(|| "resident Graph-A setup telemetry is missing".to_string())?
+        .require_strict_graph_a()
+        .map_err(|error| error.to_string())
 }
 
 fn validate_strict_aot_provenance(stats: Option<&AotRuntimeStats>) -> Result<(), String> {
@@ -844,10 +904,13 @@ fn record_context(backend: &str) -> serde_json::Value {
     let required_mode = architecture_required.then(required_gpu_pcs_runtime_mode);
     let telemetry = last_gpu_native_pcs_telemetry();
     let aot_stats = last_gpu_native_aot_stats();
+    let session_telemetry = last_gpu_native_session_telemetry();
     if let Some(required_mode) = required_mode {
         validate_gpu_native_architecture(backend, &engine(), required_mode, telemetry.as_ref())
             .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
         validate_strict_aot_provenance(aot_stats.as_ref())
+            .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
+        validate_resident_session_architecture(required_mode, session_telemetry.as_ref())
             .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
     }
     let base = json!({
@@ -862,11 +925,55 @@ fn record_context(backend: &str) -> serde_json::Value {
         "gpu_native_architecture_required": architecture_required,
         "gpu_pcs_required_runtime_mode": required_mode.map(RequiredCudaPcsRuntimeMode::cli_name),
         "gpu_native_architecture_gate_passed": architecture_required.then_some(true),
+        "performance_claim_admissible": performance_claim_admissible(),
     });
     merge_json(
-        merge_json(base, gpu_native_pcs_context(telemetry.as_ref())),
-        gpu_native_aot_context(aot_stats.as_ref(), architecture_required),
+        merge_json(
+            merge_json(base, gpu_native_pcs_context(telemetry.as_ref())),
+            gpu_native_aot_context(aot_stats.as_ref(), architecture_required),
+        ),
+        gpu_native_session_context(session_telemetry.as_ref()),
     )
+}
+
+fn gpu_native_session_context(telemetry: Option<&ResidentSessionTelemetry>) -> serde_json::Value {
+    let Some(telemetry) = telemetry.filter(|_| engine() == "gpu-native") else {
+        return json!({
+            "gpu_graph_a_setup_gate_passed": null,
+            "gpu_setup_base_migration_copies": null,
+            "gpu_setup_lookup_host_copies": null,
+            "gpu_setup_legacy_witness_fallbacks": null,
+            "gpu_execution_tables_ingest_compact_h2d_bytes": null,
+            "gpu_execution_tables_ingest_compact_h2d_copies": null,
+            "gpu_execution_tables_ingest_descriptor_h2d_bytes": null,
+            "gpu_execution_tables_ingest_descriptor_h2d_copies": null,
+            "gpu_execution_tables_ingest_syncs": null,
+            "gpu_witness_ingest_components": null,
+            "gpu_witness_ingest_h2d_bytes": null,
+            "gpu_witness_ingest_h2d_copies": null,
+            "gpu_witness_ingest_syncs": null,
+        });
+    };
+    resident_session_telemetry_json(telemetry)
+}
+
+fn resident_session_telemetry_json(telemetry: &ResidentSessionTelemetry) -> serde_json::Value {
+    let execution_tables = telemetry.execution_tables_ingest;
+    json!({
+        "gpu_graph_a_setup_gate_passed": telemetry.require_strict_graph_a().is_ok(),
+        "gpu_setup_base_migration_copies": telemetry.base.migrated_base_columns,
+        "gpu_setup_lookup_host_copies": telemetry.lookups.host_copies,
+        "gpu_setup_legacy_witness_fallbacks": telemetry.witness.host_fallbacks.len(),
+        "gpu_execution_tables_ingest_compact_h2d_bytes": execution_tables.map(|value| value.compact_h2d_bytes),
+        "gpu_execution_tables_ingest_compact_h2d_copies": execution_tables.map(|value| value.compact_h2d_copies),
+        "gpu_execution_tables_ingest_descriptor_h2d_bytes": execution_tables.map(|value| value.descriptor_h2d_bytes),
+        "gpu_execution_tables_ingest_descriptor_h2d_copies": execution_tables.map(|value| value.descriptor_h2d_copies),
+        "gpu_execution_tables_ingest_syncs": execution_tables.map(|value| value.sync_calls),
+        "gpu_witness_ingest_components": telemetry.recorded_witness_ingest.components,
+        "gpu_witness_ingest_h2d_bytes": telemetry.recorded_witness_ingest.h2d_bytes,
+        "gpu_witness_ingest_h2d_copies": telemetry.recorded_witness_ingest.h2d_copies,
+        "gpu_witness_ingest_syncs": telemetry.recorded_witness_ingest.sync_calls,
+    })
 }
 
 /// Architecture evidence from the concrete CUDA PCS driver. These fields land
@@ -881,6 +988,13 @@ fn gpu_native_pcs_context(telemetry: Option<&CudaPcsDriverTelemetry>) -> serde_j
             "gpu_pcs_stage_finished": null,
             "gpu_pcs_batched_tree_decommit": null,
             "gpu_pcs_driver_complete": null,
+            "gpu_host_syncs": null,
+            "gpu_graph_launches": null,
+            "gpu_kernel_launches": null,
+            "gpu_hot_h2d_bytes": null,
+            "gpu_hot_d2h_bytes": null,
+            "gpu_hot_allocations": null,
+            "gpu_max_graph_submit_gap_ms": null,
         });
     };
     pcs_telemetry_json(telemetry)
@@ -900,6 +1014,7 @@ fn pcs_telemetry_json(telemetry: &CudaPcsDriverTelemetry) -> serde_json::Value {
         .into_iter()
         .map(|stage| (format!("{stage:?}"), json!(telemetry.completed(stage))))
         .collect::<serde_json::Map<_, _>>();
+    let exec = telemetry.exec;
     json!({
         "gpu_pcs_driver_architecture": telemetry.architecture,
         "gpu_pcs_runtime_mode": format!("{:?}", telemetry.runtime_mode),
@@ -907,6 +1022,15 @@ fn pcs_telemetry_json(telemetry: &CudaPcsDriverTelemetry) -> serde_json::Value {
         "gpu_pcs_stage_finished": stages_finished,
         "gpu_pcs_batched_tree_decommit": telemetry.batched_tree_decommit,
         "gpu_pcs_driver_complete": telemetry.is_complete(),
+        "gpu_host_syncs": exec.map(|value| value.sync_calls),
+        "gpu_graph_launches": exec.map(|value| value.graph_launches),
+        "gpu_kernel_launches": exec.map(|value| value.kernel_launches),
+        "gpu_hot_h2d_bytes": exec.map(|value| value.h2d_bytes),
+        "gpu_hot_d2h_bytes": exec.map(|value| value.d2h_bytes),
+        "gpu_hot_allocations": exec.map(|value| value.allocations),
+        "gpu_max_graph_submit_gap_ms": exec.map(|value| {
+            value.graph_submit_gap_ns_max as f64 / 1_000_000.0
+        }),
     })
 }
 
@@ -1086,6 +1210,12 @@ fn print_main_record(
     // Compatibility: prove_s_warm has always meant the best post-cold sample,
     // falling back to cold when --reps=1.
     let warm = warm_best.unwrap_or(cold);
+    // DetachedEager remains useful as a proof-byte oracle, but it is the
+    // CPU-owned orchestration path. Never let its timing become a GPU-resident
+    // performance claim again.
+    let performance_claim_admissible = performance_claim_admissible();
+    let throughput_distribution_applicable =
+        throughput_distribution_applicable && performance_claim_admissible;
     let warm_samples_rounded: Vec<_> = warm_samples.iter().copied().map(round3).collect();
     let (free, total) = stwo_backend_cuda::gpu_memory_info();
     let vram_end_gb = if total > 0 {
@@ -1127,9 +1257,12 @@ fn print_main_record(
         // measured up to 11GB low on SN_PIE_2). The VRAM-diet metric of record.
         "pool_used_high_gb": round3(stwo_backend_cuda::gpu_pool_highwater().0 as f64 / 1e9),
         "pool_reserved_high_gb": round3(stwo_backend_cuda::gpu_pool_highwater().1 as f64 / 1e9),
-        "steps_per_s": (cycle_count as f64 / warm).round(),
-        "mhz": round3(cycle_count as f64 / warm / 1e6),
-        "useful_mhz": pie_n_steps.map(|s| round3(s as f64 / warm / 1e6)),
+        "performance_claim_admissible": performance_claim_admissible,
+        "steps_per_s": performance_claim_admissible.then(|| (cycle_count as f64 / warm).round()),
+        "mhz": performance_claim_admissible.then(|| round3(cycle_count as f64 / warm / 1e6)),
+        "useful_mhz": performance_claim_admissible
+            .then(|| pie_n_steps.map(|s| round3(s as f64 / warm / 1e6)))
+            .flatten(),
         "throughput_distribution_applicable": throughput_distribution_applicable,
         "mhz_median": throughput_mhz(
             Some(cycle_count), warm_median, throughput_distribution_applicable),
@@ -1194,6 +1327,7 @@ fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
 
     let per_proof_s = times.iter().sum::<f64>() / n as f64;
     let total_steps = pie_n_steps.map(|s| s * n);
+    let performance_claim_admissible = performance_claim_admissible();
     println!(
         "{}",
         merge_json(
@@ -1203,9 +1337,15 @@ fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
                 "n_proofs": n,
                 "twoproof_wall_s": round3(wall_s),
                 "per_proof_s": round3(per_proof_s),
-                "sustained_steps_per_s": total_steps.map(|s| (s as f64 / wall_s).round()),
-                "sustained_useful_mhz": total_steps.map(|s| round3(s as f64 / wall_s / 1e6)),
-                "cycle_useful_mhz": round3((cycle_count * n) as f64 / wall_s / 1e6),
+                "performance_claim_admissible": performance_claim_admissible,
+                "sustained_steps_per_s": performance_claim_admissible
+                    .then(|| total_steps.map(|s| (s as f64 / wall_s).round()))
+                    .flatten(),
+                "sustained_useful_mhz": performance_claim_admissible
+                    .then(|| total_steps.map(|s| round3(s as f64 / wall_s / 1e6)))
+                    .flatten(),
+                "cycle_useful_mhz": performance_claim_admissible
+                    .then(|| round3((cycle_count * n) as f64 / wall_s / 1e6)),
                 "vram_peak_gb": round3(vram_peak_gb),
                 "feed_starved_s": 0.0,
                 "verified_reps": validation.verified_reps,
@@ -1270,7 +1410,7 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
     // any unset GPU_NATIVE_DEFAULTS) and one-time CUDA init BEFORE spawning, so the
     // per-thread `new` calls find every default set and race no env writes.
     drop(
-        GpuCairoProver::<Blake2sMerkleChannel>::new(GpuProverConfig::default())
+        GpuCairoProver::<Blake2sMerkleChannel>::new(gpu_native_prover_config())
             .expect("warm-up gpu prover"),
     );
 
@@ -1291,12 +1431,16 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
             .map(|(i, input)| {
                 scope.spawn(move || {
                     let mut prover =
-                        GpuCairoProver::<Blake2sMerkleChannel>::new(GpuProverConfig::default())
+                        GpuCairoProver::<Blake2sMerkleChannel>::new(gpu_native_prover_config())
                             .expect("per-thread gpu prover");
                     let t = Instant::now();
-                    let proof = prover
-                        .prove(input, prover_params(variant))
-                        .expect("concurrent prove failed");
+                    let params = prover_params(variant);
+                    let proof = if prover.config().strict {
+                        prover.prove_resident_blake2s(input, params)
+                    } else {
+                        prover.prove(input, params)
+                    }
+                    .expect("concurrent prove failed");
                     let telemetry = prover
                         .last_pcs_telemetry()
                         .expect("concurrent prove returned without CUDA PCS telemetry");
@@ -1338,6 +1482,7 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
         true,
     );
     let total_steps = pie_n_steps.map(|s| s * n);
+    let performance_claim_admissible = performance_claim_admissible();
     println!(
         "{}",
         merge_json(
@@ -1349,9 +1494,15 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
                 "per_proof_s": round3(per_proof_s),
                 "serial_wall_s": round3(serial_wall),
                 "overlap_speedup": round3(serial_wall / wall_s),
-                "sustained_steps_per_s": total_steps.map(|s| (s as f64 / wall_s).round()),
-                "sustained_useful_mhz": total_steps.map(|s| round3(s as f64 / wall_s / 1e6)),
-                "cycle_useful_mhz": round3((cycle_count * n) as f64 / wall_s / 1e6),
+                "performance_claim_admissible": performance_claim_admissible,
+                "sustained_steps_per_s": performance_claim_admissible
+                    .then(|| total_steps.map(|s| (s as f64 / wall_s).round()))
+                    .flatten(),
+                "sustained_useful_mhz": performance_claim_admissible
+                    .then(|| total_steps.map(|s| round3(s as f64 / wall_s / 1e6)))
+                    .flatten(),
+                "cycle_useful_mhz": performance_claim_admissible
+                    .then(|| round3((cycle_count * n) as f64 / wall_s / 1e6)),
                 "vram_peak_gb": round3(vram_peak_gb),
                 "feed_starved_s": 0.0,
                 "verified_reps": validation.verified_reps,
@@ -1491,6 +1642,7 @@ fn run_pipelined(
         last_vm_s,
         last_adapt_s,
     );
+    let performance_claim_admissible = performance_claim_admissible();
     println!(
         "{}",
         json!({
@@ -1500,9 +1652,12 @@ fn run_pipelined(
             "reps": reps,
             "total_s": round3(total_s),
             "feed_starved_s": round3(feed_starved_s),
-            "sustained_steps_per_s": (total_cycles as f64 / total_s).round(),
-            "sustained_mhz": round3(total_cycles as f64 / total_s / 1e6),
-            "sustained_useful_mhz": have_pie_steps
+            "performance_claim_admissible": performance_claim_admissible,
+            "sustained_steps_per_s": performance_claim_admissible
+                .then(|| (total_cycles as f64 / total_s).round()),
+            "sustained_mhz": performance_claim_admissible
+                .then(|| round3(total_cycles as f64 / total_s / 1e6)),
+            "sustained_useful_mhz": (performance_claim_admissible && have_pie_steps)
                 .then(|| round3(total_pie_n_steps as f64 / total_s / 1e6)),
         })
     );
@@ -1855,9 +2010,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_proof_byte_equal, pcs_telemetry_json, proof_byte_equal_gate_passes, quantile,
-        throughput_mhz, validate_gpu_native_architecture, validate_strict_aot_provenance,
-        AotRuntimeStats, CudaPcsDriverTelemetry, CudaPcsRuntimeMode, RequiredCudaPcsRuntimeMode,
+        initial_proof_byte_equal, pcs_telemetry_json, performance_claim_admissible_for,
+        proof_byte_equal_gate_passes, quantile, resident_session_telemetry_json, throughput_mhz,
+        validate_gpu_native_architecture, validate_resident_session_architecture,
+        validate_strict_aot_provenance, AotRuntimeStats, CudaPcsDriverTelemetry,
+        CudaPcsRuntimeMode, RequiredCudaPcsRuntimeMode, ResidentSessionTelemetry,
         REQUIRED_CUDA_PCS_ARCHITECTURE,
     };
 
@@ -1868,6 +2025,7 @@ mod tests {
             stage_started: [1; 7],
             stage_finished: [1; 7],
             batched_tree_decommit: true,
+            exec: None,
         }
     }
 
@@ -1894,6 +2052,30 @@ mod tests {
     }
 
     #[test]
+    fn detached_gpu_native_timing_is_never_a_performance_claim() {
+        assert!(!performance_claim_admissible_for(
+            "gpu-native",
+            true,
+            RequiredCudaPcsRuntimeMode::DetachedEager,
+        ));
+        assert!(!performance_claim_admissible_for(
+            "gpu-native",
+            false,
+            RequiredCudaPcsRuntimeMode::ArenaGraph,
+        ));
+        assert!(performance_claim_admissible_for(
+            "gpu-native",
+            true,
+            RequiredCudaPcsRuntimeMode::ArenaGraph,
+        ));
+        assert!(performance_claim_admissible_for(
+            "legacy",
+            false,
+            RequiredCudaPcsRuntimeMode::DetachedEager,
+        ));
+    }
+
+    #[test]
     fn proof_equality_requires_two_comparable_proofs() {
         assert_eq!(initial_proof_byte_equal(true, 1), None);
         assert_eq!(initial_proof_byte_equal(false, 2), None);
@@ -1916,6 +2098,42 @@ mod tests {
         );
         assert_eq!(json["gpu_pcs_stage_started"]["Assembly"], 1);
         assert_eq!(json["gpu_pcs_stage_finished"]["Assembly"], 1);
+    }
+
+    #[test]
+    fn execution_table_setup_telemetry_is_machine_readable() {
+        let telemetry = ResidentSessionTelemetry {
+            execution_tables_ingest: Some(
+                stwo_backend_cuda::PreparedExecutionTablesIngestTelemetry {
+                    compact_h2d_bytes: 4096,
+                    compact_h2d_copies: 3,
+                    descriptor_h2d_bytes: 64,
+                    descriptor_h2d_copies: 2,
+                    sync_calls: 1,
+                },
+            ),
+            ..ResidentSessionTelemetry::default()
+        };
+        let json = resident_session_telemetry_json(&telemetry);
+        assert_eq!(json["gpu_execution_tables_ingest_compact_h2d_bytes"], 4096);
+        assert_eq!(json["gpu_execution_tables_ingest_compact_h2d_copies"], 3);
+        assert_eq!(json["gpu_execution_tables_ingest_descriptor_h2d_bytes"], 64);
+        assert_eq!(json["gpu_execution_tables_ingest_descriptor_h2d_copies"], 2);
+        assert_eq!(json["gpu_execution_tables_ingest_syncs"], 1);
+    }
+
+    #[test]
+    fn resident_session_gate_is_scoped_to_arena_graph_mode() {
+        assert_eq!(
+            validate_resident_session_architecture(RequiredCudaPcsRuntimeMode::DetachedEager, None,),
+            Ok(())
+        );
+        assert!(validate_resident_session_architecture(
+            RequiredCudaPcsRuntimeMode::ArenaGraph,
+            None,
+        )
+        .unwrap_err()
+        .contains("Graph-A setup telemetry is missing"));
     }
 
     #[test]

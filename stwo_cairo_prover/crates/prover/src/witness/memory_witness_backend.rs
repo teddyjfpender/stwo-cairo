@@ -56,6 +56,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Column, FromSimdColumns};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
+use stwo_backend_cuda::exec_tables::WitnessLaunchDestinations;
 use stwo_backend_cuda::{memory_witness as device, BaseFieldVec, CudaBackend};
 use stwo_cairo_adapter::memory::u128_to_4_limbs;
 use stwo_cairo_common::memory::{LARGE_MEMORY_VALUE_ID_BASE, N_M31_IN_SMALL_FELT252};
@@ -106,6 +107,7 @@ pub trait MemoryIdToBigWitness: FromSimdColumns + LogupFinalizeBackend {
     /// multiplicities, and returns the claims plus the interaction state.
     /// Trace/claim bytes must be identical to the host writer's.
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: memory_id_to_big::ClaimGenerator,
         rc99: &range_check_9_9::ClaimGenerator,
         log_max_big_size: u32,
@@ -125,6 +127,7 @@ impl MemoryIdToBigWitness for SimdBackend {
     type InteractionGen = memory_id_to_big::InteractionClaimGenerator;
 
     fn write_trace(
+        _exec_context: &WitnessExecContext,
         gen: memory_id_to_big::ClaimGenerator,
         rc99: &range_check_9_9::ClaimGenerator,
         log_max_big_size: u32,
@@ -240,12 +243,17 @@ impl MemoryIdToBigWitness for CudaBackend {
     type InteractionGen = CudaMemoryInteractionGen;
 
     fn write_trace(
+        exec_context: &WitnessExecContext,
         gen: memory_id_to_big::ClaimGenerator,
         rc99: &range_check_9_9::ClaimGenerator,
         log_max_big_size: u32,
         opt_n_components: Option<usize>,
     ) -> MemoryTraceResult<Self> {
         if !device_lane_enabled() {
+            exec_context.host_witness_fallback(
+                "memory_id_to_big",
+                "custom CUDA memory writer is disabled or unavailable",
+            );
             // Host fallback: today's writer, bridged via `from_simd_evals`.
             let (big_traces, small_trace, claims, interaction_gen) =
                 gen.write_trace(rc99, log_max_big_size, opt_n_components);
@@ -270,6 +278,79 @@ impl MemoryIdToBigWitness for CudaBackend {
         let rc_table_size = 1usize << RC99_LOG_SIZE;
         let rc_lut = rc99.input_to_row_lut();
         let mut rc_counts = vec![0u32; 8 * rc_table_size];
+
+        if let Some((big_traces, small_trace, big_segments, small)) = write_resident_memory_trace(
+            exec_context,
+            &big_values,
+            &big_mults,
+            &small_values,
+            &small_mults,
+            log_max_big_size,
+            opt_n_components,
+        ) {
+            // The trace itself is fully arena-native. range_check_9_9 still
+            // owns host AtomicMultiplicityColumns, so residency cannot honestly
+            // continue without this D2H merge. Strict mode fails here with the
+            // precise downstream seam; migration mode records it explicitly.
+            exec_context.host_witness_fallback(
+                "memory_id_to_big",
+                "range_check_9_9 multiplicity accumulation is not device-resident",
+            );
+            for segment in &big_segments {
+                accumulate_counts(
+                    &mut rc_counts,
+                    &device::rc99_count(
+                        &segment.limbs,
+                        1usize << segment.log_size,
+                        &rc_lut,
+                        rc_table_size,
+                    ),
+                );
+            }
+            accumulate_counts(
+                &mut rc_counts,
+                &device::rc99_count(
+                    &small.limbs,
+                    1usize << small.log_size,
+                    &rc_lut,
+                    rc_table_size,
+                ),
+            );
+            let verify_host = host_inputs.map(|(bv, bm, sv, sm)| {
+                let host_big = memory_id_to_big::gen_big_memory_traces(
+                    bv,
+                    bm,
+                    log_max_big_size,
+                    opt_n_components,
+                );
+                let host_small = memory_id_to_big::gen_small_memory_trace(sv, sm);
+                verify_trace_columns(&big_segments, &small, &host_big, &host_small);
+                verify_rc_counts(&rc_counts, &host_big, &host_small, &rc_lut, rc_table_size);
+                host_interaction_gen(&host_big, &host_small)
+            });
+            rc99.add_count_tables(&rc_counts);
+            let claims = (
+                BigClaim {
+                    big_log_sizes: big_segments
+                        .iter()
+                        .map(|segment| segment.log_size)
+                        .collect(),
+                },
+                SmallClaim {
+                    log_size: small.log_size,
+                },
+            );
+            return (
+                big_traces,
+                small_trace,
+                claims,
+                CudaMemoryInteractionGen::Device(DeviceMemoryWitness {
+                    big_segments,
+                    small,
+                    verify_host,
+                }),
+            );
+        }
 
         // --- Big segments: chunked exactly like `gen_big_memory_traces`.
         assert!(log_max_big_size >= LOG_N_LANES);
@@ -437,6 +518,207 @@ impl MemoryIdToBigWitness for CudaBackend {
             }
         }
     }
+}
+
+type ResidentMemoryTrace = (
+    Vec<Evals<CudaBackend>>,
+    Evals<CudaBackend>,
+    Vec<DeviceMemorySegment>,
+    DeviceMemorySegment,
+);
+
+/// Bind every memory trace part to its exact arena destination and enqueue all
+/// custom writers on the one proof stream. Inputs remain migration-era uploads;
+/// outputs are final BaseTrace addresses and are never cloned.
+fn write_resident_memory_trace(
+    exec_context: &WitnessExecContext,
+    big_values: &[[u32; 8]],
+    big_mults: &[PackedM31],
+    small_values: &[u128],
+    small_mults: &[PackedM31],
+    log_max_big_size: u32,
+    opt_n_components: Option<usize>,
+) -> Option<ResidentMemoryTrace> {
+    if !exec_context.has_resident_witness_plan() {
+        return None;
+    }
+    assert!(log_max_big_size >= LOG_N_LANES);
+    let max_big_size = 1usize << log_max_big_size;
+    assert_eq!(big_values.len() / N_LANES, big_mults.len());
+
+    let actual_big_components = big_values.len().div_ceil(max_big_size);
+    let n_big_components = opt_n_components.unwrap_or(actual_big_components);
+    assert!(n_big_components >= actual_big_components);
+
+    let mut pending_big = Vec::with_capacity(n_big_components);
+    let mut input_buffers = Vec::with_capacity(n_big_components + 1);
+    let mut host_mult_buffers = Vec::with_capacity(n_big_components + 1);
+    let mut context = None;
+    let mut id_offset = 0u32;
+
+    for index in 0..n_big_components {
+        let start = index.saturating_mul(max_big_size);
+        let end = big_values.len().min(start.saturating_add(max_big_size));
+        let values_chunk = &big_values[start.min(big_values.len())..end];
+        let mult_start = start / N_LANES;
+        let mult_end = end / N_LANES;
+        let mults_chunk = &big_mults[mult_start.min(big_mults.len())..mult_end];
+        let n_values = values_chunk.len();
+        let column_length = n_values.next_power_of_two().max(N_LANES);
+        let destination = exec_context
+            .take_resident_witness_destination(
+                "memory_id_to_big",
+                TracePartId::MemoryBig(index as u32),
+                29,
+                column_length,
+                0,
+                0,
+            )
+            .unwrap_or_else(|| {
+                panic!("resident memory plan is missing MemoryBig({index}) destination")
+            });
+        if let Some(expected) = context {
+            assert_eq!(
+                expected, destination.context,
+                "memory trace parts target different CUDA contexts"
+            );
+        } else {
+            context = Some(destination.context);
+        }
+        let words = if values_chunk.is_empty() {
+            vec![BaseField::default(); F252_N_WORDS]
+        } else {
+            values_chunk
+                .iter()
+                .flat_map(|value| {
+                    value
+                        .iter()
+                        .map(|&word| BaseField::from_u32_unchecked(word))
+                })
+                .collect()
+        };
+        let values_dev = BaseFieldVec::from_vec(words);
+        let mult_words = padded_mult_words(mults_chunk, column_length);
+        device::limb_split_big_into_on(
+            &values_dev,
+            n_values,
+            column_length,
+            &mult_words,
+            &destination.trace,
+            destination.context,
+        )
+        .unwrap_or_else(|error| {
+            panic!("arena-native memory_id_to_big[{index}] launch failed: {error}")
+        });
+        input_buffers.push(values_dev);
+        host_mult_buffers.push(mult_words);
+        pending_big.push((destination, column_length.ilog2(), id_offset));
+        id_offset = id_offset
+            .checked_add(column_length as u32)
+            .expect("memory id offset overflow");
+    }
+
+    assert_eq!(small_values.len(), small_mults.len() * N_LANES);
+    let small_n = small_values.len();
+    let small_column_length = small_n.next_power_of_two().max(N_LANES);
+    let small_destination = exec_context
+        .take_resident_witness_destination(
+            "memory_id_to_big",
+            TracePartId::MemorySmall,
+            9,
+            small_column_length,
+            0,
+            0,
+        )
+        .unwrap_or_else(|| panic!("resident memory plan is missing MemorySmall destination"));
+    if let Some(expected) = context {
+        assert_eq!(
+            expected, small_destination.context,
+            "memory trace parts target different CUDA contexts"
+        );
+    }
+    let small_words = if small_values.is_empty() {
+        vec![BaseField::default(); 4]
+    } else {
+        small_values
+            .iter()
+            .flat_map(|&value| u128_to_4_limbs(value).map(BaseField::from_u32_unchecked))
+            .collect()
+    };
+    let small_values_dev = BaseFieldVec::from_vec(small_words);
+    let small_mult_words = padded_mult_words(small_mults, small_column_length);
+    device::limb_split_small_into_on(
+        &small_values_dev,
+        small_n,
+        small_column_length,
+        &small_mult_words,
+        &small_destination.trace,
+        small_destination.context,
+    )
+    .unwrap_or_else(|error| panic!("arena-native memory_id_to_small launch failed: {error}"));
+    input_buffers.push(small_values_dev);
+    host_mult_buffers.push(small_mult_words);
+
+    // The fence protects migration-era input uploads and pageable H2D
+    // multiplicities. It is counted by the resident witness telemetry.
+    small_destination
+        .context
+        .sync()
+        .unwrap_or_else(|error| panic!("arena-native memory witness fence failed: {error}"));
+
+    let mut big_traces = Vec::with_capacity(pending_big.len());
+    let mut big_segments = Vec::with_capacity(pending_big.len());
+    for (destination, log_size, id_offset) in pending_big {
+        let (trace, segment) = resident_memory_segment(destination, 28, log_size, id_offset);
+        big_traces.push(trace);
+        big_segments.push(segment);
+        exec_context.record_resident_witness_launch();
+    }
+    let (small_trace, small) =
+        resident_memory_segment(small_destination, 8, small_column_length.ilog2(), 0);
+    exec_context.record_resident_witness_launch();
+    drop((input_buffers, host_mult_buffers));
+    Some((big_traces, small_trace, big_segments, small))
+}
+
+fn resident_memory_segment(
+    destination: WitnessLaunchDestinations,
+    n_limbs: usize,
+    log_size: u32,
+    id_offset: u32,
+) -> (Evals<CudaBackend>, DeviceMemorySegment) {
+    assert_eq!(destination.trace.len(), n_limbs + 1);
+    let column_length = 1usize << log_size;
+    let limbs = destination.trace[..n_limbs]
+        .iter()
+        .map(|column| BaseFieldVec::from_borrowed_ptr(column.device_ptr, column_length))
+        .collect();
+    let mults =
+        BaseFieldVec::from_borrowed_ptr(destination.trace[n_limbs].device_ptr, column_length);
+    let domain = CanonicCoset::new(log_size).circle_domain();
+    let trace = destination
+        .trace
+        .into_iter()
+        .map(|column| CircleEvaluation::new(domain, column))
+        .collect();
+    (
+        trace,
+        DeviceMemorySegment {
+            limbs,
+            mults,
+            log_size,
+            id_offset,
+        },
+    )
+}
+
+fn padded_mult_words(mults: &[PackedM31], column_length: usize) -> Vec<u32> {
+    let mut words = mults
+        .iter()
+        .flat_map(|packed| packed.to_array().map(|value| value.0))
+        .collect::<Vec<_>>();
+    words.resize(column_length, 0);
+    words
 }
 
 fn device_lane_enabled() -> bool {

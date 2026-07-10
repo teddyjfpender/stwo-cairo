@@ -236,6 +236,7 @@ pub trait WitnessEval {
     fn u32_add(&mut self, a: Self::U32, b: Self::U32) -> Self::U32;
     fn u32_sub(&mut self, a: Self::U32, b: Self::U32) -> Self::U32;
     fn u32_mul(&mut self, a: Self::U32, b: Self::U32) -> Self::U32;
+    fn u32_xor(&mut self, a: Self::U32, b: Self::U32) -> Self::U32;
     fn u32_and_imm(&mut self, a: Self::U32, mask: u32) -> Self::U32;
     fn u32_shl_imm(&mut self, a: Self::U32, amount: u32) -> Self::U32;
     fn u32_shr_imm(&mut self, a: Self::U32, amount: u32) -> Self::U32;
@@ -279,6 +280,106 @@ pub trait WitnessEval {
     /// `PackedBlakeRoundSigma::deduce_output` (fast_deduction/blake.rs): the sigma
     /// permutation row for a round index (`[M31; 16]`).
     fn deduce_blake_round_sigma(&mut self, round: Self::M31) -> [Self::M31; 16];
+
+    /// Canonical Poseidon round keys, kept in the generated writers' native
+    /// `Felt252Width27` word layout.
+    fn deduce_poseidon_round_keys(&mut self, round: Self::M31) -> [[Self::M31; 10]; 3];
+
+    /// `PackedCube252::deduce_output` over one ten-word Width27 field element.
+    fn deduce_cube_252(&mut self, input: [Self::M31; 10]) -> [Self::M31; 10];
+
+    /// One Poseidon full-round chain transition. The compact W27 boundary matches
+    /// `fast_deduction::poseidon` exactly and avoids expanding fp256 internals into
+    /// hundreds of recorder instructions.
+    fn deduce_poseidon_full_round_chain(
+        &mut self,
+        chain: Self::M31,
+        round: Self::M31,
+        state: [[Self::M31; 10]; 3],
+    ) -> (Self::M31, Self::M31, [[Self::M31; 10]; 3]);
+
+    /// Three Poseidon partial rounds, with the same compact Width27 ABI.
+    fn deduce_poseidon_3_partial_rounds_chain(
+        &mut self,
+        chain: Self::M31,
+        round: Self::M31,
+        state: [[Self::M31; 10]; 4],
+    ) -> (Self::M31, Self::M31, [[Self::M31; 10]; 4]);
+
+    /// `blake_round::ClaimGenerator::deduce_output`, expanded into the
+    /// recorder's existing execution-table reads and Blake-G operations. The
+    /// recorder therefore captures the complete round as ordinary auditable
+    /// witness bytecode instead of relying on an opaque component primitive.
+    fn deduce_blake_round(
+        &mut self,
+        chain: Self::M31,
+        round: Self::M31,
+        mut state: [Self::U32; 16],
+        message_pointer: Self::M31,
+    ) -> (Self::M31, Self::M31, ([Self::U32; 16], Self::M31)) {
+        const G_STATE_INDICES: [[usize; 4]; 8] = [
+            [0, 4, 8, 12],
+            [1, 5, 9, 13],
+            [2, 6, 10, 14],
+            [3, 7, 11, 15],
+            [0, 5, 10, 15],
+            [1, 6, 11, 12],
+            [2, 7, 8, 13],
+            [3, 4, 9, 14],
+        ];
+
+        let sigma = self.deduce_blake_round_sigma(round);
+        let mut message = [state[0]; 16];
+        for i in 0..16 {
+            let address = self.m31_add(message_pointer, sigma[i]);
+            let id = self.mem_addr_to_id(address);
+            let value = self.mem_id_to_value(id);
+
+            // Blake message cells are Small values. Their low 32 bits are the
+            // first four canonical 9-bit MemoryIdToBig limbs; wrapping u32
+            // shifts discard the unused high bits of limb three exactly as the
+            // host's `as_small() as u32` conversion does.
+            let limb0 = self.felt_get_m31(&value, 0);
+            let limb1 = self.felt_get_m31(&value, 1);
+            let limb2 = self.felt_get_m31(&value, 2);
+            let limb3 = self.felt_get_m31(&value, 3);
+            let word0 = self.u32_from_m31(limb0);
+            let word1 = self.u32_from_m31(limb1);
+            let word2 = self.u32_from_m31(limb2);
+            let word3 = self.u32_from_m31(limb3);
+            let shifted1 = self.u32_shl_imm(word1, 9);
+            let shifted2 = self.u32_shl_imm(word2, 18);
+            let shifted3 = self.u32_shl_imm(word3, 27);
+            let low = self.u32_add(word0, shifted1);
+            let high = self.u32_add(shifted2, shifted3);
+            message[i] = self.u32_add(low, high);
+        }
+
+        for (g, [i0, i1, i2, i3]) in G_STATE_INDICES.into_iter().enumerate() {
+            let out = self.deduce_blake_g([
+                state[i0],
+                state[i1],
+                state[i2],
+                state[i3],
+                message[2 * g],
+                message[2 * g + 1],
+            ]);
+            state[i0] = out[0];
+            state[i1] = out[1];
+            state[i2] = out[2];
+            state[i3] = out[3];
+        }
+
+        let one = self.m31_const(1);
+        let next_round = self.m31_add(round, one);
+        (chain, next_round, (state, message_pointer))
+    }
+
+    /// `PackedTripleXor32::deduce_output` as two native u32 XORs.
+    fn deduce_triple_xor_32(&mut self, input: [Self::U32; 3]) -> Self::U32 {
+        let first = self.u32_xor(input[0], input[1]);
+        self.u32_xor(first, input[2])
+    }
 
     // ---- Effects (flat-indexed) ------------------------------------------------
 

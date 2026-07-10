@@ -5,11 +5,13 @@
 //! shape refill the same identity slots and replay the same executable. A shape or
 //! protocol change builds a different workspace/graph entry.
 
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use stwo_backend_cuda::{
-    ArenaError, ArenaSlice, CudaExecContext, CudaGraphExec, CudaRuntimeError, DeviceArena,
+    ArenaError, ArenaSlice, CudaExecContext, CudaExecTelemetry, CudaGraphExec, CudaRuntimeError,
+    DeviceArena,
 };
 use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
 
@@ -55,6 +57,34 @@ pub enum GraphError {
         captured_base: usize,
         launch_base: usize,
     },
+    /// Host/runtime activity that cannot be represented by a replayable device
+    /// graph occurred while the enqueue closure was being captured.
+    CaptureHostActivity(CaptureHostActivity),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CaptureHostActivity {
+    pub sync_calls: u64,
+    pub allocations: u64,
+    pub frees: u64,
+    pub h2d_bytes: u64,
+    pub d2h_bytes: u64,
+}
+
+impl CaptureHostActivity {
+    fn between(before: CudaExecTelemetry, after: CudaExecTelemetry) -> Self {
+        Self {
+            sync_calls: after.sync_calls.saturating_sub(before.sync_calls),
+            allocations: after.allocations.saturating_sub(before.allocations),
+            frees: after.frees.saturating_sub(before.frees),
+            h2d_bytes: after.h2d_bytes.saturating_sub(before.h2d_bytes),
+            d2h_bytes: after.d2h_bytes.saturating_sub(before.d2h_bytes),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self == Self::default()
+    }
 }
 
 impl std::fmt::Display for GraphError {
@@ -85,6 +115,12 @@ impl std::fmt::Display for GraphError {
                 f,
                 "CUDA graph arena changed: captured=0x{captured_base:x}, launch=0x{launch_base:x}"
             ),
+            Self::CaptureHostActivity(activity) => {
+                write!(
+                    f,
+                    "CUDA graph capture performed host activity: {activity:?}"
+                )
+            }
         }
     }
 }
@@ -128,12 +164,18 @@ impl PhaseGraph {
     where
         E: std::error::Error + Send + Sync + 'static,
     {
+        let before = arena.context().telemetry();
         let capture = arena.context().capture()?;
         if let Err(error) = enqueue(arena) {
             // Prefer the launch error. Abort is still attempted so the stream
             // cannot remain in capture mode and poison later eager work.
             let _ = capture.abort();
             return Err(GraphError::Enqueue(Box::new(error)));
+        }
+        let activity = CaptureHostActivity::between(before, arena.context().telemetry());
+        if !activity.is_empty() {
+            let _ = capture.abort();
+            return Err(GraphError::CaptureHostActivity(activity));
         }
         let exec = capture.finish()?;
         Ok(Self {
@@ -151,12 +193,7 @@ impl PhaseGraph {
     /// not graph launch, so this method never blocks the host.
     pub fn replay(&self, arena: &DeviceArena) -> Result<(), GraphError> {
         let launch_base = arena.base_ptr().as_ptr() as usize;
-        if launch_base != self.arena_base {
-            return Err(GraphError::ArenaIdentityMismatch {
-                captured_base: self.arena_base,
-                launch_base,
-            });
-        }
+        require_arena_identity(self.arena_base, launch_base)?;
         self.exec.launch(arena.context())?;
         Ok(())
     }
@@ -175,12 +212,76 @@ impl PhaseGraph {
     }
 }
 
+/// Whether a segment was instantiated in this call or was already resident in
+/// the stable workspace. A reused capture never invokes its enqueue closure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphCaptureStatus {
+    Captured,
+    Reused,
+}
+
+impl GraphCaptureStatus {
+    pub const fn is_reused(self) -> bool {
+        matches!(self, Self::Reused)
+    }
+}
+
+struct PersistentGraphCache<T> {
+    entries: RefCell<HashMap<GraphKey, T>>,
+}
+
+impl<T> Default for PersistentGraphCache<T> {
+    fn default() -> Self {
+        Self {
+            entries: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl<T> PersistentGraphCache<T> {
+    fn contains(&self, key: GraphKey) -> bool {
+        self.entries.borrow().contains_key(&key)
+    }
+
+    fn get(&self, key: GraphKey) -> Option<Ref<'_, T>> {
+        Ref::filter_map(self.entries.borrow(), |entries| entries.get(&key)).ok()
+    }
+
+    fn insert(&self, key: GraphKey, value: T) {
+        let replaced = self.entries.borrow_mut().insert(key, value);
+        debug_assert!(replaced.is_none(), "resident graph replaced after capture");
+    }
+
+    fn capture_or_reuse<E>(
+        &self,
+        key: GraphKey,
+        capture: impl FnOnce() -> Result<T, E>,
+    ) -> Result<GraphCaptureStatus, E> {
+        if self.contains(key) {
+            return Ok(GraphCaptureStatus::Reused);
+        }
+        self.insert(key, capture()?);
+        Ok(GraphCaptureStatus::Captured)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+}
+
 /// Graphs precede `arena` in declaration order, so Rust destroys all graph execs
 /// before freeing the slab or its stream/pool context.
 pub struct GraphWorkspace {
-    graphs: HashMap<GraphKey, PhaseGraph>,
+    graphs: PersistentGraphCache<PhaseGraph>,
     plan: Arc<ProofArenaPlan>,
     arena: DeviceArena,
+    /// Fixed preprocessed coefficients, Merkle tree and transcript root are
+    /// initialized as one cold-only unit per stable arena. A failed setup leaves
+    /// this false, so cache reuse never trusts a partial fixed oracle.
+    preprocessed_commitment_ready: bool,
+    /// Forward, inverse and quotient-subdomain twiddles are immutable for the
+    /// workspace protocol key and therefore staged only once.
+    fixed_twiddles_ready: bool,
 }
 
 impl GraphWorkspace {
@@ -190,9 +291,11 @@ impl GraphWorkspace {
     ) -> Result<Self, GraphError> {
         let arena = plan.allocate(context)?;
         Ok(Self {
-            graphs: HashMap::new(),
+            graphs: PersistentGraphCache::default(),
             plan,
             arena,
+            preprocessed_commitment_ready: false,
+            fixed_twiddles_ready: false,
         })
     }
 
@@ -202,6 +305,24 @@ impl GraphWorkspace {
 
     pub fn plan(&self) -> &ProofArenaPlan {
         &self.plan
+    }
+
+    pub const fn preprocessed_commitment_ready(&self) -> bool {
+        self.preprocessed_commitment_ready
+    }
+
+    /// Mark the fixed oracle reusable only after coefficient interpolation,
+    /// commitment and the root handoff have all synchronized successfully.
+    pub fn mark_preprocessed_commitment_ready(&mut self) {
+        self.preprocessed_commitment_ready = true;
+    }
+
+    pub const fn fixed_twiddles_ready(&self) -> bool {
+        self.fixed_twiddles_ready
+    }
+
+    pub fn mark_fixed_twiddles_ready(&mut self) {
+        self.fixed_twiddles_ready = true;
     }
 
     pub fn key(&self, segment: GraphSegment) -> GraphKey {
@@ -223,44 +344,40 @@ impl GraphWorkspace {
         Ok((self.arena.bind(binding.physical)?, binding.len_words))
     }
 
-    pub fn graph(&self, key: GraphKey) -> Option<&PhaseGraph> {
+    pub fn graph(&self, key: GraphKey) -> Option<Ref<'_, PhaseGraph>> {
         if self.owns_key(key) {
-            self.graphs.get(&key)
+            self.graphs.get(key)
         } else {
             None
         }
     }
 
-    pub fn graph_segment(&self, segment: GraphSegment) -> Option<&PhaseGraph> {
+    pub fn graph_segment(&self, segment: GraphSegment) -> Option<Ref<'_, PhaseGraph>> {
         self.graph(self.key(segment))
     }
 
+    pub fn graph_count(&self) -> usize {
+        self.graphs.len()
+    }
+
     pub fn capture<E>(
-        &mut self,
+        &self,
         key: GraphKey,
         enqueue: impl FnOnce(&DeviceArena) -> Result<(), E>,
-    ) -> Result<&PhaseGraph, GraphError>
+    ) -> Result<GraphCaptureStatus, GraphError>
     where
         E: std::error::Error + Send + Sync + 'static,
     {
-        if !self.owns_key(key) {
-            return Err(GraphError::WorkspaceKeyMismatch {
-                expected_shape: self.plan.shape_key,
-                expected_protocol: self.plan.protocol_key,
-                actual_shape: key.shape,
-                actual_protocol: key.protocol_key,
-            });
-        }
-        let graph = PhaseGraph::capture(key, &self.arena, enqueue)?;
-        self.graphs.insert(key, graph);
-        Ok(self.graphs.get(&key).expect("graph inserted"))
+        require_workspace_key(self.plan.shape_key, self.plan.protocol_key, key)?;
+        self.graphs
+            .capture_or_reuse(key, || PhaseGraph::capture(key, &self.arena, enqueue))
     }
 
     pub fn capture_segment<E>(
-        &mut self,
+        &self,
         segment: GraphSegment,
         enqueue: impl FnOnce(&DeviceArena) -> Result<(), E>,
-    ) -> Result<&PhaseGraph, GraphError>
+    ) -> Result<GraphCaptureStatus, GraphError>
     where
         E: std::error::Error + Send + Sync + 'static,
     {
@@ -271,7 +388,7 @@ impl GraphWorkspace {
         let key = self.key(segment);
         let graph = self
             .graphs
-            .get(&key)
+            .get(key)
             .ok_or(GraphError::MissingSegment(segment))?;
         graph.replay(&self.arena)
     }
@@ -281,9 +398,71 @@ impl GraphWorkspace {
     }
 }
 
+fn require_workspace_key(
+    expected_shape: ProofShapeKey,
+    expected_protocol: u64,
+    key: GraphKey,
+) -> Result<(), GraphError> {
+    if key.shape != expected_shape || key.protocol_key != expected_protocol {
+        return Err(GraphError::WorkspaceKeyMismatch {
+            expected_shape,
+            expected_protocol,
+            actual_shape: key.shape,
+            actual_protocol: key.protocol_key,
+        });
+    }
+    Ok(())
+}
+
+fn require_arena_identity(captured_base: usize, launch_base: usize) -> Result<(), GraphError> {
+    if launch_base != captured_base {
+        return Err(GraphError::ArenaIdentityMismatch {
+            captured_base,
+            launch_base,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_host_activity_rejects_only_non_replayable_runtime_work() {
+        let before = CudaExecTelemetry {
+            memset_bytes: 16,
+            d2d_bytes: 32,
+            ..CudaExecTelemetry::default()
+        };
+        let device_only = CudaExecTelemetry {
+            memset_bytes: 64,
+            d2d_bytes: 128,
+            capture_begins: 1,
+            kernel_launches: 3,
+            ..before
+        };
+        assert!(CaptureHostActivity::between(before, device_only).is_empty());
+
+        let host_activity = CudaExecTelemetry {
+            sync_calls: 1,
+            allocations: 2,
+            frees: 1,
+            h2d_bytes: 64,
+            d2h_bytes: 128,
+            ..device_only
+        };
+        assert_eq!(
+            CaptureHostActivity::between(device_only, host_activity),
+            CaptureHostActivity {
+                sync_calls: 1,
+                allocations: 2,
+                frees: 1,
+                h2d_bytes: 64,
+                d2h_bytes: 128,
+            }
+        );
+    }
 
     #[test]
     fn graph_key_separates_shape_protocol_and_transcript_segment() {
@@ -306,5 +485,61 @@ mod tests {
             ..base
         });
         assert_eq!(keys.len(), 4);
+    }
+
+    #[test]
+    fn second_session_sees_the_first_sessions_resident_graph() {
+        let key = GraphKey {
+            shape: ProofShapeKey(7),
+            protocol_key: 11,
+            segment: GraphSegment::InteractionCommit,
+        };
+        let cache = PersistentGraphCache::default();
+        let captures = std::cell::Cell::new(0);
+        assert_eq!(
+            cache
+                .capture_or_reuse(key, || {
+                    captures.set(captures.get() + 1);
+                    Ok::<_, std::convert::Infallible>("first-session-executable")
+                })
+                .unwrap(),
+            GraphCaptureStatus::Captured
+        );
+        assert_eq!(
+            cache
+                .capture_or_reuse(key, || {
+                    captures.set(captures.get() + 1);
+                    Ok::<_, std::convert::Infallible>("second-session-executable")
+                })
+                .unwrap(),
+            GraphCaptureStatus::Reused
+        );
+        assert_eq!(captures.get(), 1, "warm session recaptured the graph");
+        assert_eq!(*cache.get(key).unwrap(), "first-session-executable");
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn protocol_and_arena_mismatches_fail_closed() {
+        let key = GraphKey {
+            shape: ProofShapeKey(7),
+            protocol_key: 12,
+            segment: GraphSegment::InteractionCommit,
+        };
+        assert!(matches!(
+            require_workspace_key(ProofShapeKey(7), 11, key),
+            Err(GraphError::WorkspaceKeyMismatch {
+                expected_protocol: 11,
+                actual_protocol: 12,
+                ..
+            })
+        ));
+        assert!(matches!(
+            require_arena_identity(0x1000, 0x2000),
+            Err(GraphError::ArenaIdentityMismatch {
+                captured_base: 0x1000,
+                launch_base: 0x2000,
+            })
+        ));
     }
 }

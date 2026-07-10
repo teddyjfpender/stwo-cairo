@@ -78,8 +78,8 @@
 #   POD_BOOTLOADER_JSON Stable remote bootloader path preflighted and exported for
 #                  every gate/benchmark. Default: /workspace/bench_inputs/
 #                  simple_bootloader_compiled.json.
-#   GPU_PCS_RUNTIME_MODE Required typed CUDA PCS mode for every run: detached-eager
-#                  (default) or arena-graph (strict future gate).
+#   GPU_PCS_RUNTIME_MODE Required typed CUDA PCS mode for every run: arena-graph
+#                  (default) or detached-eager (migration diagnostics only).
 #
 # NOTE: only same-pod comparisons are meaningful (community-host variance). The
 # aggregate is a SUM across heterogeneous pods — a fleet capacity number, not a
@@ -101,9 +101,11 @@ FLEET_CONF="${FLEET_CONF:-${FLEET_DIR}/fleet.conf}"
 REPORT="${REPORT:-${FLEET_DIR}/fleet_report.json}"
 INPUT_SHA256SUMS="${CAIRO_LOCAL}/gpu_benchmarks/pie/SHA256SUMS"
 ARCHITECTURE_CHECK="${CAIRO_LOCAL}/gpu_benchmarks/validate_architecture_record.py"
+SOUNDNESS_RUNNER="${CAIRO_LOCAL}/gpu_benchmarks/run_cuda_soundness_gate.py"
 
 # Pod repos + binary (identical layout to the loop).
 CAIRO_POD="/workspace/stwo-cairo"
+STWO_POD="/workspace/stwo"
 POD_PROVER_DIR="${CAIRO_POD}/stwo_cairo_prover"
 BIN="target/release/gpu_bench"                      # relative to POD_PROVER_DIR
 POD_USER="root"
@@ -119,7 +121,7 @@ POD_RUN_DIR="/workspace/fleet_runs"
 # Prover knobs.
 RUST_MIN_STACK_VAL=4194304
 BENCH_ENV="${BENCH_ENV:-}"
-GPU_PCS_RUNTIME_MODE="${GPU_PCS_RUNTIME_MODE:-detached-eager}"
+GPU_PCS_RUNTIME_MODE="${GPU_PCS_RUNTIME_MODE:-arena-graph}"
 GPU_NATIVE_ARGS="--engine gpu-native --require-gpu-native-architecture --require-gpu-pcs-runtime-mode ${GPU_PCS_RUNTIME_MODE}"
 
 # Rotate (pipeline) parameters.
@@ -149,6 +151,7 @@ TARGET_HI_MHZ=20
 declare -a POD_IDS POD_GPUS POD_USD POD_HOSTS POD_PORTS POD_KEYS
 declare -a POD_STATUS          # pending | ok | gate_failed | run_failed | stalled
 declare -a POD_OUT POD_STALL   # local out file / stall-evidence file (last stage)
+declare -a POD_SOUNDNESS       # counted native-test JSON artifact per pod
 declare -a POD_RC              # last stage rc: 0 | <code> | STALLED | TIMEOUT
 
 # ---------------------------------------------------------------------------
@@ -165,6 +168,7 @@ usage() { sed -n '2,84p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit "${1:-0}"; }
 [[ -d "$STWO_LOCAL/.git" ]] || die "missing sibling stwo checkout: $STWO_LOCAL"
 [[ -f "$INPUT_SHA256SUMS" ]] || die "input checksum manifest missing: $INPUT_SHA256SUMS"
 [[ -f "$ARCHITECTURE_CHECK" ]] || die "architecture record validator missing: $ARCHITECTURE_CHECK"
+[[ -f "$SOUNDNESS_RUNNER" ]] || die "CUDA soundness runner missing: $SOUNDNESS_RUNNER"
 STWO_LOCAL="$(cd "$STWO_LOCAL" && pwd)"
 
 case "$GPU_PCS_RUNTIME_MODE" in
@@ -254,7 +258,7 @@ parse_roster() {
     fi
     POD_IDS+=("$id"); POD_GPUS+=("$gpu"); POD_USD+=("$usd")
     POD_HOSTS+=("$fbh"); POD_PORTS+=("$fbp"); POD_KEYS+=("$fbk")
-    POD_STATUS+=("pending"); POD_OUT+=(""); POD_STALL+=(""); POD_RC+=("")
+    POD_STATUS+=("pending"); POD_OUT+=(""); POD_STALL+=(""); POD_SOUNDNESS+=(""); POD_RC+=("")
   done < "$FLEET_CONF"
   [[ ${#POD_IDS[@]} -gt 0 ]] || die "no enabled pods in ${FLEET_CONF}${ONLY:+ (matching --only ${ONLY})}"
 }
@@ -547,7 +551,65 @@ PY
 }
 
 architecture_contract_ok() {
-  python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE"
+  python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE" \
+    --soundness-gate "$2"
+}
+
+run_soundness_gate_on_pod() {
+  local idx="$1" tag pod_artifact local_artifact
+  tag="$(podtag "$idx" "soundness")"
+  pod_artifact="${POD_RUN_DIR}/${tag}.json"
+  local_artifact="${RESULTS_DIR}/${tag}.json"
+  POD_SOUNDNESS[$idx]="$local_artifact"
+  log "soundness[${POD_IDS[$idx]}]: counted native differential suite"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    PYTHONPATH="$(dirname "$ARCHITECTURE_CHECK")" \
+      STWO_HEAD="$STWO_REV" STWO_CAIRO_HEAD="$CAIRO_REV" \
+      RUNTIME_MODE="$GPU_PCS_RUNTIME_MODE" \
+      python3 - "$local_artifact" <<'PY'
+import json, os, sys
+from run_cuda_soundness_gate import gates_for_runtime_mode
+
+runtime_mode = os.environ["RUNTIME_MODE"]
+gates = gates_for_runtime_mode(runtime_mode)
+
+artifact = {
+    "schema": "stwo.cuda.soundness-gate.v2",
+    "dry_run": True,
+    "stwo_git_head": os.environ["STWO_HEAD"],
+    "stwo_cairo_git_head": os.environ["STWO_CAIRO_HEAD"],
+    "stwo_worktree_hash": "0" * 64,
+    "stwo_cairo_worktree_hash": "0" * 64,
+    "runtime_mode": runtime_mode,
+    "passed": True,
+    "gates": [
+        {"name": name, "command": list(command), "exit_code": 0,
+         "executed_tests": required,
+         "required_tests": required, "passed": True}
+        for name, command, required in gates
+    ],
+}
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump(artifact, stream)
+    stream.write("\n")
+PY
+    return 0
+  fi
+  if ! pssh "$idx" "mkdir -p '${POD_RUN_DIR}'; cd '${CAIRO_POD}'; \
+      . \$HOME/.cargo/env 2>/dev/null || true; PATH=/usr/local/cuda/bin:\$PATH \
+      python3 gpu_benchmarks/run_cuda_soundness_gate.py \
+      --stwo '${STWO_POD}' --runtime-mode '${GPU_PCS_RUNTIME_MODE}' \
+      --output '${pod_artifact}'"; then
+    pssh "$idx" "cat '${pod_artifact}' 2>/dev/null" > "$local_artifact" || true
+    return 1
+  fi
+  pssh "$idx" "cat '${pod_artifact}'" > "$local_artifact"
+  python3 - "$local_artifact" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    artifact = json.load(stream)
+raise SystemExit(0 if artifact.get("passed") is True else 1)
+PY
 }
 
 # ---------------------------------------------------------------------------
@@ -562,7 +624,7 @@ synth_pod_out() {
   local runtime_report="DetachedEager"
   [[ "$GPU_PCS_RUNTIME_MODE" == "arena-graph" ]] && runtime_report="ArenaGraph"
   local stage_counts='{"OodsEvaluation":1,"QuotientAndCompaction":1,"FriCommitAndFold":1,"ProofOfWork":1,"FriQueryAndDecommit":1,"TreeDecommit":1,"Assembly":1}'
-  local architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true'
+  local architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"gpu_host_syncs":1,"gpu_graph_launches":8,"gpu_kernel_launches":72,"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25'
   if [[ "$stage" == "gate" ]]; then
     echo "{\"program\":\"gate_10t\",\"backend\":\"cuda\",${architecture_fields},\"verify_ms\":41.0,\"verified_reps\":2,\"proof_kb\":2897.5,\"proof_comparison_applicable\":true,\"proof_byte_equal\":true,\"proof_byte_equal_required\":true}" > "$dest"
     return 0
@@ -599,7 +661,7 @@ run_stage() {
       POD_RC[$idx]="GATE_CONTRACT"
     fi
     if [[ "${POD_RC[$idx]}" == "0" && "$args" == *"--require-gpu-native-architecture"* ]] \
-       && ! architecture_contract_ok "${POD_OUT[$idx]}"; then
+       && ! architecture_contract_ok "${POD_OUT[$idx]}" "${POD_SOUNDNESS[$idx]}"; then
       POD_RC[$idx]="ARCHITECTURE_CONTRACT"
     fi
     case "${POD_RC[$idx]}" in
@@ -656,6 +718,14 @@ for idx in "${!POD_IDS[@]}"; do
   if ! resolve_pod "$idx"; then
     warn "pod '${POD_IDS[$idx]}' unresolved — dropping from the fleet."
     POD_STATUS[$idx]="run_failed"
+  fi
+done
+
+for idx in "${!POD_IDS[@]}"; do
+  [[ "${POD_STATUS[$idx]}" == "pending" || "${POD_STATUS[$idx]}" == "ok" ]] || continue
+  if ! run_soundness_gate_on_pod "$idx"; then
+    warn "pod '${POD_IDS[$idx]}' failed the counted CUDA soundness suite — dropping."
+    POD_STATUS[$idx]="gate_failed"
   fi
 done
 

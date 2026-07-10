@@ -14,15 +14,18 @@
 //! Derivation: a layout entry whose state param is a count family becomes a
 //! `CountFeed`; every other entry is a producer→consumer feed edge, coalesced
 //! per (producer, consumer, words-per-instance) into an `OutputEdge` with an
-//! instance count, and INVERTED into the consumer's `Producer` input edge — so
-//! `Schedule::validate()`'s width agreement holds by construction and the
-//! topological levels emerge from real feed data.
+//! instance count, and INVERTED into the consumer's `Producer` input edge. The
+//! inverted edges retain `CairoClaimGenerator` field order, which is also the
+//! canonical legacy writer order: ordered Vec consumers must append producer
+//! rows in that order. `Schedule::validate()`'s width agreement therefore holds
+//! by construction and the topological levels emerge from real feed data.
 //!
 //! Usage:
 //!   schedule_emit --prover-root <stwo_cairo_prover> [--check]
 //!
 //! Writes (or, with --check, byte-compares against) the schedule table, relation
-//! graph, and `crates/prover/src/witness/proof_shape_generated.rs`.
+//! graph, fixed-table materialization table, and
+//! `crates/prover/src/witness/proof_shape_generated.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -135,12 +138,46 @@ struct PlannedComponentFact {
     traces: Vec<PlannedTraceFact>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FixedTableWordSourceFact {
+    Constant(u32),
+    PreprocessedColumn(String),
+    MultiplicityColumn(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixedTableLookupWordFact {
+    output_word: u32,
+    source: FixedTableWordSourceFact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FixedTableLookupFact {
+    Words(Vec<FixedTableLookupWordFact>),
+    ExpandedXor {
+        relation_id: u32,
+        limb_bits: u32,
+        expand_bits: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixedTablePlanFact {
+    component: String,
+    log_size: u32,
+    multiplicity_columns: u32,
+    trace_columns: Vec<(u32, u32)>,
+    lookup: FixedTableLookupFact,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CustomRelationGeometry {
     memory_address_chunks: u32,
     felt252_words: u32,
     small_memory_words: u32,
     bitwise_xor_12_columns: u32,
+    bitwise_xor_12_limb_bits: u32,
+    bitwise_xor_12_expand_bits: u32,
 }
 
 fn strip_parens(mut expr: &syn::Expr) -> &syn::Expr {
@@ -323,6 +360,368 @@ fn parse_lookup_fields(file: &syn::File, component: &str) -> Option<Vec<LookupFi
         field.relation_id = ids.iter().next().copied();
     }
     Some(result)
+}
+
+fn named_function_block<'a>(file: &'a syn::File, name: &str) -> Option<&'a syn::Block> {
+    file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == name => Some(function.block.as_ref()),
+        _ => None,
+    })
+}
+
+fn local_ident(local: &syn::Local) -> Option<String> {
+    let syn::Pat::Ident(ident) = &local.pat else {
+        return None;
+    };
+    Some(ident.ident.to_string())
+}
+
+fn string_value(expr: &syn::Expr) -> Option<String> {
+    let expr = strip_parens(expr);
+    if let Some(value) = lit_str(expr) {
+        return Some(value);
+    }
+    let syn::Expr::MethodCall(call) = expr else {
+        return None;
+    };
+    matches!(call.method.to_string().as_str(), "to_owned" | "to_string")
+        .then(|| string_value(&call.receiver))?
+}
+
+fn preprocessed_column_id(expr: &syn::Expr) -> Option<String> {
+    struct ColumnVisitor {
+        ids: Vec<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ColumnVisitor {
+        fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+            let is_column_id = node
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "PreProcessedColumnId");
+            if is_column_id {
+                let id = node.fields.iter().find_map(|field| {
+                    let syn::Member::Named(name) = &field.member else {
+                        return None;
+                    };
+                    (name == "id").then(|| string_value(&field.expr)).flatten()
+                });
+                self.ids
+                    .push(id.expect("PreProcessedColumnId.id must be a string literal"));
+            }
+            syn::visit::visit_expr_struct(self, node);
+        }
+    }
+    let mut visitor = ColumnVisitor { ids: Vec::new() };
+    syn::visit::Visit::visit_expr(&mut visitor, expr);
+    match visitor.ids.as_slice() {
+        [] => None,
+        [id] => Some(id.clone()),
+        ids => panic!("one fixed-table binding references multiple preprocessed columns: {ids:?}"),
+    }
+}
+
+fn packed_m31_constant(expr: &syn::Expr) -> Option<u32> {
+    let syn::Expr::Call(call) = strip_parens(expr) else {
+        return None;
+    };
+    let syn::Expr::Path(function) = strip_parens(&call.func) else {
+        return None;
+    };
+    if !function
+        .path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "broadcast")
+    {
+        return None;
+    }
+    call.args.first().and_then(numeric_m31)
+}
+
+fn multiplicity_index(expr: &syn::Expr) -> Option<u32> {
+    struct MultiplicityVisitor {
+        indices: Vec<u32>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for MultiplicityVisitor {
+        fn visit_expr_index(&mut self, node: &'ast syn::ExprIndex) {
+            let is_mults = matches!(
+                strip_parens(&node.expr),
+                syn::Expr::Path(path) if path.path.is_ident("mults")
+            );
+            if is_mults {
+                self.indices.push(
+                    lit_int(&node.index).expect("fixed-table multiplicity index must be literal")
+                        as u32,
+                );
+            }
+            syn::visit::visit_expr_index(self, node);
+        }
+    }
+    let mut visitor = MultiplicityVisitor {
+        indices: Vec::new(),
+    };
+    syn::visit::Visit::visit_expr(&mut visitor, expr);
+    match visitor.indices.as_slice() {
+        [] => None,
+        [index] => Some(*index),
+        indices => {
+            panic!("one fixed-table binding references multiple multiplicities: {indices:?}")
+        }
+    }
+}
+
+fn trace_output_column(expr: &syn::Expr) -> Option<u32> {
+    let syn::Expr::Unary(deref) = strip_parens(expr) else {
+        return None;
+    };
+    if !matches!(deref.op, syn::UnOp::Deref(_)) {
+        return None;
+    }
+    let syn::Expr::Index(index) = strip_parens(&deref.expr) else {
+        return None;
+    };
+    let syn::Expr::Path(base) = strip_parens(&index.expr) else {
+        return None;
+    };
+    base.path
+        .is_ident("row")
+        .then(|| lit_int(&index.index).map(|value| value as u32))?
+}
+
+fn fixed_table_word_source(
+    component: &str,
+    expr: &syn::Expr,
+    constants: &BTreeMap<String, u32>,
+    preprocessed: &BTreeMap<String, String>,
+    multiplicities: &BTreeMap<String, u32>,
+) -> FixedTableWordSourceFact {
+    let syn::Expr::Path(path) = strip_parens(expr) else {
+        panic!("{component}: unsupported fixed-table lookup expression: {expr:?}");
+    };
+    let ident = path
+        .path
+        .get_ident()
+        .unwrap_or_else(|| panic!("{component}: fixed-table lookup source must be local"))
+        .to_string();
+    if let Some(value) = constants.get(&ident) {
+        FixedTableWordSourceFact::Constant(*value)
+    } else if let Some(id) = preprocessed.get(&ident) {
+        FixedTableWordSourceFact::PreprocessedColumn(id.clone())
+    } else if let Some(column) = multiplicities.get(&ident) {
+        FixedTableWordSourceFact::MultiplicityColumn(*column)
+    } else {
+        panic!("{component}: unresolved fixed-table lookup source {ident}");
+    }
+}
+
+fn parse_standard_fixed_table(
+    component: &str,
+    log_size: u32,
+    file: &syn::File,
+    fields: &[LookupField],
+) -> FixedTablePlanFact {
+    let body = named_function_block(file, "write_trace_simd")
+        .unwrap_or_else(|| panic!("{component}: fixed table has no write_trace_simd"));
+
+    struct LocalVisitor {
+        constants: BTreeMap<String, u32>,
+        preprocessed: BTreeMap<String, String>,
+        multiplicities: BTreeMap<String, u32>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for LocalVisitor {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            let Some(name) = local_ident(local) else {
+                syn::visit::visit_local(self, local);
+                return;
+            };
+            let Some(init) = &local.init else {
+                syn::visit::visit_local(self, local);
+                return;
+            };
+            if let Some(value) = packed_m31_constant(&init.expr) {
+                assert!(self.constants.insert(name.clone(), value).is_none());
+            }
+            if let Some(id) = preprocessed_column_id(&init.expr) {
+                assert!(self.preprocessed.insert(name.clone(), id).is_none());
+            }
+            if let Some(column) = multiplicity_index(&init.expr) {
+                assert!(self.multiplicities.insert(name, column).is_none());
+            }
+            syn::visit::visit_local(self, local);
+        }
+    }
+    let mut locals = LocalVisitor {
+        constants: BTreeMap::new(),
+        preprocessed: BTreeMap::new(),
+        multiplicities: BTreeMap::new(),
+    };
+    syn::visit::Visit::visit_block(&mut locals, body);
+
+    struct AssignmentVisitor<'a> {
+        component: &'a str,
+        constants: &'a BTreeMap<String, u32>,
+        preprocessed: &'a BTreeMap<String, String>,
+        multiplicities: &'a BTreeMap<String, u32>,
+        trace: BTreeMap<u32, u32>,
+        lookup: BTreeMap<String, Vec<FixedTableWordSourceFact>>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for AssignmentVisitor<'_> {
+        fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+            if let Some(output) = trace_output_column(&assignment.left) {
+                let source = fixed_table_word_source(
+                    self.component,
+                    &assignment.right,
+                    self.constants,
+                    self.preprocessed,
+                    self.multiplicities,
+                );
+                let FixedTableWordSourceFact::MultiplicityColumn(multiplicity) = source else {
+                    panic!("{}: BaseTrace column is not a multiplicity", self.component);
+                };
+                assert!(
+                    self.trace.insert(output, multiplicity).is_none(),
+                    "{}: duplicate BaseTrace output {output}",
+                    self.component
+                );
+            }
+            if let Some(field) = assigned_lookup_field(&assignment.left) {
+                let expressions: Vec<&syn::Expr> = match strip_parens(&assignment.right) {
+                    syn::Expr::Array(array) => array.elems.iter().collect(),
+                    expression => vec![expression],
+                };
+                let sources = expressions
+                    .into_iter()
+                    .map(|expression| {
+                        fixed_table_word_source(
+                            self.component,
+                            expression,
+                            self.constants,
+                            self.preprocessed,
+                            self.multiplicities,
+                        )
+                    })
+                    .collect();
+                assert!(
+                    self.lookup.insert(field.clone(), sources).is_none(),
+                    "{}: duplicate LookupData output {field}",
+                    self.component
+                );
+            }
+            syn::visit::visit_expr_assign(self, assignment);
+        }
+    }
+    let mut assignments = AssignmentVisitor {
+        component,
+        constants: &locals.constants,
+        preprocessed: &locals.preprocessed,
+        multiplicities: &locals.multiplicities,
+        trace: BTreeMap::new(),
+        lookup: BTreeMap::new(),
+    };
+    syn::visit::Visit::visit_block(&mut assignments, body);
+
+    let trace_columns: Vec<_> = assignments.trace.into_iter().collect();
+    assert!(
+        !trace_columns.is_empty(),
+        "{component}: no BaseTrace assignments"
+    );
+    for (expected, (output, multiplicity)) in trace_columns.iter().enumerate() {
+        assert_eq!(*output, expected as u32, "{component}: BaseTrace gap");
+        assert_eq!(
+            *multiplicity, expected as u32,
+            "{component}: multiplicity permutation is unsupported"
+        );
+    }
+    let multiplicity_columns = trace_columns.len() as u32;
+
+    let mut lookup_assignments = assignments.lookup;
+    let mut lookup = Vec::new();
+    for field in fields {
+        let sources = lookup_assignments
+            .remove(&field.name)
+            .unwrap_or_else(|| panic!("{component}: no LookupData assignment for {}", field.name));
+        assert_eq!(
+            sources.len(),
+            field.width as usize,
+            "{component}: LookupData width changed for {}",
+            field.name
+        );
+        for (index, source) in sources.into_iter().enumerate() {
+            lookup.push(FixedTableLookupWordFact {
+                output_word: field.word_offset + index as u32,
+                source,
+            });
+        }
+    }
+    assert!(
+        lookup_assignments.is_empty(),
+        "{component}: undeclared LookupData assignments: {:?}",
+        lookup_assignments.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        lookup.len(),
+        fields.iter().map(|field| field.width as usize).sum(),
+        "{component}: incomplete flattened LookupInputs"
+    );
+
+    FixedTablePlanFact {
+        component: component.to_owned(),
+        log_size,
+        multiplicity_columns,
+        trace_columns,
+        lookup: FixedTableLookupFact::Words(lookup),
+    }
+}
+
+fn parse_expanded_xor_fixed_table(
+    component: &str,
+    log_size: u32,
+    source: &str,
+    catalog: &BTreeMap<String, u32>,
+    geometry: CustomRelationGeometry,
+) -> FixedTablePlanFact {
+    assert_eq!(component, "verify_bitwise_xor_12");
+    let compact: String = source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let required = [
+        "letmults=self.mults.map(AtomicMultiplicityColumn::into_simd_vec);",
+        "lettrace=mults.iter().cloned().map(BaseColumn::from_simd).map(|col|CircleEvaluation::new(domain,col)).collect_vec();",
+        "letlookup_data=LookupData{mults};",
+        "let[[al,ah],[bl,bh]]=[a,b].map(|x|[x&((1<<LIMB_BITS)-1),x>>LIMB_BITS]);",
+        "letcolumn_index=(ah<<EXPAND_BITS)+bh;",
+        "letrow_index=(al<<LIMB_BITS)+bl;",
+        "leta0=u32x16::splat((ah0<<LIMB_BITS)|al);",
+        "letb0=u32x16::splat((bh0<<LIMB_BITS)|(blh<<LOG_N_LANES))|zero_to_n_lanes;",
+        "letc0=a0^b0;",
+    ];
+    for marker in required {
+        assert!(
+            compact.contains(marker),
+            "{component}: unsupported expanded-XOR fixed-table formula; missing {marker}"
+        );
+    }
+    assert_eq!(
+        log_size,
+        geometry.bitwise_xor_12_limb_bits * 2,
+        "{component}: row-bit geometry drift"
+    );
+    let multiplicity_columns = geometry.bitwise_xor_12_columns;
+    FixedTablePlanFact {
+        component: component.to_owned(),
+        log_size,
+        multiplicity_columns,
+        trace_columns: (0..multiplicity_columns)
+            .map(|column| (column, column))
+            .collect(),
+        lookup: FixedTableLookupFact::ExpandedXor {
+            relation_id: relation_id(catalog, "verify_bitwise_xor_12"),
+            limb_bits: geometry.bitwise_xor_12_limb_bits,
+            expand_bits: geometry.bitwise_xor_12_expand_bits,
+        },
+    }
 }
 
 /// Parse the exact pair/solo ordering and signed multiplicities from the
@@ -536,6 +935,13 @@ fn parse_custom_relation_geometry(root: &Path) -> CustomRelationGeometry {
         &root.join("crates/cairo-air/src/components/verify_bitwise_xor_12.rs"),
         "EXPAND_BITS",
     );
+    let elem_bits = literal_const_from_path(
+        &root.join("crates/cairo-air/src/components/verify_bitwise_xor_12.rs"),
+        "ELEM_BITS",
+    );
+    let limb_bits = elem_bits
+        .checked_sub(expand_bits)
+        .expect("xor12 limb geometry");
     CustomRelationGeometry {
         memory_address_chunks: 1u32
             .checked_shl(
@@ -549,6 +955,8 @@ fn parse_custom_relation_geometry(root: &Path) -> CustomRelationGeometry {
         bitwise_xor_12_columns: 1u32
             .checked_shl(expand_bits.checked_mul(2).expect("xor expand bits"))
             .expect("xor multiplicity columns"),
+        bitwise_xor_12_limb_bits: limb_bits,
+        bitwise_xor_12_expand_bits: expand_bits,
     }
 }
 
@@ -1286,6 +1694,30 @@ fn classify_row_source(component: &str, file: &syn::File, root: &Path) -> RowSou
 }
 
 fn parse_recorded_witness_labels(file: &syn::File) -> BTreeSet<String> {
+    fn lane_macro_component(item: &syn::ItemMacro) -> Option<String> {
+        use syn::parse::Parser;
+
+        let name = item.mac.path.segments.last()?.ident.to_string();
+        if name != "stored_builtin_lane" && name != "poseidon_edge_lane" {
+            return None;
+        }
+        let args = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+            .parse2(item.mac.tokens.clone())
+            .expect("recorded lane macro arguments");
+        let syn::Expr::Path(component) = args.iter().nth(1)? else {
+            panic!("{name} component argument is not an identifier");
+        };
+        Some(
+            component
+                .path
+                .segments
+                .last()
+                .expect("recorded lane component path")
+                .ident
+                .to_string(),
+        )
+    }
+
     let mut labels = BTreeSet::new();
     for item in &file.items {
         match item {
@@ -1297,6 +1729,9 @@ fn parse_recorded_witness_labels(file: &syn::File) -> BTreeSet<String> {
                     .next()
                     .unwrap_or_else(|| panic!("opcode_lane_spec missing string label: {tokens}"));
                 labels.insert(label.to_owned());
+            }
+            syn::Item::Macro(item) if lane_macro_component(item).is_some() => {
+                labels.insert(lane_macro_component(item).unwrap());
             }
             syn::Item::Impl(item)
                 if item.trait_.as_ref().is_some_and(|(_, path, _)| {
@@ -1335,7 +1770,8 @@ struct Node {
     outputs: BTreeMap<String, Edge>,
     /// count family (state-param name) → number of distinct relation indices fed.
     counts: BTreeMap<String, u32>,
-    /// producer component → edge (inverted from producers' outputs).
+    /// producer component → edge (inverted from producers' outputs). Emission
+    /// restores canonical `CairoClaimGenerator` order rather than BTree key order.
     inputs: BTreeMap<String, Edge>,
     /// producer component -> scalar input instances per producer row.
     capacity_inputs: BTreeMap<String, u32>,
@@ -1830,6 +2266,128 @@ fn emit_relation_source(components: &[PlannedComponentFact]) -> String {
     source
 }
 
+fn fixed_table_hash(plans: &[FixedTablePlanFact]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for plan in plans {
+        fnv_str(&mut hash, &plan.component);
+        fnv_u32(&mut hash, plan.log_size);
+        fnv_u32(&mut hash, plan.multiplicity_columns);
+        for (output, multiplicity) in &plan.trace_columns {
+            fnv_u32(&mut hash, *output);
+            fnv_u32(&mut hash, *multiplicity);
+        }
+        match &plan.lookup {
+            FixedTableLookupFact::Words(words) => {
+                fnv_u32(&mut hash, 0);
+                fnv_u32(&mut hash, words.len() as u32);
+                for word in words {
+                    fnv_u32(&mut hash, word.output_word);
+                    match &word.source {
+                        FixedTableWordSourceFact::Constant(value) => {
+                            fnv_u32(&mut hash, 0);
+                            fnv_u32(&mut hash, *value);
+                        }
+                        FixedTableWordSourceFact::PreprocessedColumn(id) => {
+                            fnv_u32(&mut hash, 1);
+                            fnv_str(&mut hash, id);
+                        }
+                        FixedTableWordSourceFact::MultiplicityColumn(column) => {
+                            fnv_u32(&mut hash, 2);
+                            fnv_u32(&mut hash, *column);
+                        }
+                    }
+                }
+            }
+            FixedTableLookupFact::ExpandedXor {
+                relation_id,
+                limb_bits,
+                expand_bits,
+            } => {
+                fnv_u32(&mut hash, 1);
+                fnv_u32(&mut hash, *relation_id);
+                fnv_u32(&mut hash, *limb_bits);
+                fnv_u32(&mut hash, *expand_bits);
+            }
+        }
+    }
+    hash
+}
+
+fn emit_fixed_table_source(plans: &[FixedTablePlanFact]) -> String {
+    let expected_hash = fixed_table_hash(plans);
+    let mut source = String::new();
+    source.push_str(
+        "//! MACHINE-WRITTEN by tools/schedule_emit — DO NOT EDIT.\n\
+         //! Exact BaseTrace and flattened LookupInputs sources parsed from fixed-table writers.\n\
+         //! Regenerate with `cargo run --manifest-path tools/schedule_emit/Cargo.toml`.\n\n\
+         use crate::fixed_table::{\n\
+             ExpandedXorLayout, FixedTableLookupLayout, FixedTableLookupWord,\n\
+             FixedTableMaterializationPlan, FixedTableMaterializationTable, FixedTableTraceColumn,\n\
+             FixedTableWordSource,\n\
+         };\n\n\
+         pub static CAIRO_FIXED_TABLE_MATERIALIZATION: FixedTableMaterializationTable =\n\
+             FixedTableMaterializationTable {\n\
+                 plans: PLANS,\n\
+                 expected_hash: EXPECTED_HASH,\n\
+             };\n\n",
+    );
+    source.push_str(&format!(
+        "pub const EXPECTED_HASH: u64 = 0x{expected_hash:016x};\n\n"
+    ));
+    source.push_str("static PLANS: &[FixedTableMaterializationPlan] = &[\n");
+    for plan in plans {
+        source.push_str("    FixedTableMaterializationPlan {\n");
+        source.push_str(&format!("        component: \"{}\",\n", plan.component));
+        source.push_str(&format!("        log_size: {},\n", plan.log_size));
+        source.push_str(&format!(
+            "        multiplicity_columns: {},\n",
+            plan.multiplicity_columns
+        ));
+        source.push_str("        trace_columns: &[\n");
+        for (output, multiplicity) in &plan.trace_columns {
+            source.push_str(&format!(
+                "            FixedTableTraceColumn {{ output_column: {output}, multiplicity_column: {multiplicity} }},\n"
+            ));
+        }
+        source.push_str("        ],\n");
+        match &plan.lookup {
+            FixedTableLookupFact::Words(words) => {
+                source.push_str("        lookup: FixedTableLookupLayout::Words(&[\n");
+                for word in words {
+                    let source_fact = match &word.source {
+                        FixedTableWordSourceFact::Constant(value) => {
+                            format!("FixedTableWordSource::Constant({value})")
+                        }
+                        FixedTableWordSourceFact::PreprocessedColumn(id) => {
+                            format!("FixedTableWordSource::PreprocessedColumn(\"{id}\")")
+                        }
+                        FixedTableWordSourceFact::MultiplicityColumn(column) => {
+                            format!("FixedTableWordSource::MultiplicityColumn({column})")
+                        }
+                    };
+                    source.push_str(&format!(
+                        "            FixedTableLookupWord {{ output_word: {}, source: {source_fact} }},\n",
+                        word.output_word
+                    ));
+                }
+                source.push_str("        ]),\n");
+            }
+            FixedTableLookupFact::ExpandedXor {
+                relation_id,
+                limb_bits,
+                expand_bits,
+            } => {
+                source.push_str(&format!(
+                    "        lookup: FixedTableLookupLayout::ExpandedXor(ExpandedXorLayout {{ relation_id: {relation_id}, limb_bits: {limb_bits}, expand_bits: {expand_bits} }}),\n"
+                ));
+            }
+        }
+        source.push_str("    },\n");
+    }
+    source.push_str("];\n");
+    source
+}
+
 fn main() -> ExitCode {
     let (root, check) = parse_args();
     let components_dir = root.join("crates/prover/src/witness/components");
@@ -1839,6 +2397,7 @@ fn main() -> ExitCode {
     let relations_path = root.join("crates/cairo-air/src/relations.rs");
     let out_path = root.join("crates/gpu-prover/src/schedule_table.rs");
     let relation_out = root.join("crates/gpu-prover/src/relation_table.rs");
+    let fixed_table_out = root.join("crates/gpu-prover/src/fixed_table_table.rs");
     let proof_shape_out = root.join("crates/prover/src/witness/proof_shape_generated.rs");
 
     let declared_relation_ids = parse_relation_id_catalog(
@@ -1871,6 +2430,7 @@ fn main() -> ExitCode {
         .iter()
         .map(|component| (component.clone(), Node::default()))
         .collect();
+    let mut fixed_table_plans = Vec::<FixedTablePlanFact>::new();
     let mut capacity_edges: Vec<(String, String, u32)> = Vec::new();
     let mut files: Vec<PathBuf> = std::fs::read_dir(&components_dir)
         .expect("read components dir")
@@ -1928,8 +2488,30 @@ fn main() -> ExitCode {
                     "memory_id_to_big" => None,
                     _ => None,
                 });
+            let row_source = classify_row_source(&stem, &file, &root);
+            if let RowSource::FixedLogSize(log_size) = row_source {
+                let fixed_plan = if stem == "verify_bitwise_xor_12" {
+                    parse_expanded_xor_fixed_table(
+                        &stem,
+                        log_size,
+                        &src,
+                        &declared_relation_ids,
+                        custom_geometry,
+                    )
+                } else {
+                    parse_standard_fixed_table(
+                        &stem,
+                        log_size,
+                        &file,
+                        lookup_fields.as_ref().unwrap_or_else(|| {
+                            panic!("{stem}: fixed-table LookupData layout is unsupported")
+                        }),
+                    )
+                };
+                fixed_table_plans.push(fixed_plan);
+            }
             let facts = StaticFacts {
-                row_source: classify_row_source(&stem, &file, &root),
+                row_source,
                 lookup_words,
                 sub_words: parse_usize_const(&file, "N_SUB_INPUT_WORDS"),
                 logup_columns,
@@ -2004,6 +2586,24 @@ fn main() -> ExitCode {
         }
     }
 
+    // The handwritten EC-op writer has no generated SUB_FEED_LAYOUT because
+    // its native CUDA graph writes consumer inputs and multiplicities directly
+    // into their final arena slots. Keep those exact count families explicit in
+    // the generated schedule instead of pretending a staging buffer exists.
+    {
+        let ec_op = nodes
+            .get_mut("ec_op_builtin")
+            .expect("ec_op_builtin claim component");
+        for family in [
+            "memory_address_to_id_state",
+            "memory_id_to_big_state",
+            "range_check_8_state",
+        ] {
+            assert!(count_families.contains_key(family));
+            ec_op.counts.insert(family.to_owned(), 1);
+        }
+    }
+
     // Materialize nodes for every referenced consumer, then invert edges.
     let producers: Vec<(String, BTreeMap<String, Edge>)> = nodes
         .iter()
@@ -2049,6 +2649,17 @@ fn main() -> ExitCode {
             "recorded witness lane {label} is absent from CairoClaimGenerator"
         );
     }
+    assert_eq!(
+        fixed_table_plans.len(),
+        nodes
+            .values()
+            .filter(|node| matches!(
+                node.static_facts.as_ref().expect("facts").row_source,
+                RowSource::FixedLogSize(_)
+            ))
+            .count(),
+        "not every FixedLogSize component has a materialization descriptor"
+    );
 
     let planned_components: Vec<PlannedComponentFact> = nodes
         .iter()
@@ -2089,7 +2700,7 @@ fn main() -> ExitCode {
          //! alphabetical (stable emission); EXECUTION order comes from\n\
          //! `Schedule::levels()`; trace COLLECTION order stays the claim\n\
          //! generator's (Fiat-Shamir-fixed) and is not this table's concern.\n\n\
-         use crate::schedule::{\n    CapacityFeed, ComponentNode, ComponentRowSource, ComponentStaticFacts, CountFeed, InputEdge,\n    KernelIdentitySource, LogSizeSource, OutputEdge, Schedule, TraceColumnCount,\n};\n\n\
+         use crate::schedule::{\n    CapacityFeed, ComponentNode, ComponentRowSource, ComponentStaticFacts, CountFeed, InputEdge,\n    KernelIdentitySource, LogSizeSource, OutputEdge, Schedule, TraceColumnCount,\n    WitnessWriterKind, WitnessWriterReadiness, WitnessWriterSpec,\n};\n\n\
          pub static CAIRO_SCHEDULE: Schedule = Schedule { nodes: NODES };\n\n",
     );
     s.push_str(
@@ -2134,6 +2745,27 @@ fn main() -> ExitCode {
                 "None"
             }
         ));
+        // These readiness values name concrete prepared launch paths, not the
+        // legacy live writers: FixedTableCuda is materialized by
+        // PreparedFixedTableGraph, while every registry recording is bound by
+        // PreparedWitnessGraph in RequireEmbeddedAot mode. Native writers stay
+        // below CaptureSafe until they have the same prepared arena contract.
+        let (writer_kind, writer_readiness) =
+            if matches!(facts.row_source, RowSource::FixedLogSize(_)) {
+                ("FixedTableCuda", "CaptureSafe")
+            } else if facts.recorded_witness_kernel {
+                ("RecordedAot", "CaptureSafe")
+            } else if matches!(
+                id.as_str(),
+                "ec_op_builtin" | "memory_address_to_id" | "memory_id_to_big"
+            ) {
+                ("NativeCuda", "CaptureSafe")
+            } else {
+                ("Host", "Detached")
+            };
+        s.push_str(&format!(
+            "            witness_writer: WitnessWriterSpec {{\n                kind: WitnessWriterKind::{writer_kind},\n                readiness: WitnessWriterReadiness::{writer_readiness},\n            }},\n"
+        ));
         s.push_str("        },\n");
         s.push_str("        kernel: None,\n");
         if matches!(facts.row_source, RowSource::FixedLogSize(_)) {
@@ -2143,13 +2775,25 @@ fn main() -> ExitCode {
         } else {
             s.push_str("        log_size: LogSizeSource::FromStates,\n");
         }
-        // Inputs: inverted producer edges (ExecTables/DeviceTable refinement is a
-        // consumption-time concern, M2d).
+        // Inputs: inverted producer edges in canonical legacy writer order.
+        // `inputs` is a map for uniqueness/addressing checks only; sorting it by
+        // producer name would change duplicate-preserving Vec consumer rows.
+        // ExecTables/DeviceTable refinement is a consumption-time concern, M2d.
         if node.inputs.is_empty() {
             s.push_str("        inputs: &[],\n");
         } else {
             s.push_str("        inputs: &[\n");
-            for (of, e) in &node.inputs {
+            let ordered_inputs = claim_component_order
+                .iter()
+                .filter(|producer| node.inputs.contains_key(*producer))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ordered_inputs.len(),
+                node.inputs.len(),
+                "{id}: producer input is absent from canonical writer order",
+            );
+            for of in ordered_inputs {
+                let e = &node.inputs[of];
                 s.push_str(&format!(
                     "            InputEdge::Producer {{\n                of: \"{of}\",\n                word_base: {},\n                words_per_instance: {},\n                n_instances: {},\n            }},\n",
                     e.word_base, e.words_per_instance, e.n_instances
@@ -2161,7 +2805,17 @@ fn main() -> ExitCode {
             s.push_str("        capacity_inputs: &[],\n");
         } else {
             s.push_str("        capacity_inputs: &[\n");
-            for (from, n_instances) in &node.capacity_inputs {
+            let ordered_capacity_inputs = claim_component_order
+                .iter()
+                .filter(|producer| node.capacity_inputs.contains_key(*producer))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ordered_capacity_inputs.len(),
+                node.capacity_inputs.len(),
+                "{id}: capacity input is absent from canonical writer order",
+            );
+            for from in ordered_capacity_inputs {
+                let n_instances = node.capacity_inputs[from];
                 s.push_str(&format!(
                     "            CapacityFeed {{ from: \"{from}\", n_instances: {n_instances} }},\n"
                 ));
@@ -2216,22 +2870,33 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let fixed_table_source = match format_rust(&root, &emit_fixed_table_source(&fixed_table_plans))
+    {
+        Ok(source) => source,
+        Err(e) => {
+            eprintln!("schedule_emit fixed_table: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     if check {
         let on_disk = std::fs::read_to_string(&out_path).unwrap_or_default();
         let relation_on_disk = std::fs::read_to_string(&relation_out).unwrap_or_default();
+        let fixed_table_on_disk = std::fs::read_to_string(&fixed_table_out).unwrap_or_default();
         let proof_shape_on_disk = std::fs::read_to_string(&proof_shape_out).unwrap_or_default();
         if on_disk == s
             && relation_on_disk == relation_source
+            && fixed_table_on_disk == fixed_table_source
             && proof_shape_on_disk == proof_shape_source
         {
             println!("schedule_emit --check: OK (no drift)");
             ExitCode::SUCCESS
         } else {
             eprintln!(
-                "schedule_emit --check: DRIFT — regenerate {}, {}, and {} (component metadata changed)",
+                "schedule_emit --check: DRIFT — regenerate {}, {}, {}, and {} (component metadata changed)",
                 out_path.display(),
                 relation_out.display(),
+                fixed_table_out.display(),
                 proof_shape_out.display(),
             );
             ExitCode::FAILURE
@@ -2239,14 +2904,17 @@ fn main() -> ExitCode {
     } else {
         std::fs::write(&out_path, &s).expect("write schedule_table.rs");
         std::fs::write(&relation_out, &relation_source).expect("write relation_table.rs");
+        std::fs::write(&fixed_table_out, &fixed_table_source).expect("write fixed_table_table.rs");
         std::fs::write(&proof_shape_out, &proof_shape_source)
             .expect("write proof_shape_generated.rs");
         println!(
-            "schedule_emit: wrote {}, {}, and {} ({} nodes)",
+            "schedule_emit: wrote {}, {}, {}, and {} ({} nodes, {} fixed tables)",
             out_path.display(),
             relation_out.display(),
+            fixed_table_out.display(),
             proof_shape_out.display(),
-            nodes.len()
+            nodes.len(),
+            fixed_table_plans.len(),
         );
         ExitCode::SUCCESS
     }
@@ -2281,6 +2949,112 @@ mod tests {
         assert_eq!(
             components.into_iter().collect::<Vec<_>>(),
             vec!["a_component", "z_component"]
+        );
+    }
+
+    #[test]
+    fn fixed_table_writer_is_parsed_into_exact_word_major_sources() {
+        let file = syn::parse_file(
+            r#"
+            fn write_trace_simd() {
+                let M31_7 = PackedM31::broadcast(M31::from(7));
+                let seq = preprocessed_trace.get_column(&PreProcessedColumnId {
+                    id: "seq_test".to_owned(),
+                });
+                closure.for_each(|_| {
+                    let seq = seq.packed_at(row_index);
+                    let mult = *mults[0].get(row_index).unwrap_or(&PackedM31::zero());
+                    *row[0] = mult;
+                    *lookup_data.test_relation_0 = [M31_7, seq];
+                    *lookup_data.mults_0 = mult;
+                });
+            }
+            struct LookupData {
+                test_relation_0: Vec<[PackedM31; 2]>,
+                mults_0: Vec<PackedM31>,
+            }
+            "#,
+        )
+        .unwrap();
+        let fields = parse_lookup_fields(&file, "test_component").unwrap();
+        let plan = parse_standard_fixed_table("test_component", 5, &file, &fields);
+        assert_eq!(
+            plan,
+            FixedTablePlanFact {
+                component: "test_component".to_owned(),
+                log_size: 5,
+                multiplicity_columns: 1,
+                trace_columns: vec![(0, 0)],
+                lookup: FixedTableLookupFact::Words(vec![
+                    FixedTableLookupWordFact {
+                        output_word: 0,
+                        source: FixedTableWordSourceFact::Constant(7),
+                    },
+                    FixedTableLookupWordFact {
+                        output_word: 1,
+                        source: FixedTableWordSourceFact::PreprocessedColumn("seq_test".to_owned(),),
+                    },
+                    FixedTableLookupWordFact {
+                        output_word: 2,
+                        source: FixedTableWordSourceFact::MultiplicityColumn(0),
+                    },
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn fixed_table_writer_rejects_unrepresentable_lookup_algebra() {
+        let file = syn::parse_file(
+            r#"
+            fn write_trace_simd() {
+                let M31_7 = PackedM31::broadcast(M31::from(7));
+                let seq = preprocessed_trace.get_column(&PreProcessedColumnId {
+                    id: "seq_test".to_owned(),
+                });
+                closure.for_each(|_| {
+                    let seq = seq.packed_at(row_index);
+                    let mult = *mults[0].get(row_index).unwrap_or(&PackedM31::zero());
+                    *row[0] = mult;
+                    *lookup_data.test_relation_0 = [M31_7, seq + M31_1];
+                    *lookup_data.mults_0 = mult;
+                });
+            }
+            struct LookupData {
+                test_relation_0: Vec<[PackedM31; 2]>,
+                mults_0: Vec<PackedM31>,
+            }
+            "#,
+        )
+        .unwrap();
+        let fields = vec![
+            LookupField {
+                name: "test_relation_0".to_owned(),
+                word_offset: 0,
+                width: 2,
+                relation_name: Some("test_relation".to_owned()),
+                relation_id: Some(7),
+            },
+            LookupField {
+                name: "mults_0".to_owned(),
+                word_offset: 2,
+                width: 1,
+                relation_name: None,
+                relation_id: None,
+            },
+        ];
+        let panic = std::panic::catch_unwind(|| {
+            parse_standard_fixed_table("test_component", 5, &file, &fields)
+        })
+        .expect_err("unsupported lookup algebra must fail closed");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("unsupported fixed-table lookup expression"),
+            "unexpected panic: {message}"
         );
     }
 }

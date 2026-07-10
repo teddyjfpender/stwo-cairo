@@ -3732,6 +3732,7 @@ dependencies = [
  "starknet-ff",
  "stwo",
  "stwo-backend-cuda",
+ "stwo-backend-cuda-kernels",
  "stwo-cairo-adapter",
  "stwo-cairo-common",
  "stwo-cairo-dev-utils",

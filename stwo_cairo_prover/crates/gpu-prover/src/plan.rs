@@ -96,6 +96,46 @@ impl ProofPlan {
         self.proof_shape.require_capture_ready().is_ok()
     }
 
+    /// Resolve generated witness-feed capacities to the exact row geometry of
+    /// the strict device DAG before materialization. Every producer contributes
+    /// its full padded row domain `n_instances` times; this is the same formula
+    /// the live device-edge ledger checks after the writers run. The post-write
+    /// seal remains mandatory and rejects any disagreement.
+    pub fn strict_resident_exact(
+        &self,
+        schedule: &'static Schedule,
+        relation_graph: &'static RelationGraph,
+    ) -> Result<Self, ProofPlanError> {
+        let components = self
+            .proof_shape
+            .components()
+            .iter()
+            .map(|component| {
+                let rows = match &component.rows {
+                    RowResolution::Bounded { bound, .. } => RowResolution::Resolved(vec![
+                        stwo_cairo_prover::witness::proof_shape::TracePartShape {
+                            part: TracePartId::Main,
+                            n_real_rows: bound.max_rows,
+                            padded_rows: bound.padded_capacity,
+                        },
+                    ]),
+                    RowResolution::Pending { .. } => {
+                        return Err(ProofPlanError::StrictResidentRowsUnresolved(component.id));
+                    }
+                    _ => component.rows.clone(),
+                };
+                Ok(RuntimeComponentShape {
+                    id: component.id,
+                    rows,
+                })
+            })
+            .collect::<Result<Vec<_>, ProofPlanError>>()?;
+        let shape = ProofShape::new(components).map_err(ProofPlanError::Shape)?;
+        let exact = Self::from_schedule(schedule, relation_graph, &shape)?;
+        debug_assert!(exact.capture_ready());
+        Ok(exact)
+    }
+
     /// Rebuilds the generated plan from the post-witness exact row ledger while
     /// proving that no component, trace width/order, or preallocated capacity
     /// changed. CUDA graph preparation must only consume the returned plan.
@@ -209,6 +249,7 @@ pub enum ProofPlanError {
         actual: ComponentId,
     },
     SealedTraceGeometryChanged(ComponentId),
+    StrictResidentRowsUnresolved(ComponentId),
     SealedRelationGraphChanged {
         expected: u64,
         actual: u64,
@@ -561,5 +602,33 @@ mod tests {
                 max_rows: 640,
             })
         ));
+    }
+
+    #[test]
+    fn strict_resident_plan_resolves_generated_feed_rows_before_witness() {
+        let pre_shape = with_components(vec![
+            RuntimeComponentShape::uniform("blake_compress_opcode", 33, 64).unwrap(),
+            RuntimeComponentShape::pending(
+                "blake_round",
+                PendingRowsReason::WitnessRelationFeeds,
+                0,
+            ),
+        ]);
+        let capacity =
+            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &pre_shape).unwrap();
+        let exact = capacity
+            .strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)
+            .unwrap();
+        assert_eq!(
+            exact.proof_shape().component("blake_round").unwrap().rows,
+            RowResolution::Resolved(vec![
+                stwo_cairo_prover::witness::proof_shape::TracePartShape {
+                    part: TracePartId::Main,
+                    n_real_rows: 640,
+                    padded_rows: 1024,
+                }
+            ])
+        );
+        assert!(exact.capture_ready());
     }
 }

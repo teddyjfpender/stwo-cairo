@@ -254,6 +254,9 @@ impl WitnessEval for RecordingWitnessEval {
     fn u32_mul(&mut self, a: RecVal, b: RecVal) -> RecVal {
         self.bin(a, b, |r, x, y| r.u32_mul(x, y))
     }
+    fn u32_xor(&mut self, a: RecVal, b: RecVal) -> RecVal {
+        self.bin(a, b, |r, x, y| r.u32_xor(x, y))
+    }
     fn u32_and_imm(&mut self, a: RecVal, mask: u32) -> RecVal {
         self.un(a, |r, x| r.u32_and(x, mask))
     }
@@ -359,6 +362,84 @@ impl WitnessEval for RecordingWitnessEval {
         };
         let outs = self.recorder.deduce(DeduceKind::BlakeRoundSigma, &[r]);
         std::array::from_fn(|i| RecVal::Ok(outs[i]))
+    }
+
+    fn deduce_poseidon_round_keys(&mut self, round: RecVal) -> [[RecVal; 10]; 3] {
+        let RecVal::Ok(round) = round else {
+            let p = self.poison("deduce_poseidon_round_keys");
+            return [[p; 10]; 3];
+        };
+        let outs = self
+            .recorder
+            .deduce(DeduceKind::PoseidonRoundKeys, &[round]);
+        std::array::from_fn(|felt| std::array::from_fn(|word| RecVal::Ok(outs[felt * 10 + word])))
+    }
+
+    fn deduce_cube_252(&mut self, input: [RecVal; 10]) -> [RecVal; 10] {
+        let Some(args) = Self::plain_args(&input) else {
+            let p = self.poison("deduce_cube_252");
+            return [p; 10];
+        };
+        let outs = self.recorder.deduce(DeduceKind::Cube252, &args);
+        std::array::from_fn(|word| RecVal::Ok(outs[word]))
+    }
+
+    fn deduce_poseidon_full_round_chain(
+        &mut self,
+        chain: RecVal,
+        round: RecVal,
+        state: [[RecVal; 10]; 3],
+    ) -> (RecVal, RecVal, [[RecVal; 10]; 3]) {
+        let args = (|| {
+            let mut args = Self::plain_args(&[chain, round])?;
+            for felt in &state {
+                args.extend(Self::plain_args(felt)?);
+            }
+            Some(args)
+        })();
+        let Some(args) = args else {
+            let p = self.poison("deduce_poseidon_full_round_chain");
+            return (p, p, [[p; 10]; 3]);
+        };
+        let outs = self
+            .recorder
+            .deduce(DeduceKind::PoseidonFullRoundChain, &args);
+        (
+            RecVal::Ok(outs[0]),
+            RecVal::Ok(outs[1]),
+            std::array::from_fn(|felt| {
+                std::array::from_fn(|word| RecVal::Ok(outs[2 + felt * 10 + word]))
+            }),
+        )
+    }
+
+    fn deduce_poseidon_3_partial_rounds_chain(
+        &mut self,
+        chain: RecVal,
+        round: RecVal,
+        state: [[RecVal; 10]; 4],
+    ) -> (RecVal, RecVal, [[RecVal; 10]; 4]) {
+        let args = (|| {
+            let mut args = Self::plain_args(&[chain, round])?;
+            for felt in &state {
+                args.extend(Self::plain_args(felt)?);
+            }
+            Some(args)
+        })();
+        let Some(args) = args else {
+            let p = self.poison("deduce_poseidon_3_partial_rounds_chain");
+            return (p, p, [[p; 10]; 4]);
+        };
+        let outs = self
+            .recorder
+            .deduce(DeduceKind::Poseidon3PartialRoundsChain, &args);
+        (
+            RecVal::Ok(outs[0]),
+            RecVal::Ok(outs[1]),
+            std::array::from_fn(|felt| {
+                std::array::from_fn(|word| RecVal::Ok(outs[2 + felt * 10 + word]))
+            }),
+        )
     }
 
     // ---- M31 field ops (ISA-core) ----------------------------------------------

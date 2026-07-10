@@ -151,6 +151,7 @@ where
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + crate::witness::blake_g_witness_backend::BlakeGWitness
         + crate::witness::jit_prove_backend::OpcodeJitBackend
+        + crate::witness::jit_prove_backend::RecordedFlatWitness
         + crate::witness::blake_round_witness_backend::BlakeRoundWitness
         + crate::witness::jit_prove_backend::Cube252Witness
         + crate::witness::pedersen_witness_backend::PartialEcMulGenericWitness
@@ -309,6 +310,7 @@ where
         + crate::witness::memory_witness_backend::MemoryIdToBigWitness
         + crate::witness::blake_g_witness_backend::BlakeGWitness
         + crate::witness::jit_prove_backend::OpcodeJitBackend
+        + crate::witness::jit_prove_backend::RecordedFlatWitness
         + crate::witness::blake_round_witness_backend::BlakeRoundWitness
         + crate::witness::jit_prove_backend::Cube252Witness
         + crate::witness::pedersen_witness_backend::PartialEcMulGenericWitness

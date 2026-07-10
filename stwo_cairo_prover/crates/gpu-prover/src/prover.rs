@@ -16,6 +16,7 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::proof_of_work::GrindOps;
 use stwo::core::utils::MaybeOwned;
+use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
 use stwo::prover::backend::{BackendForChannel, FromSimdColumns};
 use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::circle::PolyOps;
@@ -24,16 +25,19 @@ use stwo::prover::{
     CommitmentSchemeProver, CommitmentTreeProver, ProveExWithPcsDriverError, ProvingError,
 };
 use stwo_backend_cuda::{
-    aot, CudaBackend, CudaPcsDriverConfig, CudaPcsDriverError, CudaPcsDriverTelemetry,
-    CudaPcsRuntimeMode, CudaRuntimeError,
+    aot, assemble_blake2s_stark_proof, Blake2sProofAssemblyError, Blake2sProofAssemblyInput,
+    CudaBackend, CudaExecTelemetry, CudaPcsDriverConfig, CudaPcsDriverError,
+    CudaPcsDriverTelemetry, CudaPcsRuntimeMode, CudaRuntimeError, TranscriptMirrorReport,
 };
 use stwo_cairo_adapter::ProverInput;
-use stwo_cairo_prover::prover::ProverParameters;
+use stwo_cairo_prover::prover::{ChannelHash, ProverParameters};
 use stwo_cairo_prover::witness::base_trace::BaseTrace;
 use stwo_cairo_prover::witness::blake_g_witness_backend::BlakeGWitness;
 use stwo_cairo_prover::witness::blake_round_witness_backend::BlakeRoundWitness;
 use stwo_cairo_prover::witness::exec_context::WitnessArtifactPlan;
-use stwo_cairo_prover::witness::jit_prove_backend::{Cube252Witness, OpcodeJitBackend};
+use stwo_cairo_prover::witness::jit_prove_backend::{
+    Cube252Witness, OpcodeJitBackend, RecordedFlatWitness,
+};
 use stwo_cairo_prover::witness::memory_witness_backend::MemoryIdToBigWitness;
 use stwo_cairo_prover::witness::pedersen_witness_backend::{
     PartialEcMulGenericWitness, PartialEcMulWindowBits18Witness,
@@ -46,6 +50,16 @@ use tracing::{span, Level};
 
 use crate::arena_plan::ProofArenaPlan;
 use crate::graphs::{GraphError, GraphWorkspace};
+use crate::protocol_discovery::interaction_claim_from_flattened;
+use crate::relation_table::CAIRO_RELATION_GRAPH;
+use crate::resident_runtime::{ResidentGraphRuntime, ResidentRuntimeError};
+use crate::resident_session::{
+    resident_max_domain_log_size, with_resident_session, with_resident_session_from_generator,
+    ResidentExecutionReadiness, ResidentPreWitnessSessionRequest, ResidentPreparationState,
+    ResidentSessionArtifacts, ResidentSessionError, ResidentSessionRequest,
+    ResidentSessionTelemetry,
+};
+use crate::resident_witness::{planned_cairo_claim, require_strict_resident_witness_coverage};
 use crate::schedule::ScheduleError;
 use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::state::{IngestOutput, WitnessOutput};
@@ -77,6 +91,7 @@ pub trait CairoWitnessBackend:
     + MemoryIdToBigWitness
     + BlakeGWitness
     + OpcodeJitBackend
+    + RecordedFlatWitness
     + BlakeRoundWitness
     + Cube252Witness
     + PartialEcMulGenericWitness
@@ -89,6 +104,7 @@ impl<B> CairoWitnessBackend for B where
         + MemoryIdToBigWitness
         + BlakeGWitness
         + OpcodeJitBackend
+        + RecordedFlatWitness
         + BlakeRoundWitness
         + Cube252Witness
         + PartialEcMulGenericWitness
@@ -132,6 +148,58 @@ pub enum GpuError {
     Runtime(CudaRuntimeError),
     Graph(GraphError),
     WorkspaceCache(WorkspaceCacheError),
+    ResidentSession(ResidentSessionError),
+    ProofAssembly(Blake2sProofAssemblyError),
+}
+
+/// Machine-readable evidence from the opt-in U4 transcript migration gate.
+/// `performance_admissible` is permanently false: the mirror deliberately adds
+/// compact D2H reads, one synchronization and host Blake2s replay after the
+/// normal resident hot-path budget has already been checked.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResidentTranscriptMirrorTelemetry {
+    pub report: TranscriptMirrorReport,
+    pub mirror_d2h_bytes: u64,
+    pub mirror_sync_calls: u64,
+    pub performance_admissible: bool,
+}
+
+impl ResidentTranscriptMirrorTelemetry {
+    pub const fn performance_claim_admissible(&self) -> bool {
+        false
+    }
+}
+
+/// A correctness-only resident proof. Its distinct return type prevents a
+/// mirrored run from entering the ordinary MHz benchmark path by accident.
+pub struct MirroredResidentBlake2sProof {
+    pub proof: CairoProof<Blake2sMerkleHasher>,
+    pub transcript_mirror: ResidentTranscriptMirrorTelemetry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidentTranscriptMode {
+    DeviceOnly,
+    DeviceMirrored,
+}
+
+fn transcript_mirror_telemetry(
+    report: TranscriptMirrorReport,
+    before: CudaExecTelemetry,
+    after: CudaExecTelemetry,
+) -> Result<ResidentTranscriptMirrorTelemetry, ResidentRuntimeError> {
+    Ok(ResidentTranscriptMirrorTelemetry {
+        report,
+        mirror_d2h_bytes: after
+            .d2h_bytes
+            .checked_sub(before.d2h_bytes)
+            .ok_or(ResidentRuntimeError::SizeOverflow)?,
+        mirror_sync_calls: after
+            .sync_calls
+            .checked_sub(before.sync_calls)
+            .ok_or(ResidentRuntimeError::SizeOverflow)?,
+        performance_admissible: false,
+    })
 }
 
 impl From<ProvingError> for GpuError {
@@ -179,6 +247,18 @@ impl From<WorkspaceCacheError> for GpuError {
     }
 }
 
+impl From<ResidentSessionError> for GpuError {
+    fn from(e: ResidentSessionError) -> Self {
+        GpuError::ResidentSession(e)
+    }
+}
+
+impl From<Blake2sProofAssemblyError> for GpuError {
+    fn from(e: Blake2sProofAssemblyError) -> Self {
+        GpuError::ProofAssembly(e)
+    }
+}
+
 impl std::fmt::Display for GpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -189,6 +269,8 @@ impl std::fmt::Display for GpuError {
             GpuError::Runtime(e) => write!(f, "gpu-prover CUDA runtime error: {e}"),
             GpuError::Graph(e) => write!(f, "gpu-prover CUDA graph error: {e}"),
             GpuError::WorkspaceCache(e) => write!(f, "gpu-prover workspace cache error: {e}"),
+            GpuError::ResidentSession(e) => write!(f, "gpu-prover resident session error: {e}"),
+            GpuError::ProofAssembly(e) => write!(f, "gpu-prover proof assembly error: {e}"),
         }
     }
 }
@@ -253,6 +335,10 @@ where
     /// Architecture proof that the last successful gpu-native call used the
     /// concrete CUDA PCS state machine and completed every stage exactly once.
     last_pcs_telemetry: Option<CudaPcsDriverTelemetry>,
+    /// Full setup/ingest evidence for the last strict resident proof. Kept
+    /// separate from replay-only CUDA counters so architecture admission
+    /// cannot hide a legacy writer before telemetry reset.
+    last_resident_session_telemetry: Option<ResidentSessionTelemetry>,
     /// Provenance of every generated CUDA kernel lookup during the last proof.
     /// Strict mode accepts only embedded-AOT loads/hits.
     last_aot_stats: Option<aot::RuntimeStats>,
@@ -274,6 +360,18 @@ where
             )));
         }
         if config.strict {
+            if std::env::var("STWO_CUDA_PCS_REFERENCE").as_deref() == Ok("1") {
+                return Err(GpuError::Config(
+                    "strict GPU-native mode rejects the migration-only PCS reference escape hatch"
+                        .to_string(),
+                ));
+            }
+            if std::env::var("STWO_CUDA_DECOMMIT_GATHER_REFERENCE").as_deref() == Ok("1") {
+                return Err(GpuError::Config(
+                    "strict GPU-native mode rejects the migration-only decommit gather escape hatch"
+                        .to_string(),
+                ));
+            }
             let manifest_hash = aot::loaded_manifest_hash();
             if manifest_hash == 0 {
                 return Err(GpuError::Config(
@@ -292,6 +390,7 @@ where
             config,
             workspace_cache,
             last_pcs_telemetry: None,
+            last_resident_session_telemetry: None,
             last_aot_stats: None,
             witness_artifact_plan,
             twiddles: HashMap::new(),
@@ -305,6 +404,10 @@ where
 
     pub fn last_pcs_telemetry(&self) -> Option<&CudaPcsDriverTelemetry> {
         self.last_pcs_telemetry.as_ref()
+    }
+
+    pub fn last_resident_session_telemetry(&self) -> Option<&ResidentSessionTelemetry> {
+        self.last_resident_session_telemetry.as_ref()
     }
 
     pub fn last_aot_stats(&self) -> Option<aot::RuntimeStats> {
@@ -368,6 +471,117 @@ where
         Ok(materialization)
     }
 
+    /// Execute the production resident hand-off while the exact cached arena is
+    /// borrowed. Strict mode has no detached fallback: any discovery, staging,
+    /// preparation or callback failure aborts this path.
+    pub fn with_strict_resident_session<R>(
+        &mut self,
+        input: ProverInput,
+        params: ProverParameters,
+        run: impl FnOnce(
+            &mut ResidentGraphRuntime<'_>,
+            ResidentSessionArtifacts<'_>,
+        ) -> Result<R, ResidentRuntimeError>,
+    ) -> Result<(R, ResidentSessionTelemetry), GpuError> {
+        if !self.config.strict {
+            return Err(GpuError::Config(
+                "resident session entrypoint requires strict GPU-native mode".to_string(),
+            ));
+        }
+        if !matches!(params.channel_hash, ChannelHash::Blake2s) {
+            return Err(GpuError::Config(
+                "resident device transcript currently requires the Blake2s channel".to_string(),
+            ));
+        }
+
+        let IngestOutput {
+            preprocessed_trace,
+            generator,
+            proof_plan,
+        } = phases::ingest::run(
+            input,
+            params.preprocessed_trace,
+            params.opt_n_id_to_big_components,
+        );
+        let exact_plan = proof_plan
+            .strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)
+            .map_err(ResidentSessionError::ProofPlan)?;
+        require_strict_resident_witness_coverage(&exact_plan)
+            .map_err(ResidentSessionError::ResidentWitness)?;
+        let planned_claim = planned_cairo_claim(&generator, &exact_plan)
+            .map_err(ResidentSessionError::ResidentWitness)?;
+        let max_domain =
+            resident_max_domain_log_size(&planned_claim, &preprocessed_trace, params.pcs_config)?;
+        let twiddles = self.twiddle_tree(max_domain);
+        Ok(with_resident_session_from_generator(
+            &mut self.workspace_cache,
+            ResidentPreWitnessSessionRequest {
+                preprocessed_trace,
+                generator,
+                capacity_plan: proof_plan,
+                channel_salt: params.channel_salt,
+                pcs: params.pcs_config,
+                include_all_preprocessed_columns: params.include_all_preprocessed_columns,
+                twiddles,
+            },
+            run,
+        )?)
+    }
+
+    /// Lower-level entrypoint for callers that already own the sealed witness
+    /// output. The generated interaction state is consumed into resident lookup
+    /// sources and cannot fall back to the legacy interaction writer afterwards.
+    pub fn with_strict_resident_session_after_witness<R>(
+        &mut self,
+        preprocessed_trace: Arc<
+            stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace,
+        >,
+        witness: WitnessOutput<CudaBackend>,
+        channel_salt: u32,
+        pcs: stwo::core::pcs::PcsConfig,
+        include_all_preprocessed_columns: bool,
+        run: impl FnOnce(
+            &mut ResidentGraphRuntime<'_>,
+            ResidentSessionArtifacts<'_>,
+        ) -> Result<R, ResidentRuntimeError>,
+    ) -> Result<(R, ResidentSessionTelemetry), GpuError> {
+        if !self.config.strict {
+            return Err(GpuError::Config(
+                "resident session entrypoint requires strict GPU-native mode".to_string(),
+            ));
+        }
+        let max_domain = resident_max_domain_log_size(&witness.claim, &preprocessed_trace, pcs)?;
+        let twiddles = self.twiddle_tree(max_domain);
+        Ok(with_resident_session(
+            &mut self.workspace_cache,
+            ResidentSessionRequest {
+                preprocessed_trace,
+                witness,
+                channel_salt,
+                pcs,
+                include_all_preprocessed_columns,
+                twiddles,
+            },
+            run,
+        )?)
+    }
+
+    /// Prepare the strict resident architecture through runtime construction.
+    /// Prepare and validate the complete resident proof runtime without
+    /// launching or assembling a proof. Whole-proof callers use
+    /// [`Self::prove_resident_blake2s`] after this fail-closed readiness gate.
+    pub fn prepare_strict_resident(
+        &mut self,
+        input: ProverInput,
+        params: ProverParameters,
+    ) -> Result<ResidentPreparationState, GpuError> {
+        let (_, telemetry) = self.with_strict_resident_session(input, params, |_, _| Ok(()))?;
+        Ok(ResidentPreparationState {
+            telemetry,
+            readiness: ResidentExecutionReadiness::ReadyForResidentProofReplay,
+        })
+    }
+
     /// Prove one Cairo execution. Byte-identical to `prove_cairo::<CudaBackend, MC>` on the
     /// same input and parameters — the parity gate (design §9) holds at every
     /// milestone; only WHERE and WHEN values are computed changes as the pipeline
@@ -387,14 +601,16 @@ where
                     .to_string(),
             ));
         }
+        // Cache residency is ownership, not execution selection. Until the
+        // caller supplies arena-bound hooks, this remains the detached legacy
+        // path even when one or more warm workspaces have been materialized.
         let mut pcs_driver_config = CudaPcsDriverConfig::detached_eager();
         self.prove_with_pcs_driver_config(input, params, &mut pcs_driver_config)
     }
 
-    /// Explicit PCS-driver entry point. A future workspace integration constructs
+    /// Explicit PCS-driver entry point. Resident execution constructs
     /// `CudaPcsDriverConfig::arena_graph` with real captured-segment hooks and
-    /// enters here; the default [`Self::prove`] uses detached eager mode only when
-    /// no workspace has been materialized.
+    /// enters here; the default [`Self::prove`] always uses detached eager mode.
     pub fn prove_with_pcs_driver_config(
         &mut self,
         input: ProverInput,
@@ -408,6 +624,7 @@ where
             ));
         }
         self.last_pcs_telemetry = None;
+        self.last_resident_session_telemetry = None;
         self.last_aot_stats = None;
         aot::reset_runtime_stats();
         // Same top-level span name as the legacy engine: the phase-ledger tooling
@@ -725,5 +942,199 @@ where
         let leaked: &'static CommitmentTreeProver<CudaBackend, MC> = Box::leak(Box::new(tree));
         self.preprocessed_trees.insert(key, leaked);
         leaked
+    }
+}
+
+impl GpuCairoProver<Blake2sMerkleChannel> {
+    /// Production Starknet resident path. Every soundness-critical prover stage
+    /// runs through the sealed arena graph; the host receives one compact proof
+    /// bundle and only decodes it into the existing verifier-facing type.
+    pub fn prove_resident_blake2s(
+        &mut self,
+        input: ProverInput,
+        params: ProverParameters,
+    ) -> Result<CairoProof<Blake2sMerkleHasher>, GpuError> {
+        let (proof, transcript_mirror) = self.prove_resident_blake2s_with_mode(
+            input,
+            params,
+            ResidentTranscriptMode::DeviceOnly,
+        )?;
+        debug_assert!(transcript_mirror.is_none());
+        Ok(proof)
+    }
+
+    /// Opt-in U4 migration gate. It proves through the same strict resident
+    /// graphs, first enforces the ordinary hot-path budget, and only then reads
+    /// compact transcript snapshots back for a boundary-by-boundary host replay.
+    /// The distinct result and `performance_admissible=false` telemetry make
+    /// this correctness run ineligible for MHz reporting by construction.
+    pub fn prove_resident_blake2s_with_transcript_mirror(
+        &mut self,
+        input: ProverInput,
+        params: ProverParameters,
+    ) -> Result<MirroredResidentBlake2sProof, GpuError> {
+        let (proof, transcript_mirror) = self.prove_resident_blake2s_with_mode(
+            input,
+            params,
+            ResidentTranscriptMode::DeviceMirrored,
+        )?;
+        let transcript_mirror = transcript_mirror.ok_or_else(|| {
+            GpuError::Config("resident transcript mirror completed without telemetry".to_string())
+        })?;
+        Ok(MirroredResidentBlake2sProof {
+            proof,
+            transcript_mirror,
+        })
+    }
+
+    fn prove_resident_blake2s_with_mode(
+        &mut self,
+        input: ProverInput,
+        params: ProverParameters,
+        transcript_mode: ResidentTranscriptMode,
+    ) -> Result<
+        (
+            CairoProof<Blake2sMerkleHasher>,
+            Option<ResidentTranscriptMirrorTelemetry>,
+        ),
+        GpuError,
+    > {
+        if !self.config.strict {
+            return Err(GpuError::Config(
+                "resident Blake2s proving requires strict GPU-native mode".to_string(),
+            ));
+        }
+        self.last_pcs_telemetry = None;
+        self.last_aot_stats = None;
+        aot::reset_runtime_stats();
+
+        let ((claim, bundle, shape, exec, transcript_mirror), session_telemetry) = self
+            .with_strict_resident_session(input, params, |runtime, artifacts| {
+                runtime.require_prepared_witness_coverage()?;
+                runtime.capture_all_prepared_subgraphs()?;
+                let expected_graphs = u64::try_from(runtime.captured_graph_count())
+                    .map_err(|_| ResidentRuntimeError::FriRoundIndexTooLarge(usize::MAX))?;
+                let bundle_bytes = runtime
+                    .workspace_proof_bundle_bytes()
+                    .ok_or(ResidentRuntimeError::TranscriptRequirementsMismatch)?;
+                runtime.begin_hot_path_telemetry();
+                runtime.replay_all_prepared_subgraphs(2)?;
+                let bundle = runtime.read_proof_bundle_once()?;
+                let exec = runtime.require_hot_path_budget(
+                    crate::resident_runtime::ResidentHotPathBudget::final_bundle(
+                        expected_graphs,
+                        bundle_bytes,
+                    ),
+                )?;
+                let transcript_mirror = match transcript_mode {
+                    ResidentTranscriptMode::DeviceOnly => None,
+                    ResidentTranscriptMode::DeviceMirrored => {
+                        // U4 correctness work is intentionally outside the hot
+                        // telemetry accepted immediately above.
+                        let before = runtime.hot_path_telemetry();
+                        let report = runtime.verify_transcript_mirror_correctness_only()?;
+                        let after = runtime.hot_path_telemetry();
+                        Some(transcript_mirror_telemetry(report, before, after)?)
+                    }
+                };
+                Ok((
+                    artifacts.claim.clone(),
+                    bundle,
+                    runtime.proof_assembly_shape().clone(),
+                    exec,
+                    transcript_mirror,
+                ))
+            })?;
+        session_telemetry.require_strict_graph_a()?;
+
+        let interaction_claim = interaction_claim_from_flattened(&claim, &bundle.interaction_claim)
+            .map_err(ResidentSessionError::Discovery)?;
+        let proof = assemble_blake2s_stark_proof(Blake2sProofAssemblyInput {
+            config: params.pcs_config,
+            shape,
+            commitments: bundle.commitments,
+            sampled_values: bundle.sampled_values,
+            raw_queries: bundle.decommitment.raw_queries().to_vec(),
+            proof_of_work: bundle.query_pow,
+            final_line_poly_words: bundle.final_line_poly_words,
+            fri_commitments: bundle.fri_commitments,
+            decommitment: bundle.decommitment,
+        })?;
+
+        self.last_pcs_telemetry = Some(CudaPcsDriverTelemetry::completed_arena_graph(exec));
+        self.last_resident_session_telemetry = Some(session_telemetry);
+        let aot_stats = aot::runtime_stats();
+        if aot_stats.aot_misses != 0
+            || aot_stats.runtime_loads != 0
+            || aot_stats.runtime_cache_hits != 0
+            || aot_stats.strict_rejections != 0
+        {
+            return Err(GpuError::Config(format!(
+                "strict GPU-native AOT provenance failed: {aot_stats:?}"
+            )));
+        }
+        self.last_aot_stats = Some(aot_stats);
+
+        Ok((
+            CairoProof {
+                claim,
+                interaction_pow: bundle.interaction_pow,
+                interaction_claim,
+                extended_stark_proof: proof,
+                channel_salt: params.channel_salt,
+                preprocessed_trace_variant: params.preprocessed_trace,
+            },
+            transcript_mirror,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod resident_transcript_mirror_tests {
+    use stwo::core::vcs::blake2_hash::Blake2sHash;
+
+    use super::*;
+
+    fn report() -> TranscriptMirrorReport {
+        TranscriptMirrorReport {
+            protocol_key: 0x1234,
+            boundaries_verified: 17,
+            output_words_verified: 41,
+            final_digest: Blake2sHash::default(),
+            final_n_draws: 9,
+        }
+    }
+
+    #[test]
+    fn mirrored_run_is_explicitly_performance_inadmissible() {
+        let before = CudaExecTelemetry {
+            d2h_bytes: 128,
+            sync_calls: 1,
+            ..CudaExecTelemetry::default()
+        };
+        let after = CudaExecTelemetry {
+            d2h_bytes: 640,
+            sync_calls: 2,
+            ..before
+        };
+        let telemetry = transcript_mirror_telemetry(report(), before, after).unwrap();
+        assert_eq!(telemetry.mirror_d2h_bytes, 512);
+        assert_eq!(telemetry.mirror_sync_calls, 1);
+        assert!(!telemetry.performance_admissible);
+        assert!(!telemetry.performance_claim_admissible());
+        assert_eq!(telemetry.report.boundaries_verified, 17);
+    }
+
+    #[test]
+    fn mirror_telemetry_counter_regression_fails_closed() {
+        let before = CudaExecTelemetry {
+            d2h_bytes: 2,
+            sync_calls: 2,
+            ..CudaExecTelemetry::default()
+        };
+        assert!(matches!(
+            transcript_mirror_telemetry(report(), before, CudaExecTelemetry::default()),
+            Err(ResidentRuntimeError::SizeOverflow)
+        ));
     }
 }

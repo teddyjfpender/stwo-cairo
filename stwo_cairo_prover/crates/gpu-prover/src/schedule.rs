@@ -126,6 +126,47 @@ pub enum KernelIdentitySource {
     RecordedWitness,
 }
 
+/// Concrete implementation used to materialize one component's base witness.
+/// This is deliberately separate from [`KernelIdentitySource`]: a semantic
+/// recording can exist while its live writer still allocates temporary buffers
+/// and is therefore not admissible to a captured resident proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WitnessWriterKind {
+    Host,
+    RecordedAot,
+    NativeCuda,
+    FixedTableCuda,
+}
+
+/// How far the live writer has progressed toward the strict Graph-A contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WitnessWriterReadiness {
+    Detached,
+    ArenaDestination,
+    CaptureSafe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WitnessWriterSpec {
+    pub kind: WitnessWriterKind,
+    pub readiness: WitnessWriterReadiness,
+}
+
+impl WitnessWriterSpec {
+    pub const HOST: Self = Self {
+        kind: WitnessWriterKind::Host,
+        readiness: WitnessWriterReadiness::Detached,
+    };
+
+    pub const fn uses_arena_destination(self) -> bool {
+        !matches!(self.readiness, WitnessWriterReadiness::Detached)
+    }
+
+    pub const fn is_capture_safe(self) -> bool {
+        matches!(self.readiness, WitnessWriterReadiness::CaptureSafe)
+    }
+}
+
 /// Static component facts derived from generated witness and cairo-air sources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComponentStaticFacts {
@@ -135,6 +176,7 @@ pub struct ComponentStaticFacts {
     pub logup_columns: Option<u32>,
     pub row_source: ComponentRowSource,
     pub kernel_identity: KernelIdentitySource,
+    pub witness_writer: WitnessWriterSpec,
 }
 
 /// One row of the schedule table (design §16.3).
@@ -372,6 +414,10 @@ mod tests {
                 logup_columns: Some(6),
                 row_source: ComponentRowSource::WitnessRelationFeeds,
                 kernel_identity: KernelIdentitySource::RecordedWitness,
+                witness_writer: WitnessWriterSpec {
+                    kind: WitnessWriterKind::RecordedAot,
+                    readiness: WitnessWriterReadiness::ArenaDestination,
+                },
             },
             kernel: None,
             log_size: LogSizeSource::FromStates,
@@ -398,6 +444,10 @@ mod tests {
                 logup_columns: Some(65),
                 row_source: ComponentRowSource::WitnessRelationFeeds,
                 kernel_identity: KernelIdentitySource::RecordedWitness,
+                witness_writer: WitnessWriterSpec {
+                    kind: WitnessWriterKind::RecordedAot,
+                    readiness: WitnessWriterReadiness::ArenaDestination,
+                },
             },
             kernel: None,
             log_size: LogSizeSource::FromProducer("pedersen_aggregator_window_bits_18"),

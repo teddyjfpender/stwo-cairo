@@ -1,0 +1,238 @@
+{
+  "schema": "stwo.cuda.soundness-gate.v2",
+  "timestamp_utc": "2026-07-10T05:06:57.429009+00:00",
+  "stwo": "/workspace/stwo",
+  "stwo_git_head": "b36f673495cf94628678786191eb49c3bccb1efc",
+  "stwo_git_dirty": true,
+  "stwo_worktree_hash": "491759c4b94518021f7a6dff17925989cd691ac00dad59f8e264c7806f9af25c",
+  "stwo_cairo": "/workspace/stwo-cairo",
+  "stwo_cairo_git_head": "f16a52cb3927f939a5755d10ddd2096b35d46d15",
+  "stwo_cairo_git_dirty": true,
+  "stwo_cairo_worktree_hash": "41e59dae41308bbc8dcc659983f3dabff861300c9821e75a41a7f72811b3bb18",
+  "gates": [
+    {
+      "name": "cuda_link_required",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "cuda_required"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "backend_conformance_both_channels",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "conformance"
+      ],
+      "exit_code": 0,
+      "executed_tests": 2,
+      "required_tests": 2,
+      "passed": true
+    },
+    {
+      "name": "prepared_commit_eager_capture_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_commit_native"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "prepared_fri_eager_capture_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_fri_native"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "prepared_oods_eager_capture_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_oods_native"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "prepared_numerator_eager_capture_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_quotient_numerator_native"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "prepared_quotient_eager_capture_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_quotient_native"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "prepared_composition_ext_params_eager_capture_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_composition_ext_params_native"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "prepared_relation_eager_capture_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_relation_native"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "prepared_witness_eager_capture_cpu_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_witness_native"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "prepared_execution_tables_eager_capture_mutated_content_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_execution_tables_native"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "prepared_fixed_table_eager_capture_mutated_content_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_fixed_table_native"
+      ],
+      "exit_code": 0,
+      "executed_tests": 1,
+      "required_tests": 1,
+      "passed": true
+    },
+    {
+      "name": "prepared_witness_feed_eager_capture_cpu_reference",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "stwo-backend-cuda",
+        "--test",
+        "prepared_witness_feed_native"
+      ],
+      "exit_code": 101,
+      "executed_tests": 0,
+      "required_tests": 1,
+      "passed": false,
+      "output_tail": [
+        "   Compiling stwo-backend-cuda v2.2.0 (/workspace/stwo/crates/backend-cuda)",
+        "error[E0425]: cannot find value `prepared` in this scope",
+        "   --> crates/backend-cuda/tests/prepared_witness_feed_native.rs:247:9",
+        "    |",
+        "247 |         prepared.multiplicity_destinations(),",
+        "    |         ^^^^^^^^ not found in this scope",
+        "",
+        "error[E0308]: mismatched types",
+        "   --> crates/backend-cuda/tests/prepared_witness_feed_native.rs:246:9",
+        "    |",
+        "245 |     let clear = PreparedWitnessFeedClearGraph::prepare(",
+        "    |                 -------------------------------------- arguments to this function are incorrect",
+        "246 |         &arena,",
+        "    |         ^^^^^^ expected `&DeviceArena`, found `&fn(&..., ...) -> ... {arena}`",
+        "    |",
+        "    = note: expected reference `&DeviceArena`",
+        "               found reference `&for<'a, 'b> fn(&'a WitnessFeedWorkspaceRequirements, &'b WitnessFeedWorkspaceSlots) -> DeviceArena {arena}`",
+        "note: associated function defined here",
+        "   --> /workspace/stwo/crates/backend-cuda/src/backend/prepared_witness_feed.rs:655:12",
+        "    |",
+        "655 |     pub fn prepare(",
+        "    |            ^^^^^^^",
+        "",
+        "Some errors have detailed explanations: E0308, E0425.",
+        "For more information about an error, try `rustc --explain E0308`.",
+        "error: could not compile `stwo-backend-cuda` (test \"prepared_witness_feed_native\") due to 2 previous errors"
+      ]
+    }
+  ],
+  "passed": false
+}

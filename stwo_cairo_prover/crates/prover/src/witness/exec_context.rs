@@ -8,9 +8,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use stwo_backend_cuda::BaseFieldVec;
+use stwo_backend_cuda::exec_tables::WitnessLaunchDestinations;
+use stwo_backend_cuda::{BaseFieldVec, CudaLaunchContext};
 
 use super::proof_shape::{
     ComponentId, ProofShape, ProofShapeError, RowResolution, RuntimeComponentShape, TracePartId,
@@ -26,7 +28,8 @@ pub(crate) struct DeviceLookup {
 
 pub(crate) struct DeviceEdge {
     pub buffer: BaseFieldVec,
-    pub host_flat: Vec<u32>,
+    /// Recovery-only D2H mirror. Certified fail-closed edges deliberately omit it.
+    pub host_flat: Option<Vec<u32>>,
     pub n_rows: usize,
     pub plan: PlannedDeviceEdge,
 }
@@ -50,6 +53,98 @@ pub struct PlannedDeviceEdge {
 pub struct WitnessArtifactPlan {
     components: HashSet<&'static str>,
     edges: HashMap<(&'static str, &'static str), PlannedDeviceEdge>,
+}
+
+/// Stable arena destinations for one component trace part. Trace, lookup and
+/// subcomponent buffers are borrowed views: the GraphWorkspace owns their
+/// allocation for the whole proof.
+pub struct ResidentWitnessDestination {
+    pub component: ComponentId,
+    pub part: TracePartId,
+    pub trace: Vec<BaseFieldVec>,
+    pub lookup: BaseFieldVec,
+    pub sub: BaseFieldVec,
+}
+
+/// Device-born witness contract installed before any component writer runs.
+/// Strict mode rejects any component that does not consume one of these exact
+/// destinations; migration mode records the fallback and lets the caller stage
+/// its detached output explicitly.
+pub struct ResidentWitnessPlan {
+    pub strict: bool,
+    pub context: CudaLaunchContext,
+    pub destinations: Vec<ResidentWitnessDestination>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WitnessResidencyReport {
+    pub planned_components: usize,
+    pub direct_components: usize,
+    pub explicit_stream_launches: usize,
+    pub explicit_stream_syncs: usize,
+    pub pending_components: usize,
+    pub host_fallbacks: Vec<(ComponentId, &'static str)>,
+}
+
+struct ResidentWitnessState {
+    strict: bool,
+    context: CudaLaunchContext,
+    planned_components: usize,
+    destinations: Mutex<HashMap<(ComponentId, TracePartId), ResidentWitnessDestination>>,
+    direct_components: AtomicUsize,
+    explicit_stream_launches: AtomicUsize,
+    explicit_stream_syncs: AtomicUsize,
+    host_fallbacks: Mutex<Vec<(ComponentId, &'static str)>>,
+}
+
+impl ResidentWitnessState {
+    fn new(plan: ResidentWitnessPlan) -> Self {
+        let planned_components = plan.destinations.len();
+        let mut destinations = HashMap::with_capacity(planned_components);
+        for destination in plan.destinations {
+            assert!(
+                destination.trace.iter().all(|column| !column.owns_memory)
+                    && !destination.lookup.owns_memory
+                    && !destination.sub.owns_memory,
+                "resident witness destinations must borrow GraphWorkspace memory"
+            );
+            let key = (destination.component, destination.part);
+            assert!(
+                destinations.insert(key, destination).is_none(),
+                "duplicate resident witness destination: {key:?}"
+            );
+        }
+        Self {
+            strict: plan.strict,
+            context: plan.context,
+            planned_components,
+            destinations: Mutex::new(destinations),
+            direct_components: AtomicUsize::new(0),
+            explicit_stream_launches: AtomicUsize::new(0),
+            explicit_stream_syncs: AtomicUsize::new(0),
+            host_fallbacks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn report(&self) -> WitnessResidencyReport {
+        let pending_components = self
+            .destinations
+            .lock()
+            .expect("resident witness destination mutex poisoned")
+            .len();
+        WitnessResidencyReport {
+            planned_components: self.planned_components,
+            direct_components: self.direct_components.load(Ordering::Relaxed),
+            explicit_stream_launches: self.explicit_stream_launches.load(Ordering::Relaxed),
+            explicit_stream_syncs: self.explicit_stream_syncs.load(Ordering::Relaxed),
+            pending_components,
+            host_fallbacks: self
+                .host_fallbacks
+                .lock()
+                .expect("resident witness fallback mutex poisoned")
+                .clone(),
+        }
+    }
 }
 
 impl WitnessArtifactPlan {
@@ -365,6 +460,7 @@ where
 pub struct WitnessExecContext {
     plan: Option<Arc<WitnessArtifactPlan>>,
     final_shape: Option<FinalShapeLedger>,
+    resident_witness: Option<ResidentWitnessState>,
     device_lookups: ProofScopedStash<&'static str, DeviceLookup>,
     edges: ProofScopedStash<(&'static str, &'static str), DeviceEdge>,
 }
@@ -382,6 +478,123 @@ impl WitnessExecContext {
             plan: Some(plan),
             final_shape: Some(FinalShapeLedger::new(shape)),
             ..Self::default()
+        }
+    }
+
+    pub fn planned_with_resident_witness(
+        plan: Arc<WitnessArtifactPlan>,
+        shape: ProofShape,
+        resident_witness: ResidentWitnessPlan,
+    ) -> Self {
+        Self {
+            plan: Some(plan),
+            final_shape: Some(FinalShapeLedger::new(shape)),
+            resident_witness: Some(ResidentWitnessState::new(resident_witness)),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn has_resident_witness_plan(&self) -> bool {
+        self.resident_witness.is_some()
+    }
+
+    /// Consume the exact arena buffers for one device writer. Geometry is
+    /// checked before a kernel sees the pointers. `None` means migration mode
+    /// has no resident plan; strict mode fails closed instead.
+    pub(crate) fn take_resident_witness_destination(
+        &self,
+        component: ComponentId,
+        part: TracePartId,
+        trace_columns: usize,
+        rows: usize,
+        lookup_words: usize,
+        sub_words: usize,
+    ) -> Option<WitnessLaunchDestinations> {
+        let resident = self.resident_witness.as_ref()?;
+        let destination = resident
+            .destinations
+            .lock()
+            .expect("resident witness destination mutex poisoned")
+            .remove(&(component, part));
+        let Some(destination) = destination else {
+            if resident.strict {
+                panic!("strict resident witness has no destination for {component} {part:?}");
+            }
+            return None;
+        };
+        assert_eq!(
+            destination.trace.len(),
+            trace_columns,
+            "resident witness trace width mismatch for {component}"
+        );
+        assert!(
+            destination.trace.iter().all(|column| column.size == rows),
+            "resident witness row geometry mismatch for {component}"
+        );
+        assert!(
+            destination.lookup.size >= lookup_words.max(1),
+            "resident witness lookup destination too small for {component}"
+        );
+        assert!(
+            destination.sub.size >= sub_words.max(1),
+            "resident witness subcomponent destination too small for {component}"
+        );
+        Some(WitnessLaunchDestinations {
+            trace: destination.trace,
+            lookup: destination.lookup,
+            sub: destination.sub,
+            context: resident.context,
+        })
+    }
+
+    pub(crate) fn record_resident_witness_launch(&self) {
+        if let Some(resident) = &self.resident_witness {
+            resident.direct_components.fetch_add(1, Ordering::Relaxed);
+            resident
+                .explicit_stream_launches
+                .fetch_add(1, Ordering::Relaxed);
+            // The current resident launch seam fences once because its input and
+            // pointer tables are still legacy-owned temporaries. Keep this
+            // visible until those inputs move into the arena and the fence can
+            // disappear into graph replay.
+            resident
+                .explicit_stream_syncs
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn host_witness_fallback(&self, component: ComponentId, reason: &'static str) {
+        let Some(resident) = &self.resident_witness else {
+            return;
+        };
+        resident
+            .host_fallbacks
+            .lock()
+            .expect("resident witness fallback mutex poisoned")
+            .push((component, reason));
+        assert!(
+            !resident.strict,
+            "strict resident witness rejected host fallback for {component}: {reason}"
+        );
+    }
+
+    pub fn witness_residency_report(&self) -> WitnessResidencyReport {
+        self.resident_witness
+            .as_ref()
+            .map(ResidentWitnessState::report)
+            .unwrap_or_default()
+    }
+
+    pub fn assert_resident_witness_complete(&self) {
+        let Some(resident) = &self.resident_witness else {
+            return;
+        };
+        let report = resident.report();
+        if resident.strict {
+            assert!(
+                report.pending_components == 0 && report.host_fallbacks.is_empty(),
+                "strict resident witness incomplete: {report:?}"
+            );
         }
     }
 
@@ -507,7 +720,7 @@ impl WitnessExecContext {
         &self,
         plan: PlannedDeviceEdge,
         buffer: BaseFieldVec,
-        host_flat: Vec<u32>,
+        host_flat: Option<Vec<u32>>,
         n_rows: usize,
     ) {
         self.require_edge(plan);
@@ -593,7 +806,7 @@ mod tests {
         let second = WitnessExecContext::planned(test_plan());
 
         first.insert_device_lookup("component", borrowed_empty_buffer(), 16, 8);
-        first.insert_edge(test_edge(), borrowed_empty_buffer(), vec![1, 2], 16);
+        first.insert_edge(test_edge(), borrowed_empty_buffer(), Some(vec![1, 2]), 16);
 
         assert!(first.has_device_lookup("component"));
         assert!(!second.has_device_lookup("component"));
@@ -604,7 +817,7 @@ mod tests {
         assert_eq!((lookup.n_rows, lookup.n_real), (16, 8));
         let edge = first.take_edge("producer", "consumer").unwrap();
         assert_eq!(edge.plan, test_edge());
-        assert_eq!((edge.host_flat, edge.n_rows), (vec![1, 2], 16));
+        assert_eq!((edge.host_flat, edge.n_rows), (Some(vec![1, 2]), 16));
         first.assert_witness_drained();
         first.assert_interaction_drained();
     }
@@ -612,7 +825,7 @@ mod tests {
     #[test]
     fn phase_drains_report_live_artifacts() {
         let context = WitnessExecContext::planned(test_plan());
-        context.insert_edge(test_edge(), borrowed_empty_buffer(), Vec::new(), 16);
+        context.insert_edge(test_edge(), borrowed_empty_buffer(), Some(Vec::new()), 16);
         assert!(std::panic::catch_unwind(|| context.assert_witness_drained()).is_err());
         context.take_edge("producer", "consumer").unwrap();
         context.assert_witness_drained();
@@ -621,6 +834,14 @@ mod tests {
         assert!(std::panic::catch_unwind(|| context.assert_interaction_drained()).is_err());
         context.take_device_lookup("component").unwrap();
         context.assert_interaction_drained();
+    }
+
+    #[test]
+    fn certified_edge_carries_no_recovery_host_mirror() {
+        let context = WitnessExecContext::planned(test_plan());
+        context.insert_edge(test_edge(), borrowed_empty_buffer(), None, 16);
+        let edge = context.take_edge("producer", "consumer").unwrap();
+        assert!(edge.host_flat.is_none());
     }
 
     #[test]
@@ -634,7 +855,7 @@ mod tests {
         let mut drifted = test_edge();
         drifted.word_base += 1;
         assert!(std::panic::catch_unwind(|| {
-            context.insert_edge(drifted, borrowed_empty_buffer(), Vec::new(), 16)
+            context.insert_edge(drifted, borrowed_empty_buffer(), Some(Vec::new()), 16)
         })
         .is_err());
     }
@@ -715,7 +936,7 @@ mod tests {
         )])
         .unwrap();
         let context = WitnessExecContext::planned_with_shape(artifacts, expected);
-        context.insert_edge(edge, borrowed_empty_buffer(), Vec::new(), 16);
+        context.insert_edge(edge, borrowed_empty_buffer(), None, 16);
 
         context.record_final_component(&blake_g::ClaimGenerator::new(), None);
         let sealed = context.seal_final_proof_shape().unwrap();

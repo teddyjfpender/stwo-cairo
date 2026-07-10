@@ -17,15 +17,20 @@ use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId, TraceP
 
 use crate::arena_plan::{
     BufferPurpose, CommitmentColumnSource, CommitmentGeometry, CommitmentTreeId, DecommitStrategy,
-    ProofEpoch, ProtocolGeometry, ProtocolIdentity, TranscriptGeometry,
+    OodsColumnGeometry, OodsGeometry, OpenedColumnSource, ProofEpoch, ProtocolGeometry,
+    ProtocolIdentity, QuotientGeometry, TranscriptGeometry,
 };
+use crate::composition_plan::CompositionPlan;
 use crate::plan::ProofPlan;
+use crate::protocol_discovery::ProtocolTranscriptDiscovery;
 use crate::relation::RelationTracePart;
 use crate::relation_execution::{RelationExecutionError, RelationExecutionPlan};
 use crate::relation_table::CAIRO_RELATION_GRAPH;
 use crate::schedule::TraceColumnCount;
 use crate::schedule_table::CAIRO_COMMITMENT_COMPONENT_ORDER;
-use crate::transcript_plan::CairoBlake2sTranscriptPlan;
+use crate::transcript_plan::{
+    CairoBlake2sTranscriptPlan, CairoTranscriptInput, CairoTranscriptOutput,
+};
 
 /// Stable identity for the ordinary Blake2s channel/proof format used by the
 /// Starknet block benchmark.  It is intentionally not a Rust `TypeId` or hash.
@@ -38,17 +43,25 @@ pub struct ProtocolPlanPolicy {
     /// Hash of the AOT manifest actually loaded by the runtime.  Zero is never
     /// accepted: graph reuse without a bound kernel library is unsafe.
     pub kernel_manifest_hash: u64,
+    pub composition_max_kernel_instrs: usize,
     pub decommit_strategy: DecommitStrategy,
+    /// Maximum persistent canonical LDE storage selected by the hybrid opener.
+    pub retained_lde_budget_bytes: usize,
     pub unretained_bottom_layers: u32,
     pub max_fused_tail_levels: u32,
 }
 
 impl ProtocolPlanPolicy {
-    pub const fn starknet_blake2s(kernel_manifest_hash: u64) -> Self {
+    pub const fn starknet_blake2s(
+        kernel_manifest_hash: u64,
+        composition_max_kernel_instrs: usize,
+    ) -> Self {
         Self {
             channel_tag: BLAKE2S_MERKLE_CHANNEL_TAG,
             kernel_manifest_hash,
-            decommit_strategy: DecommitStrategy::RecomputeQueriedLde,
+            composition_max_kernel_instrs,
+            decommit_strategy: DecommitStrategy::HybridByGroup,
+            retained_lde_budget_bytes: 8 * 1024 * 1024 * 1024,
             unretained_bottom_layers: 4,
             max_fused_tail_levels: 12,
         }
@@ -58,10 +71,20 @@ impl ProtocolPlanPolicy {
     /// and binaries with no generated pack are rejected before CUDA allocation.
     pub fn loaded_starknet_blake2s() -> Result<Self, ProtocolPlanError> {
         let hash = stwo_backend_cuda::aot::loaded_manifest_hash();
+        let composition_max_kernel_instrs = stwo_backend_cuda::aot::loaded_constraint_max_instrs();
         if hash == 0 {
             return Err(ProtocolPlanError::UnboundKernelManifest);
         }
-        Ok(Self::starknet_blake2s(hash))
+        if composition_max_kernel_instrs == 0 {
+            return Err(ProtocolPlanError::UnboundCompositionKernelCap);
+        }
+        let mut policy = Self::starknet_blake2s(hash, composition_max_kernel_instrs);
+        if let Ok(value) = std::env::var("STWO_CUDA_RETAINED_LDE_BUDGET_BYTES") {
+            policy.retained_lde_budget_bytes = value
+                .parse()
+                .map_err(|_| ProtocolPlanError::InvalidRetainedLdeBudget)?;
+        }
+        Ok(policy)
     }
 }
 
@@ -69,6 +92,13 @@ impl ProtocolPlanPolicy {
 pub enum ProtocolPlanError {
     UnboundChannel,
     UnboundKernelManifest,
+    UnboundCompositionKernelCap,
+    InvalidRetainedLdeBudget,
+    UnsupportedRetainAllLde,
+    CompositionKernelCapMismatch {
+        policy: usize,
+        plan: usize,
+    },
     InvalidClaimTreeCount(usize),
     EmptyClaimTree(usize),
     EmptyPreprocessedTrace,
@@ -76,10 +106,19 @@ pub enum ProtocolPlanError {
         lifting: u32,
         required: u32,
     },
+    DynamicTreeLiftingMismatch {
+        tree: CommitmentTreeId,
+        tree_lifting: u32,
+        composition_lifting: u32,
+    },
     InvalidFriGeometry {
         lifting: u32,
         first_fold: u32,
         last_domain: u32,
+    },
+    DiscoveryLiftingMismatch {
+        planned: u32,
+        discovered: u32,
     },
     Fri(PreparedFriError),
     Relation(RelationExecutionError),
@@ -123,6 +162,36 @@ pub enum ProtocolPlanError {
         expected: u32,
         actual: u32,
     },
+    InvalidOodsTreeCount(usize),
+    OodsTreeColumnCountMismatch {
+        tree: usize,
+        expected: usize,
+        actual: usize,
+    },
+    OodsColumnOrderMismatch {
+        flat_column: usize,
+        expected_tree: usize,
+        expected_column: usize,
+        actual_tree: usize,
+        actual_column: usize,
+    },
+    OodsColumnLogMismatch {
+        tree: usize,
+        column: usize,
+        expected: u32,
+        actual: u32,
+    },
+    OodsMaskArityMismatch {
+        tree: usize,
+        column: usize,
+        shape_points: usize,
+        offset_points: usize,
+    },
+    OodsSampleCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    TranscriptAbi,
     SizeOverflow,
 }
 
@@ -138,8 +207,8 @@ impl std::error::Error for ProtocolPlanError {}
 ///
 /// Claim tree order is protocol data: base then interaction.  Composition is
 /// eight M31 coordinate polynomials (two secure halves), and the persistent
-/// preprocessed tree participates in openings without acquiring a per-proof
-/// commit workspace.
+/// preprocessed tree is the first canonical commitment and is materialized once
+/// per exact resident workspace.
 pub fn plan_protocol_geometry(
     proof_plan: &ProofPlan,
     claim: &CairoClaim,
@@ -148,7 +217,15 @@ pub fn plan_protocol_geometry(
     include_all_preprocessed_columns: bool,
     policy: ProtocolPlanPolicy,
     transcript_plan: &CairoBlake2sTranscriptPlan,
+    discovery: &ProtocolTranscriptDiscovery,
+    composition: &CompositionPlan,
 ) -> Result<ProtocolGeometry, ProtocolPlanError> {
+    if composition.max_kernel_instrs != policy.composition_max_kernel_instrs {
+        return Err(ProtocolPlanError::CompositionKernelCapMismatch {
+            policy: policy.composition_max_kernel_instrs,
+            plan: composition.max_kernel_instrs,
+        });
+    }
     let claim_log_sizes = claim.log_sizes();
     plan_protocol_from_logs(
         proof_plan,
@@ -161,6 +238,8 @@ pub fn plan_protocol_geometry(
             schedule_key: transcript_plan.schedule_key(),
             requirements: transcript_plan.schedule().requirements().clone(),
         },
+        discovery,
+        composition.key(),
     )
 }
 
@@ -283,7 +362,7 @@ pub fn trace_commitment_layout(
                 source: CommitmentColumnSource::Trace {
                     component: component_id,
                     part: part.part,
-                    purpose: BufferPurpose::BaseTrace,
+                    purpose: BufferPurpose::BaseCoefficients,
                     ordinal,
                 },
                 log_size,
@@ -328,7 +407,7 @@ pub fn trace_commitment_layout(
                             source: CommitmentColumnSource::Trace {
                                 component: component_id,
                                 part: part.part,
-                                purpose: BufferPurpose::InteractionTrace,
+                                purpose: BufferPurpose::InteractionCoefficients,
                                 ordinal: u32::try_from(coordinate)
                                     .map_err(|_| ProtocolPlanError::SizeOverflow)?,
                             },
@@ -398,6 +477,135 @@ fn canonical_commit_columns(
     (logs, sources)
 }
 
+fn plan_oods_geometry(
+    discovery: &ProtocolTranscriptDiscovery,
+    preprocessed_logs: &[u32],
+    base_columns: &[TraceCommitmentColumn],
+    interaction_columns: &[TraceCommitmentColumn],
+    composition_coefficient_log: u32,
+) -> Result<OodsGeometry, ProtocolPlanError> {
+    let expected = vec![
+        preprocessed_logs
+            .iter()
+            .enumerate()
+            .map(|(ordinal, &log_size)| {
+                Ok((
+                    OpenedColumnSource::Preprocessed {
+                        ordinal: u32::try_from(ordinal)
+                            .map_err(|_| ProtocolPlanError::SizeOverflow)?,
+                    },
+                    log_size,
+                ))
+            })
+            .collect::<Result<Vec<_>, ProtocolPlanError>>()?,
+        base_columns
+            .iter()
+            .map(|column| (column.source.into(), column.log_size))
+            .collect(),
+        interaction_columns
+            .iter()
+            .map(|column| (column.source.into(), column.log_size))
+            .collect(),
+        (0..8)
+            .map(|ordinal| {
+                (
+                    OpenedColumnSource::Composition { ordinal },
+                    composition_coefficient_log,
+                )
+            })
+            .collect(),
+    ];
+    if discovery.oods_topology.tree_column_counts.len() != expected.len() {
+        return Err(ProtocolPlanError::InvalidOodsTreeCount(
+            discovery.oods_topology.tree_column_counts.len(),
+        ));
+    }
+    for (tree, (expected_columns, &actual)) in expected
+        .iter()
+        .zip(&discovery.oods_topology.tree_column_counts)
+        .enumerate()
+    {
+        if expected_columns.len() != actual {
+            return Err(ProtocolPlanError::OodsTreeColumnCountMismatch {
+                tree,
+                expected: expected_columns.len(),
+                actual,
+            });
+        }
+    }
+    let expected_column_count = expected.iter().map(Vec::len).sum::<usize>();
+    if discovery.oods_topology.columns.len() != expected_column_count {
+        return Err(ProtocolPlanError::OodsTreeColumnCountMismatch {
+            tree: expected.len(),
+            expected: expected_column_count,
+            actual: discovery.oods_topology.columns.len(),
+        });
+    }
+
+    let mut flat_column = 0usize;
+    let mut sample_count = 0usize;
+    let mut columns = Vec::with_capacity(expected_column_count);
+    for (tree, expected_columns) in expected.into_iter().enumerate() {
+        for (column, (source, log_size)) in expected_columns.into_iter().enumerate() {
+            let discovered = &discovery.oods_topology.columns[flat_column];
+            if discovered.tree != tree || discovered.column != column {
+                return Err(ProtocolPlanError::OodsColumnOrderMismatch {
+                    flat_column,
+                    expected_tree: tree,
+                    expected_column: column,
+                    actual_tree: discovered.tree,
+                    actual_column: discovered.column,
+                });
+            }
+            if discovered.coefficient_log_size != log_size {
+                return Err(ProtocolPlanError::OodsColumnLogMismatch {
+                    tree,
+                    column,
+                    expected: log_size,
+                    actual: discovered.coefficient_log_size,
+                });
+            }
+            if discovered.shape_points.len() != discovered.offset_points.len() {
+                return Err(ProtocolPlanError::OodsMaskArityMismatch {
+                    tree,
+                    column,
+                    shape_points: discovered.shape_points.len(),
+                    offset_points: discovered.offset_points.len(),
+                });
+            }
+            sample_count = sample_count
+                .checked_add(discovered.shape_points.len())
+                .ok_or(ProtocolPlanError::SizeOverflow)?;
+            columns.push(OodsColumnGeometry {
+                source,
+                coefficient_log_size: log_size,
+                shape_points: discovered.shape_points.clone(),
+                offset_points: discovered.offset_points.clone(),
+            });
+            flat_column += 1;
+        }
+    }
+    if sample_count != discovery.oods_sampled_value_felts {
+        return Err(ProtocolPlanError::OodsSampleCountMismatch {
+            expected: discovery.oods_sampled_value_felts,
+            actual: sample_count,
+        });
+    }
+    Ok(OodsGeometry {
+        mask_log_size: discovery.max_log_degree_bound,
+        sampled_values_input: CairoTranscriptInput::OodsSampledValues
+            .id()
+            .map_err(|_| ProtocolPlanError::TranscriptAbi)?,
+        point_parameter_output: CairoTranscriptOutput::OodsPointParameter
+            .id()
+            .map_err(|_| ProtocolPlanError::TranscriptAbi)?,
+        quotient_random_coefficient_output: CairoTranscriptOutput::QuotientRandomCoefficient
+            .id()
+            .map_err(|_| ProtocolPlanError::TranscriptAbi)?,
+        columns,
+    })
+}
+
 fn plan_protocol_from_logs(
     proof_plan: &ProofPlan,
     claim_log_sizes: &[Vec<u32>],
@@ -406,12 +614,17 @@ fn plan_protocol_from_logs(
     include_all_preprocessed_columns: bool,
     policy: ProtocolPlanPolicy,
     transcript: TranscriptGeometry,
+    discovery: &ProtocolTranscriptDiscovery,
+    composition_plan_hash: u64,
 ) -> Result<ProtocolGeometry, ProtocolPlanError> {
     if policy.channel_tag == 0 {
         return Err(ProtocolPlanError::UnboundChannel);
     }
     if policy.kernel_manifest_hash == 0 {
         return Err(ProtocolPlanError::UnboundKernelManifest);
+    }
+    if policy.composition_max_kernel_instrs == 0 {
+        return Err(ProtocolPlanError::UnboundCompositionKernelCap);
     }
     if claim_log_sizes.len() != 2 {
         return Err(ProtocolPlanError::InvalidClaimTreeCount(
@@ -429,14 +642,16 @@ fn plan_protocol_from_logs(
     }
 
     let blowup = pcs.fri_config.log_blowup_factor;
-    let max_trace_log = claim_log_sizes
+    // STWO samples FRI queries on the split composition tree. With implicit
+    // lifting, that height is derived from the two dynamic trace trees only;
+    // a taller preprocessed tree is opened by remapping those query positions.
+    let max_dynamic_trace_log = claim_log_sizes
         .iter()
         .flatten()
         .copied()
-        .chain(preprocessed_logs.iter().copied())
         .max()
         .ok_or(ProtocolPlanError::EmptyPreprocessedTrace)?;
-    let required_lifting = max_trace_log
+    let required_lifting = max_dynamic_trace_log
         .checked_add(blowup.max(1))
         .ok_or(ProtocolPlanError::SizeOverflow)?;
     let lifting = pcs.lifting_log_size.unwrap_or(required_lifting);
@@ -444,6 +659,12 @@ fn plan_protocol_from_logs(
         return Err(ProtocolPlanError::InvalidLiftingLogSize {
             lifting,
             required: required_lifting,
+        });
+    }
+    if lifting != discovery.lifting_log_size {
+        return Err(ProtocolPlanError::DiscoveryLiftingMismatch {
+            planned: lifting,
+            discovered: discovery.lifting_log_size,
         });
     }
 
@@ -469,6 +690,24 @@ fn plan_protocol_from_logs(
     let preprocessed_lifting = tree_lifting(&preprocessed_logs)?;
     let base_lifting = tree_lifting(&claim_log_sizes[0])?;
     let interaction_lifting = tree_lifting(&claim_log_sizes[1])?;
+    for (tree, tree_lifting) in [
+        (CommitmentTreeId::Base, base_lifting),
+        (CommitmentTreeId::Interaction, interaction_lifting),
+    ] {
+        if tree_lifting != lifting {
+            return Err(ProtocolPlanError::DynamicTreeLiftingMismatch {
+                tree,
+                tree_lifting,
+                composition_lifting: lifting,
+            });
+        }
+    }
+    if include_all_preprocessed_columns && preprocessed_lifting > lifting {
+        return Err(ProtocolPlanError::InvalidLiftingLogSize {
+            lifting,
+            required: preprocessed_lifting,
+        });
+    }
     let composition_coefficient_log = lifting
         .checked_sub(blowup)
         .ok_or(ProtocolPlanError::SizeOverflow)?;
@@ -482,8 +721,31 @@ fn plan_protocol_from_logs(
         &interaction_columns,
         &claim_log_sizes[1],
     )?;
+    let oods = plan_oods_geometry(
+        discovery,
+        &preprocessed_logs,
+        &base_columns,
+        &interaction_columns,
+        composition_coefficient_log,
+    )?;
     let (base_logs, base_sources) = canonical_commit_columns(base_columns);
     let (interaction_logs, interaction_sources) = canonical_commit_columns(interaction_columns);
+    let (grouped_preprocessed_logs, preprocessed_sources) = canonical_commit_columns(
+        preprocessed_logs
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(ordinal, log_size)| {
+                Ok(TraceCommitmentColumn {
+                    source: CommitmentColumnSource::Preprocessed {
+                        ordinal: u32::try_from(ordinal)
+                            .map_err(|_| ProtocolPlanError::SizeOverflow)?,
+                    },
+                    log_size,
+                })
+            })
+            .collect::<Result<Vec<_>, ProtocolPlanError>>()?,
+    );
     let composition_sources = (0..8)
         .map(|ordinal| CommitmentColumnSource::Composition { ordinal })
         .collect();
@@ -494,13 +756,22 @@ fn plan_protocol_from_logs(
         unretained_bottom_layers: policy.unretained_bottom_layers,
         max_fused_tail_levels: policy.max_fused_tail_levels,
     };
-    let commitments = vec![
+    let mut commitments = vec![
+        CommitmentGeometry {
+            id: CommitmentTreeId::Preprocessed,
+            created: ProofEpoch::Ingest,
+            config: commit_config(preprocessed_lifting),
+            grouped_column_log_sizes: grouped_preprocessed_logs,
+            grouped_column_sources: preprocessed_sources,
+            retained_evaluation_groups: Vec::new(),
+        },
         CommitmentGeometry {
             id: CommitmentTreeId::Base,
             created: ProofEpoch::BaseCommit,
             config: commit_config(base_lifting),
             grouped_column_log_sizes: base_logs,
             grouped_column_sources: base_sources,
+            retained_evaluation_groups: Vec::new(),
         },
         CommitmentGeometry {
             id: CommitmentTreeId::Interaction,
@@ -508,6 +779,7 @@ fn plan_protocol_from_logs(
             config: commit_config(interaction_lifting),
             grouped_column_log_sizes: interaction_logs,
             grouped_column_sources: interaction_sources,
+            retained_evaluation_groups: Vec::new(),
         },
         CommitmentGeometry {
             id: CommitmentTreeId::Composition,
@@ -515,8 +787,14 @@ fn plan_protocol_from_logs(
             config: commit_config(lifting),
             grouped_column_log_sizes: vec![vec![composition_coefficient_log; 8]],
             grouped_column_sources: vec![composition_sources],
+            retained_evaluation_groups: Vec::new(),
         },
     ];
+    select_retained_evaluation_groups(
+        &mut commitments,
+        policy.decommit_strategy,
+        policy.retained_lde_budget_bytes,
+    )?;
 
     let fri_layer_log_sizes = fri_merkle_log_sizes(lifting, pcs.fri_config)?;
     let opened_tree_log_sizes = vec![
@@ -546,19 +824,105 @@ fn plan_protocol_from_logs(
             policy.channel_tag,
             proof_plan.relation_graph_hash,
             preprocessed_binding_hash,
+            oods.topology_hash(),
+            composition_plan_hash,
             policy.kernel_manifest_hash,
             policy.decommit_strategy,
         ),
-        max_domain_log_size: lifting,
+        preprocessed_column_ids: preprocessed_trace
+            .ids()
+            .into_iter()
+            .map(|identity| identity.id)
+            .collect(),
+        max_domain_log_size: preprocessed_lifting.max(lifting),
         lifting_log_size: lifting,
         n_queries: pcs.fri_config.n_queries,
         total_opened_columns,
         proof_capacity_words,
         transcript,
+        composition_random_coefficient_output: CairoTranscriptOutput::CompositionRandomCoefficient
+            .id()
+            .map_err(|_| ProtocolPlanError::TranscriptAbi)?,
+        oods,
+        quotient: QuotientGeometry {
+            partial_numerator_log_sizes: discovery.partial_numerator_log_sizes.clone(),
+        },
         commitments,
         opened_tree_log_sizes,
         fri_layer_log_sizes,
     })
+}
+
+fn select_retained_evaluation_groups(
+    commitments: &mut [CommitmentGeometry],
+    strategy: DecommitStrategy,
+    budget_bytes: usize,
+) -> Result<(), ProtocolPlanError> {
+    for commitment in commitments.iter_mut() {
+        commitment.retained_evaluation_groups =
+            vec![false; commitment.grouped_column_log_sizes.len()];
+    }
+    match strategy {
+        DecommitStrategy::RecomputeQueriedLde => return Ok(()),
+        DecommitStrategy::RetainAllLde => return Err(ProtocolPlanError::UnsupportedRetainAllLde),
+        DecommitStrategy::HybridByGroup => {}
+    }
+
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        commitment: usize,
+        group: usize,
+        words: usize,
+        weighted_log: u128,
+    }
+
+    let mut candidates = Vec::new();
+    // The fixed preprocessed commitment has its own process-persistent cache.
+    // Hybrid per-proof storage is reserved for the three dynamic trees.
+    for (commitment_index, commitment) in commitments.iter().enumerate().skip(1) {
+        for (group_index, logs) in commitment.grouped_column_log_sizes.iter().enumerate() {
+            let mut words = 0usize;
+            let mut weighted_log = 0u128;
+            for &log_size in logs {
+                let evaluation_log = log_size
+                    .checked_add(commitment.config.log_blowup_factor)
+                    .ok_or(ProtocolPlanError::SizeOverflow)?;
+                let column_words = 1usize
+                    .checked_shl(evaluation_log)
+                    .ok_or(ProtocolPlanError::SizeOverflow)?;
+                words = words
+                    .checked_add(column_words)
+                    .ok_or(ProtocolPlanError::SizeOverflow)?;
+                weighted_log = weighted_log
+                    .checked_add((column_words as u128) * u128::from(evaluation_log))
+                    .ok_or(ProtocolPlanError::SizeOverflow)?;
+            }
+            candidates.push(Candidate {
+                commitment: commitment_index,
+                group: group_index,
+                words,
+                weighted_log,
+            });
+        }
+    }
+    // Saved FFT work per retained word is approximately log(domain). Stable
+    // ties prefer the smaller group, then proof order, to use the full budget.
+    candidates.sort_by(|left, right| {
+        (right.weighted_log * left.words as u128)
+            .cmp(&(left.weighted_log * right.words as u128))
+            .then_with(|| left.words.cmp(&right.words))
+            .then_with(|| left.commitment.cmp(&right.commitment))
+            .then_with(|| left.group.cmp(&right.group))
+    });
+
+    let mut remaining_words = budget_bytes / core::mem::size_of::<u32>();
+    for candidate in candidates {
+        if candidate.words <= remaining_words {
+            commitments[candidate.commitment].retained_evaluation_groups[candidate.group] = true;
+            remaining_words -= candidate.words;
+        }
+    }
+    Ok(())
 }
 
 /// Stable ascending leaf order, split into full 16-column Blake2s blocks and
@@ -692,6 +1056,7 @@ mod tests {
 
     use super::*;
     use crate::plan::ProofPlan;
+    use crate::protocol_discovery::{DiscoveredOodsColumn, DiscoveredOodsTopology};
     use crate::relation_table::CAIRO_RELATION_GRAPH;
     use crate::schedule_table::CAIRO_SCHEDULE;
 
@@ -701,6 +1066,51 @@ mod tests {
             fri_config: FriConfig::new(0, 1, 70, fold_step),
             lifting_log_size: None,
         }
+    }
+
+    #[test]
+    fn hybrid_opening_budget_prefers_highest_fft_work_per_word() {
+        let config = CommitWorkspaceConfig {
+            log_blowup_factor: 1,
+            lifting_log_size: 21,
+            unretained_bottom_layers: 4,
+            max_fused_tail_levels: 12,
+        };
+        let mut commitments = vec![
+            CommitmentGeometry {
+                id: CommitmentTreeId::Preprocessed,
+                created: ProofEpoch::Ingest,
+                config,
+                grouped_column_log_sizes: vec![vec![20]],
+                grouped_column_sources: vec![Vec::new()],
+                retained_evaluation_groups: Vec::new(),
+            },
+            CommitmentGeometry {
+                id: CommitmentTreeId::Base,
+                created: ProofEpoch::BaseCommit,
+                config,
+                grouped_column_log_sizes: vec![vec![10], vec![12]],
+                grouped_column_sources: vec![Vec::new(), Vec::new()],
+                retained_evaluation_groups: Vec::new(),
+            },
+            CommitmentGeometry {
+                id: CommitmentTreeId::Interaction,
+                created: ProofEpoch::InteractionCommit,
+                config,
+                grouped_column_log_sizes: vec![vec![11]],
+                grouped_column_sources: vec![Vec::new()],
+                retained_evaluation_groups: Vec::new(),
+            },
+        ];
+        select_retained_evaluation_groups(
+            &mut commitments,
+            DecommitStrategy::HybridByGroup,
+            (1usize << 13) * core::mem::size_of::<u32>(),
+        )
+        .unwrap();
+        assert_eq!(commitments[0].retained_evaluation_groups, [false]);
+        assert_eq!(commitments[1].retained_evaluation_groups, [false, true]);
+        assert_eq!(commitments[2].retained_evaluation_groups, [false]);
     }
 
     fn memory_plan() -> ProofPlan {
@@ -752,6 +1162,58 @@ mod tests {
         }
     }
 
+    fn discovery_for(
+        claim_logs: &[Vec<u32>],
+        preprocessed: &PreProcessedTrace,
+        pcs: &PcsConfig,
+    ) -> ProtocolTranscriptDiscovery {
+        let blowup = pcs.fri_config.log_blowup_factor;
+        let required = claim_logs.iter().flatten().copied().max().unwrap() + blowup.max(1);
+        let lifting_log_size = pcs.lifting_log_size.unwrap_or(required);
+        let max_log_degree_bound = lifting_log_size - blowup;
+        let logs_by_tree = vec![
+            preprocessed.log_sizes(),
+            claim_logs[0].clone(),
+            claim_logs[1].clone(),
+            vec![max_log_degree_bound; 8],
+        ];
+        let tree_column_counts = logs_by_tree.iter().map(Vec::len).collect::<Vec<_>>();
+        let mut columns = Vec::new();
+        for (tree, logs) in logs_by_tree.into_iter().enumerate() {
+            for (column, coefficient_log_size) in logs.into_iter().enumerate() {
+                let sampled = tree == 0 && column == 0;
+                columns.push(DiscoveredOodsColumn {
+                    tree,
+                    column,
+                    coefficient_log_size,
+                    shape_points: sampled
+                        .then_some(stwo::core::circle::SECURE_FIELD_CIRCLE_GEN)
+                        .into_iter()
+                        .collect(),
+                    offset_points: sampled
+                        .then_some(stwo::core::circle::CirclePoint {
+                            x: stwo::core::fields::m31::BaseField::from(1),
+                            y: stwo::core::fields::m31::BaseField::from(0),
+                        })
+                        .into_iter()
+                        .collect(),
+                });
+            }
+        }
+        ProtocolTranscriptDiscovery {
+            interaction_claim_felts: 1,
+            oods_sampled_value_felts: 1,
+            sampled_value_felts_by_tree: vec![1, 0, 0, 0],
+            partial_numerator_log_sizes: vec![preprocessed.log_sizes()[0]],
+            oods_topology: DiscoveredOodsTopology {
+                tree_column_counts,
+                columns,
+            },
+            lifting_log_size,
+            max_log_degree_bound,
+        }
+    }
+
     #[test]
     fn canonical_groups_are_full_blocks_plus_one_tail() {
         let logs: Vec<_> = (0..35).rev().map(|index| 4 + index % 7).collect();
@@ -759,6 +1221,40 @@ mod tests {
         assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), [16, 16, 3]);
         let flattened: Vec<_> = groups.into_iter().flatten().collect();
         assert!(flattened.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn canonical_commit_sort_preserves_source_order_within_each_log() {
+        let source = |ordinal| CommitmentColumnSource::Trace {
+            component: "test",
+            part: TracePartId::Main,
+            purpose: BufferPurpose::BaseCoefficients,
+            ordinal,
+        };
+        let columns = vec![
+            TraceCommitmentColumn {
+                source: source(2),
+                log_size: 6,
+            },
+            TraceCommitmentColumn {
+                source: source(9),
+                log_size: 5,
+            },
+            TraceCommitmentColumn {
+                source: source(0),
+                log_size: 6,
+            },
+            TraceCommitmentColumn {
+                source: source(1),
+                log_size: 6,
+            },
+        ];
+        let (logs, sources) = canonical_commit_columns(columns);
+        assert_eq!(logs.into_iter().flatten().collect::<Vec<_>>(), [5, 6, 6, 6]);
+        assert_eq!(
+            sources.into_iter().flatten().collect::<Vec<_>>(),
+            [source(9), source(2), source(0), source(1)]
+        );
     }
 
     #[test]
@@ -781,22 +1277,116 @@ mod tests {
     fn exact_claim_logs_produce_all_four_opening_trees() {
         let plan = memory_plan();
         let TraceCommitmentLayout { base, interaction } = trace_commitment_layout(&plan).unwrap();
+        assert!(base.iter().all(|column| matches!(
+            column.source,
+            CommitmentColumnSource::Trace {
+                purpose: BufferPurpose::BaseCoefficients,
+                ..
+            }
+        )));
+        assert!(interaction.iter().all(|column| matches!(
+            column.source,
+            CommitmentColumnSource::Trace {
+                purpose: BufferPurpose::InteractionCoefficients,
+                ..
+            }
+        )));
         let claim_logs = vec![
             base.iter().map(|column| column.log_size).collect(),
             interaction.iter().map(|column| column.log_size).collect(),
         ];
         let preprocessed = PreProcessedTrace::canonical();
+        let discovery = discovery_for(&claim_logs, &preprocessed, &pcs(3));
         let geometry = plan_protocol_from_logs(
             &plan,
             &claim_logs,
             &preprocessed,
             &pcs(3),
             false,
-            ProtocolPlanPolicy::starknet_blake2s(0x1234),
+            ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048),
             transcript_geometry(),
+            &discovery,
+            0x5678,
         )
         .unwrap();
-        assert_eq!(geometry.commitments.len(), 3);
+        let blowup = pcs(3).fri_config.log_blowup_factor;
+        let preprocessed_height = preprocessed.log_sizes().into_iter().max().unwrap() + blowup;
+        let base_height = claim_logs[0].iter().copied().max().unwrap() + blowup;
+        let interaction_height = claim_logs[1].iter().copied().max().unwrap() + blowup;
+        assert_eq!(base_height, interaction_height);
+        assert!(
+            preprocessed_height > base_height,
+            "regression fixture must exercise a taller preprocessed tree"
+        );
+        assert_eq!(geometry.lifting_log_size, base_height);
+        assert_eq!(geometry.max_domain_log_size, preprocessed_height);
+        assert_eq!(
+            geometry.opened_tree_log_sizes,
+            [
+                preprocessed_height,
+                base_height,
+                interaction_height,
+                base_height,
+            ]
+        );
+        assert!(
+            geometry.decommit_workspace_config().is_ok(),
+            "preprocessed height may exceed the dynamic FRI query height"
+        );
+        assert_eq!(
+            plan_protocol_from_logs(
+                &plan,
+                &claim_logs,
+                &preprocessed,
+                &pcs(3),
+                true,
+                ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048),
+                transcript_geometry(),
+                &discovery,
+                0x5678,
+            ),
+            Err(ProtocolPlanError::InvalidLiftingLogSize {
+                lifting: base_height,
+                required: preprocessed_height,
+            }),
+            "including every fixed column must preserve STWO's explicit lifting check"
+        );
+        assert_eq!(geometry.commitments.len(), 4);
+        assert_eq!(
+            geometry
+                .commitments
+                .iter()
+                .map(|commitment| commitment.id)
+                .collect::<Vec<_>>(),
+            [
+                CommitmentTreeId::Preprocessed,
+                CommitmentTreeId::Base,
+                CommitmentTreeId::Interaction,
+                CommitmentTreeId::Composition,
+            ]
+        );
+        let committed_preprocessed = &geometry.commitments[0];
+        assert_eq!(committed_preprocessed.created, ProofEpoch::Ingest);
+        let mut expected_preprocessed = preprocessed
+            .log_sizes()
+            .into_iter()
+            .enumerate()
+            .collect::<Vec<_>>();
+        expected_preprocessed.sort_by_key(|(_, log_size)| *log_size);
+        assert_eq!(
+            committed_preprocessed
+                .grouped_column_sources
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            expected_preprocessed
+                .into_iter()
+                .map(|(ordinal, _)| CommitmentColumnSource::Preprocessed {
+                    ordinal: ordinal as u32,
+                })
+                .collect::<Vec<_>>()
+        );
         assert_eq!(geometry.opened_tree_log_sizes.len(), 4);
         assert_eq!(
             geometry.total_opened_columns,
@@ -812,6 +1402,51 @@ mod tests {
             plan.relation_graph_hash
         );
         assert_ne!(geometry.identity.preprocessed_binding_hash, 0);
+        assert_eq!(
+            geometry.identity.oods_topology_hash,
+            geometry.oods.topology_hash()
+        );
+        let preprocessed_count = preprocessed.log_sizes().len();
+        let opened_base =
+            &geometry.oods.columns[preprocessed_count..preprocessed_count + base.len()];
+        assert_eq!(
+            opened_base
+                .iter()
+                .map(|column| column.source)
+                .collect::<Vec<_>>(),
+            base.iter()
+                .map(|column| OpenedColumnSource::from(column.source))
+                .collect::<Vec<_>>(),
+            "OODS must retain base claim order"
+        );
+        let committed_base = geometry
+            .commitments
+            .iter()
+            .find(|commitment| commitment.id == CommitmentTreeId::Base)
+            .unwrap()
+            .grouped_column_sources
+            .iter()
+            .flatten()
+            .copied()
+            .map(OpenedColumnSource::from)
+            .collect::<Vec<_>>();
+        assert_ne!(
+            opened_base
+                .iter()
+                .map(|column| column.source)
+                .collect::<Vec<_>>(),
+            committed_base,
+            "opening order must remain distinct from log-sorted commit leaf order"
+        );
+        let mut changed_topology = geometry.clone();
+        let sampled = changed_topology
+            .oods
+            .columns
+            .iter_mut()
+            .find(|column| !column.shape_points.is_empty())
+            .unwrap();
+        sampled.shape_points[0] = sampled.shape_points[0].conjugate();
+        assert_ne!(geometry.key(), changed_topology.key());
     }
 
     #[test]
@@ -825,15 +1460,19 @@ mod tests {
         let shape = CairoClaimGenerator::default().proof_shape(None).unwrap();
         let plan =
             ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
+        let claim_logs = [vec![18], vec![18]];
+        let discovery = discovery_for(&claim_logs, &trace, &config);
         assert_eq!(
             plan_protocol_from_logs(
                 &plan,
-                &[vec![18], vec![18]],
+                &claim_logs,
                 &trace,
                 &config,
                 false,
-                ProtocolPlanPolicy::starknet_blake2s(0),
+                ProtocolPlanPolicy::starknet_blake2s(0, 2048),
                 transcript_geometry(),
+                &discovery,
+                0x5678,
             ),
             Err(ProtocolPlanError::UnboundKernelManifest)
         );

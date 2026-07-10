@@ -10282,6 +10282,76 @@ pub struct InteractionClaimGenerator {
     log_size: u32,
     lookup_data: LookupData,
 }
+
+impl InteractionClaimGenerator {
+    /// Exact word-major lookup layout consumed by the resident relation graph.
+    /// This is intentionally a consuming differential hook: the live prover
+    /// either exports the device source or writes the host interaction trace,
+    /// while native CUDA gates use this method as the generated-writer oracle.
+    #[doc(hidden)]
+    pub fn into_flat_lookup_words(self) -> Vec<u32> {
+        use crate::witness::relation_sources::PackedRelationField;
+
+        let mut words = Vec::with_capacity((1usize << self.log_size) * 488);
+        self.lookup_data
+            .memory_address_to_id_0
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_id_to_big_1
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_address_to_id_2
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_id_to_big_3
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_address_to_id_4
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_id_to_big_5
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_address_to_id_6
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_id_to_big_7
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_address_to_id_8
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_id_to_big_9
+            .append_word_major(&mut words);
+        self.lookup_data
+            .range_check_8_10
+            .append_word_major(&mut words);
+        self.lookup_data
+            .range_check_8_11
+            .append_word_major(&mut words);
+        self.lookup_data
+            .partial_ec_mul_generic_12
+            .append_word_major(&mut words);
+        self.lookup_data
+            .partial_ec_mul_generic_13
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_address_to_id_14
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_id_to_big_15
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_address_to_id_16
+            .append_word_major(&mut words);
+        self.lookup_data
+            .memory_id_to_big_17
+            .append_word_major(&mut words);
+        self.lookup_data.mults_0.append_word_major(&mut words);
+        debug_assert_eq!(words.len(), (1usize << self.log_size) * 488);
+        words
+    }
+}
 // === BEGIN relation_lookup_source_codegen ===
 crate::relation_lookup_source! {
     memory_address_to_id_0: 3,

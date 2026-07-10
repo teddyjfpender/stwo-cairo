@@ -16,25 +16,52 @@
 //! M4 (commit fusion), M5 (graphs + device channel), M6 (pipelining).
 
 pub mod arena_plan;
+pub mod composition_plan;
+pub mod fixed_table;
+pub mod fixed_table_materializer;
+pub mod fixed_table_table;
 pub mod flags;
 pub mod graphs;
+pub mod multiplicity_pipeline;
 pub mod phases;
 pub mod plan;
+pub mod prepared_composition;
+pub mod proof_bundle;
 pub mod protocol_discovery;
 pub mod protocol_plan;
 pub mod prover;
+pub mod recorded_witness_inputs;
 pub mod relation;
 pub mod relation_execution;
 pub mod relation_table;
+mod resident_composition;
+mod resident_oods;
 pub mod resident_runtime;
+pub mod resident_session;
 pub mod resident_sources;
+pub mod resident_witness;
 pub mod schedule;
 pub mod schedule_table;
 pub mod state;
 pub mod transcript_plan;
 pub mod workspace_cache;
 
-pub use prover::{CairoBackend, GpuCairoProver, GpuProverConfig};
+pub use prepared_composition::{
+    composition_workspace_requirements, CompositionArenaSlotRequirement,
+    CompositionCoefficientSource, CompositionDeviceInputs, CompositionExtParamBinding,
+    CompositionTraceTopology, CompositionWorkspaceRequirements, CompositionWorkspaceSlots,
+    PreparedCompositionError, PreparedCompositionGraph, COMPOSITION_POINTER_ALIGNMENT_WORDS,
+};
+pub use prover::{
+    CairoBackend, GpuCairoProver, GpuProverConfig, MirroredResidentBlake2sProof,
+    ResidentTranscriptMirrorTelemetry,
+};
+pub use resident_composition::ResidentCompositionError;
+pub use resident_oods::ResidentOodsError;
+pub use resident_session::{
+    ResidentExecutionReadiness, ResidentPreparationState, ResidentSessionError,
+    ResidentSessionTelemetry,
+};
 pub use stwo_backend_cuda::{CudaPcsDriverTelemetry, CudaPcsRuntimeMode};
 pub use workspace_cache::{
     WorkspaceCache, WorkspaceCacheError, WorkspaceCacheTelemetry, WorkspaceKey,

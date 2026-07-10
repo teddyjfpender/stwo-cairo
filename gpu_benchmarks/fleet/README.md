@@ -83,7 +83,7 @@ dropped) — and does **not** modify `bench_loop.sh`.
 | `FLEET_CONF` / `FLEET_ONLY`                | (—)     | Roster path / single pod id (overridden by `--conf` / `--only`). |
 | `FLEET_REPS` / `FLEET_DEPTH` / `FLEET_PRODUCERS` | `8`/`3`/`4` | Rotate stream knobs. |
 | `BENCH_ENV`                                | (empty) | `"K=V K=V ..."` exported into every `gpu_bench` invocation (gate + benchmark) on every pod, and recorded in the report. Debug bisects (`STWO_CUDA_DISABLE_STREAMS=1`, ...). No spaces in values. |
-| `GPU_PCS_RUNTIME_MODE`                     | `detached-eager` | Required typed CUDA PCS runtime mode. `arena-graph` is a strict future gate and currently rejects detached telemetry; it does not claim ArenaGraph is ready. |
+| `GPU_PCS_RUNTIME_MODE`                     | `arena-graph` | Required typed CUDA PCS runtime mode. `detached-eager` remains migration diagnostics only. |
 | `POD_BOOTLOADER_JSON`                      | `/workspace/bench_inputs/simple_bootloader_compiled.json` | Stable remote bootloader path, manifest-pinned and SHA-256 preflighted on every participating pod, then exported for every launch. |
 | `DRY_RUN=1`                                | `0`     | Echo every ssh instead of executing; fabricate per-pod output so the whole roster→launch→poll→aggregate→report path runs offline. |
 | `FAKE_STALL`                               | (unset) | (DRY_RUN only) pod id to simulate as stalled — exercises the stall→drop path. |

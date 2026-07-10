@@ -551,6 +551,49 @@ fn add_opcode_records_without_poison() {
     );
 }
 
+/// The new source lane's permanent soundness fence: the mechanically genericized
+/// Blake-compress writer must reproduce the original AIR-generated SIMD writer
+/// byte-for-byte across trace, lookup and all 324 sub-input words on the real
+/// opcode fixture. This also validates the recorder-side expanded Blake-round
+/// deduction against `ClaimGenerator::deduce_output` on real memory.
+#[test]
+fn blake_compress_opcode_generic_simd_is_byte_identical() {
+    use crate::witness::components::blake_compress_opcode;
+
+    let cg = fill_fixture(&[
+        "blake_compress_opcode",
+        "memory_address_to_id",
+        "memory_id_to_big",
+        "verify_instruction",
+        "range_check_7_2_5",
+        "verify_bitwise_xor_8",
+        "blake_round",
+        "triple_xor_32",
+    ]);
+    let mut inputs = cg
+        .blake_compress_opcode
+        .as_ref()
+        .expect("blake compress fixture")
+        .inputs
+        .clone();
+    let n_rows = inputs.len();
+    assert!(n_rows > 0, "fixture must exercise blake_compress_opcode");
+    let size = std::cmp::max(n_rows.next_power_of_two(), N_LANES);
+    inputs.resize(size, inputs[0]);
+    let packed = pack_values(&inputs);
+    assert_generic_diff_byte_identical!(blake_compress_opcode::generic_simd_diff(
+        packed,
+        n_rows,
+        cg.memory_address_to_id.as_ref().unwrap(),
+        cg.memory_id_to_big.as_ref().unwrap(),
+        cg.verify_instruction.as_ref().unwrap(),
+        cg.range_check_7_2_5.as_ref().unwrap(),
+        cg.verify_bitwise_xor_8.as_ref().unwrap(),
+        cg.blake_round.as_ref().unwrap(),
+        cg.triple_xor_32.as_ref().unwrap(),
+    ));
+}
+
 /// Parameterized prove-accessor parity gate (see `add_opcode_prove_accessors_match_
 /// host` for the full rationale): interpret every PADDED row with real enabler
 /// semantics -> word-major flats (the launch's D2H format) -> the module's
@@ -1318,11 +1361,17 @@ struct FastDeductionHost;
 impl stwo_backend_cuda::jit_witness::interp::DeduceHost for FastDeductionHost {
     fn deduce(&mut self, kind: u32, args: &[u32]) -> Vec<u32> {
         use stwo_cairo_common::prover_types::cpu::UInt32;
-        use stwo_cairo_common::prover_types::simd::{PackedFelt252, PackedUInt32};
+        use stwo_cairo_common::prover_types::simd::{
+            PackedFelt252, PackedFelt252Width27, PackedUInt32,
+        };
 
         use crate::witness::fast_deduction::blake::{PackedBlakeG, PackedBlakeRoundSigma};
         use crate::witness::fast_deduction::pedersen::{
             PackedPartialEcMulWindowBits18, PackedPedersenPointsTableWindowBits18,
+        };
+        use crate::witness::fast_deduction::poseidon::{
+            PackedCube252, PackedPoseidon3PartialRoundsChain, PackedPoseidonFullRoundChain,
+            PackedPoseidonRoundKeys,
         };
         let m31 = |v: u32| PackedM31::broadcast(M31(v));
         let felt =
@@ -1380,6 +1429,52 @@ impl stwo_backend_cuda::jit_witness::interp::DeduceHost for FastDeductionHost {
                     _ => a / b,
                 };
                 (0..28).map(|i| r.get_m31(i).0).collect()
+            }
+            8 => PackedPoseidonRoundKeys::deduce_output([m31(args[0])])
+                .iter()
+                .flat_map(|felt| (0..10).map(|word| felt.get_m31(word).to_array()[0].0))
+                .collect(),
+            9 => {
+                let input =
+                    PackedFelt252Width27::from_limbs(std::array::from_fn(|word| m31(args[word])));
+                let output = PackedCube252::deduce_output(input);
+                (0..10)
+                    .map(|word| output.get_m31(word).to_array()[0].0)
+                    .collect()
+            }
+            10 => {
+                let state = std::array::from_fn(|felt| {
+                    PackedFelt252Width27::from_limbs(std::array::from_fn(|word| {
+                        m31(args[2 + felt * 10 + word])
+                    }))
+                });
+                let (chain, round, state) = PackedPoseidonFullRoundChain::deduce_output((
+                    m31(args[0]),
+                    m31(args[1]),
+                    state,
+                ));
+                let mut output = vec![chain.to_array()[0].0, round.to_array()[0].0];
+                for felt in &state {
+                    output.extend((0..10).map(|word| felt.get_m31(word).to_array()[0].0));
+                }
+                output
+            }
+            11 => {
+                let state = std::array::from_fn(|felt| {
+                    PackedFelt252Width27::from_limbs(std::array::from_fn(|word| {
+                        m31(args[2 + felt * 10 + word])
+                    }))
+                });
+                let (chain, round, state) = PackedPoseidon3PartialRoundsChain::deduce_output((
+                    m31(args[0]),
+                    m31(args[1]),
+                    state,
+                ));
+                let mut output = vec![chain.to_array()[0].0, round.to_array()[0].0];
+                for felt in &state {
+                    output.extend((0..10).map(|word| felt.get_m31(word).to_array()[0].0));
+                }
+                output
             }
             k => panic!("unexpected deduce kind {k}"),
         }
@@ -1911,7 +2006,7 @@ fn builtin_lane_recording_shapes_match_specs() {
     let blake_field_words: usize = br::JIT_LOOKUP_FIELDS.iter().map(|f| f.1).sum();
     assert_eq!(blake_field_words as u32, b.program.n_lookup_words);
 
-    // PROVE-LANE LAUNCHABILITY, all five builtin lanes: the launch path declines
+    // PROVE-LANE LAUNCHABILITY for every fp256/Poseidon builtin lane: the launch path declines
     // (silent `None` → "launch unavailable" on pod) any program with mult tables
     // (counts flow through the SEPARATE feed kernel, never through MultPush) or
     // any program codegen can't lower. Both are properties of the RECORDING —
@@ -1919,10 +2014,13 @@ fn builtin_lane_recording_shapes_match_specs() {
     // laptop catches them before a pod ever spins up.
     use crate::witness::components::{
         cube_252 as cb, partial_ec_mul_generic as pg, partial_ec_mul_window_bits_18 as pw,
+        poseidon_3_partial_rounds_chain as p3, poseidon_aggregator as pa, poseidon_builtin as pb,
+        poseidon_full_round_chain as pf,
     };
     use crate::witness::jit_prove_backend::{
         BlakeRoundLane, BuiltinLaneSpec, Cube252Lane, PartialEcMulGenericLane, PartialEcMulW18Lane,
-        PedersenAggregatorW18Lane,
+        PedersenAggregatorW18Lane, Poseidon3PartialRoundsChainLane, PoseidonAggregatorLane,
+        PoseidonBuiltinLane, PoseidonFullRoundChainLane,
     };
     for (label, prog, needs_table) in [
         (
@@ -1950,6 +2048,26 @@ fn builtin_lane_recording_shapes_match_specs() {
             &cb::record_cube_252().program,
             Cube252Lane::NEEDS_PEDERSEN_TABLE,
         ),
+        (
+            "poseidon_builtin",
+            &pb::record_poseidon_builtin().program,
+            PoseidonBuiltinLane::NEEDS_PEDERSEN_TABLE,
+        ),
+        (
+            "poseidon_aggregator",
+            &pa::record_poseidon_aggregator().program,
+            PoseidonAggregatorLane::NEEDS_PEDERSEN_TABLE,
+        ),
+        (
+            "poseidon_full_round_chain",
+            &pf::record_poseidon_full_round_chain().program,
+            PoseidonFullRoundChainLane::NEEDS_PEDERSEN_TABLE,
+        ),
+        (
+            "poseidon_3_partial_rounds_chain",
+            &p3::record_poseidon_3_partial_rounds_chain().program,
+            Poseidon3PartialRoundsChainLane::NEEDS_PEDERSEN_TABLE,
+        ),
     ] {
         assert_eq!(
             prog.n_mult_tables, 0,
@@ -1960,21 +2078,22 @@ fn builtin_lane_recording_shapes_match_specs() {
             stwo_backend_cuda::jit_witness::codegen::compile_witness_to_cuda_source(prog).is_some(),
             "[{label}] codegen returned None — the prove launch would silently fall back"
         );
-        // NEEDS_PEDERSEN_TABLE tracks the fp256 EMBED, not table READS: any
-        // fp256 deduce kind makes the kernel's CUmodule declare the table
-        // globals, and the fail-closed load fill rejects the module when no
-        // host table is registered — component ORDER must never decide whether
-        // a lane engages (ROUND-28 pod finding: partial_ec_mul_generic ran
-        // before the aggregator's registration and silently fell back).
+        // Only deduce kinds 2/3 declare and read the module-local Pedersen table.
+        // Felt/Poseidon fp256 helpers are self-contained and must not inherit a
+        // multi-gigabyte table registration dependency merely by sharing math.
         use stwo_backend_cuda::jit_witness::isa::{DeduceKind, WitnessOp};
-        let embeds_fp256 = prog.insts.iter().any(|inst| {
+        let reads_pedersen = prog.insts.iter().any(|inst| {
             WitnessOp::from_raw(inst.op) == Some(WitnessOp::DeduceCall)
-                && DeduceKind::from_raw(inst.imm)
-                    .is_some_and(|k| !matches!(k, DeduceKind::BlakeG | DeduceKind::BlakeRoundSigma))
+                && DeduceKind::from_raw(inst.imm).is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        DeduceKind::PartialEcMulW18 | DeduceKind::PedersenPointsTableW18
+                    )
+                })
         });
         assert_eq!(
-            needs_table, embeds_fp256,
-            "[{label}] NEEDS_PEDERSEN_TABLE ({needs_table}) must equal fp256-embed ({embeds_fp256})"
+            needs_table, reads_pedersen,
+            "[{label}] NEEDS_PEDERSEN_TABLE ({needs_table}) must equal table reads ({reads_pedersen})"
         );
     }
 }
@@ -2104,6 +2223,57 @@ fn stwo_wit_deduce_oracle_matches_fast_deduction() {
         current = dev2;
     }
     eprintln!("deduce oracle kind 2: PASS (64 cases x {CHAIN_LEN} chained rounds)");
+
+    // ---- Kinds 8-11: Cairo Poseidon W27 primitives. ---------------------------
+    // Round-key outputs seed every arithmetic case, so the device constant table,
+    // Width27 regrouping, cube, and both chain transitions are checked together.
+    let compare =
+        |kind: u32, items: &[Vec<u32>], out_words: usize, host: &mut FastDeductionHost| {
+            let device = run_oracle(kind, items, out_words);
+            for (row, (input, actual)) in items.iter().zip(&device).enumerate() {
+                assert_eq!(
+                    actual,
+                    &host.deduce(kind, input),
+                    "Poseidon oracle kind {kind} row {row}"
+                );
+            }
+        };
+    let rounds = (0..35).map(|round| vec![round]).collect::<Vec<_>>();
+    compare(8, &rounds, 30, &mut host);
+
+    let keys = rounds
+        .iter()
+        .map(|round| host.deduce(8, round))
+        .collect::<Vec<_>>();
+    let cubes = keys
+        .iter()
+        .flat_map(|row| (0..3).map(move |felt| row[felt * 10..felt * 10 + 10].to_vec()))
+        .collect::<Vec<_>>();
+    compare(9, &cubes, 10, &mut host);
+
+    let full = keys
+        .iter()
+        .enumerate()
+        .map(|(round, keys)| {
+            let mut input = vec![round as u32, round as u32];
+            input.extend(keys);
+            input
+        })
+        .collect::<Vec<_>>();
+    compare(10, &full, 32, &mut host);
+
+    let partial = keys
+        .iter()
+        .enumerate()
+        .map(|(round, keys)| {
+            let mut input = vec![round as u32, round as u32];
+            input.extend(keys);
+            input.extend(&host.deduce(9, &keys[..10]));
+            input
+        })
+        .collect::<Vec<_>>();
+    compare(11, &partial, 42, &mut host);
+    eprintln!("deduce oracle kinds 8-11: PASS (all 35 Poseidon rounds)");
 }
 
 // ---------------- fp256/EC flagship: partial_ec_mul_window_bits_18 ------------------
@@ -2632,11 +2802,7 @@ fn partial_ec_mul_generic_recording_interpreter_matches_host() {
 
 // ---------------- poseidon-family fp256: cube_252 + range_check_252_width_27 --------
 
-/// Shared fixture prep: the poseidon fixture fed through the production chain
-/// (poseidon_builtin -> aggregator -> full/partial round chains), which fills
-/// cube_252 and range_check_252_width_27 inputs.
-#[allow(clippy::type_complexity)]
-fn poseidon_family_fixture() -> (crate::witness::cairo_claim_generator::CairoClaimGenerator,) {
+fn fresh_poseidon_claim_generator() -> crate::witness::cairo_claim_generator::CairoClaimGenerator {
     use cairo_vm::types::layout_name::LayoutName;
     use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
     use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
@@ -2684,6 +2850,15 @@ fn poseidon_family_fixture() -> (crate::witness::cairo_claim_generator::CairoCla
         Arc::new(memory),
         preprocessed_trace,
     );
+    cg
+}
+
+/// Shared fixture prep: the poseidon fixture fed through the production chain
+/// (poseidon_builtin -> aggregator -> full/partial round chains), which fills
+/// cube_252 and range_check_252_width_27 inputs.
+#[allow(clippy::type_complexity)]
+fn poseidon_family_fixture() -> (crate::witness::cairo_claim_generator::CairoClaimGenerator,) {
+    let mut cg = fresh_poseidon_claim_generator();
     // Production feed chain, in spawn order.
     {
         let pb = cg.poseidon_builtin.take().expect("poseidon_builtin");
@@ -2733,6 +2908,122 @@ fn poseidon_family_fixture() -> (crate::witness::cairo_claim_generator::CairoCla
     (cg,)
 }
 
+/// Permanent source-of-truth gate for the four newly recorded Poseidon writers.
+/// It follows the real producer order so every relation-fed input is exercised,
+/// then compares every trace, lookup, and sub-feed word with zero tolerance.
+#[test]
+fn poseidon_recorded_source_writers_are_byte_identical() {
+    // The mechanically generated aggregator writer has thousands of scalar SSA
+    // locals.  Debug test builds retain enough of them to exceed libtest's small
+    // default worker stack even though the production writer runs inside its
+    // explicitly sized Rayon pool.  Keep this permanent conformance gate usable
+    // under plain `cargo test` instead of requiring an ambient RUST_MIN_STACK.
+    std::thread::Builder::new()
+        .name("poseidon-recorded-parity".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(poseidon_recorded_source_writers_are_byte_identical_inner)
+        .expect("spawn Poseidon parity thread")
+        .join()
+        .expect("Poseidon parity thread panicked");
+}
+
+fn poseidon_recorded_source_writers_are_byte_identical_inner() {
+    use std::sync::atomic::Ordering;
+
+    use crate::witness::components::{
+        poseidon_3_partial_rounds_chain as partial, poseidon_aggregator as aggregator,
+        poseidon_builtin as builtin, poseidon_full_round_chain as full,
+    };
+
+    let mut cg = fresh_poseidon_claim_generator();
+
+    let builtin_gen = cg.poseidon_builtin.take().expect("poseidon builtin");
+    assert_generic_diff_byte_identical!(builtin::generic_simd_diff(
+        builtin_gen.log_size,
+        builtin_gen.poseidon_builtin_segment_start,
+        cg.memory_address_to_id.as_ref().expect("mem addr"),
+        cg.poseidon_aggregator.as_ref().expect("aggregator state"),
+    ));
+    let _ = builtin_gen.write_trace(
+        cg.memory_address_to_id.as_ref().expect("mem addr"),
+        cg.poseidon_aggregator.as_ref().expect("aggregator state"),
+    );
+
+    let aggregator_gen = cg.poseidon_aggregator.take().expect("populated aggregator");
+    let mut input_mults = aggregator_gen
+        .mults
+        .iter()
+        .map(|entry| (*entry.key(), M31(entry.value().load(Ordering::Relaxed))))
+        .collect::<Vec<_>>();
+    input_mults.sort_by_key(|(input, _)| input.0);
+    let (mut inputs, mut mults): (Vec<_>, Vec<_>) = input_mults.into_iter().unzip();
+    let n_real = inputs.len();
+    assert!(n_real > 0, "fixture fed no aggregator rows");
+    let size = n_real.next_power_of_two().max(N_LANES);
+    inputs.resize(size, inputs[0]);
+    mults.resize(size, M31::zero());
+    assert_generic_diff_byte_identical!(aggregator::generic_simd_diff(
+        pack_values(&inputs),
+        vec![pack_values(&mults)],
+        cg.memory_id_to_big.as_ref().expect("mem big"),
+        cg.poseidon_full_round_chain.as_ref().expect("full state"),
+        cg.range_check_252_width_27.as_ref().expect("rc252"),
+        cg.cube_252.as_ref().expect("cube"),
+        cg.range_check_3_3_3_3_3.as_ref().expect("rc33333"),
+        cg.range_check_4_4_4_4.as_ref().expect("rc4444"),
+        cg.range_check_4_4.as_ref().expect("rc44"),
+        cg.poseidon_3_partial_rounds_chain
+            .as_ref()
+            .expect("partial state"),
+    ));
+    let _ = aggregator_gen.write_trace(
+        cg.memory_id_to_big.as_ref().expect("mem big"),
+        cg.poseidon_full_round_chain.as_ref().expect("full state"),
+        cg.range_check_252_width_27.as_ref().expect("rc252"),
+        cg.cube_252.as_ref().expect("cube"),
+        cg.range_check_3_3_3_3_3.as_ref().expect("rc33333"),
+        cg.range_check_4_4_4_4.as_ref().expect("rc4444"),
+        cg.range_check_4_4.as_ref().expect("rc44"),
+        cg.poseidon_3_partial_rounds_chain
+            .as_ref()
+            .expect("partial state"),
+    );
+
+    let full_gen = cg
+        .poseidon_full_round_chain
+        .take()
+        .expect("populated full chain");
+    let mut full_inputs = full_gen.packed_inputs.lock().unwrap().clone();
+    let full_n_rows = full_inputs.len() * N_LANES;
+    let full_size = full_inputs.len().next_power_of_two();
+    full_inputs.resize(full_size, full_inputs[0]);
+    assert_generic_diff_byte_identical!(full::generic_simd_diff(
+        full_inputs,
+        full_n_rows,
+        cg.cube_252.as_ref().expect("cube"),
+        cg.poseidon_round_keys.as_ref().expect("round keys"),
+        cg.range_check_3_3_3_3_3.as_ref().expect("rc33333"),
+    ));
+
+    let partial_gen = cg
+        .poseidon_3_partial_rounds_chain
+        .take()
+        .expect("populated partial chain");
+    let mut partial_inputs = partial_gen.packed_inputs.lock().unwrap().clone();
+    let partial_n_rows = partial_inputs.len() * N_LANES;
+    let partial_size = partial_inputs.len().next_power_of_two();
+    partial_inputs.resize(partial_size, partial_inputs[0]);
+    assert_generic_diff_byte_identical!(partial::generic_simd_diff(
+        partial_inputs,
+        partial_n_rows,
+        cg.poseidon_round_keys.as_ref().expect("round keys"),
+        cg.cube_252.as_ref().expect("cube"),
+        cg.range_check_4_4_4_4.as_ref().expect("rc4444"),
+        cg.range_check_4_4.as_ref().expect("rc44"),
+        cg.range_check_252_width_27.as_ref().expect("rc252"),
+    ));
+}
+
 /// Gate (a) for `cube_252` (poseidon-family fp256: x^3 mod p via W27 felts).
 #[test]
 fn cube_252_generic_simd_byte_identical() {
@@ -2770,15 +3061,56 @@ fn range_check_252_width_27_generic_simd_byte_identical() {
 /// Recording manifests for the poseidon-family pair: fully recorded.
 #[test]
 fn poseidon_family_recording_poison_manifests() {
-    use crate::witness::components::{cube_252, range_check_252_width_27};
+    use stwo_backend_cuda::jit_witness::isa::{DeduceKind, WitnessOp};
+
+    use crate::witness::components::{
+        cube_252, poseidon_3_partial_rounds_chain, poseidon_aggregator, poseidon_builtin,
+        poseidon_full_round_chain, range_check_252_width_27,
+    };
+
     let c = cube_252::record_cube_252();
     assert!(c.poison_ops.is_empty(), "cube poisons: {:?}", c.poison_ops);
     let r = range_check_252_width_27::record_range_check_252_width_27();
     assert!(r.poison_ops.is_empty(), "rc252 poisons: {:?}", r.poison_ops);
+    let recordings = [
+        poseidon_builtin::record_poseidon_builtin(),
+        poseidon_aggregator::record_poseidon_aggregator(),
+        poseidon_full_round_chain::record_poseidon_full_round_chain(),
+        poseidon_3_partial_rounds_chain::record_poseidon_3_partial_rounds_chain(),
+    ];
+    for recording in &recordings {
+        assert!(
+            recording.poison_ops.is_empty(),
+            "{} poisons: {:?}",
+            recording.program.label,
+            recording.poison_ops
+        );
+        assert!(recording.poisoned_cols.is_empty());
+        assert!(recording.poisoned_lookup_words.is_empty());
+        assert!(recording.poisoned_sub_words.is_empty());
+    }
+    let kinds = recordings
+        .iter()
+        .flat_map(|recording| &recording.program.insts)
+        .filter(|inst| inst.op == WitnessOp::DeduceCall as u8)
+        .map(|inst| DeduceKind::from_raw(inst.imm).expect("known deduce"))
+        .collect::<Vec<_>>();
+    for expected in [
+        DeduceKind::PoseidonRoundKeys,
+        DeduceKind::Cube252,
+        DeduceKind::PoseidonFullRoundChain,
+        DeduceKind::Poseidon3PartialRoundsChain,
+    ] {
+        assert!(kinds.contains(&expected), "missing {expected:?}");
+    }
     eprintln!(
-        "cube_252 instrs={} rc252w27 instrs={}",
+        "cube_252 instrs={} rc252w27 instrs={} poseidon source instrs={:?}",
         c.program.n_instrs(),
-        r.program.n_instrs()
+        r.program.n_instrs(),
+        recordings
+            .iter()
+            .map(|recording| recording.program.n_instrs())
+            .collect::<Vec<_>>()
     );
 }
 

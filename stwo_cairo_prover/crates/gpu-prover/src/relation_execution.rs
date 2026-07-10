@@ -429,6 +429,15 @@ mod tests {
             RelationExecutionPlan::from_proof_plan(&proof, &CAIRO_RELATION_GRAPH).unwrap();
         assert_eq!(execution.template_use_count, 1566);
         assert_eq!(execution.batches.len(), 68);
+        assert_eq!(
+            execution
+                .kernel_program
+                .batches
+                .iter()
+                .map(|batch| batch.columns.len())
+                .sum::<usize>(),
+            807
+        );
         assert_eq!(execution.relation_graph_hash, 0x7396_3831_c53d_f4a2);
         execution.requirements().unwrap();
     }

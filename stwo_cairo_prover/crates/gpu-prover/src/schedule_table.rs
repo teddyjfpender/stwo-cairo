@@ -10,7 +10,8 @@
 
 use crate::schedule::{
     CapacityFeed, ComponentNode, ComponentRowSource, ComponentStaticFacts, CountFeed, InputEdge,
-    KernelIdentitySource, LogSizeSource, OutputEdge, Schedule, TraceColumnCount,
+    KernelIdentitySource, LogSizeSource, OutputEdge, Schedule, TraceColumnCount, WitnessWriterKind,
+    WitnessWriterReadiness, WitnessWriterSpec,
 };
 
 pub static CAIRO_SCHEDULE: Schedule = Schedule { nodes: NODES };
@@ -97,7 +98,11 @@ static NODES: &[ComponentNode] = &[
             sub_words: Some(11),
             logup_columns: Some(4),
             row_source: ComponentRowSource::DirectInputs,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -140,6 +145,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(27),
             row_source: ComponentRowSource::StoredLogSize,
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::Host,
+                readiness: WitnessWriterReadiness::Detached,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -160,6 +169,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(5),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -194,6 +207,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(5),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -228,6 +245,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(3),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -256,6 +277,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(4),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -290,6 +315,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(3),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -314,17 +343,38 @@ static NODES: &[ComponentNode] = &[
                 cairo_air::components::bitwise_builtin::N_TRACE_COLUMNS as u32,
             ),
             lookup_words: Some(278),
-            sub_words: None,
+            sub_words: Some(94),
             logup_columns: Some(19),
             row_source: ComponentRowSource::StoredLogSize,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
         inputs: &[],
         capacity_inputs: &[],
         outputs: &[],
-        counts: &[],
+        counts: &[
+            CountFeed {
+                family: "memory_address_to_id_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "memory_id_to_big_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "verify_bitwise_xor_8_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "verify_bitwise_xor_9_state",
+                n_relations: 1,
+            },
+        ],
         slots: None,
     },
     ComponentNode {
@@ -334,17 +384,57 @@ static NODES: &[ComponentNode] = &[
                 cairo_air::components::blake_compress_opcode::N_TRACE_COLUMNS as u32,
             ),
             lookup_words: Some(906),
-            sub_words: None,
+            sub_words: Some(324),
             logup_columns: Some(37),
             row_source: ComponentRowSource::DirectInputs,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
         inputs: &[],
         capacity_inputs: &[],
-        outputs: &[],
-        counts: &[],
+        outputs: &[
+            OutputEdge {
+                to: "blake_round",
+                word_base: 110,
+                words_per_instance: 19,
+                n_instances: 10,
+            },
+            OutputEdge {
+                to: "triple_xor_32",
+                word_base: 300,
+                words_per_instance: 3,
+                n_instances: 8,
+            },
+            OutputEdge {
+                to: "verify_instruction",
+                word_base: 0,
+                words_per_instance: 7,
+                n_instances: 1,
+            },
+        ],
+        counts: &[
+            CountFeed {
+                family: "memory_address_to_id_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "memory_id_to_big_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "range_check_7_2_5_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "verify_bitwise_xor_8_state",
+                n_relations: 1,
+            },
+        ],
         slots: None,
     },
     ComponentNode {
@@ -357,7 +447,11 @@ static NODES: &[ComponentNode] = &[
             sub_words: Some(48),
             logup_columns: Some(9),
             row_source: ComponentRowSource::WitnessRelationFeeds,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -371,39 +465,29 @@ static NODES: &[ComponentNode] = &[
             from: "blake_round",
             n_instances: 8,
         }],
-        outputs: &[
-            OutputEdge {
-                to: "verify_bitwise_xor_12",
-                word_base: 24,
-                words_per_instance: 3,
-                n_instances: 2,
+        outputs: &[],
+        counts: &[
+            CountFeed {
+                family: "verify_bitwise_xor_12_state",
+                n_relations: 1,
             },
-            OutputEdge {
-                to: "verify_bitwise_xor_4",
-                word_base: 30,
-                words_per_instance: 3,
-                n_instances: 2,
+            CountFeed {
+                family: "verify_bitwise_xor_4_state",
+                n_relations: 1,
             },
-            OutputEdge {
-                to: "verify_bitwise_xor_7",
-                word_base: 36,
-                words_per_instance: 3,
-                n_instances: 2,
+            CountFeed {
+                family: "verify_bitwise_xor_7_state",
+                n_relations: 1,
             },
-            OutputEdge {
-                to: "verify_bitwise_xor_8",
-                word_base: 0,
-                words_per_instance: 3,
-                n_instances: 8,
+            CountFeed {
+                family: "verify_bitwise_xor_8_state",
+                n_relations: 2,
             },
-            OutputEdge {
-                to: "verify_bitwise_xor_9",
-                word_base: 42,
-                words_per_instance: 3,
-                n_instances: 2,
+            CountFeed {
+                family: "verify_bitwise_xor_9_state",
+                n_relations: 1,
             },
         ],
-        counts: &[],
         slots: None,
     },
     ComponentNode {
@@ -417,10 +501,19 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(30),
             row_source: ComponentRowSource::WitnessRelationFeeds,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[],
+        inputs: &[InputEdge::Producer {
+            of: "blake_compress_opcode",
+            word_base: 110,
+            words_per_instance: 19,
+            n_instances: 10,
+        }],
         capacity_inputs: &[CapacityFeed {
             from: "blake_compress_opcode",
             n_instances: 10,
@@ -462,6 +555,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(4),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::blake_round_sigma::LOG_SIZE),
@@ -485,6 +582,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(5),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -519,6 +620,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(5),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -553,18 +658,41 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(50),
             row_source: ComponentRowSource::WitnessRelationFeeds,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[],
-        capacity_inputs: &[
-            CapacityFeed {
-                from: "poseidon_3_partial_rounds_chain",
+        inputs: &[
+            InputEdge::Producer {
+                of: "poseidon_aggregator",
+                word_base: 282,
+                words_per_instance: 10,
+                n_instances: 2,
+            },
+            InputEdge::Producer {
+                of: "poseidon_3_partial_rounds_chain",
+                word_base: 1,
+                words_per_instance: 10,
                 n_instances: 3,
             },
+            InputEdge::Producer {
+                of: "poseidon_full_round_chain",
+                word_base: 0,
+                words_per_instance: 10,
+                n_instances: 3,
+            },
+        ],
+        capacity_inputs: &[
             CapacityFeed {
                 from: "poseidon_aggregator",
                 n_instances: 2,
+            },
+            CapacityFeed {
+                from: "poseidon_3_partial_rounds_chain",
+                n_instances: 3,
             },
             CapacityFeed {
                 from: "poseidon_full_round_chain",
@@ -595,13 +723,30 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(9),
             row_source: ComponentRowSource::StoredLogSize,
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::NativeCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
         inputs: &[],
         capacity_inputs: &[],
         outputs: &[],
-        counts: &[],
+        counts: &[
+            CountFeed {
+                family: "memory_address_to_id_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "memory_id_to_big_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "range_check_8_state",
+                n_relations: 1,
+            },
+        ],
         slots: None,
     },
     ComponentNode {
@@ -615,6 +760,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(34),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::Host,
+                readiness: WitnessWriterReadiness::Detached,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -635,6 +784,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(3),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -669,6 +822,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(4),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -703,6 +860,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(3),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -737,6 +898,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(4),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -771,6 +936,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(3),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -805,6 +974,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(3),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -839,19 +1012,15 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(8),
             row_source: ComponentRowSource::MemoryAddress,
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::NativeCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
         inputs: &[],
         capacity_inputs: &[
-            CapacityFeed {
-                from: "add_ap_opcode",
-                n_instances: 1,
-            },
-            CapacityFeed {
-                from: "add_mod_builtin",
-                n_instances: 29,
-            },
             CapacityFeed {
                 from: "add_opcode",
                 n_instances: 3,
@@ -861,7 +1030,15 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 3,
             },
             CapacityFeed {
+                from: "add_ap_opcode",
+                n_instances: 1,
+            },
+            CapacityFeed {
                 from: "assert_eq_opcode",
+                n_instances: 2,
+            },
+            CapacityFeed {
+                from: "assert_eq_opcode_imm",
                 n_instances: 2,
             },
             CapacityFeed {
@@ -869,20 +1046,8 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 3,
             },
             CapacityFeed {
-                from: "assert_eq_opcode_imm",
-                n_instances: 2,
-            },
-            CapacityFeed {
-                from: "bitwise_builtin",
-                n_instances: 5,
-            },
-            CapacityFeed {
                 from: "blake_compress_opcode",
                 n_instances: 20,
-            },
-            CapacityFeed {
-                from: "blake_round",
-                n_instances: 16,
             },
             CapacityFeed {
                 from: "call_opcode_abs",
@@ -891,10 +1056,6 @@ static NODES: &[ComponentNode] = &[
             CapacityFeed {
                 from: "call_opcode_rel_imm",
                 n_instances: 3,
-            },
-            CapacityFeed {
-                from: "ec_op_builtin",
-                n_instances: 7,
             },
             CapacityFeed {
                 from: "generic_opcode",
@@ -925,16 +1086,40 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
             CapacityFeed {
-                from: "mul_mod_builtin",
-                n_instances: 29,
-            },
-            CapacityFeed {
                 from: "mul_opcode",
                 n_instances: 3,
             },
             CapacityFeed {
                 from: "mul_opcode_small",
                 n_instances: 3,
+            },
+            CapacityFeed {
+                from: "qm_31_add_mul_opcode",
+                n_instances: 3,
+            },
+            CapacityFeed {
+                from: "ret_opcode",
+                n_instances: 2,
+            },
+            CapacityFeed {
+                from: "verify_instruction",
+                n_instances: 1,
+            },
+            CapacityFeed {
+                from: "blake_round",
+                n_instances: 16,
+            },
+            CapacityFeed {
+                from: "add_mod_builtin",
+                n_instances: 29,
+            },
+            CapacityFeed {
+                from: "bitwise_builtin",
+                n_instances: 5,
+            },
+            CapacityFeed {
+                from: "mul_mod_builtin",
+                n_instances: 29,
             },
             CapacityFeed {
                 from: "pedersen_builtin",
@@ -949,10 +1134,6 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 6,
             },
             CapacityFeed {
-                from: "qm_31_add_mul_opcode",
-                n_instances: 3,
-            },
-            CapacityFeed {
                 from: "range_check96_builtin",
                 n_instances: 1,
             },
@@ -961,12 +1142,8 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
             CapacityFeed {
-                from: "ret_opcode",
-                n_instances: 2,
-            },
-            CapacityFeed {
-                from: "verify_instruction",
-                n_instances: 1,
+                from: "ec_op_builtin",
+                n_instances: 7,
             },
         ],
         outputs: &[],
@@ -985,19 +1162,15 @@ static NODES: &[ComponentNode] = &[
             logup_columns: None,
             row_source: ComponentRowSource::MemoryIdToBig,
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::NativeCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
         inputs: &[],
         capacity_inputs: &[
-            CapacityFeed {
-                from: "add_ap_opcode",
-                n_instances: 1,
-            },
-            CapacityFeed {
-                from: "add_mod_builtin",
-                n_instances: 24,
-            },
             CapacityFeed {
                 from: "add_opcode",
                 n_instances: 3,
@@ -1007,20 +1180,16 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 3,
             },
             CapacityFeed {
+                from: "add_ap_opcode",
+                n_instances: 1,
+            },
+            CapacityFeed {
                 from: "assert_eq_opcode_double_deref",
                 n_instances: 1,
             },
             CapacityFeed {
-                from: "bitwise_builtin",
-                n_instances: 5,
-            },
-            CapacityFeed {
                 from: "blake_compress_opcode",
                 n_instances: 20,
-            },
-            CapacityFeed {
-                from: "blake_round",
-                n_instances: 16,
             },
             CapacityFeed {
                 from: "call_opcode_abs",
@@ -1029,10 +1198,6 @@ static NODES: &[ComponentNode] = &[
             CapacityFeed {
                 from: "call_opcode_rel_imm",
                 n_instances: 3,
-            },
-            CapacityFeed {
-                from: "ec_op_builtin",
-                n_instances: 7,
             },
             CapacityFeed {
                 from: "generic_opcode",
@@ -1063,16 +1228,52 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
             CapacityFeed {
-                from: "mul_mod_builtin",
-                n_instances: 24,
-            },
-            CapacityFeed {
                 from: "mul_opcode",
                 n_instances: 3,
             },
             CapacityFeed {
                 from: "mul_opcode_small",
                 n_instances: 3,
+            },
+            CapacityFeed {
+                from: "qm_31_add_mul_opcode",
+                n_instances: 3,
+            },
+            CapacityFeed {
+                from: "ret_opcode",
+                n_instances: 2,
+            },
+            CapacityFeed {
+                from: "verify_instruction",
+                n_instances: 1,
+            },
+            CapacityFeed {
+                from: "blake_round",
+                n_instances: 16,
+            },
+            CapacityFeed {
+                from: "add_mod_builtin",
+                n_instances: 24,
+            },
+            CapacityFeed {
+                from: "bitwise_builtin",
+                n_instances: 5,
+            },
+            CapacityFeed {
+                from: "mul_mod_builtin",
+                n_instances: 24,
+            },
+            CapacityFeed {
+                from: "range_check96_builtin",
+                n_instances: 1,
+            },
+            CapacityFeed {
+                from: "range_check_builtin",
+                n_instances: 1,
+            },
+            CapacityFeed {
+                from: "ec_op_builtin",
+                n_instances: 7,
             },
             CapacityFeed {
                 from: "pedersen_aggregator_window_bits_18",
@@ -1085,26 +1286,6 @@ static NODES: &[ComponentNode] = &[
             CapacityFeed {
                 from: "poseidon_aggregator",
                 n_instances: 6,
-            },
-            CapacityFeed {
-                from: "qm_31_add_mul_opcode",
-                n_instances: 3,
-            },
-            CapacityFeed {
-                from: "range_check96_builtin",
-                n_instances: 1,
-            },
-            CapacityFeed {
-                from: "range_check_builtin",
-                n_instances: 1,
-            },
-            CapacityFeed {
-                from: "ret_opcode",
-                n_instances: 2,
-            },
-            CapacityFeed {
-                from: "verify_instruction",
-                n_instances: 1,
             },
         ],
         outputs: &[],
@@ -1122,6 +1303,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(94),
             row_source: ComponentRowSource::StoredLogSize,
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::Host,
+                readiness: WitnessWriterReadiness::Detached,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -1141,7 +1326,11 @@ static NODES: &[ComponentNode] = &[
             sub_words: Some(41),
             logup_columns: Some(19),
             row_source: ComponentRowSource::DirectInputs,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -1179,7 +1368,11 @@ static NODES: &[ComponentNode] = &[
             sub_words: Some(16),
             logup_columns: Some(6),
             row_source: ComponentRowSource::DirectInputs,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -1218,6 +1411,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(157),
             row_source: ComponentRowSource::WitnessRelationFeeds,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -1254,6 +1451,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(65),
             row_source: ComponentRowSource::WitnessRelationFeeds,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -1295,6 +1496,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(65),
             row_source: ComponentRowSource::WitnessRelationFeeds,
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::Host,
+                readiness: WitnessWriterReadiness::Detached,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -1318,10 +1523,19 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(6),
             row_source: ComponentRowSource::WitnessRelationFeeds,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[],
+        inputs: &[InputEdge::Producer {
+            of: "pedersen_builtin",
+            word_base: 3,
+            words_per_instance: 3,
+            n_instances: 1,
+        }],
         capacity_inputs: &[CapacityFeed {
             from: "pedersen_builtin",
             n_instances: 1,
@@ -1355,6 +1569,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(6),
             row_source: ComponentRowSource::WitnessRelationFeeds,
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::Host,
+                readiness: WitnessWriterReadiness::Detached,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -1374,17 +1592,29 @@ static NODES: &[ComponentNode] = &[
                 cairo_air::components::pedersen_builtin::N_TRACE_COLUMNS as u32,
             ),
             lookup_words: Some(14),
-            sub_words: None,
+            sub_words: Some(6),
             logup_columns: Some(2),
             row_source: ComponentRowSource::StoredLogSize,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
         inputs: &[],
         capacity_inputs: &[],
-        outputs: &[],
-        counts: &[],
+        outputs: &[OutputEdge {
+            to: "pedersen_aggregator_window_bits_18",
+            word_base: 3,
+            words_per_instance: 3,
+            n_instances: 1,
+        }],
+        counts: &[CountFeed {
+            family: "memory_address_to_id_state",
+            n_relations: 1,
+        }],
         slots: None,
     },
     ComponentNode {
@@ -1398,6 +1628,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(2),
             row_source: ComponentRowSource::StoredLogSize,
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::Host,
+                readiness: WitnessWriterReadiness::Detached,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -1418,6 +1652,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(23),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(
@@ -1443,6 +1681,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(15),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(
@@ -1464,20 +1706,57 @@ static NODES: &[ComponentNode] = &[
                 cairo_air::components::poseidon_3_partial_rounds_chain::N_TRACE_COLUMNS as u32,
             ),
             lookup_words: Some(255),
-            sub_words: None,
+            sub_words: Some(91),
             logup_columns: Some(9),
             row_source: ComponentRowSource::WitnessRelationFeeds,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[],
+        inputs: &[InputEdge::Producer {
+            of: "poseidon_aggregator",
+            word_base: 342,
+            words_per_instance: 42,
+            n_instances: 27,
+        }],
         capacity_inputs: &[CapacityFeed {
             from: "poseidon_aggregator",
             n_instances: 27,
         }],
-        outputs: &[],
-        counts: &[],
+        outputs: &[
+            OutputEdge {
+                to: "cube_252",
+                word_base: 1,
+                words_per_instance: 10,
+                n_instances: 3,
+            },
+            OutputEdge {
+                to: "poseidon_round_keys",
+                word_base: 0,
+                words_per_instance: 1,
+                n_instances: 1,
+            },
+            OutputEdge {
+                to: "range_check_252_width_27",
+                word_base: 61,
+                words_per_instance: 10,
+                n_instances: 3,
+            },
+        ],
+        counts: &[
+            CountFeed {
+                family: "range_check_4_4_4_4_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "range_check_4_4_state",
+                n_relations: 1,
+            },
+        ],
         slots: None,
     },
     ComponentNode {
@@ -1487,20 +1766,71 @@ static NODES: &[ComponentNode] = &[
                 cairo_air::components::poseidon_aggregator::N_TRACE_COLUMNS as u32,
             ),
             lookup_words: Some(522),
-            sub_words: None,
+            sub_words: Some(1476),
             logup_columns: Some(14),
             row_source: ComponentRowSource::WitnessRelationFeeds,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[],
+        inputs: &[InputEdge::Producer {
+            of: "poseidon_builtin",
+            word_base: 6,
+            words_per_instance: 6,
+            n_instances: 1,
+        }],
         capacity_inputs: &[CapacityFeed {
             from: "poseidon_builtin",
             n_instances: 1,
         }],
-        outputs: &[],
-        counts: &[],
+        outputs: &[
+            OutputEdge {
+                to: "cube_252",
+                word_base: 282,
+                words_per_instance: 10,
+                n_instances: 2,
+            },
+            OutputEdge {
+                to: "poseidon_3_partial_rounds_chain",
+                word_base: 342,
+                words_per_instance: 42,
+                n_instances: 27,
+            },
+            OutputEdge {
+                to: "poseidon_full_round_chain",
+                word_base: 6,
+                words_per_instance: 32,
+                n_instances: 8,
+            },
+            OutputEdge {
+                to: "range_check_252_width_27",
+                word_base: 262,
+                words_per_instance: 10,
+                n_instances: 2,
+            },
+        ],
+        counts: &[
+            CountFeed {
+                family: "memory_id_to_big_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "range_check_3_3_3_3_3_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "range_check_4_4_4_4_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "range_check_4_4_state",
+                n_relations: 1,
+            },
+        ],
         slots: None,
     },
     ComponentNode {
@@ -1510,17 +1840,29 @@ static NODES: &[ComponentNode] = &[
                 cairo_air::components::poseidon_builtin::N_TRACE_COLUMNS as u32,
             ),
             lookup_words: Some(26),
-            sub_words: None,
+            sub_words: Some(12),
             logup_columns: Some(4),
             row_source: ComponentRowSource::StoredLogSize,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
         inputs: &[],
         capacity_inputs: &[],
-        outputs: &[],
-        counts: &[],
+        outputs: &[OutputEdge {
+            to: "poseidon_aggregator",
+            word_base: 6,
+            words_per_instance: 6,
+            n_instances: 1,
+        }],
+        counts: &[CountFeed {
+            family: "memory_address_to_id_state",
+            n_relations: 1,
+        }],
         slots: None,
     },
     ComponentNode {
@@ -1530,20 +1872,45 @@ static NODES: &[ComponentNode] = &[
                 cairo_air::components::poseidon_full_round_chain::N_TRACE_COLUMNS as u32,
             ),
             lookup_words: Some(199),
-            sub_words: None,
+            sub_words: Some(61),
             logup_columns: Some(6),
             row_source: ComponentRowSource::WitnessRelationFeeds,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[],
+        inputs: &[InputEdge::Producer {
+            of: "poseidon_aggregator",
+            word_base: 6,
+            words_per_instance: 32,
+            n_instances: 8,
+        }],
         capacity_inputs: &[CapacityFeed {
             from: "poseidon_aggregator",
             n_instances: 8,
         }],
-        outputs: &[],
-        counts: &[],
+        outputs: &[
+            OutputEdge {
+                to: "cube_252",
+                word_base: 0,
+                words_per_instance: 10,
+                n_instances: 3,
+            },
+            OutputEdge {
+                to: "poseidon_round_keys",
+                word_base: 30,
+                words_per_instance: 1,
+                n_instances: 1,
+            },
+        ],
+        counts: &[CountFeed {
+            family: "range_check_3_3_3_3_3_state",
+            n_relations: 1,
+        }],
         slots: None,
     },
     ComponentNode {
@@ -1557,10 +1924,27 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(6),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::poseidon_round_keys::LOG_SIZE),
-        inputs: &[],
+        inputs: &[
+            InputEdge::Producer {
+                of: "poseidon_3_partial_rounds_chain",
+                word_base: 0,
+                words_per_instance: 1,
+                n_instances: 1,
+            },
+            InputEdge::Producer {
+                of: "poseidon_full_round_chain",
+                word_base: 30,
+                words_per_instance: 1,
+                n_instances: 1,
+            },
+        ],
         capacity_inputs: &[
             CapacityFeed {
                 from: "poseidon_3_partial_rounds_chain",
@@ -1585,7 +1969,11 @@ static NODES: &[ComponentNode] = &[
             sub_words: Some(25),
             logup_columns: Some(6),
             row_source: ComponentRowSource::DirectInputs,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -1624,6 +2012,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(2),
             row_source: ComponentRowSource::StoredLogSize,
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::Host,
+                readiness: WitnessWriterReadiness::Detached,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -1644,6 +2036,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(11),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_11::LOG_SIZE),
@@ -1677,6 +2073,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(12),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_12::LOG_SIZE),
@@ -1700,6 +2100,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(18),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_18::LOG_SIZE),
@@ -1737,15 +2141,15 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(4),
             row_source: ComponentRowSource::FixedLogSize(20),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_20::LOG_SIZE),
         inputs: &[],
         capacity_inputs: &[
-            CapacityFeed {
-                from: "cube_252",
-                n_instances: 56,
-            },
             CapacityFeed {
                 from: "generic_opcode",
                 n_instances: 28,
@@ -1766,6 +2170,10 @@ static NODES: &[ComponentNode] = &[
                 from: "partial_ec_mul_window_bits_9",
                 n_instances: 84,
             },
+            CapacityFeed {
+                from: "cube_252",
+                n_instances: 56,
+            },
         ],
         outputs: &[],
         counts: &[],
@@ -1781,19 +2189,36 @@ static NODES: &[ComponentNode] = &[
             sub_words: Some(19),
             logup_columns: Some(8),
             row_source: ComponentRowSource::WitnessRelationFeeds,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[],
-        capacity_inputs: &[
-            CapacityFeed {
-                from: "poseidon_3_partial_rounds_chain",
+        inputs: &[
+            InputEdge::Producer {
+                of: "poseidon_aggregator",
+                word_base: 262,
+                words_per_instance: 10,
+                n_instances: 2,
+            },
+            InputEdge::Producer {
+                of: "poseidon_3_partial_rounds_chain",
+                word_base: 61,
+                words_per_instance: 10,
                 n_instances: 3,
             },
+        ],
+        capacity_inputs: &[
             CapacityFeed {
                 from: "poseidon_aggregator",
                 n_instances: 2,
+            },
+            CapacityFeed {
+                from: "poseidon_3_partial_rounds_chain",
+                n_instances: 3,
             },
         ],
         outputs: &[],
@@ -1820,6 +2245,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(15),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_3_3_3_3_3::LOG_SIZE),
@@ -1849,6 +2278,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(18),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_3_6_6_3::LOG_SIZE),
@@ -1872,6 +2305,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(7),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_4_3::LOG_SIZE),
@@ -1900,17 +2337,21 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(8),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_4_4::LOG_SIZE),
         inputs: &[],
         capacity_inputs: &[
             CapacityFeed {
-                from: "poseidon_3_partial_rounds_chain",
+                from: "poseidon_aggregator",
                 n_instances: 3,
             },
             CapacityFeed {
-                from: "poseidon_aggregator",
+                from: "poseidon_3_partial_rounds_chain",
                 n_instances: 3,
             },
         ],
@@ -1929,22 +2370,26 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(16),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_4_4_4_4::LOG_SIZE),
         inputs: &[],
         capacity_inputs: &[
             CapacityFeed {
-                from: "poseidon_3_partial_rounds_chain",
-                n_instances: 6,
+                from: "qm_31_add_mul_opcode",
+                n_instances: 3,
             },
             CapacityFeed {
                 from: "poseidon_aggregator",
                 n_instances: 6,
             },
             CapacityFeed {
-                from: "qm_31_add_mul_opcode",
-                n_instances: 3,
+                from: "poseidon_3_partial_rounds_chain",
+                n_instances: 6,
             },
         ],
         outputs: &[],
@@ -1962,6 +2407,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(6),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_6::LOG_SIZE),
@@ -1985,6 +2434,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(14),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_7_2_5::LOG_SIZE),
@@ -1995,12 +2448,12 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 17,
             },
             CapacityFeed {
-                from: "blake_round",
-                n_instances: 16,
-            },
-            CapacityFeed {
                 from: "verify_instruction",
                 n_instances: 1,
+            },
+            CapacityFeed {
+                from: "blake_round",
+                n_instances: 16,
             },
         ],
         outputs: &[],
@@ -2018,6 +2471,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(8),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_8::LOG_SIZE),
@@ -2055,15 +2512,15 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(4),
             row_source: ComponentRowSource::FixedLogSize(18),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_9_9::LOG_SIZE),
         inputs: &[],
         capacity_inputs: &[
-            CapacityFeed {
-                from: "cube_252",
-                n_instances: 42,
-            },
             CapacityFeed {
                 from: "generic_opcode",
                 n_instances: 28,
@@ -2078,6 +2535,10 @@ static NODES: &[ComponentNode] = &[
             },
             CapacityFeed {
                 from: "partial_ec_mul_window_bits_9",
+                n_instances: 42,
+            },
+            CapacityFeed {
+                from: "cube_252",
                 n_instances: 42,
             },
             CapacityFeed {
@@ -2096,17 +2557,30 @@ static NODES: &[ComponentNode] = &[
                 cairo_air::components::range_check_builtin::N_TRACE_COLUMNS as u32,
             ),
             lookup_words: Some(34),
-            sub_words: None,
+            sub_words: Some(2),
             logup_columns: Some(1),
             row_source: ComponentRowSource::StoredLogSize,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
         inputs: &[],
         capacity_inputs: &[],
         outputs: &[],
-        counts: &[],
+        counts: &[
+            CountFeed {
+                family: "memory_address_to_id_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "memory_id_to_big_state",
+                n_relations: 1,
+            },
+        ],
         slots: None,
     },
     ComponentNode {
@@ -2120,6 +2594,10 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(4),
             row_source: ComponentRowSource::DirectInputs,
             kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
@@ -2153,22 +2631,29 @@ static NODES: &[ComponentNode] = &[
             sub_words: Some(24),
             logup_columns: Some(5),
             row_source: ComponentRowSource::WitnessRelationFeeds,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
-        inputs: &[],
+        inputs: &[InputEdge::Producer {
+            of: "blake_compress_opcode",
+            word_base: 300,
+            words_per_instance: 3,
+            n_instances: 8,
+        }],
         capacity_inputs: &[CapacityFeed {
             from: "blake_compress_opcode",
             n_instances: 8,
         }],
-        outputs: &[OutputEdge {
-            to: "verify_bitwise_xor_8",
-            word_base: 0,
-            words_per_instance: 3,
-            n_instances: 8,
+        outputs: &[],
+        counts: &[CountFeed {
+            family: "verify_bitwise_xor_8_state",
+            n_relations: 2,
         }],
-        counts: &[],
         slots: None,
     },
     ComponentNode {
@@ -2182,15 +2667,14 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(8),
             row_source: ComponentRowSource::FixedLogSize(20),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::verify_bitwise_xor_12::LOG_SIZE),
-        inputs: &[InputEdge::Producer {
-            of: "blake_g",
-            word_base: 24,
-            words_per_instance: 3,
-            n_instances: 2,
-        }],
+        inputs: &[],
         capacity_inputs: &[CapacityFeed {
             from: "blake_g",
             n_instances: 2,
@@ -2210,15 +2694,14 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(8),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::verify_bitwise_xor_4::LOG_SIZE),
-        inputs: &[InputEdge::Producer {
-            of: "blake_g",
-            word_base: 30,
-            words_per_instance: 3,
-            n_instances: 2,
-        }],
+        inputs: &[],
         capacity_inputs: &[CapacityFeed {
             from: "blake_g",
             n_instances: 2,
@@ -2238,15 +2721,14 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(14),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::verify_bitwise_xor_7::LOG_SIZE),
-        inputs: &[InputEdge::Producer {
-            of: "blake_g",
-            word_base: 36,
-            words_per_instance: 3,
-            n_instances: 2,
-        }],
+        inputs: &[],
         capacity_inputs: &[CapacityFeed {
             from: "blake_g",
             n_instances: 2,
@@ -2266,28 +2748,15 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(16),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::verify_bitwise_xor_8::LOG_SIZE),
-        inputs: &[
-            InputEdge::Producer {
-                of: "blake_g",
-                word_base: 0,
-                words_per_instance: 3,
-                n_instances: 8,
-            },
-            InputEdge::Producer {
-                of: "triple_xor_32",
-                word_base: 0,
-                words_per_instance: 3,
-                n_instances: 8,
-            },
-        ],
+        inputs: &[],
         capacity_inputs: &[
-            CapacityFeed {
-                from: "bitwise_builtin",
-                n_instances: 1,
-            },
             CapacityFeed {
                 from: "blake_compress_opcode",
                 n_instances: 4,
@@ -2299,6 +2768,10 @@ static NODES: &[ComponentNode] = &[
             CapacityFeed {
                 from: "triple_xor_32",
                 n_instances: 8,
+            },
+            CapacityFeed {
+                from: "bitwise_builtin",
+                n_instances: 1,
             },
         ],
         outputs: &[],
@@ -2316,23 +2789,22 @@ static NODES: &[ComponentNode] = &[
             logup_columns: Some(1),
             row_source: ComponentRowSource::FixedLogSize(18),
             kernel_identity: KernelIdentitySource::None,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::FixedTableCuda,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::verify_bitwise_xor_9::LOG_SIZE),
-        inputs: &[InputEdge::Producer {
-            of: "blake_g",
-            word_base: 42,
-            words_per_instance: 3,
-            n_instances: 2,
-        }],
+        inputs: &[],
         capacity_inputs: &[
-            CapacityFeed {
-                from: "bitwise_builtin",
-                n_instances: 27,
-            },
             CapacityFeed {
                 from: "blake_g",
                 n_instances: 2,
+            },
+            CapacityFeed {
+                from: "bitwise_builtin",
+                n_instances: 27,
             },
         ],
         outputs: &[],
@@ -2349,17 +2821,15 @@ static NODES: &[ComponentNode] = &[
             sub_words: Some(7),
             logup_columns: Some(3),
             row_source: ComponentRowSource::WitnessRelationFeeds,
-            kernel_identity: KernelIdentitySource::None,
+            kernel_identity: KernelIdentitySource::RecordedWitness,
+            witness_writer: WitnessWriterSpec {
+                kind: WitnessWriterKind::RecordedAot,
+                readiness: WitnessWriterReadiness::CaptureSafe,
+            },
         },
         kernel: None,
         log_size: LogSizeSource::FromStates,
         inputs: &[
-            InputEdge::Producer {
-                of: "add_ap_opcode",
-                word_base: 0,
-                words_per_instance: 7,
-                n_instances: 1,
-            },
             InputEdge::Producer {
                 of: "add_opcode",
                 word_base: 0,
@@ -2373,7 +2843,19 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
             InputEdge::Producer {
+                of: "add_ap_opcode",
+                word_base: 0,
+                words_per_instance: 7,
+                n_instances: 1,
+            },
+            InputEdge::Producer {
                 of: "assert_eq_opcode",
+                word_base: 0,
+                words_per_instance: 7,
+                n_instances: 1,
+            },
+            InputEdge::Producer {
+                of: "assert_eq_opcode_imm",
                 word_base: 0,
                 words_per_instance: 7,
                 n_instances: 1,
@@ -2385,7 +2867,7 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
             InputEdge::Producer {
-                of: "assert_eq_opcode_imm",
+                of: "blake_compress_opcode",
                 word_base: 0,
                 words_per_instance: 7,
                 n_instances: 1,
@@ -2465,10 +2947,6 @@ static NODES: &[ComponentNode] = &[
         ],
         capacity_inputs: &[
             CapacityFeed {
-                from: "add_ap_opcode",
-                n_instances: 1,
-            },
-            CapacityFeed {
                 from: "add_opcode",
                 n_instances: 1,
             },
@@ -2477,15 +2955,19 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
             CapacityFeed {
+                from: "add_ap_opcode",
+                n_instances: 1,
+            },
+            CapacityFeed {
                 from: "assert_eq_opcode",
                 n_instances: 1,
             },
             CapacityFeed {
-                from: "assert_eq_opcode_double_deref",
+                from: "assert_eq_opcode_imm",
                 n_instances: 1,
             },
             CapacityFeed {
-                from: "assert_eq_opcode_imm",
+                from: "assert_eq_opcode_double_deref",
                 n_instances: 1,
             },
             CapacityFeed {

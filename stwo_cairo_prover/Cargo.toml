@@ -58,6 +58,7 @@ stwo-cairo-serialize = { path = "crates/cairo-serialize", version = "~1.2.2" }
 stwo-cairo-serialize-derive = { path = "crates/cairo-serialize-derive", version = "~1.2.2" }
 stwo = { git = "https://github.com/teddyjfpender/stwo", rev = "9d7e3d6fa0fc64a0d143a8b2fcb8ee952f4de8f2" }
 stwo-backend-cuda = { git = "https://github.com/teddyjfpender/stwo", rev = "9d7e3d6fa0fc64a0d143a8b2fcb8ee952f4de8f2", features = ["parallel"] }
+stwo-backend-cuda-kernels = { git = "https://github.com/teddyjfpender/stwo", rev = "9d7e3d6fa0fc64a0d143a8b2fcb8ee952f4de8f2" }
 stwo-constraint-framework = { git = "https://github.com/teddyjfpender/stwo", rev = "9d7e3d6fa0fc64a0d143a8b2fcb8ee952f4de8f2" }
 stwo-air-utils-derive = { git = "https://github.com/teddyjfpender/stwo", rev = "9d7e3d6fa0fc64a0d143a8b2fcb8ee952f4de8f2" }
 stwo-air-utils = { git = "https://github.com/teddyjfpender/stwo", rev = "9d7e3d6fa0fc64a0d143a8b2fcb8ee952f4de8f2" }

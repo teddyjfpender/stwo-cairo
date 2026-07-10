@@ -169,12 +169,20 @@ impl CairoTranscriptBoundary {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CairoTranscriptSegment {
-    BootstrapAndLookup,
+    /// Static inputs through the freshly committed base-tree root. The device
+    /// transcript state after this segment is the exact interaction-PoW seed.
+    BootstrapThroughBase,
+    /// Absorb the device-found interaction nonce, then draw z and alpha.
+    InteractionPowAndLookup,
     InteractionAndComposition,
     CompositionAndOods,
     OodsAndQuotient,
     FriLayer(u32),
-    FriLastLayerAndQueries,
+    /// Absorb the device-produced final LinePoly. The resulting state is the
+    /// exact query-PoW seed.
+    FriLastLayer,
+    /// Absorb the device-found query nonce, then draw query positions.
+    QueryPowAndPositions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -416,7 +424,7 @@ fn plan_with_interaction_pow_bits(
         u32::try_from(last_layer_felts).map_err(|_| TranscriptPlanError::SizeOverflow)?;
 
     let mut builder = PlanBuilder::default();
-    builder.begin(CairoTranscriptSegment::BootstrapAndLookup, None);
+    builder.begin(CairoTranscriptSegment::BootstrapThroughBase, None);
     builder.mix_felts(
         CairoTranscriptBoundary::ChannelSalt,
         CairoTranscriptInput::ChannelSalt,
@@ -468,6 +476,12 @@ fn plan_with_interaction_pow_bits(
         CairoTranscriptBoundary::BaseRoot,
         CairoTranscriptInput::BaseRoot,
     )?;
+    builder.end(CairoTranscriptBoundary::BaseRoot);
+
+    builder.begin(
+        CairoTranscriptSegment::InteractionPowAndLookup,
+        Some(CairoTranscriptBoundary::BaseRoot),
+    );
     builder.absorb_pow(
         CairoTranscriptBoundary::InteractionPow,
         CairoTranscriptInput::InteractionPowNonce,
@@ -541,15 +555,18 @@ fn plan_with_interaction_pow_bits(
         previous = challenge;
     }
 
-    builder.begin(
-        CairoTranscriptSegment::FriLastLayerAndQueries,
-        Some(previous),
-    );
+    builder.begin(CairoTranscriptSegment::FriLastLayer, Some(previous));
     builder.mix_felts(
         CairoTranscriptBoundary::FriLastLayerPolynomial,
         CairoTranscriptInput::FriLastLayerPolynomial,
         last_layer_felts,
     )?;
+    builder.end(CairoTranscriptBoundary::FriLastLayerPolynomial);
+
+    builder.begin(
+        CairoTranscriptSegment::QueryPowAndPositions,
+        Some(CairoTranscriptBoundary::FriLastLayerPolynomial),
+    );
     builder.absorb_pow(
         CairoTranscriptBoundary::QueryPow,
         CairoTranscriptInput::QueryPowNonce,
@@ -906,12 +923,14 @@ fn cairo_schedule_key(
     feed(&schedule.protocol_key().to_le_bytes());
     for segment in segments {
         let (tag, index) = match segment.segment {
-            CairoTranscriptSegment::BootstrapAndLookup => (0u32, 0),
-            CairoTranscriptSegment::InteractionAndComposition => (1, 0),
-            CairoTranscriptSegment::CompositionAndOods => (2, 0),
-            CairoTranscriptSegment::OodsAndQuotient => (3, 0),
-            CairoTranscriptSegment::FriLayer(index) => (4, index),
-            CairoTranscriptSegment::FriLastLayerAndQueries => (5, 0),
+            CairoTranscriptSegment::BootstrapThroughBase => (0u32, 0),
+            CairoTranscriptSegment::InteractionPowAndLookup => (1, 0),
+            CairoTranscriptSegment::InteractionAndComposition => (2, 0),
+            CairoTranscriptSegment::CompositionAndOods => (3, 0),
+            CairoTranscriptSegment::OodsAndQuotient => (4, 0),
+            CairoTranscriptSegment::FriLayer(index) => (5, index),
+            CairoTranscriptSegment::FriLastLayer => (6, 0),
+            CairoTranscriptSegment::QueryPowAndPositions => (7, 0),
         };
         feed(&tag.to_le_bytes());
         feed(&index.to_le_bytes());
@@ -1115,7 +1134,8 @@ mod tests {
                 CairoTranscriptBoundary::CommonLookupElements,
             ]
         );
-        assert_eq!(plan.segments().first().unwrap().operation_range, 0..13);
+        assert_eq!(plan.segments().first().unwrap().operation_range, 0..11);
+        assert_eq!(plan.segments()[1].operation_range, 11..13);
         assert_eq!(
             plan.segments().last().unwrap().ends_at,
             CairoTranscriptBoundary::QueryPositions
@@ -1208,7 +1228,7 @@ mod tests {
         )
         .unwrap();
         assert_ne!(first.schedule_key(), second.schedule_key());
-        assert_eq!(first.schedule_key(), 0x61ca_f791_0416_2c54);
+        assert_eq!(first.schedule_key(), 0x2e69_7865_acf5_0354);
     }
 
     #[test]

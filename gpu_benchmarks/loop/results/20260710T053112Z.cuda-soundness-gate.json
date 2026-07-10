@@ -1,0 +1,14 @@
+{
+  "schema": "stwo.cuda.soundness-gate.v2",
+  "timestamp_utc": "2026-07-10T05:32:27.271323+00:00",
+  "stwo": "/workspace/stwo",
+  "stwo_git_head": "b36f673495cf94628678786191eb49c3bccb1efc",
+  "stwo_git_dirty": true,
+  "stwo_worktree_hash": "3a2da91b6b6752db552398e69cc93a64c16ec813a0a590beb528f2053c2f9a9b",
+  "stwo_cairo": "/workspace/stwo-cairo",
+  "stwo_cairo_git_head": "f16a52cb3927f939a5755d10ddd2096b35d46d15",
+  "stwo_cairo_git_dirty": true,
+  "stwo_cairo_worktree_hash": "2c11f5cd029bea0f2a62d6683974aa7ddd1505bb036f70055a928970cdc2dc11",
+  "gates": [],
+  "passed": false
+}
