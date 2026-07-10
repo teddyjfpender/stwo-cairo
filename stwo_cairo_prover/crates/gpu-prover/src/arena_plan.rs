@@ -188,6 +188,7 @@ pub enum BufferPurpose {
     ExecutionTablePointers,
     ExecutionTableStrides,
     EcOpSegmentStart,
+    EcOpPartialIota,
     WitnessExecutionTablePointers,
     WitnessExecutionTableStrides,
     WitnessOutputPointers,
@@ -304,6 +305,7 @@ pub enum BufferPurpose {
     RelationReductionB,
     RelationScanEvalScratch,
     RelationScanTempScratch,
+    RelationScanDescriptors,
     RelationFractionPointers,
     RelationFractionGeometry,
     RelationSourcePointers,
@@ -1988,6 +1990,7 @@ struct LogicalRelationWorkspace {
     reduction_b: LogicalBufferId,
     scan_eval_scratch: LogicalBufferId,
     scan_temp_scratch: LogicalBufferId,
+    scan_descriptors: LogicalBufferId,
     fraction_pointers: LogicalBufferId,
     fraction_geometry: LogicalBufferId,
     instances: Vec<LogicalRelationInstanceSlots>,
@@ -3498,7 +3501,14 @@ fn append_ec_op_buffers(
         },
     )
     .map_err(|_| ArenaPlanError::InvalidProtocolGeometry("invalid resident EC-op geometry"))?;
-    if partial.input_columns.len() != requirements.partial_input_column_words.len()
+    // The native ec_op writer materializes 127 partial-input columns: the 126
+    // the consumer recording binds (data + enabler) plus the one-past-end iota
+    // column the witness kernel computes in-kernel and never reads. The
+    // consumer's witness plan therefore owns 126 slots and the plan adds an
+    // ec_op-owned slot for the writer's iota column so the producer ABI stays
+    // intact (see recorded_witness_inputs' 126-input contract for the same
+    // seam on the consumer side).
+    if partial.input_columns.len() + 1 != requirements.partial_input_column_words.len()
         || partial
             .input_columns
             .iter()
@@ -3508,6 +3518,20 @@ fn append_ec_op_buffers(
             "EC-op direct partial_ec_mul_generic input geometry mismatch",
         ));
     }
+    let iota_words = *requirements.partial_input_column_words.last().ok_or(
+        ArenaPlanError::InvalidProtocolGeometry("EC-op partial input requirements are empty"),
+    )?;
+    let iota_column = push_buffer_id(
+        logical,
+        Some("ec_op_builtin"),
+        Some(TracePartId::Main),
+        BufferPurpose::EcOpPartialIota,
+        0,
+        iota_words,
+        BufferLifetime::at(ProofEpoch::Witness),
+    )?;
+    let mut partial_input_columns = partial.input_columns.clone();
+    partial_input_columns.push(iota_column);
     let segment_start = push_buffer_id(
         logical,
         Some("ec_op_builtin"),
@@ -3521,7 +3545,7 @@ fn append_ec_op_buffers(
         requirements,
         trace_columns,
         lookup_words,
-        partial_input_columns: partial.input_columns.clone(),
+        partial_input_columns,
         segment_start,
         address_counts,
         big_counts,
@@ -3952,7 +3976,7 @@ fn append_graph_a_multiplicity_buffers(
     })
 }
 
-fn topological_component_order(
+pub(crate) fn topological_component_order(
     proof: &ProofPlan,
 ) -> Result<Vec<&crate::plan::ComponentPlan>, ArenaPlanError> {
     let known = proof
@@ -4429,6 +4453,15 @@ fn append_relation_buffers(
         requirements.scan_temp_words.max(1),
         interaction,
     )?;
+    let scan_descriptors = push_buffer_id(
+        logical,
+        None,
+        None,
+        BufferPurpose::RelationScanDescriptors,
+        0,
+        requirements.scan_descriptor_words.max(1),
+        interaction,
+    )?;
     let fraction_pointers = push_buffer_id(
         logical,
         None,
@@ -4647,6 +4680,7 @@ fn append_relation_buffers(
         reduction_b,
         scan_eval_scratch,
         scan_temp_scratch,
+        scan_descriptors,
         fraction_pointers,
         fraction_geometry,
         instances,
@@ -7594,6 +7628,7 @@ fn resolve_relation_slots(
         reduction_b: physical(logical.reduction_b)?,
         scan_eval_scratch: physical(logical.scan_eval_scratch)?,
         scan_temp_scratch: physical(logical.scan_temp_scratch)?,
+        scan_descriptors: physical(logical.scan_descriptors)?,
         fraction_pointers: physical(logical.fraction_pointers)?,
         fraction_geometry: physical(logical.fraction_geometry)?,
         instances: logical

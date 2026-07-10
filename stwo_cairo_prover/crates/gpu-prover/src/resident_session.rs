@@ -270,7 +270,12 @@ pub enum ResidentSessionError {
     },
     StrictArchitectureTelemetry(&'static str),
     PlannedClaimMismatch,
-    PlannedShapeMismatch,
+    PlannedShapeMismatch {
+        context: &'static str,
+        component: Option<&'static str>,
+        expected: usize,
+        actual: usize,
+    },
     DetachedBaseWitness {
         migrated_columns: usize,
     },
@@ -670,17 +675,33 @@ fn resident_host_witness_inputs<'a>(
     arena: &ProofArenaPlan,
 ) -> Result<Vec<ResidentWitnessInputRoute<'a>>, ResidentSessionError> {
     if recorded.lanes.len() != arena.witness().components.len() {
-        return Err(ResidentSessionError::PlannedShapeMismatch);
+        return Err(ResidentSessionError::PlannedShapeMismatch {
+            context: "recorded lane count vs arena witness components",
+            component: None,
+            expected: arena.witness().components.len(),
+            actual: recorded.lanes.len(),
+        });
     }
     recorded
         .lanes
         .iter()
         .zip(&arena.witness().components)
         .map(|(lane, component)| {
-            if lane.component != component.component
-                || lane.columns.len() != component.program.n_inputs as usize
-            {
-                return Err(ResidentSessionError::PlannedShapeMismatch);
+            if lane.component != component.component {
+                return Err(ResidentSessionError::PlannedShapeMismatch {
+                    context: "recorded lane order vs arena witness order",
+                    component: Some(lane.component),
+                    expected: 0,
+                    actual: 0,
+                });
+            }
+            if lane.columns.len() != component.program.n_inputs as usize {
+                return Err(ResidentSessionError::PlannedShapeMismatch {
+                    context: "recorded lane column count vs recording n_inputs",
+                    component: Some(lane.component),
+                    expected: component.program.n_inputs as usize,
+                    actual: lane.columns.len(),
+                });
             }
             if let Some(producer) = component.native_input_producer {
                 if lane.columns.iter().enumerate().all(|(ordinal, source)| {
@@ -798,15 +819,19 @@ fn resident_host_witness_inputs<'a>(
                         }
                     }
                 }
-                if seed_scalars.len()
-                    != component
-                        .input_seed
-                        .as_ref()
-                        .expect("seed presence checked")
-                        .requirements
-                        .scalar_words
-                {
-                    return Err(ResidentSessionError::PlannedShapeMismatch);
+                let expected_scalars = component
+                    .input_seed
+                    .as_ref()
+                    .expect("seed presence checked")
+                    .requirements
+                    .scalar_words;
+                if seed_scalars.len() != expected_scalars {
+                    return Err(ResidentSessionError::PlannedShapeMismatch {
+                        context: "recorded seed scalars vs planned seed words",
+                        component: Some(lane.component),
+                        expected: expected_scalars,
+                        actual: seed_scalars.len(),
+                    });
                 }
                 return Ok(ResidentWitnessInputRoute {
                     columns: Vec::new(),
@@ -1007,6 +1032,78 @@ mod tests {
     use stwo_backend_cuda::{witness_input_gather_requirements, WitnessInputGatherEdge};
 
     use super::*;
+
+    /// Host-side replication of the pre-witness session planning
+    /// (`with_resident_session_from_generator` up to the
+    /// `resident_host_witness_inputs` shape check), so a recorded-lane vs
+    /// arena-plan drift is caught on any machine instead of surfacing as an
+    /// opaque `PlannedShapeMismatch` twenty minutes into an H100 parity run.
+    #[test]
+    fn poseidon_fixture_recorded_lanes_match_arena_witness_plan() {
+        use cairo_vm::types::layout_name::LayoutName;
+        use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+        use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
+        use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
+
+        use crate::schedule::WitnessWriterKind;
+
+        let input = run_and_adapt(
+            &get_compiled_cairo_program_path("test_prove_verify_poseidon_builtin"),
+            ProgramType::Json,
+            LayoutName::all_cairo_stwo,
+            None,
+        )
+        .unwrap();
+        let ingest = crate::phases::ingest::run(
+            input,
+            PreProcessedTraceVariant::CanonicalWithoutPedersen,
+            None,
+        );
+        let exact_plan = ingest
+            .proof_plan
+            .strict_resident_exact(
+                &crate::schedule_table::CAIRO_SCHEDULE,
+                &crate::relation_table::CAIRO_RELATION_GRAPH,
+            )
+            .unwrap();
+        require_strict_resident_witness_coverage(&exact_plan).unwrap();
+        let _planned_claim = planned_cairo_claim(&ingest.generator, &exact_plan).unwrap();
+        let recorded = recorded_witness_inputs_for_plan(&ingest.generator, &exact_plan).unwrap();
+        recorded.require_resolved().unwrap();
+
+        // Full protocol planning needs the embedded kernel manifest (CUDA
+        // builds only), but the arena's witness component list is exactly the
+        // topological RecordedAot filter — compare against that directly. The
+        // aggregator must precede the chains it feeds even though plan order
+        // sorts the chains first; the zip in resident_host_witness_inputs
+        // fails closed on any drift.
+        let lanes: Vec<_> = recorded.lanes.iter().map(|lane| lane.component).collect();
+        let expected: Vec<_> = crate::arena_plan::topological_component_order(&exact_plan)
+            .unwrap()
+            .into_iter()
+            .filter(|component| {
+                component.runtime.is_present()
+                    && component.node.facts.witness_writer.kind == WitnessWriterKind::RecordedAot
+            })
+            .map(|component| component.node.id)
+            .collect();
+        assert_eq!(
+            lanes, expected,
+            "recorded witness lanes disagree with the arena's topological order"
+        );
+        let aggregator = lanes
+            .iter()
+            .position(|id| *id == "poseidon_aggregator")
+            .unwrap();
+        let partial_chain = lanes
+            .iter()
+            .position(|id| *id == "poseidon_3_partial_rounds_chain")
+            .unwrap();
+        assert!(
+            aggregator < partial_chain,
+            "producer must be planned before its consumer"
+        );
+    }
 
     fn pcs(lifting_log_size: Option<u32>) -> PcsConfig {
         PcsConfig {

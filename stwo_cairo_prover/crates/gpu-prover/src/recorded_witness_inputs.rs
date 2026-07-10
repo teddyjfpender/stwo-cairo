@@ -155,6 +155,9 @@ pub enum RecordedWitnessPlanError {
     Inputs(RecordedWitnessInputsError),
     ShapeNotExact(ComponentId),
     InvalidTracePart(ComponentId),
+    /// The witness dependency graph could not be topologically ordered
+    /// (cyclic or dangling producer edges).
+    UnorderableSchedule,
     RowGeometryMismatch {
         component: ComponentId,
         expected_real: usize,
@@ -199,8 +202,15 @@ pub fn recorded_witness_inputs_for_plan(
     generator: &CairoClaimGenerator,
     proof_plan: &ProofPlan,
 ) -> Result<PlannedRecordedWitnessInputs, RecordedWitnessPlanError> {
+    // Lanes must be planned in the same topological (producer-before-consumer)
+    // order the arena witness workspace and the Graph A launcher use; the
+    // resident session zips the two lists pairwise and fails closed on any
+    // order drift. Plan order differs whenever a producer sorts after its
+    // consumer (e.g. poseidon_aggregator after poseidon_3_partial_rounds_chain).
+    let ordered = crate::arena_plan::topological_component_order(proof_plan)
+        .map_err(|_| RecordedWitnessPlanError::UnorderableSchedule)?;
     let mut expected = Vec::new();
-    for component in &proof_plan.components {
+    for component in ordered {
         if component.node.facts.witness_writer.kind != WitnessWriterKind::RecordedAot
             || !component.runtime.is_present()
         {
