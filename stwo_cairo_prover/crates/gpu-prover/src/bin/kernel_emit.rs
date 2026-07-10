@@ -292,6 +292,25 @@ fn main() -> ExitCode {
         &mut covered,
         max_instrs,
     );
+    // The strict resident parity gate proves this exact fixture x variant
+    // combination; its small shapes produce constraint variants the SN-scale
+    // fixtures above do not (observed as a strict AOT rejection on H100).
+    run_fixture(
+        "test_prove_verify_poseidon_builtin",
+        PreProcessedTraceVariant::CanonicalWithoutPedersen,
+        &mut out,
+        &mut covered,
+        max_instrs,
+    );
+    // The staged Step-1.2 gate fixture (SN2 component profile under the
+    // Canonical variant the SN PIE lane uses).
+    run_fixture(
+        "test_prove_verify_sn2_profile",
+        PreProcessedTraceVariant::Canonical,
+        &mut out,
+        &mut covered,
+        max_instrs,
+    );
     for input_path in args("--input-bincode") {
         eprintln!("kernel_emit: adapted input {input_path} (Canonical)");
         let bytes = std::fs::read(&input_path)
