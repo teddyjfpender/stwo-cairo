@@ -530,17 +530,43 @@ with open(sys.argv[1], "w", encoding="utf-8") as stream:
 PY
     return 0
   fi
-  local out code
-  out="$(run_ssh "cd '${CAIRO_POD}' && . \$HOME/.cargo/env 2>/dev/null; \
-      PATH=/usr/local/cuda/bin:\$PATH \
-      python3 gpu_benchmarks/run_cuda_soundness_gate.py \
-      --stwo '${STWO_POD}' --runtime-mode '${GPU_PCS_RUNTIME_MODE}' \
-      --output '${POD_SOUNDNESS_GATE}'; \
-      echo SOUNDNESS_EXIT=\$?")"
-  code="$(printf '%s\n' "$out" | sed -n 's/.*SOUNDNESS_EXIT=\([0-9][0-9]*\).*/\1/p' | tail -1)"
+  # Detached launcher + rc sentinel, same pattern as the benchmark step below:
+  # the gate builds and runs many cargo test targets for tens of minutes, and a
+  # synchronous ssh channel dying mid-run kills the remote gate with it
+  # (observed 2026-07-10: a transient drop aborted the arena gate and a stale
+  # artifact was fetched). The pod-side artifact is removed up front so a
+  # stale file can never be mistaken for this run's result.
+  local gate_sh="${POD_RUN_DIR}/soundness_gate.sh"
+  local gate_rc="${POD_RUN_DIR}/soundness_gate.rc"
+  local gate_log="${POD_RUN_DIR}/soundness_gate.log"
+  run_ssh "mkdir -p '${POD_RUN_DIR}'"
+  run_ssh "cat > '${gate_sh}'" <<EOF
+#!/usr/bin/env bash
+cd '${CAIRO_POD}'
+. "\$HOME/.cargo/env" 2>/dev/null || true
+export PATH=/usr/local/cuda/bin:\$PATH
+python3 gpu_benchmarks/run_cuda_soundness_gate.py \
+  --stwo '${STWO_POD}' --runtime-mode '${GPU_PCS_RUNTIME_MODE}' \
+  --output '${POD_SOUNDNESS_GATE}'
+echo \$? > '${gate_rc}'
+EOF
+  run_ssh "rm -f '${gate_rc}' '${POD_SOUNDNESS_GATE}'; nohup setsid bash '${gate_sh}' > '${gate_log}' 2>&1 & echo LAUNCHED"
+  local waited=0 code=""
+  while true; do
+    code="$(run_ssh "cat '${gate_rc}' 2>/dev/null" 2>/dev/null || true)"
+    [[ -n "$code" ]] && break
+    waited=$(( waited + POLL_INTERVAL ))
+    if (( waited >= MAX_WAIT )); then
+      warn "CUDA soundness gate exceeded MAX_WAIT (${MAX_WAIT}s); log tail:"
+      run_ssh "tail -n 20 '${gate_log}' 2>/dev/null" || true
+      return 1
+    fi
+    sleep "$POLL_INTERVAL"
+  done
   run_ssh "cat '${POD_SOUNDNESS_GATE}' 2>/dev/null" > "$LOCAL_SOUNDNESS_GATE" || true
   if [[ "$code" != "0" ]]; then
     warn "CUDA soundness gate failed (exit=${code:-?}); artifact: ${LOCAL_SOUNDNESS_GATE}"
+    run_ssh "tail -n 40 '${gate_log}' 2>/dev/null" || true
     return 1
   fi
   log "CUDA soundness gate PASSED: ${LOCAL_SOUNDNESS_GATE}"

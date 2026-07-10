@@ -424,7 +424,10 @@ pub fn testing_preprocessed_tree(max_log_size: u32) -> PreProcessedTrace {
     }
 }
 
-#[cfg(test)]
+// The assertions use `stwo::prover` items, which this crate only pulls in
+// behind its `prover` feature; a default-features `cargo test` must still
+// build.
+#[cfg(all(test, feature = "prover"))]
 pub mod tests {
     use super::*;
     const LOG_SIZE: u32 = 8;

@@ -44,8 +44,7 @@ fn fixture_profile(fixture: &str, variant: PreProcessedTraceVariant) -> FixtureP
         .components
         .iter()
         .filter(|component| {
-            component.runtime.is_present()
-                && !component.node.facts.witness_writer.is_capture_safe()
+            component.runtime.is_present() && !component.node.facts.witness_writer.is_capture_safe()
         })
         .map(|component| component.node.id)
         .collect();

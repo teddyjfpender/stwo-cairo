@@ -793,7 +793,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relation_projection_uses_every_device_column_exactly_once() {
+    fn relation_projection_uses_every_lookup_column_exactly_once() {
         let mut columns: Vec<_> = BLAKE_G_TUPLE_COLUMNS
             .iter()
             .flat_map(|(_, columns)| columns)
@@ -802,7 +802,16 @@ mod tests {
             .chain([52])
             .collect();
         columns.sort_unstable();
-        assert_eq!(columns, (0..73).collect::<Vec<_>>());
+        // Columns 12/13 and 22/23 are the triple_sum32 result limbs of the two
+        // G additions; only their 8-bit split columns (14/15, 24/25) enter the
+        // XOR lookups, so the projection deliberately excludes them (the word
+        // count still matches blake_g::N_LOOKUP_WORDS below). Double use is
+        // separately impossible: blake_g_projected_words takes each column
+        // Option exactly once.
+        let expected: Vec<usize> = (0..73)
+            .filter(|column| ![12, 13, 22, 23].contains(column))
+            .collect();
+        assert_eq!(columns, expected);
         assert_eq!(BLAKE_G_TUPLE_COLUMNS.len() * 4 + 1 + 20 + 2, 87);
     }
 }
