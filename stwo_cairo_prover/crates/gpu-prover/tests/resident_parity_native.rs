@@ -111,6 +111,64 @@ fn assert_capture_safe_fixture(input: &ProverInput, params: ProverParameters) {
     }
 }
 
+/// Deterministic SIMD reference proofs are expensive (~20 minutes of pod CPU
+/// per green round) and fixed for a given (fixture, params, input tag), so an
+/// opt-in cache (STWO_PARITY_REF_CACHE=<dir>) stores the serialized reference
+/// felts once and replays them byte-for-byte. Flag sweeps are byte-identical
+/// by construction, so the cache stays valid across the whole measurement
+/// campaign; delete the directory to force recomputation after any change
+/// that legitimately moves the reference.
+fn cached_reference_felts(
+    tag: &str,
+    input: ProverInput,
+    params: ProverParameters,
+) -> Vec<starknet_ff::FieldElement> {
+    const REFERENCE_SCHEMA: u32 = 1;
+    let cache_dir = std::env::var_os("STWO_PARITY_REF_CACHE").map(std::path::PathBuf::from);
+    let key_path = cache_dir.as_ref().map(|dir| {
+        dir.join(format!(
+            "{STRICT_RESIDENT_FIXTURE}-{tag}-v{REFERENCE_SCHEMA}-{:x}.ref",
+            {
+                // Stable fingerprint of the parameters that shape the proof.
+                let text = format!("{params:?}");
+                let mut hash = 0xcbf29ce484222325u64;
+                for byte in text.bytes() {
+                    hash ^= byte as u64;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+                hash
+            }
+        ))
+    });
+    if let Some(path) = &key_path {
+        if let Ok(bytes) = std::fs::read(path) {
+            if bytes.len() % 32 == 0 {
+                return bytes
+                    .chunks_exact(32)
+                    .map(|chunk| {
+                        starknet_ff::FieldElement::from_bytes_be(chunk.try_into().unwrap())
+                            .expect("cached reference felt")
+                    })
+                    .collect();
+            }
+        }
+    }
+    let felts =
+        serialize_felts(&prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input, params).unwrap());
+    if let Some(path) = &key_path {
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let mut bytes = Vec::with_capacity(felts.len() * 32);
+        for felt in &felts {
+            bytes.extend_from_slice(&felt.to_bytes_be());
+        }
+        let staging = path.with_extension("ref.tmp");
+        if std::fs::write(&staging, &bytes).is_ok() {
+            let _ = std::fs::rename(&staging, path);
+        }
+    }
+    felts
+}
+
 fn serialize_felts<H>(proof: &cairo_air::CairoProof<H>) -> Vec<starknet_ff::FieldElement>
 where
     H: stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted,
@@ -139,9 +197,7 @@ fn strict_resident_cold_and_warm_proofs_match_simd_bytes() {
         .prove_resident_blake2s(resident_input(), params)
         .unwrap();
 
-    let expected = serialize_felts(
-        &prove_cairo::<SimdBackend, Blake2sMerkleChannel>(reference_input, params).unwrap(),
-    );
+    let expected = cached_reference_felts("cold-warm", reference_input, params);
     assert_eq!(
         expected,
         serialize_felts(&cold),
@@ -193,10 +249,8 @@ fn strict_resident_same_shape_changed_memory_matches_second_simd_proof() {
         .prove_resident_blake2s(second.clone(), params)
         .unwrap();
 
-    let expected_first =
-        serialize_felts(&prove_cairo::<SimdBackend, Blake2sMerkleChannel>(first, params).unwrap());
-    let expected_second =
-        serialize_felts(&prove_cairo::<SimdBackend, Blake2sMerkleChannel>(second, params).unwrap());
+    let expected_first = cached_reference_felts("changed-memory-first", first, params);
+    let expected_second = cached_reference_felts("changed-memory-second", second, params);
     assert_ne!(
         expected_first, expected_second,
         "changed compact memory did not affect the reference proof"
@@ -239,9 +293,7 @@ fn strict_resident_poseidon_graph_a_matches_simd_bytes() {
         .prove_resident_blake2s(resident_input(), params)
         .unwrap();
 
-    let expected = serialize_felts(
-        &prove_cairo::<SimdBackend, Blake2sMerkleChannel>(reference_input, params).unwrap(),
-    );
+    let expected = cached_reference_felts("shared", reference_input, params);
     assert_eq!(
         expected,
         serialize_felts(&actual),
@@ -278,9 +330,7 @@ fn strict_resident_mirrored_transcript_matches_host_channel() {
             .unwrap(),
     );
 
-    let expected = serialize_felts(
-        &prove_cairo::<SimdBackend, Blake2sMerkleChannel>(reference_input, params).unwrap(),
-    );
+    let expected = cached_reference_felts("shared", reference_input, params);
 
     for round in 0..3 {
         let mirrored = match first_mirrored.take() {

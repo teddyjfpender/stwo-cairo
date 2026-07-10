@@ -547,6 +547,7 @@ cd '${CAIRO_POD}'
 . "\$HOME/.cargo/env" 2>/dev/null || true
 export PATH=/usr/local/cuda/bin:\$PATH
 export STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache
+export STWO_PARITY_REF_CACHE=/workspace/.parity_ref_cache
 python3 gpu_benchmarks/run_cuda_soundness_gate.py \
   --stwo '${STWO_POD}' --runtime-mode '${GPU_PCS_RUNTIME_MODE}' \
   --output '${POD_SOUNDNESS_GATE}'
