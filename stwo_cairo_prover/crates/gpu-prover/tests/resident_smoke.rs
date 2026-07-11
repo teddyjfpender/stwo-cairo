@@ -359,8 +359,154 @@ fn smoke_single_resident_proof_boundary_stepped() {
     // fault at its boundary, so the ~20-minute SIMD reference (or its cached
     // felts — see `cached_reference_felts`) only runs on a completed proof.
     let expected = cached_reference_felts("shared", reference_input, params);
-    assert_eq!(
-        expected, actual,
-        "boundary-stepped resident proof drifted from the SIMD reference"
+    if expected != actual {
+        report_section_offsets(&proof);
+        report_divergence(&expected, &actual);
+        panic!(
+            "boundary-stepped resident proof drifted from the SIMD reference \
+             (structured divergence report above; streams dumped if \
+             STWO_SMOKE_DIVERGENCE_DIR is set)"
+        );
+    }
+}
+
+/// Map felt indices to proof sections by mirroring the manual
+/// `CairoSerialize for CairoProof` impl (cairo-air/src/serde_utils.rs), which
+/// emits: claim, interaction_pow, interaction_claim, then the commitment
+/// scheme proof fields (config, commitments, sampled_values, decommitments,
+/// sorted_queried_values, proof_of_work, fri_proof), then channel_salt.
+/// Cumulative offsets printed here attribute `first_diff_index` from the
+/// divergence report immediately. Both streams share the claim-derived shape,
+/// so the resident proof's offsets apply to the SIMD stream as well unless
+/// total lengths differ (also reported).
+fn report_section_offsets(proof: &cairo_air::CairoProof<Blake2sMerkleHasher>) {
+    use std::ops::Deref;
+    fn len_of(serialize: impl FnOnce(&mut Vec<starknet_ff::FieldElement>)) -> usize {
+        let mut felts = Vec::new();
+        serialize(&mut felts);
+        felts.len()
+    }
+    let scheme = &proof.extended_stark_proof.proof.0;
+    let trace_log_sizes = proof.claim.log_sizes();
+    let sorted_queried_values = cairo_air::utils::sort_and_transpose_queried_values(
+        &scheme.queried_values,
+        trace_log_sizes.iter().map(|c| c.as_slice()).collect(),
     );
+    let sections: [(&str, usize); 11] = [
+        (
+            "claim",
+            len_of(|out| CairoSerialize::serialize(&proof.claim, out)),
+        ),
+        (
+            "interaction_pow",
+            len_of(|out| CairoSerialize::serialize(&proof.interaction_pow, out)),
+        ),
+        (
+            "interaction_claim",
+            len_of(|out| CairoSerialize::serialize(&proof.interaction_claim, out)),
+        ),
+        (
+            "pcs_config",
+            len_of(|out| CairoSerialize::serialize(&scheme.config, out)),
+        ),
+        (
+            "commitments",
+            len_of(|out| CairoSerialize::serialize(scheme.commitments.deref(), out)),
+        ),
+        (
+            "sampled_values",
+            len_of(|out| CairoSerialize::serialize(scheme.sampled_values.deref(), out)),
+        ),
+        (
+            "decommitments",
+            len_of(|out| CairoSerialize::serialize(scheme.decommitments.deref(), out)),
+        ),
+        (
+            "sorted_queried_values",
+            len_of(|out| CairoSerialize::serialize(sorted_queried_values.deref(), out)),
+        ),
+        (
+            "proof_of_work",
+            len_of(|out| CairoSerialize::serialize(&scheme.proof_of_work, out)),
+        ),
+        (
+            "fri_proof",
+            len_of(|out| CairoSerialize::serialize(&scheme.fri_proof, out)),
+        ),
+        (
+            "channel_salt",
+            len_of(|out| CairoSerialize::serialize(&proof.channel_salt, out)),
+        ),
+    ];
+    let mut offset = 0usize;
+    for (name, len) in sections {
+        eprintln!("smoke proof section {name}: offset={offset} len={len}");
+        offset += len;
+    }
+    eprintln!("smoke proof section TOTAL: {offset}");
+}
+
+/// Structured divergence evidence instead of `assert_eq!`'s multi-megabyte
+/// Debug dump of both felt vectors: first divergent index, a hex window
+/// around it, per-stream lengths, and (when STWO_SMOKE_DIVERGENCE_DIR is set)
+/// both streams dumped as raw 32-byte big-endian felts for offline diffing.
+fn report_divergence(
+    expected: &[starknet_ff::FieldElement],
+    actual: &[starknet_ff::FieldElement],
+) {
+    let hex = |felt: &starknet_ff::FieldElement| {
+        felt.to_bytes_be()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let shared_len = expected.len().min(actual.len());
+    let first_diff = (0..shared_len).find(|&i| expected[i] != actual[i]);
+    eprintln!(
+        "smoke divergence: expected_len={} actual_len={} first_diff_index={:?}",
+        expected.len(),
+        actual.len(),
+        first_diff
+    );
+    let divergent = first_diff.unwrap_or(shared_len);
+    let window_start = divergent.saturating_sub(4);
+    let window_end = (divergent + 8).min(shared_len);
+    for index in window_start..window_end {
+        eprintln!(
+            "  [{index}] expected={} actual={}{}",
+            hex(&expected[index]),
+            hex(&actual[index]),
+            if expected[index] == actual[index] {
+                ""
+            } else {
+                "   <-- DIVERGES"
+            }
+        );
+    }
+    let total_diffs = (0..shared_len)
+        .filter(|&i| expected[i] != actual[i])
+        .count();
+    eprintln!(
+        "smoke divergence: {total_diffs} of {shared_len} shared positions differ \
+         (plus {} length-tail positions)",
+        expected.len().abs_diff(actual.len())
+    );
+    if let Some(dir) = std::env::var_os("STWO_SMOKE_DIVERGENCE_DIR").map(std::path::PathBuf::from)
+    {
+        let _ = std::fs::create_dir_all(&dir);
+        for (name, felts) in [("expected_simd", expected), ("actual_resident", actual)] {
+            let mut bytes = Vec::with_capacity(felts.len() * 32);
+            for felt in felts {
+                bytes.extend_from_slice(&felt.to_bytes_be());
+            }
+            let path = dir.join(format!("{name}.felts.bin"));
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => eprintln!("smoke divergence: wrote {}", path.display()),
+                Err(error) => eprintln!(
+                    "smoke divergence: FAILED to write {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
 }
