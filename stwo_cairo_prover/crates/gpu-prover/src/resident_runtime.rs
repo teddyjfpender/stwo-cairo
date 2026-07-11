@@ -34,7 +34,7 @@ use stwo_backend_cuda::{
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
-use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
+use stwo_cairo_prover::witness::proof_shape::{ProofShapeKey, TracePartId};
 
 use crate::arena_plan::{BufferPurpose, CommitmentColumnSource, CommitmentTreeId};
 use crate::graphs::{
@@ -2950,6 +2950,82 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// proof-bundle D2H and then calls `DecommitAssembly::decode` on its prefix.
     pub fn read_decommit_assembly_once(&self) -> Result<DecommitAssembly, ResidentRuntimeError> {
         Ok(self.decommit.read_assembly_once()?)
+    }
+
+    /// DIAGNOSTIC-ONLY base-trace readback: every planned `BaseTrace`
+    /// evaluation column of one component part (ordinals `0..width`, each
+    /// `padded_rows` u32 words), copied D2H and drained with one stream
+    /// synchronization.
+    ///
+    /// `pub` (rather than `pub(crate)`) solely for the diagnostic trace-audit
+    /// runner (`tests/resident_trace_audit.rs`), exactly like the
+    /// `interaction_claim_from_flattened` promotion — not a stable API
+    /// surface. Production replay must never call this: it crosses PCIe and
+    /// synchronizes, deliberately violating the resident hot-path budget.
+    ///
+    /// Content is only meaningful while the buffers' planned lifetime is live
+    /// (`ProofEpoch::Witness..=Interaction`): read between the base-commit
+    /// boundary replay and the interaction replay — later epochs may reuse the
+    /// pooled arena slots.
+    pub fn read_base_trace_columns_for_diagnostics(
+        &self,
+        component: &'static str,
+        part: TracePartId,
+    ) -> Result<Vec<Vec<u32>>, ResidentRuntimeError> {
+        let missing = |ordinal: u32| ResidentRuntimeError::MissingCommitmentSource {
+            id: CommitmentTreeId::Base,
+            source: CommitmentColumnSource::Trace {
+                component,
+                part,
+                purpose: BufferPurpose::BaseTrace,
+                ordinal,
+            },
+        };
+        let plan = self.workspace.plan();
+        let mut columns: Vec<Vec<u32>> = Vec::new();
+        loop {
+            let ordinal = u32::try_from(columns.len()).map_err(|_| missing(u32::MAX))?;
+            let Some((logical, binding)) =
+                plan.find(Some(component), Some(part), BufferPurpose::BaseTrace, ordinal)
+            else {
+                break;
+            };
+            let words = logical.len_words;
+            let slice = bind_arena_binding(self.workspace.arena(), binding)?;
+            if slice.len_words() < words {
+                return Err(ResidentRuntimeError::TranscriptBindingTooSmall {
+                    role: "diagnostic base-trace column",
+                    required_words: words,
+                    actual_words: slice.len_words(),
+                });
+            }
+            let bytes = words.checked_mul(core::mem::size_of::<u32>()).ok_or(
+                ResidentRuntimeError::TranscriptBindingTooSmall {
+                    role: "diagnostic base-trace column",
+                    required_words: words,
+                    actual_words: slice.len_words(),
+                },
+            )?;
+            let mut host = vec![0u32; words];
+            // SAFETY: `slice` is an arena-owned device range of at least
+            // `words` words (checked above); `host` owns `words` writable
+            // words and its heap allocation is address-stable across the move
+            // into `columns`. The copy is drained by the sync below before
+            // any host read.
+            unsafe {
+                self.workspace.arena().context().memcpy_d2h_async(
+                    host.as_mut_ptr().cast(),
+                    slice.as_void_ptr().cast_const(),
+                    bytes,
+                )?;
+            }
+            columns.push(host);
+        }
+        if columns.is_empty() {
+            return Err(missing(0));
+        }
+        self.workspace.arena().context().sync()?;
+        Ok(columns)
     }
 
     fn commitment(
