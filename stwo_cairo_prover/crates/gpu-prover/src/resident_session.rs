@@ -270,6 +270,7 @@ pub enum ResidentSessionError {
     },
     StrictArchitectureTelemetry(&'static str),
     PlannedClaimMismatch,
+    PublicMemoryMultiplicitySeed(&'static str),
     PlannedShapeMismatch {
         context: &'static str,
         component: Option<&'static str>,
@@ -518,6 +519,7 @@ fn run_materialized_session<R>(
         None,
         None,
         None,
+        None,
     )?;
     let transcript_inputs = encode_static_transcript_inputs(channel_salt, pcs, &claim)?;
     runtime.upload_transcript_inputs_at_ingest(&transcript_inputs)?;
@@ -569,6 +571,61 @@ fn require_device_born_base(residency: BaseTraceResidency) -> Result<(), Residen
         Err(ResidentSessionError::DetachedBaseWitness {
             migrated_columns: residency.migrated_columns,
         })
+    }
+}
+
+fn public_memory_multiplicity_seed_words(
+    claim: &CairoClaim,
+    memory: &stwo_cairo_adapter::memory::Memory,
+) -> Result<Vec<u32>, ResidentSessionError> {
+    let entries = claim.public_data.public_memory.get_entries(
+        claim.public_data.initial_state.pc.0,
+        claim.public_data.initial_state.ap.0,
+        claim.public_data.final_state.ap.0,
+    );
+    let mut addresses = Vec::new();
+    let mut ids = Vec::new();
+    for (address, id, _) in entries {
+        if address == 0 {
+            return Err(ResidentSessionError::PublicMemoryMultiplicitySeed(
+                "public address zero cannot be represented by the address-minus-one descriptor",
+            ));
+        }
+        let actual = memory.address_to_id.get(address as usize).ok_or(
+            ResidentSessionError::PublicMemoryMultiplicitySeed(
+                "public address is outside execution memory",
+            ),
+        )?;
+        if actual.0 != id {
+            return Err(ResidentSessionError::PublicMemoryMultiplicitySeed(
+                "claim public memory disagrees with execution memory",
+            ));
+        }
+        if !public_memory_id_is_valid(id, memory.f252_values.len(), memory.small_values.len()) {
+            return Err(ResidentSessionError::PublicMemoryMultiplicitySeed(
+                "claim public memory contains an invalid encoded ID",
+            ));
+        }
+        addresses.push(address);
+        ids.push(id);
+    }
+    if addresses.is_empty() {
+        return Err(ResidentSessionError::PublicMemoryMultiplicitySeed(
+            "claim contains no public memory",
+        ));
+    }
+    addresses.extend(ids);
+    Ok(addresses)
+}
+
+fn public_memory_id_is_valid(id: u32, n_f252: usize, n_small: usize) -> bool {
+    use stwo_cairo_adapter::memory::DEFAULT_ID;
+
+    let index = (id & 0x3fff_ffff) as usize;
+    match id >> 30 {
+        0 => id != DEFAULT_ID && index < n_small,
+        1 => index < n_f252,
+        _ => false,
     }
 }
 
@@ -938,17 +995,22 @@ pub fn with_resident_session_from_generator<R>(
     let recorded = recorded_witness_inputs_for_plan(&generator, &exact_plan)?;
     recorded.require_resolved()?;
     let memory = &recorded.execution_memory;
+    let public_memory_seed = public_memory_multiplicity_seed_words(&planned_claim, memory)?;
+    let public_memory_entries = public_memory_seed.len() / 2;
     let planned = plan_resident_protocol(
         &planned_claim,
         &exact_plan,
         &preprocessed_trace,
         pcs,
         include_all_preprocessed_columns,
-        Some(ExecutionTableGeometry::new(
-            memory.address_to_id.len(),
-            memory.f252_values.len(),
-            memory.small_values.len(),
-        )),
+        Some(
+            ExecutionTableGeometry::new(
+                memory.address_to_id.len(),
+                memory.f252_values.len(),
+                memory.small_values.len(),
+            )
+            .with_public_memory_entries(public_memory_entries),
+        ),
     )?;
 
     if recorded
@@ -1003,6 +1065,7 @@ pub fn with_resident_session_from_generator<R>(
             }),
             ec_op_segment_start,
             Some(Arc::clone(&preprocessed_trace)),
+            Some(&public_memory_seed),
         )?;
         let execution_tables_ingest = runtime.execution_tables_ingest_telemetry();
         let ec_op_ingest = runtime.ec_op_ingest_telemetry();
@@ -1139,6 +1202,11 @@ pub fn plan_resident_preflight(
     recorded
         .require_resolved()
         .map_err(ResidentSessionError::from)?;
+    let public_memory_entries =
+        public_memory_multiplicity_seed_words(&planned_claim, &recorded.execution_memory)
+            .map_err(ResidentPreflightError::from)?
+            .len()
+            / 2;
     let multiplicities = crate::multiplicity_pipeline::plan_graph_a_multiplicities(&exact_plan)?;
 
     let (protocol_policy, manifest_policy) = match ProtocolPlanPolicy::loaded_starknet_blake2s() {
@@ -1171,11 +1239,14 @@ pub fn plan_resident_preflight(
         preprocessed_trace,
         pcs,
         include_all_preprocessed_columns,
-        Some(ExecutionTableGeometry::new(
-            memory.address_to_id.len(),
-            memory.f252_values.len(),
-            memory.small_values.len(),
-        )),
+        Some(
+            ExecutionTableGeometry::new(
+                memory.address_to_id.len(),
+                memory.f252_values.len(),
+                memory.small_values.len(),
+            )
+            .with_public_memory_entries(public_memory_entries),
+        ),
         protocol_policy,
     )?;
 
@@ -1211,6 +1282,64 @@ mod tests {
     use stwo_backend_cuda::{witness_input_gather_requirements, WitnessInputGatherEdge};
 
     use super::*;
+
+    #[test]
+    fn public_memory_seed_rejects_invalid_tags_and_out_of_bounds_ids() {
+        use stwo_cairo_adapter::memory::DEFAULT_ID;
+
+        assert!(public_memory_id_is_valid(1, 3, 2));
+        assert!(public_memory_id_is_valid((1 << 30) | 2, 3, 2));
+        assert!(!public_memory_id_is_valid(DEFAULT_ID, 3, usize::MAX));
+        assert!(!public_memory_id_is_valid(2, 3, 2));
+        assert!(!public_memory_id_is_valid((1 << 30) | 3, 3, 2));
+        assert!(!public_memory_id_is_valid(2 << 30, usize::MAX, usize::MAX));
+        assert!(!public_memory_id_is_valid(3 << 30, usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn claim_public_entries_equal_adapter_public_address_multiset() {
+        use cairo_vm::types::layout_name::LayoutName;
+        use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+        use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
+        use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
+
+        let input = run_and_adapt(
+            &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
+            ProgramType::Json,
+            LayoutName::all_cairo_stwo,
+            None,
+        )
+        .unwrap();
+        let mut expected = input
+            .public_memory_addresses
+            .iter()
+            .map(|&address| (address, input.memory.get_raw_id(address)))
+            .collect::<Vec<_>>();
+        let ingest = crate::phases::ingest::run(input, PreProcessedTraceVariant::Canonical, None);
+        let exact = ingest
+            .proof_plan
+            .strict_resident_exact(
+                &crate::schedule_table::CAIRO_SCHEDULE,
+                &crate::relation_table::CAIRO_RELATION_GRAPH,
+            )
+            .unwrap();
+        let claim = planned_cairo_claim(&ingest.generator, &exact).unwrap();
+        let recorded = recorded_witness_inputs_for_plan(&ingest.generator, &exact).unwrap();
+        let words =
+            public_memory_multiplicity_seed_words(&claim, &recorded.execution_memory).unwrap();
+        let n = words.len() / 2;
+        let mut actual = words[..n]
+            .iter()
+            .copied()
+            .zip(words[n..].iter().copied())
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "public-memory pair multiset incl. duplicates"
+        );
+    }
 
     /// Host-side replication of the pre-witness session planning
     /// (`with_resident_session_from_generator` up to the

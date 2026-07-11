@@ -171,7 +171,7 @@ PROLOGUE
   echo 'echo done > "$RUN/session.done"'
 } | pssh "mkdir -p '$RUN' && cat > '$RUN/session.sh'"
 # shellcheck disable=SC2016
-pssh "cd '$RUN' && rm -rf divergence *.log *.rc *.secs session.done && nohup setsid bash '$RUN/session.sh' > session.out 2>&1 & echo LAUNCHED" \
+pssh "cd '$RUN' && rm -rf divergence *.log *.rc *.secs session.done && nohup setsid -f bash '$RUN/session.sh' </dev/null > session.out 2>&1 && echo LAUNCHED" \
   || { note "LAUNCH FAILED"; exit 1; }
 
 # --- 5. poll phases in order ---

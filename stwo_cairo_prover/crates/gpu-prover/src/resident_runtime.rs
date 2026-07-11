@@ -225,6 +225,7 @@ pub enum ResidentRuntimeError {
     UnsupportedMultiplicityFeeds(Vec<MultiplicityFeedBlocker>),
     MissingPreprocessedTraceForMultiplicity,
     CanonicalMultiplicityLut(&'static str),
+    PublicMemoryMultiplicitySeed(&'static str),
     MissingPreparedExecutionTables,
     UnexpectedPreparedExecutionTables,
     MissingPreparedEcOpSegment,
@@ -761,6 +762,7 @@ fn enqueue_witness_lane_levels(
 
 struct PreparedResidentMultiplicity<'a> {
     clear: PreparedWitnessFeedClearGraph<'a>,
+    public_memory_seed: Option<PreparedWitnessFeedGraph<'a>>,
     feeds: Vec<(&'static str, PreparedWitnessFeedGraph<'a>)>,
     fixed_tables: Vec<PreparedFixedTableGraph<'a>>,
     memory_traces: Option<PreparedMemoryBaseTraceGraph<'a>>,
@@ -835,6 +837,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         execution_tables_host: Option<ExecutionTablesHostData<'_>>,
         ec_op_segment_start: Option<usize>,
         preprocessed_trace: Option<Arc<PreProcessedTrace>>,
+        public_memory_seed_host: Option<&[u32]>,
     ) -> Result<Self, ResidentRuntimeError> {
         let actual_identity = ResidentWorkspaceIdentity::of(workspace);
         if expected_identity != actual_identity {
@@ -845,6 +848,16 @@ impl<'a> ResidentGraphRuntime<'a> {
         }
         if !workspace.preprocessed_commitment_ready() {
             return Err(ResidentRuntimeError::FixedPreprocessedCommitmentNotReady);
+        }
+        let public_memory_seed_planned = workspace
+            .plan()
+            .multiplicity()
+            .and_then(|planned| planned.public_memory_seed.as_ref())
+            .is_some();
+        if public_memory_seed_planned != public_memory_seed_host.is_some() {
+            return Err(ResidentRuntimeError::PublicMemoryMultiplicitySeed(
+                "claim-bound source and planned seed disagree",
+            ));
         }
         if let Some(planned) = workspace.plan().multiplicity() {
             if !planned.coverage_complete() {
@@ -1018,6 +1031,34 @@ impl<'a> ResidentGraphRuntime<'a> {
                         Ok::<_, ResidentRuntimeError>((feed.plan.producer, graph))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let public_memory_seed = planned
+                    .public_memory_seed
+                    .as_ref()
+                    .map(|feed| {
+                        let graph = PreparedWitnessFeedGraph::prepare(
+                            arena,
+                            bind_arena_binding(arena, feed.source)?,
+                            feed.plan.row_count,
+                            feed.plan.sub_words_per_row,
+                            &feed.plan.descriptors,
+                            &[],
+                            &feed.plan.requirements.multiplicity_words,
+                            &feed.slots,
+                        )?;
+                        let words = public_memory_seed_host.ok_or(
+                            ResidentRuntimeError::PublicMemoryMultiplicitySeed(
+                                "planned seed has no claim-bound source",
+                            ),
+                        )?;
+                        graph.upload_source(words)?;
+                        Ok::<_, ResidentRuntimeError>(graph)
+                    })
+                    .transpose()?;
+                if planned.public_memory_seed.is_none() && public_memory_seed_host.is_some() {
+                    return Err(ResidentRuntimeError::PublicMemoryMultiplicitySeed(
+                        "claim-bound source has no planned seed",
+                    ));
+                }
                 let fixed_tables = planned
                     .fixed_tables
                     .iter()
@@ -1089,7 +1130,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             .iter()
                             .map(|&binding| bind_arena_binding(arena, binding))
                             .collect::<Result<Vec<_>, _>>()?;
-                        PreparedMemoryBaseTraceGraph::prepare(
+                        let graph = PreparedMemoryBaseTraceGraph::prepare(
                             arena,
                             execution,
                             multiplicity("memory_address_to_id")?,
@@ -1106,12 +1147,24 @@ impl<'a> ResidentGraphRuntime<'a> {
                                 row_count: memory.small_part.row_count,
                                 outputs: &small_outputs,
                             },
+                            bind_arena_binding(arena, memory.rc99_lut)?,
+                            memory.plan.rc99_lut_words,
+                            bind_arena_binding(arena, memory.rc99_counts)?,
+                        )?;
+                        let rc99_lut = canonical_count_lut(
+                            "range_check_9_9_state",
+                            Arc::clone(&preprocessed_trace),
                         )
-                        .map_err(ResidentRuntimeError::from)
+                        .map_err(|_| {
+                            ResidentRuntimeError::CanonicalMultiplicityLut("range_check_9_9_state")
+                        })?;
+                        graph.upload_rc99_lut(&rc99_lut)?;
+                        Ok::<_, ResidentRuntimeError>(graph)
                     })
                     .transpose()?;
                 Some(PreparedResidentMultiplicity {
                     clear,
+                    public_memory_seed,
                     feeds,
                     fixed_tables,
                     memory_traces,
@@ -1835,6 +1888,9 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .clear
                         .launch()
                         .map_err(ResidentLaunchError::WitnessFeed)?;
+                    if let Some(seed) = &multiplicity.public_memory_seed {
+                        seed.launch().map_err(ResidentLaunchError::WitnessFeed)?;
+                    }
                 }
                 enqueue_witness_lane_levels(
                     arena,
@@ -2582,6 +2638,40 @@ impl<'a> ResidentGraphRuntime<'a> {
                     role: "PreparedMemoryBaseTraceGraph presence",
                 });
             }
+            if let (Some(prepared), Some(planned)) = (
+                prepared_multiplicity.memory_traces.as_ref(),
+                planned_multiplicity.memory_traces.as_ref(),
+            ) {
+                let reject = |role| ResidentRuntimeError::PreparedFixedTableCaptureContract {
+                    component: "memory_id_to_big->range_check_9_9",
+                    role,
+                };
+                if !slice_matches_slot(
+                    prepared.rc99_lut(),
+                    planned.rc99_lut.physical,
+                    planned.plan.rc99_lut_words,
+                ) || prepared.rc99_table_size() != planned.plan.rc99_lut_words
+                {
+                    return Err(reject("canonical LUT binding"));
+                }
+                if !slice_matches_slot(
+                    prepared.rc99_counts(),
+                    planned.rc99_counts.physical,
+                    planned.plan.rc99_count_words,
+                ) {
+                    return Err(reject("multiplicity slab binding"));
+                }
+                let Some(range_check) = planned_multiplicity
+                    .fixed_tables
+                    .iter()
+                    .find(|fixed| fixed.plan.component == "range_check_9_9")
+                else {
+                    return Err(reject("downstream materializer"));
+                };
+                if range_check.multiplicity.physical != planned.rc99_counts.physical {
+                    return Err(reject("shared downstream multiplicity slab"));
+                }
+            }
             if planned_memory
                 && !["memory_address_to_id", "memory_id_to_big"]
                     .into_iter()
@@ -2666,6 +2756,9 @@ impl<'a> ResidentGraphRuntime<'a> {
         }
         if let Some(multiplicity) = &self.multiplicity {
             multiplicity.clear.launch()?;
+            if let Some(seed) = &multiplicity.public_memory_seed {
+                seed.launch()?;
+            }
         }
         enqueue_witness_lane_levels(
             self.workspace.arena(),

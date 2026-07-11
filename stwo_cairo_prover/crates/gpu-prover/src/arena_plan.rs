@@ -56,8 +56,9 @@ use stwo_cairo_prover::witness::proof_shape::{
 
 use crate::composition_plan::{CompositionExtParamSource, CompositionPlan};
 use crate::multiplicity_pipeline::{
-    plan_graph_a_multiplicities, FixedMultiplicityCoverageGap, GraphAMultiplicityPlan,
-    GraphAMultiplicityPlanError, MultiplicityFeedBlocker, PlannedMemoryBaseTraces,
+    plan_graph_a_multiplicities, plan_public_memory_multiplicity_seed,
+    FixedMultiplicityCoverageGap, GraphAMultiplicityPlan, GraphAMultiplicityPlanError,
+    MultiplicityFeedBlocker, PlannedMemoryBaseTraces,
 };
 use crate::plan::ProofPlan;
 use crate::prepared_composition::{
@@ -227,6 +228,7 @@ pub enum BufferPurpose {
     WitnessFeedLut,
     WitnessFeedLutPointers,
     WitnessFeedMultiplicityPointers,
+    PublicMemoryMultiplicitySeed,
     FixedTableSourcePointers,
     FixedTableMultiplicityPointers,
     FixedTableTraceMultiplicityColumns,
@@ -1506,7 +1508,12 @@ fn feed_hash(hash: &mut u64, bytes: &[u8]) {
 
 fn execution_tables_protocol_key(mut protocol_key: u64, geometry: ExecutionTableGeometry) -> u64 {
     feed_hash(&mut protocol_key, b"resident-execution-tables-v1\0");
-    for dimension in [geometry.n_addrs, geometry.n_big, geometry.n_small] {
+    for dimension in [
+        geometry.n_addrs,
+        geometry.n_big,
+        geometry.n_small,
+        geometry.public_memory_entries,
+    ] {
         feed_hash(&mut protocol_key, &(dimension as u64).to_le_bytes());
     }
     protocol_key
@@ -1835,6 +1842,7 @@ pub struct ExecutionTableGeometry {
     pub n_addrs: usize,
     pub n_big: usize,
     pub n_small: usize,
+    pub public_memory_entries: usize,
 }
 
 impl ExecutionTableGeometry {
@@ -1843,7 +1851,13 @@ impl ExecutionTableGeometry {
             n_addrs,
             n_big,
             n_small,
+            public_memory_entries: 0,
         }
+    }
+
+    pub const fn with_public_memory_entries(mut self, entries: usize) -> Self {
+        self.public_memory_entries = entries;
+        self
     }
 }
 
@@ -1972,6 +1986,7 @@ struct LogicalGraphAMultiplicityWorkspace {
     clear_pointers: LogicalBufferId,
     clear_lengths: LogicalBufferId,
     feeds: Vec<LogicalRecordedMultiplicityFeed>,
+    public_memory_seed: Option<LogicalRecordedMultiplicityFeed>,
     fixed_tables: Vec<LogicalFixedTableMaterializer>,
     memory_traces: Option<LogicalMemoryBaseTraces>,
 }
@@ -1990,6 +2005,8 @@ struct LogicalMemoryBaseTraces {
     address_outputs: Vec<LogicalBufferId>,
     big_parts: Vec<LogicalMemoryTracePart>,
     small_part: LogicalMemoryTracePart,
+    rc99_lut: LogicalBufferId,
+    rc99_counts: LogicalBufferId,
 }
 
 #[derive(Clone, Debug)]
@@ -2094,6 +2111,7 @@ pub struct PlannedGraphAMultiplicityWorkspace {
     pub clear_requirements: WitnessFeedClearWorkspaceRequirements,
     pub clear_slots: WitnessFeedClearWorkspaceSlots,
     pub feeds: Vec<PlannedRecordedMultiplicityFeedGraph>,
+    pub public_memory_seed: Option<PlannedRecordedMultiplicityFeedGraph>,
     pub fixed_tables: Vec<PlannedFixedTableMaterializer>,
     pub memory_traces: Option<PlannedMemoryBaseTraceWorkspace>,
 }
@@ -2112,6 +2130,8 @@ pub struct PlannedMemoryBaseTraceWorkspace {
     pub address_outputs: Vec<ArenaBinding>,
     pub big_parts: Vec<PlannedMemoryTracePartWorkspace>,
     pub small_part: PlannedMemoryTracePartWorkspace,
+    pub rc99_lut: ArenaBinding,
+    pub rc99_counts: ArenaBinding,
 }
 
 impl PlannedGraphAMultiplicityWorkspace {
@@ -2530,6 +2550,7 @@ impl ProofArenaPlan {
                     &mut logical,
                     &logical_preprocessed,
                     multiplicity_plan,
+                    execution_table_geometry.map_or(0, |geometry| geometry.public_memory_entries),
                 )?)
             }
         } else {
@@ -3646,6 +3667,7 @@ fn append_graph_a_multiplicity_buffers(
     logical: &mut Vec<LogicalBuffer>,
     preprocessed: &LogicalPreprocessedWorkspace,
     plan: GraphAMultiplicityPlan,
+    public_memory_entries: usize,
 ) -> Result<LogicalGraphAMultiplicityWorkspace, ArenaPlanError> {
     let persistent = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble)?;
     let witness = BufferLifetime::at(ProofEpoch::Witness);
@@ -3730,7 +3752,8 @@ fn append_graph_a_multiplicity_buffers(
         lut_ids.insert(lut.state_param, id);
     }
 
-    let mut feeds = Vec::with_capacity(plan.feeds.len());
+    let feed_count = plan.feeds.len();
+    let mut feeds = Vec::with_capacity(feed_count);
     for (ordinal, feed) in plan.feeds.into_iter().enumerate() {
         let ordinal = u32::try_from(ordinal).map_err(|_| ArenaPlanError::SizeOverflow)?;
         let source = logical_buffer_id(
@@ -3800,6 +3823,85 @@ fn append_graph_a_multiplicity_buffers(
             multiplicity_pointers,
         });
     }
+
+    let public_memory_seed = (public_memory_entries != 0)
+        .then(|| {
+            let address = *multiplicity_ids.get("memory_address_to_id").ok_or(
+                ArenaPlanError::InvalidProtocolGeometry("missing public-memory address counts"),
+            )?;
+            let big = *multiplicity_ids.get("memory_id_to_big").ok_or(
+                ArenaPlanError::InvalidProtocolGeometry("missing public-memory big counts"),
+            )?;
+            let small = *multiplicity_ids.get("memory_id_to_big#small").ok_or(
+                ArenaPlanError::InvalidProtocolGeometry("missing public-memory small counts"),
+            )?;
+            let seed = plan_public_memory_multiplicity_seed(
+                public_memory_entries,
+                logical[address.0 as usize].len_words,
+                logical[big.0 as usize].len_words,
+                logical[small.0 as usize].len_words,
+            )
+            .map_err(ArenaPlanError::MultiplicityPlan)?;
+            if !seed.lut_families.is_empty()
+                || seed.destination_components
+                    != [
+                        "memory_address_to_id_state",
+                        "memory_id_to_big_state",
+                        "memory_id_to_big_state#small",
+                    ]
+            {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "public-memory multiplicity seed descriptor routing drifted",
+                ));
+            }
+            let ordinal = u32::try_from(feed_count).map_err(|_| ArenaPlanError::SizeOverflow)?;
+            let source = push_buffer_id(
+                logical,
+                None,
+                None,
+                BufferPurpose::PublicMemoryMultiplicitySeed,
+                0,
+                seed.requirements.source_words,
+                persistent,
+            )?;
+            let descriptors = push_buffer_id(
+                logical,
+                None,
+                None,
+                BufferPurpose::WitnessFeedDescriptors,
+                ordinal,
+                seed.requirements.descriptor_words,
+                persistent,
+            )?;
+            let lut_pointers = push_buffer_id(
+                logical,
+                None,
+                None,
+                BufferPurpose::WitnessFeedLutPointers,
+                ordinal,
+                seed.requirements.lut_pointer_words,
+                persistent,
+            )?;
+            let multiplicity_pointers = push_buffer_id(
+                logical,
+                None,
+                None,
+                BufferPurpose::WitnessFeedMultiplicityPointers,
+                ordinal,
+                seed.requirements.multiplicity_pointer_words,
+                persistent,
+            )?;
+            Ok::<_, ArenaPlanError>(LogicalRecordedMultiplicityFeed {
+                plan: seed,
+                source,
+                descriptors,
+                lut_tables: Vec::new(),
+                lut_pointers,
+                multiplicity_destinations: vec![address, big, small],
+                multiplicity_pointers,
+            })
+        })
+        .transpose()?;
 
     let mut fixed_tables = Vec::with_capacity(plan.fixed.len());
     for fixed in plan.fixed {
@@ -3973,11 +4075,26 @@ fn append_graph_a_multiplicity_buffers(
                     cairo_air::components::memory_id_to_small::N_TRACE_COLUMNS,
                 )?,
             };
+            let rc99_lut = *lut_ids.get("range_check_9_9_state").ok_or(
+                ArenaPlanError::InvalidProtocolGeometry("missing canonical rc9_9 LUT"),
+            )?;
+            let rc99_counts = *multiplicity_ids.get("range_check_9_9").ok_or(
+                ArenaPlanError::InvalidProtocolGeometry("missing rc9_9 multiplicity slab"),
+            )?;
+            if logical[rc99_lut.0 as usize].len_words != memory.rc99_lut_words
+                || logical[rc99_counts.0 as usize].len_words != memory.rc99_count_words
+            {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "rc9_9 memory-feed binding geometry drifted",
+                ));
+            }
             Ok::<_, ArenaPlanError>(LogicalMemoryBaseTraces {
                 plan: memory,
                 address_outputs,
                 big_parts,
                 small_part,
+                rc99_lut,
+                rc99_counts,
             })
         })
         .transpose()?;
@@ -3991,6 +4108,7 @@ fn append_graph_a_multiplicity_buffers(
         clear_pointers,
         clear_lengths,
         feeds,
+        public_memory_seed,
         fixed_tables,
         memory_traces,
     })
@@ -7452,36 +7570,38 @@ fn resolve_graph_a_multiplicity_slots(
         .clear_requirements
         .arena_slot_requirements(clear_slots)
         .map_err(ArenaPlanError::WitnessFeed)?;
+    let resolve_feed = |feed: LogicalRecordedMultiplicityFeed| {
+        let slots = WitnessFeedWorkspaceSlots {
+            descriptors: physical(feed.descriptors)?,
+            lut_tables: feed
+                .lut_tables
+                .into_iter()
+                .map(physical)
+                .collect::<Result<Vec<_>, _>>()?,
+            lut_pointers: physical(feed.lut_pointers)?,
+            multiplicity_destinations: feed
+                .multiplicity_destinations
+                .into_iter()
+                .map(physical)
+                .collect::<Result<Vec<_>, _>>()?,
+            multiplicity_pointers: physical(feed.multiplicity_pointers)?,
+        };
+        feed.plan
+            .requirements
+            .arena_slot_requirements(&slots)
+            .map_err(ArenaPlanError::WitnessFeed)?;
+        Ok::<_, ArenaPlanError>(PlannedRecordedMultiplicityFeedGraph {
+            plan: feed.plan,
+            source: binding(feed.source)?,
+            slots,
+        })
+    };
     let feeds = logical
         .feeds
         .into_iter()
-        .map(|feed| {
-            let slots = WitnessFeedWorkspaceSlots {
-                descriptors: physical(feed.descriptors)?,
-                lut_tables: feed
-                    .lut_tables
-                    .into_iter()
-                    .map(physical)
-                    .collect::<Result<Vec<_>, _>>()?,
-                lut_pointers: physical(feed.lut_pointers)?,
-                multiplicity_destinations: feed
-                    .multiplicity_destinations
-                    .into_iter()
-                    .map(physical)
-                    .collect::<Result<Vec<_>, _>>()?,
-                multiplicity_pointers: physical(feed.multiplicity_pointers)?,
-            };
-            feed.plan
-                .requirements
-                .arena_slot_requirements(&slots)
-                .map_err(ArenaPlanError::WitnessFeed)?;
-            Ok(PlannedRecordedMultiplicityFeedGraph {
-                plan: feed.plan,
-                source: binding(feed.source)?,
-                slots,
-            })
-        })
+        .map(&resolve_feed)
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+    let public_memory_seed = logical.public_memory_seed.map(resolve_feed).transpose()?;
     let fixed_tables = logical
         .fixed_tables
         .into_iter()
@@ -7546,6 +7666,8 @@ fn resolve_graph_a_multiplicity_slots(
                     .map(resolve_part)
                     .collect::<Result<Vec<_>, _>>()?,
                 small_part: resolve_part(memory.small_part)?,
+                rc99_lut: binding(memory.rc99_lut)?,
+                rc99_counts: binding(memory.rc99_counts)?,
             })
         })
         .transpose()?;
@@ -7557,6 +7679,7 @@ fn resolve_graph_a_multiplicity_slots(
         clear_requirements: logical.clear_requirements,
         clear_slots,
         feeds,
+        public_memory_seed,
         fixed_tables,
         memory_traces,
     })
@@ -8456,6 +8579,22 @@ mod tests {
             resident_arena.protocol_key,
             changed_execution_shape.protocol_key
         );
+        let public_seed_arena = ProofArenaPlan::build_with_execution_tables(
+            &proof,
+            &protocol,
+            &composition,
+            ExecutionTableGeometry::new(19, 17, 5).with_public_memory_entries(3),
+        )
+        .unwrap();
+        assert_ne!(resident_arena.protocol_key, public_seed_arena.protocol_key);
+        let public_seed = public_seed_arena
+            .multiplicity()
+            .unwrap()
+            .public_memory_seed
+            .as_ref()
+            .unwrap();
+        assert_eq!(public_seed.plan.row_count, 3);
+        assert_eq!(public_seed.source.len_words, 6);
         assert_eq!(arena.shape_key, proof.shape_key);
         assert_eq!(arena.commitments().len(), 4);
         assert_eq!(arena.composition().plan, composition);

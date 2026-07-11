@@ -1,0 +1,120 @@
+info: syncing channel updates for nightly-2025-07-14-x86_64-unknown-linux-gnu
+info: latest update on 2025-07-14 for version 1.90.0-nightly (e9182f195 2025-07-13)
+info: downloading 6 components
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded ark-ff-asm v0.4.2
+  Downloaded ark-serialize v0.4.2
+  Downloaded allocator-api2 v0.2.21
+  Downloaded arrayref v0.3.9
+  Downloaded ark-ff-macros v0.4.2
+  Downloaded autocfg v1.5.0
+  Downloaded block-buffer v0.10.4
+  Downloaded ark-std v0.4.0
+  Downloaded bigdecimal v0.3.1
+  Downloaded arrayvec v0.7.6
+  Downloaded fnv v1.0.7
+  Downloaded crypto-common v0.1.6
+  Downloaded block-buffer v0.12.0
+  Downloaded hex v0.4.3
+  Downloaded crypto-common v0.2.1
+  Downloaded generic-array v0.14.7
+  Downloaded constant_time_eq v0.3.1
+  Downloaded cpufeatures v0.2.17
+  Downloaded equivalent v1.0.2
+  Downloaded enum-ordinalize v4.3.0
+  Downloaded rfc6979 v0.4.0
+  Downloaded version_check v0.9.5
+  Downloaded starknet-crypto-codegen v0.3.3
+  Downloaded stwo-std-shims v1.0.0
+  Downloaded starknet-curve v0.4.2
+  Downloaded rustc_version v0.4.1
+  Downloaded zeroize_derive v1.4.2
+  Downloaded starknet-ff v0.3.7
+  Downloaded cfg-if v1.0.1
+  Downloaded enum-ordinalize-derive v4.3.1
+  Downloaded starknet-crypto v0.6.2
+  Downloaded scopeguard v1.2.0
+  Downloaded subtle v2.6.1
+  Downloaded bytemuck_derive v1.9.3
+  Downloaded paste v1.0.15
+  Downloaded dashmap v6.1.0
+  Downloaded num-integer v0.1.46
+  Downloaded rand_chacha v0.3.1
+  Downloaded foldhash v0.1.5
+  Downloaded lock_api v0.4.14
+  Downloaded sha2 v0.10.9
+  Downloaded shlex v1.3.0
+  Downloaded rand_core v0.6.4
+  Downloaded pin-project-lite v0.2.16
+  Downloaded thiserror-impl v2.0.12
+  Downloaded semver v1.0.26
+  Downloaded keccak v0.2.0
+  Downloaded either v1.15.0
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded digest v0.11.2
+  Downloaded digest v0.10.7
+  Downloaded thiserror v2.0.12
+  Downloaded zeroize v1.8.1
+  Downloaded blake2 v0.10.6
+  Downloaded ark-ff v0.4.2
+  Downloaded hybrid-array v0.4.11
+  Downloaded parking_lot_core v0.9.12
+  Downloaded educe v0.5.11
+  Downloaded derivative v2.2.0
+  Downloaded tracing-attributes v0.1.30
+  Downloaded quote v1.0.40
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded hmac v0.12.1
+  Downloaded once_cell v1.21.3
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded serde_core v1.0.228
+  Downloaded unicode-ident v1.0.18
+  Downloaded smallvec v1.15.1
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded proc-macro2 v1.0.95
+  Downloaded serde_derive v1.0.228
+  Downloaded bytemuck v1.23.1
+  Downloaded rayon-core v1.12.1
+  Downloaded num-traits v0.2.19
+  Downloaded tracing-core v0.1.34
+  Downloaded tracing v0.1.41
+  Downloaded serde v1.0.228
+  Downloaded rand v0.8.5
+  Downloaded crypto-bigint v0.5.5
+  Downloaded num-bigint v0.4.6
+  Downloaded typenum v1.20.0
+  Downloaded indexmap v2.10.0
+  Downloaded itertools v0.10.5
+  Downloaded cc v1.2.29
+  Downloaded itertools v0.12.1
+  Downloaded hashbrown v0.14.5
+  Downloaded hashbrown v0.15.4
+  Downloaded tracing-subscriber v0.3.19
+  Downloaded rayon v1.10.0
+  Downloaded blake3 v1.8.2
+  Downloaded syn v2.0.104
+  Downloaded zerocopy v0.8.26
+  Downloaded syn v1.0.109
+  Downloaded sha3 v0.11.0
+  Downloaded libc v0.2.174
+   Compiling stwo-backend-cuda-kernels v0.1.0 (/workspace/stwo/crates/backend-cuda-kernels)
+   Compiling stwo-backend-cuda v2.2.0 (/workspace/stwo/crates/backend-cuda)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19m 50s
+     Running tests/prepared_execution_tables_native.rs (target/debug/deps/prepared_execution_tables_native-c90b1182ccbf9346)
+
+running 1 test
+test prepared_memory_base_trace_handles_partial_final_and_padding_part ...
+thread 'prepared_memory_base_trace_handles_partial_final_and_padding_part' panicked at crates/backend-cuda/tests/prepared_execution_tables_native.rs:583:6:
+called `Result::unwrap()` on an `Err` value: ShapeMismatch { role: "big source coverage", expected: 32, actual: 48 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    prepared_memory_base_trace_handles_partial_final_and_padding_part
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.63s
+
+error: test failed, to rerun pass `-p stwo-backend-cuda --test prepared_execution_tables_native`

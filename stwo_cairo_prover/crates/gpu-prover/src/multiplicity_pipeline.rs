@@ -16,7 +16,7 @@ use crate::fixed_table_materializer::{
     FixedTableMaterializerError,
 };
 use crate::plan::ProofPlan;
-use crate::schedule::WitnessWriterKind;
+use crate::schedule::{WitnessWriterKind, WitnessWriterSpec};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MultiplicityFeedBlockerKind {
@@ -56,6 +56,49 @@ pub struct PlannedRecordedMultiplicityFeed {
     pub requirements: WitnessFeedWorkspaceRequirements,
 }
 
+pub fn plan_public_memory_multiplicity_seed(
+    row_count: usize,
+    address_words: usize,
+    big_words: usize,
+    small_words: usize,
+) -> Result<PlannedRecordedMultiplicityFeed, GraphAMultiplicityPlanError> {
+    if row_count == 0 {
+        return Err(GraphAMultiplicityPlanError::SizeOverflow);
+    }
+    const LAYOUT: &[(&str, usize, &str, u32, usize, usize)] = &[
+        ("address", 0, "memory_address_to_id_state", 0, 0, 1),
+        ("id", 0, "memory_id_to_big_state", 0, 1, 1),
+    ];
+    let (descriptors, lut_families, destination_components, multiplicity_words) =
+        build_feed_descriptors_sized(LAYOUT, COUNT_RELATIONS, &|state| match state {
+            "memory_address_to_id_state" => Some((address_words, 0)),
+            "memory_id_to_big_state" => Some((big_words, small_words)),
+            _ => None,
+        });
+    let source_words = row_count
+        .checked_mul(2)
+        .ok_or(GraphAMultiplicityPlanError::SizeOverflow)?;
+    Ok(PlannedRecordedMultiplicityFeed {
+        producer: "__public_memory__",
+        row_count,
+        sub_words_per_row: 2,
+        requirements: WitnessFeedWorkspaceRequirements {
+            row_count,
+            sub_words_per_row: 2,
+            source_words,
+            descriptor_words: descriptors.len(),
+            descriptor_count: descriptors.len() / WITNESS_FEED_DESCRIPTOR_WORDS,
+            lut_pointer_words: pointer_words(0)?,
+            multiplicity_pointer_words: pointer_words(destination_components.len())?,
+            lut_words: Vec::new(),
+            multiplicity_words,
+        },
+        descriptors,
+        lut_families,
+        destination_components,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedFixedMultiplicity {
     pub component: &'static str,
@@ -84,6 +127,8 @@ pub struct PlannedMemoryBaseTraces {
     pub address_count_words: usize,
     pub big_count_words: usize,
     pub small_count_words: usize,
+    pub rc99_lut_words: usize,
+    pub rc99_count_words: usize,
     pub big_parts: Vec<PlannedMemoryTracePart>,
     pub small_part: PlannedMemoryTracePart,
 }
@@ -348,6 +393,16 @@ pub fn plan_graph_a_multiplicities(
     }) {
         actual.insert(("range_check_8", "ec_op_builtin"), 2);
     }
+    let memory_native_coverage = memory_traces.is_some()
+        && native_memory_rc99_coverage(
+            proof_component(proof, "memory_id_to_big")?
+                .node
+                .facts
+                .witness_writer,
+        );
+    if memory_native_coverage {
+        actual.insert(("range_check_9_9", "memory_id_to_big"), 18);
+    }
 
     let mut expected = BTreeMap::new();
     for table in &fixed {
@@ -370,6 +425,9 @@ pub fn plan_graph_a_multiplicities(
             expected.insert((table.component, capacity.from), capacity.n_instances);
         }
     }
+    if memory_traces.is_some() {
+        expected.insert(("range_check_9_9", "memory_id_to_big"), 18);
+    }
     let coverage_gaps = validate_coverage(&expected, &actual)?;
 
     let mut luts = BTreeMap::new();
@@ -383,6 +441,14 @@ pub fn plan_graph_a_multiplicities(
             }
         }
     }
+    if let Some(memory) = &memory_traces {
+        match luts.insert("range_check_9_9_state", memory.rc99_lut_words) {
+            Some(previous) if previous != memory.rc99_lut_words => {
+                return Err(GraphAMultiplicityPlanError::SizeOverflow)
+            }
+            _ => {}
+        }
+    }
     let luts = luts
         .into_iter()
         .map(|(state_param, words)| PlannedCanonicalLut { state_param, words })
@@ -392,6 +458,7 @@ pub fn plan_graph_a_multiplicities(
         &runtime,
         memory_traces.as_ref(),
         &feeds,
+        &luts,
         &coverage_gaps,
         &blockers,
     );
@@ -532,11 +599,24 @@ fn plan_memory_base_traces(
     let small_part = small_part.ok_or(GraphAMultiplicityPlanError::InvalidMemoryGeometry(
         "memory_id_to_big has no small part",
     ))?;
+    let rc99 = count_relation("range_check_9_9_state").ok_or(
+        GraphAMultiplicityPlanError::InvalidMemoryGeometry("missing canonical rc9_9 relation"),
+    )?;
+    if !rc99.needs_lut || rc99.n_relations != 8 || rc99.table_size == 0 {
+        return Err(GraphAMultiplicityPlanError::InvalidMemoryGeometry(
+            "canonical rc9_9 relation geometry drifted",
+        ));
+    }
     Ok(Some(PlannedMemoryBaseTraces {
         address_rows,
         address_count_words,
         big_count_words,
         small_count_words: small_part.row_count,
+        rc99_lut_words: rc99.table_size,
+        rc99_count_words: rc99
+            .table_size
+            .checked_mul(rc99.n_relations)
+            .ok_or(GraphAMultiplicityPlanError::SizeOverflow)?,
         big_parts,
         small_part,
     }))
@@ -558,6 +638,10 @@ fn count_relation(state_param: &str) -> Option<&'static CountRelation> {
     COUNT_RELATIONS
         .iter()
         .find(|relation| relation.state_param == state_param)
+}
+
+fn native_memory_rc99_coverage(writer: WitnessWriterSpec) -> bool {
+    writer.kind == WitnessWriterKind::NativeCuda && writer.is_capture_safe()
 }
 
 fn count_relation_for_fixed(component: &str) -> Option<&'static CountRelation> {
@@ -603,6 +687,7 @@ fn topology_hash(
     runtime: &[PlannedRuntimeMultiplicity],
     memory: Option<&PlannedMemoryBaseTraces>,
     feeds: &[PlannedRecordedMultiplicityFeed],
+    luts: &[PlannedCanonicalLut],
     gaps: &[FixedMultiplicityCoverageGap],
     blockers: &[MultiplicityFeedBlocker],
 ) -> u64 {
@@ -613,7 +698,7 @@ fn topology_hash(
             hash = hash.wrapping_mul(0x100_0000_01b3);
         }
     };
-    feed(b"stwo-cairo-graph-a-multiplicity-v1\0");
+    feed(b"stwo-cairo-graph-a-multiplicity-v2\0");
     for table in fixed {
         feed(table.component.as_bytes());
         feed(&[0]);
@@ -641,6 +726,8 @@ fn topology_hash(
     }
     if let Some(memory) = memory {
         feed(&(memory.address_rows as u64).to_le_bytes());
+        feed(&(memory.rc99_lut_words as u64).to_le_bytes());
+        feed(&(memory.rc99_count_words as u64).to_le_bytes());
         for part in memory.big_parts.iter().chain([&memory.small_part]) {
             feed(&match part.part {
                 TracePartId::Main => [0, 0, 0, 0],
@@ -665,6 +752,11 @@ fn topology_hash(
             feed(destination.as_bytes());
             feed(&[0]);
         }
+    }
+    for lut in luts {
+        feed(lut.state_param.as_bytes());
+        feed(&[0]);
+        feed(&(lut.words as u64).to_le_bytes());
     }
     for gap in gaps {
         feed(gap.fixed_component.as_bytes());
@@ -696,7 +788,39 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn public_memory_seed_preserves_duplicate_address_and_id_multiplicities() {
+        use stwo_cairo_prover::witness::device_feed::host_feed_counts;
+
+        let seed = plan_public_memory_multiplicity_seed(3, 16, 8, 4).unwrap();
+        assert!(seed.lut_families.is_empty());
+        assert_eq!(
+            seed.destination_components,
+            [
+                "memory_address_to_id_state",
+                "memory_id_to_big_state",
+                "memory_id_to_big_state#small"
+            ]
+        );
+        let source = vec![1, 3, 3, 1 << 30, 1, (1 << 30) | 2];
+        let mut counts = vec![vec![0; 16], vec![0; 8], vec![0; 4]];
+        host_feed_counts(&source, 3, &seed.descriptors, &[], &mut counts);
+        assert_eq!(counts[0][0], 1);
+        assert_eq!(counts[0][2], 2);
+        assert_eq!(counts[1][0], 1);
+        assert_eq!(counts[1][2], 1);
+        assert_eq!(counts[2][1], 1);
+        assert_eq!(
+            counts
+                .iter()
+                .map(|slot| slot.iter().sum::<u32>())
+                .sum::<u32>(),
+            6
+        );
+    }
     use crate::relation_table::CAIRO_RELATION_GRAPH;
+    use crate::schedule::WitnessWriterReadiness;
     use crate::schedule_table::CAIRO_SCHEDULE;
 
     #[test]
@@ -719,6 +843,19 @@ mod tests {
             validate_coverage(&expected, &unexpected),
             Err(GraphAMultiplicityPlanError::UnexpectedPreparedProducer { .. })
         ));
+    }
+
+    #[test]
+    fn memory_rc99_native_coverage_requires_capture_safe_cuda() {
+        assert!(native_memory_rc99_coverage(WitnessWriterSpec {
+            kind: WitnessWriterKind::NativeCuda,
+            readiness: WitnessWriterReadiness::CaptureSafe,
+        }));
+        assert!(!native_memory_rc99_coverage(WitnessWriterSpec {
+            kind: WitnessWriterKind::NativeCuda,
+            readiness: WitnessWriterReadiness::ArenaDestination,
+        }));
+        assert!(!native_memory_rc99_coverage(WitnessWriterSpec::HOST));
     }
 
     #[test]
@@ -786,6 +923,8 @@ mod tests {
         assert_eq!(memory.address_count_words, 16 * 16);
         assert_eq!(memory.big_count_words, 32 + 32 + 16);
         assert_eq!(memory.small_count_words, 16);
+        assert_eq!(memory.rc99_lut_words, 1 << 18);
+        assert_eq!(memory.rc99_count_words, 8 << 18);
         assert_eq!(
             memory
                 .big_parts
@@ -797,6 +936,28 @@ mod tests {
                 (TracePartId::MemoryBig(1), 32, 32),
                 (TracePartId::MemoryBig(2), 64, 16),
             ]
+        );
+        let multiplicity = plan_graph_a_multiplicities(&proof).unwrap();
+        assert!(multiplicity
+            .luts
+            .iter()
+            .any(|lut| { lut.state_param == "range_check_9_9_state" && lut.words == 1 << 18 }));
+        assert!(!multiplicity.coverage_gaps.iter().any(|gap| {
+            gap.fixed_component == "range_check_9_9" && gap.producer == "memory_id_to_big"
+        }));
+        let mut changed_memory = multiplicity.memory_traces.clone().unwrap();
+        changed_memory.rc99_count_words += 1;
+        assert_ne!(
+            multiplicity.topology_hash,
+            topology_hash(
+                &multiplicity.fixed,
+                &multiplicity.runtime,
+                Some(&changed_memory),
+                &multiplicity.feeds,
+                &multiplicity.luts,
+                &multiplicity.coverage_gaps,
+                &multiplicity.blockers,
+            )
         );
     }
 }

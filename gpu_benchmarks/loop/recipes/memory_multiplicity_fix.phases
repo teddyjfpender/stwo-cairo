@@ -1,0 +1,9 @@
+# Hardware admission for the two host-origin multiplicity fixes, followed by
+# the full strict resident trace audit. Keep smoke gated on trace_audit 45/45.
+cd "$STWO"
+phase memory_rc99_native cargo test -p stwo-backend-cuda --test prepared_execution_tables_native prepared_memory_base_trace_handles_partial_final_and_padding_part -- --nocapture --test-threads=1
+
+cd "$CAIRO"
+phase memory_planner_units cargo test -p stwo-cairo-gpu-prover multiplicity_pipeline::tests::memory_ --lib -- --nocapture --test-threads=1
+phase public_seed_units cargo test -p stwo-cairo-gpu-prover public_memory_ --lib -- --nocapture --test-threads=1
+phase trace_audit env STWO_TRACE_AUDIT_DUMP_POSEIDON_KIND11_ROW0=1 cargo test -p stwo-cairo-gpu-prover --test resident_trace_audit -- --nocapture --test-threads=1

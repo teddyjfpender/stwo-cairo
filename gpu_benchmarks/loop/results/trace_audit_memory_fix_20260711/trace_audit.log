@@ -1,0 +1,960 @@
+    Updating crates.io index
+    Updating git repository `https://github.com/starkware-libs/proving-utils`
+ Downloading crates ...
+  Downloaded alloy-rlp v0.3.12
+  Downloaded adler2 v2.0.1
+  Downloaded ark-ec v0.5.0
+  Downloaded anstyle-query v1.1.5
+  Downloaded assert_matches v1.5.0
+  Downloaded ark-secp256k1 v0.5.0
+  Downloaded bincode_derive v2.0.1
+  Downloaded anstyle v1.0.13
+  Downloaded block-buffer v0.10.4
+  Downloaded cairo-lang-eq-solver v2.17.0-rc.4
+  Downloaded parking_lot v0.12.5
+  Downloaded colorchoice v1.0.4
+  Downloaded cairo-lang-primitive-token v1.0.0
+  Downloaded funty v2.0.0
+  Downloaded cairo-lang-sierra-ap-change v2.17.0-rc.4
+  Downloaded hex v0.4.3
+  Downloaded starknet-ff v0.3.7
+  Downloaded test-log-macros v0.2.19
+  Downloaded test-log v0.2.19
+  Downloaded toml_parser v1.0.6+spec-1.1.0
+  Downloaded hashbrown v0.14.5
+  Downloaded starknet-curve v0.6.0
+  Downloaded unty v0.0.4
+  Downloaded bzip2-sys v0.1.13+1.0.8
+  Downloaded utf8parse v0.2.2
+  Downloaded either v1.15.0
+  Downloaded indent v0.1.1
+  Downloaded crossbeam-queue v0.3.12
+  Downloaded toml v0.9.11+spec-1.1.0
+  Downloaded virtue v0.0.18
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded subtle v2.6.1
+  Downloaded tracing-log v0.2.0
+  Downloaded rayon-core v1.13.0
+  Downloaded equivalent v1.0.2
+  Downloaded enum-ordinalize v4.3.2
+  Downloaded nom v7.1.3
+  Downloaded env_filter v0.1.4
+  Downloaded serde_derive v1.0.228
+  Downloaded yansi v1.0.1
+  Downloaded ryu v1.0.22
+  Downloaded faststr v0.2.34
+  Downloaded env_logger v0.11.8
+  Downloaded serde v1.0.228
+  Downloaded fixed-hash v0.8.0
+  Downloaded winnow v0.7.14
+  Downloaded memmap2 v0.9.9
+  Downloaded fixedbitset v0.5.7
+  Downloaded schemars v1.2.0
+  Downloaded matrixmultiply v0.3.10
+  Downloaded pest v2.8.5
+  Downloaded sonic-rs v0.3.17
+  Downloaded ruint v1.17.2
+  Downloaded zerocopy v0.8.37
+  Downloaded memchr v2.7.6
+  Downloaded flate2 v1.1.8
+  Downloaded libm v0.2.16
+  Downloaded hashbrown v0.16.1
+  Downloaded hashbrown v0.15.5
+  Downloaded salsa v0.26.2
+  Downloaded proptest v1.9.0
+  Downloaded itertools v0.13.0
+  Downloaded tracing-subscriber v0.3.22
+  Downloaded syn v1.0.109
+  Downloaded portable-atomic v1.13.1
+  Downloaded regex-syntax v0.8.8
+  Downloaded rust_decimal v1.40.0
+  Downloaded syn v2.0.114
+  Downloaded rkyv v0.8.14
+  Downloaded rayon v1.11.0
+  Downloaded serde_json v1.0.149
+  Downloaded regex v1.12.2
+  Downloaded num-prime v0.4.4
+  Downloaded getrandom v0.3.4
+  Downloaded sprs v0.11.4
+  Downloaded sha3 v0.11.0
+  Downloaded rand v0.9.2
+  Downloaded uuid v1.20.0
+  Downloaded fnv v1.0.7
+  Downloaded rand v0.8.5
+  Downloaded log v0.4.29
+  Downloaded regex-automata v0.4.13
+  Downloaded libbz2-rs-sys v0.1.3
+  Downloaded miniz_oxide v0.8.9
+  Downloaded tracing v0.1.44
+  Downloaded enum-ordinalize-derive v4.3.2
+  Downloaded memoffset v0.9.1
+  Downloaded matchers v0.2.0
+  Downloaded time v0.3.46
+  Downloaded petgraph v0.7.1
+  Downloaded pretty_assertions v1.4.1
+  Downloaded libc v0.2.180
+  Downloaded ena v0.14.3
+  Downloaded crypto-bigint v0.5.5
+  Downloaded sha3 v0.10.8
+  Downloaded const_format v0.2.35
+  Downloaded zip v0.6.6
+  Downloaded itertools v0.12.1
+  Downloaded hashbrown v0.17.1
+  Downloaded starknet-types-core v0.2.4
+  Downloaded proc-macro2 v1.0.106
+  Downloaded itertools v0.10.5
+  Downloaded indexmap v2.13.0
+  Downloaded zeroize v1.8.2
+  Downloaded xxhash-rust v0.8.15
+  Downloaded xshell-macros v0.2.7
+  Downloaded xshell v0.2.7
+  Downloaded wyz v0.5.1
+  Downloaded walkdir v2.5.0
+  Downloaded version_check v0.9.5
+  Downloaded vector-map v1.0.2
+  Downloaded typeid v1.0.3
+  Downloaded getrandom v0.2.17
+  Downloaded genco-macros v0.19.0
+  Downloaded foldhash v0.1.5
+  Downloaded lock_api v0.4.14
+  Downloaded keccak v0.2.0
+  Downloaded keccak v0.1.5
+  Downloaded unicode-segmentation v1.12.0
+  Downloaded typenum v1.19.0
+  Downloaded sharded-slab v0.1.7
+  Downloaded serde_core v1.0.228
+  Downloaded parity-scale-codec v3.7.5
+  Downloaded generic-array v0.14.7
+  Downloaded fastrlp v0.4.0
+  Downloaded fastrlp v0.3.1
+  Downloaded erased-serde v0.4.9
+  Downloaded stwo-std-shims v1.0.0
+  Downloaded strsim v0.11.1
+  Downloaded string_cache v0.8.9
+  Downloaded static_assertions v1.1.0
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded new_debug_unreachable v1.0.6
+  Downloaded munge v0.4.7
+  Downloaded hash32 v0.2.1
+  Downloaded good_lp v1.14.2
+  Downloaded globset v0.4.18
+  Downloaded tracing-core v0.1.36
+  Downloaded tracing-attributes v0.1.31
+  Downloaded toml_writer v1.0.6+spec-1.1.0
+  Downloaded tinyvec v1.10.0
+  Downloaded time-macros v0.2.26
+  Downloaded time-core v0.1.8
+  Downloaded thread_local v1.1.9
+  Downloaded thiserror-impl v2.0.18
+  Downloaded thiserror v2.0.18
+  Downloaded embedded-io v0.6.1
+  Downloaded embedded-io v0.4.0
+  Downloaded crypto-common v0.1.7
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded crc32fast v1.5.0
+  Downloaded constant_time_eq v0.4.2
+  Downloaded const_format_proc_macros v0.2.34
+  Downloaded lru v0.12.5
+  Downloaded toml_edit v0.23.10+spec-1.0.0
+  Downloaded sonic-number v0.1.0
+  Downloaded smallvec v1.15.1
+  Downloaded pkg-config v0.3.32
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded tap v1.0.1
+  Downloaded synstructure v0.13.2
+  Downloaded crunchy v0.2.4
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded cpufeatures v0.2.17
+  Downloaded convert_case v0.11.0
+  Downloaded const-fnv1a-hash v1.1.0
+  Downloaded zmij v1.0.18
+  Downloaded zeroize_derive v1.4.3
+  Downloaded itoa v1.0.17
+  Downloaded intrusive-collections v0.9.7
+  Downloaded ignore v0.4.25
+  Downloaded valuable v0.1.1
+  Downloaded num-bigint v0.4.6
+  Downloaded lambdaworks-math v0.13.0
+  Downloaded spin v0.9.8
+  Downloaded semver-parser v0.10.3
+  Downloaded salsa-macros v0.26.2
+  Downloaded postcard v1.1.3
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded inventory v0.3.24
+  Downloaded indoc v2.0.7
+  Downloaded impl-trait-for-tuples v0.2.3
+  Downloaded impl-codec v0.6.0
+  Downloaded minimal-lexical v0.2.1
+  Downloaded lambdaworks-crypto v0.13.0
+  Downloaded smol_str v0.3.5
+  Downloaded ptr_meta_derive v0.3.1
+  Downloaded id-arena v2.3.0
+  Downloaded semver v1.0.27
+  Downloaded scopeguard v1.2.0
+  Downloaded rustversion v1.0.22
+  Downloaded rkyv_derive v0.8.14
+  Downloaded educe v0.6.0
+  Downloaded educe v0.5.11
+  Downloaded dyn-clone v1.0.20
+  Downloaded digest v0.11.3
+  Downloaded digest v0.10.7
+  Downloaded digest v0.9.0
+  Downloaded diffy v0.4.2
+  Downloaded diff v0.1.13
+  Downloaded derivative v2.2.0
+  Downloaded deranged v0.5.5
+  Downloaded dashmap v6.1.0
+  Downloaded crypto-common v0.2.2
+  Downloaded lalrpop v0.22.2
+  Downloaded semver v0.11.0
+  Downloaded schemars_derive v1.2.0
+  Downloaded rand_core v0.6.4
+  Downloaded quote v1.0.44
+  Downloaded pin-project-lite v0.2.16
+  Downloaded once_cell v1.21.3
+  Downloaded num-traits v0.2.19
+  Downloaded cairo-lang-starknet v2.17.0-rc.4
+  Downloaded starknet-crypto v0.8.1
+  Downloaded sonic-simd v0.1.2
+  Downloaded simdutf8 v0.1.5
+  Downloaded simd-adler32 v0.3.8
+  Downloaded shlex v1.3.0
+  Downloaded sha2 v0.10.9
+  Downloaded serde_derive_internals v0.29.1
+  Downloaded serde_arrays v0.1.0
+  Downloaded salsa-macro-rules v0.26.2
+  Downloaded relative-path v1.9.3
+  Downloaded rand_xorshift v0.4.0
+  Downloaded rand_core v0.9.5
+  Downloaded rand_chacha v0.9.0
+  Downloaded phf_shared v0.11.3
+  Downloaded unicode-xid v0.2.6
+  Downloaded unicode-ident v1.0.22
+  Downloaded unescaper v0.1.8
+  Downloaded unarray v0.1.4
+  Downloaded uint v0.9.5
+  Downloaded ucd-trie v0.1.7
+  Downloaded typetag-impl v0.2.21
+  Downloaded typetag v0.2.21
+  Downloaded itertools v0.14.0
+  Downloaded proc-macro-crate v3.4.0
+  Downloaded paste v1.0.15
+  Downloaded parking_lot_core v0.9.12
+  Downloaded num-modular v0.5.1
+  Downloaded ndarray v0.17.2
+  Downloaded colored v3.1.1
+  Downloaded cairo-vm v3.2.0
+  Downloaded cairo-lang-semantic v2.17.0-rc.4
+  Downloaded cairo-lang-lowering v2.17.0-rc.4
+  Downloaded bstr v1.12.1
+  Downloaded blake3 v1.8.3
+  Downloaded bitvec v1.0.1
+  Downloaded starknet-curve v0.4.2
+  Downloaded starknet-crypto v0.6.2
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded siphasher v1.0.2
+  Downloaded rustc-hex v2.1.0
+  Downloaded rlp v0.5.2
+  Downloaded ref-cast-impl v1.0.25
+  Downloaded primitive-types v0.12.2
+  Downloaded precomputed-hash v0.1.1
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded clap_builder v4.5.56
+  Downloaded cairo-lang-syntax v2.17.0-rc.4
+  Downloaded aho-corasick v1.1.4
+  Downloaded toml_datetime v0.7.5+spec-1.1.0
+  Downloaded thin-vec v0.2.14
+  Downloaded microlp v0.2.11
+  Downloaded heapless v0.7.17
+  Downloaded rawpointer v0.2.1
+  Downloaded cairo-lang-sierra-to-casm v2.17.0-rc.4
+  Downloaded cairo-lang-sierra v2.17.0-rc.4
+  Downloaded cairo-lang-parser v2.17.0-rc.4
+  Downloaded bumpalo v3.19.1
+  Downloaded term v1.2.1
+  Downloaded cairo-lang-sierra-generator v2.17.0-rc.4
+  Downloaded num-complex v0.4.6
+  Downloaded hmac v0.12.1
+  Downloaded genco v0.19.0
+  Downloaded ref-cast v1.0.25
+  Downloaded clap v4.5.56
+  Downloaded cc v1.2.55
+  Downloaded cairo-lang-syntax-codegen v2.17.0-rc.4
+  Downloaded cairo-lang-runner v2.17.0-rc.4
+  Downloaded cairo-lang-executable v2.17.0-rc.4
+  Downloaded bytes v1.11.0
+  Downloaded bytemuck v1.25.0
+  Downloaded borsh v1.6.0
+  Downloaded bincode v2.0.1
+  Downloaded ark-ff v0.5.0
+  Downloaded ark-ff v0.4.2
+  Downloaded lazy_static v1.5.0
+  Downloaded lalrpop-util v0.22.2
+  Downloaded hybrid-array v0.4.10
+  Downloaded starknet-crypto-codegen v0.3.3
+  Downloaded rustc_version v0.3.3
+  Downloaded rfc6979 v0.4.0
+  Downloaded rand_chacha v0.3.1
+  Downloaded clap_derive v4.5.55
+  Downloaded cairo-lang-plugins v2.17.0-rc.4
+  Downloaded cairo-lang-defs v2.17.0-rc.4
+  Downloaded cairo-lang-casm v2.17.0-rc.4
+  Downloaded bzip2 v0.5.2
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded block-buffer v0.12.0
+  Downloaded blake2 v0.10.6
+  Downloaded bitflags v2.10.0
+  Downloaded ark-poly v0.5.0
+  Downloaded anyhow v1.0.100
+  Downloaded allocator-api2 v0.2.21
+  Downloaded heck v0.5.0
+  Downloaded hashlink v0.10.0
+  Downloaded foldhash v0.2.0
+  Downloaded serde_spanned v1.0.4
+  Downloaded same-file v1.0.6
+  Downloaded rustc_version v0.4.1
+  Downloaded rustc-hash v2.1.1
+  Downloaded ruint-macro v1.2.1
+  Downloaded rend v0.5.3
+  Downloaded radium v0.7.0
+  Downloaded pico-args v0.5.0
+  Downloaded path-clean v1.0.1
+  Downloaded parity-scale-codec-derive v3.7.5
+  Downloaded num-integer v0.1.46
+  Downloaded cairo-lang-utils v2.17.0-rc.4
+  Downloaded cairo-lang-test-utils v2.17.0-rc.4
+  Downloaded cairo-lang-starknet-classes v2.17.0-rc.4
+  Downloaded cairo-lang-sierra-gas v2.17.0-rc.4
+  Downloaded cairo-lang-formatter v2.17.0-rc.4
+  Downloaded cairo-lang-executable-plugin v2.17.0-rc.4
+  Downloaded cairo-lang-compiler v2.17.0-rc.4
+  Downloaded ark-ff v0.3.0
+  Downloaded cairo-lang-runnable-utils v2.17.0-rc.4
+  Downloaded cairo-lang-filesystem v2.17.0-rc.4
+  Downloaded cairo-lang-diagnostics v2.17.0-rc.4
+  Downloaded byteorder v1.5.0
+  Downloaded boxcar v0.2.14
+  Downloaded bit-vec v0.8.0
+  Downloaded bincode v1.3.3
+  Downloaded bigdecimal v0.3.1
+  Downloaded autocfg v1.5.0
+  Downloaded auto_impl v1.3.0
+  Downloaded ark-std v0.4.0
+  Downloaded ahash v0.8.12
+  Downloaded rancor v0.1.1
+  Downloaded ptr_meta v0.3.1
+  Downloaded powerfmt v0.2.0
+  Downloaded num-conv v0.2.0
+  Downloaded munge_macro v0.4.7
+  Downloaded cobs v0.3.0
+  Downloaded cairo-lang-sierra-type-size v2.17.0-rc.4
+  Downloaded cairo-lang-proc-macros v2.17.0-rc.4
+  Downloaded cairo-lang-debug v2.17.0-rc.4
+  Downloaded arrayvec v0.7.6
+  Downloaded ark-std v0.5.0
+  Downloaded ark-std v0.3.0
+  Downloaded anstyle-parse v0.2.7
+  Downloaded bit-set v0.8.0
+  Downloaded ark-serialize v0.3.0
+  Downloaded clap_lex v0.7.7
+  Downloaded cfg-if v1.0.4
+  Downloaded arrayref v0.3.9
+  Downloaded cfg_aliases v0.2.1
+  Downloaded cairo-lang-project v2.17.0-rc.4
+  Downloaded ark-serialize v0.4.2
+  Downloaded byte-slice-cast v1.2.3
+  Downloaded ark-secp256r1 v0.5.0
+  Downloaded ark-ff-macros v0.3.0
+  Downloaded ark-ff-asm v0.4.2
+  Downloaded anstream v0.6.21
+  Downloaded ascii-canvas v4.0.0
+  Downloaded ark-serialize-derive v0.5.0
+  Downloaded ark-ff-macros v0.5.0
+  Downloaded ark-ff-macros v0.4.2
+  Downloaded ark-ff-asm v0.5.0
+  Downloaded ark-serialize v0.5.0
+  Downloaded ark-ff-asm v0.3.0
+warning: unused variable: `raw_u32`
+    --> crates/prover/src/witness/components/blake_round.rs:6986:9
+     |
+6986 |     let raw_u32 = |word: usize, vi: usize| PackedUInt32 {
+     |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_raw_u32`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `n_vec`
+   --> crates/prover/src/witness/logup_descs.rs:123:9
+    |
+123 |     let n_vec = n_rows / N_LANES;
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_n_vec`
+
+warning: method `mults_snapshot` is never used
+   --> crates/prover/src/witness/components/memory_address_to_id.rs:117:19
+    |
+73  | impl ClaimGenerator {
+    | ------------------- method in this implementation
+...
+117 |     pub(crate) fn mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+    |                   ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: methods `big_mults_snapshot` and `small_mults_snapshot` are never used
+   --> crates/prover/src/witness/components/memory_id_to_big.rs:112:19
+    |
+49  | impl ClaimGenerator {
+    | ------------------- methods in this implementation
+...
+112 |     pub(crate) fn big_mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+    |                   ^^^^^^^^^^^^^^^^^^
+...
+115 |     pub(crate) fn small_mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+    |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/add_ap_opcode.rs:938:4
+    |
+938 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/add_ap_opcode.rs:961:4
+    |
+961 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/bitwise_builtin.rs:2913:4
+     |
+2913 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/bitwise_builtin.rs:3094:4
+     |
+3094 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_compress_opcode.rs:7836:4
+     |
+7836 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/blake_compress_opcode.rs:8018:4
+     |
+8018 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_g.rs:1810:4
+     |
+1810 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/blake_g.rs:1903:4
+     |
+1903 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_round.rs:5908:4
+     |
+5908 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/blake_round.rs:6041:4
+     |
+6041 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: method `mults_snapshot` is never used
+  --> crates/prover/src/witness/components/blake_round_sigma.rs:35:19
+   |
+21 | impl ClaimGenerator {
+   | ------------------- method in this implementation
+...
+35 |     pub(crate) fn mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+   |                   ^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/cube_252.rs:9195:4
+     |
+9195 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/cube_252.rs:9304:4
+     |
+9304 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode.rs:5174:4
+     |
+5174 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode.rs:5235:4
+     |
+5235 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode_small.rs:1589:4
+     |
+1589 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode_small.rs:1625:4
+     |
+1625 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:25891:4
+      |
+25891 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:26225:4
+      |
+26225 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_window_bits_18.rs:17998:4
+      |
+17998 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_window_bits_18.rs:18149:4
+      |
+18149 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:12598:4
+      |
+12598 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:12642:4
+      |
+12642 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/pedersen_builtin.rs:459:4
+    |
+459 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/pedersen_builtin.rs:490:4
+    |
+490 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4893:4
+     |
+4893 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4951:4
+     |
+4951 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/poseidon_aggregator.rs:10769:4
+      |
+10769 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/poseidon_aggregator.rs:10877:4
+      |
+10877 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/poseidon_builtin.rs:608:4
+    |
+608 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/poseidon_builtin.rs:650:4
+    |
+650 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:3197:4
+     |
+3197 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:3253:4
+     |
+3253 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/qm_31_add_mul_opcode.rs:2028:4
+     |
+2028 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/qm_31_add_mul_opcode.rs:2064:4
+     |
+2064 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/range_check_252_width_27.rs:971:4
+    |
+971 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/range_check_252_width_27.rs:1002:4
+     |
+1002 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/range_check_builtin.rs:560:4
+    |
+560 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/range_check_builtin.rs:577:4
+    |
+577 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/triple_xor_32.rs:891:4
+    |
+891 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/triple_xor_32.rs:944:4
+    |
+944 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/verify_instruction.rs:730:4
+    |
+730 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/verify_instruction.rs:751:4
+    |
+751 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:22527:9
+      |
+22527 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+      |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+      |
+      = note: `#[warn(non_snake_case)]` on by default
+
+warning: variable `Felt252_3_0_0_0` should have a snake case name
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:22528:9
+      |
+22528 |     let Felt252_3_0_0_0 = PackedFelt252::broadcast(Felt252::from([3, 0, 0, 0]));
+      |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3_0_0_0`
+
+warning: variable `Felt252_15078781199387521180_7290787951512770967_8332093602989199897_317979597309161923` should have a snake case name
+    --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:9717:9
+     |
+9717 |     let Felt252_15078781199387521180_7290787951512770967_8332093602989199897_317979597309161923 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_15078781199387521180_7290787951512770967_8332093602989199897_317979597309161923`
+
+warning: variable `Felt252_2796306760980396030_6142433350943679003_9786206818587032316_455457488062799560` should have a snake case name
+    --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:9724:9
+     |
+9724 |     let Felt252_2796306760980396030_6142433350943679003_9786206818587032316_455457488062799560 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2796306760980396030_6142433350943679003_9786206818587032316_455457488062799560`
+
+warning: variable `Felt252_0_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4264:9
+     |
+4264 |     let Felt252_0_0_0_0 = PackedFelt252::broadcast(Felt252::from([0, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_0_0_0_0`
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4265:9
+     |
+4265 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+
+warning: variable `Felt252_2_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4266:9
+     |
+4266 |     let Felt252_2_0_0_0 = PackedFelt252::broadcast(Felt252::from([2, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2_0_0_0`
+
+warning: variable `Felt252_3_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4267:9
+     |
+4267 |     let Felt252_3_0_0_0 = PackedFelt252::broadcast(Felt252::from([3, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3_0_0_0`
+
+warning: variable `Felt252_4_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4268:9
+     |
+4268 |     let Felt252_4_0_0_0 = PackedFelt252::broadcast(Felt252::from([4, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_4_0_0_0`
+
+warning: variable `Felt252_0_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:7992:9
+     |
+7992 |     let Felt252_0_0_0_0 = PackedFelt252::broadcast(Felt252::from([0, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_0_0_0_0`
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:7993:9
+     |
+7993 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+
+warning: variable `Felt252_10310704347937391837_5874215448258336115_2880320859071049537_45350836576946303` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:7994:9
+     |
+7994 |     let Felt252_10310704347937391837_5874215448258336115_2880320859071049537_45350836576946303 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_10310704347937391837_5874215448258336115_2880320859071049537_45350836576946303`
+
+warning: variable `Felt252_10931822301410252833_1475756362763989377_3378552166684303673_348229636055909092` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8001:9
+     |
+8001 |     let Felt252_10931822301410252833_1475756362763989377_3378552166684303673_348229636055909092 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_10931822301410252833_1475756362763989377_3378552166684303673_348229636055909092`
+
+warning: variable `Felt252_11041071929982523380_7503192613203831446_4943121247101232560_560497091765764140` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8008:9
+     |
+8008 |     let Felt252_11041071929982523380_7503192613203831446_4943121247101232560_560497091765764140 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_11041071929982523380_7503192613203831446_4943121247101232560_560497091765764140`
+
+warning: variable `Felt252_16477292399064058052_4441744911417641572_18431044672185975386_252894828082060025` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8015:9
+     |
+8015 |     let Felt252_16477292399064058052_4441744911417641572_18431044672185975386_252894828082060025 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_16477292399064058052_4441744911417641572_18431044672185975386_252894828082060025`
+
+warning: variable `Felt252_2_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8022:9
+     |
+8022 |     let Felt252_2_0_0_0 = PackedFelt252::broadcast(Felt252::from([2, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2_0_0_0`
+
+warning: variable `Felt252_3969818800901670911_10562874008078701503_14906396266795319764_223312371439046257` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8023:9
+     |
+8023 |     let Felt252_3969818800901670911_10562874008078701503_14906396266795319764_223312371439046257 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3969818800901670911_10562874008078701503_14906396266795319764_223312371439046257`
+
+warning: variable `Felt252_4_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8030:9
+     |
+8030 |     let Felt252_4_0_0_0 = PackedFelt252::broadcast(Felt252::from([4, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_4_0_0_0`
+
+warning: variable `Felt252_8794894655201903369_3219077422080798056_16714934791572408267_262217499501479120` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8031:9
+     |
+8031 |     let Felt252_8794894655201903369_3219077422080798056_16714934791572408267_262217499501479120 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_8794894655201903369_3219077422080798056_16714934791572408267_262217499501479120`
+
+warning: variable `Felt252_9275160746813554287_16541205595039575623_4169650429605064889_470088886057789987` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8038:9
+     |
+8038 |     let Felt252_9275160746813554287_16541205595039575623_4169650429605064889_470088886057789987 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_9275160746813554287_16541205595039575623_4169650429605064889_470088886057789987`
+
+warning: variable `Felt252_0_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2789:9
+     |
+2789 |     let Felt252_0_0_0_0 = PackedFelt252::broadcast(Felt252::from([0, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_0_0_0_0`
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2790:9
+     |
+2790 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+
+warning: variable `Felt252_2_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2791:9
+     |
+2791 |     let Felt252_2_0_0_0 = PackedFelt252::broadcast(Felt252::from([2, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2_0_0_0`
+
+warning: variable `Felt252_3_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2792:9
+     |
+2792 |     let Felt252_3_0_0_0 = PackedFelt252::broadcast(Felt252::from([3, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3_0_0_0`
+
+warning: `stwo-cairo-prover` (lib) generated 71 warnings
+   Compiling stwo-cairo-gpu-prover v1.2.2 (/workspace/stwo-cairo/stwo_cairo_prover/crates/gpu-prover)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 33s
+     Running tests/resident_trace_audit.rs (target/debug/deps/resident_trace_audit-eb8abde074b2f990)
+
+running 1 test
+test audit_resident_base_trace_against_simd_reference ... pedersen table: registered HOST-BUILT table on device (56 cols x 8388608 rows, borrowed mode)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_d94540f2fd219001 key=b14e918990dc0514 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_643d6ea7402e00f9 key=6f57f1ff8a5b9bb0 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_c4b01b327c2ce2a3 key=b73dc2474b9b58d1 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_06f670fcbec124d8 key=4f81f6f223d1e3d0 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_e17e872ded26ebd1 key=51ea47f4bded53af (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_154882da03f89342 key=02dfe03fefee2f9a (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_ce0ddfc37a60580e key=a9962a644121df3e (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_1ab1e90dff938797 key=09fbfe2983906fc6 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_b37424b6011f268e key=fe360b744272e22c (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_da729390f0d884f9 key=d7b6e6ef82833ff3 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_58a69689aa366788 key=d0eccad456a9e973 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_57e09935feaee102 key=96d07a4f0641ec91 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_a290ddc144ee416a key=49134650debd448c (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_945de91f8879d0ac key=904335a58245131f (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_b0eb28f739a39f20 key=186c1a58c177afb6 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_eebaf3650dcb7ba3 key=330f381b4225e7c9 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_17255b30022f129d key=7ef540b698a16690 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_d14e690e89d48795 key=15f522d510516a00 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_d6df0fe1ca333aac key=8999c9b1a5e6684d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_752513a1a2621451 key=6010587068a7e8f8 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_22ad07ddaf1c1605 key=b6c6e4ddb03a94d2 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_ad984cdbe607f973 key=6dff0bc2f9e84e46 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_c404737783a8b93e key=e79242490fb703e8 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_8b1229a89671563e key=4fcf64dc366ed1e5 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_db623f0e10c81639 key=89f07725ea264191 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_f53805dad6e749bb key=6e50a44b40217a1d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_036dfb90ab7f0477 key=e3462b3b08b56d56 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_b60c9c9c25015103 key=547f0f9b9dbeae56 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_16d2ea9e41d7d7e6 key=abfe396850620439 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_c4424f733f4bd4ab key=e8c2123e86cdbc13 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_39781b15a0897e90 key=d0ccc83517704466 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_d1f6a2534aa0a301 key=7a173a4409a94d3c (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_4b561009970da257 key=19a10da57467ba9d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_6a28ac80d1faacad key=896864742b9d7f54 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_be86d027dbdb6203 key=6e825b570de4e032 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_a7d48d63680c85d8 key=6c249ca7a2331b34 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_df9c6a0cee30d01f key=ffaab9e210692a14 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_87d0117207915942 key=5a3417c81866daa3 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_a825a049ba6a952f key=938d4c6c79c6c68e (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_a5a22a904ae7719a key=0d85e62852e65bf1 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_fd5f6abc639c7ad3 key=00f8a89b9d11ef90 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_49565bc27a55d074 key=ef130c4b88f1d0bf (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_3a940a524062d0a6 key=95cbc777b66614e4 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_9927162c86fc449f key=b52eac7ce08c782d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_04d089b7c5ed2771 key=cc28bdf0b8c53698 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_eec4da0738322101 key=1c5835b3a5fef139 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_4503468882eeb245 key=05f9c53174f0aaab (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_633fe71fc869665d key=c0f1039453865a30 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_9caf184ede0cedd8 key=5c68aa540bd25c9e (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_d147c801aa6abdcc key=3952448476f93180 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_86a901b804923a10 key=1ab049f2a1c4ff32 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_88abad321f9b225e key=bdfea75f60bf42ca (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_0500d6a23bdae342 key=5dc55cbb1ce6c19d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_69d8461df4d70472 key=983c2c769fa70013 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_17292106903a36d4 key=feb3d54f64d37c87 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_6d15c44abe421789 key=2e3eccbf87dcd53e (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_551eb18f22f5a3b6 key=e91530cd9f486993 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_488673d56eb5384d key=1a43361d170e86a6 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_119c78399329b29a key=467f5312ce40c230 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_d547dbd1baf953e1 key=bf683868cc5044f1 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_b3298f3d64db6945 key=b9e5e23780fc4fff (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_b6d974c335a15d00 key=908d029611e1f887 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_236ecb1645901ac0 key=c687f168b5760e1f (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_6a1dcd04b35338e6 key=2952e2f9e4d5ed3a (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_5837b076ba757437 key=2f59786637dcd05b (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_6eec0240134c359d key=72234bdb224e728d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_a7ddf49888aeec68 key=1df0014b5a0f5a54 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_2935f225c67ee1d9 key=25be520aa9de408d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_cb1ce2703d2db392 key=a6aa239ed1a25e9c (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_5300354eae2fe0f2 key=d331505bba420355 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_b455671faf7e7149 key=5754f8a873a52740 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_c97d0e3125403a90 key=e205ab564ba682ee (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_441cd9c7fd53458a key=915b9c6c996bd323 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_bfbf5a8a40591289 key=785f1d2fda1ea922 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_239c495915d1b092 key=8a40cc3240faf63d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_b6da13dc52c21465 key=7e0b6c8348014c9a (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_8bfe46e1447d7e33 key=7427d3ae2749288a (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_264153f324dfa389 key=08e5448d4cd611c0 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_870b93acf1caf2fe key=5d8214b451babf5c (embedded sm_90 cubin)
+audit: base-commit boundary replayed; reading device base trace
+audit: device plane done: 45 component parts, 2627 columns, 119.0 MiB D2H, 62.849 s
+audit POSEIDON_KIND11_INPUT component=poseidon_3_partial_rounds_chain part=Main row=0 args_u32=[0, 4, 50414066, 128588089, 120633038, 63732151, 97038777, 32313651, 132029487, 122547581, 103664913, 254, 70246675, 35346168, 94916093, 40649707, 36525582, 74717629, 46705327, 50424067, 58946647, 39, 87784937, 111781535, 84088807, 86541649, 127250820, 6346412, 29906354, 123707764, 53944726, 252, 22813865, 35298563, 79701982, 108932941, 43138495, 66822320, 50165977, 5364451, 38958708, 247]
+audit: SIMD plane done: 45 component parts, 2627 columns, 119.0 MiB, 14.805 s
+audit summary (45 component parts):
+  add_ap_opcode[Main]                              MATCH
+  add_opcode_small[Main]                           MATCH
+  assert_eq_opcode[Main]                           MATCH
+  assert_eq_opcode_double_deref[Main]              MATCH
+  assert_eq_opcode_imm[Main]                       MATCH
+  bitwise_builtin[Main]                            MATCH
+  call_opcode_rel_imm[Main]                        MATCH
+  cube_252[Main]                                   MATCH
+  ec_op_builtin[Main]                              MATCH
+  jnz_opcode_non_taken[Main]                       MATCH
+  jnz_opcode_taken[Main]                           MATCH
+  memory_address_to_id[Main]                       MATCH
+  memory_id_to_big[MemoryBig(0)]                   MATCH
+  memory_id_to_big[MemorySmall]                    MATCH
+  partial_ec_mul_generic[Main]                     MATCH
+  partial_ec_mul_window_bits_18[Main]              MATCH
+  pedersen_aggregator_window_bits_18[Main]         MATCH
+  pedersen_builtin[Main]                           MATCH
+  pedersen_points_table_window_bits_18[Main]       MATCH
+  poseidon_3_partial_rounds_chain[Main]            MATCH
+  poseidon_aggregator[Main]                        MATCH
+  poseidon_builtin[Main]                           MATCH
+  poseidon_full_round_chain[Main]                  MATCH
+  poseidon_round_keys[Main]                        MATCH
+  range_check_11[Main]                             MATCH
+  range_check_12[Main]                             MATCH
+  range_check_18[Main]                             MATCH
+  range_check_20[Main]                             MATCH
+  range_check_252_width_27[Main]                   MATCH
+  range_check_3_3_3_3_3[Main]                      MATCH
+  range_check_3_6_6_3[Main]                        MATCH
+  range_check_4_3[Main]                            MATCH
+  range_check_4_4[Main]                            MATCH
+  range_check_4_4_4_4[Main]                        MATCH
+  range_check_6[Main]                              MATCH
+  range_check_7_2_5[Main]                          MATCH
+  range_check_8[Main]                              MATCH
+  range_check_9_9[Main]                            MATCH
+  range_check_builtin[Main]                        MATCH
+  ret_opcode[Main]                                 MATCH
+  verify_bitwise_xor_4[Main]                       MATCH
+  verify_bitwise_xor_7[Main]                       MATCH
+  verify_bitwise_xor_8[Main]                       MATCH
+  verify_bitwise_xor_9[Main]                       MATCH
+  verify_instruction[Main]                         MATCH
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.58s
