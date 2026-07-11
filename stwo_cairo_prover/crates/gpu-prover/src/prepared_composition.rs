@@ -160,8 +160,11 @@ pub struct CompositionExtParamBinding {
 #[derive(Clone, Debug)]
 pub struct CompositionDeviceInputs {
     pub random_coefficient: ArenaSlotId,
-    pub forward_twiddles: ArenaSlotId,
-    pub inverse_twiddles: ArenaSlotId,
+    /// Full logical twiddle-tree slices. Small-domain NTTs index relative to
+    /// the END of these trees, so callers must preserve the planned logical
+    /// length rather than truncate to a consumer's minimum requirement.
+    pub forward_twiddles: ArenaSlice,
+    pub inverse_twiddles: ArenaSlice,
     /// Stable challenge slices produced by `PreparedRelationGraph`. These are
     /// logically-truncated slices, not slot ids: the alpha-power count is
     /// derived from `relation_alpha_powers.len_words()`, which must be the
@@ -429,6 +432,7 @@ pub enum PreparedCompositionError {
         required_words: usize,
         actual_words: usize,
     },
+    ContextMismatch(ArenaSlotId),
     SourceAliasesWritableWorkspace(ArenaSlotId),
     InputAliasesWritableWorkspace(ArenaSlotId),
     ForwardInverseTwiddlesAlias(ArenaSlotId),
@@ -1087,19 +1091,19 @@ impl<'a> PreparedCompositionGraph<'a> {
             .try_into()
             .expect("exactly eight output requirements");
         let random_coefficient = bind_minimum(arena, inputs.random_coefficient, SECURE_WORDS)?;
-        let forward_twiddles = bind_minimum(
+        let forward_twiddles = require_input_min(
             arena,
             inputs.forward_twiddles,
             requirements.forward_twiddle_words,
         )?;
-        let inverse_twiddles = bind_minimum(
+        let inverse_twiddles = require_input_min(
             arena,
             inputs.inverse_twiddles,
             requirements.inverse_twiddle_words,
         )?;
-        if inputs.forward_twiddles == inputs.inverse_twiddles {
+        if inputs.forward_twiddles.id() == inputs.inverse_twiddles.id() {
             return Err(PreparedCompositionError::ForwardInverseTwiddlesAlias(
-                inputs.forward_twiddles,
+                inputs.forward_twiddles.id(),
             ));
         }
 
@@ -1136,8 +1140,8 @@ impl<'a> PreparedCompositionGraph<'a> {
         }
         for input in [
             inputs.random_coefficient,
-            inputs.forward_twiddles,
-            inputs.inverse_twiddles,
+            inputs.forward_twiddles.id(),
+            inputs.inverse_twiddles.id(),
             inputs.relation_z.id(),
             inputs.relation_alpha_powers.id(),
         ] {
@@ -1825,7 +1829,7 @@ fn bind_minimum(
 /// slice is returned as provided: its length is the caller's logical extent,
 /// already truncated at bind time, and downstream counts derive from it.
 fn require_input_min(
-    _arena: &DeviceArena,
+    arena: &DeviceArena,
     slice: ArenaSlice,
     required_words: usize,
 ) -> Result<ArenaSlice, PreparedCompositionError> {
@@ -1836,7 +1840,18 @@ fn require_input_min(
             actual_words: slice.len_words(),
         });
     }
-    Ok(slice)
+    if !slice.belongs_to(arena.context()) {
+        return Err(PreparedCompositionError::ContextMismatch(slice.id()));
+    }
+    let rebound = arena.bind(slice.id())?;
+    if rebound.len_words() < slice.len_words() {
+        return Err(PreparedCompositionError::SlotTooSmall {
+            slot: slice.id(),
+            required_words: slice.len_words(),
+            actual_words: rebound.len_words(),
+        });
+    }
+    Ok(rebound.truncated(slice.len_words()))
 }
 
 fn write_pointer(words: &mut [u32], offset_words: usize, pointer: *mut u32) {

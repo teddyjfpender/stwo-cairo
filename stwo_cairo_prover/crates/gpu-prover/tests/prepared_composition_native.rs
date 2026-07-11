@@ -365,6 +365,8 @@ fn read_outputs(arena: &DeviceArena, slots: &CompositionWorkspaceSlots) -> [Vec<
 
 #[test]
 fn real_range_check_6_matches_cpu_eager_and_capture_replay() {
+    const SHARED_TWIDDLE_LOG_SIZE: u32 = EVALUATION_LOG_SIZE + 2;
+
     let (component, plan) = real_component_and_plan();
     let trace = topology();
     let requirements = composition_workspace_requirements(&plan, &trace).unwrap();
@@ -386,8 +388,8 @@ fn real_range_check_6_matches_cpu_eager_and_capture_replay() {
             (INTERACTION_2, 1 << TRACE_LOG_SIZE, 1),
             (INTERACTION_3, 1 << TRACE_LOG_SIZE, 1),
             (RANDOM_COEFFICIENT, SECURE_WORDS, SECURE_WORDS),
-            (FORWARD_TWIDDLES, requirements.forward_twiddle_words, 1),
-            (INVERSE_TWIDDLES, requirements.inverse_twiddle_words, 1),
+            (FORWARD_TWIDDLES, 1 << (SHARED_TWIDDLE_LOG_SIZE - 1), 1),
+            (INVERSE_TWIDDLES, 1 << (SHARED_TWIDDLE_LOG_SIZE - 1), 1),
             (RELATION_Z, SECURE_WORDS, SECURE_WORDS),
             (RELATION_ALPHA_POWERS, SECURE_WORDS, SECURE_WORDS),
             (EXT_PARAMS, ext_param_words, SECURE_WORDS),
@@ -403,7 +405,10 @@ fn real_range_check_6_matches_cpu_eager_and_capture_replay() {
     );
     upload(&arena, RELATION_Z, &[0u32; SECURE_WORDS]);
     upload(&arena, RELATION_ALPHA_POWERS, &[0u32; SECURE_WORDS]);
-    let domain = CanonicCoset::new(EVALUATION_LOG_SIZE).circle_domain();
+    // Resident proofs share one larger twiddle tree across smaller composition
+    // domains. CUDA selects the nested tree relative to the logical END, so
+    // preparation must retain this caller-provided length.
+    let domain = CanonicCoset::new(SHARED_TWIDDLE_LOG_SIZE).circle_domain();
     let forward = slow_precompute_twiddles(domain.half_coset)
         .into_iter()
         .map(|value| value.0)
@@ -415,14 +420,51 @@ fn real_range_check_6_matches_cpu_eager_and_capture_replay() {
     upload(&arena, FORWARD_TWIDDLES, &forward);
     upload(&arena, INVERSE_TWIDDLES, &inverse);
 
+    let foreign_arena = DeviceArena::new(
+        CudaExecContext::new().unwrap(),
+        ArenaLayout::new(
+            forward.len(),
+            &[ArenaSlotSpec {
+                id: FORWARD_TWIDDLES,
+                offset_words: 0,
+                len_words: forward.len(),
+                alignment_words: 1,
+            }],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let foreign_result = PreparedCompositionGraph::prepare(
+        &arena,
+        &plan,
+        &trace,
+        &CompositionDeviceInputs {
+            random_coefficient: RANDOM_COEFFICIENT,
+            forward_twiddles: foreign_arena.bind(FORWARD_TWIDDLES).unwrap(),
+            inverse_twiddles: arena.bind(INVERSE_TWIDDLES).unwrap(),
+            relation_z: arena.bind(RELATION_Z).unwrap(),
+            relation_alpha_powers: arena.bind(RELATION_ALPHA_POWERS).unwrap(),
+            claimed_sums: vec![None],
+            ext_params: vec![Some(CompositionExtParamBinding {
+                slot: EXT_PARAMS,
+                offset_words: 0,
+            })],
+        },
+        &slots,
+    );
+    assert!(matches!(
+        foreign_result,
+        Err(stwo_cairo_gpu_prover::PreparedCompositionError::ContextMismatch(FORWARD_TWIDDLES))
+    ));
+
     let prepared = PreparedCompositionGraph::prepare(
         &arena,
         &plan,
         &trace,
         &CompositionDeviceInputs {
             random_coefficient: RANDOM_COEFFICIENT,
-            forward_twiddles: FORWARD_TWIDDLES,
-            inverse_twiddles: INVERSE_TWIDDLES,
+            forward_twiddles: arena.bind(FORWARD_TWIDDLES).unwrap(),
+            inverse_twiddles: arena.bind(INVERSE_TWIDDLES).unwrap(),
             relation_z: arena.bind(RELATION_Z).unwrap(),
             relation_alpha_powers: arena.bind(RELATION_ALPHA_POWERS).unwrap(),
             claimed_sums: vec![None],
@@ -692,8 +734,8 @@ fn serial_and_wide_modes_match_cpu_and_each_other() {
 
     let inputs = CompositionDeviceInputs {
         random_coefficient: RANDOM,
-        forward_twiddles: FORWARD,
-        inverse_twiddles: INVERSE,
+        forward_twiddles: arena.bind(FORWARD).unwrap(),
+        inverse_twiddles: arena.bind(INVERSE).unwrap(),
         relation_z: arena.bind(Z).unwrap(),
         relation_alpha_powers: arena.bind(ALPHA).unwrap(),
         claimed_sums: vec![None, None],

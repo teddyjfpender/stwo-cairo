@@ -3,7 +3,7 @@
 use stwo_backend_cuda::{ArenaSlotId, PreparedRelationGraph};
 
 use crate::composition_plan::CompositionExtParamSource;
-use crate::graphs::GraphWorkspace;
+use crate::graphs::{bind_arena_binding, GraphWorkspace};
 use crate::prepared_composition::{
     CompositionDeviceInputs, PreparedCompositionError, PreparedCompositionGraph,
 };
@@ -108,8 +108,10 @@ pub(crate) fn prepare_resident_composition<'a>(
         .collect::<Result<Vec<Option<ArenaSlotId>>, ResidentCompositionError>>()?;
     let inputs = CompositionDeviceInputs {
         random_coefficient: planned.random_coefficient.physical,
-        forward_twiddles: planned.forward_twiddles.physical,
-        inverse_twiddles: planned.inverse_twiddles.physical,
+        forward_twiddles: bind_arena_binding(workspace.arena(), planned.forward_twiddles)
+            .map_err(PreparedCompositionError::Arena)?,
+        inverse_twiddles: bind_arena_binding(workspace.arena(), planned.inverse_twiddles)
+            .map_err(PreparedCompositionError::Arena)?,
         // Pass the relation graph's logically-truncated challenge slices, not
         // slot ids: the composition alpha-power count derives from the slice
         // length, which must be the logical challenge extent even when the
