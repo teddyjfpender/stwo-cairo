@@ -1,0 +1,6 @@
+# Divergence diagnostics: boundary-stepped smoke (structured felt dump) then
+# the mirrored-transcript qualification test (host Blake2s channel replays &
+# verifies every device boundary; names the first diverging protocol seam).
+cd "$CAIRO"
+phase smoke_diag cargo test -p stwo-cairo-gpu-prover --test resident_smoke -- --nocapture --test-threads=1
+phase mirrored_diag cargo test -p stwo-cairo-gpu-prover --test resident_parity_native strict_resident_mirrored_transcript -- --nocapture --test-threads=1

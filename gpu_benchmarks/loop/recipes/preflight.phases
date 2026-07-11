@@ -1,0 +1,8 @@
+# Real-SN2 admissibility, no GPU proof: build the tools, adapt SN_PIE_2 to a
+# bincode ProverInput (STWO_DUMP_INPUT exits right after adaptation), run the
+# off-CUDA arena session-planning verdict incl. host-side exact-row derivation.
+cd "$CAIRO"
+phase build_bench env RUSTFLAGS='-C target-cpu=native' cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench
+phase build_preflight env RUSTFLAGS='-C target-cpu=native' cargo build --release -p stwo-cairo-gpu-prover --bin arena_preflight --features emit-tools
+phase adapt env STWO_DUMP_INPUT=/workspace/bench_inputs/SN_PIE_2.adapted.bin ./target/release/gpu_bench --pie /workspace/stwo-cairo/gpu_benchmarks/pie/sn/SN_PIE_2.zip --backend simd --reps 1
+phase preflight ./target/release/arena_preflight --input-bincode /workspace/bench_inputs/SN_PIE_2.adapted.bin --vram-budget-gb 79

@@ -1,0 +1,6 @@
+# Boundary-stepped single resident proof of the sn2-profile fixture. On
+# byte-divergence it dumps structured evidence (STWO_SMOKE_DIVERGENCE_DIR is
+# exported by pod_run.sh, fetched automatically). On a device fault it panics
+# naming the exact protocol boundary.
+cd "$CAIRO"
+phase smoke cargo test -p stwo-cairo-gpu-prover --test resident_smoke -- --nocapture --test-threads=1
