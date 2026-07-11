@@ -552,7 +552,11 @@ pub(crate) fn schema_zero_interaction_claim_for_composition(
 /// Rehydrate the canonical Cairo interaction claim from the resident relation
 /// graph's flat output. This is a mechanical host decoder after the single
 /// proof download: it performs no transcript or protocol computation.
-pub(crate) fn interaction_claim_from_flattened(
+///
+/// `pub` (rather than `pub(crate)`) solely for the diagnostic smoke runner
+/// (`tests/resident_smoke.rs`), which completes a boundary-stepped resident
+/// proof exactly as production does. Not a stable API surface.
+pub fn interaction_claim_from_flattened(
     claim: &CairoClaim,
     claimed_sums: &[SecureField],
 ) -> Result<CairoInteractionClaim, ProtocolDiscoveryError> {
