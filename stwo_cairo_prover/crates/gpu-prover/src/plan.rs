@@ -101,6 +101,18 @@ impl ProofPlan {
     /// its full padded row domain `n_instances` times; this is the same formula
     /// the live device-edge ledger checks after the writers run. The post-write
     /// seal remains mandatory and rejects any disagreement.
+    ///
+    /// The capacity formula is exact only for PLAIN feed consumers, whose
+    /// device writers process every padded producer row (a padded producer row
+    /// times a power-of-two instance count keeps the same padded power of
+    /// two). A DEVICE-COMPACTED consumer (RLE multiset compaction, e.g.
+    /// `verify_instruction` and the aggregators) deduplicates the gathered
+    /// feed, so its exact row count is a property of the witness data and is
+    /// NOT derivable from producer capacities. Promoting the capacity bound
+    /// for such a component produced a claim whose log size diverges from the
+    /// host reference AND armed the compact kernel's fail-closed device trap
+    /// (observed on hardware as a SIGSEGV inside `cudaGraphLaunch`); this now
+    /// fails closed at plan time instead.
     pub fn strict_resident_exact(
         &self,
         schedule: &'static Schedule,
@@ -112,13 +124,27 @@ impl ProofPlan {
             .iter()
             .map(|component| {
                 let rows = match &component.rows {
-                    RowResolution::Bounded { bound, .. } => RowResolution::Resolved(vec![
-                        stwo_cairo_prover::witness::proof_shape::TracePartShape {
-                            part: TracePartId::Main,
-                            n_real_rows: bound.max_rows,
-                            padded_rows: bound.padded_capacity,
-                        },
-                    ]),
+                    RowResolution::Bounded { bound, .. } => {
+                        if stwo_cairo_prover::witness::jit_prove_backend::recorded_input_compaction_geometry(
+                            component.id,
+                        )
+                        .is_some()
+                        {
+                            return Err(ProofPlanError::StrictResidentCompactedRowsUnresolved {
+                                component: component.id,
+                                observed_rows: bound.observed_rows,
+                                max_rows: bound.max_rows,
+                                padded_capacity: bound.padded_capacity,
+                            });
+                        }
+                        RowResolution::Resolved(vec![
+                            stwo_cairo_prover::witness::proof_shape::TracePartShape {
+                                part: TracePartId::Main,
+                                n_real_rows: bound.max_rows,
+                                padded_rows: bound.padded_capacity,
+                            },
+                        ])
+                    }
                     RowResolution::Pending { .. } => {
                         return Err(ProofPlanError::StrictResidentRowsUnresolved(component.id));
                     }
@@ -250,6 +276,21 @@ pub enum ProofPlanError {
     },
     SealedTraceGeometryChanged(ComponentId),
     StrictResidentRowsUnresolved(ComponentId),
+    /// A capacity bound cannot stand in for exact rows on a device-compacted
+    /// consumer. The RLE compaction shrinks the gathered feed by the
+    /// input-dependent number of duplicate tuples, so the exact row count is
+    /// unknowable from producer capacities alone. Hardware-verified on the
+    /// SN2-profile fixture: the compact finalize kernel's fail-closed trap
+    /// fired with 174 unique tuples (256 padded rows) against this
+    /// capacity-planned consumer size, poisoning the CUDA context in the
+    /// middle of `cudaGraphLaunch` (SIGSEGV inside the driver). Failing here,
+    /// at plan time, replaces that undefined behavior with a checked error.
+    StrictResidentCompactedRowsUnresolved {
+        component: ComponentId,
+        observed_rows: u64,
+        max_rows: u64,
+        padded_capacity: u64,
+    },
     SealedRelationGraphChanged {
         expected: u64,
         actual: u64,
@@ -263,6 +304,51 @@ impl std::fmt::Display for ProofPlanError {
 }
 
 impl std::error::Error for ProofPlanError {}
+
+/// TEST-ONLY stand-in for the exact rows of device-compacted consumers.
+/// [`ProofPlan::strict_resident_exact`] fails closed on their capacity bounds,
+/// and the pre-witness exact-count derivation does not exist yet, so tests of
+/// lane/arena geometry substitute the capacity geometry explicitly before the
+/// strict resolution. Production code must never take this shortcut: the
+/// substituted row counts are upper bounds, not the deduplicated truth.
+#[cfg(test)]
+pub(crate) fn resolve_compacted_capacity_for_test(
+    plan: &ProofPlan,
+    schedule: &'static Schedule,
+    relation_graph: &'static RelationGraph,
+) -> ProofPlan {
+    let components = plan
+        .proof_shape()
+        .components()
+        .iter()
+        .map(|component| {
+            let rows = match &component.rows {
+                RowResolution::Bounded { bound, .. }
+                    if stwo_cairo_prover::witness::jit_prove_backend::recorded_input_compaction_geometry(
+                        component.id,
+                    )
+                    .is_some() =>
+                {
+                    RowResolution::Resolved(vec![
+                        stwo_cairo_prover::witness::proof_shape::TracePartShape {
+                            part: TracePartId::Main,
+                            n_real_rows: bound.max_rows,
+                            padded_rows: bound.padded_capacity,
+                        },
+                    ])
+                }
+                _ => component.rows.clone(),
+            };
+            RuntimeComponentShape {
+                id: component.id,
+                rows,
+            }
+        })
+        .collect();
+    let shape = ProofShape::new(components).expect("test capacity substitution kept a valid shape");
+    ProofPlan::from_schedule(schedule, relation_graph, &shape)
+        .expect("test capacity substitution kept a plannable shape")
+}
 
 fn validate_row_source(
     node: &ComponentNode,
@@ -551,6 +637,37 @@ mod tests {
             ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
         assert!(plan.arena_capacity_ready());
         assert!(plan.capture_ready());
+    }
+
+    /// A device-compacted consumer deduplicates its gathered feed, so a
+    /// capacity bound can never stand in for its exact rows. Promoting it
+    /// armed the compact kernel's fail-closed device trap (hardware SIGSEGV
+    /// inside `cudaGraphLaunch` on the SN2-profile fixture); the strict
+    /// resident plan must reject it at plan time instead.
+    #[test]
+    fn strict_resident_exact_rejects_capacity_bounded_compacted_consumer() {
+        let shape = with_components(vec![
+            RuntimeComponentShape::uniform("ret_opcode", 33, 64).unwrap(),
+            RuntimeComponentShape::pending(
+                "verify_instruction",
+                PendingRowsReason::WitnessRelationFeeds,
+                0,
+            ),
+        ]);
+        let plan =
+            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
+        let verify_instruction = plan.proof_shape().component("verify_instruction").unwrap();
+        assert!(
+            matches!(verify_instruction.rows, RowResolution::Bounded { .. }),
+            "test setup: verify_instruction must be capacity-bounded"
+        );
+        assert!(matches!(
+            plan.strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH),
+            Err(ProofPlanError::StrictResidentCompactedRowsUnresolved {
+                component: "verify_instruction",
+                ..
+            })
+        ));
     }
 
     #[test]

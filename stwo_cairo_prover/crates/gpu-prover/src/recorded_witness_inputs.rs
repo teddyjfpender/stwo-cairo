@@ -787,9 +787,16 @@ mod tests {
             &generator.proof_shape(None).unwrap(),
         )
         .unwrap();
-        let exact = capacity
-            .strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)
-            .unwrap();
+        // The strict resolution fails closed on the compacted aggregator's
+        // capacity bound; this lane-provenance test substitutes the capacity
+        // geometry explicitly (see resolve_compacted_capacity_for_test).
+        let exact = crate::plan::resolve_compacted_capacity_for_test(
+            &capacity,
+            &CAIRO_SCHEDULE,
+            &CAIRO_RELATION_GRAPH,
+        )
+        .strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)
+        .unwrap();
         let planned = recorded_witness_inputs_for_plan(&generator, &exact).unwrap();
         planned.require_resolved().unwrap();
         assert_eq!(planned.lanes.len(), 4);
