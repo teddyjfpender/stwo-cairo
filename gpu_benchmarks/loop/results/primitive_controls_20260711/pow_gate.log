@@ -1,0 +1,48 @@
+info: syncing channel updates for nightly-2025-07-14-x86_64-unknown-linux-gnu
+info: latest update on 2025-07-14 for version 1.90.0-nightly (e9182f195 2025-07-13)
+info: downloading 6 components
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bytemuck v1.23.1
+  Downloaded enum-ordinalize v4.3.0
+  Downloaded crypto-common v0.2.1
+  Downloaded enum-ordinalize-derive v4.3.1
+  Downloaded constant_time_eq v0.3.1
+  Downloaded bytemuck_derive v1.9.3
+  Downloaded crypto-common v0.1.6
+  Downloaded zeroize_derive v1.4.2
+  Downloaded digest v0.11.2
+  Downloaded zeroize v1.8.1
+  Downloaded semver v1.0.26
+  Downloaded quote v1.0.40
+  Downloaded tracing-attributes v0.1.30
+  Downloaded unicode-ident v1.0.18
+  Downloaded proc-macro2 v1.0.95
+  Downloaded hybrid-array v0.4.11
+  Downloaded cfg-if v1.0.1
+  Downloaded thiserror-impl v2.0.12
+  Downloaded tracing-core v0.1.34
+  Downloaded tracing v0.1.41
+  Downloaded typenum v1.20.0
+  Downloaded cc v1.2.29
+  Downloaded rayon-core v1.12.1
+  Downloaded hashbrown v0.15.4
+  Downloaded blake3 v1.8.2
+  Downloaded tracing-subscriber v0.3.19
+  Downloaded rayon v1.10.0
+  Downloaded indexmap v2.10.0
+  Downloaded thiserror v2.0.12
+  Downloaded zerocopy v0.8.26
+  Downloaded syn v2.0.104
+  Downloaded libc v0.2.174
+   Compiling stwo-backend-cuda-kernels v0.1.0 (/workspace/stwo/crates/backend-cuda-kernels)
+   Compiling stwo-backend-cuda v2.2.0 (/workspace/stwo/crates/backend-cuda)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.38s
+     Running tests/prepared_fri_final_pow_native.rs (target/debug/deps/prepared_fri_final_pow_native-bb541e6963b43089)
+
+running 2 tests
+test final_fri_eager_and_capture_match_reference_bytes_and_reject_high_coefficients ... ok
+test persistent_pow_eager_and_capture_return_simd_lattice_minimum ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
