@@ -1,0 +1,5 @@
+# Opt-in strict-AOT reproducer for the captured divergent Poseidon row.
+# Pre-fix this must fail at device column 114 row 0: 17375169 vs 17375170.
+cd "$CAIRO"
+phase poseidon_captured_aot env STWO_CUDA_WITNESS_JIT_MAX_INSTRS=8192 cargo test -p stwo-cairo-prover poseidon_combination_37_strict_aot_captured_row -- --ignored --nocapture --test-threads=1
+phase poseidon_captured_nvrtc env STWO_CUDA_WITNESS_JIT_MAX_INSTRS=8192 cargo test -p stwo-cairo-prover poseidon_combination_37_nvrtc_captured_row -- --ignored --nocapture --test-threads=1

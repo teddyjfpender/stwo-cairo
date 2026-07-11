@@ -2529,6 +2529,167 @@ fn poseidon_combination_37_exact_source_primitives_match_host() {
     eprintln!("combination_37 exact-source primitive controls: PASS (12/12)");
 }
 
+/// Opt-in H100 reproducer: launch the complete captured row through the strict
+/// embedded-AOT recorded-program path. Pre-fix, column 114 is 17375169 on the
+/// device and 17375170 in the host recording interpreter.
+#[test]
+#[ignore = "requires an H100 CUDA build with the embedded AOT witness pack"]
+fn poseidon_combination_37_strict_aot_captured_row() {
+    const ROW0: [u32; 42] = [
+        0, 4, 50414066, 128588089, 120633038, 63732151, 97038777, 32313651, 132029487, 122547581,
+        103664913, 254, 70246675, 35346168, 94916093, 40649707, 36525582, 74717629, 46705327,
+        50424067, 58946647, 39, 87784937, 111781535, 84088807, 86541649, 127250820, 6346412,
+        29906354, 123707764, 53944726, 252, 22813865, 35298563, 79701982, 108932941, 43138495,
+        66822320, 50165977, 5364451, 38958708, 247,
+    ];
+    const LABEL: &str = "poseidon_3_partial_rounds_chain";
+
+    let recording = crate::witness::components::poseidon_3_partial_rounds_chain::record_poseidon_3_partial_rounds_chain();
+    let mut row_inputs = ROW0.to_vec();
+    row_inputs.push(1); // enabler; this recording does not read iota
+    assert_eq!(row_inputs.len(), recording.program.n_inputs as usize);
+    let oracle = |table: u32, key: u32, limb: u32| -> u32 {
+        panic!("unexpected table read: table {table} key {key} limb {limb}")
+    };
+    let host = stwo_backend_cuda::jit_witness::interp::interpret_row_with(
+        &recording.program,
+        &row_inputs,
+        &oracle,
+        &mut FastDeductionHost,
+    );
+    assert_eq!(host.columns[114], 17_375_170, "captured host column 114");
+
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        eprintln!("strict-AOT captured row: SKIPPED (stub build)");
+        return;
+    }
+
+    let rows = vec![row_inputs; N_LANES];
+    let input_cols = (0..recording.program.n_inputs as usize)
+        .map(|slot| rows.iter().map(|row| row[slot]).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert!(
+        crate::witness::jit_prove_backend::ensure_device_pedersen_table(),
+        "strict-AOT captured row: device Pedersen table registration failed"
+    );
+    stwo_backend_cuda::aot::require_loaded_kernels();
+    stwo_backend_cuda::aot::reset_runtime_stats();
+    stwo_backend_cuda::jit_witness::register_recorded_program(LABEL, recording.program);
+    let tables =
+        stwo_backend_cuda::exec_tables::DeviceExecutionTables::upload(&[0], &[[0; 8]], &[0]);
+    let (device_columns, ..) = stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
+        LABEL,
+        &input_cols,
+        &tables,
+        false,
+        false,
+    )
+    .expect("strict-AOT captured-row launch unavailable");
+
+    let stats = stwo_backend_cuda::aot::runtime_stats();
+    assert_eq!(stats.aot_misses, 0, "strict AOT miss");
+    assert_eq!(stats.runtime_loads, 0, "runtime compilation");
+    assert_eq!(stats.runtime_cache_hits, 0, "runtime cache hit");
+    assert_eq!(stats.strict_rejections, 0, "strict AOT rejection");
+    assert_eq!(
+        stats.aot_loads + stats.aot_cache_hits,
+        1,
+        "launch did not use exactly one embedded AOT kernel"
+    );
+    let actual = device_columns[114].to_vec();
+    for (row, value) in actual.iter().enumerate() {
+        assert_eq!(
+            value.0, host.columns[114],
+            "strict-AOT poseidon device col 114 row {row}"
+        );
+    }
+}
+
+/// NVRTC-path discriminator for the captured row. A dead constant changes only
+/// the semantic hash/AOT key, forcing runtime compilation without changing outputs.
+#[test]
+#[ignore = "requires an H100 CUDA build with NVRTC"]
+fn poseidon_combination_37_nvrtc_captured_row() {
+    use stwo_backend_cuda::jit_witness::isa::{WitnessInst, WitnessOp};
+
+    const ROW0: [u32; 42] = [
+        0, 4, 50414066, 128588089, 120633038, 63732151, 97038777, 32313651, 132029487, 122547581,
+        103664913, 254, 70246675, 35346168, 94916093, 40649707, 36525582, 74717629, 46705327,
+        50424067, 58946647, 39, 87784937, 111781535, 84088807, 86541649, 127250820, 6346412,
+        29906354, 123707764, 53944726, 252, 22813865, 35298563, 79701982, 108932941, 43138495,
+        66822320, 50165977, 5364451, 38958708, 247,
+    ];
+    const LABEL: &str = "poseidon_3_partial_rounds_chain_nvrtc_discriminator";
+
+    let mut program = crate::witness::components::poseidon_3_partial_rounds_chain::record_poseidon_3_partial_rounds_chain().program;
+    let dead_reg = u16::try_from(program.n_regs).expect("witness register index exceeds u16");
+    program.insts.push(WitnessInst::new(
+        WitnessOp::Const,
+        dead_reg,
+        0,
+        0,
+        0xC011_A37,
+    ));
+    program.n_regs += 1;
+    let mut row_inputs = ROW0.to_vec();
+    row_inputs.push(1);
+    let oracle = |table: u32, key: u32, limb: u32| -> u32 {
+        panic!("unexpected table read: table {table} key {key} limb {limb}")
+    };
+    let host = stwo_backend_cuda::jit_witness::interp::interpret_row_with(
+        &program,
+        &row_inputs,
+        &oracle,
+        &mut FastDeductionHost,
+    );
+    assert_eq!(host.columns[114], 17_375_170, "captured host column 114");
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        eprintln!("NVRTC captured row: SKIPPED (stub build)");
+        return;
+    }
+
+    let rows = vec![row_inputs; N_LANES];
+    let input_cols = (0..program.n_inputs as usize)
+        .map(|slot| rows.iter().map(|row| row[slot]).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert!(
+        crate::witness::jit_prove_backend::ensure_device_pedersen_table(),
+        "NVRTC captured row: device Pedersen table registration failed"
+    );
+    unsafe {
+        std::env::set_var("STWO_CUDA_WITNESS_JIT_MAX_INSTRS", "8192");
+        stwo_backend_cuda_kernels::raw::stwo_cuda_jit_set_require_aot(false);
+    }
+    stwo_backend_cuda::aot::reset_runtime_stats();
+    stwo_backend_cuda::jit_witness::register_recorded_program(LABEL, program);
+    let tables =
+        stwo_backend_cuda::exec_tables::DeviceExecutionTables::upload(&[0], &[[0; 8]], &[0]);
+    let (device_columns, ..) = stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
+        LABEL,
+        &input_cols,
+        &tables,
+        false,
+        false,
+    )
+    .expect("NVRTC captured-row launch unavailable");
+    let stats = stwo_backend_cuda::aot::runtime_stats();
+    assert_eq!(stats.aot_loads, 0, "unexpected AOT load");
+    assert_eq!(stats.aot_cache_hits, 0, "unexpected AOT cache hit");
+    assert_eq!(stats.aot_misses, 1, "perturbed key did not miss AOT");
+    assert_eq!(
+        stats.runtime_loads, 1,
+        "perturbed key did not load via NVRTC"
+    );
+    assert_eq!(stats.runtime_cache_hits, 0, "unexpected runtime cache hit");
+    assert_eq!(stats.strict_rejections, 0, "unexpected strict rejection");
+    for (row, value) in device_columns[114].to_vec().iter().enumerate() {
+        assert_eq!(
+            value.0, host.columns[114],
+            "NVRTC poseidon device col 114 row {row}"
+        );
+    }
+}
+
 // ---------------- fp256/EC flagship: partial_ec_mul_window_bits_18 ------------------
 
 /// Shared fixture prep for the w18 gates: run the pedersen fixture, feed the
