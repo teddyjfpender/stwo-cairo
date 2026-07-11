@@ -317,6 +317,23 @@ fn strict_resident_poseidon_graph_a_matches_simd_bytes() {
         .unwrap();
 }
 
+/// One-proof transcript diagnostic. This deliberately skips the SIMD oracle so
+/// a fresh secure GPU can classify the device/host channel mirror immediately.
+#[test]
+fn strict_resident_transcript_mirror_diagnostic_once() {
+    let mut config = GpuProverConfig::default();
+    config.strict = true;
+    let mut prover = GpuCairoProver::<Blake2sMerkleChannel>::new(config).unwrap();
+    let mirrored = prover
+        .prove_resident_blake2s_with_transcript_mirror(resident_input(), resident_params())
+        .unwrap();
+    let mirror = &mirrored.transcript_mirror;
+    assert!(mirror.report.boundaries_verified > 0);
+    assert!(mirror.report.output_words_verified > 0);
+    assert!(!mirror.performance_admissible);
+    assert!(!mirror.performance_claim_admissible());
+}
+
 /// U4 transcript-migration qualification: three consecutive mirrored resident
 /// proofs must byte-match the SIMD reference while the host Blake2s channel
 /// replays and verifies every device transcript boundary. The mirrored return

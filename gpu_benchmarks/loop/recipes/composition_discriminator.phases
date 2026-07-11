@@ -1,0 +1,5 @@
+# One fresh strict resident proof with canonical host-channel mirror replay.
+# This classifies transcript correctness without reading or regenerating the
+# expensive SIMD proof cache.
+cd "$CAIRO"
+phase transcript_mirror cargo test -p stwo-cairo-gpu-prover --test resident_parity_native strict_resident_transcript_mirror_diagnostic_once -- --exact --nocapture --test-threads=1

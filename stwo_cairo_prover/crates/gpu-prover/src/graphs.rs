@@ -203,6 +203,10 @@ impl PhaseGraph {
         self.key
     }
 
+    pub fn kernel_nodes(&self) -> u64 {
+        self.exec.kernel_nodes()
+    }
+
     /// Enqueue one replay. Synchronization belongs to the real transcript edge,
     /// not graph launch, so this method never blocks the host.
     pub fn replay(&self, arena: &DeviceArena) -> Result<(), GraphError> {
@@ -374,6 +378,14 @@ impl GraphWorkspace {
 
     pub fn graph_count(&self) -> usize {
         self.graphs.len()
+    }
+
+    pub fn graph_kernel_node_count(&self) -> Option<u64> {
+        self.graphs
+            .entries
+            .borrow()
+            .values()
+            .try_fold(0u64, |total, graph| total.checked_add(graph.kernel_nodes()))
     }
 
     pub fn capture<E>(

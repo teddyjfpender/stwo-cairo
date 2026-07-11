@@ -149,10 +149,14 @@ impl ResidentHotPathBudget {
         }
     }
 
-    pub const fn final_bundle(expected_graph_launches: u64, d2h_bytes: u64) -> Self {
+    pub const fn final_bundle(
+        expected_graph_launches: u64,
+        max_kernel_launches: u64,
+        d2h_bytes: u64,
+    ) -> Self {
         Self {
             expected_graph_launches,
-            max_kernel_launches: 99,
+            max_kernel_launches,
             expected_sync_calls: 1,
             max_h2d_bytes: 0,
             expected_d2h_bytes: d2h_bytes,
@@ -2333,6 +2337,12 @@ impl<'a> ResidentGraphRuntime<'a> {
         self.workspace.graph_count()
     }
 
+    pub fn captured_graph_kernel_node_count(&self) -> Result<u64, ResidentRuntimeError> {
+        self.workspace
+            .graph_kernel_node_count()
+            .ok_or(ResidentRuntimeError::SizeOverflow)
+    }
+
     pub fn prepared_witness_graph_count(&self) -> usize {
         self.witness.len()
     }
@@ -3863,6 +3873,14 @@ fn fri_round_segment(round_index: usize) -> Result<GraphSegment, ResidentRuntime
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_bundle_budget_uses_the_captured_kernel_node_count() {
+        let budget = ResidentHotPathBudget::final_bundle(29, 7_859, 371_604);
+        assert_eq!(budget.expected_graph_launches, 29);
+        assert_eq!(budget.max_kernel_launches, 7_859);
+        assert_eq!(budget.expected_d2h_bytes, 371_604);
+    }
 
     #[test]
     fn witness_level_packing_is_deterministic_and_balances_long_writers() {

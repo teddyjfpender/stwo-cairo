@@ -12,12 +12,14 @@
 #      volume persists target/ + caches; the container layer does NOT).
 #   3. rsync BOTH repos (stwo, stwo-cairo) with the exact excludes bench_loop
 #      uses, so a later bench_loop sync is a no-op.
-#   4. Upload a PHASES fragment (your file) into a detached, setsid on-pod
+#   4. Install and verify the repo-pinned Rust toolchain after the toolchain
+#      manifest exists on the pod.
+#   5. Upload a PHASES fragment (your file) into a detached, setsid on-pod
 #      session with per-phase rc/secs sentinels (an ssh drop can't kill it).
-#   5. POLL each phase in order; print a per-phase rc + duration.
-#   6. Grep a standard evidence pattern set from every phase log.
-#   7. Fetch all phase logs (+ an optional divergence dir) to results/<label>/.
-#   8. STOP the pod on EVERY exit path (trap) — failed rounds cost cents, not
+#   6. POLL each phase in order; print a per-phase rc + duration.
+#   7. Grep a standard evidence pattern set from every phase log.
+#   8. Fetch all phase logs (+ an optional divergence dir) to results/<label>/.
+#   9. STOP the pod on EVERY exit path (trap) — failed rounds cost cents, not
 #      an idle-pod bleed.
 #
 # Usage:
@@ -87,7 +89,7 @@ note "label:  $LABEL"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   note "DRY_RUN: pod=$POD_ID key=$KEY"
-  note "DRY_RUN: would rsync $STWO_LOCAL and $CAIRO_LOCAL, run the phases above, fetch to $RESULTS_DIR/$LABEL, stop the pod."
+  note "DRY_RUN: would bootstrap, rsync $STWO_LOCAL and $CAIRO_LOCAL, install the pinned toolchain, run the phases above, fetch to $RESULTS_DIR/$LABEL, stop the pod."
   exit 0
 fi
 
@@ -122,12 +124,9 @@ note "endpoint: $HOST:$PORT"
 note "bootstrap (rsync + rustup)"
 pssh 'set -e
   command -v rsync >/dev/null 2>&1 || { apt-get update -qq >/dev/null && apt-get install -y -qq rsync >/dev/null; }
-  if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+  if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none >/dev/null
-  fi
-  . "$HOME/.cargo/env"
-  cd /workspace/stwo-cairo/stwo_cairo_prover && rustup toolchain install 2>/dev/null || true
-  rustc --version' || { note "BOOTSTRAP FAILED"; exit 1; }
+  fi' || { note "BOOTSTRAP FAILED"; exit 1; }
 
 # --- 3. rsync both repos (bench_loop-identical excludes) ---
 note "rsync stwo"
@@ -141,7 +140,15 @@ rsync -azc --delete --partial --no-owner --no-group --exclude=target --exclude=.
   -e "ssh ${SSH_OPTS[*]} -i $KEY -p $PORT" \
   "${CAIRO_LOCAL}/" "root@${HOST}:${CAIRO_POD}/" || { note "SYNC stwo-cairo FAILED"; exit 1; }
 
-# --- 4. upload + launch the detached session with rc sentinels ---
+# --- 4. install + verify the repo-pinned Rust toolchain ---
+note "install pinned Rust toolchain"
+pssh "set -e
+  . \"\$HOME/.cargo/env\"
+  cd '$CAIRO_POD/stwo_cairo_prover'
+  rustup toolchain install
+  rustc --version" || { note "TOOLCHAIN INSTALL FAILED"; exit 1; }
+
+# --- 5. upload + launch the detached session with rc sentinels ---
 note "upload + launch session"
 {
   cat <<'PROLOGUE'
@@ -174,7 +181,7 @@ PROLOGUE
 pssh "cd '$RUN' && rm -rf divergence *.log *.rc *.secs session.done && nohup setsid -f bash '$RUN/session.sh' </dev/null > session.out 2>&1 && echo LAUNCHED" \
   || { note "LAUNCH FAILED"; exit 1; }
 
-# --- 5. poll phases in order ---
+# --- 6. poll phases in order ---
 DEADLINE=$((SECONDS + ${MAX_WAIT:-10800}))
 for p in $PHASE_NAMES; do
   note "waiting on phase: $p"
@@ -192,13 +199,13 @@ for p in $PHASE_NAMES; do
   done
 done
 
-# --- 6. standard evidence grep ---
+# --- 7. standard evidence grep ---
 for p in $PHASE_NAMES; do
   note "--- $p evidence ---"
   pssh "grep -E 'verdict|DIVERGENCE|GEOMETRY|ORDER|PADDING|CONTENT|smoke proof section|smoke divergence|first mismatch|panicked|drifted|useful_mhz|\"pass\"|test result' '$RUN/$p.log' 2>/dev/null | head -60" || true
 done
 
-# --- 7. fetch evidence ---
+# --- 8. fetch evidence ---
 note "fetching evidence to $RESULTS_DIR/$LABEL"
 mkdir -p "$RESULTS_DIR/$LABEL"
 scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" "root@${HOST}:$RUN/*.log" "root@${HOST}:$RUN/*.secs" \
@@ -206,6 +213,6 @@ scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" "root@${HOST}:$RUN/*.log" "root@${HOST
 pssh "test -d '$RUN/divergence'" 2>/dev/null \
   && scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" -r "root@${HOST}:$RUN/divergence" "$RESULTS_DIR/$LABEL/" 2>/dev/null
 
-# --- 8. stop (also via trap) ---
+# --- 9. stop (also via trap) ---
 stop_pod
 note "done — results in $RESULTS_DIR/$LABEL"

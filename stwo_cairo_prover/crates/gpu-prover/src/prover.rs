@@ -52,7 +52,7 @@ use crate::arena_plan::ProofArenaPlan;
 use crate::graphs::{GraphError, GraphWorkspace};
 use crate::protocol_discovery::interaction_claim_from_flattened;
 use crate::relation_table::CAIRO_RELATION_GRAPH;
-use crate::resident_runtime::{ResidentGraphRuntime, ResidentRuntimeError};
+use crate::resident_runtime::{ResidentGraphRuntime, ResidentHotPathBudget, ResidentRuntimeError};
 use crate::resident_session::{
     resident_max_domain_log_size, with_resident_session, with_resident_session_from_generator,
     ResidentExecutionReadiness, ResidentPreWitnessSessionRequest, ResidentPreparationState,
@@ -181,6 +181,23 @@ pub struct MirroredResidentBlake2sProof {
 enum ResidentTranscriptMode {
     DeviceOnly,
     DeviceMirrored,
+}
+
+fn resident_hot_path_budget(
+    mode: ResidentTranscriptMode,
+    expected_graph_launches: u64,
+    max_kernel_launches: u64,
+    d2h_bytes: u64,
+) -> ResidentHotPathBudget {
+    let mut budget = ResidentHotPathBudget::final_bundle(
+        expected_graph_launches,
+        max_kernel_launches,
+        d2h_bytes,
+    );
+    if mode == ResidentTranscriptMode::DeviceMirrored {
+        budget.max_graph_submit_gap_ns = u64::MAX;
+    }
+    budget
 }
 
 fn transcript_mirror_telemetry(
@@ -964,8 +981,10 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
     }
 
     /// Opt-in U4 migration gate. It proves through the same strict resident
-    /// graphs, first enforces the ordinary hot-path budget, and only then reads
-    /// compact transcript snapshots back for a boundary-by-boundary host replay.
+    /// graphs, first enforces the ordinary structural hot-path budget, and only
+    /// then reads compact transcript snapshots back for a boundary-by-boundary
+    /// host replay. Submit-gap timing is ignored because this correctness-only
+    /// mode is explicitly performance-inadmissible.
     /// The distinct result and `performance_admissible=false` telemetry make
     /// this correctness run ineligible for MHz reporting by construction.
     pub fn prove_resident_blake2s_with_transcript_mirror(
@@ -1014,18 +1033,19 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
                 runtime.capture_all_prepared_subgraphs()?;
                 let expected_graphs = u64::try_from(runtime.captured_graph_count())
                     .map_err(|_| ResidentRuntimeError::FriRoundIndexTooLarge(usize::MAX))?;
+                let expected_kernel_launches = runtime.captured_graph_kernel_node_count()?;
                 let bundle_bytes = runtime
                     .workspace_proof_bundle_bytes()
                     .ok_or(ResidentRuntimeError::TranscriptRequirementsMismatch)?;
                 runtime.begin_hot_path_telemetry();
                 runtime.replay_all_prepared_subgraphs(2)?;
                 let bundle = runtime.read_proof_bundle_once()?;
-                let exec = runtime.require_hot_path_budget(
-                    crate::resident_runtime::ResidentHotPathBudget::final_bundle(
-                        expected_graphs,
-                        bundle_bytes,
-                    ),
-                )?;
+                let exec = runtime.require_hot_path_budget(resident_hot_path_budget(
+                    transcript_mode,
+                    expected_graphs,
+                    expected_kernel_launches,
+                    bundle_bytes,
+                ))?;
                 let transcript_mirror = match transcript_mode {
                     ResidentTranscriptMode::DeviceOnly => None,
                     ResidentTranscriptMode::DeviceMirrored => {
@@ -1123,6 +1143,23 @@ mod resident_transcript_mirror_tests {
         assert!(!telemetry.performance_admissible);
         assert!(!telemetry.performance_claim_admissible());
         assert_eq!(telemetry.report.boundaries_verified, 17);
+    }
+
+    #[test]
+    fn mirrored_budget_relaxes_only_submit_gap_timing() {
+        let production =
+            resident_hot_path_budget(ResidentTranscriptMode::DeviceOnly, 29, 7_859, 371_604);
+        assert_eq!(
+            production,
+            ResidentHotPathBudget::final_bundle(29, 7_859, 371_604)
+        );
+
+        let mut expected_mirrored = production;
+        expected_mirrored.max_graph_submit_gap_ns = u64::MAX;
+        assert_eq!(
+            resident_hot_path_budget(ResidentTranscriptMode::DeviceMirrored, 29, 7_859, 371_604,),
+            expected_mirrored
+        );
     }
 
     #[test]
