@@ -5,9 +5,10 @@
 
 use std::collections::BTreeSet;
 
+use stwo_cairo_gpu_prover::fixed_table_materializer::compile_cairo_fixed_table_materializations;
 use stwo_cairo_gpu_prover::schedule::{
-    InputEdge, KernelIdentitySource, ScheduleError, TraceColumnCount, WitnessWriterKind,
-    WitnessWriterReadiness,
+    ComponentRowSource, InputEdge, KernelIdentitySource, ScheduleError, TraceColumnCount,
+    WitnessWriterKind, WitnessWriterReadiness,
 };
 use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
 
@@ -212,6 +213,64 @@ fn certified_edges_pinned() {
         (342, 42, 27),
         "poseidon_aggregator→partial-round edge changed"
     );
+}
+
+/// M4 completeness fence for the fixed-table lane: the CUDA fixed-table
+/// materializer unconditionally writes the word-major flattened LookupInputs
+/// buffer for EVERY fixed table, and the arena planner sizes that buffer from
+/// `facts.lookup_words` — so a missing or wrong fact only surfaces as a strict
+/// resident `MissingWitnessBuffer` once the component is PRESENT (the SN2
+/// fixture has no blake, so `verify_bitwise_xor_12`'s `lookup_words: None`
+/// survived every fixture gate and failed on the real SN PIE). Pin the whole
+/// fixed-table set against the compiled CUDA ABI on any host, both directions.
+#[test]
+fn fixed_table_lookup_facts_match_the_cuda_materializer_abi() {
+    let compiled = compile_cairo_fixed_table_materializations().unwrap();
+    let fixed_nodes: Vec<_> = CAIRO_SCHEDULE
+        .nodes
+        .iter()
+        .filter(|node| node.facts.witness_writer.kind == WitnessWriterKind::FixedTableCuda)
+        .collect();
+    assert_eq!(
+        fixed_nodes.len(),
+        compiled.len(),
+        "fixed-table schedule set drifted from the materialization descriptors"
+    );
+    for node in fixed_nodes {
+        let materializer = compiled
+            .iter()
+            .find(|candidate| candidate.component() == node.id)
+            .unwrap_or_else(|| panic!("{}: no compiled fixed-table materializer", node.id));
+        let requirements = materializer.requirements();
+        assert!(
+            node.facts.lookup_words.is_some_and(|words| words > 0),
+            "{}: every fixed table writes lookup words; a None here starves the \
+             resident fixed-table workspace of its LookupInputs buffer",
+            node.id
+        );
+        assert_eq!(
+            node.facts.lookup_words,
+            u32::try_from(requirements.lookup_output_count).ok(),
+            "{}: schedule lookup_words must size exactly the materializer's \
+             flattened LookupInputs output",
+            node.id
+        );
+        let ComponentRowSource::FixedLogSize(log_size) = node.facts.row_source else {
+            panic!("{}: fixed table without a FixedLogSize row source", node.id);
+        };
+        assert_eq!(
+            requirements.row_count,
+            1usize << log_size,
+            "{}: materializer row count disagrees with the schedule log size",
+            node.id
+        );
+        assert!(
+            node.facts.sub_words.is_none(),
+            "{}: the fixed-table writer has no sub-word output; a Some here would \
+             allocate a SubcomponentInputs buffer no writer fills",
+            node.id
+        );
+    }
 }
 
 #[test]

@@ -334,10 +334,16 @@ impl FixedTableMaterializationTable {
             {
                 return Err(FixedTablePlanError::ScheduleMismatch(plan.component));
             }
+            // The CUDA fixed-table writer always materializes the flattened
+            // LookupInputs buffer, so the schedule fact must carry the exact
+            // per-row word count for BOTH layouts — the arena planner sizes
+            // (and the resident workspace requires) that buffer from it.
             match plan.lookup {
                 FixedTableLookupLayout::Words(words)
                     if node.facts.lookup_words == u32::try_from(words.len()).ok() => {}
-                FixedTableLookupLayout::ExpandedXor(_) if node.facts.lookup_words.is_none() => {}
+                FixedTableLookupLayout::ExpandedXor(layout)
+                    if node.facts.lookup_words.is_some()
+                        && node.facts.lookup_words == layout.lookup_word_count() => {}
                 _ => return Err(FixedTablePlanError::ScheduleMismatch(plan.component)),
             }
         }

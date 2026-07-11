@@ -2476,9 +2476,9 @@ fn main() -> ExitCode {
                     "{stem}: JIT_LOGUP_DESCS drift from write_interaction_trace"
                 );
             }
-            let lookup_words = lookup_fields
+            let mut lookup_words = lookup_fields
                 .as_ref()
-                .map(|fields| fields.iter().map(|field| field.width).sum());
+                .map(|fields| fields.iter().map(|field| field.width).sum::<u32>());
             let logup_columns = relation_columns
                 .as_ref()
                 .map(|columns| columns.len() as u32)
@@ -2508,6 +2508,28 @@ fn main() -> ExitCode {
                         }),
                     )
                 };
+                // Every fixed table is materialized by the CUDA fixed-table
+                // writer, whose ABI unconditionally emits the flattened
+                // word-major LookupInputs buffer (one output column per
+                // lookup word). The schedule fact must size that arena buffer
+                // even when the SIMD writer has no flat LookupData — the
+                // expanded-XOR table synthesizes its tuples from row bits, so
+                // its words/row = columns * (relation_id + a + b + a^b + mult).
+                lookup_words = Some(match &fixed_plan.lookup {
+                    FixedTableLookupFact::Words(words) => {
+                        let words = words.len() as u32;
+                        assert_eq!(
+                            lookup_words,
+                            Some(words),
+                            "{stem}: fixed-table lookup layout disagrees with LookupData"
+                        );
+                        words
+                    }
+                    FixedTableLookupFact::ExpandedXor { .. } => fixed_plan
+                        .multiplicity_columns
+                        .checked_mul(5)
+                        .expect("expanded-XOR lookup word count"),
+                });
                 fixed_table_plans.push(fixed_plan);
             }
             let facts = StaticFacts {

@@ -1735,12 +1735,6 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 3,
             },
             OutputEdge {
-                to: "poseidon_round_keys",
-                word_base: 0,
-                words_per_instance: 1,
-                n_instances: 1,
-            },
-            OutputEdge {
                 to: "range_check_252_width_27",
                 word_base: 61,
                 words_per_instance: 10,
@@ -1748,6 +1742,10 @@ static NODES: &[ComponentNode] = &[
             },
         ],
         counts: &[
+            CountFeed {
+                family: "poseidon_round_keys_state",
+                n_relations: 1,
+            },
             CountFeed {
                 family: "range_check_4_4_4_4_state",
                 n_relations: 1,
@@ -1893,24 +1891,22 @@ static NODES: &[ComponentNode] = &[
             from: "poseidon_aggregator",
             n_instances: 8,
         }],
-        outputs: &[
-            OutputEdge {
-                to: "cube_252",
-                word_base: 0,
-                words_per_instance: 10,
-                n_instances: 3,
+        outputs: &[OutputEdge {
+            to: "cube_252",
+            word_base: 0,
+            words_per_instance: 10,
+            n_instances: 3,
+        }],
+        counts: &[
+            CountFeed {
+                family: "poseidon_round_keys_state",
+                n_relations: 1,
             },
-            OutputEdge {
-                to: "poseidon_round_keys",
-                word_base: 30,
-                words_per_instance: 1,
-                n_instances: 1,
+            CountFeed {
+                family: "range_check_3_3_3_3_3_state",
+                n_relations: 1,
             },
         ],
-        counts: &[CountFeed {
-            family: "range_check_3_3_3_3_3_state",
-            n_relations: 1,
-        }],
         slots: None,
     },
     ComponentNode {
@@ -1931,20 +1927,7 @@ static NODES: &[ComponentNode] = &[
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::poseidon_round_keys::LOG_SIZE),
-        inputs: &[
-            InputEdge::Producer {
-                of: "poseidon_3_partial_rounds_chain",
-                word_base: 0,
-                words_per_instance: 1,
-                n_instances: 1,
-            },
-            InputEdge::Producer {
-                of: "poseidon_full_round_chain",
-                word_base: 30,
-                words_per_instance: 1,
-                n_instances: 1,
-            },
-        ],
+        inputs: &[],
         capacity_inputs: &[
             CapacityFeed {
                 from: "poseidon_3_partial_rounds_chain",
@@ -2312,12 +2295,7 @@ static NODES: &[ComponentNode] = &[
         },
         kernel: None,
         log_size: LogSizeSource::Fixed(cairo_air::components::range_check_4_3::LOG_SIZE),
-        inputs: &[InputEdge::Producer {
-            of: "verify_instruction",
-            word_base: 3,
-            words_per_instance: 2,
-            n_instances: 1,
-        }],
+        inputs: &[],
         capacity_inputs: &[CapacityFeed {
             from: "verify_instruction",
             n_instances: 1,
@@ -2662,7 +2640,7 @@ static NODES: &[ComponentNode] = &[
             trace_columns: TraceColumnCount::Fixed(
                 cairo_air::components::verify_bitwise_xor_12::N_TRACE_COLUMNS as u32,
             ),
-            lookup_words: None,
+            lookup_words: Some(80),
             sub_words: None,
             logup_columns: Some(8),
             row_source: ComponentRowSource::FixedLogSize(20),
@@ -3027,12 +3005,7 @@ static NODES: &[ComponentNode] = &[
                 n_instances: 1,
             },
         ],
-        outputs: &[OutputEdge {
-            to: "range_check_4_3",
-            word_base: 3,
-            words_per_instance: 2,
-            n_instances: 1,
-        }],
+        outputs: &[],
         counts: &[
             CountFeed {
                 family: "memory_address_to_id_state",
@@ -3040,6 +3013,10 @@ static NODES: &[ComponentNode] = &[
             },
             CountFeed {
                 family: "memory_id_to_big_state",
+                n_relations: 1,
+            },
+            CountFeed {
+                family: "range_check_4_3_state",
                 n_relations: 1,
             },
             CountFeed {
