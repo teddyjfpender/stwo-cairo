@@ -605,7 +605,7 @@ macro_rules! prove_accessor_parity_gate {
         #[test]
         fn $test() {
             use crate::witness::components::$module;
-            let cg = fill_fixture(&[
+            let (cg, addr_ids, f252_values, small_values, _mem_arc) = fill_fixture_with_memory(&[
                 $mstr,
                 "memory_address_to_id",
                 "memory_id_to_big",
@@ -657,9 +657,13 @@ macro_rules! prove_accessor_parity_gate {
             let n_sub = out.program.n_sub_words as usize;
             let mut lookup_flat = vec![0u32; n_lookup * n_padded];
             let mut sub_flat = vec![0u32; n_sub * n_padded];
-            for (r, cs) in inputs.iter().enumerate() {
-                let row_inputs = [cs.pc.0, cs.ap.0, cs.fp.0, u32::from(r < n_rows)];
-                let ro = interpret_row(&out.program, &row_inputs, &oracle);
+            let rows: Vec<Vec<u32>> = inputs
+                .iter()
+                .enumerate()
+                .map(|(r, cs)| vec![cs.pc.0, cs.ap.0, cs.fp.0, u32::from(r < n_rows)])
+                .collect();
+            for (r, row_inputs) in rows.iter().enumerate() {
+                let ro = interpret_row(&out.program, row_inputs, &oracle);
                 for (w, &v) in ro.lookup_words.iter().enumerate() {
                     lookup_flat[w * n_padded + r] = v;
                 }
@@ -708,6 +712,20 @@ macro_rules! prove_accessor_parity_gate {
                     );
                 }
             }
+
+            let host_rows: Vec<Vec<M31>> = diff.orig_rows.iter().map(|r| r.to_vec()).collect();
+            assert_device_builtin_leg_matches_host(
+                $mstr,
+                out.program,
+                false,
+                &rows,
+                &addr_ids,
+                &f252_values,
+                &small_values,
+                &host_rows,
+                &diff.orig_lookup,
+                &diff.orig_sub,
+            );
         }
     };
 }
@@ -2577,14 +2595,15 @@ fn poseidon_combination_37_strict_aot_captured_row() {
     stwo_backend_cuda::jit_witness::register_recorded_program(LABEL, recording.program);
     let tables =
         stwo_backend_cuda::exec_tables::DeviceExecutionTables::upload(&[0], &[[0; 8]], &[0]);
-    let (device_columns, ..) = stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
-        LABEL,
-        &input_cols,
-        &tables,
-        false,
-        false,
-    )
-    .expect("strict-AOT captured-row launch unavailable");
+    let (device_columns, _lookup_device, lookup_flat, _sub_device, sub_flat) =
+        stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
+            LABEL,
+            &input_cols,
+            &tables,
+            true,
+            true,
+        )
+        .expect("strict-AOT captured-row launch unavailable");
 
     let stats = stwo_backend_cuda::aot::runtime_stats();
     assert_eq!(stats.aot_misses, 0, "strict AOT miss");
@@ -2596,12 +2615,42 @@ fn poseidon_combination_37_strict_aot_captured_row() {
         1,
         "launch did not use exactly one embedded AOT kernel"
     );
-    let actual = device_columns[114].to_vec();
-    for (row, value) in actual.iter().enumerate() {
-        assert_eq!(
-            value.0, host.columns[114],
-            "strict-AOT poseidon device col 114 row {row}"
-        );
+    assert_eq!(device_columns.len(), host.columns.len(), "column count");
+    for (column, device_column) in device_columns.iter().enumerate() {
+        for (row, value) in device_column.to_vec().iter().enumerate() {
+            assert_eq!(
+                value.0, host.columns[column],
+                "strict-AOT poseidon device col {column} row {row}"
+            );
+        }
+    }
+    assert_eq!(
+        lookup_flat.len(),
+        host.lookup_words.len() * N_LANES,
+        "lookup flat length"
+    );
+    for (word, expected) in host.lookup_words.iter().enumerate() {
+        for row in 0..N_LANES {
+            assert_eq!(
+                lookup_flat[word * N_LANES + row],
+                *expected,
+                "strict-AOT poseidon lookup word {word} row {row}"
+            );
+        }
+    }
+    assert_eq!(
+        sub_flat.len(),
+        host.sub_words.len() * N_LANES,
+        "sub flat length"
+    );
+    for (word, expected) in host.sub_words.iter().enumerate() {
+        for row in 0..N_LANES {
+            assert_eq!(
+                sub_flat[word * N_LANES + row],
+                *expected,
+                "strict-AOT poseidon sub word {word} row {row}"
+            );
+        }
     }
 }
 
@@ -2686,6 +2735,155 @@ fn poseidon_combination_37_nvrtc_captured_row() {
         assert_eq!(
             value.0, host.columns[114],
             "NVRTC poseidon device col 114 row {row}"
+        );
+    }
+}
+
+/// Test-only schedule-context mirror. Inserts a low-W27-word mirror immediately
+/// after one selected felt deduce while preserving every original instruction.
+#[test]
+#[ignore = "requires an H100 CUDA build with NVRTC"]
+fn poseidon_combination_37_nvrtc_stage_mirror() {
+    use stwo_backend_cuda::jit_witness::isa::{WitnessInst, WitnessOp};
+
+    const ROW0: [u32; 42] = [
+        0, 4, 50414066, 128588089, 120633038, 63732151, 97038777, 32313651, 132029487, 122547581,
+        103664913, 254, 70246675, 35346168, 94916093, 40649707, 36525582, 74717629, 46705327,
+        50424067, 58946647, 39, 87784937, 111781535, 84088807, 86541649, 127250820, 6346412,
+        29906354, 123707764, 53944726, 252, 22813865, 35298563, 79701982, 108932941, 43138495,
+        66822320, 50165977, 5364451, 38958708, 247,
+    ];
+    let selected = std::env::var("STWO_POSEIDON_MIRROR_CALL_ORDINAL")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("mirror ordinal must be usize")
+        })
+        .unwrap_or(28);
+    assert!((17..=28).contains(&selected), "mirror ordinal {selected}");
+
+    let mut program = crate::witness::components::poseidon_3_partial_rounds_chain::record_poseidon_3_partial_rounds_chain().program;
+    let mut ordinal = 0usize;
+    let call_index = program
+        .insts
+        .iter()
+        .position(|inst| {
+            if WitnessOp::from_raw(inst.op) != Some(WitnessOp::DeduceCall) {
+                return false;
+            }
+            let matches = ordinal == selected;
+            ordinal += 1;
+            matches
+        })
+        .expect("selected deduce call missing");
+    let call = program.insts[call_index];
+    assert_eq!(call.b, 28, "selected call must produce one W9 felt");
+    let reg = u16::try_from(program.n_regs).expect("witness register index exceeds u16");
+    let mirror_col = program.n_cols;
+    let extra = vec![
+        WitnessInst::new(WitnessOp::Const, reg, 0, 0, 512),
+        WitnessInst::new(WitnessOp::Const, reg + 1, 0, 0, 262_144),
+        WitnessInst::new(
+            WitnessOp::M31Mul,
+            reg + 2,
+            call.dst as u32 + 1,
+            reg as u32,
+            0,
+        ),
+        WitnessInst::new(
+            WitnessOp::M31Add,
+            reg + 3,
+            call.dst as u32,
+            reg as u32 + 2,
+            0,
+        ),
+        WitnessInst::new(
+            WitnessOp::M31Mul,
+            reg + 4,
+            call.dst as u32 + 2,
+            reg as u32 + 1,
+            0,
+        ),
+        WitnessInst::new(
+            WitnessOp::M31Add,
+            reg + 5,
+            reg as u32 + 3,
+            reg as u32 + 4,
+            0,
+        ),
+        WitnessInst::new(WitnessOp::ColWrite, 0, reg as u32 + 5, 0, mirror_col),
+    ];
+    program.insts.splice(call_index + 1..call_index + 1, extra);
+    program.n_regs += 6;
+    program.n_cols += 1;
+
+    let mut row_inputs = ROW0.to_vec();
+    row_inputs.push(1);
+    let oracle = |table: u32, key: u32, limb: u32| -> u32 {
+        panic!("unexpected table read: table {table} key {key} limb {limb}")
+    };
+    let host = stwo_backend_cuda::jit_witness::interp::interpret_row_with(
+        &program,
+        &row_inputs,
+        &oracle,
+        &mut FastDeductionHost,
+    );
+    let expected = host.columns[mirror_col as usize];
+    if selected == 28 {
+        assert_eq!(expected, 17_375_170, "final combination_37 mirror");
+    }
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        eprintln!("NVRTC stage mirror ordinal {selected}: host={expected}, device SKIPPED");
+        return;
+    }
+
+    let rows = vec![row_inputs; N_LANES];
+    let input_cols = (0..program.n_inputs as usize)
+        .map(|slot| rows.iter().map(|row| row[slot]).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert!(
+        crate::witness::jit_prove_backend::ensure_device_pedersen_table(),
+        "NVRTC stage mirror: device Pedersen table registration failed"
+    );
+    unsafe {
+        std::env::set_var("STWO_CUDA_WITNESS_JIT_MAX_INSTRS", "8192");
+        stwo_backend_cuda_kernels::raw::stwo_cuda_jit_set_require_aot(false);
+    }
+    stwo_backend_cuda::aot::reset_runtime_stats();
+    let label = format!("poseidon_3_partial_rounds_chain_nvrtc_mirror_{selected}");
+    stwo_backend_cuda::jit_witness::register_recorded_program(&label, program);
+    let tables =
+        stwo_backend_cuda::exec_tables::DeviceExecutionTables::upload(&[0], &[[0; 8]], &[0]);
+    let (device_columns, ..) = stwo_backend_cuda::exec_tables::launch_recorded_builtin_for_prove(
+        &label,
+        &input_cols,
+        &tables,
+        false,
+        false,
+    )
+    .expect("NVRTC stage-mirror launch unavailable");
+    let stats = stwo_backend_cuda::aot::runtime_stats();
+    assert_eq!(
+        stats.aot_loads + stats.aot_cache_hits,
+        0,
+        "unexpected AOT provenance"
+    );
+    assert_eq!(stats.aot_misses, 1, "mirrored key did not miss AOT");
+    assert_eq!(
+        stats.runtime_loads + stats.runtime_cache_hits,
+        1,
+        "mirrored key did not use runtime compiler/cache"
+    );
+    assert_eq!(stats.strict_rejections, 0, "unexpected strict rejection");
+    for (row, value) in device_columns[mirror_col as usize]
+        .to_vec()
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            value.0, expected,
+            "NVRTC schedule-context mirror call {selected} row {row}"
         );
     }
 }
@@ -3553,6 +3751,66 @@ fn cube_252_generic_simd_byte_identical() {
     let packed_size = packed.len().next_power_of_two();
     packed.resize(packed_size, *packed.first().unwrap());
     assert_generic_diff_byte_identical!(m::generic_simd_diff(packed, n_rows, &rc99, &rc20));
+}
+
+/// Gate (c) for `cube_252`: launch the recorded program as a real CUDA
+/// kernel and compare every committed, lookup, and sub-feed word with the
+/// production SIMD writer over the poseidon-family fixture.
+#[test]
+fn cube_252_recording_device_matches_host() {
+    use crate::witness::components::cube_252 as m;
+
+    let (cg,) = poseidon_family_fixture();
+    let gen = cg.cube_252.expect("cube_252 populated");
+    assert!(
+        gen.remainder_inputs.lock().unwrap().is_empty(),
+        "fixture left scalar cube_252 inputs"
+    );
+    let rc99 = cg.range_check_9_9.expect("rc99");
+    let rc20 = cg.range_check_20.expect("rc20");
+    let mut packed = gen.packed_inputs.into_inner().unwrap();
+    assert!(!packed.is_empty(), "fixture fed no cube_252 inputs");
+    let n_rows = packed.len() * N_LANES;
+    packed.resize(packed.len().next_power_of_two(), packed[0]);
+    let diff = m::generic_simd_diff(packed.clone(), n_rows, &rc99, &rc20);
+
+    // Slot layout: W27 words 0..10, enabler 10, iota 11.
+    let n_padded = packed.len() * N_LANES;
+    let rows = (0..n_padded)
+        .map(|r| {
+            let (packed_row, lane) = (r / N_LANES, r % N_LANES);
+            let input = &packed[packed_row];
+            let mut row = (0..10)
+                .map(|word| input.get_m31(word).to_array()[lane].0)
+                .collect::<Vec<_>>();
+            row.push(u32::from(r < n_rows));
+            row.push(r as u32);
+            row
+        })
+        .collect::<Vec<_>>();
+    let recording = m::record_cube_252();
+    assert!(
+        recording.poison_ops.is_empty(),
+        "cube poisons: {:?}",
+        recording.poison_ops
+    );
+    let host_rows = diff
+        .orig_rows
+        .iter()
+        .map(|row| row.to_vec())
+        .collect::<Vec<_>>();
+    assert_device_builtin_leg_matches_host(
+        "cube_252",
+        recording.program,
+        true,
+        &rows,
+        &[0],
+        &[[0; 8]],
+        &[0],
+        &host_rows,
+        &diff.orig_lookup,
+        &diff.orig_sub,
+    );
 }
 
 /// Gate (a) for `range_check_252_width_27` (W27 range-check component).
@@ -4490,5 +4748,115 @@ fn blake_to_blake_g_edge_interleave_matches_host_feed() {
     eprintln!(
         "edge gate [blake_round->blake_g]: PASS ({prod_padded} producer rows x 8 -> \
          {cons_padded} consumer rows)"
+    );
+}
+
+/// SN2 omission diagnostic: pin the two host-origin count classes which are
+/// not produced by recorded component sub-feeds. These are the exact public
+/// memory seed loop and memory-big rc_9_9 row semantics used by the SIMD path.
+#[test]
+fn sn2_host_origin_memory_count_shapes_are_nonzero() {
+    use cairo_vm::types::layout_name::LayoutName;
+    use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
+        PreProcessedTrace, MAX_SEQUENCE_LOG_SIZE,
+    };
+    use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
+    use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
+
+    use crate::witness::components::range_check_9_9;
+
+    let input = run_and_adapt(
+        &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .expect("run SN2 fixture");
+    let ProverInput {
+        memory,
+        public_memory_addresses,
+        ..
+    } = input;
+    let memory = Arc::new(memory);
+    let address_seeds = memory_address_to_id::ClaimGenerator::new(memory.clone());
+    let value_seeds = memory_id_to_big::ClaimGenerator::new(memory.clone());
+
+    // Keep this byte-for-byte semantic twin of create_cairo_claim_generator's
+    // public-memory loop: resolve id, seed address, then seed encoded value id.
+    for addr in public_memory_addresses
+        .iter()
+        .copied()
+        .map(M31::from_u32_unchecked)
+    {
+        let id = address_seeds.get_id(addr);
+        address_seeds.add_input(&addr, 0);
+        value_seeds.add_input(&id, 0);
+    }
+    let scalar_counts = |columns: Vec<Vec<PackedM31>>| {
+        columns
+            .into_iter()
+            .flat_map(|column| column.into_iter().flat_map(|packed| packed.to_array()))
+            .map(|value| value.0)
+            .collect::<Vec<_>>()
+    };
+    let address_counts = scalar_counts(address_seeds.mults_snapshot());
+    let big_seed_counts = scalar_counts(value_seeds.big_mults_snapshot());
+    let small_seed_counts = scalar_counts(value_seeds.small_mults_snapshot());
+    let stats = |counts: &[u32]| {
+        (
+            counts.iter().map(|&count| u64::from(count)).sum::<u64>(),
+            counts.iter().filter(|&&count| count != 0).count(),
+        )
+    };
+    let (address_total, address_nonzero) = stats(&address_counts);
+    let (big_seed_total, big_seed_nonzero) = stats(&big_seed_counts);
+    let (small_seed_total, small_seed_nonzero) = stats(&small_seed_counts);
+    assert_eq!(address_total, public_memory_addresses.len() as u64);
+    assert_eq!(big_seed_total + small_seed_total, address_total);
+    assert!(address_nonzero > 0 && big_seed_nonzero > 0 && small_seed_nonzero > 0);
+
+    // Run the real memory table writer into a fresh rc_9_9 state. Its totals
+    // include big rows (14 pairs, relation shape 2,2,2,2,2,2,1,1) plus small
+    // rows (4 pairs in relations 0..3). Subtract the latter to expose the
+    // otherwise omitted big-row contribution exactly.
+    let rc99 = range_check_9_9::ClaimGenerator::new(Arc::new(PreProcessedTrace::canonical()));
+    let memory_values = memory_id_to_big::ClaimGenerator::new(memory);
+    let (_, _, _, interaction) = memory_values.write_trace(&rc99, MAX_SEQUENCE_LOG_SIZE, None);
+    let big_rows = interaction
+        .big_components_values
+        .iter()
+        .map(|component| component[0].len() * N_LANES)
+        .sum::<usize>();
+    let small_rows = interaction.small_values[0].len() * N_LANES;
+    let rc_totals = rc99.mults.each_ref().map(|column| {
+        column
+            .snapshot_simd_vec()
+            .into_iter()
+            .flat_map(|packed| packed.to_array())
+            .map(|value| u64::from(value.0))
+            .sum::<u64>()
+    });
+    let big_pair_totals = std::array::from_fn::<_, 8, _>(|relation| {
+        rc_totals[relation] - if relation < 4 { small_rows as u64 } else { 0 }
+    });
+    let expected_per_row = [2, 2, 2, 2, 2, 2, 1, 1];
+    assert_eq!(
+        big_pair_totals,
+        expected_per_row.map(|pairs| pairs * big_rows as u64)
+    );
+    assert!(big_pair_totals.iter().all(|&count| count > 0));
+    assert_eq!(big_pair_totals.iter().sum::<u64>(), 14 * big_rows as u64);
+    eprintln!(
+        "SN2 host-origin counts: public={} address_nonzero={} big_seeds={}/{} \
+         small_seeds={}/{}; memory rows big={} small={} big_rc9_9={:?}",
+        address_total,
+        address_nonzero,
+        big_seed_total,
+        big_seed_nonzero,
+        small_seed_total,
+        small_seed_nonzero,
+        big_rows,
+        small_rows,
+        big_pair_totals,
     );
 }

@@ -1,0 +1,4 @@
+# Identify the independent rc9_9 and memory multiplicity-feed residues.
+cd "$CAIRO"
+phase cube_sub_feed env STWO_CUDA_WITNESS_JIT_MAX_INSTRS=8192 cargo test -p stwo-cairo-prover cube_252_recording_device_matches_host -- --nocapture --test-threads=1
+phase opcode_sub_feeds cargo test -p stwo-cairo-prover prove_accessors_match_host -- --nocapture --test-threads=1

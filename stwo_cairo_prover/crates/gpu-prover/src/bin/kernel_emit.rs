@@ -21,7 +21,7 @@
 //!                    [--input-bincode <adapted-input>]... [--check]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -36,6 +36,14 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTra
 use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
 use stwo_cairo_gpu_prover::{phases, state};
 use stwo_cairo_prover::witness::jit_prove_backend::all_lane_recordings;
+
+fn write_if_changed(path: &Path, content: &str) -> std::io::Result<bool> {
+    if std::fs::read(path).is_ok_and(|bytes| bytes == content.as_bytes()) {
+        return Ok(false);
+    }
+    std::fs::write(path, content)?;
+    Ok(true)
+}
 
 fn arg(name: &str) -> Option<String> {
     args(name).into_iter().next()
@@ -410,14 +418,45 @@ fn main() -> ExitCode {
                 }
             }
         }
+        let mut written = 0usize;
+        let mut unchanged = 0usize;
         for (name, content) in &files {
-            std::fs::write(out_dir.join(name), content).expect("write generated file");
+            if write_if_changed(&out_dir.join(name), content).expect("write generated file") {
+                written += 1;
+            } else {
+                unchanged += 1;
+            }
         }
         println!(
-            "kernel_emit: wrote {} kernels + manifest to {}",
+            "kernel_emit: {written} written, {unchanged} unchanged generated files \
+             ({} kernels + metadata) in {}",
             files.len() - 1,
             out_dir.display()
         );
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_if_changed;
+
+    #[test]
+    fn write_if_changed_skips_identical_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "stwo-kernel-emit-write-if-changed-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert!(write_if_changed(&path, "first\n").unwrap());
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(!write_if_changed(&path, "first\n").unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(write_if_changed(&path, "second\n").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second\n");
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -1,0 +1,629 @@
+warning: unused variable: `raw_u32`
+    --> crates/prover/src/witness/components/blake_round.rs:6986:9
+     |
+6986 |     let raw_u32 = |word: usize, vi: usize| PackedUInt32 {
+     |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_raw_u32`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `n_vec`
+   --> crates/prover/src/witness/logup_descs.rs:123:9
+    |
+123 |     let n_vec = n_rows / N_LANES;
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_n_vec`
+
+warning: method `mults_snapshot` is never used
+   --> crates/prover/src/witness/components/memory_address_to_id.rs:117:19
+    |
+73  | impl ClaimGenerator {
+    | ------------------- method in this implementation
+...
+117 |     pub(crate) fn mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+    |                   ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: methods `big_mults_snapshot` and `small_mults_snapshot` are never used
+   --> crates/prover/src/witness/components/memory_id_to_big.rs:112:19
+    |
+49  | impl ClaimGenerator {
+    | ------------------- methods in this implementation
+...
+112 |     pub(crate) fn big_mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+    |                   ^^^^^^^^^^^^^^^^^^
+...
+115 |     pub(crate) fn small_mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+    |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/add_ap_opcode.rs:938:4
+    |
+938 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/add_ap_opcode.rs:961:4
+    |
+961 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/bitwise_builtin.rs:2913:4
+     |
+2913 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/bitwise_builtin.rs:3094:4
+     |
+3094 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_compress_opcode.rs:7836:4
+     |
+7836 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/blake_compress_opcode.rs:8018:4
+     |
+8018 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_g.rs:1810:4
+     |
+1810 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/blake_g.rs:1903:4
+     |
+1903 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_round.rs:5908:4
+     |
+5908 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/blake_round.rs:6041:4
+     |
+6041 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: method `mults_snapshot` is never used
+  --> crates/prover/src/witness/components/blake_round_sigma.rs:35:19
+   |
+21 | impl ClaimGenerator {
+   | ------------------- method in this implementation
+...
+35 |     pub(crate) fn mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+   |                   ^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/cube_252.rs:9195:4
+     |
+9195 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/cube_252.rs:9304:4
+     |
+9304 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode.rs:5174:4
+     |
+5174 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode.rs:5235:4
+     |
+5235 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode_small.rs:1589:4
+     |
+1589 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode_small.rs:1625:4
+     |
+1625 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:25891:4
+      |
+25891 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:26225:4
+      |
+26225 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_window_bits_18.rs:17998:4
+      |
+17998 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_window_bits_18.rs:18149:4
+      |
+18149 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:12598:4
+      |
+12598 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:12642:4
+      |
+12642 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/pedersen_builtin.rs:459:4
+    |
+459 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/pedersen_builtin.rs:490:4
+    |
+490 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4893:4
+     |
+4893 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4951:4
+     |
+4951 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/poseidon_aggregator.rs:10769:4
+      |
+10769 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/poseidon_aggregator.rs:10877:4
+      |
+10877 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/poseidon_builtin.rs:608:4
+    |
+608 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/poseidon_builtin.rs:650:4
+    |
+650 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:3197:4
+     |
+3197 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:3253:4
+     |
+3253 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/qm_31_add_mul_opcode.rs:2028:4
+     |
+2028 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/qm_31_add_mul_opcode.rs:2064:4
+     |
+2064 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/range_check_252_width_27.rs:971:4
+    |
+971 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/range_check_252_width_27.rs:1002:4
+     |
+1002 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/range_check_builtin.rs:560:4
+    |
+560 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/range_check_builtin.rs:577:4
+    |
+577 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/triple_xor_32.rs:891:4
+    |
+891 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/triple_xor_32.rs:944:4
+    |
+944 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/verify_instruction.rs:730:4
+    |
+730 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/verify_instruction.rs:751:4
+    |
+751 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:22527:9
+      |
+22527 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+      |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+      |
+      = note: `#[warn(non_snake_case)]` on by default
+
+warning: variable `Felt252_3_0_0_0` should have a snake case name
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:22528:9
+      |
+22528 |     let Felt252_3_0_0_0 = PackedFelt252::broadcast(Felt252::from([3, 0, 0, 0]));
+      |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3_0_0_0`
+
+warning: variable `Felt252_15078781199387521180_7290787951512770967_8332093602989199897_317979597309161923` should have a snake case name
+    --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:9717:9
+     |
+9717 |     let Felt252_15078781199387521180_7290787951512770967_8332093602989199897_317979597309161923 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_15078781199387521180_7290787951512770967_8332093602989199897_317979597309161923`
+
+warning: variable `Felt252_2796306760980396030_6142433350943679003_9786206818587032316_455457488062799560` should have a snake case name
+    --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:9724:9
+     |
+9724 |     let Felt252_2796306760980396030_6142433350943679003_9786206818587032316_455457488062799560 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2796306760980396030_6142433350943679003_9786206818587032316_455457488062799560`
+
+warning: variable `Felt252_0_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4264:9
+     |
+4264 |     let Felt252_0_0_0_0 = PackedFelt252::broadcast(Felt252::from([0, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_0_0_0_0`
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4265:9
+     |
+4265 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+
+warning: variable `Felt252_2_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4266:9
+     |
+4266 |     let Felt252_2_0_0_0 = PackedFelt252::broadcast(Felt252::from([2, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2_0_0_0`
+
+warning: variable `Felt252_3_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4267:9
+     |
+4267 |     let Felt252_3_0_0_0 = PackedFelt252::broadcast(Felt252::from([3, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3_0_0_0`
+
+warning: variable `Felt252_4_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4268:9
+     |
+4268 |     let Felt252_4_0_0_0 = PackedFelt252::broadcast(Felt252::from([4, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_4_0_0_0`
+
+warning: variable `Felt252_0_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:7992:9
+     |
+7992 |     let Felt252_0_0_0_0 = PackedFelt252::broadcast(Felt252::from([0, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_0_0_0_0`
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:7993:9
+     |
+7993 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+
+warning: variable `Felt252_10310704347937391837_5874215448258336115_2880320859071049537_45350836576946303` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:7994:9
+     |
+7994 |     let Felt252_10310704347937391837_5874215448258336115_2880320859071049537_45350836576946303 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_10310704347937391837_5874215448258336115_2880320859071049537_45350836576946303`
+
+warning: variable `Felt252_10931822301410252833_1475756362763989377_3378552166684303673_348229636055909092` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8001:9
+     |
+8001 |     let Felt252_10931822301410252833_1475756362763989377_3378552166684303673_348229636055909092 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_10931822301410252833_1475756362763989377_3378552166684303673_348229636055909092`
+
+warning: variable `Felt252_11041071929982523380_7503192613203831446_4943121247101232560_560497091765764140` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8008:9
+     |
+8008 |     let Felt252_11041071929982523380_7503192613203831446_4943121247101232560_560497091765764140 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_11041071929982523380_7503192613203831446_4943121247101232560_560497091765764140`
+
+warning: variable `Felt252_16477292399064058052_4441744911417641572_18431044672185975386_252894828082060025` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8015:9
+     |
+8015 |     let Felt252_16477292399064058052_4441744911417641572_18431044672185975386_252894828082060025 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_16477292399064058052_4441744911417641572_18431044672185975386_252894828082060025`
+
+warning: variable `Felt252_2_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8022:9
+     |
+8022 |     let Felt252_2_0_0_0 = PackedFelt252::broadcast(Felt252::from([2, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2_0_0_0`
+
+warning: variable `Felt252_3969818800901670911_10562874008078701503_14906396266795319764_223312371439046257` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8023:9
+     |
+8023 |     let Felt252_3969818800901670911_10562874008078701503_14906396266795319764_223312371439046257 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3969818800901670911_10562874008078701503_14906396266795319764_223312371439046257`
+
+warning: variable `Felt252_4_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8030:9
+     |
+8030 |     let Felt252_4_0_0_0 = PackedFelt252::broadcast(Felt252::from([4, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_4_0_0_0`
+
+warning: variable `Felt252_8794894655201903369_3219077422080798056_16714934791572408267_262217499501479120` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8031:9
+     |
+8031 |     let Felt252_8794894655201903369_3219077422080798056_16714934791572408267_262217499501479120 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_8794894655201903369_3219077422080798056_16714934791572408267_262217499501479120`
+
+warning: variable `Felt252_9275160746813554287_16541205595039575623_4169650429605064889_470088886057789987` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8038:9
+     |
+8038 |     let Felt252_9275160746813554287_16541205595039575623_4169650429605064889_470088886057789987 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_9275160746813554287_16541205595039575623_4169650429605064889_470088886057789987`
+
+warning: variable `Felt252_0_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2789:9
+     |
+2789 |     let Felt252_0_0_0_0 = PackedFelt252::broadcast(Felt252::from([0, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_0_0_0_0`
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2790:9
+     |
+2790 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+
+warning: variable `Felt252_2_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2791:9
+     |
+2791 |     let Felt252_2_0_0_0 = PackedFelt252::broadcast(Felt252::from([2, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2_0_0_0`
+
+warning: variable `Felt252_3_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2792:9
+     |
+2792 |     let Felt252_3_0_0_0 = PackedFelt252::broadcast(Felt252::from([3, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3_0_0_0`
+
+warning: `stwo-cairo-prover` (lib) generated 71 warnings
+warning: function `test_lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/add_ap_opcode.rs:957:15
+    |
+957 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: function `test_lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/bitwise_builtin.rs:3090:15
+     |
+3090 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `GenericSimdDiff` is never constructed
+    --> crates/prover/src/witness/components/bitwise_builtin.rs:3253:19
+     |
+3253 | pub(crate) struct GenericSimdDiff {
+     |                   ^^^^^^^^^^^^^^^
+
+warning: function `generic_simd_diff` is never used
+    --> crates/prover/src/witness/components/bitwise_builtin.rs:3269:15
+     |
+3269 | pub(crate) fn generic_simd_diff(
+     |               ^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_compress_opcode.rs:8014:15
+     |
+8014 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_g.rs:1899:15
+     |
+1899 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/cube_252.rs:9300:15
+     |
+9300 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode.rs:5231:15
+     |
+5231 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode_small.rs:1621:15
+     |
+1621 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:26221:15
+      |
+26221 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+      |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_window_bits_18.rs:18145:15
+      |
+18145 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+      |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/pedersen_builtin.rs:486:15
+    |
+486 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `GenericSimdDiff` is never constructed
+   --> crates/prover/src/witness/components/pedersen_builtin.rs:513:19
+    |
+513 | pub(crate) struct GenericSimdDiff {
+    |                   ^^^^^^^^^^^^^^^
+
+warning: function `generic_simd_diff` is never used
+   --> crates/prover/src/witness/components/pedersen_builtin.rs:529:15
+    |
+529 | pub(crate) fn generic_simd_diff(
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4947:15
+     |
+4947 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/poseidon_aggregator.rs:10873:15
+      |
+10873 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+      |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/poseidon_builtin.rs:646:15
+    |
+646 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:3249:15
+     |
+3249 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/qm_31_add_mul_opcode.rs:2060:15
+     |
+2060 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/range_check_252_width_27.rs:998:15
+    |
+998 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/range_check_builtin.rs:573:15
+    |
+573 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `GenericSimdDiff` is never constructed
+   --> crates/prover/src/witness/components/range_check_builtin.rs:592:19
+    |
+592 | pub(crate) struct GenericSimdDiff {
+    |                   ^^^^^^^^^^^^^^^
+
+warning: function `generic_simd_diff` is never used
+   --> crates/prover/src/witness/components/range_check_builtin.rs:608:15
+    |
+608 | pub(crate) fn generic_simd_diff(
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/triple_xor_32.rs:940:15
+    |
+940 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `GenericSimdDiff` is never constructed
+   --> crates/prover/src/witness/components/triple_xor_32.rs:983:19
+    |
+983 | pub(crate) struct GenericSimdDiff {
+    |                   ^^^^^^^^^^^^^^^
+
+warning: function `generic_simd_diff` is never used
+   --> crates/prover/src/witness/components/triple_xor_32.rs:999:15
+    |
+999 | pub(crate) fn generic_simd_diff(
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `test_lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/verify_instruction.rs:747:15
+    |
+747 | pub(crate) fn test_lookup_data_flat(ig: &InteractionClaimGenerator) -> Vec<Vec<PackedM31>> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `stwo-cairo-prover` (lib test) generated 61 warnings (34 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.00s
+     Running unittests src/lib.rs (target/debug/deps/stwo_cairo_prover-876bcbaa7ea0744e)
+
+running 1 test
+test witness::witness_eval::differential_test::poseidon_combination_37_nvrtc_stage_mirror ... pedersen table: registered HOST-BUILT table on device (56 cols x 8388608 rows, borrowed mode)
+stwo witness-JIT: registered dynamic program component=poseidon_3_partial_rounds_chain_nvrtc_mirror_28 instrs=5168
+stwo JIT: NVRTC compile start kernel=stwo_jit_witness_44c9571fccb1f00e key=67459881088d2d6b source_bytes=263262 n_options=2 relax_opt=0
+stwo JIT: NVRTC compile end kernel=stwo_jit_witness_44c9571fccb1f00e nvrtc_ms=11279
+stwo JIT: module load start kernel=stwo_jit_witness_44c9571fccb1f00e ptx_bytes=3781560 relax_opt=0
+stwo JIT: stwo_jit_witness_44c9571fccb1f00e ready in 16972 ms (module_load_ms=5685, NVRTC compile)
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 145 filtered out; finished in 50.02s
+
+     Running tests/prepared_ec_op_native.rs (target/debug/deps/prepared_ec_op_native-71a874226d4d779d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s

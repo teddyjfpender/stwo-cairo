@@ -1,0 +1,606 @@
+warning: unused variable: `raw_u32`
+    --> crates/prover/src/witness/components/blake_round.rs:6986:9
+     |
+6986 |     let raw_u32 = |word: usize, vi: usize| PackedUInt32 {
+     |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_raw_u32`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `n_vec`
+   --> crates/prover/src/witness/logup_descs.rs:123:9
+    |
+123 |     let n_vec = n_rows / N_LANES;
+    |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_n_vec`
+
+warning: method `mults_snapshot` is never used
+   --> crates/prover/src/witness/components/memory_address_to_id.rs:117:19
+    |
+73  | impl ClaimGenerator {
+    | ------------------- method in this implementation
+...
+117 |     pub(crate) fn mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+    |                   ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: methods `big_mults_snapshot` and `small_mults_snapshot` are never used
+   --> crates/prover/src/witness/components/memory_id_to_big.rs:112:19
+    |
+49  | impl ClaimGenerator {
+    | ------------------- methods in this implementation
+...
+112 |     pub(crate) fn big_mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+    |                   ^^^^^^^^^^^^^^^^^^
+...
+115 |     pub(crate) fn small_mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+    |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/add_ap_opcode.rs:938:4
+    |
+938 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/add_ap_opcode.rs:961:4
+    |
+961 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/bitwise_builtin.rs:2913:4
+     |
+2913 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/bitwise_builtin.rs:3094:4
+     |
+3094 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_compress_opcode.rs:7836:4
+     |
+7836 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/blake_compress_opcode.rs:8018:4
+     |
+8018 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_g.rs:1810:4
+     |
+1810 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/blake_g.rs:1903:4
+     |
+1903 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/blake_round.rs:5908:4
+     |
+5908 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/blake_round.rs:6041:4
+     |
+6041 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: method `mults_snapshot` is never used
+  --> crates/prover/src/witness/components/blake_round_sigma.rs:35:19
+   |
+21 | impl ClaimGenerator {
+   | ------------------- method in this implementation
+...
+35 |     pub(crate) fn mults_snapshot(&self) -> Vec<Vec<PackedM31>> {
+   |                   ^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/cube_252.rs:9195:4
+     |
+9195 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/cube_252.rs:9304:4
+     |
+9304 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode.rs:5174:4
+     |
+5174 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode.rs:5235:4
+     |
+5235 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode_small.rs:1589:4
+     |
+1589 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/mul_opcode_small.rs:1625:4
+     |
+1625 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:25891:4
+      |
+25891 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:26225:4
+      |
+26225 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_window_bits_18.rs:17998:4
+      |
+17998 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/partial_ec_mul_window_bits_18.rs:18149:4
+      |
+18149 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:12598:4
+      |
+12598 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:12642:4
+      |
+12642 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/pedersen_builtin.rs:459:4
+    |
+459 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/pedersen_builtin.rs:490:4
+    |
+490 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4893:4
+     |
+4893 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4951:4
+     |
+4951 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+     --> crates/prover/src/witness/components/poseidon_aggregator.rs:10769:4
+      |
+10769 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+     --> crates/prover/src/witness/components/poseidon_aggregator.rs:10877:4
+      |
+10877 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+      |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/poseidon_builtin.rs:608:4
+    |
+608 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/poseidon_builtin.rs:650:4
+    |
+650 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:3197:4
+     |
+3197 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:3253:4
+     |
+3253 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+    --> crates/prover/src/witness/components/qm_31_add_mul_opcode.rs:2028:4
+     |
+2028 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/qm_31_add_mul_opcode.rs:2064:4
+     |
+2064 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/range_check_252_width_27.rs:971:4
+    |
+971 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+    --> crates/prover/src/witness/components/range_check_252_width_27.rs:1002:4
+     |
+1002 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/range_check_builtin.rs:560:4
+    |
+560 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/range_check_builtin.rs:577:4
+    |
+577 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/triple_xor_32.rs:891:4
+    |
+891 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/triple_xor_32.rs:944:4
+    |
+944 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup_data_flat` is never used
+   --> crates/prover/src/witness/components/verify_instruction.rs:730:4
+    |
+730 | fn lookup_data_flat(ld: &LookupData) -> Vec<Vec<PackedM31>> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `sub_inputs_flat` is never used
+   --> crates/prover/src/witness/components/verify_instruction.rs:751:4
+    |
+751 | fn sub_inputs_flat(sci: &SubComponentInputs) -> Vec<Vec<Simd<u32, N_LANES>>> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:22527:9
+      |
+22527 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+      |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+      |
+      = note: `#[warn(non_snake_case)]` on by default
+
+warning: variable `Felt252_3_0_0_0` should have a snake case name
+     --> crates/prover/src/witness/components/partial_ec_mul_generic.rs:22528:9
+      |
+22528 |     let Felt252_3_0_0_0 = PackedFelt252::broadcast(Felt252::from([3, 0, 0, 0]));
+      |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3_0_0_0`
+
+warning: variable `Felt252_15078781199387521180_7290787951512770967_8332093602989199897_317979597309161923` should have a snake case name
+    --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:9717:9
+     |
+9717 |     let Felt252_15078781199387521180_7290787951512770967_8332093602989199897_317979597309161923 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_15078781199387521180_7290787951512770967_8332093602989199897_317979597309161923`
+
+warning: variable `Felt252_2796306760980396030_6142433350943679003_9786206818587032316_455457488062799560` should have a snake case name
+    --> crates/prover/src/witness/components/pedersen_aggregator_window_bits_18.rs:9724:9
+     |
+9724 |     let Felt252_2796306760980396030_6142433350943679003_9786206818587032316_455457488062799560 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2796306760980396030_6142433350943679003_9786206818587032316_455457488062799560`
+
+warning: variable `Felt252_0_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4264:9
+     |
+4264 |     let Felt252_0_0_0_0 = PackedFelt252::broadcast(Felt252::from([0, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_0_0_0_0`
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4265:9
+     |
+4265 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+
+warning: variable `Felt252_2_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4266:9
+     |
+4266 |     let Felt252_2_0_0_0 = PackedFelt252::broadcast(Felt252::from([2, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2_0_0_0`
+
+warning: variable `Felt252_3_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4267:9
+     |
+4267 |     let Felt252_3_0_0_0 = PackedFelt252::broadcast(Felt252::from([3, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3_0_0_0`
+
+warning: variable `Felt252_4_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_3_partial_rounds_chain.rs:4268:9
+     |
+4268 |     let Felt252_4_0_0_0 = PackedFelt252::broadcast(Felt252::from([4, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_4_0_0_0`
+
+warning: variable `Felt252_0_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:7992:9
+     |
+7992 |     let Felt252_0_0_0_0 = PackedFelt252::broadcast(Felt252::from([0, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_0_0_0_0`
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:7993:9
+     |
+7993 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+
+warning: variable `Felt252_10310704347937391837_5874215448258336115_2880320859071049537_45350836576946303` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:7994:9
+     |
+7994 |     let Felt252_10310704347937391837_5874215448258336115_2880320859071049537_45350836576946303 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_10310704347937391837_5874215448258336115_2880320859071049537_45350836576946303`
+
+warning: variable `Felt252_10931822301410252833_1475756362763989377_3378552166684303673_348229636055909092` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8001:9
+     |
+8001 |     let Felt252_10931822301410252833_1475756362763989377_3378552166684303673_348229636055909092 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_10931822301410252833_1475756362763989377_3378552166684303673_348229636055909092`
+
+warning: variable `Felt252_11041071929982523380_7503192613203831446_4943121247101232560_560497091765764140` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8008:9
+     |
+8008 |     let Felt252_11041071929982523380_7503192613203831446_4943121247101232560_560497091765764140 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_11041071929982523380_7503192613203831446_4943121247101232560_560497091765764140`
+
+warning: variable `Felt252_16477292399064058052_4441744911417641572_18431044672185975386_252894828082060025` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8015:9
+     |
+8015 |     let Felt252_16477292399064058052_4441744911417641572_18431044672185975386_252894828082060025 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_16477292399064058052_4441744911417641572_18431044672185975386_252894828082060025`
+
+warning: variable `Felt252_2_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8022:9
+     |
+8022 |     let Felt252_2_0_0_0 = PackedFelt252::broadcast(Felt252::from([2, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2_0_0_0`
+
+warning: variable `Felt252_3969818800901670911_10562874008078701503_14906396266795319764_223312371439046257` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8023:9
+     |
+8023 |     let Felt252_3969818800901670911_10562874008078701503_14906396266795319764_223312371439046257 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3969818800901670911_10562874008078701503_14906396266795319764_223312371439046257`
+
+warning: variable `Felt252_4_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8030:9
+     |
+8030 |     let Felt252_4_0_0_0 = PackedFelt252::broadcast(Felt252::from([4, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_4_0_0_0`
+
+warning: variable `Felt252_8794894655201903369_3219077422080798056_16714934791572408267_262217499501479120` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8031:9
+     |
+8031 |     let Felt252_8794894655201903369_3219077422080798056_16714934791572408267_262217499501479120 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_8794894655201903369_3219077422080798056_16714934791572408267_262217499501479120`
+
+warning: variable `Felt252_9275160746813554287_16541205595039575623_4169650429605064889_470088886057789987` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_aggregator.rs:8038:9
+     |
+8038 |     let Felt252_9275160746813554287_16541205595039575623_4169650429605064889_470088886057789987 =
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_9275160746813554287_16541205595039575623_4169650429605064889_470088886057789987`
+
+warning: variable `Felt252_0_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2789:9
+     |
+2789 |     let Felt252_0_0_0_0 = PackedFelt252::broadcast(Felt252::from([0, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_0_0_0_0`
+
+warning: variable `Felt252_1_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2790:9
+     |
+2790 |     let Felt252_1_0_0_0 = PackedFelt252::broadcast(Felt252::from([1, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_1_0_0_0`
+
+warning: variable `Felt252_2_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2791:9
+     |
+2791 |     let Felt252_2_0_0_0 = PackedFelt252::broadcast(Felt252::from([2, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_2_0_0_0`
+
+warning: variable `Felt252_3_0_0_0` should have a snake case name
+    --> crates/prover/src/witness/components/poseidon_full_round_chain.rs:2792:9
+     |
+2792 |     let Felt252_3_0_0_0 = PackedFelt252::broadcast(Felt252::from([3, 0, 0, 0]));
+     |         ^^^^^^^^^^^^^^^ help: convert the identifier to snake case (notice the capitalization): `felt252_3_0_0_0`
+
+warning: `stwo-cairo-prover` (lib) generated 71 warnings
+   Compiling stwo-cairo-gpu-prover v1.2.2 (/workspace/stwo-cairo/stwo_cairo_prover/crates/gpu-prover)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 36s
+     Running tests/resident_trace_audit.rs (target/debug/deps/resident_trace_audit-eb8abde074b2f990)
+
+running 1 test
+test audit_resident_base_trace_against_simd_reference ... pedersen table: registered HOST-BUILT table on device (56 cols x 8388608 rows, borrowed mode)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_d94540f2fd219001 key=b14e918990dc0514 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_643d6ea7402e00f9 key=6f57f1ff8a5b9bb0 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_c4b01b327c2ce2a3 key=b73dc2474b9b58d1 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_06f670fcbec124d8 key=4f81f6f223d1e3d0 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_e17e872ded26ebd1 key=51ea47f4bded53af (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_154882da03f89342 key=02dfe03fefee2f9a (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_ce0ddfc37a60580e key=a9962a644121df3e (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_1ab1e90dff938797 key=09fbfe2983906fc6 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_b37424b6011f268e key=fe360b744272e22c (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_da729390f0d884f9 key=d7b6e6ef82833ff3 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_58a69689aa366788 key=d0eccad456a9e973 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_57e09935feaee102 key=96d07a4f0641ec91 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_a290ddc144ee416a key=49134650debd448c (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_945de91f8879d0ac key=904335a58245131f (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_b0eb28f739a39f20 key=186c1a58c177afb6 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_eebaf3650dcb7ba3 key=330f381b4225e7c9 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_17255b30022f129d key=7ef540b698a16690 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_d14e690e89d48795 key=15f522d510516a00 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_e38bacad738f1890 key=8999c9b1a5e6684d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_752513a1a2621451 key=6010587068a7e8f8 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_22ad07ddaf1c1605 key=b6c6e4ddb03a94d2 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_witness_ad984cdbe607f973 key=6dff0bc2f9e84e46 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_c404737783a8b93e key=e79242490fb703e8 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_8b1229a89671563e key=4fcf64dc366ed1e5 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_db623f0e10c81639 key=89f07725ea264191 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_f53805dad6e749bb key=6e50a44b40217a1d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_036dfb90ab7f0477 key=e3462b3b08b56d56 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_b60c9c9c25015103 key=547f0f9b9dbeae56 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_16d2ea9e41d7d7e6 key=abfe396850620439 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_c4424f733f4bd4ab key=e8c2123e86cdbc13 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_39781b15a0897e90 key=d0ccc83517704466 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_d1f6a2534aa0a301 key=7a173a4409a94d3c (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_4b561009970da257 key=19a10da57467ba9d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_6a28ac80d1faacad key=896864742b9d7f54 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_be86d027dbdb6203 key=6e825b570de4e032 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_a7d48d63680c85d8 key=6c249ca7a2331b34 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_df9c6a0cee30d01f key=ffaab9e210692a14 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_87d0117207915942 key=5a3417c81866daa3 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_a825a049ba6a952f key=938d4c6c79c6c68e (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_a5a22a904ae7719a key=0d85e62852e65bf1 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_fd5f6abc639c7ad3 key=00f8a89b9d11ef90 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_49565bc27a55d074 key=ef130c4b88f1d0bf (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_3a940a524062d0a6 key=95cbc777b66614e4 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_9927162c86fc449f key=b52eac7ce08c782d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_04d089b7c5ed2771 key=cc28bdf0b8c53698 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_eec4da0738322101 key=1c5835b3a5fef139 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_4503468882eeb245 key=05f9c53174f0aaab (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_633fe71fc869665d key=c0f1039453865a30 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_9caf184ede0cedd8 key=5c68aa540bd25c9e (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_d147c801aa6abdcc key=3952448476f93180 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_86a901b804923a10 key=1ab049f2a1c4ff32 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_88abad321f9b225e key=bdfea75f60bf42ca (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_0500d6a23bdae342 key=5dc55cbb1ce6c19d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_69d8461df4d70472 key=983c2c769fa70013 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_17292106903a36d4 key=feb3d54f64d37c87 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_6d15c44abe421789 key=2e3eccbf87dcd53e (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_551eb18f22f5a3b6 key=e91530cd9f486993 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_488673d56eb5384d key=1a43361d170e86a6 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_119c78399329b29a key=467f5312ce40c230 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_d547dbd1baf953e1 key=bf683868cc5044f1 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_b3298f3d64db6945 key=b9e5e23780fc4fff (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_b6d974c335a15d00 key=908d029611e1f887 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_236ecb1645901ac0 key=c687f168b5760e1f (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_6a1dcd04b35338e6 key=2952e2f9e4d5ed3a (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_5837b076ba757437 key=2f59786637dcd05b (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_6eec0240134c359d key=72234bdb224e728d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_a7ddf49888aeec68 key=1df0014b5a0f5a54 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_2935f225c67ee1d9 key=25be520aa9de408d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_cb1ce2703d2db392 key=a6aa239ed1a25e9c (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_5300354eae2fe0f2 key=d331505bba420355 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_b455671faf7e7149 key=5754f8a873a52740 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_c97d0e3125403a90 key=e205ab564ba682ee (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_441cd9c7fd53458a key=915b9c6c996bd323 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_bfbf5a8a40591289 key=785f1d2fda1ea922 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_239c495915d1b092 key=8a40cc3240faf63d (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_b6da13dc52c21465 key=7e0b6c8348014c9a (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_8bfe46e1447d7e33 key=7427d3ae2749288a (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_264153f324dfa389 key=08e5448d4cd611c0 (embedded sm_90 cubin)
+stwo JIT: AOT pack hit kernel=stwo_jit_fused_870b93acf1caf2fe key=5d8214b451babf5c (embedded sm_90 cubin)
+audit: base-commit boundary replayed; reading device base trace
+audit: device plane done: 45 component parts, 2627 columns, 119.0 MiB D2H, 58.707 s
+audit: SIMD plane done: 45 component parts, 2627 columns, 119.0 MiB, 11.930 s
+audit DIVERGENCE cube_252[Main]: CONTENT: 118/141 mismatching columns, 59488 cells across 512 rows; first mismatch at (column 0, row 1056): expected(SIMD) 34750339 (0x02123f83) actual(device) 34750338 (0x02123f82); mismatching rows 1056..=1567 with n_real_rows 1952, padded_rows 2048; padding_only=false row_multiset_equal=false
+audit DIVERGENCE memory_address_to_id[Main]: CONTENT: 2/32 mismatching columns, 556 cells across 495 rows; first mismatch at (column 1, row 0): expected(SIMD) 84 (0x00000054) actual(device) 83 (0x00000053); mismatching rows 0..=494 with n_real_rows 272, padded_rows 512; padding_only=false row_multiset_equal=false
+audit DIVERGENCE memory_id_to_big[MemoryBig(0)]: CONTENT: 1/29 mismatching columns, 50 cells across 50 rows; first mismatch at (column 28, row 0): expected(SIMD) 1 (0x00000001) actual(device) 0 (0x00000000); mismatching rows 0..=49 with n_real_rows 64, padded_rows 64; padding_only=false row_multiset_equal=false
+audit DIVERGENCE memory_id_to_big[MemorySmall]: CONTENT: 1/9 mismatching columns, 196 cells across 196 rows; first mismatch at (column 8, row 0): expected(SIMD) 87 (0x00000057) actual(device) 84 (0x00000054); mismatching rows 0..=331 with n_real_rows 848, padded_rows 1024; padding_only=false row_multiset_equal=false
+audit DIVERGENCE poseidon_3_partial_rounds_chain[Main]: CONTENT: 40/169 mismatching columns, 18672 cells across 512 rows; first mismatch at (column 114, row 0): expected(SIMD) 17375170 (0x01091fc2) actual(device) 17375169 (0x01091fc1); mismatching rows 0..=511 with n_real_rows 432, padded_rows 512; padding_only=false row_multiset_equal=false
+audit DIVERGENCE range_check_18[Main]: CONTENT: 2/2 mismatching columns, 528 cells across 528 rows; first mismatch at (column 0, row 542): expected(SIMD) 16 (0x00000010) actual(device) 0 (0x00000000); mismatching rows 192..=261094 with n_real_rows 262144, padded_rows 262144; padding_only=false row_multiset_equal=false
+audit DIVERGENCE range_check_20[Main]: CONTENT: 8/8 mismatching columns, 3014 cells across 2967 rows; first mismatch at (column 0, row 516500): expected(SIMD) 0 (0x00000000) actual(device) 16 (0x00000010); mismatching rows 511791..=665435 with n_real_rows 1048576, padded_rows 1048576; padding_only=false row_multiset_equal=false
+audit DIVERGENCE range_check_252_width_27[Main]: CONTENT: 19/20 mismatching columns, 11200 cells across 1024 rows; first mismatch at (column 0, row 544): expected(SIMD) 17375170 (0x01091fc2) actual(device) 17375169 (0x01091fc1); mismatching rows 544..=1567 with n_real_rows 1568, padded_rows 2048; padding_only=false row_multiset_equal=false
+audit DIVERGENCE range_check_4_4[Main]: CONTENT: 1/1 mismatching columns, 17 cells across 17 rows; first mismatch at (column 0, row 85): expected(SIMD) 16 (0x00000010) actual(device) 0 (0x00000000); mismatching rows 85..=154 with n_real_rows 256, padded_rows 256; padding_only=false row_multiset_equal=false
+audit DIVERGENCE range_check_4_4_4_4[Main]: CONTENT: 1/1 mismatching columns, 110 cells across 110 rows; first mismatch at (column 0, row 9829): expected(SIMD) 0 (0x00000000) actual(device) 16 (0x00000010); mismatching rows 9829..=47205 with n_real_rows 65536, padded_rows 65536; padding_only=false row_multiset_equal=false
+audit DIVERGENCE range_check_9_9[Main]: CONTENT: 8/8 mismatching columns, 3136 cells across 3103 rows; first mismatch at (column 0, row 0): expected(SIMD) 222 (0x000000de) actual(device) 0 (0x00000000); mismatching rows 0..=262143 with n_real_rows 262144, padded_rows 262144; padding_only=false row_multiset_equal=false
+audit summary (45 component parts):
+  add_ap_opcode[Main]                              MATCH
+  add_opcode_small[Main]                           MATCH
+  assert_eq_opcode[Main]                           MATCH
+  assert_eq_opcode_double_deref[Main]              MATCH
+  assert_eq_opcode_imm[Main]                       MATCH
+  bitwise_builtin[Main]                            MATCH
+  call_opcode_rel_imm[Main]                        MATCH
+  cube_252[Main]                                   CONTENT
+  ec_op_builtin[Main]                              MATCH
+  jnz_opcode_non_taken[Main]                       MATCH
+  jnz_opcode_taken[Main]                           MATCH
+  memory_address_to_id[Main]                       CONTENT
+  memory_id_to_big[MemoryBig(0)]                   CONTENT
+  memory_id_to_big[MemorySmall]                    CONTENT
+  partial_ec_mul_generic[Main]                     MATCH
+  partial_ec_mul_window_bits_18[Main]              MATCH
+  pedersen_aggregator_window_bits_18[Main]         MATCH
+  pedersen_builtin[Main]                           MATCH
+  pedersen_points_table_window_bits_18[Main]       MATCH
+  poseidon_3_partial_rounds_chain[Main]            CONTENT
+  poseidon_aggregator[Main]                        MATCH
+  poseidon_builtin[Main]                           MATCH
+  poseidon_full_round_chain[Main]                  MATCH
+  poseidon_round_keys[Main]                        MATCH
+  range_check_11[Main]                             MATCH
+  range_check_12[Main]                             MATCH
+  range_check_18[Main]                             CONTENT
+  range_check_20[Main]                             CONTENT
+  range_check_252_width_27[Main]                   CONTENT
+  range_check_3_3_3_3_3[Main]                      MATCH
+  range_check_3_6_6_3[Main]                        MATCH
+  range_check_4_3[Main]                            MATCH
+  range_check_4_4[Main]                            CONTENT
+  range_check_4_4_4_4[Main]                        CONTENT
+  range_check_6[Main]                              MATCH
+  range_check_7_2_5[Main]                          MATCH
+  range_check_8[Main]                              MATCH
+  range_check_9_9[Main]                            CONTENT
+  range_check_builtin[Main]                        MATCH
+  ret_opcode[Main]                                 MATCH
+  verify_bitwise_xor_4[Main]                       MATCH
+  verify_bitwise_xor_7[Main]                       MATCH
+  verify_bitwise_xor_8[Main]                       MATCH
+  verify_bitwise_xor_9[Main]                       MATCH
+  verify_instruction[Main]                         MATCH
+
+thread 'audit_resident_base_trace_against_simd_reference' panicked at crates/gpu-prover/tests/resident_trace_audit.rs:540:5:
+assertion `left == right` failed: 11 component part(s) diverge from the SIMD base trace (verdicts and first-cell evidence above)
+  left: 11
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    audit_resident_base_trace_against_simd_reference
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 73.15s
+
+error: test failed, to rerun pass `-p stwo-cairo-gpu-prover --test resident_trace_audit`

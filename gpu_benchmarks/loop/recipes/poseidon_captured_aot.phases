@@ -3,3 +3,6 @@
 cd "$CAIRO"
 phase poseidon_captured_aot env STWO_CUDA_WITNESS_JIT_MAX_INSTRS=8192 cargo test -p stwo-cairo-prover poseidon_combination_37_strict_aot_captured_row -- --ignored --nocapture --test-threads=1
 phase poseidon_captured_nvrtc env STWO_CUDA_WITNESS_JIT_MAX_INSTRS=8192 cargo test -p stwo-cairo-prover poseidon_combination_37_nvrtc_captured_row -- --ignored --nocapture --test-threads=1
+phase poseidon_mirror_28 env STWO_CUDA_WITNESS_JIT_MAX_INSTRS=8192 STWO_POSEIDON_MIRROR_CALL_ORDINAL=28 cargo test -p stwo-cairo-prover poseidon_combination_37_nvrtc_stage_mirror -- --ignored --nocapture --test-threads=1
+phase poseidon_mirror_26 env STWO_CUDA_WITNESS_JIT_MAX_INSTRS=8192 STWO_POSEIDON_MIRROR_CALL_ORDINAL=26 cargo test -p stwo-cairo-prover poseidon_combination_37_nvrtc_stage_mirror -- --ignored --nocapture --test-threads=1
+phase poseidon_mirror_23 env STWO_CUDA_WITNESS_JIT_MAX_INSTRS=8192 STWO_POSEIDON_MIRROR_CALL_ORDINAL=23 cargo test -p stwo-cairo-prover poseidon_combination_37_nvrtc_stage_mirror -- --ignored --nocapture --test-threads=1
