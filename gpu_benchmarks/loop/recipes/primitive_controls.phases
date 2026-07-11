@@ -1,0 +1,6 @@
+# Exact low-pressure controls for the 12 primitive calls that build
+# poseidon_3_partial_rounds_chain combination_37, followed by PoW regression.
+cd "$CAIRO"
+phase primitive_controls cargo test -p stwo-cairo-prover poseidon_combination_37_exact_source_primitives_match_host -- --nocapture --test-threads=1
+cd "$STWO"
+phase pow_gate cargo test -p stwo-backend-cuda --test prepared_fri_final_pow_native -- --nocapture

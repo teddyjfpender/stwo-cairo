@@ -21,13 +21,11 @@
 //! gets a verdict:
 //!
 //! - `MATCH`     — byte-identical.
-//! - `GEOMETRY`  — column count / padded rows / real rows disagree (cells not
-//!                 compared).
+//! - `GEOMETRY`  — column count / padded rows / real rows disagree (cells not compared).
 //! - `PADDING`   — every mismatching cell sits at row >= n_real_rows.
-//! - `ORDER`     — real rows mismatch but both sides hold the same multiset of
-//!                 full rows (128-bit row-hash multiset), i.e. the rows were
-//!                 written in a different order — the prime suspicion for the
-//!                 device-compacted consumers.
+//! - `ORDER`     — real rows mismatch but both sides hold the same multiset of full rows (128-bit
+//!   row-hash multiset), i.e. the rows were written in a different order — the prime suspicion for
+//!   the device-compacted consumers.
 //! - `CONTENT`   — real-row values genuinely differ.
 //!
 //! The report prints, for every non-matching component: the number of
@@ -52,13 +50,12 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTra
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
 use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 use stwo_cairo_gpu_prover::arena_plan::{CommitmentColumnSource, CommitmentTreeId};
-use stwo_cairo_gpu_prover::phases;
 use stwo_cairo_gpu_prover::plan::ProofPlan;
 use stwo_cairo_gpu_prover::protocol_plan::trace_commitment_layout;
 use stwo_cairo_gpu_prover::relation_table::CAIRO_RELATION_GRAPH;
 use stwo_cairo_gpu_prover::resident_runtime::{ResidentGraphRuntime, ResidentRuntimeError};
 use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
-use stwo_cairo_gpu_prover::{GpuCairoProver, GpuProverConfig};
+use stwo_cairo_gpu_prover::{phases, GpuCairoProver, GpuProverConfig};
 use stwo_cairo_prover::prover::{ChannelHash, ProverParameters};
 use stwo_cairo_prover::witness::base_trace::BaseTrace;
 use stwo_cairo_prover::witness::exec_context::WitnessExecContext;
@@ -71,6 +68,10 @@ const STRICT_RESIDENT_FIXTURE: &str = "test_prove_verify_sn2_profile";
 /// Production replay generation: capture consumes generation 1, the first warm
 /// replay is generation 2 (same literal as `tests/resident_smoke.rs`).
 const REPLAY_GENERATION: u64 = 2;
+
+/// Opt-in row capture consumed by the deduce-oracle hardware reproducer.
+const DUMP_POSEIDON_KIND11_ROW0_ENV: &str = "STWO_TRACE_AUDIT_DUMP_POSEIDON_KIND11_ROW0";
+const POSEIDON_KIND11_REPRO_PATH_ENV: &str = "STWO_POSEIDON_KIND11_REPRO_PATH";
 
 fn resident_input() -> ProverInput {
     run_and_adapt(
@@ -241,7 +242,12 @@ fn simd_reference_parts() -> Vec<AuditPart> {
             "layout log size disagrees with the realized SIMD evaluation domain \
              for {component}[{part:?}] ordinal {ordinal}"
         );
-        let values: Vec<u32> = eval.values.to_cpu().into_iter().map(|felt| felt.0).collect();
+        let values: Vec<u32> = eval
+            .values
+            .to_cpu()
+            .into_iter()
+            .map(|felt| felt.0)
+            .collect();
         if out.last().map(|last| (last.component, last.part)) != Some((component, part)) {
             let (n_real_rows, padded_rows) = resolved_rows(&exact_plan, component, part);
             out.push(AuditPart {
@@ -261,6 +267,42 @@ fn simd_reference_parts() -> Vec<AuditPart> {
         entry.columns.push(values);
     }
     out
+}
+
+/// Emit the failing component row's exact compact kind-11 arguments. The
+/// generated component writes `(chain, round, 4 x 10 W27 state)` into columns
+/// 0..42. This captures the component input, not internal intermediates such as
+/// `combination_37` (trace column 114).
+fn dump_poseidon_kind11_row0(parts: &[AuditPart]) {
+    let output_path = std::env::var_os(POSEIDON_KIND11_REPRO_PATH_ENV);
+    if std::env::var_os(DUMP_POSEIDON_KIND11_ROW0_ENV).is_none() && output_path.is_none() {
+        return;
+    }
+    let part = parts
+        .iter()
+        .find(|part| {
+            part.component == "poseidon_3_partial_rounds_chain" && part.part == TracePartId::Main
+        })
+        .expect("poseidon_3_partial_rounds_chain[Main] missing from SIMD trace");
+    assert!(
+        part.columns.len() >= 42,
+        "kind-11 input requires 42 columns"
+    );
+    let args: Vec<u32> = part.columns[..42].iter().map(|column| column[0]).collect();
+    if let Some(path) = output_path {
+        let words = args
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        std::fs::write(&path, format!("{words}\n"))
+            .unwrap_or_else(|error| panic!("failed to write {path:?}: {error}"));
+        eprintln!("audit: wrote kind-11 row-0 input to {path:?}");
+    }
+    eprintln!(
+        "audit POSEIDON_KIND11_INPUT component={} part={:?} row=0 args_u32={args:?}",
+        part.component, part.part
+    );
 }
 
 /// 128-bit FNV-1a over one full row (all columns, LE bytes). Used only for the
@@ -433,6 +475,7 @@ fn audit_resident_base_trace_against_simd_reference() {
     // Host plane: independent SIMD realization of the same input.
     let simd_start = Instant::now();
     let simd_parts = simd_reference_parts();
+    dump_poseidon_kind11_row0(&simd_parts);
     eprintln!(
         "audit: SIMD plane done: {} component parts, {} columns, {:.1} MiB, {:.3} s",
         simd_parts.len(),
@@ -470,7 +513,9 @@ fn audit_resident_base_trace_against_simd_reference() {
             reports.push((
                 simd.label(),
                 "GEOMETRY",
-                Some("present in the SIMD reference layout, absent from the device plan".to_string()),
+                Some(
+                    "present in the SIMD reference layout, absent from the device plan".to_string(),
+                ),
             ));
         }
     }

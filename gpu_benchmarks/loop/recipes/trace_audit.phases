@@ -2,6 +2,6 @@
 # component) + the counted resident-PoW hardware gate. Both non-aborting so
 # you get both verdicts in one round.
 cd "$CAIRO"
-phase trace_audit cargo test -p stwo-cairo-gpu-prover --test resident_trace_audit -- --nocapture --test-threads=1
+phase trace_audit env STWO_TRACE_AUDIT_DUMP_POSEIDON_KIND11_ROW0=1 cargo test -p stwo-cairo-gpu-prover --test resident_trace_audit -- --nocapture --test-threads=1
 cd "$STWO"
 phase pow_gate cargo test -p stwo-backend-cuda --test prepared_fri_final_pow_native -- --nocapture

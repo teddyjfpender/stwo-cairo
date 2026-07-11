@@ -1481,6 +1481,65 @@ impl stwo_backend_cuda::jit_witness::interp::DeduceHost for FastDeductionHost {
     }
 }
 
+fn assert_poseidon_recording_interpreter_matches_host<const N_TRACE_COLUMNS: usize>(
+    program: &stwo_backend_cuda::jit_witness::isa::WitnessProgram,
+    rows: &[Vec<u32>],
+    orig_rows: &[[M31; N_TRACE_COLUMNS]],
+    orig_lookup: &[Vec<PackedM31>],
+    orig_sub: &[Vec<Simd<u32, N_LANES>>],
+) {
+    use stwo_backend_cuda::jit_witness::interp::interpret_row_with;
+
+    let oracle = |table: u32, key: u32, limb: u32| -> u32 {
+        panic!("unexpected table read: table {table} key {key} limb {limb}")
+    };
+    let n_packed_rows = rows.len() / N_LANES;
+    for (r, row_inputs) in rows.iter().enumerate() {
+        let ro = interpret_row_with(program, row_inputs, &oracle, &mut FastDeductionHost);
+        for (c, hv) in orig_rows[r].iter().enumerate() {
+            assert_eq!(ro.columns[c], hv.0, "row {r} column {c}");
+        }
+        let (pr, lane) = (r / N_LANES, r % N_LANES);
+        let mut w = 0;
+        for field in orig_lookup {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                let hv = field[pr * width + k].to_array()[lane].0;
+                assert_eq!(ro.lookup_words[w], hv, "row {r} lookup word {w} (+{k})");
+                w += 1;
+            }
+        }
+        let mut w = 0;
+        for field in orig_sub {
+            let width = field.len() / n_packed_rows;
+            for k in 0..width {
+                let hv = field[pr * width + k].as_array()[lane];
+                assert_eq!(ro.sub_words[w], hv, "row {r} sub word {w} (+{k})");
+                w += 1;
+            }
+        }
+    }
+}
+
+fn poseidon_chain_rows<const N_STATE: usize>(
+    inputs: &[(PackedM31, PackedM31, [PackedFelt252Width27; N_STATE])],
+    n_rows: usize,
+) -> Vec<Vec<u32>> {
+    (0..inputs.len() * N_LANES)
+        .map(|r| {
+            let (pr, lane) = (r / N_LANES, r % N_LANES);
+            let input = &inputs[pr];
+            let mut row = vec![input.0.to_array()[lane].0, input.1.to_array()[lane].0];
+            for felt in &input.2 {
+                row.extend((0..10).map(|word| felt.get_m31(word).to_array()[lane].0));
+            }
+            row.push(u32::from(r < n_rows));
+            row.push(r as u32);
+            row
+        })
+        .collect()
+}
+
 /// GATE (c), pod only: the same recorded program LAUNCHED AS A CUDA KERNEL on the
 /// slot-layout input columns, byte-compared against the host writer everywhere the
 /// interpreter gate compares (committed columns, lookup words, sub words — all padded
@@ -2098,7 +2157,7 @@ fn builtin_lane_recording_shapes_match_specs() {
     }
 }
 
-/// POD ORACLE LEGS (deduce kinds 2/3): the precompiled `stwo_wit_deduce_*` device
+/// POD ORACLE LEGS (deduce kinds 2-11): the precompiled `stwo_wit_deduce_*` device
 /// functions — the exact code the JIT kernels embed — vs the host `fast_deduction`
 /// reference ([`FastDeductionHost`]). Kind 3 doubles as the device TABLE spot check:
 /// the GPU-generated pedersen table vs the host `PEDERSEN_TABLE_18`, across every
@@ -2224,9 +2283,6 @@ fn stwo_wit_deduce_oracle_matches_fast_deduction() {
     }
     eprintln!("deduce oracle kind 2: PASS (64 cases x {CHAIN_LEN} chained rounds)");
 
-    // ---- Kinds 8-11: Cairo Poseidon W27 primitives. ---------------------------
-    // Round-key outputs seed every arithmetic case, so the device constant table,
-    // Width27 regrouping, cube, and both chain transitions are checked together.
     let compare =
         |kind: u32, items: &[Vec<u32>], out_words: usize, host: &mut FastDeductionHost| {
             let device = run_oracle(kind, items, out_words);
@@ -2234,10 +2290,108 @@ fn stwo_wit_deduce_oracle_matches_fast_deduction() {
                 assert_eq!(
                     actual,
                     &host.deduce(kind, input),
-                    "Poseidon oracle kind {kind} row {row}"
+                    "deduce oracle kind {kind} row {row}"
                 );
             }
         };
+
+    // Run the captured component input before the broader fp256 fuzz below as
+    // a compact kind-11 control. The compact operation does not expose internal
+    // writer intermediates such as `combination_37` (trace column 114).
+    let captured_kind11 = std::env::var_os("STWO_POSEIDON_KIND11_REPRO_PATH").map(|path| {
+        let words = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {path:?}: {error}"));
+        let input = words
+            .split_whitespace()
+            .map(|word| {
+                word.parse::<u32>()
+                    .unwrap_or_else(|error| panic!("invalid u32 {word:?} in {path:?}: {error}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(input.len(), 42, "kind-11 repro input in {path:?}");
+        let actual = run_oracle(11, std::slice::from_ref(&input), 42).remove(0);
+        let expected = host.deduce(11, &input);
+        eprintln!(
+            "deduce oracle kind 11 captured control from {path:?}: output[12] device={} host={}; compact output does not map to internal combination_37 (trace column 114)",
+            actual[12], expected[12]
+        );
+        assert_eq!(actual, expected, "captured kind-11 row from {path:?}");
+        (path, input)
+    });
+
+    // ---- Kinds 4-7: fp256 arithmetic, carry-heavy boundaries + fuzz. ----------
+    use stwo_cairo_common::prover_types::cpu::{Felt252, P_FELTS};
+
+    let zero = vec![0; 28];
+    let mut one = zero.clone();
+    one[0] = 1;
+    let mut prime_minus_one = P_FELTS.to_vec();
+    prime_minus_one[0] -= 1;
+    let mut low_carry = zero.clone();
+    low_carry[..21].fill(511);
+    let alternating = (0..28)
+        .map(|word| if word < 27 && word % 2 == 0 { 511 } else { 0 })
+        .collect::<Vec<_>>();
+    let boundaries = [
+        zero.clone(),
+        one.clone(),
+        prime_minus_one,
+        low_carry,
+        alternating,
+    ];
+    let normalize = |limbs: Vec<u32>| {
+        let limbs = limbs.into_iter().map(M31).collect::<Vec<_>>();
+        let value = Felt252::from_limbs(&limbs) + Felt252::default();
+        (0..28)
+            .map(|word| value.get_m31(word).0)
+            .collect::<Vec<_>>()
+    };
+    let is_canonical = |limbs: &[u32]| limbs.iter().rev().cmp(P_FELTS.iter().rev()).is_lt();
+    let mut felt_pairs = Vec::new();
+    for a in &boundaries {
+        for b in &boundaries {
+            let mut input = a.clone();
+            input.extend(b);
+            felt_pairs.push(input);
+        }
+    }
+    for _ in 0..231 {
+        let mut a = (0..28).map(|_| next(512)).collect::<Vec<_>>();
+        let mut b = (0..28).map(|_| next(512)).collect::<Vec<_>>();
+        a[27] = next(256);
+        b[27] = next(256);
+        // Force frequent low-limb carry/borrow ripples in half the cases.
+        if next(2) == 0 {
+            a[..8].fill(511);
+            b[0] = 1;
+        }
+        let mut input = normalize(a);
+        input.extend(normalize(b));
+        felt_pairs.push(input);
+    }
+    assert!(felt_pairs.iter().all(|input| {
+        input.len() == 56 && is_canonical(&input[..28]) && is_canonical(&input[28..])
+    }));
+    for kind in 4..=6 {
+        compare(kind, &felt_pairs, 28, &mut host);
+    }
+    let division_pairs = felt_pairs
+        .iter()
+        .filter(|input| input[28..] != zero[..])
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(division_pairs
+        .iter()
+        .all(|input| is_canonical(&input[28..]) && input[28..] != zero[..]));
+    compare(7, &division_pairs, 28, &mut host);
+    eprintln!(
+        "deduce oracle kinds 4-7: PASS ({} carry-heavy/fuzz pairs)",
+        felt_pairs.len()
+    );
+
+    // ---- Kinds 8-11: Cairo Poseidon W27 primitives. ---------------------------
+    // Round-key outputs seed every arithmetic case, so the device constant table,
+    // Width27 regrouping, cube, and both chain transitions are checked together.
     let rounds = (0..35).map(|round| vec![round]).collect::<Vec<_>>();
     compare(8, &rounds, 30, &mut host);
 
@@ -2262,7 +2416,7 @@ fn stwo_wit_deduce_oracle_matches_fast_deduction() {
         .collect::<Vec<_>>();
     compare(10, &full, 32, &mut host);
 
-    let partial = keys
+    let mut partial = keys
         .iter()
         .enumerate()
         .map(|(round, keys)| {
@@ -2272,8 +2426,107 @@ fn stwo_wit_deduce_oracle_matches_fast_deduction() {
             input
         })
         .collect::<Vec<_>>();
-    compare(11, &partial, 42, &mut host);
-    eprintln!("deduce oracle kinds 8-11: PASS (all 35 Poseidon rounds)");
+    let captured_case = captured_kind11.map(|(path, input)| {
+        let case = partial.len();
+        partial.push(input);
+        eprintln!(
+            "deduce oracle kind 11: appended captured compact-control case {case} from {path:?}; it does not exercise internal combination_37 (trace column 114)"
+        );
+        case
+    });
+    let device_partial = run_oracle(11, &partial, 42);
+    for (row, (input, actual)) in partial.iter().zip(&device_partial).enumerate() {
+        let expected = host.deduce(11, input);
+        if captured_case == Some(row) {
+            eprintln!(
+                "deduce oracle kind 11 captured control: output[12] device={} host={}; not internal combination_37 (trace column 114)",
+                actual[12], expected[12]
+            );
+        }
+        assert_eq!(actual, &expected, "deduce oracle kind 11 row {row}");
+    }
+    eprintln!(
+        "deduce oracle kinds 8-11: PASS (35 generated Poseidon rounds{})",
+        if captured_case.is_some() {
+            " + captured row-0 case"
+        } else {
+            ""
+        }
+    );
+}
+
+/// H100 controls for the exact source operands used by the generated
+/// `combination_37` schedule. Each primitive runs independently through the
+/// low-pressure generic oracle; the resident trace audit remains the definitive
+/// failing schedule-context gate.
+#[test]
+fn poseidon_combination_37_exact_source_primitives_match_host() {
+    use stwo_backend_cuda::jit_witness::interp::DeduceHost;
+
+    const ROW0: [u32; 42] = [
+        0, 4, 50414066, 128588089, 120633038, 63732151, 97038777, 32313651, 132029487, 122547581,
+        103664913, 254, 70246675, 35346168, 94916093, 40649707, 36525582, 74717629, 46705327,
+        50424067, 58946647, 39, 87784937, 111781535, 84088807, 86541649, 127250820, 6346412,
+        29906354, 123707764, 53944726, 252, 22813865, 35298563, 79701982, 108932941, 43138495,
+        66822320, 50165977, 5364451, 38958708, 247,
+    ];
+
+    struct CapturingDeduceHost {
+        calls: Vec<(u32, Vec<u32>, Vec<u32>)>,
+    }
+    impl DeduceHost for CapturingDeduceHost {
+        fn deduce(&mut self, kind: u32, args: &[u32]) -> Vec<u32> {
+            let output = FastDeductionHost.deduce(kind, args);
+            self.calls.push((kind, args.to_vec(), output.clone()));
+            output
+        }
+    }
+
+    let recording = crate::witness::components::poseidon_3_partial_rounds_chain::record_poseidon_3_partial_rounds_chain();
+    let mut inputs = ROW0.to_vec();
+    inputs.push(1); // enabler; this recording does not read iota
+    assert_eq!(inputs.len(), recording.program.n_inputs as usize);
+    let oracle = |table: u32, key: u32, limb: u32| -> u32 {
+        panic!("unexpected table read: table {table} key {key} limb {limb}")
+    };
+    let mut capture = CapturingDeduceHost { calls: Vec::new() };
+    let row = stwo_backend_cuda::jit_witness::interp::interpret_row_with(
+        &recording.program,
+        &inputs,
+        &oracle,
+        &mut capture,
+    );
+    assert_eq!(row.columns[114], 17_375_170, "captured SIMD column 114");
+
+    const KINDS: [u32; 12] = [6, 4, 6, 4, 6, 4, 6, 4, 6, 5, 6, 4];
+    let chain = capture
+        .calls
+        .get(17..29)
+        .expect("recording must contain combination_37 calls 17..28");
+    assert_eq!(chain.len(), KINDS.len());
+    for (stage, ((kind, input, _), expected_kind)) in chain.iter().zip(KINDS).enumerate() {
+        assert_eq!(*kind, expected_kind, "combination_37 call ordinal {stage}");
+        assert_eq!(input.len(), 56, "combination_37 stage {stage} args");
+    }
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        eprintln!("combination_37 device primitives: SKIPPED (stub build)");
+        return;
+    }
+    for (stage, ((kind, input, expected), expected_kind)) in chain.iter().zip(KINDS).enumerate() {
+        debug_assert_eq!(*kind, expected_kind);
+        let mut output = vec![0; 28];
+        let rc = unsafe {
+            stwo_backend_cuda_kernels::raw::stwo_wit_deduce_oracle_run(
+                *kind,
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                1,
+            )
+        };
+        assert_eq!(rc, 0, "combination_37 primitive stage {stage} launch");
+        assert_eq!(&output, expected, "combination_37 primitive stage {stage}");
+    }
+    eprintln!("combination_37 exact-source primitive controls: PASS (12/12)");
 }
 
 // ---------------- fp256/EC flagship: partial_ec_mul_window_bits_18 ------------------
@@ -3022,6 +3275,107 @@ fn poseidon_recorded_source_writers_are_byte_identical_inner() {
         cg.range_check_4_4.as_ref().expect("rc44"),
         cg.range_check_252_width_27.as_ref().expect("rc252"),
     ));
+}
+
+/// Gate (b) for both Poseidon chain writers: replay the recorded bytecode through
+/// the host deduce oracle and byte-compare every trace, lookup, and sub-feed word.
+#[test]
+fn poseidon_chain_recording_interpreters_match_host() {
+    std::thread::Builder::new()
+        .name("poseidon-chain-interpreter-parity".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(poseidon_chain_recording_interpreters_match_host_inner)
+        .expect("spawn Poseidon chain interpreter parity thread")
+        .join()
+        .expect("Poseidon chain interpreter parity thread panicked");
+}
+
+fn poseidon_chain_recording_interpreters_match_host_inner() {
+    use crate::witness::components::{
+        poseidon_3_partial_rounds_chain as partial, poseidon_full_round_chain as full,
+    };
+
+    let mut cg = fresh_poseidon_claim_generator();
+    let builtin = cg.poseidon_builtin.take().expect("poseidon builtin");
+    let _ = builtin.write_trace(
+        cg.memory_address_to_id.as_ref().expect("mem addr"),
+        cg.poseidon_aggregator.as_ref().expect("aggregator state"),
+    );
+    let aggregator = cg.poseidon_aggregator.take().expect("aggregator populated");
+    let _ = aggregator.write_trace(
+        cg.memory_id_to_big.as_ref().expect("mem big"),
+        cg.poseidon_full_round_chain.as_ref().expect("full state"),
+        cg.range_check_252_width_27.as_ref().expect("rc252"),
+        cg.cube_252.as_ref().expect("cube"),
+        cg.range_check_3_3_3_3_3.as_ref().expect("rc33333"),
+        cg.range_check_4_4_4_4.as_ref().expect("rc4444"),
+        cg.range_check_4_4.as_ref().expect("rc44"),
+        cg.poseidon_3_partial_rounds_chain
+            .as_ref()
+            .expect("partial state"),
+    );
+
+    let full_gen = cg
+        .poseidon_full_round_chain
+        .take()
+        .expect("full chain populated");
+    assert!(full_gen.remainder_inputs.lock().unwrap().is_empty());
+    let mut full_inputs = full_gen.packed_inputs.into_inner().unwrap();
+    let full_n_rows = full_inputs.len() * N_LANES;
+    full_inputs.resize(full_inputs.len().next_power_of_two(), full_inputs[0]);
+    let full_diff = full::generic_simd_diff(
+        full_inputs.clone(),
+        full_n_rows,
+        cg.cube_252.as_ref().expect("cube"),
+        cg.poseidon_round_keys.as_ref().expect("round keys"),
+        cg.range_check_3_3_3_3_3.as_ref().expect("rc33333"),
+    );
+    let full_recording = full::record_poseidon_full_round_chain();
+    assert!(
+        full_recording.poison_ops.is_empty(),
+        "full chain poisons: {:?}",
+        full_recording.poison_ops
+    );
+    let full_rows = poseidon_chain_rows(&full_inputs, full_n_rows);
+    assert_poseidon_recording_interpreter_matches_host(
+        &full_recording.program,
+        &full_rows,
+        &full_diff.orig_rows,
+        &full_diff.orig_lookup,
+        &full_diff.orig_sub,
+    );
+
+    let partial_gen = cg
+        .poseidon_3_partial_rounds_chain
+        .take()
+        .expect("partial chain populated");
+    assert!(partial_gen.remainder_inputs.lock().unwrap().is_empty());
+    let mut partial_inputs = partial_gen.packed_inputs.into_inner().unwrap();
+    let partial_n_rows = partial_inputs.len() * N_LANES;
+    partial_inputs.resize(partial_inputs.len().next_power_of_two(), partial_inputs[0]);
+    let partial_diff = partial::generic_simd_diff(
+        partial_inputs.clone(),
+        partial_n_rows,
+        cg.poseidon_round_keys.as_ref().expect("round keys"),
+        cg.cube_252.as_ref().expect("cube"),
+        cg.range_check_4_4_4_4.as_ref().expect("rc4444"),
+        cg.range_check_4_4.as_ref().expect("rc44"),
+        cg.range_check_252_width_27.as_ref().expect("rc252"),
+    );
+    let partial_recording = partial::record_poseidon_3_partial_rounds_chain();
+    assert!(
+        partial_recording.poison_ops.is_empty(),
+        "partial chain poisons: {:?}",
+        partial_recording.poison_ops
+    );
+    let partial_rows = poseidon_chain_rows(&partial_inputs, partial_n_rows);
+    assert_poseidon_recording_interpreter_matches_host(
+        &partial_recording.program,
+        &partial_rows,
+        &partial_diff.orig_rows,
+        &partial_diff.orig_lookup,
+        &partial_diff.orig_sub,
+    );
 }
 
 /// Gate (a) for `cube_252` (poseidon-family fp256: x^3 mod p via W27 felts).

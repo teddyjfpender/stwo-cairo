@@ -1,0 +1,12 @@
+# Capture the exact divergent component input, prove the host recording path,
+# retain the compact kind-11 control, then verify each exact combination_37
+# source primitive independently. The resident trace audit remains the
+# definitive pre-fix failure because only it preserves generated AOT pressure.
+cd "$CAIRO"
+REPRO="$RUN/poseidon_kind11_row0.log"
+phase trace_capture env STWO_POSEIDON_KIND11_REPRO_PATH="$REPRO" cargo test -p stwo-cairo-gpu-prover --test resident_trace_audit -- --nocapture --test-threads=1
+phase poseidon_host cargo test -p stwo-cairo-prover poseidon_chain_recording_interpreters_match_host -- --nocapture --test-threads=1
+phase carry_repro env STWO_POSEIDON_KIND11_REPRO_PATH="$REPRO" cargo test -p stwo-cairo-prover stwo_wit_deduce_oracle_matches_fast_deduction -- --nocapture --test-threads=1
+phase combination37_controls cargo test -p stwo-cairo-prover poseidon_combination_37_exact_source_primitives_match_host -- --nocapture --test-threads=1
+cd "$STWO"
+phase pow_gate cargo test -p stwo-backend-cuda --test prepared_fri_final_pow_native -- --nocapture
