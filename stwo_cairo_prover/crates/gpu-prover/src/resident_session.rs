@@ -1238,15 +1238,11 @@ mod tests {
             PreProcessedTraceVariant::CanonicalWithoutPedersen,
             None,
         );
-        // The strict resolution fails closed on the compacted consumers'
-        // capacity bounds; this lane-order test substitutes the capacity
-        // geometry explicitly (see resolve_compacted_capacity_for_test).
-        let capacity_for_test = crate::plan::resolve_compacted_capacity_for_test(
-            &ingest.proof_plan,
-            &crate::schedule_table::CAIRO_SCHEDULE,
-            &crate::relation_table::CAIRO_RELATION_GRAPH,
-        );
-        let exact_plan = capacity_for_test
+        // Ingest seals the compacted consumers' exact host-derived rows into
+        // the plan, so the strict resolution runs on the production plan
+        // directly — exactly the session pipeline.
+        let exact_plan = ingest
+            .proof_plan
             .strict_resident_exact(
                 &crate::schedule_table::CAIRO_SCHEDULE,
                 &crate::relation_table::CAIRO_RELATION_GRAPH,
@@ -1377,7 +1373,7 @@ mod tests {
         // would materialize.
         let preflight = plan_resident_preflight(
             &ingest.generator,
-            &capacity_for_test,
+            &ingest.proof_plan,
             &ingest.preprocessed_trace,
             session_pcs,
             false,

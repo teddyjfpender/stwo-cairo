@@ -159,8 +159,40 @@ fn load_fixture(name: &str) -> Result<ProverInput, String> {
         .map_err(|error| format!("VM run + adapt failed for fixture {name}: {error:?}"))
 }
 
+/// Exact pre-witness rows of the device-compacted consumers, sealed into the
+/// ingest plan by the host derivation (`n_real`/`padded` per label). These are
+/// the row counts the compact-finalize kernel will enforce on device.
+fn compacted_consumer_rows(
+    plan: &stwo_cairo_gpu_prover::plan::ProofPlan,
+) -> Vec<serde_json::Value> {
+    use stwo_cairo_prover::witness::jit_prove_backend::recorded_input_compaction_geometry;
+    use stwo_cairo_prover::witness::proof_shape::RowResolution;
+
+    plan.proof_shape()
+        .components()
+        .iter()
+        .filter(|component| {
+            component.is_present() && recorded_input_compaction_geometry(component.id).is_some()
+        })
+        .map(|component| {
+            let RowResolution::Resolved(parts) = &component.rows else {
+                panic!(
+                    "compacted consumer {} is not sealed exact in the ingest plan",
+                    component.id
+                );
+            };
+            serde_json::json!({
+                "component": component.id,
+                "n_real_rows": parts[0].n_real_rows,
+                "padded_rows": parts[0].padded_rows,
+            })
+        })
+        .collect()
+}
+
 fn report_json(
     report: &ResidentPreflightReport,
+    compacted_rows: Vec<serde_json::Value>,
     source: &str,
     vram_budget_gb: f64,
 ) -> serde_json::Value {
@@ -216,6 +248,7 @@ fn report_json(
         "capture_safe_components": report.capture_safe_components.len(),
         "capture_safe_coverage_ok": capture_safe_ok,
         "recorded_witness_lanes": report.recorded_lanes.len(),
+        "compacted_consumer_rows": compacted_rows,
         "multiplicity_coverage_gaps": coverage_gaps,
         "multiplicity_feed_blockers": blockers,
         "arena": {
@@ -258,6 +291,7 @@ fn main() -> ExitCode {
     };
 
     let ingest = phases::ingest::run(input, variant, None);
+    let compacted_rows = compacted_consumer_rows(&ingest.proof_plan);
     let report = match plan_resident_preflight(
         &ingest.generator,
         &ingest.proof_plan,
@@ -274,7 +308,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let record = report_json(&report, &source, vram_budget_gb);
+    let record = report_json(&report, compacted_rows, &source, vram_budget_gb);
     println!("{}", serde_json::to_string_pretty(&record).unwrap());
     if record["pass"].as_bool() == Some(true) {
         ExitCode::SUCCESS

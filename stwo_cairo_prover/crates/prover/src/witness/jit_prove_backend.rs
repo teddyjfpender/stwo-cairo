@@ -1332,6 +1332,218 @@ pub fn recorded_input_compaction_geometry(label: &str) -> Option<RecordedInputCo
     })
 }
 
+/// Every generated component whose SIMD writer feeds the `verify_instruction`
+/// multiset (one tuple per input row, word 0 = the row's `pc`). This list must
+/// stay equal to `verify_instruction`'s `capacity_inputs` in the gpu-prover
+/// `CAIRO_SCHEDULE` — a gpu-prover regression test pins the two sets against
+/// each other so a future opcode feeder cannot silently skew the plan-time
+/// distinct-pc derivation below.
+macro_rules! for_each_verify_instruction_feeder {
+    ($callback:ident) => {
+        $callback! {
+            add_opcode,
+            add_opcode_small,
+            add_ap_opcode,
+            assert_eq_opcode,
+            assert_eq_opcode_imm,
+            assert_eq_opcode_double_deref,
+            blake_compress_opcode,
+            call_opcode_abs,
+            call_opcode_rel_imm,
+            generic_opcode,
+            jnz_opcode_non_taken,
+            jnz_opcode_taken,
+            jump_opcode_abs,
+            jump_opcode_double_deref,
+            jump_opcode_rel,
+            jump_opcode_rel_imm,
+            mul_opcode,
+            mul_opcode_small,
+            qm_31_add_mul_opcode,
+            ret_opcode,
+        }
+    };
+}
+
+macro_rules! feeder_labels {
+    ($($field:ident),* $(,)?) => {
+        &[$(stringify!($field)),*]
+    };
+}
+
+/// The `verify_instruction` feeder registry as schedule labels (see
+/// [`for_each_verify_instruction_feeder`]).
+pub const VERIFY_INSTRUCTION_FEEDERS: &[&str] = for_each_verify_instruction_feeder!(feeder_labels);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlannedCompactedRowsError {
+    /// The compacted consumer is present but a generator state its feed is
+    /// derived from is absent — a structurally impossible ProverInput; fail
+    /// closed instead of guessing rows.
+    MissingFeederState {
+        consumer: &'static str,
+        state: &'static str,
+    },
+    Shape(crate::witness::proof_shape::ProofShapeError),
+}
+
+impl core::fmt::Display for PlannedCompactedRowsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "plan-time compacted row derivation rejected: {self:?}")
+    }
+}
+
+impl std::error::Error for PlannedCompactedRowsError {}
+
+/// HOST-SIDE EXACT ROW DERIVATION for the device-compacted consumers, at plan
+/// time (pre-witness). Returns `Ok(None)` when `label` is not a compacted
+/// consumer or the component is absent from this proof.
+///
+/// INVARIANT (soundness-critical): for every device-compacted consumer
+/// (`verify_instruction`, `pedersen_aggregator_window_bits_18`,
+/// `poseidon_aggregator`), the row resolution derived here from the
+/// pre-witness generator state MUST equal the row count the SIMD
+/// `CairoClaimGenerator` realizes for the same ProverInput — the same dedup
+/// semantics (the component's own tuple-keyed multiplicity `DashMap`) and the
+/// same padding to the next power of two (min `N_LANES`,
+/// `proof_shape::padded_rows`). Enforcement backstops: the fixture
+/// differential tests (plan-time derivation vs full SIMD `write_trace`
+/// realization), the witness-time `FinalShapeLedger` equality check on the
+/// sealed shape, the device compact-finalize kernel's fail-closed trap (it
+/// refuses unless the device-born unique count pads to exactly the planned
+/// extent), and whole-proof byte identity.
+///
+/// Dedup logic is REUSED, not re-implemented: the aggregator arms feed a
+/// throwaway instance of the component's own `ClaimGenerator` through the
+/// exact `AddInputs` entry point the SIMD builtin writer uses, then read the
+/// row count through the same generated `FinalComponentShape` projection the
+/// post-witness seal uses.
+pub fn planned_compacted_consumer_shape(
+    generator: &crate::witness::cairo_claim_generator::CairoClaimGenerator,
+    label: &str,
+) -> Result<Option<crate::witness::proof_shape::RuntimeComponentShape>, PlannedCompactedRowsError> {
+    use crate::witness::proof_shape::{padded_rows, RuntimeComponentShape};
+    use crate::witness::proof_shape_generated::FinalComponentShape;
+    use crate::witness::utils::AddInputs;
+
+    match label {
+        // The host multiset keys on the FULL 7-word tuple
+        // `(pc, offsets, flags, opcode_extension)` (see
+        // `verify_instruction::ClaimGenerator::mults`), but every word after
+        // `pc` is a pure function of the immutable instruction memory at
+        // `pc`, and `pc` itself is tuple word 0 — so distinct tuples and
+        // distinct pcs are in bijection. The device compaction contract
+        // codifies the same fact (`key_words: 1` above: the RLE dedup keys on
+        // word 0 alone). Each opcode writer adds one tuple per padded input
+        // row, and padding replicates the first REAL input row
+        // (`inputs.resize(size, *inputs.first().unwrap())`), so padding never
+        // introduces a new key: the realized `mults.len()` is exactly the
+        // number of distinct pcs across all executed instructions.
+        "verify_instruction" => {
+            if generator.verify_instruction.is_none() {
+                return Ok(None);
+            }
+            let mut pcs: Vec<u32> = Vec::new();
+            macro_rules! collect_feeder_pcs {
+                ($($field:ident),* $(,)?) => {
+                    $(
+                        if let Some(gen) = &generator.$field {
+                            pcs.extend(gen.inputs.iter().map(|state| state.pc.0));
+                        }
+                    )*
+                };
+            }
+            for_each_verify_instruction_feeder!(collect_feeder_pcs);
+            pcs.sort_unstable();
+            pcs.dedup();
+            let n_real = pcs.len() as u64;
+            let padded = padded_rows("verify_instruction", n_real, N_LANES as u64)
+                .map_err(PlannedCompactedRowsError::Shape)?;
+            RuntimeComponentShape::uniform("verify_instruction", n_real, padded)
+                .map(Some)
+                .map_err(PlannedCompactedRowsError::Shape)
+        }
+        // Sole feeder: `pedersen_builtin`. Its SIMD writer
+        // (`pedersen_builtin::write_trace_simd`) adds one aggregator tuple
+        // `([id(a), id(a+1)], id(a+2))`, `a = 3*row + segment_start` (M31
+        // arithmetic), for EVERY row of its full padded `2^log_size` domain
+        // (padding rows re-read the adapter-padded segment memory). All three
+        // words are pure `memory_address_to_id` reads of the immutable
+        // execution memory, so the identical multiset is derivable here,
+        // pre-witness, with the identical `AddInputs` dedup.
+        "pedersen_aggregator_window_bits_18" => {
+            if generator.pedersen_aggregator_window_bits_18.is_none() {
+                return Ok(None);
+            }
+            let builtin = generator.pedersen_builtin.as_ref().ok_or(
+                PlannedCompactedRowsError::MissingFeederState {
+                    consumer: "pedersen_aggregator_window_bits_18",
+                    state: "pedersen_builtin",
+                },
+            )?;
+            let addr_to_id = generator.memory_address_to_id.as_ref().ok_or(
+                PlannedCompactedRowsError::MissingFeederState {
+                    consumer: "pedersen_aggregator_window_bits_18",
+                    state: "memory_address_to_id",
+                },
+            )?;
+            let probe = pedersen_aggregator_window_bits_18::ClaimGenerator::new();
+            let segment_start = BaseField::from(builtin.pedersen_builtin_segment_start);
+            let three = BaseField::from(3u32);
+            let one = BaseField::from(1u32);
+            let two = BaseField::from(2u32);
+            for row in 0..(1u64 << builtin.log_size) {
+                let instance_addr = BaseField::from(row as u32) * three + segment_start;
+                let id0 = addr_to_id.get_id(instance_addr);
+                let id1 = addr_to_id.get_id(instance_addr + one);
+                let id2 = addr_to_id.get_id(instance_addr + two);
+                probe.add_input(&([id0, id1], id2), 0);
+            }
+            probe
+                .final_component_shape(None, 0)
+                .map(Some)
+                .map_err(PlannedCompactedRowsError::Shape)
+        }
+        // Sole feeder: `poseidon_builtin`. Same structure as the pedersen arm
+        // (`poseidon_builtin::write_trace_simd`): one tuple
+        // `([id(a), id(a+1), id(a+2)], [id(a+3), id(a+4), id(a+5)])`,
+        // `a = 6*row + segment_start`, per padded builtin row.
+        "poseidon_aggregator" => {
+            if generator.poseidon_aggregator.is_none() {
+                return Ok(None);
+            }
+            let builtin = generator.poseidon_builtin.as_ref().ok_or(
+                PlannedCompactedRowsError::MissingFeederState {
+                    consumer: "poseidon_aggregator",
+                    state: "poseidon_builtin",
+                },
+            )?;
+            let addr_to_id = generator.memory_address_to_id.as_ref().ok_or(
+                PlannedCompactedRowsError::MissingFeederState {
+                    consumer: "poseidon_aggregator",
+                    state: "memory_address_to_id",
+                },
+            )?;
+            let probe = poseidon_aggregator::ClaimGenerator::new();
+            let segment_start = BaseField::from(builtin.poseidon_builtin_segment_start);
+            let six = BaseField::from(6u32);
+            for row in 0..(1u64 << builtin.log_size) {
+                let instance_addr = BaseField::from(row as u32) * six + segment_start;
+                let word = |offset: u32| addr_to_id.get_id(instance_addr + BaseField::from(offset));
+                probe.add_input(
+                    &([word(0), word(1), word(2)], [word(3), word(4), word(5)]),
+                    0,
+                );
+            }
+            probe
+                .final_component_shape(None, 0)
+                .map(Some)
+                .map_err(PlannedCompactedRowsError::Shape)
+        }
+        _ => Ok(None),
+    }
+}
+
 pub fn recorded_input_geometry(label: &str) -> Option<RecordedInputGeometry> {
     let casm = RecordedInputGeometry {
         enabler_slot: Some(3),
@@ -4326,5 +4538,158 @@ mod emitted_lane_tests {
             Err(RecordedWitnessInputsError::UnsupportedLabels(labels))
                 if labels == vec!["add_opcode", "not_a_recorded_lane"]
         ));
+    }
+}
+
+#[cfg(test)]
+mod planned_compacted_rows_tests {
+    use stwo_cairo_adapter::memory::{EncodedMemoryValueId, MemoryConfig};
+    use stwo_cairo_common::prover_types::cpu::M31;
+
+    use super::*;
+    use crate::witness::cairo_claim_generator::CairoClaimGenerator;
+    use crate::witness::components::{add_opcode, ret_opcode};
+    use crate::witness::proof_shape::RuntimeComponentShape;
+
+    fn casm(pc: u32) -> CasmState {
+        CasmState {
+            pc: M31::from_u32_unchecked(pc),
+            ap: M31::from_u32_unchecked(0),
+            fp: M31::from_u32_unchecked(0),
+        }
+    }
+
+    /// `memory.address_to_id` covering addresses `0..len`; every address maps
+    /// to `default_id` except the listed `(address, id)` overrides.
+    fn memory_with_ids(len: usize, default_id: u32, overrides: &[(usize, u32)]) -> Arc<Memory> {
+        let mut address_to_id = vec![EncodedMemoryValueId(default_id); len];
+        for &(address, id) in overrides {
+            address_to_id[address] = EncodedMemoryValueId(id);
+        }
+        Arc::new(Memory {
+            config: MemoryConfig::default(),
+            address_to_id,
+            f252_values: vec![[0; 8]],
+            small_values: vec![0],
+        })
+    }
+
+    #[test]
+    fn verify_instruction_rows_are_the_distinct_pcs_across_all_feeders() {
+        let generator = CairoClaimGenerator {
+            verify_instruction: Some(verify_instruction::ClaimGenerator::new()),
+            // pc 9 repeats across two different feeders; pc 5 repeats within
+            // one — the dedup must count {5, 9, 11} once each.
+            ret_opcode: Some(ret_opcode::ClaimGenerator::new(vec![
+                casm(5),
+                casm(5),
+                casm(9),
+            ])),
+            add_opcode: Some(add_opcode::ClaimGenerator::new(vec![casm(9), casm(11)])),
+            ..CairoClaimGenerator::default()
+        };
+        let shape = planned_compacted_consumer_shape(&generator, "verify_instruction")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shape,
+            RuntimeComponentShape::uniform("verify_instruction", 3, N_LANES as u64).unwrap()
+        );
+    }
+
+    #[test]
+    fn absent_compacted_consumer_and_plain_labels_derive_nothing() {
+        let generator = CairoClaimGenerator::default();
+        for label in [
+            "verify_instruction",
+            "pedersen_aggregator_window_bits_18",
+            "poseidon_aggregator",
+            "ret_opcode",
+            "blake_round",
+        ] {
+            assert_eq!(
+                planned_compacted_consumer_shape(&generator, label),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn poseidon_aggregator_rows_dedup_the_builtin_id_tuples() {
+        // 16 builtin instances (log_size 4), segment start 1, stride 6:
+        // instance 0 reads distinct ids, instances 1..16 all read the default
+        // id — exactly two unique aggregator tuples.
+        let memory = memory_with_ids(
+            128,
+            7,
+            &[(1, 101), (2, 102), (3, 103), (4, 104), (5, 105), (6, 106)],
+        );
+        let generator = CairoClaimGenerator {
+            memory_address_to_id: Some(memory_address_to_id::ClaimGenerator::new(memory)),
+            poseidon_builtin: Some(poseidon_builtin::ClaimGenerator::new(4, 1)),
+            poseidon_aggregator: Some(poseidon_aggregator::ClaimGenerator::new()),
+            ..CairoClaimGenerator::default()
+        };
+        let shape = planned_compacted_consumer_shape(&generator, "poseidon_aggregator")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shape,
+            RuntimeComponentShape::uniform("poseidon_aggregator", 2, N_LANES as u64).unwrap()
+        );
+    }
+
+    #[test]
+    fn pedersen_aggregator_rows_dedup_the_builtin_id_tuples() {
+        // 16 builtin instances (log_size 4), segment start 1, stride 3:
+        // three distinct leading instances, the rest identical — four unique
+        // tuples in total.
+        let memory = memory_with_ids(
+            64,
+            9,
+            &[
+                (1, 201),
+                (2, 202),
+                (3, 203),
+                (4, 204),
+                (5, 205),
+                (6, 206),
+                (7, 207),
+                (8, 208),
+                (9, 209),
+            ],
+        );
+        let generator = CairoClaimGenerator {
+            memory_address_to_id: Some(memory_address_to_id::ClaimGenerator::new(memory)),
+            pedersen_builtin: Some(pedersen_builtin::ClaimGenerator::new(4, 1)),
+            pedersen_aggregator_window_bits_18: Some(
+                pedersen_aggregator_window_bits_18::ClaimGenerator::new(),
+            ),
+            ..CairoClaimGenerator::default()
+        };
+        let shape =
+            planned_compacted_consumer_shape(&generator, "pedersen_aggregator_window_bits_18")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            shape,
+            RuntimeComponentShape::uniform("pedersen_aggregator_window_bits_18", 4, N_LANES as u64)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn aggregator_derivation_fails_closed_without_its_feeder_states() {
+        let generator = CairoClaimGenerator {
+            poseidon_aggregator: Some(poseidon_aggregator::ClaimGenerator::new()),
+            ..CairoClaimGenerator::default()
+        };
+        assert_eq!(
+            planned_compacted_consumer_shape(&generator, "poseidon_aggregator"),
+            Err(PlannedCompactedRowsError::MissingFeederState {
+                consumer: "poseidon_aggregator",
+                state: "poseidon_builtin",
+            })
+        );
     }
 }

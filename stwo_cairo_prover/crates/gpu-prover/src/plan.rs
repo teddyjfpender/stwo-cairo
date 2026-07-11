@@ -111,8 +111,18 @@ impl ProofPlan {
     /// NOT derivable from producer capacities. Promoting the capacity bound
     /// for such a component produced a claim whose log size diverges from the
     /// host reference AND armed the compact kernel's fail-closed device trap
-    /// (observed on hardware as a SIGSEGV inside `cudaGraphLaunch`); this now
+    /// (observed on hardware as a SIGSEGV inside `cudaGraphLaunch`); this
     /// fails closed at plan time instead.
+    ///
+    /// The production path never reaches that refusal: ingest seals the
+    /// compacted consumers' EXACT rows pre-witness
+    /// (`phases::ingest::seal_compacted_consumer_rows`, backed by the host
+    /// derivation `planned_compacted_consumer_shape` which reuses the
+    /// components' own dedup), so by the time this resolution runs those
+    /// components are `Resolved` and every remaining `Bounded` consumer is a
+    /// plain feed whose bound was recomputed FROM the sealed exact domains.
+    /// Hitting `StrictResidentCompactedRowsUnresolved` therefore means a
+    /// caller built a strict plan from an unsealed shape.
     pub fn strict_resident_exact(
         &self,
         schedule: &'static Schedule,
@@ -125,11 +135,20 @@ impl ProofPlan {
             .map(|component| {
                 let rows = match &component.rows {
                     RowResolution::Bounded { bound, .. } => {
-                        if stwo_cairo_prover::witness::jit_prove_backend::recorded_input_compaction_geometry(
+                        // Soundness-review hardening: the refusal keys on
+                        // DEDUP SEMANTICS, not only on the device-compaction
+                        // registry — pedersen_aggregator_window_bits_9 dedups
+                        // via the same DashMap multiset in its host lane, so a
+                        // capacity bound is equally non-exact for it even
+                        // though it has no device compaction geometry (its
+                        // writer is Detached today, but that coverage check
+                        // runs AFTER this resolution).
+                        let dedup_consumer = stwo_cairo_prover::witness::jit_prove_backend::recorded_input_compaction_geometry(
                             component.id,
                         )
                         .is_some()
-                        {
+                            || component.id == "pedersen_aggregator_window_bits_9";
+                        if dedup_consumer {
                             return Err(ProofPlanError::StrictResidentCompactedRowsUnresolved {
                                 component: component.id,
                                 observed_rows: bound.observed_rows,
@@ -306,11 +325,14 @@ impl std::fmt::Display for ProofPlanError {
 impl std::error::Error for ProofPlanError {}
 
 /// TEST-ONLY stand-in for the exact rows of device-compacted consumers.
-/// [`ProofPlan::strict_resident_exact`] fails closed on their capacity bounds,
-/// and the pre-witness exact-count derivation does not exist yet, so tests of
-/// lane/arena geometry substitute the capacity geometry explicitly before the
-/// strict resolution. Production code must never take this shortcut: the
-/// substituted row counts are upper bounds, not the deduplicated truth.
+/// [`ProofPlan::strict_resident_exact`] fails closed on their capacity bounds.
+/// Production plans get the exact rows from the pre-witness host derivation
+/// sealed at ingest (`phases::ingest::seal_compacted_consumer_rows`); that
+/// derivation replays real memory reads, so SYNTHETIC-shape tests (stub
+/// memories that cannot back the builtin segment reads) substitute the
+/// capacity geometry explicitly instead. Production code must never take this
+/// shortcut: the substituted row counts are upper bounds, not the
+/// deduplicated truth.
 #[cfg(test)]
 pub(crate) fn resolve_compacted_capacity_for_test(
     plan: &ProofPlan,
@@ -668,6 +690,61 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The green counterpart of the refusal above: once the pre-witness host
+    /// derivation has sealed a compacted consumer's exact rows into the shape
+    /// (as `phases::ingest` does in production), the strict resolution
+    /// succeeds and preserves the sealed geometry verbatim.
+    #[test]
+    fn strict_resident_exact_accepts_sealed_compacted_consumer() {
+        let shape = with_components(vec![
+            RuntimeComponentShape::uniform("ret_opcode", 33, 64).unwrap(),
+            RuntimeComponentShape::uniform("verify_instruction", 5, 16).unwrap(),
+        ]);
+        let plan =
+            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
+        let exact = plan
+            .strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)
+            .unwrap();
+        assert_eq!(
+            exact
+                .proof_shape()
+                .component("verify_instruction")
+                .unwrap()
+                .rows,
+            RowResolution::Resolved(vec![
+                stwo_cairo_prover::witness::proof_shape::TracePartShape {
+                    part: TracePartId::Main,
+                    n_real_rows: 5,
+                    padded_rows: 16,
+                }
+            ])
+        );
+        assert!(exact.capture_ready());
+    }
+
+    /// The plan-time distinct-pc derivation for `verify_instruction`
+    /// enumerates a fixed feeder registry in the witness crate; the schedule's
+    /// capacity feeds are the authoritative feeder set. Pin the two against
+    /// each other so a future opcode feeder cannot silently skew the
+    /// derivation.
+    #[test]
+    fn verify_instruction_feeder_registry_matches_schedule() {
+        let node = CAIRO_SCHEDULE
+            .nodes
+            .iter()
+            .find(|node| node.id == "verify_instruction")
+            .unwrap();
+        let mut expected: Vec<&str> = node.capacity_inputs.iter().map(|feed| feed.from).collect();
+        expected.sort_unstable();
+        let mut actual: Vec<&str> =
+            stwo_cairo_prover::witness::jit_prove_backend::VERIFY_INSTRUCTION_FEEDERS.to_vec();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "verify_instruction feeder registry drifted from CAIRO_SCHEDULE capacity feeds"
+        );
     }
 
     #[test]
