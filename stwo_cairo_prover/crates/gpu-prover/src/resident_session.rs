@@ -1481,6 +1481,11 @@ mod tests {
         )
         .unwrap();
         let memory = &recorded.execution_memory;
+        let public_memory_entries =
+            public_memory_multiplicity_seed_words(&planned_claim, memory)
+                .unwrap()
+                .len()
+                / 2;
         let arena = ProofArenaPlan::build_with_execution_tables(
             &exact_plan,
             &protocol,
@@ -1489,7 +1494,8 @@ mod tests {
                 memory.address_to_id.len(),
                 memory.f252_values.len(),
                 memory.small_values.len(),
-            ),
+            )
+            .with_public_memory_entries(public_memory_entries),
         )
         .unwrap();
         assert_witness_input_slots_satisfy_prepare(&arena);
