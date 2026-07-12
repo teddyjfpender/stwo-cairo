@@ -8725,13 +8725,29 @@ mod tests {
                 }))
                 .collect(),
         );
-        let mut oods_columns = vec![OodsColumnGeometry {
-            source: OpenedColumnSource::Preprocessed { ordinal: 0 },
-            coefficient_log_size: 25,
-            evaluation_log_size: 26,
-            shape_points: Vec::new(),
-            offset_points: Vec::new(),
-        }];
+        let mut oods_columns = vec![
+            OodsColumnGeometry {
+                source: OpenedColumnSource::Preprocessed { ordinal: 0 },
+                coefficient_log_size: 25,
+                evaluation_log_size: 26,
+                shape_points: Vec::new(),
+                offset_points: Vec::new(),
+            },
+            OodsColumnGeometry {
+                source: OpenedColumnSource::Preprocessed { ordinal: 1 },
+                coefficient_log_size: 18,
+                evaluation_log_size: 19,
+                shape_points: Vec::new(),
+                offset_points: Vec::new(),
+            },
+            OodsColumnGeometry {
+                source: OpenedColumnSource::Preprocessed { ordinal: 2 },
+                coefficient_log_size: 18,
+                evaluation_log_size: 19,
+                shape_points: Vec::new(),
+                offset_points: Vec::new(),
+            },
+        ];
         oods_columns.extend(
             base_logs
                 .iter()
@@ -8905,7 +8921,11 @@ mod tests {
                 interpolation_mode: InterpolationLaunchMode::StageWiseCopyThenInPlace,
                 quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::CoefficientsOnly,
             },
-            preprocessed_column_ids: vec!["test_preprocessed".to_owned()],
+            preprocessed_column_ids: vec![
+                "test_preprocessed".to_owned(),
+                "range_check_9_9_column_0".to_owned(),
+                "range_check_9_9_column_1".to_owned(),
+            ],
             max_domain_log_size: 26,
             lifting_log_size: 26,
             n_queries: 70,
@@ -8930,10 +8950,12 @@ mod tests {
                         unretained_bottom_layers: 4,
                         max_fused_tail_levels: 12,
                     },
-                    grouped_column_log_sizes: vec![vec![25]],
-                    grouped_column_sources: vec![vec![CommitmentColumnSource::Preprocessed {
-                        ordinal: 0,
-                    }]],
+                    grouped_column_log_sizes: vec![vec![18, 18, 25]],
+                    grouped_column_sources: vec![vec![
+                        CommitmentColumnSource::Preprocessed { ordinal: 1 },
+                        CommitmentColumnSource::Preprocessed { ordinal: 2 },
+                        CommitmentColumnSource::Preprocessed { ordinal: 0 },
+                    ]],
                     retained_evaluation_groups: vec![false],
                 },
                 CommitmentGeometry {
@@ -9356,7 +9378,15 @@ mod tests {
             .iter()
             .map(Vec::len)
             .sum::<usize>();
-        proof_order_protocol.oods.columns.swap(1, base_columns);
+        let preprocessed_columns = proof_order_protocol.commitments[0]
+            .grouped_column_sources
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>();
+        proof_order_protocol.oods.columns.swap(
+            preprocessed_columns,
+            preprocessed_columns + base_columns - 1,
+        );
         let proof_order_shape = proof_order_protocol.proof_assembly_shape().unwrap();
         assert_ne!(
             proof_order_shape.trace_trees[1].commit_to_proof_column,
@@ -9370,8 +9400,8 @@ mod tests {
         assert_eq!(permutation, (0..base_columns).collect::<Vec<_>>());
         assert_eq!(arena.quotient().requirements.sample_count, 3);
         assert_eq!(arena.quotient().partial_numerators.len(), 3);
-        assert_eq!(arena.preprocessed_coefficients().len(), 1);
-        assert_eq!(arena.preprocessed().interpolation_batches.len(), 1);
+        assert_eq!(arena.preprocessed_coefficients().len(), 3);
+        assert_eq!(arena.preprocessed().interpolation_batches.len(), 2);
         let preprocessed_inverse = arena
             .find(None, None, BufferPurpose::PreprocessedInverseTwiddles, 0)
             .unwrap()
