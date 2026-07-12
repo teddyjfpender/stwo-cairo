@@ -606,6 +606,7 @@ impl QuotientGeometry {
 pub struct OodsColumnGeometry {
     pub source: OpenedColumnSource,
     pub coefficient_log_size: u32,
+    pub evaluation_log_size: u32,
     pub shape_points: Vec<CirclePoint<SecureField>>,
     pub offset_points: Vec<CirclePoint<BaseField>>,
 }
@@ -634,8 +635,9 @@ impl OodsGeometry {
         self.columns
             .iter()
             .map(|column| {
-                OodsColumnTopology::offset_points(
+                OodsColumnTopology::coefficient_offset_points(
                     column.coefficient_log_size,
+                    column.evaluation_log_size,
                     &column.offset_points,
                 )
             })
@@ -687,6 +689,7 @@ impl OodsGeometry {
         for column in &self.columns {
             feed_opened_source(&mut hash, column.source);
             feed_hash(&mut hash, &column.coefficient_log_size.to_le_bytes());
+            feed_hash(&mut hash, &column.evaluation_log_size.to_le_bytes());
             feed_hash(&mut hash, &(column.shape_points.len() as u64).to_le_bytes());
             for point in &column.shape_points {
                 for coordinate in [point.x, point.y] {
@@ -1032,6 +1035,18 @@ impl ProtocolGeometry {
         let mut preprocessed_ordinal = 0u32;
         let mut composition_ordinal = 0u32;
         for column in &self.oods.columns {
+            if column.evaluation_log_size
+                != column
+                    .coefficient_log_size
+                    .checked_add(self.identity.log_blowup_factor)
+                    .ok_or(ArenaPlanError::SizeOverflow)?
+                || (!column.shape_points.is_empty()
+                    && column.evaluation_log_size > self.lifting_log_size)
+            {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "OODS evaluation domain disagrees with coefficient log and PCS blowup",
+                ));
+            }
             if seen_sources.contains(&column.source) {
                 return Err(ArenaPlanError::InvalidProtocolGeometry(
                     "duplicate OODS opened-column source",
@@ -2168,6 +2183,7 @@ pub struct PlannedPreprocessedWorkspace {
 pub struct PlannedOodsColumn {
     pub source: OpenedColumnSource,
     pub coefficient_log_size: u32,
+    pub evaluation_log_size: u32,
     pub shape_points: Vec<CirclePoint<SecureField>>,
     pub offset_points: Vec<CirclePoint<BaseField>>,
     pub coefficients: ArenaBinding,
@@ -2234,7 +2250,11 @@ impl PlannedCompositionWorkspace {
 
 impl PlannedOodsColumn {
     pub fn topology(&self) -> OodsColumnTopology<'_> {
-        OodsColumnTopology::offset_points(self.coefficient_log_size, &self.offset_points)
+        OodsColumnTopology::coefficient_offset_points(
+            self.coefficient_log_size,
+            self.evaluation_log_size,
+            &self.offset_points,
+        )
     }
 }
 
@@ -6854,6 +6874,7 @@ fn resolve_oods_slots(
             Ok(PlannedOodsColumn {
                 source: column.geometry.source,
                 coefficient_log_size: column.geometry.coefficient_log_size,
+                evaluation_log_size: column.geometry.evaluation_log_size,
                 shape_points: column.geometry.shape_points,
                 offset_points: column.geometry.offset_points,
                 coefficients: binding(column.coefficients)?,
@@ -8281,6 +8302,7 @@ mod tests {
         let mut oods_columns = vec![OodsColumnGeometry {
             source: OpenedColumnSource::Preprocessed { ordinal: 0 },
             coefficient_log_size: 25,
+            evaluation_log_size: 26,
             shape_points: Vec::new(),
             offset_points: Vec::new(),
         }];
@@ -8293,6 +8315,7 @@ mod tests {
                 .map(|(coefficient_log_size, source)| OodsColumnGeometry {
                     source: source.into(),
                     coefficient_log_size,
+                    evaluation_log_size: coefficient_log_size + 1,
                     shape_points: Vec::new(),
                     offset_points: Vec::new(),
                 }),
@@ -8306,6 +8329,7 @@ mod tests {
                 .map(|(coefficient_log_size, source)| OodsColumnGeometry {
                     source: source.into(),
                     coefficient_log_size,
+                    evaluation_log_size: coefficient_log_size + 1,
                     shape_points: Vec::new(),
                     offset_points: Vec::new(),
                 }),
@@ -8324,6 +8348,7 @@ mod tests {
             OodsColumnGeometry {
                 source: OpenedColumnSource::Composition { ordinal },
                 coefficient_log_size: 25,
+                evaluation_log_size: 26,
                 shape_points: (ordinal == 0)
                     .then(|| shape_points.clone())
                     .unwrap_or_default(),
@@ -8534,6 +8559,19 @@ mod tests {
             .partial_numerator_log_sizes
             .push(23);
         assert_ne!(protocol.key(), changed_quotient.key());
+        let mut invalid_oods_evaluation_log = protocol.clone();
+        invalid_oods_evaluation_log.oods.columns[0].evaluation_log_size =
+            invalid_oods_evaluation_log.oods.columns[0].coefficient_log_size;
+        // Seal the mutated topology so validation reaches the domain relation
+        // instead of rejecting the stale topology hash first.
+        invalid_oods_evaluation_log.identity.oods_topology_hash =
+            invalid_oods_evaluation_log.oods.topology_hash();
+        assert_eq!(
+            invalid_oods_evaluation_log.validate(),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "OODS evaluation domain disagrees with coefficient log and PCS blowup"
+            ))
+        );
         let mut missing_fixed_tree = protocol.clone();
         missing_fixed_tree.commitments.remove(0);
         let missing_fixed_tree_result =

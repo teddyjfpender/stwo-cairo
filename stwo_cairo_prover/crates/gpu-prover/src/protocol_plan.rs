@@ -483,6 +483,7 @@ fn plan_oods_geometry(
     base_columns: &[TraceCommitmentColumn],
     interaction_columns: &[TraceCommitmentColumn],
     composition_coefficient_log: u32,
+    log_blowup_factor: u32,
 ) -> Result<OodsGeometry, ProtocolPlanError> {
     let expected = vec![
         preprocessed_logs
@@ -579,6 +580,9 @@ fn plan_oods_geometry(
             columns.push(OodsColumnGeometry {
                 source,
                 coefficient_log_size: log_size,
+                evaluation_log_size: log_size
+                    .checked_add(log_blowup_factor)
+                    .ok_or(ProtocolPlanError::SizeOverflow)?,
                 shape_points: discovered.shape_points.clone(),
                 offset_points: discovered.offset_points.clone(),
             });
@@ -727,6 +731,7 @@ fn plan_protocol_from_logs(
         &base_columns,
         &interaction_columns,
         composition_coefficient_log,
+        blowup,
     )?;
     let (base_logs, base_sources) = canonical_commit_columns(base_columns);
     let (interaction_logs, interaction_sources) = canonical_commit_columns(interaction_columns);
