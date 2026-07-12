@@ -1544,6 +1544,241 @@ mod tests {
         );
     }
 
+    #[test]
+    fn progressive_direct_fixture_closes_producer_to_consumer_bindings() {
+        use cairo_vm::types::layout_name::LayoutName;
+        use stwo_backend_cuda::{ModeAwareCommitWorkspaceRequirements, ProgressiveCommitMode};
+        use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+        use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
+        use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
+
+        use crate::arena_plan::{BufferLifetime, BufferPurpose, CommitmentTreeId, ProofEpoch};
+        use crate::direct_composition_retention::DirectCompositionRetentionMode;
+
+        let input = run_and_adapt(
+            &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
+            ProgramType::Json,
+            LayoutName::all_cairo_stwo,
+            None,
+        )
+        .unwrap();
+        let ingest = crate::phases::ingest::run(input, PreProcessedTraceVariant::Canonical, None);
+        let exact_plan = ingest
+            .proof_plan
+            .strict_resident_exact(
+                &crate::schedule_table::CAIRO_SCHEDULE,
+                &crate::relation_table::CAIRO_RELATION_GRAPH,
+            )
+            .unwrap();
+        let planned_claim = planned_cairo_claim(&ingest.generator, &exact_plan).unwrap();
+        let recorded = recorded_witness_inputs_for_plan(&ingest.generator, &exact_plan).unwrap();
+        recorded.require_resolved().unwrap();
+        let memory = &recorded.execution_memory;
+        let public_memory_entries = public_memory_multiplicity_seed_words(&planned_claim, memory)
+            .unwrap()
+            .len()
+            / 2;
+        let mut policy = ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048);
+        policy.commit_mode = ProgressiveCommitMode::DomainProgressive;
+        policy.direct_composition_retention_mode = DirectCompositionRetentionMode::ExactNative;
+        let planned = plan_resident_protocol_with_policy(
+            &planned_claim,
+            &exact_plan,
+            &ingest.preprocessed_trace,
+            PcsConfig::default(),
+            false,
+            Some(
+                ExecutionTableGeometry::new(
+                    memory.address_to_id.len(),
+                    memory.f252_values.len(),
+                    memory.small_values.len(),
+                )
+                .with_public_memory_entries(public_memory_entries),
+            ),
+            policy,
+        )
+        .unwrap();
+        let arena = planned.arena.as_ref();
+        let retention = arena
+            .composition()
+            .direct_retention
+            .as_ref()
+            .expect("explicit direct policy must seal a retention plan");
+        assert!(retention.direct_column_count > 0);
+
+        for binding in arena
+            .composition()
+            .direct_bindings
+            .iter()
+            .filter(|binding| binding.evaluation.is_some())
+        {
+            let column = retention.columns[binding.plan_column];
+            assert_eq!(
+                column.canonical_column,
+                column.group * 16 + column.column_in_group
+            );
+            let commitment = arena.commitment(column.tree).unwrap();
+            let ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements) =
+                &commitment.requirements
+            else {
+                panic!("direct retention must use a progressive producer");
+            };
+            let producer = requirements
+                .leaves
+                .plan
+                .columns
+                .get(column.canonical_column)
+                .unwrap();
+            assert_eq!(producer.canonical_index, column.canonical_column);
+            assert_eq!(producer.group_index, column.group);
+            assert_eq!(producer.column_in_group, column.column_in_group);
+            assert_eq!(producer.coefficient_log_size, column.coefficient_log_size);
+            assert_eq!(producer.evaluation_log_size, column.evaluation_log_size);
+            assert!(producer.retained_evaluation);
+
+            let runtime_flattened = commitment
+                .grouped_column_log_sizes
+                .iter()
+                .zip(&commitment.evaluation_output_groups)
+                .flat_map(|(logs, outputs)| match outputs {
+                    Some(outputs) => outputs.iter().copied().map(Some).collect::<Vec<_>>(),
+                    None => vec![None; logs.len()],
+                })
+                .collect::<Vec<_>>();
+            let evaluation = binding.evaluation.unwrap();
+            assert_eq!(
+                runtime_flattened[column.canonical_column],
+                Some(evaluation),
+                "runtime producer flattening must resolve the consumer's exact slot"
+            );
+            assert_eq!(
+                commitment.evaluation_output_groups[column.group]
+                    .as_ref()
+                    .unwrap()[column.column_in_group],
+                evaluation
+            );
+
+            let producer_occurrences = requirements
+                .leaves
+                .plan
+                .lde_batches
+                .iter()
+                .flat_map(|batch| &batch.columns)
+                .filter(|&&canonical| canonical == column.canonical_column)
+                .count();
+            assert_eq!(
+                producer_occurrences, 1,
+                "every canonical column must have exactly one progressive LDE producer"
+            );
+            let (batch, batch_column) = requirements
+                .leaves
+                .plan
+                .lde_batches
+                .iter()
+                .find_map(|batch| {
+                    batch
+                        .columns
+                        .iter()
+                        .position(|&canonical| canonical == column.canonical_column)
+                        .map(|position| (batch, position))
+                })
+                .expect("every progressive column must occur in one LDE batch");
+            assert_eq!(batch.evaluation_log_size, column.evaluation_log_size);
+            assert_eq!(
+                batch.retained_columns[batch_column],
+                Some((column.group, column.column_in_group))
+            );
+        }
+
+        let fixed = arena.commitment(CommitmentTreeId::Preprocessed).unwrap();
+        let prepare_written = [
+            BufferPurpose::QuotientSamplePoints,
+            BufferPurpose::QuotientFirstLinearTerms,
+        ]
+        .map(|purpose| {
+            let (logical, binding) = arena.find(None, None, purpose, 0).unwrap();
+            assert_eq!(
+                logical.lifetime,
+                BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Quotient).unwrap(),
+                "prepare-time quotient writes must be live from Ingest"
+            );
+            binding.physical
+        });
+        for purpose in [BufferPurpose::RelationAlphaPowers, BufferPurpose::RelationZ] {
+            let (logical, _) = arena.find(None, None, purpose, 0).unwrap();
+            assert_eq!(
+                logical.lifetime,
+                BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Composition).unwrap(),
+                "prepare-time relation challenge writes must be live from Ingest"
+            );
+        }
+        let fixed_cached = fixed
+            .evaluation_output_groups
+            .iter()
+            .flatten()
+            .flatten()
+            .chain(fixed.retained_layers_bottom_up.iter())
+            .collect::<Vec<_>>();
+        for binding in &fixed_cached {
+            assert!(
+                !prepare_written.contains(&binding.physical),
+                "quotient preparation must not overwrite a live fixed commitment output"
+            );
+        }
+        for binding in fixed_cached {
+            assert_eq!(
+                arena.logical_buffers()[binding.logical.0 as usize]
+                    .lifetime
+                    .last,
+                ProofEpoch::Assemble,
+                "cached preprocessed commitment data must survive the next proof cycle"
+            );
+        }
+        assert!(arena
+            .logical_buffers()
+            .iter()
+            .filter(|buffer| {
+                matches!(
+                    buffer.purpose,
+                    BufferPurpose::PreprocessedEvaluations
+                        | BufferPurpose::PreprocessedCoefficients
+                        | BufferPurpose::ForwardTwiddles
+                        | BufferPurpose::InverseTwiddles
+                        | BufferPurpose::QuotientInverseTwiddles
+                )
+            })
+            .all(|buffer| buffer.lifetime.last == ProofEpoch::Assemble));
+        let ingest_to_decommit =
+            BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit).unwrap();
+        let finite_setup = arena
+            .logical_buffers()
+            .iter()
+            .filter(|buffer| buffer.lifetime == ingest_to_decommit)
+            .collect::<Vec<_>>();
+        assert_eq!(finite_setup.len(), 1);
+        assert_eq!(
+            finite_setup[0].purpose,
+            BufferPurpose::PreprocessedInverseTwiddles,
+            "only the cold fixed interpolation twiddles may end before Assemble"
+        );
+        let preprocessed_root_id = crate::transcript_plan::CairoTranscriptInput::PreprocessedRoot
+            .id()
+            .unwrap();
+        let root_input = arena
+            .transcript()
+            .inputs
+            .iter()
+            .find(|(id, _)| *id == preprocessed_root_id)
+            .unwrap()
+            .1;
+        assert_eq!(
+            arena.logical_buffers()[root_input.logical.0 as usize]
+                .lifetime
+                .last,
+            ProofEpoch::Assemble
+        );
+    }
+
     /// Host mirror of the slot validation in stwo's
     /// `PreparedWitnessInput{Gather,Seed,Compact}::prepare` and the recorded
     /// host-column ingest: every workspace slot handed to the witness-input

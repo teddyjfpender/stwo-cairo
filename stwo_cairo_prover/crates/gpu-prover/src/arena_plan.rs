@@ -5173,9 +5173,13 @@ fn append_relation_buffers(
         RelationExecutionError::BackendPlan(error) => ArenaPlanError::Relation(error),
         other => ArenaPlanError::RelationExecution(other),
     })?;
-    let persistent = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?;
+    // Captured relation kernels dereference these immutable tables on every
+    // warm replay, so their lifetime crosses the Assemble -> Ingest cycle.
+    let persistent = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble)?;
     let interaction = BufferLifetime::at(ProofEpoch::Interaction);
-    let challenge = BufferLifetime::new(ProofEpoch::Interaction, ProofEpoch::Composition)?;
+    // Relation preparation uploads placeholder challenge values before replay;
+    // the transcript overwrites them with the real values at Interaction.
+    let challenge = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Composition)?;
     let claimed = BufferLifetime::new(ProofEpoch::Interaction, ProofEpoch::Composition)?;
     let descriptors = push_buffer_id(
         logical,
@@ -5958,9 +5962,11 @@ fn append_protocol_buffers(
         ))?;
     let forward_twiddle_words =
         max_commitment_twiddle_words.max(quotient_requirements.forward_twiddle_words);
-    // Forward and inverse twiddles are distinct persistent values. Sharing one
-    // physical range and overwriting it at the FRI boundary would invalidate
-    // the later queried-LDE recomputation used by decommitment.
+    // These three trees are staged once per workspace and reused by every warm
+    // proof. Their semantic lifetime crosses the Assemble -> Ingest cycle, so
+    // model the full cycle explicitly instead of relying on incidental overlap
+    // with the current proof-assembly buffers.
+    let cached_workspace = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble)?;
     let forward_twiddles = push_buffer_id(
         logical,
         None,
@@ -5968,7 +5974,7 @@ fn append_protocol_buffers(
         BufferPurpose::ForwardTwiddles,
         0,
         forward_twiddle_words,
-        BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?,
+        cached_workspace,
     )?;
     let inverse_twiddles = push_buffer_id(
         logical,
@@ -5977,7 +5983,7 @@ fn append_protocol_buffers(
         BufferPurpose::InverseTwiddles,
         0,
         fri_requirements.twiddle_words,
-        BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?,
+        cached_workspace,
     )?;
     let preprocessed_inverse_twiddles = push_buffer_id(
         logical,
@@ -5995,7 +6001,7 @@ fn append_protocol_buffers(
         BufferPurpose::QuotientInverseTwiddles,
         0,
         quotient_requirements.inverse_twiddle_words,
-        BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?,
+        cached_workspace,
     )?;
     let logical_transcript = append_transcript_buffers(logical, protocol)?;
 
@@ -6043,7 +6049,7 @@ fn append_protocol_buffers(
                     BufferPurpose::PreprocessedCoefficients,
                     ordinal,
                     checked_pow2(log_size)?,
-                    BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?,
+                    cached_workspace,
                 )?,
             })
         })
@@ -6098,11 +6104,18 @@ fn append_protocol_buffers(
         .enumerate()
     {
         let at = BufferLifetime::at(geometry.created);
-        let retained = BufferLifetime::new(geometry.created, ProofEpoch::Decommit)?;
+        // The fixed commitment is produced once and cache-hit on every later
+        // proof. All of its retained Merkle/LDE outputs must survive the full
+        // workspace cycle; dynamic commitments are regenerated each replay.
+        let retained = if geometry.id == CommitmentTreeId::Preprocessed {
+            cached_workspace
+        } else {
+            BufferLifetime::new(geometry.created, ProofEpoch::Decommit)?
+        };
         // Captured kernels dereference these tables on every warm replay. Their
         // contents are commitment-specific and therefore cannot alias another
         // segment's descriptors even though the compute epochs are disjoint.
-        let descriptor = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?;
+        let descriptor = cached_workspace;
         let mut next_ordinal = 0u32;
         let mut ordinal = || {
             let local = next_ordinal;
@@ -6245,7 +6258,9 @@ fn append_protocol_buffers(
                                         BufferPurpose::CommitRetainedEvaluation,
                                         ordinal()?,
                                         checked_pow2(evaluation_log)?,
-                                        if keep_decommit {
+                                        if geometry.id == CommitmentTreeId::Preprocessed {
+                                            cached_workspace
+                                        } else if keep_decommit {
                                             retained
                                         } else if keep_numerator {
                                             BufferLifetime::new(
@@ -6439,7 +6454,7 @@ fn append_protocol_buffers(
         BufferLifetime::new(ProofEpoch::Quotient, ProofEpoch::Decommit)?,
     )?;
     let quotient_live = BufferLifetime::at(ProofEpoch::Quotient);
-    let quotient_descriptor = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?;
+    let quotient_descriptor = cached_workspace;
     let partial_numerators = protocol
         .quotient
         .partial_numerator_log_sizes
@@ -6475,6 +6490,12 @@ fn append_protocol_buffers(
             })
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+    // Generic quotient preparation uploads placeholder constants into these
+    // destinations before the resident numerator overwrites them at Quotient.
+    // Their declared lifetime must cover that real setup-time write; otherwise
+    // arena coloring may alias them with a retained direct-composition input
+    // that is still live and silently corrupt the first proof before replay.
+    let quotient_prepare_live = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Quotient)?;
     let sample_points = push_buffer_id(
         logical,
         None,
@@ -6482,7 +6503,7 @@ fn append_protocol_buffers(
         BufferPurpose::QuotientSamplePoints,
         0,
         quotient_requirements.sample_point_words,
-        quotient_live,
+        quotient_prepare_live,
     )?;
     let first_linear_terms = push_buffer_id(
         logical,
@@ -6491,7 +6512,7 @@ fn append_protocol_buffers(
         BufferPurpose::QuotientFirstLinearTerms,
         0,
         quotient_requirements.first_linear_term_words,
-        quotient_live,
+        quotient_prepare_live,
     )?;
     let partial_log_sizes = push_buffer_id(
         logical,
@@ -6575,7 +6596,7 @@ fn append_protocol_buffers(
     };
     let fri_scratch = BufferLifetime::at(ProofEpoch::Fri);
     let fri_live = BufferLifetime::new(ProofEpoch::Fri, ProofEpoch::Decommit)?;
-    let fri_descriptor = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?;
+    let fri_descriptor = cached_workspace;
     let evaluation_ping = push_buffer_id(
         logical,
         None,
@@ -7030,7 +7051,7 @@ fn append_protocol_buffers(
         transcript_output(protocol.oods.quotient_random_coefficient_output)?;
     let oods_live = BufferLifetime::at(ProofEpoch::Oods);
     let oods_sample_points_live = BufferLifetime::new(ProofEpoch::Oods, ProofEpoch::Quotient)?;
-    let oods_descriptor = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?;
+    let oods_descriptor = cached_workspace;
     let mut oods_slot = |purpose, ordinal, words, lifetime| {
         push_buffer_id(logical, None, None, purpose, ordinal, words, lifetime)
     };
@@ -7134,7 +7155,7 @@ fn append_protocol_buffers(
     };
 
     let numerator_live = BufferLifetime::at(ProofEpoch::Quotient);
-    let numerator_descriptor = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?;
+    let numerator_descriptor = cached_workspace;
     let mut numerator_slot =
         |purpose, words, lifetime| push_buffer_id(logical, None, None, purpose, 0, words, lifetime);
     let numerator_runtime_terms = numerator_slot(
@@ -7329,7 +7350,7 @@ fn append_decommit_buffers(
     )
     .map_err(ArenaPlanError::ProofBundle)?;
     let scratch = BufferLifetime::at(ProofEpoch::Decommit);
-    let descriptor = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Decommit)?;
+    let descriptor = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble)?;
     let assembly_live = BufferLifetime::new(ProofEpoch::Decommit, ProofEpoch::Assemble)?;
     let mut allocate = |purpose, ordinal, words, lifetime| {
         push_buffer_id(logical, None, None, purpose, ordinal, words, lifetime)
@@ -10302,8 +10323,12 @@ mod tests {
             direct_arena.logical_buffers()[both.logical.0 as usize]
                 .lifetime
                 .last,
-            ProofEpoch::Decommit,
-            "direct plus decommit intent must retain through decommit"
+            if first_direct.tree == CommitmentTreeId::Preprocessed {
+                ProofEpoch::Assemble
+            } else {
+                ProofEpoch::Decommit
+            },
+            "cached fixed outputs must persist; dynamic decommit outputs end at decommit"
         );
         let mut direct_only_protocol = direct_protocol.clone();
         direct_only_protocol
@@ -10330,8 +10355,12 @@ mod tests {
             direct_only_arena.logical_buffers()[direct_only.logical.0 as usize]
                 .lifetime
                 .last,
-            ProofEpoch::Composition,
-            "direct-only intent must end at composition"
+            if first_direct.tree == CommitmentTreeId::Preprocessed {
+                ProofEpoch::Assemble
+            } else {
+                ProofEpoch::Composition
+            },
+            "cached fixed outputs must persist; dynamic direct-only outputs end at composition"
         );
         let composition_commitment = direct_arena
             .commitment(CommitmentTreeId::Composition)
