@@ -51,9 +51,9 @@ pub use prepared_composition::{
     composition_workspace_requirements, composition_workspace_requirements_with_mode,
     default_composition_launch_mode, pack_composition_wide_groups, CompositionArenaSlotRequirement,
     CompositionCoefficientSource, CompositionDeviceInputs, CompositionExtParamBinding,
-    CompositionLaunchMode, CompositionTraceTopology, CompositionWideGroup,
-    CompositionWorkspaceRequirements, CompositionWorkspaceSlots, PreparedCompositionError,
-    PreparedCompositionGraph, COMPOSITION_POINTER_ALIGNMENT_WORDS,
+    CompositionLaunchMode, CompositionSourceRetention, CompositionTraceTopology,
+    CompositionWideGroup, CompositionWorkspaceRequirements, CompositionWorkspaceSlots,
+    PreparedCompositionError, PreparedCompositionGraph, COMPOSITION_POINTER_ALIGNMENT_WORDS,
     COMPOSITION_WIDE_SMALL_MAX_EVALUATION_LOG,
 };
 pub use prover::{

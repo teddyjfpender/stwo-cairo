@@ -16,8 +16,12 @@ use stwo::core::fields::m31::M31;
 use stwo_backend_cuda::{aot, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena};
 use stwo_backend_cuda_kernels::raw::{self, CudaSecureField};
 
+use crate::arena_plan::{CommitmentTreeId, OpenedColumnSource};
 use crate::composition_plan::{
     CompositionComponentPlan, CompositionExtParamSource, CompositionKernelPart, CompositionPlan,
+};
+use crate::direct_composition_retention::{
+    direct_composition_plan_key, DirectCompositionRetentionPlan,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -206,6 +210,24 @@ pub struct CompositionSourceRef {
     pub source: CompositionCoefficientSource,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositionSourceRetention {
+    pub consumer: usize,
+    pub plan_column: usize,
+    pub source: OpenedColumnSource,
+    pub tree: CommitmentTreeId,
+    pub proof_column: usize,
+    pub native_evaluation_log_size: u32,
+    pub direct: bool,
+    pub fallback_ordinal: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CompositionDirectEvaluationBinding {
+    pub plan_column: usize,
+    pub evaluation: ArenaSlice,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionComponentRequirements {
     pub component: &'static str,
@@ -214,6 +236,10 @@ pub struct CompositionComponentRequirements {
     pub evaluation_log_size: u32,
     pub row_count: usize,
     pub sources: Vec<CompositionSourceRef>,
+    /// Empty on the historical all-fallback path. When a retention plan is
+    /// supplied this is one-for-one with `sources`, in exact evaluator order.
+    pub source_retention: Vec<CompositionSourceRetention>,
+    pub fallback_count: usize,
     pub interaction_offsets: [u32; TRACE_TREES],
     pub denominator_words: usize,
     pub ext_param_words: usize,
@@ -238,6 +264,9 @@ struct ComponentDescriptorLayout {
     coefficient_pointers: usize,
     coefficient_sizes: usize,
     evaluation_pointers: usize,
+    fallback_coefficient_pointers: Option<usize>,
+    fallback_coefficient_sizes: Option<usize>,
+    fallback_evaluation_pointers: Option<usize>,
     interaction_offsets: usize,
     denominator_inverses: usize,
 }
@@ -257,6 +286,9 @@ pub struct CompositionWorkspaceRequirements {
     pub inverse_twiddle_words: usize,
     pub dynamic_ext_param_count: usize,
     pub claimed_sum_count: usize,
+    /// `None` preserves the historical descriptor bytes and launch topology.
+    pub direct_retention_plan_key: Option<u64>,
+    pub direct_retention_bitmap: Vec<u64>,
     /// The launch mode these requirements were computed for. `Wide` changes
     /// only `lde_tile_words`, per-component `lde_tile_offset_words`, and the
     /// scheduling metadata below; everything else is mode-independent.
@@ -437,6 +469,26 @@ pub enum PreparedCompositionError {
     InputAliasesWritableWorkspace(ArenaSlotId),
     ForwardInverseTwiddlesAlias(ArenaSlotId),
     RelationChallengeSourcesAlias(ArenaSlotId),
+    DirectRetentionBindingCount {
+        expected: usize,
+        actual: usize,
+    },
+    DirectRetentionPlanKeyDrift,
+    DirectRetentionPlanDrift(&'static str),
+    DirectEvaluationBindingCount {
+        expected: usize,
+        actual: usize,
+    },
+    MissingDirectEvaluation(usize),
+    UnexpectedDirectEvaluation(usize),
+    DuplicateDirectEvaluationColumn(usize),
+    InconsistentDuplicateDirectEvaluation {
+        first: usize,
+        second: usize,
+    },
+    DirectEvaluationAliasesWritableWorkspace(ArenaSlotId),
+    DirectEvaluationAliasesCoefficient(ArenaSlotId),
+    DirectEvaluationAliasesUnrelatedInput(ArenaSlotId),
     AlphaPowerOutOfRange {
         component: usize,
         power: u32,
@@ -512,6 +564,15 @@ pub fn composition_workspace_requirements_with_mode(
     plan: &CompositionPlan,
     trace: &CompositionTraceTopology,
     mode: CompositionLaunchMode,
+) -> Result<CompositionWorkspaceRequirements, PreparedCompositionError> {
+    composition_workspace_requirements_with_retention(plan, trace, mode, None)
+}
+
+pub(crate) fn composition_workspace_requirements_with_retention(
+    plan: &CompositionPlan,
+    trace: &CompositionTraceTopology,
+    mode: CompositionLaunchMode,
+    direct_retention: Option<&DirectCompositionRetentionPlan>,
 ) -> Result<CompositionWorkspaceRequirements, PreparedCompositionError> {
     if plan.components.is_empty() || plan.total_constraints == 0 {
         return Err(PreparedCompositionError::EmptyPlan);
@@ -615,6 +676,8 @@ pub fn composition_workspace_requirements_with_mode(
             evaluation_log_size: component.evaluation_log_size,
             row_count,
             sources,
+            source_retention: Vec::new(),
+            fallback_count: 0,
             interaction_offsets,
             denominator_words: expected_denominators,
             ext_param_words: component
@@ -629,8 +692,17 @@ pub fn composition_workspace_requirements_with_mode(
             lde_tile_offset_words: 0,
         });
     }
+    let (direct_retention_plan_key, direct_retention_bitmap) =
+        apply_direct_retention(&mut components, direct_retention)?;
     debug_assert_eq!(expected_random_offset, plan.total_constraints);
-    let (lde_tile_words, wide_groups, serial_components) = lde_tile_layout(mode, &mut components)?;
+    let (mut lde_tile_words, wide_groups, serial_components) =
+        lde_tile_layout(mode, &mut components)?;
+    // The arena cannot materialize or bind a zero-length logical slot. Keep
+    // one inert physical word in the all-direct case; semantic work remains
+    // exactly `fallback_count == 0`, so no LDE kernel is enqueued.
+    if direct_retention_plan_key.is_some() {
+        lde_tile_words = lde_tile_words.max(1);
+    }
 
     let mut descriptor = DescriptorAllocator::default();
     let zero_words = descriptor.take(SECURE_WORDS, SECURE_WORDS)?;
@@ -678,6 +750,29 @@ pub fn composition_workspace_requirements_with_mode(
             coefficient_sizes: descriptor.take(component.sources.len(), 1)?,
             evaluation_pointers: descriptor
                 .take(pointer_words, COMPOSITION_POINTER_ALIGNMENT_WORDS)?,
+            fallback_coefficient_pointers: direct_retention_plan_key
+                .map(|_| {
+                    component
+                        .fallback_count
+                        .checked_mul(POINTER_WORDS)
+                        .ok_or(PreparedCompositionError::SizeOverflow)
+                })
+                .transpose()?
+                .map(|words| descriptor.take(words, COMPOSITION_POINTER_ALIGNMENT_WORDS))
+                .transpose()?,
+            fallback_coefficient_sizes: direct_retention_plan_key
+                .map(|_| descriptor.take(component.fallback_count, 1))
+                .transpose()?,
+            fallback_evaluation_pointers: direct_retention_plan_key
+                .map(|_| {
+                    component
+                        .fallback_count
+                        .checked_mul(POINTER_WORDS)
+                        .ok_or(PreparedCompositionError::SizeOverflow)
+                })
+                .transpose()?
+                .map(|words| descriptor.take(words, COMPOSITION_POINTER_ALIGNMENT_WORDS))
+                .transpose()?,
             interaction_offsets: descriptor.take(TRACE_TREES, 1)?,
             denominator_inverses: descriptor.take(component.denominator_words, 1)?,
         });
@@ -699,6 +794,8 @@ pub fn composition_workspace_requirements_with_mode(
         inverse_twiddle_words: max_rows / 2,
         dynamic_ext_param_count,
         claimed_sum_count,
+        direct_retention_plan_key,
+        direct_retention_bitmap,
         mode,
         wide_groups,
         serial_components,
@@ -715,13 +812,200 @@ pub fn composition_workspace_requirements_with_mode(
     })
 }
 
+#[cfg(feature = "direct-retention-test-api")]
+#[doc(hidden)]
+pub fn composition_workspace_requirements_with_retention_for_test(
+    plan: &CompositionPlan,
+    trace: &CompositionTraceTopology,
+    mode: CompositionLaunchMode,
+    direct_retention: Option<&DirectCompositionRetentionPlan>,
+) -> Result<CompositionWorkspaceRequirements, PreparedCompositionError> {
+    composition_workspace_requirements_with_retention(plan, trace, mode, direct_retention)
+}
+
 fn component_lde_footprint_words(
     component: &CompositionComponentRequirements,
 ) -> Result<usize, PreparedCompositionError> {
     component
         .row_count
-        .checked_mul(component.sources.len())
+        .checked_mul(component.fallback_count)
         .ok_or(PreparedCompositionError::SizeOverflow)
+}
+
+fn apply_direct_retention(
+    components: &mut [CompositionComponentRequirements],
+    direct_retention: Option<&DirectCompositionRetentionPlan>,
+) -> Result<(Option<u64>, Vec<u64>), PreparedCompositionError> {
+    let Some(plan) = direct_retention else {
+        for component in components {
+            component.fallback_count = component.sources.len();
+        }
+        return Ok((None, Vec::new()));
+    };
+    if direct_composition_plan_key(plan) != plan.cache_key {
+        return Err(PreparedCompositionError::DirectRetentionPlanKeyDrift);
+    }
+    let expected_bindings = components.iter().try_fold(0usize, |count, component| {
+        count
+            .checked_add(component.sources.len())
+            .ok_or(PreparedCompositionError::SizeOverflow)
+    })?;
+    if plan.bindings.len() != expected_bindings {
+        return Err(PreparedCompositionError::DirectRetentionBindingCount {
+            expected: expected_bindings,
+            actual: plan.bindings.len(),
+        });
+    }
+    if plan.direct_bitmap.len() != expected_bindings.div_ceil(64) {
+        return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+            "bitmap word count",
+        ));
+    }
+    let used_tail_bits = expected_bindings % 64;
+    if used_tail_bits != 0
+        && plan
+            .direct_bitmap
+            .last()
+            .is_some_and(|word| word >> used_tail_bits != 0)
+    {
+        return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+            "bitmap tail bits",
+        ));
+    }
+
+    let mut consumer = 0usize;
+    let mut seen_columns =
+        Vec::<(CommitmentTreeId, usize, usize, OpenedColumnSource, u32, u32)>::new();
+    for component in components {
+        let mut fallback_ordinal = 0usize;
+        let mut retention = Vec::with_capacity(component.sources.len());
+        for source_ref in &component.sources {
+            let binding = plan.bindings.get(consumer).ok_or(
+                PreparedCompositionError::DirectRetentionPlanDrift("missing binding"),
+            )?;
+            if binding.consumer != consumer {
+                return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+                    "consumer order",
+                ));
+            }
+            if binding.consumer_evaluation_log_size != component.evaluation_log_size {
+                return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+                    "consumer evaluation log",
+                ));
+            }
+            let column = plan.columns.get(binding.column).ok_or(
+                PreparedCompositionError::DirectRetentionPlanDrift("column index"),
+            )?;
+            let tree = composition_tree(source_ref.tree)?;
+            if column.tree != tree {
+                return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+                    "source tree",
+                ));
+            }
+            if column.proof_column != source_ref.column {
+                return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+                    "proof column",
+                ));
+            }
+            if column.coefficient_log_size != source_ref.source.log_size {
+                return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+                    "coefficient log",
+                ));
+            }
+            // Tree/proof-column/log are the prepared engine's execution
+            // identity. Full OpenedColumnSource equality is established by
+            // the upstream phase-1 protocol planner and sealed plan key; this
+            // address-free topology deliberately does not duplicate it.
+            if source_tree(column.source)? != tree {
+                return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+                    "source identity tree",
+                ));
+            }
+            let expected_direct = column.evaluation_log_size == component.evaluation_log_size;
+            let bitmap_direct = (plan.direct_bitmap[consumer / 64] >> (consumer % 64)) & 1 != 0;
+            if binding.direct != expected_direct || bitmap_direct != binding.direct {
+                return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+                    "direct bitmap or native log",
+                ));
+            }
+            if let Some((_, _, plan_column, source, coefficient_log, evaluation_log)) =
+                seen_columns.iter().find(|(seen_tree, seen_column, ..)| {
+                    *seen_tree == tree && *seen_column == source_ref.column
+                })
+            {
+                if *plan_column != binding.column {
+                    return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+                        "logical source has multiple plan columns",
+                    ));
+                }
+                if *source != column.source
+                    || *coefficient_log != column.coefficient_log_size
+                    || *evaluation_log != column.evaluation_log_size
+                {
+                    return Err(PreparedCompositionError::DirectRetentionPlanDrift(
+                        "inconsistent duplicate source",
+                    ));
+                }
+            } else {
+                seen_columns.push((
+                    tree,
+                    source_ref.column,
+                    binding.column,
+                    column.source,
+                    column.coefficient_log_size,
+                    column.evaluation_log_size,
+                ));
+            }
+            let fallback = (!binding.direct).then_some(fallback_ordinal);
+            if fallback.is_some() {
+                fallback_ordinal = fallback_ordinal
+                    .checked_add(1)
+                    .ok_or(PreparedCompositionError::SizeOverflow)?;
+            }
+            retention.push(CompositionSourceRetention {
+                consumer,
+                plan_column: binding.column,
+                source: column.source,
+                tree,
+                proof_column: source_ref.column,
+                native_evaluation_log_size: column.evaluation_log_size,
+                direct: binding.direct,
+                fallback_ordinal: fallback,
+            });
+            consumer += 1;
+        }
+        component.source_retention = retention;
+        component.fallback_count = fallback_ordinal;
+    }
+    Ok((Some(plan.cache_key), plan.direct_bitmap.clone()))
+}
+
+fn composition_tree(tree: usize) -> Result<CommitmentTreeId, PreparedCompositionError> {
+    match tree {
+        0 => Ok(CommitmentTreeId::Preprocessed),
+        1 => Ok(CommitmentTreeId::Base),
+        2 => Ok(CommitmentTreeId::Interaction),
+        _ => Err(PreparedCompositionError::DirectRetentionPlanDrift(
+            "unsupported source tree",
+        )),
+    }
+}
+
+fn source_tree(source: OpenedColumnSource) -> Result<CommitmentTreeId, PreparedCompositionError> {
+    match source {
+        OpenedColumnSource::Preprocessed { .. } => Ok(CommitmentTreeId::Preprocessed),
+        OpenedColumnSource::Trace {
+            purpose: crate::arena_plan::BufferPurpose::BaseCoefficients,
+            ..
+        } => Ok(CommitmentTreeId::Base),
+        OpenedColumnSource::Trace {
+            purpose: crate::arena_plan::BufferPurpose::InteractionCoefficients,
+            ..
+        } => Ok(CommitmentTreeId::Interaction),
+        _ => Err(PreparedCompositionError::DirectRetentionPlanDrift(
+            "unsupported source identity",
+        )),
+    }
 }
 
 /// Size the shared LDE tile and (in wide mode) assign each small group its
@@ -979,9 +1263,10 @@ struct PreparedKernel {
 
 #[derive(Debug)]
 struct PreparedComponent {
-    coefficient_pointers: usize,
-    coefficient_sizes: usize,
     evaluation_pointers: usize,
+    fallback_coefficient_pointers: usize,
+    fallback_coefficient_sizes: usize,
+    fallback_evaluation_pointers: usize,
     interaction_offsets: usize,
     denominator_inverses: usize,
     ext_params: *const u32,
@@ -989,7 +1274,7 @@ struct PreparedComponent {
     trace_log_size: u32,
     evaluation_log_size: u32,
     row_count: u32,
-    column_count: u32,
+    fallback_count: u32,
     kernels: Vec<PreparedKernel>,
 }
 
@@ -1009,6 +1294,7 @@ pub struct PreparedCompositionGraph<'a> {
     relation_z: ArenaSlice,
     relation_alpha_powers: ArenaSlice,
     _claimed_sums: Vec<ArenaSlice>,
+    _direct_evaluations: Vec<ArenaSlice>,
     composition_coefficients: [ArenaSlice; SPLIT_COORDINATES],
     components: Vec<PreparedComponent>,
     /// Wide-mode fanout: `lane_components[lane]` holds component indices in
@@ -1048,7 +1334,47 @@ impl<'a> PreparedCompositionGraph<'a> {
         slots: &CompositionWorkspaceSlots,
         mode: CompositionLaunchMode,
     ) -> Result<Self, PreparedCompositionError> {
-        let requirements = composition_workspace_requirements_with_mode(plan, trace, mode)?;
+        Self::prepare_with_mode_and_retention(arena, plan, trace, inputs, slots, mode, None, &[])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "direct-retention-test-api")]
+    #[doc(hidden)]
+    pub fn prepare_with_mode_and_retention_for_test(
+        arena: &'a DeviceArena,
+        plan: &CompositionPlan,
+        trace: &CompositionTraceTopology,
+        inputs: &CompositionDeviceInputs,
+        slots: &CompositionWorkspaceSlots,
+        mode: CompositionLaunchMode,
+        direct_retention: Option<&DirectCompositionRetentionPlan>,
+        direct_evaluations: &[CompositionDirectEvaluationBinding],
+    ) -> Result<Self, PreparedCompositionError> {
+        Self::prepare_with_mode_and_retention(
+            arena,
+            plan,
+            trace,
+            inputs,
+            slots,
+            mode,
+            direct_retention,
+            direct_evaluations,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_with_mode_and_retention(
+        arena: &'a DeviceArena,
+        plan: &CompositionPlan,
+        trace: &CompositionTraceTopology,
+        inputs: &CompositionDeviceInputs,
+        slots: &CompositionWorkspaceSlots,
+        mode: CompositionLaunchMode,
+        direct_retention: Option<&DirectCompositionRetentionPlan>,
+        direct_evaluations: &[CompositionDirectEvaluationBinding],
+    ) -> Result<Self, PreparedCompositionError> {
+        let requirements =
+            composition_workspace_requirements_with_retention(plan, trace, mode, direct_retention)?;
         let lane_components = if requirements.wide_groups.is_empty() {
             Vec::new()
         } else {
@@ -1128,6 +1454,101 @@ impl<'a> PreparedCompositionGraph<'a> {
             .union(&ext_param_ids)
             .copied()
             .collect::<BTreeSet<_>>();
+        let direct_columns = requirements
+            .components
+            .iter()
+            .flat_map(|component| &component.source_retention)
+            .filter(|source| source.direct)
+            .map(|source| source.plan_column)
+            .collect::<BTreeSet<_>>();
+        let expected_direct_bindings = direct_columns.len();
+        if direct_evaluations.len() != expected_direct_bindings {
+            return Err(PreparedCompositionError::DirectEvaluationBindingCount {
+                expected: expected_direct_bindings,
+                actual: direct_evaluations.len(),
+            });
+        }
+        let canonical_column_count = direct_retention.map_or(0, |plan| plan.columns.len());
+        let mut direct_by_plan_column = vec![None; canonical_column_count];
+        let unrelated_readonly_ids = [
+            inputs.random_coefficient,
+            inputs.forward_twiddles.id(),
+            inputs.inverse_twiddles.id(),
+            inputs.relation_z.id(),
+            inputs.relation_alpha_powers.id(),
+        ]
+        .into_iter()
+        .chain(inputs.claimed_sums.iter().flatten().copied())
+        .collect::<BTreeSet<_>>();
+        let mut direct_by_slot = Vec::<(ArenaSlotId, CommitmentTreeId, usize, usize)>::new();
+        for (binding_index, binding) in direct_evaluations.iter().enumerate() {
+            if !direct_columns.contains(&binding.plan_column) {
+                return Err(PreparedCompositionError::UnexpectedDirectEvaluation(
+                    binding.plan_column,
+                ));
+            }
+            let destination = direct_by_plan_column.get_mut(binding.plan_column).ok_or(
+                PreparedCompositionError::UnexpectedDirectEvaluation(binding.plan_column),
+            )?;
+            if destination.is_some() {
+                return Err(PreparedCompositionError::DuplicateDirectEvaluationColumn(
+                    binding.plan_column,
+                ));
+            }
+            if !binding.evaluation.belongs_to(arena.context()) {
+                return Err(PreparedCompositionError::ContextMismatch(
+                    binding.evaluation.id(),
+                ));
+            }
+            if writable_ids.contains(&binding.evaluation.id()) {
+                return Err(
+                    PreparedCompositionError::DirectEvaluationAliasesWritableWorkspace(
+                        binding.evaluation.id(),
+                    ),
+                );
+            }
+            if unrelated_readonly_ids.contains(&binding.evaluation.id()) {
+                return Err(
+                    PreparedCompositionError::DirectEvaluationAliasesUnrelatedInput(
+                        binding.evaluation.id(),
+                    ),
+                );
+            }
+            let column = direct_retention
+                .and_then(|plan| plan.columns.get(binding.plan_column))
+                .ok_or(PreparedCompositionError::UnexpectedDirectEvaluation(
+                    binding.plan_column,
+                ))?;
+            let evaluation =
+                require_input_min(arena, binding.evaluation, pow2(column.evaluation_log_size)?)?;
+            if let Some((_, tree, proof_column, first)) = direct_by_slot
+                .iter()
+                .find(|(slot, ..)| *slot == evaluation.id())
+            {
+                if (*tree, *proof_column) != (column.tree, column.proof_column) {
+                    return Err(
+                        PreparedCompositionError::InconsistentDuplicateDirectEvaluation {
+                            first: *first,
+                            second: binding_index,
+                        },
+                    );
+                }
+            } else {
+                direct_by_slot.push((
+                    evaluation.id(),
+                    column.tree,
+                    column.proof_column,
+                    binding_index,
+                ));
+            }
+            *destination = Some(evaluation);
+        }
+        if let Some(&missing) = direct_columns
+            .iter()
+            .find(|&&column| direct_by_plan_column[column].is_none())
+        {
+            return Err(PreparedCompositionError::MissingDirectEvaluation(missing));
+        }
         for tree in &trace.trees {
             for source in tree {
                 if writable_ids.contains(&source.slot) {
@@ -1136,6 +1557,14 @@ impl<'a> PreparedCompositionGraph<'a> {
                     ));
                 }
                 let _ = bind_minimum(arena, source.slot, pow2(source.log_size)?)?;
+                if direct_evaluations
+                    .iter()
+                    .any(|binding| binding.evaluation.id() == source.slot)
+                {
+                    return Err(
+                        PreparedCompositionError::DirectEvaluationAliasesCoefficient(source.slot),
+                    );
+                }
             }
         }
         for input in [
@@ -1213,6 +1642,11 @@ impl<'a> PreparedCompositionGraph<'a> {
         let mut claimed_sums = Vec::with_capacity(requirements.claimed_sum_count);
         let mut dynamic_index = 0usize;
         let mut claimed_index = 0usize;
+        let direct_evaluation_slices = direct_by_plan_column
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
         for (
             component_index,
             ((((component_plan, component), descriptor), ext_binding), claimed_sum_binding),
@@ -1240,13 +1674,58 @@ impl<'a> PreparedCompositionGraph<'a> {
                 descriptor_words[descriptor.coefficient_sizes + source_index] =
                     u32::try_from(pow2(source_ref.source.log_size)?)
                         .map_err(|_| PreparedCompositionError::SizeOverflow)?;
-                let evaluation = unsafe {
-                    lde_tile.as_u32_ptr().add(
-                        source_index
-                            .checked_mul(row_count)
-                            .and_then(|words| words.checked_add(component.lde_tile_offset_words))
-                            .ok_or(PreparedCompositionError::SizeOverflow)?,
-                    )
+                let retention = component.source_retention.get(source_index);
+                let evaluation = match retention {
+                    None => unsafe {
+                        lde_tile.as_u32_ptr().add(
+                            source_index
+                                .checked_mul(row_count)
+                                .and_then(|words| {
+                                    words.checked_add(component.lde_tile_offset_words)
+                                })
+                                .ok_or(PreparedCompositionError::SizeOverflow)?,
+                        )
+                    },
+                    Some(retention) if retention.direct => {
+                        let evaluation = direct_by_plan_column[retention.plan_column]
+                            .expect("canonical direct bindings were validated");
+                        evaluation.as_u32_ptr()
+                    }
+                    Some(retention) => {
+                        let fallback = retention.fallback_ordinal.expect("fallback has ordinal");
+                        let evaluation = unsafe {
+                            lde_tile.as_u32_ptr().add(
+                                fallback
+                                    .checked_mul(row_count)
+                                    .and_then(|words| {
+                                        words.checked_add(component.lde_tile_offset_words)
+                                    })
+                                    .ok_or(PreparedCompositionError::SizeOverflow)?,
+                            )
+                        };
+                        write_pointer(
+                            &mut descriptor_words,
+                            descriptor
+                                .fallback_coefficient_pointers
+                                .expect("retention descriptors")
+                                + fallback * POINTER_WORDS,
+                            source.as_u32_ptr(),
+                        );
+                        descriptor_words[descriptor
+                            .fallback_coefficient_sizes
+                            .expect("retention descriptors")
+                            + fallback] = u32::try_from(pow2(source_ref.source.log_size)?)
+                            .map_err(|_| PreparedCompositionError::SizeOverflow)?;
+                        write_pointer(
+                            &mut descriptor_words,
+                            descriptor
+                                .fallback_evaluation_pointers
+                                .expect("retention descriptors")
+                                + fallback * POINTER_WORDS,
+                            evaluation,
+                        );
+                        evaluation
+                    }
                 };
                 write_pointer(
                     &mut descriptor_words,
@@ -1418,9 +1897,16 @@ impl<'a> PreparedCompositionGraph<'a> {
                 kernels.push(prepare_aot_kernel(component_index, kernel_index, kernel)?);
             }
             prepared_components.push(PreparedComponent {
-                coefficient_pointers: descriptor.coefficient_pointers,
-                coefficient_sizes: descriptor.coefficient_sizes,
                 evaluation_pointers: descriptor.evaluation_pointers,
+                fallback_coefficient_pointers: descriptor
+                    .fallback_coefficient_pointers
+                    .unwrap_or(descriptor.coefficient_pointers),
+                fallback_coefficient_sizes: descriptor
+                    .fallback_coefficient_sizes
+                    .unwrap_or(descriptor.coefficient_sizes),
+                fallback_evaluation_pointers: descriptor
+                    .fallback_evaluation_pointers
+                    .unwrap_or(descriptor.evaluation_pointers),
                 interaction_offsets: descriptor.interaction_offsets,
                 denominator_inverses: descriptor.denominator_inverses,
                 ext_params,
@@ -1429,7 +1915,7 @@ impl<'a> PreparedCompositionGraph<'a> {
                 evaluation_log_size: component.evaluation_log_size,
                 row_count: u32::try_from(component.row_count)
                     .map_err(|_| PreparedCompositionError::SizeOverflow)?,
-                column_count: u32::try_from(component.sources.len())
+                fallback_count: u32::try_from(component.fallback_count)
                     .map_err(|_| PreparedCompositionError::SizeOverflow)?,
                 kernels,
             });
@@ -1474,6 +1960,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             relation_z,
             relation_alpha_powers,
             _claimed_sums: claimed_sums,
+            _direct_evaluations: direct_evaluation_slices,
             composition_coefficients,
             components: prepared_components,
             lane_components,
@@ -1677,23 +2164,25 @@ impl<'a> PreparedCompositionGraph<'a> {
         let component = &self.components[component_index];
         let twiddle_words = u32::try_from(self.forward_twiddles.len_words())
             .map_err(|_| PreparedCompositionError::SizeOverflow)?;
-        check_status("composition_trace_lde", unsafe {
-            raw::stwo_lde_n2b_columns_on(
-                descriptor_ptr
-                    .add(component.coefficient_pointers)
-                    .cast::<*const u32>(),
-                descriptor_ptr.add(component.coefficient_sizes),
-                descriptor_ptr
-                    .add(component.evaluation_pointers)
-                    .cast::<*mut u32>(),
-                component.evaluation_log_size,
-                component.column_count,
-                self.forward_twiddles.as_u32_ptr(),
-                twiddle_words,
-                1u32 << (component.evaluation_log_size - 1),
-                stream,
-            )
-        })?;
+        if component.fallback_count != 0 {
+            check_status("composition_trace_lde", unsafe {
+                raw::stwo_lde_n2b_columns_on(
+                    descriptor_ptr
+                        .add(component.fallback_coefficient_pointers)
+                        .cast::<*const u32>(),
+                    descriptor_ptr.add(component.fallback_coefficient_sizes),
+                    descriptor_ptr
+                        .add(component.fallback_evaluation_pointers)
+                        .cast::<*mut u32>(),
+                    component.evaluation_log_size,
+                    component.fallback_count,
+                    self.forward_twiddles.as_u32_ptr(),
+                    twiddle_words,
+                    1u32 << (component.evaluation_log_size - 1),
+                    stream,
+                )
+            })?;
+        }
 
         let row_count = component.row_count as usize;
         let accumulator = unsafe {
@@ -1910,6 +2399,10 @@ mod tests {
     use stwo::core::pcs::TreeSubspan;
 
     use super::*;
+    use crate::arena_plan::{BufferLifetime, BufferPurpose, ProofEpoch};
+    use crate::direct_composition_retention::{
+        DirectCompositionBinding, DirectCompositionColumn, DirectCompositionRetentionPlan,
+    };
 
     fn kernel(rc_base: u32) -> CompositionKernelPart {
         CompositionKernelPart {
@@ -1980,6 +2473,326 @@ mod tests {
                 tree(300, &[4, 4, 5]),
             ],
         }
+    }
+
+    fn one_component_plan(preprocessed: Vec<usize>) -> CompositionPlan {
+        CompositionPlan {
+            max_kernel_instrs: 2048,
+            total_constraints: 2,
+            max_evaluation_log_size: 8,
+            components: vec![component("a", 5, 8, 2, 0, preprocessed, 1..4, 0..2)],
+        }
+    }
+
+    fn opened_source(tree: usize, column: usize) -> OpenedColumnSource {
+        match tree {
+            0 => OpenedColumnSource::Preprocessed {
+                ordinal: column as u32,
+            },
+            1 => OpenedColumnSource::Trace {
+                component: "test",
+                part: stwo_cairo_prover::witness::proof_shape::TracePartId::Main,
+                purpose: BufferPurpose::BaseCoefficients,
+                ordinal: column as u32,
+            },
+            2 => OpenedColumnSource::Trace {
+                component: "test",
+                part: stwo_cairo_prover::witness::proof_shape::TracePartId::Main,
+                purpose: BufferPurpose::InteractionCoefficients,
+                ordinal: column as u32,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    fn retention_plan(
+        requirements: &CompositionWorkspaceRequirements,
+        direct_consumers: &[usize],
+    ) -> DirectCompositionRetentionPlan {
+        let mut columns = Vec::<DirectCompositionColumn>::new();
+        let mut bindings = Vec::new();
+        let mut direct_bitmap = vec![
+            0u64;
+            requirements
+                .components
+                .iter()
+                .map(|component| component.sources.len())
+                .sum::<usize>()
+                .div_ceil(64)
+        ];
+        let mut consumer = 0usize;
+        for component in &requirements.components {
+            for source in &component.sources {
+                let tree = composition_tree(source.tree).unwrap();
+                let source_identity = opened_source(source.tree, source.column);
+                let column = columns
+                    .iter()
+                    .position(|column| column.tree == tree && column.proof_column == source.column)
+                    .unwrap_or_else(|| {
+                        let direct = direct_consumers.contains(&consumer);
+                        columns.push(DirectCompositionColumn {
+                            source: source_identity,
+                            tree,
+                            proof_column: source.column,
+                            group: 0,
+                            column_in_group: source.column,
+                            canonical_column: source.column,
+                            coefficient_log_size: source.source.log_size,
+                            evaluation_log_size: if direct {
+                                component.evaluation_log_size
+                            } else {
+                                source.source.log_size + 1
+                            },
+                            lifetime: BufferLifetime::new(
+                                match tree {
+                                    CommitmentTreeId::Preprocessed => ProofEpoch::Ingest,
+                                    CommitmentTreeId::Base => ProofEpoch::BaseCommit,
+                                    CommitmentTreeId::Interaction => ProofEpoch::InteractionCommit,
+                                    CommitmentTreeId::Composition | CommitmentTreeId::Fri(_) => {
+                                        unreachable!()
+                                    }
+                                },
+                                ProofEpoch::Composition,
+                            )
+                            .unwrap(),
+                        });
+                        columns.len() - 1
+                    });
+                let direct = columns[column].evaluation_log_size == component.evaluation_log_size;
+                if direct {
+                    direct_bitmap[consumer / 64] |= 1 << (consumer % 64);
+                }
+                bindings.push(DirectCompositionBinding {
+                    consumer,
+                    column,
+                    consumer_evaluation_log_size: component.evaluation_log_size,
+                    direct,
+                });
+                consumer += 1;
+            }
+        }
+        let mut plan = DirectCompositionRetentionPlan {
+            columns,
+            bindings,
+            direct_bitmap,
+            buckets: Vec::new(),
+            direct_column_count: 0,
+            direct_bytes: 0,
+            cache_key: 0,
+        };
+        plan.direct_column_count = plan
+            .bindings
+            .iter()
+            .filter(|binding| binding.direct)
+            .map(|binding| binding.column)
+            .collect::<BTreeSet<_>>()
+            .len();
+        plan.cache_key = direct_composition_plan_key(&plan);
+        plan
+    }
+
+    #[test]
+    fn direct_retention_all_fallback_mixed_and_all_direct_preserve_evaluator_order() {
+        for mode in [CompositionLaunchMode::Serial, CompositionLaunchMode::Wide] {
+            let plan = one_component_plan(vec![2, 0]);
+            let legacy =
+                composition_workspace_requirements_with_mode(&plan, &trace(), mode).unwrap();
+            let explicit_off =
+                composition_workspace_requirements_with_retention(&plan, &trace(), mode, None)
+                    .unwrap();
+            assert_eq!(legacy, explicit_off, "flags-off requirements must be exact");
+            assert_eq!(legacy.direct_retention_plan_key, None);
+            assert!(legacy.direct_retention_bitmap.is_empty());
+
+            let source_count = legacy.components[0].sources.len();
+            for direct_consumers in [
+                Vec::new(),
+                vec![0, 2, source_count - 1],
+                (0..source_count).collect::<Vec<_>>(),
+            ] {
+                let retention = retention_plan(&legacy, &direct_consumers);
+                let requirements = composition_workspace_requirements_with_retention(
+                    &plan,
+                    &trace(),
+                    mode,
+                    Some(&retention),
+                )
+                .unwrap();
+                let component = &requirements.components[0];
+                assert_eq!(component.source_retention.len(), source_count);
+                assert_eq!(
+                    component
+                        .source_retention
+                        .iter()
+                        .map(|retention| (retention.tree, retention.proof_column))
+                        .collect::<Vec<_>>(),
+                    component
+                        .sources
+                        .iter()
+                        .map(|source| (composition_tree(source.tree).unwrap(), source.column))
+                        .collect::<Vec<_>>()
+                );
+                let expected_fallbacks = source_count - direct_consumers.len();
+                assert_eq!(component.fallback_count, expected_fallbacks);
+                assert_eq!(
+                    component
+                        .source_retention
+                        .iter()
+                        .filter_map(|retention| retention.fallback_ordinal)
+                        .collect::<Vec<_>>(),
+                    (0..expected_fallbacks).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    requirements.lde_tile_words,
+                    (expected_fallbacks * (1usize << component.evaluation_log_size)).max(1)
+                );
+                assert_eq!(
+                    requirements.direct_retention_plan_key,
+                    Some(retention.cache_key)
+                );
+                assert_eq!(
+                    requirements.direct_retention_bitmap,
+                    retention.direct_bitmap
+                );
+                let expected_descriptor_delta = expected_fallbacks * (2 * POINTER_WORDS + 1)
+                    + (POINTER_WORDS - expected_fallbacks % POINTER_WORDS) % POINTER_WORDS;
+                assert_eq!(
+                    requirements.descriptor_words,
+                    legacy.descriptor_words + expected_descriptor_delta
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_retention_interleaving_and_duplicate_occurrences_are_sealed() {
+        let plan = one_component_plan(vec![0, 0, 2]);
+        let legacy = composition_workspace_requirements_with_mode(
+            &plan,
+            &trace(),
+            CompositionLaunchMode::Serial,
+        )
+        .unwrap();
+        let retention = retention_plan(&legacy, &[0, 1, 3, 6]);
+        assert_eq!(retention.bindings[0].column, retention.bindings[1].column);
+        let requirements = composition_workspace_requirements_with_retention(
+            &plan,
+            &trace(),
+            CompositionLaunchMode::Serial,
+            Some(&retention),
+        )
+        .unwrap();
+        let metadata = &requirements.components[0].source_retention;
+        assert_eq!(metadata[0].plan_column, metadata[1].plan_column);
+        assert!(metadata[0].direct && metadata[1].direct);
+        assert_eq!(
+            metadata
+                .iter()
+                .filter_map(|entry| entry.fallback_ordinal)
+                .collect::<Vec<_>>(),
+            (0..requirements.components[0].fallback_count).collect::<Vec<_>>()
+        );
+
+        let mut ambiguous = retention.clone();
+        ambiguous.columns.push(ambiguous.columns[0]);
+        ambiguous.bindings[1].column = ambiguous.columns.len() - 1;
+        ambiguous.cache_key = direct_composition_plan_key(&ambiguous);
+        assert_eq!(
+            composition_workspace_requirements_with_retention(
+                &plan,
+                &trace(),
+                CompositionLaunchMode::Serial,
+                Some(&ambiguous),
+            )
+            .unwrap_err(),
+            PreparedCompositionError::DirectRetentionPlanDrift(
+                "logical source has multiple plan columns"
+            )
+        );
+    }
+
+    #[test]
+    fn direct_retention_rejects_cache_bitmap_order_source_tree_proof_and_log_drift() {
+        let plan = one_component_plan(vec![2, 0]);
+        let legacy = composition_workspace_requirements(&plan, &trace()).unwrap();
+        let retention = retention_plan(&legacy, &[0, 2]);
+
+        let mut drift = retention.clone();
+        drift.cache_key ^= 1;
+        assert_eq!(
+            composition_workspace_requirements_with_retention(
+                &plan,
+                &trace(),
+                CompositionLaunchMode::Serial,
+                Some(&drift),
+            )
+            .unwrap_err(),
+            PreparedCompositionError::DirectRetentionPlanKeyDrift
+        );
+
+        let mut mutations: Vec<(&str, Box<dyn Fn(&mut DirectCompositionRetentionPlan)>)> = vec![
+            (
+                "consumer order",
+                Box::new(|plan| plan.bindings[0].consumer = 1),
+            ),
+            (
+                "direct bitmap or native log",
+                Box::new(|plan| plan.direct_bitmap[0] ^= 1),
+            ),
+            (
+                "source tree",
+                Box::new(|plan| plan.columns[0].tree = CommitmentTreeId::Base),
+            ),
+            (
+                "proof column",
+                Box::new(|plan| plan.columns[0].proof_column += 1),
+            ),
+            (
+                "coefficient log",
+                Box::new(|plan| plan.columns[0].coefficient_log_size += 1),
+            ),
+            (
+                "source identity tree",
+                Box::new(|plan| {
+                    plan.columns[0].source = OpenedColumnSource::Trace {
+                        component: "test",
+                        part: stwo_cairo_prover::witness::proof_shape::TracePartId::Main,
+                        purpose: BufferPurpose::BaseCoefficients,
+                        ordinal: 0,
+                    }
+                }),
+            ),
+        ];
+        for (expected, mutate) in mutations.drain(..) {
+            let mut drift = retention.clone();
+            mutate(&mut drift);
+            drift.cache_key = direct_composition_plan_key(&drift);
+            assert_eq!(
+                composition_workspace_requirements_with_retention(
+                    &plan,
+                    &trace(),
+                    CompositionLaunchMode::Serial,
+                    Some(&drift),
+                )
+                .unwrap_err(),
+                PreparedCompositionError::DirectRetentionPlanDrift(expected)
+            );
+        }
+
+        let mut tail_drift = retention.clone();
+        let occurrence_count = tail_drift.bindings.len();
+        tail_drift.direct_bitmap[occurrence_count / 64] |= 1 << (occurrence_count % 64);
+        tail_drift.cache_key = direct_composition_plan_key(&tail_drift);
+        assert_eq!(
+            composition_workspace_requirements_with_retention(
+                &plan,
+                &trace(),
+                CompositionLaunchMode::Serial,
+                Some(&tail_drift),
+            )
+            .unwrap_err(),
+            PreparedCompositionError::DirectRetentionPlanDrift("bitmap tail bits")
+        );
     }
 
     #[test]

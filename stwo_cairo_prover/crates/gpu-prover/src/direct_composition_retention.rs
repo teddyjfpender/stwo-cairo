@@ -661,6 +661,10 @@ fn plan_hash(plan: &DirectCompositionRetentionPlan) -> u64 {
     hash
 }
 
+pub fn direct_composition_plan_key(plan: &DirectCompositionRetentionPlan) -> u64 {
+    plan_hash(plan)
+}
+
 fn feed_column(hash: &mut u64, column: &DirectCompositionColumn) {
     feed_source(hash, column.source);
     feed_tree(hash, column.tree);
