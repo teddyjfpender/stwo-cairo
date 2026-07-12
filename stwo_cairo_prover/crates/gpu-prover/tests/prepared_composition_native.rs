@@ -731,7 +731,9 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
         &mixed_requirements,
         &slots,
         &[
-            (PREPROCESSED, 1 << TRACE_LOG_SIZE, 1),
+            // Oversize this pooled physical slot so the negative test below
+            // isolates coefficient aliasing instead of failing extent first.
+            (PREPROCESSED, 1 << EVALUATION_LOG_SIZE, 1),
             (BASE, 1 << TRACE_LOG_SIZE, 1),
             (INTERACTION_0, 1 << TRACE_LOG_SIZE, 1),
             (INTERACTION_1, 1 << TRACE_LOG_SIZE, 1),
