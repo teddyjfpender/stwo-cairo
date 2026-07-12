@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use cairo_vm::types::layout_name::LayoutName;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
-use stwo::prover::backend::simd::SimdBackend;
 use stwo_backend_cuda::{assemble_blake2s_stark_proof, Blake2sProofAssemblyInput};
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
@@ -33,8 +32,12 @@ use stwo_cairo_gpu_prover::graphs::GraphSegment;
 use stwo_cairo_gpu_prover::protocol_discovery::interaction_claim_from_flattened;
 use stwo_cairo_gpu_prover::resident_runtime::{ResidentGraphRuntime, ResidentRuntimeError};
 use stwo_cairo_gpu_prover::{GpuCairoProver, GpuProverConfig};
-use stwo_cairo_prover::prover::{prove_cairo, ChannelHash, ProverParameters};
+use stwo_cairo_prover::prover::{ChannelHash, ProverParameters};
 use stwo_cairo_serialize::CairoSerialize;
+
+#[path = "common/reference_cache.rs"]
+mod reference_cache;
+use reference_cache::{cached_reference_felts, serialize_felts};
 
 // Same fixture as the strict resident qualification gate: broad, capture-safe
 // opcode + Poseidon statement.
@@ -71,12 +74,9 @@ fn resident_params() -> ProverParameters {
     }
 }
 
-/// Verbatim copy of the reference cache helper from
-/// `tests/resident_parity_native.rs` — same `STWO_PARITY_REF_CACHE` directory,
-/// same `"{fixture}-{tag}-v1-{fnv-of-params-debug}.ref"` key. Called below with
-/// tag `"shared"` and identical params, so a smoke run POPULATES exactly the
-/// cache entry the qualification gate (`strict_resident_poseidon_graph_a_*`,
-/// `strict_resident_mirrored_transcript_*`) later reads, and vice versa.
+/// The shared reference-cache module uses the same hermetic key and validated
+/// payload for smoke and parity, so tag `"shared"` populates exactly the entry
+/// consumed by the qualification gate and vice versa.
 ///
 /// Deterministic SIMD reference proofs are expensive (~20 minutes of pod CPU
 /// per green round) and fixed for a given (fixture, params, input tag), so an
@@ -85,66 +85,6 @@ fn resident_params() -> ProverParameters {
 /// by construction, so the cache stays valid across the whole measurement
 /// campaign; delete the directory to force recomputation after any change
 /// that legitimately moves the reference.
-fn cached_reference_felts(
-    tag: &str,
-    input: ProverInput,
-    params: ProverParameters,
-) -> Vec<starknet_ff::FieldElement> {
-    const REFERENCE_SCHEMA: u32 = 1;
-    let cache_dir = std::env::var_os("STWO_PARITY_REF_CACHE").map(std::path::PathBuf::from);
-    let key_path = cache_dir.as_ref().map(|dir| {
-        dir.join(format!(
-            "{STRICT_RESIDENT_FIXTURE}-{tag}-v{REFERENCE_SCHEMA}-{:x}.ref",
-            {
-                // Stable fingerprint of the parameters that shape the proof.
-                let text = format!("{params:?}");
-                let mut hash = 0xcbf29ce484222325u64;
-                for byte in text.bytes() {
-                    hash ^= byte as u64;
-                    hash = hash.wrapping_mul(0x100000001b3);
-                }
-                hash
-            }
-        ))
-    });
-    if let Some(path) = &key_path {
-        if let Ok(bytes) = std::fs::read(path) {
-            if bytes.len() % 32 == 0 {
-                return bytes
-                    .chunks_exact(32)
-                    .map(|chunk| {
-                        starknet_ff::FieldElement::from_bytes_be(chunk.try_into().unwrap())
-                            .expect("cached reference felt")
-                    })
-                    .collect();
-            }
-        }
-    }
-    let felts =
-        serialize_felts(&prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input, params).unwrap());
-    if let Some(path) = &key_path {
-        let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let mut bytes = Vec::with_capacity(felts.len() * 32);
-        for felt in &felts {
-            bytes.extend_from_slice(&felt.to_bytes_be());
-        }
-        let staging = path.with_extension("ref.tmp");
-        if std::fs::write(&staging, &bytes).is_ok() {
-            let _ = std::fs::rename(&staging, path);
-        }
-    }
-    felts
-}
-
-fn serialize_felts<H>(proof: &cairo_air::CairoProof<H>) -> Vec<starknet_ff::FieldElement>
-where
-    H: stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted,
-    H::Hash: CairoSerialize,
-{
-    let mut felts = Vec::new();
-    CairoSerialize::serialize(proof, &mut felts);
-    felts
-}
 
 /// Diagnostic-mode sync: drain the workspace's single proof stream through an
 /// existing public seam. `read_commitment_root(Preprocessed)` enqueues one
@@ -358,7 +298,8 @@ fn smoke_single_resident_proof_boundary_stepped() {
     // Byte-oracle last: the resident proof above already surfaced any device
     // fault at its boundary, so the ~20-minute SIMD reference (or its cached
     // felts — see `cached_reference_felts`) only runs on a completed proof.
-    let expected = cached_reference_felts("shared", reference_input, params);
+    let expected =
+        cached_reference_felts(STRICT_RESIDENT_FIXTURE, "shared", reference_input, params);
     if expected != actual {
         report_section_offsets(&proof);
         report_divergence(&expected, &actual);
