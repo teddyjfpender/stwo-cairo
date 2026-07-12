@@ -19,31 +19,36 @@ use stwo_backend_cuda::{
     decommit_workspace_requirements, ec_op_workspace_requirements,
     execution_tables_workspace_requirements, fri_final_workspace_requirements,
     fri_workspace_requirements, oods_workspace_requirements,
-    quotient_numerator_workspace_requirements, quotient_workspace_requirements,
-    witness_input_compact_requirements, witness_input_gather_requirements,
-    witness_workspace_requirements, ArenaError, ArenaLayout, ArenaSlotId, ArenaSlotSpec,
-    Blake2sFriAssemblyShape, Blake2sPowWorkspaceRequirements, Blake2sPowWorkspaceSlots,
-    Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape, Blake2sTranscriptRequirements,
-    Blake2sTranscriptWorkspaceSlots, CommitBatchSlots, CommitGroupSlots, CommitWorkspaceConfig,
-    CommitWorkspaceRequirements, CommitWorkspaceSlots, CudaExecContext, DecommitColumnGeometry,
-    DecommitSourceMode, DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots,
-    DecommitWorkspaceConfig, DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena,
-    DeviceTranscriptError, EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
+    progressive_commit_workspace_requirements_for_mode, quotient_numerator_workspace_requirements,
+    quotient_workspace_requirements, witness_input_compact_requirements,
+    witness_input_gather_requirements, witness_workspace_requirements, ArenaError, ArenaLayout,
+    ArenaSlotId, ArenaSlotSpec, Blake2sFriAssemblyShape, Blake2sPowWorkspaceRequirements,
+    Blake2sPowWorkspaceSlots, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,
+    Blake2sTranscriptRequirements, Blake2sTranscriptWorkspaceSlots, CommitBatchRequirements,
+    CommitBatchSlots, CommitGroupSlots, CommitWorkspaceConfig, CommitWorkspaceSlots,
+    CudaExecContext, DecommitColumnGeometry, DecommitSourceMode, DecommitTreeGeometry,
+    DecommitTreeRequirements, DecommitTreeSlots, DecommitWorkspaceConfig,
+    DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena, DeviceTranscriptError,
+    EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
     ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
     FixedTableContiguousWorkspaceSlots, FriDecommitGeometry, FriDecommitSlots,
     FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriMerkleTreeSlots, FriWorkspaceConfig,
-    FriWorkspaceRequirements, FriWorkspaceSlots, InterpolationLaunchMode, OodsColumnTopology,
+    FriWorkspaceRequirements, FriWorkspaceSlots, InterpolationLaunchMode, MerkleFromLeavesSlots,
+    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, OodsColumnTopology,
     OodsWorkspaceConfig, OodsWorkspaceRequirements, OodsWorkspaceSlots, PreparedBlake2sPowError,
     PreparedCommitError, PreparedDecommitError, PreparedExecutionTablesError,
     PreparedFixedTableError, PreparedFriError, PreparedFriFinalError, PreparedOodsError,
-    PreparedQuotientError, PreparedQuotientNumeratorError, PreparedWitnessError,
-    PreparedWitnessFeedError, PreparedWitnessInputGatherError, QuotientNumeratorColumnTopology,
-    QuotientNumeratorSourceKind, QuotientNumeratorWorkspaceConfig,
-    QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
-    QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
-    RelationGraphError, RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots,
-    TraceDecommitGeometry, TraceDecommitSlots, TraceSourceGroupGeometry, TraceSourceGroupSlots,
-    TraceTreeRole, TranscriptInputId, TranscriptOutputId, WitnessFeedClearWorkspaceRequirements,
+    PreparedProgressiveCommitError, PreparedQuotientError, PreparedQuotientNumeratorError,
+    PreparedWitnessError, PreparedWitnessFeedError, PreparedWitnessInputGatherError,
+    ProgressiveBatchRequirements, ProgressiveBatchSlots, ProgressiveCommitGeometry,
+    ProgressiveCommitGroupGeometry, ProgressiveCommitMode, ProgressiveCommitWorkspaceSlots,
+    ProgressiveLeafWorkspaceSlots, QuotientNumeratorColumnTopology, QuotientNumeratorSourceKind,
+    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
+    QuotientNumeratorWorkspaceSlots, QuotientOodsSample, QuotientWorkspaceConfig,
+    QuotientWorkspaceRequirements, QuotientWorkspaceSlots, RelationGraphError,
+    RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots, TraceDecommitGeometry,
+    TraceDecommitSlots, TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRole,
+    TranscriptInputId, TranscriptOutputId, WitnessFeedClearWorkspaceRequirements,
     WitnessFeedClearWorkspaceSlots, WitnessFeedWorkspaceSlots, WitnessInputCompactLayout,
     WitnessInputCompactRequirements, WitnessInputCompactSlots, WitnessInputGatherEdge,
     WitnessInputGatherRequirements, WitnessInputGatherSlots, WitnessInputSeedRequirements,
@@ -254,6 +259,8 @@ pub enum BufferPurpose {
     QuotientInverseTwiddles,
     CommitLdeTile,
     MerkleLeafState,
+    CommitProgressiveStatePing,
+    CommitProgressiveStatePong,
     MerkleLayerScratch,
     CommitColumnPointers,
     CommitColumnLogSizes,
@@ -475,6 +482,48 @@ pub struct CommitmentGeometry {
     pub retained_evaluation_groups: Vec<bool>,
 }
 
+fn commitment_workspace_requirements(
+    mode: ProgressiveCommitMode,
+    commitment: &CommitmentGeometry,
+) -> Result<ModeAwareCommitWorkspaceRequirements, PreparedCommitError> {
+    match mode {
+        ProgressiveCommitMode::FullLifting => Ok(
+            ModeAwareCommitWorkspaceRequirements::FullLifting(commit_workspace_requirements(
+                commitment.config,
+                &commitment.grouped_column_log_sizes,
+            )?),
+        ),
+        ProgressiveCommitMode::DomainProgressive => {
+            let groups = commitment
+                .grouped_column_log_sizes
+                .iter()
+                .zip(&commitment.retained_evaluation_groups)
+                .map(
+                    |(logs, &retain_evaluations)| ProgressiveCommitGroupGeometry {
+                        coefficient_log_sizes: logs.clone(),
+                        retain_evaluations,
+                    },
+                )
+                .collect();
+            progressive_commit_workspace_requirements_for_mode(
+                mode,
+                commitment.config,
+                ProgressiveCommitGeometry {
+                    lifting_log_size: commitment.config.lifting_log_size,
+                    log_blowup_factor: commitment.config.log_blowup_factor,
+                    groups,
+                },
+            )
+            .map(ModeAwareCommitWorkspaceRequirements::DomainProgressive)
+            .map_err(|_| PreparedCommitError::SlotShapeMismatch {
+                role: "progressive_commit_geometry",
+                expected: 1,
+                actual: 0,
+            })
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum DecommitStrategy {
@@ -525,6 +574,7 @@ pub struct ProtocolIdentity {
     pub decommit_strategy: DecommitStrategy,
     pub interpolation_mode: InterpolationLaunchMode,
     pub quotient_numerator_source_policy: QuotientNumeratorSourcePolicy,
+    pub commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
 }
 
 impl ProtocolIdentity {
@@ -537,6 +587,7 @@ impl ProtocolIdentity {
         composition_plan_hash: u64,
         kernel_manifest_hash: u64,
         decommit_strategy: DecommitStrategy,
+        commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
     ) -> Self {
         Self {
             pow_bits: pcs.pow_bits,
@@ -552,6 +603,7 @@ impl ProtocolIdentity {
             decommit_strategy,
             interpolation_mode: InterpolationLaunchMode::from_env(),
             quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::from_env(),
+            commit_mode,
         }
     }
 }
@@ -1423,7 +1475,7 @@ impl ProtocolGeometry {
                 seen_sources.push(*source);
                 committed_opened_sources.push((*source).into());
             }
-            commit_workspace_requirements(commitment.config, &commitment.grouped_column_log_sizes)
+            commitment_workspace_requirements(self.identity.commit_mode, commitment)
                 .map_err(ArenaPlanError::Commit)?;
         }
         if committed_opened_sources.len() != self.oods.columns.len()
@@ -1495,7 +1547,7 @@ impl ProtocolGeometry {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
         };
-        feed(b"stwo-cairo-protocol-geometry-v7\0");
+        feed(b"stwo-cairo-protocol-geometry-v8\0");
         feed(&self.identity.pow_bits.to_le_bytes());
         feed(&self.identity.log_blowup_factor.to_le_bytes());
         feed(&self.identity.log_last_layer_degree_bound.to_le_bytes());
@@ -1508,6 +1560,7 @@ impl ProtocolGeometry {
         feed(&self.identity.kernel_manifest_hash.to_le_bytes());
         feed(&[self.identity.interpolation_mode as u8]);
         feed(&[self.identity.quotient_numerator_source_policy as u8]);
+        feed(&[self.identity.commit_mode as u8]);
         for identity in &self.preprocessed_column_ids {
             feed(&(identity.len() as u64).to_le_bytes());
             feed(identity.as_bytes());
@@ -1604,6 +1657,15 @@ impl ProtocolGeometry {
                         }
                     }
                 }
+            }
+            if self.identity.commit_mode == ProgressiveCommitMode::DomainProgressive {
+                let ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements) =
+                    commitment_workspace_requirements(self.identity.commit_mode, commitment)
+                        .expect("validated commitment geometry")
+                else {
+                    unreachable!();
+                };
+                feed(&requirements.leaves.plan.cache_key.to_le_bytes());
             }
         }
         feed(&(self.opened_tree_log_sizes.len() as u64).to_le_bytes());
@@ -1826,17 +1888,30 @@ struct LogicalCommitWorkspace {
     config: CommitWorkspaceConfig,
     grouped_column_log_sizes: Vec<Vec<u32>>,
     grouped_column_sources: Vec<Vec<CommitmentColumnSource>>,
-    requirements: CommitWorkspaceRequirements,
+    requirements: ModeAwareCommitWorkspaceRequirements,
     twiddles: LogicalBufferId,
-    lde_tile: LogicalBufferId,
     leaf_state: LogicalBufferId,
     merkle_scratch: Option<LogicalBufferId>,
     retained_layers: Vec<LogicalBufferId>,
     tail_level_ptrs: Option<LogicalBufferId>,
     tail_outputs: Vec<LogicalBufferId>,
     retained_evaluations: Vec<Option<Vec<LogicalBufferId>>>,
-    groups: Vec<LogicalCommitGroupSlots>,
+    leaf_workspace: LogicalCommitLeafWorkspace,
     interpolation_batches: Vec<LogicalInterpolationBatch>,
+}
+
+#[derive(Clone, Debug)]
+enum LogicalCommitLeafWorkspace {
+    FullLifting {
+        lde_tile: LogicalBufferId,
+        groups: Vec<LogicalCommitGroupSlots>,
+    },
+    DomainProgressive {
+        lde_scratch: Option<LogicalBufferId>,
+        state_ping: LogicalBufferId,
+        state_pong: Option<LogicalBufferId>,
+        batches: Vec<LogicalCommitBatchSlots>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1859,6 +1934,77 @@ struct LogicalCommitBatchSlots {
     coefficient_ptrs: LogicalBufferId,
     coefficient_sizes: LogicalBufferId,
     output_ptrs: LogicalBufferId,
+}
+
+fn allocate_commit_batch(
+    logical: &mut Vec<LogicalBuffer>,
+    ordinal: &mut impl FnMut() -> Result<u32, ArenaPlanError>,
+    batch: &CommitBatchRequirements,
+    lifetime: BufferLifetime,
+) -> Result<LogicalCommitBatchSlots, ArenaPlanError> {
+    allocate_commit_batch_words(
+        logical,
+        ordinal,
+        batch.coefficient_pointer_words,
+        batch.coefficient_size_words,
+        batch.output_pointer_words,
+        lifetime,
+    )
+}
+
+fn allocate_progressive_commit_batch(
+    logical: &mut Vec<LogicalBuffer>,
+    ordinal: &mut impl FnMut() -> Result<u32, ArenaPlanError>,
+    batch: &ProgressiveBatchRequirements,
+    lifetime: BufferLifetime,
+) -> Result<LogicalCommitBatchSlots, ArenaPlanError> {
+    allocate_commit_batch_words(
+        logical,
+        ordinal,
+        batch.coefficient_pointer_words,
+        batch.coefficient_size_words,
+        batch.output_pointer_words,
+        lifetime,
+    )
+}
+
+fn allocate_commit_batch_words(
+    logical: &mut Vec<LogicalBuffer>,
+    ordinal: &mut impl FnMut() -> Result<u32, ArenaPlanError>,
+    coefficient_pointer_words: usize,
+    coefficient_size_words: usize,
+    output_pointer_words: usize,
+    lifetime: BufferLifetime,
+) -> Result<LogicalCommitBatchSlots, ArenaPlanError> {
+    Ok(LogicalCommitBatchSlots {
+        coefficient_ptrs: push_buffer_id(
+            logical,
+            None,
+            None,
+            BufferPurpose::CommitCoefficientPointers,
+            ordinal()?,
+            coefficient_pointer_words,
+            lifetime,
+        )?,
+        coefficient_sizes: push_buffer_id(
+            logical,
+            None,
+            None,
+            BufferPurpose::CommitCoefficientSizes,
+            ordinal()?,
+            coefficient_size_words,
+            lifetime,
+        )?,
+        output_ptrs: push_buffer_id(
+            logical,
+            None,
+            None,
+            BufferPurpose::CommitOutputPointers,
+            ordinal()?,
+            output_pointer_words,
+            lifetime,
+        )?,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -2432,9 +2578,9 @@ pub struct PlannedCommitment {
     pub config: CommitWorkspaceConfig,
     pub grouped_column_log_sizes: Vec<Vec<u32>>,
     pub grouped_column_sources: Vec<Vec<CommitmentColumnSource>>,
-    pub requirements: CommitWorkspaceRequirements,
+    pub requirements: ModeAwareCommitWorkspaceRequirements,
     pub twiddles: ArenaBinding,
-    pub slots: CommitWorkspaceSlots,
+    pub slots: ModeAwareCommitWorkspaceSlots,
     pub retained_evaluation_groups: Vec<Option<Vec<ArenaBinding>>>,
     /// Exact root and retained decommit layers, bound independently of the
     /// ephemeral `PreparedCommitGraph` value used for the cold fixed commit.
@@ -3099,6 +3245,7 @@ pub enum ArenaPlanError {
         second: LogicalBufferId,
     },
     Commit(PreparedCommitError),
+    ProgressiveCommit(PreparedProgressiveCommitError),
     Composition(PreparedCompositionError),
     Oods(PreparedOodsError),
     QuotientNumerator(PreparedQuotientNumeratorError),
@@ -5239,7 +5386,6 @@ fn append_transcript_buffers(
 
 fn interpolation_batch_geometry(
     geometry: &CommitmentGeometry,
-    requirements: &CommitWorkspaceRequirements,
     mode: InterpolationLaunchMode,
 ) -> Result<Vec<(u32, Vec<CommitmentColumnSource>)>, ArenaPlanError> {
     if !matches!(
@@ -5251,31 +5397,19 @@ fn interpolation_batch_geometry(
     match mode {
         InterpolationLaunchMode::StageWiseCopyThenInPlace => {
             let mut output = Vec::new();
-            for ((sources, logs), group) in geometry
+            for (sources, logs) in geometry
                 .grouped_column_sources
                 .iter()
                 .zip(&geometry.grouped_column_log_sizes)
-                .zip(&requirements.groups)
             {
-                for batch in &group.batches {
-                    let end = batch
-                        .first_column
-                        .checked_add(batch.column_count)
-                        .ok_or(ArenaPlanError::SizeOverflow)?;
-                    let selected = sources
-                        .get(batch.first_column..end)
-                        .ok_or(ArenaPlanError::InvalidProtocolGeometry(
-                            "interpolation batch exceeds commitment group",
-                        ))?
-                        .to_vec();
-                    if logs.get(batch.first_column..end).is_none_or(|logs| {
-                        logs.iter().any(|&log| log != batch.coefficient_log_size)
-                    }) {
-                        return Err(ArenaPlanError::InvalidProtocolGeometry(
-                            "interpolation batch mixes coefficient logs",
-                        ));
+                let mut start = 0usize;
+                while start < logs.len() {
+                    let mut end = start + 1;
+                    while end < logs.len() && logs[end] == logs[start] {
+                        end += 1;
                     }
-                    output.push((batch.coefficient_log_size, selected));
+                    output.push((logs[start], sources[start..end].to_vec()));
+                    start = end;
                 }
             }
             Ok(output)
@@ -5385,7 +5519,7 @@ fn append_protocol_buffers(
         .commitments
         .iter()
         .map(|commitment| {
-            commit_workspace_requirements(commitment.config, &commitment.grouped_column_log_sizes)
+            commitment_workspace_requirements(protocol.identity.commit_mode, commitment)
                 .map_err(ArenaPlanError::Commit)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -5417,7 +5551,14 @@ fn append_protocol_buffers(
             .map_err(ArenaPlanError::Composition)?;
     let max_commitment_twiddle_words = commit_requirements
         .iter()
-        .map(|requirements| requirements.twiddle_words)
+        .map(|requirements| match requirements {
+            ModeAwareCommitWorkspaceRequirements::FullLifting(requirements) => {
+                requirements.twiddle_words
+            }
+            ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements) => {
+                requirements.leaves.twiddle_words
+            }
+        })
         .max()
         .ok_or(ArenaPlanError::InvalidProtocolGeometry(
             "proof has no commitment workspace",
@@ -5583,30 +5724,42 @@ fn append_protocol_buffers(
                 .checked_add(local)
                 .ok_or(ArenaPlanError::SizeOverflow)
         };
-        let lde_tile = push_buffer_id(
-            logical,
-            None,
-            None,
-            BufferPurpose::CommitLdeTile,
-            ordinal()?,
-            requirements.lde_tile_words,
-            at,
-        )?;
+        let (
+            leaf_words,
+            merkle_scratch_words,
+            retained_layer_requirements,
+            tail_pointer_words,
+            tail_output_requirements,
+        ) = match &requirements {
+            ModeAwareCommitWorkspaceRequirements::FullLifting(requirements) => (
+                requirements.leaf_state_words,
+                requirements.merkle_scratch_words,
+                requirements.retained_layers.as_slice(),
+                requirements.tail_pointer_words,
+                requirements.tail_outputs.as_slice(),
+            ),
+            ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements) => (
+                requirements.merkle.leaf_words,
+                requirements.merkle.merkle_scratch_words,
+                requirements.merkle.retained_layers.as_slice(),
+                requirements.merkle.tail_pointer_words,
+                requirements.merkle.tail_outputs.as_slice(),
+            ),
+        };
         let leaf_state = push_buffer_id(
             logical,
             None,
             None,
             BufferPurpose::MerkleLeafState,
             ordinal()?,
-            requirements.leaf_state_words,
+            leaf_words,
             if geometry.config.unretained_bottom_layers == 0 {
                 retained
             } else {
                 at
             },
         )?;
-        let merkle_scratch = requirements
-            .merkle_scratch_words
+        let merkle_scratch = merkle_scratch_words
             .map(|words| {
                 push_buffer_id(
                     logical,
@@ -5619,8 +5772,7 @@ fn append_protocol_buffers(
                 )
             })
             .transpose()?;
-        let retained_layers = requirements
-            .retained_layers
+        let retained_layers = retained_layer_requirements
             .iter()
             .map(|layer| {
                 push_buffer_id(
@@ -5634,8 +5786,7 @@ fn append_protocol_buffers(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let tail_level_ptrs = requirements
-            .tail_pointer_words
+        let tail_level_ptrs = tail_pointer_words
             .map(|words| {
                 push_buffer_id(
                     logical,
@@ -5648,8 +5799,7 @@ fn append_protocol_buffers(
                 )
             })
             .transpose()?;
-        let tail_outputs = requirements
-            .tail_outputs
+        let tail_outputs = tail_output_requirements
             .iter()
             .map(|layer| {
                 push_buffer_id(
@@ -5694,105 +5844,145 @@ fn append_protocol_buffers(
                 .transpose()
             })
             .collect::<Result<Vec<_>, ArenaPlanError>>()?;
-        let groups = requirements
-            .groups
-            .iter()
-            .map(|group| {
-                let column_ptrs = push_buffer_id(
+        let leaf_workspace = match &requirements {
+            ModeAwareCommitWorkspaceRequirements::FullLifting(requirements) => {
+                let lde_tile = push_buffer_id(
                     logical,
                     None,
                     None,
-                    BufferPurpose::CommitColumnPointers,
+                    BufferPurpose::CommitLdeTile,
                     ordinal()?,
-                    group.column_pointer_words,
-                    descriptor,
+                    requirements.lde_tile_words,
+                    at,
                 )?;
-                let column_log_sizes = push_buffer_id(
-                    logical,
-                    None,
-                    None,
-                    BufferPurpose::CommitColumnLogSizes,
-                    ordinal()?,
-                    group.column_log_size_words,
-                    descriptor,
-                )?;
-                let batches = group
-                    .batches
+                let groups = requirements
+                    .groups
                     .iter()
-                    .map(|batch| {
-                        Ok(LogicalCommitBatchSlots {
-                            coefficient_ptrs: push_buffer_id(
-                                logical,
-                                None,
-                                None,
-                                BufferPurpose::CommitCoefficientPointers,
-                                ordinal()?,
-                                batch.coefficient_pointer_words,
-                                descriptor,
-                            )?,
-                            coefficient_sizes: push_buffer_id(
-                                logical,
-                                None,
-                                None,
-                                BufferPurpose::CommitCoefficientSizes,
-                                ordinal()?,
-                                batch.coefficient_size_words,
-                                descriptor,
-                            )?,
-                            output_ptrs: push_buffer_id(
-                                logical,
-                                None,
-                                None,
-                                BufferPurpose::CommitOutputPointers,
-                                ordinal()?,
-                                batch.output_pointer_words,
-                                descriptor,
-                            )?,
+                    .map(|group| {
+                        let column_ptrs = push_buffer_id(
+                            logical,
+                            None,
+                            None,
+                            BufferPurpose::CommitColumnPointers,
+                            ordinal()?,
+                            group.column_pointer_words,
+                            descriptor,
+                        )?;
+                        let column_log_sizes = push_buffer_id(
+                            logical,
+                            None,
+                            None,
+                            BufferPurpose::CommitColumnLogSizes,
+                            ordinal()?,
+                            group.column_log_size_words,
+                            descriptor,
+                        )?;
+                        let batches = group
+                            .batches
+                            .iter()
+                            .map(|batch| {
+                                allocate_commit_batch(logical, &mut ordinal, batch, descriptor)
+                            })
+                            .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+                        Ok(LogicalCommitGroupSlots {
+                            column_ptrs,
+                            column_log_sizes,
+                            batches,
                         })
                     })
                     .collect::<Result<Vec<_>, ArenaPlanError>>()?;
-                Ok(LogicalCommitGroupSlots {
-                    column_ptrs,
-                    column_log_sizes,
+                LogicalCommitLeafWorkspace::FullLifting { lde_tile, groups }
+            }
+            ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements) => {
+                let lde_scratch = requirements
+                    .leaves
+                    .lde_scratch_words
+                    .map(|words| {
+                        push_buffer_id(
+                            logical,
+                            None,
+                            None,
+                            BufferPurpose::CommitLdeTile,
+                            ordinal()?,
+                            words,
+                            at,
+                        )
+                    })
+                    .transpose()?;
+                let state_ping = push_buffer_id(
+                    logical,
+                    None,
+                    None,
+                    BufferPurpose::CommitProgressiveStatePing,
+                    ordinal()?,
+                    requirements.leaves.state_ping_words,
+                    at,
+                )?;
+                let state_pong = requirements
+                    .leaves
+                    .state_pong_words
+                    .map(|words| {
+                        push_buffer_id(
+                            logical,
+                            None,
+                            None,
+                            BufferPurpose::CommitProgressiveStatePong,
+                            ordinal()?,
+                            words,
+                            at,
+                        )
+                    })
+                    .transpose()?;
+                let batches = requirements
+                    .leaves
+                    .batches
+                    .iter()
+                    .map(|batch| {
+                        allocate_progressive_commit_batch(logical, &mut ordinal, batch, descriptor)
+                    })
+                    .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+                LogicalCommitLeafWorkspace::DomainProgressive {
+                    lde_scratch,
+                    state_ping,
+                    state_pong,
                     batches,
+                }
+            }
+        };
+        let interpolation_batches =
+            interpolation_batch_geometry(geometry, protocol.identity.interpolation_mode)?
+                .into_iter()
+                .map(|(log_size, sources)| {
+                    let pointer_words = sources
+                        .len()
+                        .checked_mul(
+                            core::mem::size_of::<usize>().div_ceil(core::mem::size_of::<u32>()),
+                        )
+                        .ok_or(ArenaPlanError::SizeOverflow)?;
+                    Ok(LogicalInterpolationBatch {
+                        log_size,
+                        sources,
+                        input_pointers: push_buffer_id(
+                            logical,
+                            None,
+                            None,
+                            BufferPurpose::InterpolationInputPointers,
+                            ordinal()?,
+                            pointer_words,
+                            descriptor,
+                        )?,
+                        output_pointers: push_buffer_id(
+                            logical,
+                            None,
+                            None,
+                            BufferPurpose::InterpolationOutputPointers,
+                            ordinal()?,
+                            pointer_words,
+                            descriptor,
+                        )?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, ArenaPlanError>>()?;
-        let interpolation_batches = interpolation_batch_geometry(
-            geometry,
-            &requirements,
-            protocol.identity.interpolation_mode,
-        )?
-        .into_iter()
-        .map(|(log_size, sources)| {
-            let pointer_words = sources
-                .len()
-                .checked_mul(core::mem::size_of::<usize>().div_ceil(core::mem::size_of::<u32>()))
-                .ok_or(ArenaPlanError::SizeOverflow)?;
-            Ok(LogicalInterpolationBatch {
-                log_size,
-                sources,
-                input_pointers: push_buffer_id(
-                    logical,
-                    None,
-                    None,
-                    BufferPurpose::InterpolationInputPointers,
-                    ordinal()?,
-                    pointer_words,
-                    descriptor,
-                )?,
-                output_pointers: push_buffer_id(
-                    logical,
-                    None,
-                    None,
-                    BufferPurpose::InterpolationOutputPointers,
-                    ordinal()?,
-                    pointer_words,
-                    descriptor,
-                )?,
-            })
-        })
-        .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+                .collect::<Result<Vec<_>, ArenaPlanError>>()?;
         logical_commitments.push(LogicalCommitWorkspace {
             id: geometry.id,
             interpolation_mode: protocol.identity.interpolation_mode,
@@ -5801,14 +5991,13 @@ fn append_protocol_buffers(
             grouped_column_sources: geometry.grouped_column_sources.clone(),
             requirements,
             twiddles: forward_twiddles,
-            lde_tile,
             leaf_state,
             merkle_scratch,
             retained_layers,
             tail_level_ptrs,
             tail_outputs,
             retained_evaluations,
-            groups,
+            leaf_workspace,
             interpolation_batches,
         });
     }
@@ -6908,33 +7097,28 @@ fn find_binding(
         .ok_or(ArenaPlanError::MissingBinding(id))
 }
 
+fn resolve_commit_batches(
+    batches: Vec<LogicalCommitBatchSlots>,
+    physical: &impl Fn(LogicalBufferId) -> Result<ArenaSlotId, ArenaPlanError>,
+) -> Result<Vec<CommitBatchSlots>, ArenaPlanError> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            Ok(CommitBatchSlots {
+                coefficient_ptrs: physical(batch.coefficient_ptrs)?,
+                coefficient_sizes: physical(batch.coefficient_sizes)?,
+                output_ptrs: physical(batch.output_ptrs)?,
+            })
+        })
+        .collect()
+}
+
 fn resolve_commitment_slots(
     logical: LogicalCommitWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedCommitment, ArenaPlanError> {
     let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
-    let groups = logical
-        .groups
-        .into_iter()
-        .map(|group| {
-            Ok(CommitGroupSlots {
-                column_ptrs: physical(group.column_ptrs)?,
-                column_log_sizes: physical(group.column_log_sizes)?,
-                batches: group
-                    .batches
-                    .into_iter()
-                    .map(|batch| {
-                        Ok(CommitBatchSlots {
-                            coefficient_ptrs: physical(batch.coefficient_ptrs)?,
-                            coefficient_sizes: physical(batch.coefficient_sizes)?,
-                            output_ptrs: physical(batch.output_ptrs)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, ArenaPlanError>>()?,
-            })
-        })
-        .collect::<Result<Vec<_>, ArenaPlanError>>()?;
     let leaf_state = binding(logical.leaf_state)?;
     let retained_layers = logical
         .retained_layers
@@ -6984,9 +7168,8 @@ fn resolve_commitment_slots(
             "commitment root binding is not one Blake2s hash",
         ));
     }
-    let slots = CommitWorkspaceSlots {
-        lde_tile: physical(logical.lde_tile)?,
-        leaf_state: leaf_state.physical,
+    let merkle_slots = MerkleFromLeavesSlots {
+        leaves: leaf_state.physical,
         merkle_scratch: logical.merkle_scratch.map(physical).transpose()?,
         retained_layers: retained_layers
             .iter()
@@ -6997,12 +7180,56 @@ fn resolve_commitment_slots(
             .iter()
             .map(|binding| binding.physical)
             .collect(),
-        groups,
+    };
+    let slots = match logical.leaf_workspace {
+        LogicalCommitLeafWorkspace::FullLifting { lde_tile, groups } => {
+            let groups = groups
+                .into_iter()
+                .map(|group| {
+                    Ok(CommitGroupSlots {
+                        column_ptrs: physical(group.column_ptrs)?,
+                        column_log_sizes: physical(group.column_log_sizes)?,
+                        batches: resolve_commit_batches(group.batches, &physical)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+            ModeAwareCommitWorkspaceSlots::FullLifting(CommitWorkspaceSlots {
+                lde_tile: physical(lde_tile)?,
+                leaf_state: merkle_slots.leaves,
+                merkle_scratch: merkle_slots.merkle_scratch,
+                retained_layers: merkle_slots.retained_layers.clone(),
+                tail_level_ptrs: merkle_slots.tail_level_ptrs,
+                tail_outputs: merkle_slots.tail_outputs.clone(),
+                groups,
+            })
+        }
+        LogicalCommitLeafWorkspace::DomainProgressive {
+            lde_scratch,
+            state_ping,
+            state_pong,
+            batches,
+        } => ModeAwareCommitWorkspaceSlots::DomainProgressive(ProgressiveCommitWorkspaceSlots {
+            leaves: ProgressiveLeafWorkspaceSlots {
+                lde_scratch: lde_scratch.map(physical).transpose()?,
+                state_ping: physical(state_ping)?,
+                state_pong: state_pong.map(physical).transpose()?,
+                leaf_hashes: merkle_slots.leaves,
+                batches: resolve_commit_batches(batches, &physical)?
+                    .into_iter()
+                    .map(|batch| ProgressiveBatchSlots {
+                        coefficient_ptrs: batch.coefficient_ptrs,
+                        coefficient_sizes: batch.coefficient_sizes,
+                        output_ptrs: batch.output_ptrs,
+                    })
+                    .collect(),
+            },
+            merkle: merkle_slots,
+        }),
     };
     logical
         .requirements
         .arena_slot_requirements(&slots)
-        .map_err(ArenaPlanError::Commit)?;
+        .map_err(ArenaPlanError::ProgressiveCommit)?;
     Ok(PlannedCommitment {
         id: logical.id,
         config: logical.config,
@@ -8919,6 +9146,7 @@ mod tests {
                 decommit_strategy: DecommitStrategy::RecomputeQueriedLde,
                 interpolation_mode: InterpolationLaunchMode::StageWiseCopyThenInPlace,
                 quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::CoefficientsOnly,
+                commit_mode: ProgressiveCommitMode::FullLifting,
             },
             preprocessed_column_ids: vec![
                 "test_preprocessed".to_owned(),
@@ -9091,6 +9319,69 @@ mod tests {
         let arena = ProofArenaPlan::build(&proof, &protocol, &composition).unwrap();
         arena.validate_aliases().unwrap();
         assert_eq!(arena.protocol_key, protocol.key());
+
+        let mut progressive = protocol.clone();
+        progressive.identity.commit_mode = ProgressiveCommitMode::DomainProgressive;
+        assert_ne!(protocol.key(), progressive.key());
+        let progressive_arena = ProofArenaPlan::build(&proof, &progressive, &composition).unwrap();
+        progressive_arena.validate_aliases().unwrap();
+        assert_ne!(arena.protocol_key, progressive_arena.protocol_key);
+        assert!(arena.commitments().iter().all(|commitment| matches!(
+            (&commitment.requirements, &commitment.slots),
+            (
+                ModeAwareCommitWorkspaceRequirements::FullLifting(_),
+                ModeAwareCommitWorkspaceSlots::FullLifting(_)
+            )
+        )));
+        assert_eq!(
+            arena
+                .logical_buffers()
+                .iter()
+                .filter(|buffer| matches!(
+                    buffer.purpose,
+                    BufferPurpose::CommitProgressiveStatePing
+                        | BufferPurpose::CommitProgressiveStatePong
+                ))
+                .count(),
+            0,
+            "flags-off arena must not allocate progressive-only workspace"
+        );
+        assert!(progressive_arena
+            .commitments()
+            .iter()
+            .all(|commitment| matches!(
+                (&commitment.requirements, &commitment.slots),
+                (
+                    ModeAwareCommitWorkspaceRequirements::DomainProgressive(_),
+                    ModeAwareCommitWorkspaceSlots::DomainProgressive(_)
+                )
+            )));
+        assert_eq!(
+            progressive_arena
+                .logical_buffers()
+                .iter()
+                .filter(|buffer| buffer.purpose == BufferPurpose::CommitColumnPointers)
+                .count(),
+            0,
+            "progressive arena must not allocate legacy leaf pointer groups"
+        );
+        assert!(progressive_arena
+            .logical_buffers()
+            .iter()
+            .any(|buffer| { buffer.purpose == BufferPurpose::CommitProgressiveStatePing }));
+        assert_eq!(
+            arena
+                .logical_buffers()
+                .iter()
+                .filter(|buffer| buffer.purpose == BufferPurpose::MerkleLeafState)
+                .count(),
+            progressive_arena
+                .logical_buffers()
+                .iter()
+                .filter(|buffer| buffer.purpose == BufferPurpose::MerkleLeafState)
+                .count(),
+            "both modes own exactly one common Merkle leaf layer per tree"
+        );
 
         let retained_numerator_arena =
             ProofArenaPlan::build(&proof, &retained_numerator, &composition).unwrap();
@@ -9305,6 +9596,18 @@ mod tests {
         let base = arena.commitment(CommitmentTreeId::Base).unwrap();
         let interaction = arena.commitment(CommitmentTreeId::Interaction).unwrap();
         let preprocessed = arena.commitment(CommitmentTreeId::Preprocessed).unwrap();
+        let base_slots = match &base.slots {
+            ModeAwareCommitWorkspaceSlots::FullLifting(slots) => slots,
+            ModeAwareCommitWorkspaceSlots::DomainProgressive(_) => {
+                panic!("default arena unexpectedly uses progressive commit slots")
+            }
+        };
+        let interaction_slots = match &interaction.slots {
+            ModeAwareCommitWorkspaceSlots::FullLifting(slots) => slots,
+            ModeAwareCommitWorkspaceSlots::DomainProgressive(_) => {
+                panic!("default arena unexpectedly uses progressive commit slots")
+            }
+        };
         assert_eq!(preprocessed.root.len_words, BLAKE2S_HASH_WORDS);
         assert_eq!(
             preprocessed.root,
@@ -9312,7 +9615,7 @@ mod tests {
             "fixed tree root must stay bound through decommit"
         );
         assert_ne!(
-            base.slots.groups[0].column_ptrs, interaction.slots.groups[0].column_ptrs,
+            base_slots.groups[0].column_ptrs, interaction_slots.groups[0].column_ptrs,
             "captured commitment descriptor tables must persist independently"
         );
         assert_eq!(arena.fri().requirements.trees.len(), 25);
@@ -9558,7 +9861,7 @@ mod tests {
         assert_eq!(arena.transcript().requirements.outputs.len(), 5);
         assert_ne!(
             arena.fri().slots.input_coordinate_ptrs,
-            base.slots.groups[0].column_ptrs
+            base_slots.groups[0].column_ptrs
         );
         let composition_sources: Vec<_> = (0..8)
             .map(|ordinal| {

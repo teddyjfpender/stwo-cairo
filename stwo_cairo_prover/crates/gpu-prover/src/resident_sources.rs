@@ -15,8 +15,9 @@ use stwo::prover::poly::BitReversedOrder;
 use stwo_backend_cuda::{
     synchronize_legacy_stream_for_arena_handoff, ArenaSlice, BaseFieldVec, CommitCoefficientColumn,
     CommitCoefficientGroup, CudaBackend, CudaRuntimeError, InterpolationBatch, InterpolationColumn,
-    PreparedCommitError, PreparedCommitGraph, PreparedInterpolationError,
-    PreparedInterpolationGraph,
+    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedCommitError,
+    PreparedCommitGraph, PreparedInterpolationError, PreparedInterpolationGraph,
+    PreparedProgressiveCommitError, PreparedProgressiveCommitGraph,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::base_trace::BaseTrace;
@@ -179,6 +180,7 @@ pub enum ResidentSourceStageError {
     Runtime(CudaRuntimeError),
     Interpolation(PreparedInterpolationError),
     Commit(PreparedCommitError),
+    ProgressiveCommit(PreparedProgressiveCommitError),
 }
 
 impl core::fmt::Display for ResidentSourceStageError {
@@ -216,6 +218,12 @@ impl From<PreparedInterpolationError> for ResidentSourceStageError {
 impl From<PreparedCommitError> for ResidentSourceStageError {
     fn from(value: PreparedCommitError) -> Self {
         Self::Commit(value)
+    }
+}
+
+impl From<PreparedProgressiveCommitError> for ResidentSourceStageError {
+    fn from(value: PreparedProgressiveCommitError) -> Self {
+        Self::ProgressiveCommit(value)
     }
 }
 
@@ -767,15 +775,52 @@ pub fn stage_preprocessed_commitment(
         }
     }
     let groups = commitment_groups(workspace, &commitment)?;
-    let commit = PreparedCommitGraph::prepare(
-        workspace.arena(),
-        commitment.config,
-        &groups,
-        workspace.bind(commitment.twiddles.logical)?.0,
-        &commitment.slots,
-    )?;
-    let retained = commit.retained_layers_bottom_up();
-    if commit.root_slice().id() != commitment.root.physical
+    let twiddles = workspace.bind(commitment.twiddles.logical)?.0;
+    let (root, retained) = match (&commitment.requirements, &commitment.slots) {
+        (
+            ModeAwareCommitWorkspaceRequirements::FullLifting(_),
+            ModeAwareCommitWorkspaceSlots::FullLifting(slots),
+        ) => {
+            let commit = PreparedCommitGraph::prepare(
+                workspace.arena(),
+                commitment.config,
+                &groups,
+                twiddles,
+                slots,
+            )?;
+            commit.launch()?;
+            (
+                commit.root_slice(),
+                commit.retained_layers_bottom_up().to_vec(),
+            )
+        }
+        (
+            ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+            ModeAwareCommitWorkspaceSlots::DomainProgressive(slots),
+        ) => {
+            let coefficients = groups
+                .iter()
+                .flat_map(|group| group.columns.iter().copied())
+                .collect::<Vec<_>>();
+            let retained_outputs = vec![None; coefficients.len()];
+            let commit = PreparedProgressiveCommitGraph::prepare(
+                workspace.arena(),
+                commitment.config,
+                requirements,
+                slots,
+                &coefficients,
+                &retained_outputs,
+                twiddles,
+            )?;
+            commit.launch()?;
+            (
+                commit.root_slice(),
+                commit.retained_layers_bottom_up().to_vec(),
+            )
+        }
+        _ => return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch),
+    };
+    if root.id() != commitment.root.physical
         || retained.len() != commitment.retained_layers_bottom_up.len()
         || retained
             .iter()
@@ -786,8 +831,6 @@ pub fn stage_preprocessed_commitment(
     {
         return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch);
     }
-    commit.launch()?;
-
     let root_input = CairoTranscriptInput::PreprocessedRoot
         .id()
         .map_err(|_| ResidentSourceStageError::MissingPreprocessedRootInput)?;
@@ -808,14 +851,13 @@ pub fn stage_preprocessed_commitment(
     unsafe {
         workspace.arena().context().memcpy_d2d_async(
             root_destination.as_void_ptr(),
-            commit.root_slice().as_void_ptr().cast_const(),
+            root.as_void_ptr().cast_const(),
             8 * core::mem::size_of::<u32>(),
         )?;
     }
     workspace.arena().context().sync()?;
     drop(descriptor_storage);
     drop(evaluations);
-    drop(commit);
     let (commit_descriptor_bytes, commit_descriptor_copies) =
         commitment_descriptor_transfers(&commitment)?;
     let report = ResidentPreprocessedStageReport {
@@ -1165,57 +1207,96 @@ fn commitment_descriptor_transfers(
     planned: &PlannedCommitment,
 ) -> Result<(usize, usize), ResidentSourceStageError> {
     let word_bytes = core::mem::size_of::<u32>();
-    let mut bytes = planned
-        .requirements
-        .tail_pointer_words
+    let (tail_words, groups, progressive_batches) = match &planned.requirements {
+        ModeAwareCommitWorkspaceRequirements::FullLifting(requirements) => (
+            requirements.tail_pointer_words,
+            Some(requirements.groups.as_slice()),
+            None,
+        ),
+        ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements) => (
+            requirements.merkle.tail_pointer_words,
+            None,
+            Some(requirements.leaves.batches.as_slice()),
+        ),
+    };
+    let mut bytes = tail_words
         .unwrap_or_default()
         .checked_mul(word_bytes)
         .ok_or(ResidentSourceStageError::SizeOverflow)?;
-    let mut copies = usize::from(planned.requirements.tail_pointer_words.is_some());
-    for group in &planned.requirements.groups {
-        copies = copies
-            .checked_add(2)
-            .ok_or(ResidentSourceStageError::SizeOverflow)?;
-        bytes = bytes
-            .checked_add(
-                group
-                    .column_pointer_words
-                    .checked_mul(word_bytes)
-                    .ok_or(ResidentSourceStageError::SizeOverflow)?,
-            )
-            .and_then(|bytes| {
-                group
-                    .column_log_size_words
-                    .checked_mul(word_bytes)
-                    .and_then(|next| bytes.checked_add(next))
-            })
-            .ok_or(ResidentSourceStageError::SizeOverflow)?;
-        for batch in &group.batches {
+    let mut copies = usize::from(tail_words.is_some());
+    if let Some(groups) = groups {
+        for group in groups {
             copies = copies
-                .checked_add(3)
+                .checked_add(2)
                 .ok_or(ResidentSourceStageError::SizeOverflow)?;
             bytes = bytes
                 .checked_add(
-                    batch
-                        .coefficient_pointer_words
+                    group
+                        .column_pointer_words
                         .checked_mul(word_bytes)
                         .ok_or(ResidentSourceStageError::SizeOverflow)?,
                 )
                 .and_then(|bytes| {
-                    batch
-                        .coefficient_size_words
-                        .checked_mul(word_bytes)
-                        .and_then(|next| bytes.checked_add(next))
-                })
-                .and_then(|bytes| {
-                    batch
-                        .output_pointer_words
+                    group
+                        .column_log_size_words
                         .checked_mul(word_bytes)
                         .and_then(|next| bytes.checked_add(next))
                 })
                 .ok_or(ResidentSourceStageError::SizeOverflow)?;
+            for batch in &group.batches {
+                let (next_bytes, next_copies) = descriptor_batch_transfer(
+                    bytes,
+                    copies,
+                    batch.coefficient_pointer_words,
+                    batch.coefficient_size_words,
+                    batch.output_pointer_words,
+                    word_bytes,
+                )?;
+                bytes = next_bytes;
+                copies = next_copies;
+            }
         }
     }
+    if let Some(batches) = progressive_batches {
+        for batch in batches {
+            let (next_bytes, next_copies) = descriptor_batch_transfer(
+                bytes,
+                copies,
+                batch.coefficient_pointer_words,
+                batch.coefficient_size_words,
+                batch.output_pointer_words,
+                word_bytes,
+            )?;
+            bytes = next_bytes;
+            copies = next_copies;
+        }
+    }
+    Ok((bytes, copies))
+}
+
+fn descriptor_batch_transfer(
+    bytes: usize,
+    copies: usize,
+    coefficient_pointer_words: usize,
+    coefficient_size_words: usize,
+    output_pointer_words: usize,
+    word_bytes: usize,
+) -> Result<(usize, usize), ResidentSourceStageError> {
+    let copies = copies
+        .checked_add(3)
+        .ok_or(ResidentSourceStageError::SizeOverflow)?;
+    let bytes = [
+        coefficient_pointer_words,
+        coefficient_size_words,
+        output_pointer_words,
+    ]
+    .into_iter()
+    .try_fold(bytes, |total, words| {
+        words
+            .checked_mul(word_bytes)
+            .and_then(|next| total.checked_add(next))
+            .ok_or(ResidentSourceStageError::SizeOverflow)
+    })?;
     Ok((bytes, copies))
 }
 

@@ -68,6 +68,11 @@ pub const FLAGS: &[FlagDef] = &[
         purpose: "resident quotient numerator: opt in to reusing retained commitment evaluations instead of coefficients",
         deletion_milestone: "M6 (remove after retained-source parity is the unconditional path)",
     },
+    FlagDef {
+        name: "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE",
+        purpose: "resident commitment: build leaves progressively across native evaluation domains",
+        deletion_milestone: "M6 (remove only after full resident proof and flags-off baseline qualification)",
+    },
 ];
 
 /// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed

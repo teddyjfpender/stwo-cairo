@@ -16,16 +16,18 @@ use stwo_backend_cuda::{
     ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitEvaluationGroup,
     CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
     DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError, ExecutionTablesHostData,
-    FriDecommitOwnedSources, MemoryBaseTracePart, PreparedBlake2sPowError, PreparedBlake2sPowGraph,
+    FriDecommitOwnedSources, MemoryBaseTracePart, ModeAwareCommitWorkspaceRequirements,
+    ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError, PreparedBlake2sPowGraph,
     PreparedBlake2sTranscript, PreparedCommitError, PreparedCommitGraph, PreparedDecommitError,
     PreparedDecommitGraph, PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
     PreparedExecutionTablesError, PreparedExecutionTablesGraph,
     PreparedExecutionTablesIngestTelemetry, PreparedFixedTableError, PreparedFixedTableGraph,
     PreparedFriError, PreparedFriFinalError, PreparedFriFinalGraph, PreparedFriGraph,
     PreparedInterpolationError, PreparedInterpolationGraph, PreparedMemoryBaseTraceError,
-    PreparedMemoryBaseTraceGraph, PreparedRelationGraph, PreparedWitnessError,
-    PreparedWitnessFeedClearGraph, PreparedWitnessFeedError, PreparedWitnessFeedGraph,
-    PreparedWitnessGraph, PreparedWitnessInputCompactGraph, PreparedWitnessInputGatherError,
+    PreparedMemoryBaseTraceGraph, PreparedProgressiveCommitError, PreparedProgressiveCommitGraph,
+    PreparedRelationGraph, PreparedWitnessError, PreparedWitnessFeedClearGraph,
+    PreparedWitnessFeedError, PreparedWitnessFeedGraph, PreparedWitnessGraph,
+    PreparedWitnessInputCompactGraph, PreparedWitnessInputGatherError,
     PreparedWitnessInputGatherGraph, PreparedWitnessInputSeedGraph, PreparedWitnessMode,
     RelationChallenges, RelationGraphError, RelationInstanceSources, RelationSourceLayout,
     TraceDecommitSources, TraceSourceGroup, TranscriptInputBinding, TranscriptInputId,
@@ -269,6 +271,8 @@ pub enum ResidentRuntimeError {
     Cuda(CudaRuntimeError),
     Graph(GraphError),
     Commit(PreparedCommitError),
+    ProgressiveCommit(PreparedProgressiveCommitError),
+    CommitModeMismatch,
     Interpolation(PreparedInterpolationError),
     SourceStage(ResidentSourceStageError),
     CompositionBinding(ResidentCompositionError),
@@ -321,6 +325,12 @@ impl From<CudaRuntimeError> for ResidentRuntimeError {
 impl From<PreparedCommitError> for ResidentRuntimeError {
     fn from(value: PreparedCommitError) -> Self {
         Self::Commit(value)
+    }
+}
+
+impl From<PreparedProgressiveCommitError> for ResidentRuntimeError {
+    fn from(value: PreparedProgressiveCommitError) -> Self {
+        Self::ProgressiveCommit(value)
     }
 }
 
@@ -447,6 +457,7 @@ impl From<TranscriptPlanError> for ResidentRuntimeError {
 #[derive(Debug)]
 enum ResidentLaunchError {
     Commit(PreparedCommitError),
+    ProgressiveCommit(PreparedProgressiveCommitError),
     Interpolation(PreparedInterpolationError),
     Composition(PreparedCompositionError),
     Oods(ResidentOodsError),
@@ -469,6 +480,12 @@ impl core::fmt::Display for ResidentLaunchError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Commit(error) => write!(f, "resident commitment launch rejected: {error}"),
+            Self::ProgressiveCommit(error) => {
+                write!(
+                    f,
+                    "resident progressive commitment launch rejected: {error}"
+                )
+            }
             Self::Interpolation(error) => {
                 write!(f, "resident interpolation launch rejected: {error}")
             }
@@ -502,6 +519,12 @@ impl core::fmt::Display for ResidentLaunchError {
 }
 
 impl std::error::Error for ResidentLaunchError {}
+
+impl From<ResidentLaunchError> for ResidentRuntimeError {
+    fn from(value: ResidentLaunchError) -> Self {
+        Self::Graph(GraphError::Enqueue(Box::new(value)))
+    }
+}
 
 /// Prepared proof primitives bound to workspace-owned transcript subgraphs.
 /// The workspace outlives the runtime and keeps exact-key graph executables
@@ -790,6 +813,56 @@ fn slices_match_slots(
             .all(|((&slice, &slot), &words)| slice_matches_slot(slice, slot, words))
 }
 
+enum PreparedResidentCommitment<'a> {
+    Full(PreparedCommitGraph<'a>),
+    Progressive {
+        graph: PreparedProgressiveCommitGraph<'a>,
+        retained_evaluations: Vec<Option<Vec<ArenaSlice>>>,
+    },
+}
+
+impl PreparedResidentCommitment<'_> {
+    fn launch(&self) -> Result<(), ResidentLaunchError> {
+        match self {
+            Self::Full(graph) => graph.launch().map_err(ResidentLaunchError::Commit),
+            Self::Progressive { graph, .. } => graph
+                .launch()
+                .map_err(ResidentLaunchError::ProgressiveCommit),
+        }
+    }
+
+    fn root_slice(&self) -> ArenaSlice {
+        match self {
+            Self::Full(graph) => graph.root_slice(),
+            Self::Progressive { graph, .. } => graph.root_slice(),
+        }
+    }
+
+    fn retained_layers_bottom_up(&self) -> &[ArenaSlice] {
+        match self {
+            Self::Full(graph) => graph.retained_layers_bottom_up(),
+            Self::Progressive { graph, .. } => graph.retained_layers_bottom_up(),
+        }
+    }
+
+    fn retained_evaluations(&self) -> &[Option<Vec<ArenaSlice>>] {
+        match self {
+            Self::Full(graph) => graph.retained_evaluations(),
+            Self::Progressive {
+                retained_evaluations,
+                ..
+            } => retained_evaluations,
+        }
+    }
+
+    fn read_root_at_transcript_boundary(&self) -> Result<Blake2sHash, ResidentRuntimeError> {
+        match self {
+            Self::Full(graph) => Ok(graph.read_root_at_transcript_boundary()?),
+            Self::Progressive { graph, .. } => Ok(graph.read_root_at_transcript_boundary()?),
+        }
+    }
+}
+
 pub struct ResidentGraphRuntime<'a> {
     execution_tables: Option<PreparedExecutionTablesGraph<'a>>,
     execution_tables_ingest: Option<PreparedExecutionTablesIngestTelemetry>,
@@ -798,7 +871,7 @@ pub struct ResidentGraphRuntime<'a> {
     witness: Vec<PreparedResidentWitness<'a>>,
     witness_lane_levels: Vec<Vec<Vec<usize>>>,
     multiplicity: Option<PreparedResidentMultiplicity<'a>>,
-    commitments: Vec<(CommitmentTreeId, PreparedCommitGraph<'a>)>,
+    commitments: Vec<(CommitmentTreeId, PreparedResidentCommitment<'a>)>,
     base_interpolation: PreparedInterpolationGraph<'a>,
     fixed_preprocessed_root: ArenaSlice,
     fixed_preprocessed_retained_layers: Vec<ArenaSlice>,
@@ -1269,17 +1342,61 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .transpose()
                 })
                 .collect::<Result<Vec<_>, ArenaError>>()?;
-            commitments.push((
-                planned.id,
-                PreparedCommitGraph::prepare_with_retained_evaluations(
-                    arena,
-                    planned.config,
-                    &groups,
-                    twiddles,
-                    &planned.slots,
-                    &retained_evaluations,
-                )?,
-            ));
+            let prepared = match (&planned.requirements, &planned.slots) {
+                (
+                    ModeAwareCommitWorkspaceRequirements::FullLifting(_),
+                    ModeAwareCommitWorkspaceSlots::FullLifting(slots),
+                ) => PreparedResidentCommitment::Full(
+                    PreparedCommitGraph::prepare_with_retained_evaluations(
+                        arena,
+                        planned.config,
+                        &groups,
+                        twiddles,
+                        slots,
+                        &retained_evaluations,
+                    )?,
+                ),
+                (
+                    ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+                    ModeAwareCommitWorkspaceSlots::DomainProgressive(slots),
+                ) => {
+                    let coefficients = groups
+                        .iter()
+                        .flat_map(|group| group.columns.iter().copied())
+                        .collect::<Vec<_>>();
+                    let flat_retained = groups
+                        .iter()
+                        .zip(&retained_evaluations)
+                        .flat_map(|(group, retained)| match retained {
+                            Some(retained) => retained
+                                .columns
+                                .iter()
+                                .copied()
+                                .map(Some)
+                                .collect::<Vec<_>>(),
+                            None => vec![None; group.columns.len()],
+                        })
+                        .collect::<Vec<_>>();
+                    let grouped_retained = retained_evaluations
+                        .iter()
+                        .map(|group| group.as_ref().map(|group| group.columns.clone()))
+                        .collect();
+                    PreparedResidentCommitment::Progressive {
+                        graph: PreparedProgressiveCommitGraph::prepare(
+                            arena,
+                            planned.config,
+                            requirements,
+                            slots,
+                            &coefficients,
+                            &flat_retained,
+                            twiddles,
+                        )?,
+                        retained_evaluations: grouped_retained,
+                    }
+                }
+                _ => return Err(ResidentRuntimeError::CommitModeMismatch),
+            };
+            commitments.push((planned.id, prepared));
         }
         let base_interpolation =
             prepare_commitment_interpolation(workspace, CommitmentTreeId::Base)?;
@@ -1917,7 +2034,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                 interpolation
                     .launch()
                     .map_err(ResidentLaunchError::Interpolation)?;
-                commitment.launch().map_err(ResidentLaunchError::Commit)?;
+                commitment.launch()?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
                 transcript
                     .launch_segment(
@@ -1976,7 +2093,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                 interpolation
                     .launch()
                     .map_err(ResidentLaunchError::Interpolation)?;
-                commitment.launch().map_err(ResidentLaunchError::Commit)?;
+                commitment.launch()?;
                 enqueue_claimed_sums(arena, claim_sources, claim_destination)?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
                 transcript
@@ -2015,7 +2132,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                 composition
                     .launch()
                     .map_err(ResidentLaunchError::Composition)?;
-                commitment.launch().map_err(ResidentLaunchError::Commit)?;
+                commitment.launch()?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
                 transcript
                     .launch_segment(cursor, generation, range, TranscriptSegmentStart::Resume)
@@ -3134,7 +3251,7 @@ impl<'a> ResidentGraphRuntime<'a> {
     fn commitment(
         &self,
         id: CommitmentTreeId,
-    ) -> Result<&PreparedCommitGraph<'a>, ResidentRuntimeError> {
+    ) -> Result<&PreparedResidentCommitment<'a>, ResidentRuntimeError> {
         self.commitments
             .iter()
             .find_map(|(candidate, graph)| (*candidate == id).then_some(graph))
@@ -3488,7 +3605,7 @@ fn interaction_outputs_in_cairo_order(
 
 fn resident_decommit_sources(
     workspace: &GraphWorkspace,
-    commitments: &[(CommitmentTreeId, PreparedCommitGraph<'_>)],
+    commitments: &[(CommitmentTreeId, PreparedResidentCommitment<'_>)],
     fixed_preprocessed_root: ArenaSlice,
     fixed_preprocessed_layers: &[ArenaSlice],
     fri: &PreparedFriGraph<'_>,

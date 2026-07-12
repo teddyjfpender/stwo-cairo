@@ -49,6 +49,7 @@ pub struct ProtocolPlanPolicy {
     pub retained_lde_budget_bytes: usize,
     pub unretained_bottom_layers: u32,
     pub max_fused_tail_levels: u32,
+    pub commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
 }
 
 impl ProtocolPlanPolicy {
@@ -64,6 +65,7 @@ impl ProtocolPlanPolicy {
             retained_lde_budget_bytes: 8 * 1024 * 1024 * 1024,
             unretained_bottom_layers: 4,
             max_fused_tail_levels: 12,
+            commit_mode: stwo_backend_cuda::ProgressiveCommitMode::FullLifting,
         }
     }
 
@@ -79,6 +81,7 @@ impl ProtocolPlanPolicy {
             return Err(ProtocolPlanError::UnboundCompositionKernelCap);
         }
         let mut policy = Self::starknet_blake2s(hash, composition_max_kernel_instrs);
+        policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::from_env();
         if let Ok(value) = crate::flags::env_value("STWO_CUDA_RETAINED_LDE_BUDGET_BYTES") {
             policy.retained_lde_budget_bytes = value
                 .parse()
@@ -833,6 +836,7 @@ fn plan_protocol_from_logs(
             composition_plan_hash,
             policy.kernel_manifest_hash,
             policy.decommit_strategy,
+            policy.commit_mode,
         ),
         preprocessed_column_ids: preprocessed_trace
             .ids()
