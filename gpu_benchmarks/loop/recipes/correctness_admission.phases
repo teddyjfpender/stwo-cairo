@@ -1,7 +1,9 @@
 # Fail-fast hardware admission for the locally sealed progressive/direct/
-# numerator-retention line. One phase is intentional: any failed native oracle
-# stops before whole-proof smoke or performance work, and pod_run.sh's EXIT trap
-# stops the pod.
+# numerator-retention line. Correctness uses the explicitly performance-
+# inadmissible transcript mirror so wall-clock scheduling cannot hide a byte
+# verdict; the DeviceOnly submit-gap gate remains part of later qualification.
+# One phase is intentional: any failed native oracle stops before whole-proof
+# smoke or performance work, and pod_run.sh's EXIT trap stops the pod.
 correctness_admission() {
   set -euo pipefail
 
@@ -20,7 +22,7 @@ correctness_admission() {
     STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=1 \
     cargo test -p stwo-cairo-gpu-prover \
       --test resident_parity_native \
-      strict_resident_cold_and_warm_proofs_match_simd_bytes \
+      strict_resident_mirrored_transcript_matches_host_channel \
       -- --exact --nocapture --test-threads=1
 
   env \
