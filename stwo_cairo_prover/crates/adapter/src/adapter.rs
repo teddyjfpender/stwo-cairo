@@ -75,16 +75,13 @@ mod tests {
         let is_fix_mode = std::env::var("FIX") == Ok("1".to_string());
 
         let compiled_program = get_compiled_cairo_program_path(test_name);
-        let mut prover_input = run_and_adapt(
+        let prover_input = run_and_adapt(
             &compiled_program,
             ProgramType::Json,
             LayoutName::all_cairo_stwo,
             None,
         )
         .unwrap();
-        // Public memory addresses are not deterministic, sort them.
-        prover_input.public_memory_addresses.sort();
-
         let prover_input_value =
             to_value(&prover_input).expect("Unable to convert prover input to value");
 

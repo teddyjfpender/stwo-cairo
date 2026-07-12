@@ -166,7 +166,10 @@ impl Relocator {
                 res.push(addr);
             }
         }
-
+        // Cairo VM exposes public segments as a HashMap. Their addresses are a
+        // multiset, so iteration order is semantically irrelevant but would
+        // otherwise make adapted ProverInput bytes process-randomized.
+        res.sort_unstable();
         res
     }
 }
@@ -367,9 +370,7 @@ pub mod relocator_tests {
 
         let relocatble_public_addrs =
             HashMap::from([(0, vec![(2, 0)]), (1, vec![(0, 0), (1, 0), (43, 0)])]);
-        let mut relocated_public_addrs =
-            relocator.relocate_public_addresses(&relocatble_public_addrs);
-        relocated_public_addrs.sort();
+        let relocated_public_addrs = relocator.relocate_public_addresses(&relocatble_public_addrs);
 
         let expected_relocated_public_addresses = vec![3, 4, 5, 47];
         assert_eq!(relocated_public_addrs, expected_relocated_public_addresses);
