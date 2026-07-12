@@ -32,18 +32,18 @@ use stwo_backend_cuda::{
     ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
     FixedTableContiguousWorkspaceSlots, FriDecommitGeometry, FriDecommitSlots,
     FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriMerkleTreeSlots, FriWorkspaceConfig,
-    FriWorkspaceRequirements, FriWorkspaceSlots, OodsColumnTopology, OodsWorkspaceConfig,
-    OodsWorkspaceRequirements, OodsWorkspaceSlots, PreparedBlake2sPowError, PreparedCommitError,
-    PreparedDecommitError, PreparedExecutionTablesError, PreparedFixedTableError, PreparedFriError,
-    PreparedFriFinalError, PreparedOodsError, PreparedQuotientError,
-    PreparedQuotientNumeratorError, PreparedWitnessError, PreparedWitnessFeedError,
-    PreparedWitnessInputGatherError, QuotientNumeratorColumnTopology, QuotientNumeratorSourceKind,
-    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
-    QuotientNumeratorWorkspaceSlots, QuotientOodsSample, QuotientWorkspaceConfig,
-    QuotientWorkspaceRequirements, QuotientWorkspaceSlots, RelationGraphError,
-    RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots, TraceDecommitGeometry,
-    TraceDecommitSlots, TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRole,
-    TranscriptInputId, TranscriptOutputId, WitnessFeedClearWorkspaceRequirements,
+    FriWorkspaceRequirements, FriWorkspaceSlots, InterpolationLaunchMode, OodsColumnTopology,
+    OodsWorkspaceConfig, OodsWorkspaceRequirements, OodsWorkspaceSlots, PreparedBlake2sPowError,
+    PreparedCommitError, PreparedDecommitError, PreparedExecutionTablesError,
+    PreparedFixedTableError, PreparedFriError, PreparedFriFinalError, PreparedOodsError,
+    PreparedQuotientError, PreparedQuotientNumeratorError, PreparedWitnessError,
+    PreparedWitnessFeedError, PreparedWitnessInputGatherError, QuotientNumeratorColumnTopology,
+    QuotientNumeratorSourceKind, QuotientNumeratorWorkspaceConfig,
+    QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
+    QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
+    RelationGraphError, RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots,
+    TraceDecommitGeometry, TraceDecommitSlots, TraceSourceGroupGeometry, TraceSourceGroupSlots,
+    TraceTreeRole, TranscriptInputId, TranscriptOutputId, WitnessFeedClearWorkspaceRequirements,
     WitnessFeedClearWorkspaceSlots, WitnessFeedWorkspaceSlots, WitnessInputCompactLayout,
     WitnessInputCompactRequirements, WitnessInputCompactSlots, WitnessInputGatherEdge,
     WitnessInputGatherRequirements, WitnessInputGatherSlots, WitnessInputSeedRequirements,
@@ -258,6 +258,8 @@ pub enum BufferPurpose {
     CommitColumnPointers,
     CommitColumnLogSizes,
     CommitCoefficientPointers,
+    InterpolationInputPointers,
+    InterpolationOutputPointers,
     CommitCoefficientSizes,
     CommitOutputPointers,
     CommitRetainedEvaluation,
@@ -500,6 +502,7 @@ pub struct ProtocolIdentity {
     pub composition_plan_hash: u64,
     pub kernel_manifest_hash: u64,
     pub decommit_strategy: DecommitStrategy,
+    pub interpolation_mode: InterpolationLaunchMode,
 }
 
 impl ProtocolIdentity {
@@ -525,6 +528,7 @@ impl ProtocolIdentity {
             composition_plan_hash,
             kernel_manifest_hash,
             decommit_strategy,
+            interpolation_mode: InterpolationLaunchMode::from_env(),
         }
     }
 }
@@ -1377,7 +1381,7 @@ impl ProtocolGeometry {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
         };
-        feed(b"stwo-cairo-protocol-geometry-v5\0");
+        feed(b"stwo-cairo-protocol-geometry-v6\0");
         feed(&self.identity.pow_bits.to_le_bytes());
         feed(&self.identity.log_blowup_factor.to_le_bytes());
         feed(&self.identity.log_last_layer_degree_bound.to_le_bytes());
@@ -1388,6 +1392,7 @@ impl ProtocolGeometry {
         feed(&self.identity.oods_topology_hash.to_le_bytes());
         feed(&self.identity.composition_plan_hash.to_le_bytes());
         feed(&self.identity.kernel_manifest_hash.to_le_bytes());
+        feed(&[self.identity.interpolation_mode as u8]);
         for identity in &self.preprocessed_column_ids {
             feed(&(identity.len() as u64).to_le_bytes());
             feed(identity.as_bytes());
@@ -1701,6 +1706,7 @@ struct LogicalQuotientNumeratorWorkspace {
 #[derive(Clone, Debug)]
 struct LogicalCommitWorkspace {
     id: CommitmentTreeId,
+    interpolation_mode: InterpolationLaunchMode,
     config: CommitWorkspaceConfig,
     grouped_column_log_sizes: Vec<Vec<u32>>,
     grouped_column_sources: Vec<Vec<CommitmentColumnSource>>,
@@ -1714,6 +1720,15 @@ struct LogicalCommitWorkspace {
     tail_outputs: Vec<LogicalBufferId>,
     retained_evaluations: Vec<Option<Vec<LogicalBufferId>>>,
     groups: Vec<LogicalCommitGroupSlots>,
+    interpolation_batches: Vec<LogicalInterpolationBatch>,
+}
+
+#[derive(Clone, Debug)]
+struct LogicalInterpolationBatch {
+    log_size: u32,
+    sources: Vec<CommitmentColumnSource>,
+    input_pointers: LogicalBufferId,
+    output_pointers: LogicalBufferId,
 }
 
 #[derive(Clone, Debug)]
@@ -2308,6 +2323,16 @@ pub struct PlannedCommitment {
     /// ephemeral `PreparedCommitGraph` value used for the cold fixed commit.
     pub root: ArenaBinding,
     pub retained_layers_bottom_up: Vec<ArenaBinding>,
+    pub interpolation_mode: InterpolationLaunchMode,
+    pub interpolation_batches: Vec<PlannedInterpolationBatch>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlannedInterpolationBatch {
+    pub log_size: u32,
+    pub sources: Vec<CommitmentColumnSource>,
+    pub input_pointers: ArenaSlotId,
+    pub output_pointers: ArenaSlotId,
 }
 
 #[derive(Clone, Debug)]
@@ -5094,6 +5119,70 @@ fn append_transcript_buffers(
     })
 }
 
+fn interpolation_batch_geometry(
+    geometry: &CommitmentGeometry,
+    requirements: &CommitWorkspaceRequirements,
+    mode: InterpolationLaunchMode,
+) -> Result<Vec<(u32, Vec<CommitmentColumnSource>)>, ArenaPlanError> {
+    if !matches!(
+        geometry.id,
+        CommitmentTreeId::Base | CommitmentTreeId::Interaction
+    ) {
+        return Ok(Vec::new());
+    }
+    match mode {
+        InterpolationLaunchMode::StageWiseCopyThenInPlace => {
+            let mut output = Vec::new();
+            for ((sources, logs), group) in geometry
+                .grouped_column_sources
+                .iter()
+                .zip(&geometry.grouped_column_log_sizes)
+                .zip(&requirements.groups)
+            {
+                for batch in &group.batches {
+                    let end = batch
+                        .first_column
+                        .checked_add(batch.column_count)
+                        .ok_or(ArenaPlanError::SizeOverflow)?;
+                    let selected = sources
+                        .get(batch.first_column..end)
+                        .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                            "interpolation batch exceeds commitment group",
+                        ))?
+                        .to_vec();
+                    if logs.get(batch.first_column..end).is_none_or(|logs| {
+                        logs.iter().any(|&log| log != batch.coefficient_log_size)
+                    }) {
+                        return Err(ArenaPlanError::InvalidProtocolGeometry(
+                            "interpolation batch mixes coefficient logs",
+                        ));
+                    }
+                    output.push((batch.coefficient_log_size, selected));
+                }
+            }
+            Ok(output)
+        }
+        InterpolationLaunchMode::StageFusedOutOfPlace => {
+            let mut by_log = BTreeMap::<u32, Vec<CommitmentColumnSource>>::new();
+            for (sources, logs) in geometry
+                .grouped_column_sources
+                .iter()
+                .zip(&geometry.grouped_column_log_sizes)
+            {
+                if sources.len() != logs.len() {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "commitment interpolation source/log width mismatch",
+                    ));
+                }
+                for (&source, &log) in sources.iter().zip(logs) {
+                    by_log.entry(log).or_default().push(source);
+                }
+            }
+            Ok(by_log.into_iter().collect())
+        }
+    }
+}
+
 fn append_protocol_buffers(
     logical: &mut Vec<LogicalBuffer>,
     protocol: &ProtocolGeometry,
@@ -5491,8 +5580,44 @@ fn append_protocol_buffers(
                 })
             })
             .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+        let interpolation_batches = interpolation_batch_geometry(
+            geometry,
+            &requirements,
+            protocol.identity.interpolation_mode,
+        )?
+        .into_iter()
+        .map(|(log_size, sources)| {
+            let pointer_words = sources
+                .len()
+                .checked_mul(core::mem::size_of::<usize>().div_ceil(core::mem::size_of::<u32>()))
+                .ok_or(ArenaPlanError::SizeOverflow)?;
+            Ok(LogicalInterpolationBatch {
+                log_size,
+                sources,
+                input_pointers: push_buffer_id(
+                    logical,
+                    None,
+                    None,
+                    BufferPurpose::InterpolationInputPointers,
+                    ordinal()?,
+                    pointer_words,
+                    descriptor,
+                )?,
+                output_pointers: push_buffer_id(
+                    logical,
+                    None,
+                    None,
+                    BufferPurpose::InterpolationOutputPointers,
+                    ordinal()?,
+                    pointer_words,
+                    descriptor,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, ArenaPlanError>>()?;
         logical_commitments.push(LogicalCommitWorkspace {
             id: geometry.id,
+            interpolation_mode: protocol.identity.interpolation_mode,
             config: geometry.config,
             grouped_column_log_sizes: geometry.grouped_column_log_sizes.clone(),
             grouped_column_sources: geometry.grouped_column_sources.clone(),
@@ -5506,6 +5631,7 @@ fn append_protocol_buffers(
             tail_outputs,
             retained_evaluations,
             groups,
+            interpolation_batches,
         });
     }
 
@@ -6643,6 +6769,18 @@ fn resolve_commitment_slots(
                 .transpose()
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+    let interpolation_batches = logical
+        .interpolation_batches
+        .iter()
+        .map(|batch| {
+            Ok(PlannedInterpolationBatch {
+                log_size: batch.log_size,
+                sources: batch.sources.clone(),
+                input_pointers: physical(batch.input_pointers)?,
+                output_pointers: physical(batch.output_pointers)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ArenaPlanError>>()?;
     let mut retained_layers_bottom_up = Vec::new();
     if logical.config.unretained_bottom_layers == 0 {
         retained_layers_bottom_up.push(leaf_state);
@@ -6687,6 +6825,8 @@ fn resolve_commitment_slots(
         retained_evaluation_groups,
         root,
         retained_layers_bottom_up,
+        interpolation_mode: logical.interpolation_mode,
+        interpolation_batches,
     })
 }
 
@@ -8476,6 +8616,7 @@ mod tests {
                 composition_plan_hash: composition.key(),
                 kernel_manifest_hash: 4,
                 decommit_strategy: DecommitStrategy::RecomputeQueriedLde,
+                interpolation_mode: InterpolationLaunchMode::StageWiseCopyThenInPlace,
             },
             preprocessed_column_ids: vec!["test_preprocessed".to_owned()],
             max_domain_log_size: 26,
@@ -8559,6 +8700,10 @@ mod tests {
             .partial_numerator_log_sizes
             .push(23);
         assert_ne!(protocol.key(), changed_quotient.key());
+        let mut fused_interpolation = protocol.clone();
+        fused_interpolation.identity.interpolation_mode =
+            InterpolationLaunchMode::StageFusedOutOfPlace;
+        assert_ne!(protocol.key(), fused_interpolation.key());
         let mut invalid_oods_evaluation_log = protocol.clone();
         invalid_oods_evaluation_log.oods.columns[0].evaluation_log_size =
             invalid_oods_evaluation_log.oods.columns[0].coefficient_log_size;
@@ -8588,6 +8733,50 @@ mod tests {
         let arena = ProofArenaPlan::build(&proof, &protocol, &composition).unwrap();
         arena.validate_aliases().unwrap();
         assert_eq!(arena.protocol_key, protocol.key());
+        let fused_arena =
+            ProofArenaPlan::build(&proof, &fused_interpolation, &composition).unwrap();
+        let fused_base = fused_arena.commitment(CommitmentTreeId::Base).unwrap();
+        let distinct_base_logs = fused_interpolation
+            .commitments
+            .iter()
+            .find(|commitment| commitment.id == CommitmentTreeId::Base)
+            .unwrap()
+            .grouped_column_log_sizes
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fused_base.interpolation_batches.len(),
+            distinct_base_logs.len()
+        );
+        assert!(fused_base
+            .interpolation_batches
+            .windows(2)
+            .all(|pair| pair[0].log_size < pair[1].log_size));
+        let base_geometry = fused_interpolation
+            .commitments
+            .iter()
+            .find(|commitment| commitment.id == CommitmentTreeId::Base)
+            .unwrap();
+        let mut expected_by_log = BTreeMap::<u32, Vec<CommitmentColumnSource>>::new();
+        for (sources, logs) in base_geometry
+            .grouped_column_sources
+            .iter()
+            .zip(&base_geometry.grouped_column_log_sizes)
+        {
+            for (&source, &log_size) in sources.iter().zip(logs) {
+                expected_by_log.entry(log_size).or_default().push(source);
+            }
+        }
+        assert_eq!(
+            fused_base
+                .interpolation_batches
+                .iter()
+                .map(|batch| (batch.log_size, batch.sources.clone()))
+                .collect::<Vec<_>>(),
+            expected_by_log.into_iter().collect::<Vec<_>>()
+        );
         assert!(arena.execution_tables().is_none());
         let resident_arena = ProofArenaPlan::build_with_execution_tables(
             &proof,

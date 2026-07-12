@@ -1219,10 +1219,10 @@ fn commitment_descriptor_transfers(
     Ok((bytes, copies))
 }
 
-/// Build same-log interpolation batches in the commitment's exact canonical
-/// source order. The prepared commit coefficient-pointer slots are reused: both
-/// consumers require the identical coefficient pointer table and it is
-/// persistent across every captured replay.
+/// Bind the planner's sealed same-log interpolation batches. Stage-wise mode
+/// preserves the historical commitment-group partition; fused mode coalesces
+/// equal logs in canonical encounter order. Both own immutable input/output
+/// pointer tables, so capture never depends on host allocation.
 pub(crate) fn commitment_interpolation_batches(
     workspace: &GraphWorkspace,
     tree: CommitmentTreeId,
@@ -1240,39 +1240,14 @@ pub(crate) fn commitment_interpolation_batches(
             ))
         }
     };
-    let mut batches = Vec::new();
-    for (((sources, logs), group_requirements), group_slots) in planned
-        .grouped_column_sources
+    planned
+        .interpolation_batches
         .iter()
-        .zip(&planned.grouped_column_log_sizes)
-        .zip(&planned.requirements.groups)
-        .zip(&planned.slots.groups)
-    {
-        for (batch_requirements, batch_slots) in
-            group_requirements.batches.iter().zip(&group_slots.batches)
-        {
-            let end = batch_requirements
-                .first_column
-                .checked_add(batch_requirements.column_count)
-                .ok_or(ResidentSourceStageError::SizeOverflow)?;
-            let source_range = sources.get(batch_requirements.first_column..end).ok_or(
-                ResidentSourceStageError::InterpolationBatchShapeMismatch(tree),
-            )?;
-            let log_range = logs.get(batch_requirements.first_column..end).ok_or(
-                ResidentSourceStageError::InterpolationBatchShapeMismatch(tree),
-            )?;
-            if log_range
+        .map(|batch| {
+            let columns = batch
+                .sources
                 .iter()
-                .any(|&log_size| log_size != batch_requirements.coefficient_log_size)
-            {
-                return Err(ResidentSourceStageError::InterpolationBatchShapeMismatch(
-                    tree,
-                ));
-            }
-            let columns = source_range
-                .iter()
-                .zip(log_range)
-                .map(|(&source, &log_size)| {
+                .map(|&source| {
                     if !matches!(
                         source,
                         CommitmentColumnSource::Trace { purpose, .. }
@@ -1287,17 +1262,17 @@ pub(crate) fn commitment_interpolation_batches(
                     Ok(InterpolationColumn {
                         evaluations,
                         coefficients,
-                        log_size,
+                        log_size: batch.log_size,
                     })
                 })
                 .collect::<Result<Vec<_>, ResidentSourceStageError>>()?;
-            batches.push(InterpolationBatch {
+            Ok(InterpolationBatch {
                 columns,
-                coefficient_pointers: batch_slots.coefficient_ptrs,
-            });
-        }
-    }
-    Ok(batches)
+                input_pointers: batch.input_pointers,
+                output_pointers: batch.output_pointers,
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn prepare_commitment_interpolation<'a>(
@@ -1310,6 +1285,11 @@ pub(crate) fn prepare_commitment_interpolation<'a>(
         workspace.arena(),
         &batches,
         inverse_twiddles,
+        workspace
+            .plan()
+            .commitment(tree)
+            .ok_or(ResidentSourceStageError::MissingCommitment(tree))?
+            .interpolation_mode,
     )?)
 }
 
