@@ -8648,6 +8648,12 @@ mod tests {
             ],
         )
         .unwrap();
+        let rc99_rows = 1u64 << cairo_air::components::range_check_9_9::LOG_SIZE;
+        *components
+            .iter_mut()
+            .find(|component| component.id == "range_check_9_9")
+            .unwrap() =
+            RuntimeComponentShape::uniform("range_check_9_9", rc99_rows, rc99_rows).unwrap();
         let shape = ProofShape::new(components).unwrap();
         let proof =
             ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
