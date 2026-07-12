@@ -62,6 +62,10 @@ required-features = ["emit-tools"]
 name = "arena_preflight"
 required-features = ["emit-tools"]
 
+[[test]]
+name = "prepared_composition_native"
+required-features = ["direct-retention-test-api"]
+
 [dependencies.stwo-cairo-dev-utils]
 path = "../dev_utils"
 optional = true

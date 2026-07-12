@@ -695,7 +695,7 @@ PY
 # Exit 0 alone is insufficient (cfg-gated tests can run nothing) — require a
 # "test result: ok. N passed" line with N >= 1 for EVERY mapped suite.
 # ---------------------------------------------------------------------------
-# Emits one "workdir|package|test_target" line per suite for the given lane.
+# Emits one "workdir|package|test_target|features" line per suite for the given lane.
 parity_suite_specs() {
   local lane="$1"
   case "$lane" in
@@ -712,7 +712,7 @@ parity_suite_specs() {
       echo "${STWO_POD}|stwo-backend-cuda|prepared_witness_feed_native"
       ;;
     STWO_CUDA_COMPOSITION_WIDE)
-      echo "${POD_PROVER_DIR}|stwo-cairo-gpu-prover|prepared_composition_native"
+      echo "${POD_PROVER_DIR}|stwo-cairo-gpu-prover|prepared_composition_native|direct-retention-test-api"
       ;;
     *)
       echo "${STWO_POD}|stwo-backend-cuda|prepared_relation_native"
@@ -727,11 +727,13 @@ run_parity_lane() {
   specs="$(parity_suite_specs "$lane")"
   n_suites="$(printf '%s\n' "$specs" | grep -c .)"
   # Chain suites with && so any failing suite fails the pod job.
-  local cmds="" names="" dir pkg target
-  while IFS='|' read -r dir pkg target; do
+  local cmds="" names="" dir pkg target features feature_args
+  while IFS='|' read -r dir pkg target features; do
     [[ -z "$dir" ]] && continue
+    feature_args=""
+    [[ -z "$features" ]] || feature_args=" --features ${features}"
     [[ -n "$cmds" ]] && cmds+=" && "
-    cmds+="cd '${dir}' && cargo test -p ${pkg} --test ${target}"
+    cmds+="cd '${dir}' && cargo test -p ${pkg}${feature_args} --test ${target}"
     names+="${target} + "
   done <<<"$specs"
   names="${names% + }"

@@ -349,6 +349,14 @@ class ArchitectureRecordTest(unittest.TestCase):
             SOUNDNESS_GATES["strict_resident_whole_proof_simd_byte_identity"],
             len(STRICT_RESIDENT_REQUIRED_TESTS),
         )
+        composition_command = SOUNDNESS_COMMANDS[
+            "prepared_composition_eager_capture_cpu_reference"
+        ]
+        self.assertIn("--features", composition_command)
+        self.assertEqual(
+            composition_command[composition_command.index("--features") + 1],
+            "direct-retention-test-api",
+        )
 
     def test_reference_cache_tests_cannot_be_absorbed_by_strict_resident_target(self) -> None:
         _, stwo_cairo = source_roots()

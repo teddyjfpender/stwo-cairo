@@ -241,6 +241,8 @@ GATES = (
             "../stwo-cairo/stwo_cairo_prover/Cargo.toml",
             "-p",
             "stwo-cairo-gpu-prover",
+            "--features",
+            "direct-retention-test-api",
             "--test",
             "prepared_composition_native",
         ),
