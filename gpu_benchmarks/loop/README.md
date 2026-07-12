@@ -168,6 +168,9 @@ baseline.
 
 - Pod identity: `pod.conf` (`POD_ID` + fallback endpoint); resolution via `runpodctl`.
 - Repos on the pod: `/workspace/stwo`, `/workspace/stwo-cairo`.
+- `pod_run.sh` keeps Rustup and Cargo state on the persistent volume at
+  `/workspace/.rustup-persist` and `/workspace/.cargo-persist`; override these remote
+  paths with `POD_RUSTUP_HOME` and `POD_CARGO_HOME` when needed.
 - `stwo_cairo_prover/Cargo.toml` uses portable relative `[patch]` paths to the sibling
   `stwo` checkout; the same manifest resolves locally and under `/workspace` on a pod.
 - PIE inputs (`SN_PIE_*.zip`, the 10-transfer zip) already live on the pod and are

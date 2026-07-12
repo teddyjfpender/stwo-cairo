@@ -9,7 +9,8 @@
 #   1. START the pod (idempotent) and RE-RESOLVE its ssh endpoint. Community
 #      pods return a NEW host/port on each resume — never trust a cached one.
 #   2. BOOTSTRAP the reset container layer: apt rsync + rustup (the /workspace
-#      volume persists target/ + caches; the container layer does NOT).
+#      volume persists target/, Rustup/Cargo homes, and caches; the container
+#      layer does NOT).
 #   3. rsync BOTH repos (stwo, stwo-cairo) with the exact excludes bench_loop
 #      uses, so a later bench_loop sync is a no-op.
 #   4. Install and verify the repo-pinned Rust toolchain after the toolchain
@@ -36,7 +37,7 @@
 #   * function `phase NAME CMD...` : run CMD (never aborts siblings), record
 #       $RUN/NAME.rc and $RUN/NAME.secs. The driver polls exactly the NAMEs it
 #       finds by scanning your file for lines beginning `phase `.
-#   * exported env: cargo/cuda on PATH, STWO_CUDA_OBJ_CACHE,
+#   * exported env: cargo/cuda on PATH, RUSTUP_HOME, CARGO_HOME, STWO_CUDA_OBJ_CACHE,
 #       STWO_PARITY_REF_CACHE, STWO_SMOKE_DIVERGENCE_DIR, RUST_MIN_STACK=32Mi,
 #       STWO_BOOTLOADER_JSON.
 #   * vars: $CAIRO (=/workspace/stwo-cairo/stwo_cairo_prover),
@@ -59,6 +60,10 @@ CAIRO_LOCAL="${CAIRO_LOCAL:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 STWO_LOCAL="${STWO_LOCAL:-${CAIRO_LOCAL}/../stwo}"
 POD_CONF="${POD_CONF:-${SCRIPT_DIR}/pod.conf}"
 RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results}"
+POD_RUSTUP_HOME="${POD_RUSTUP_HOME:-/workspace/.rustup-persist}"
+POD_CARGO_HOME="${POD_CARGO_HOME:-/workspace/.cargo-persist}"
+printf -v POD_RUSTUP_HOME_Q '%q' "$POD_RUSTUP_HOME"
+printf -v POD_CARGO_HOME_Q '%q' "$POD_CARGO_HOME"
 
 PHASES_FILE="${1:?usage: pod_run.sh <phases_file> [label]}"
 [[ -f "$PHASES_FILE" ]] || { echo "phases file not found: $PHASES_FILE" >&2; exit 2; }
@@ -89,6 +94,7 @@ note "label:  $LABEL"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   note "DRY_RUN: pod=$POD_ID key=$KEY"
+  note "DRY_RUN: RUSTUP_HOME=$POD_RUSTUP_HOME CARGO_HOME=$POD_CARGO_HOME"
   note "DRY_RUN: would bootstrap, rsync $STWO_LOCAL and $CAIRO_LOCAL, install the pinned toolchain, run the phases above, fetch to $RESULTS_DIR/$LABEL, stop the pod."
   exit 0
 fi
@@ -122,11 +128,15 @@ note "endpoint: $HOST:$PORT"
 
 # --- 2. bootstrap the reset container layer ---
 note "bootstrap (rsync + rustup)"
-pssh 'set -e
+pssh "set -e
+  export RUSTUP_HOME=$POD_RUSTUP_HOME_Q
+  export CARGO_HOME=$POD_CARGO_HOME_Q
+  export PATH=\"\$CARGO_HOME/bin:\$PATH\"
+  mkdir -p \"\$RUSTUP_HOME\" \"\$CARGO_HOME\"
   command -v rsync >/dev/null 2>&1 || { apt-get update -qq >/dev/null && apt-get install -y -qq rsync >/dev/null; }
-  if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+  if [ ! -x \"\$CARGO_HOME/bin/rustup\" ]; then
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none >/dev/null
-  fi' || { note "BOOTSTRAP FAILED"; exit 1; }
+  fi" || { note "BOOTSTRAP FAILED"; exit 1; }
 
 # --- 3. rsync both repos (bench_loop-identical excludes) ---
 note "rsync stwo"
@@ -143,7 +153,9 @@ rsync -azc --delete --partial --no-owner --no-group --exclude=target --exclude=.
 # --- 4. install + verify the repo-pinned Rust toolchain ---
 note "install pinned Rust toolchain"
 pssh "set -e
-  . \"\$HOME/.cargo/env\"
+  export RUSTUP_HOME=$POD_RUSTUP_HOME_Q
+  export CARGO_HOME=$POD_CARGO_HOME_Q
+  export PATH=\"\$CARGO_HOME/bin:\$PATH\"
   cd '$CAIRO_POD/stwo_cairo_prover'
   rustup toolchain install
   rustc --version" || { note "TOOLCHAIN INSTALL FAILED"; exit 1; }
@@ -151,11 +163,13 @@ pssh "set -e
 # --- 5. upload + launch the detached session with rc sentinels ---
 note "upload + launch session"
 {
-  cat <<'PROLOGUE'
+  cat <<'PROLOGUE_HEADER'
 #!/usr/bin/env bash
 set -u
-. "$HOME/.cargo/env" 2>/dev/null
-export PATH=/usr/local/cuda/bin:$PATH
+PROLOGUE_HEADER
+  printf 'export RUSTUP_HOME=%q\nexport CARGO_HOME=%q\n' "$POD_RUSTUP_HOME" "$POD_CARGO_HOME"
+  cat <<'PROLOGUE'
+export PATH="$CARGO_HOME/bin:/usr/local/cuda/bin:$PATH"
 export STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache
 export STWO_PARITY_REF_CACHE=/workspace/.parity_ref_cache
 export STWO_SMOKE_DIVERGENCE_DIR=/workspace/bench_loop_runs/pod_run/divergence
