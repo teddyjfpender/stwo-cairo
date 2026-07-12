@@ -60,6 +60,11 @@ use stwo_cairo_prover::witness::proof_shape::{
 };
 
 use crate::composition_plan::{CompositionExtParamSource, CompositionPlan};
+use crate::direct_composition_retention::{
+    derive_direct_composition_consumers, direct_bitmap_hash,
+    validate_direct_composition_retention_plan, DirectCompositionRetentionMode,
+    DirectCompositionRetentionPlan,
+};
 use crate::multiplicity_pipeline::{
     plan_graph_a_multiplicities, plan_public_memory_multiplicity_seed,
     FixedMultiplicityCoverageGap, GraphAMultiplicityPlan, GraphAMultiplicityPlanError,
@@ -480,6 +485,9 @@ pub struct CommitmentGeometry {
     pub grouped_column_sources: Vec<Vec<CommitmentColumnSource>>,
     /// Explicit commitment/opening policy in canonical group order.
     pub retained_evaluation_groups: Vec<bool>,
+    /// Exact-native evaluations retained only through composition. These are
+    /// separate from decommit intent; allocation uses the union.
+    pub direct_composition_evaluation_groups: Vec<bool>,
 }
 
 fn commitment_workspace_requirements(
@@ -498,10 +506,11 @@ fn commitment_workspace_requirements(
                 .grouped_column_log_sizes
                 .iter()
                 .zip(&commitment.retained_evaluation_groups)
+                .zip(&commitment.direct_composition_evaluation_groups)
                 .map(
-                    |(logs, &retain_evaluations)| ProgressiveCommitGroupGeometry {
+                    |((logs, &retain_decommit), &retain_direct)| ProgressiveCommitGroupGeometry {
                         coefficient_log_sizes: logs.clone(),
-                        retain_evaluations,
+                        retain_evaluations: retain_decommit || retain_direct,
                     },
                 )
                 .collect();
@@ -522,6 +531,34 @@ fn commitment_workspace_requirements(
             })
         }
     }
+}
+
+fn commitment_group_evaluation_bytes(
+    commitment: &CommitmentGeometry,
+    group: usize,
+) -> Result<usize, ArenaPlanError> {
+    commitment
+        .grouped_column_log_sizes
+        .get(group)
+        .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+            "retained evaluation group index is out of range",
+        ))?
+        .iter()
+        .try_fold(0usize, |bytes, &coefficient_log| {
+            let evaluation_log = coefficient_log
+                .checked_add(commitment.config.log_blowup_factor)
+                .ok_or(ArenaPlanError::SizeOverflow)?;
+            let words = 1usize
+                .checked_shl(evaluation_log)
+                .ok_or(ArenaPlanError::SizeOverflow)?;
+            bytes
+                .checked_add(
+                    words
+                        .checked_mul(core::mem::size_of::<u32>())
+                        .ok_or(ArenaPlanError::SizeOverflow)?,
+                )
+                .ok_or(ArenaPlanError::SizeOverflow)
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -575,6 +612,11 @@ pub struct ProtocolIdentity {
     pub interpolation_mode: InterpolationLaunchMode,
     pub quotient_numerator_source_policy: QuotientNumeratorSourcePolicy,
     pub commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
+    pub direct_composition_retention_mode: DirectCompositionRetentionMode,
+    pub direct_composition_planner_key: u64,
+    pub direct_composition_occurrence_bitmap_hash: u64,
+    pub direct_composition_group_rounded_bytes: usize,
+    pub retained_evaluation_union_bytes: usize,
 }
 
 impl ProtocolIdentity {
@@ -588,6 +630,11 @@ impl ProtocolIdentity {
         kernel_manifest_hash: u64,
         decommit_strategy: DecommitStrategy,
         commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
+        direct_composition_retention_mode: DirectCompositionRetentionMode,
+        direct_composition_planner_key: u64,
+        direct_composition_occurrence_bitmap_hash: u64,
+        direct_composition_group_rounded_bytes: usize,
+        retained_evaluation_union_bytes: usize,
     ) -> Self {
         Self {
             pow_bits: pcs.pow_bits,
@@ -604,6 +651,11 @@ impl ProtocolIdentity {
             interpolation_mode: InterpolationLaunchMode::from_env(),
             quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::from_env(),
             commit_mode,
+            direct_composition_retention_mode,
+            direct_composition_planner_key,
+            direct_composition_occurrence_bitmap_hash,
+            direct_composition_group_rounded_bytes,
+            retained_evaluation_union_bytes,
         }
     }
 }
@@ -817,6 +869,7 @@ pub struct ProtocolGeometry {
     pub oods: OodsGeometry,
     pub quotient: QuotientGeometry,
     pub commitments: Vec<CommitmentGeometry>,
+    pub direct_composition_retention: Option<DirectCompositionRetentionPlan>,
     /// Commitment-tree leaf log sizes opened by the PCS, in proof tree order.
     /// The first tree is the cold-once resident preprocessed commitment.
     pub opened_tree_log_sizes: Vec<u32>,
@@ -1380,6 +1433,24 @@ impl ProtocolGeometry {
         }
         let mut ids = Vec::new();
         let mut committed_opened_sources = Vec::with_capacity(self.total_opened_columns);
+        match (
+            self.identity.direct_composition_retention_mode,
+            &self.direct_composition_retention,
+        ) {
+            (DirectCompositionRetentionMode::Disabled, None)
+                if self.identity.direct_composition_planner_key == 0
+                    && self.identity.direct_composition_occurrence_bitmap_hash == 0
+                    && self.identity.direct_composition_group_rounded_bytes == 0
+                    && self.identity.retained_evaluation_union_bytes == 0 => {}
+            (DirectCompositionRetentionMode::ExactNative, Some(plan))
+                if self.identity.commit_mode == ProgressiveCommitMode::DomainProgressive
+                    && self.identity.direct_composition_planner_key == plan.cache_key => {}
+            _ => {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "direct composition retention identity or mode drifted",
+                ));
+            }
+        }
         for commitment in &self.commitments {
             if ids.contains(&commitment.id) {
                 return Err(ArenaPlanError::InvalidProtocolGeometry(
@@ -1408,6 +1479,10 @@ impl ProtocolGeometry {
             }
             BufferLifetime::new(commitment.created, ProofEpoch::Decommit)?;
             if commitment.grouped_column_sources.len() != commitment.grouped_column_log_sizes.len()
+                || commitment.direct_composition_evaluation_groups.len()
+                    != commitment.grouped_column_log_sizes.len()
+                || commitment.retained_evaluation_groups.len()
+                    != commitment.grouped_column_log_sizes.len()
                 || commitment
                     .grouped_column_sources
                     .iter()
@@ -1478,6 +1553,92 @@ impl ProtocolGeometry {
             commitment_workspace_requirements(self.identity.commit_mode, commitment)
                 .map_err(ArenaPlanError::Commit)?;
         }
+        match &self.direct_composition_retention {
+            None => {
+                if self.commitments.iter().any(|commitment| {
+                    commitment
+                        .direct_composition_evaluation_groups
+                        .iter()
+                        .any(|&selected| selected)
+                }) {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "disabled direct composition retention selected a group",
+                    ));
+                }
+            }
+            Some(plan) => {
+                if self.identity.direct_composition_occurrence_bitmap_hash
+                    != direct_bitmap_hash(&plan.direct_bitmap)
+                {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "direct composition occurrence bitmap identity drifted",
+                    ));
+                }
+                let mut expected = self
+                    .commitments
+                    .iter()
+                    .map(|commitment| vec![false; commitment.grouped_column_log_sizes.len()])
+                    .collect::<Vec<_>>();
+                for binding in plan.bindings.iter().filter(|binding| binding.direct) {
+                    let column = plan.columns.get(binding.column).ok_or(
+                        ArenaPlanError::InvalidProtocolGeometry(
+                            "direct composition binding column is out of range",
+                        ),
+                    )?;
+                    let commitment = self
+                        .commitments
+                        .iter()
+                        .position(|commitment| commitment.id == column.tree)
+                        .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                            "direct composition binding tree is missing",
+                        ))?;
+                    let selected = expected[commitment].get_mut(column.group).ok_or(
+                        ArenaPlanError::InvalidProtocolGeometry(
+                            "direct composition binding group is out of range",
+                        ),
+                    )?;
+                    *selected = true;
+                }
+                if self
+                    .commitments
+                    .iter()
+                    .zip(&expected)
+                    .any(|(commitment, expected)| {
+                        commitment.direct_composition_evaluation_groups != *expected
+                    })
+                {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "direct composition group closure has missing or extra groups",
+                    ));
+                }
+                let mut direct_bytes = 0usize;
+                let mut union_bytes = 0usize;
+                for commitment in &self.commitments {
+                    for group in 0..commitment.grouped_column_log_sizes.len() {
+                        let direct = commitment.direct_composition_evaluation_groups[group];
+                        let decommit = commitment.retained_evaluation_groups[group];
+                        if direct || decommit {
+                            let bytes = commitment_group_evaluation_bytes(commitment, group)?;
+                            union_bytes = union_bytes
+                                .checked_add(bytes)
+                                .ok_or(ArenaPlanError::SizeOverflow)?;
+                            if direct {
+                                direct_bytes = direct_bytes
+                                    .checked_add(bytes)
+                                    .ok_or(ArenaPlanError::SizeOverflow)?;
+                            }
+                        }
+                    }
+                }
+                if self.identity.direct_composition_group_rounded_bytes != direct_bytes
+                    || self.identity.retained_evaluation_union_bytes != union_bytes
+                {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "direct composition physical retained byte identity drifted",
+                    ));
+                }
+            }
+        }
         if committed_opened_sources.len() != self.oods.columns.len()
             || self
                 .oods
@@ -1547,7 +1708,7 @@ impl ProtocolGeometry {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
         };
-        feed(b"stwo-cairo-protocol-geometry-v8\0");
+        feed(b"stwo-cairo-protocol-geometry-v9\0");
         feed(&self.identity.pow_bits.to_le_bytes());
         feed(&self.identity.log_blowup_factor.to_le_bytes());
         feed(&self.identity.log_last_layer_degree_bound.to_le_bytes());
@@ -1561,6 +1722,16 @@ impl ProtocolGeometry {
         feed(&[self.identity.interpolation_mode as u8]);
         feed(&[self.identity.quotient_numerator_source_policy as u8]);
         feed(&[self.identity.commit_mode as u8]);
+        feed(&[self.identity.direct_composition_retention_mode as u8]);
+        feed(&self.identity.direct_composition_planner_key.to_le_bytes());
+        feed(
+            &self
+                .identity
+                .direct_composition_occurrence_bitmap_hash
+                .to_le_bytes(),
+        );
+        feed(&(self.identity.direct_composition_group_rounded_bytes as u64).to_le_bytes());
+        feed(&(self.identity.retained_evaluation_union_bytes as u64).to_le_bytes());
         for identity in &self.preprocessed_column_ids {
             feed(&(identity.len() as u64).to_le_bytes());
             feed(identity.as_bytes());
@@ -1612,6 +1783,10 @@ impl ProtocolGeometry {
             feed(&commitment.config.max_fused_tail_levels.to_le_bytes());
             feed(&(commitment.retained_evaluation_groups.len() as u64).to_le_bytes());
             for &retained in &commitment.retained_evaluation_groups {
+                feed(&[u8::from(retained)]);
+            }
+            feed(&(commitment.direct_composition_evaluation_groups.len() as u64).to_le_bytes());
+            for &retained in &commitment.direct_composition_evaluation_groups {
                 feed(&[u8::from(retained)]);
             }
             for group in &commitment.grouped_column_log_sizes {
@@ -1821,6 +1996,20 @@ struct LogicalCompositionWorkspace {
     accumulators: LogicalBufferId,
     random_coefficient_powers: LogicalBufferId,
     composition_coefficients: [LogicalBufferId; 8],
+    direct_bindings: Vec<LogicalDirectCompositionBinding>,
+}
+
+#[derive(Clone, Debug)]
+struct LogicalDirectCompositionBinding {
+    consumer: usize,
+    source: OpenedColumnSource,
+    tree: CommitmentTreeId,
+    proof_column: usize,
+    group: usize,
+    column_in_group: usize,
+    canonical_column: usize,
+    evaluation_log_size: u32,
+    evaluation: Option<LogicalBufferId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1896,6 +2085,8 @@ struct LogicalCommitWorkspace {
     tail_level_ptrs: Option<LogicalBufferId>,
     tail_outputs: Vec<LogicalBufferId>,
     retained_evaluations: Vec<Option<Vec<LogicalBufferId>>>,
+    decommit_evaluation_groups: Vec<bool>,
+    direct_composition_evaluation_groups: Vec<bool>,
     leaf_workspace: LogicalCommitLeafWorkspace,
     interpolation_batches: Vec<LogicalInterpolationBatch>,
 }
@@ -2473,6 +2664,19 @@ pub struct PlannedCompositionTraceColumn {
     pub coefficients: ArenaBinding,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedDirectCompositionBinding {
+    pub consumer: usize,
+    pub source: OpenedColumnSource,
+    pub tree: CommitmentTreeId,
+    pub proof_column: usize,
+    pub group: usize,
+    pub column_in_group: usize,
+    pub canonical_column: usize,
+    pub evaluation_log_size: u32,
+    pub evaluation: Option<ArenaBinding>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PlannedCompositionExtParams {
     pub component: &'static str,
@@ -2492,6 +2696,7 @@ pub struct PlannedCompositionWorkspace {
     pub inverse_twiddles: ArenaBinding,
     pub ext_params: Vec<PlannedCompositionExtParams>,
     pub slots: CompositionWorkspaceSlots,
+    pub direct_bindings: Vec<PlannedDirectCompositionBinding>,
 }
 
 impl PlannedCompositionWorkspace {
@@ -2582,6 +2787,8 @@ pub struct PlannedCommitment {
     pub twiddles: ArenaBinding,
     pub slots: ModeAwareCommitWorkspaceSlots,
     pub retained_evaluation_groups: Vec<Option<Vec<ArenaBinding>>>,
+    pub evaluation_output_groups: Vec<Option<Vec<ArenaBinding>>>,
+    pub direct_composition_evaluation_groups: Vec<Option<Vec<ArenaBinding>>>,
     /// Exact root and retained decommit layers, bound independently of the
     /// ephemeral `PreparedCommitGraph` value used for the cold fixed commit.
     pub root: ArenaBinding,
@@ -2704,6 +2911,11 @@ impl ProofArenaPlan {
         protocol: &ProtocolGeometry,
         composition: &CompositionPlan,
     ) -> Result<Self, ArenaPlanError> {
+        if protocol.identity.direct_composition_retention_mode
+            == DirectCompositionRetentionMode::ExactNative
+        {
+            return Err(ArenaPlanError::DirectCompositionExecutionUnsupported);
+        }
         Self::build_inner(plan, protocol, composition, None)
     }
 
@@ -2713,6 +2925,11 @@ impl ProofArenaPlan {
         composition: &CompositionPlan,
         geometry: ExecutionTableGeometry,
     ) -> Result<Self, ArenaPlanError> {
+        if protocol.identity.direct_composition_retention_mode
+            == DirectCompositionRetentionMode::ExactNative
+        {
+            return Err(ArenaPlanError::DirectCompositionExecutionUnsupported);
+        }
         Self::build_inner(plan, protocol, composition, Some(geometry))
     }
 
@@ -2731,6 +2948,21 @@ impl ProofArenaPlan {
                 protocol: protocol.identity.composition_plan_hash,
                 planned: composition.key(),
             });
+        }
+        if let Some(direct) = &protocol.direct_composition_retention {
+            let consumers = derive_direct_composition_consumers(&protocol.oods, composition)
+                .map_err(|_| {
+                    ArenaPlanError::InvalidProtocolGeometry(
+                        "direct composition consumer derivation failed",
+                    )
+                })?;
+            validate_direct_composition_retention_plan(protocol, &consumers, direct).map_err(
+                |_| {
+                    ArenaPlanError::InvalidProtocolGeometry(
+                        "direct composition retention plan drifted",
+                    )
+                },
+            )?;
         }
         if protocol.identity.relation_graph_hash != plan.relation_graph_hash {
             return Err(ArenaPlanError::RelationGraphMismatch {
@@ -3151,6 +3383,7 @@ pub enum ArenaPlanError {
         last: ProofEpoch,
     },
     InvalidProtocolGeometry(&'static str),
+    DirectCompositionExecutionUnsupported,
     ComponentExceedsProtocolDomain {
         component: &'static str,
         padded_rows: u64,
@@ -5495,6 +5728,37 @@ fn retained_quotient_numerator_source(
     ))
 }
 
+fn direct_composition_logical_source(
+    commitments: &[LogicalCommitWorkspace],
+    column: &crate::direct_composition_retention::DirectCompositionColumn,
+) -> Result<LogicalBufferId, ArenaPlanError> {
+    let commitment = commitments
+        .iter()
+        .find(|commitment| commitment.id == column.tree)
+        .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+            "direct composition commitment is missing",
+        ))?;
+    if !commitment
+        .direct_composition_evaluation_groups
+        .get(column.group)
+        .copied()
+        .unwrap_or(false)
+    {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "direct composition group closure is missing",
+        ));
+    }
+    commitment
+        .retained_evaluations
+        .get(column.group)
+        .and_then(Option::as_ref)
+        .and_then(|group| group.get(column.column_in_group))
+        .copied()
+        .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+            "direct composition evaluation output is missing",
+        ))
+}
+
 fn append_protocol_buffers(
     logical: &mut Vec<LogicalBuffer>,
     protocol: &ProtocolGeometry,
@@ -5818,30 +6082,46 @@ fn append_protocol_buffers(
                 "commitment opening policy does not match its groups",
             ));
         }
+        if geometry.direct_composition_evaluation_groups.len()
+            != geometry.grouped_column_log_sizes.len()
+        {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "direct composition retention policy does not match its groups",
+            ));
+        }
         let retained_evaluations = geometry
             .grouped_column_log_sizes
             .iter()
             .zip(&geometry.retained_evaluation_groups)
-            .map(|(logs, &keep)| {
-                keep.then(|| {
-                    logs.iter()
-                        .map(|&log_size| {
-                            let evaluation_log = log_size
-                                .checked_add(geometry.config.log_blowup_factor)
-                                .ok_or(ArenaPlanError::SizeOverflow)?;
-                            push_buffer_id(
-                                logical,
-                                None,
-                                None,
-                                BufferPurpose::CommitRetainedEvaluation,
-                                ordinal()?,
-                                checked_pow2(evaluation_log)?,
-                                retained,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, ArenaPlanError>>()
-                })
-                .transpose()
+            .zip(&geometry.direct_composition_evaluation_groups)
+            .map(|((logs, &keep_decommit), &keep_direct)| {
+                (keep_decommit || keep_direct)
+                    .then(|| {
+                        logs.iter()
+                            .map(|&log_size| {
+                                let evaluation_log = log_size
+                                    .checked_add(geometry.config.log_blowup_factor)
+                                    .ok_or(ArenaPlanError::SizeOverflow)?;
+                                push_buffer_id(
+                                    logical,
+                                    None,
+                                    None,
+                                    BufferPurpose::CommitRetainedEvaluation,
+                                    ordinal()?,
+                                    checked_pow2(evaluation_log)?,
+                                    if keep_decommit {
+                                        retained
+                                    } else {
+                                        BufferLifetime::new(
+                                            geometry.created,
+                                            ProofEpoch::Composition,
+                                        )?
+                                    },
+                                )
+                            })
+                            .collect::<Result<Vec<_>, ArenaPlanError>>()
+                    })
+                    .transpose()
             })
             .collect::<Result<Vec<_>, ArenaPlanError>>()?;
         let leaf_workspace = match &requirements {
@@ -5997,6 +6277,10 @@ fn append_protocol_buffers(
             tail_level_ptrs,
             tail_outputs,
             retained_evaluations,
+            decommit_evaluation_groups: geometry.retained_evaluation_groups.clone(),
+            direct_composition_evaluation_groups: geometry
+                .direct_composition_evaluation_groups
+                .clone(),
             leaf_workspace,
             interpolation_batches,
         });
@@ -6500,6 +6784,45 @@ fn append_protocol_buffers(
             })
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+    let direct_bindings = protocol
+        .direct_composition_retention
+        .as_ref()
+        .map(|plan| {
+            plan.bindings
+                .iter()
+                .enumerate()
+                .map(|(consumer, binding)| {
+                    if binding.consumer != consumer {
+                        return Err(ArenaPlanError::InvalidProtocolGeometry(
+                            "direct composition occurrence order drifted",
+                        ));
+                    }
+                    let column = plan.columns.get(binding.column).ok_or(
+                        ArenaPlanError::InvalidProtocolGeometry(
+                            "direct composition column index drifted",
+                        ),
+                    )?;
+                    Ok(LogicalDirectCompositionBinding {
+                        consumer,
+                        source: column.source,
+                        tree: column.tree,
+                        proof_column: column.proof_column,
+                        group: column.group,
+                        column_in_group: column.column_in_group,
+                        canonical_column: column.canonical_column,
+                        evaluation_log_size: column.evaluation_log_size,
+                        evaluation: binding
+                            .direct
+                            .then(|| {
+                                direct_composition_logical_source(&logical_commitments, column)
+                            })
+                            .transpose()?,
+                    })
+                })
+                .collect()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let logical_composition = LogicalCompositionWorkspace {
         plan: composition.clone(),
         requirements: composition_requirements,
@@ -6513,6 +6836,7 @@ fn append_protocol_buffers(
         accumulators: composition_accumulators,
         random_coefficient_powers: composition_random_powers,
         composition_coefficients,
+        direct_bindings,
     };
     let opened_columns = protocol
         .oods
@@ -7132,7 +7456,7 @@ fn resolve_commitment_slots(
         .copied()
         .map(binding)
         .collect::<Result<Vec<_>, _>>()?;
-    let retained_evaluation_groups = logical
+    let evaluation_output_groups = logical
         .retained_evaluations
         .iter()
         .map(|group| {
@@ -7142,6 +7466,16 @@ fn resolve_commitment_slots(
                 .transpose()
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+    let retained_evaluation_groups = evaluation_output_groups
+        .iter()
+        .zip(&logical.decommit_evaluation_groups)
+        .map(|(group, &selected)| selected.then(|| group.clone().expect("union output exists")))
+        .collect();
+    let direct_composition_evaluation_groups = evaluation_output_groups
+        .iter()
+        .zip(&logical.direct_composition_evaluation_groups)
+        .map(|(group, &selected)| selected.then(|| group.clone().expect("union output exists")))
+        .collect();
     let interpolation_batches = logical
         .interpolation_batches
         .iter()
@@ -7239,6 +7573,8 @@ fn resolve_commitment_slots(
         twiddles: binding(logical.twiddles)?,
         slots,
         retained_evaluation_groups,
+        evaluation_output_groups,
+        direct_composition_evaluation_groups,
         root,
         retained_layers_bottom_up,
         interpolation_mode: logical.interpolation_mode,
@@ -7336,6 +7672,23 @@ fn resolve_composition_slots(
             })
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+    let direct_bindings = logical
+        .direct_bindings
+        .iter()
+        .map(|direct| {
+            Ok(PlannedDirectCompositionBinding {
+                consumer: direct.consumer,
+                source: direct.source,
+                tree: direct.tree,
+                proof_column: direct.proof_column,
+                group: direct.group,
+                column_in_group: direct.column_in_group,
+                canonical_column: direct.canonical_column,
+                evaluation_log_size: direct.evaluation_log_size,
+                evaluation: direct.evaluation.map(binding).transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, ArenaPlanError>>()?;
     let random_coefficient = binding(logical.random_coefficient)?;
     let forward_twiddles = binding(logical.forward_twiddles)?;
     let inverse_twiddles = binding(logical.inverse_twiddles)?;
@@ -7344,6 +7697,11 @@ fn resolve_composition_slots(
         .flatten()
         .map(|column| column.coefficients)
         .chain(ext_params.iter().filter_map(|params| params.binding))
+        .chain(
+            direct_bindings
+                .iter()
+                .filter_map(|direct| direct.evaluation),
+        )
         .chain([random_coefficient, forward_twiddles, inverse_twiddles]);
     if external
         .into_iter()
@@ -7391,6 +7749,7 @@ fn resolve_composition_slots(
         inverse_twiddles,
         ext_params,
         slots,
+        direct_bindings,
     })
 }
 
@@ -9147,6 +9506,11 @@ mod tests {
                 interpolation_mode: InterpolationLaunchMode::StageWiseCopyThenInPlace,
                 quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::CoefficientsOnly,
                 commit_mode: ProgressiveCommitMode::FullLifting,
+                direct_composition_retention_mode: DirectCompositionRetentionMode::Disabled,
+                direct_composition_planner_key: 0,
+                direct_composition_occurrence_bitmap_hash: 0,
+                direct_composition_group_rounded_bytes: 0,
+                retained_evaluation_union_bytes: 0,
             },
             preprocessed_column_ids: vec![
                 "test_preprocessed".to_owned(),
@@ -9184,6 +9548,7 @@ mod tests {
                         CommitmentColumnSource::Preprocessed { ordinal: 0 },
                     ]],
                     retained_evaluation_groups: vec![false],
+                    direct_composition_evaluation_groups: vec![false],
                 },
                 CommitmentGeometry {
                     id: CommitmentTreeId::Base,
@@ -9195,6 +9560,7 @@ mod tests {
                         max_fused_tail_levels: 12,
                     },
                     retained_evaluation_groups: vec![false; base_logs.len()],
+                    direct_composition_evaluation_groups: vec![false; base_logs.len()],
                     grouped_column_log_sizes: base_logs,
                     grouped_column_sources: base_sources,
                 },
@@ -9208,6 +9574,7 @@ mod tests {
                         max_fused_tail_levels: 12,
                     },
                     retained_evaluation_groups: vec![false; interaction_logs.len()],
+                    direct_composition_evaluation_groups: vec![false; interaction_logs.len()],
                     grouped_column_log_sizes: interaction_logs,
                     grouped_column_sources: interaction_sources,
                 },
@@ -9225,8 +9592,10 @@ mod tests {
                         .map(|ordinal| CommitmentColumnSource::Composition { ordinal })
                         .collect()],
                     retained_evaluation_groups: vec![false],
+                    direct_composition_evaluation_groups: vec![false],
                 },
             ],
+            direct_composition_retention: None,
             opened_tree_log_sizes: vec![26, 26, 26, 26],
             fri_layer_log_sizes: (2..=26).rev().collect(),
         };
@@ -9382,6 +9751,285 @@ mod tests {
                 .count(),
             "both modes own exactly one common Merkle leaf layer per tree"
         );
+
+        assert!(arena.composition().direct_bindings.is_empty());
+        assert!(arena.commitments().iter().all(|commitment| commitment
+            .direct_composition_evaluation_groups
+            .iter()
+            .all(Option::is_none)));
+        assert_eq!(
+            arena
+                .logical_buffers()
+                .iter()
+                .filter(|buffer| buffer.purpose == BufferPurpose::CommitRetainedEvaluation)
+                .count(),
+            0,
+            "flags-off layout must not allocate direct-retention outputs"
+        );
+
+        let mut keyed = Vec::new();
+        for mode in [
+            DirectCompositionRetentionMode::Disabled,
+            DirectCompositionRetentionMode::ExactNative,
+        ] {
+            for planner_key in [0, 1] {
+                let mut candidate = protocol.clone();
+                candidate.identity.direct_composition_retention_mode = mode;
+                candidate.identity.direct_composition_planner_key = planner_key;
+                keyed.push(candidate.key());
+            }
+        }
+        assert_eq!(keyed.iter().copied().collect::<BTreeSet<_>>().len(), 4);
+
+        let consumers = derive_direct_composition_consumers(&protocol.oods, &composition).unwrap();
+        let direct_plan = crate::direct_composition_retention::plan_direct_composition_retention(
+            &protocol, &consumers,
+        )
+        .unwrap();
+        assert!(direct_plan.bindings.iter().any(|binding| binding.direct));
+        let mut direct_protocol = protocol.clone();
+        direct_protocol.identity.commit_mode = ProgressiveCommitMode::DomainProgressive;
+        direct_protocol.identity.decommit_strategy = DecommitStrategy::HybridByGroup;
+        direct_protocol.identity.direct_composition_retention_mode =
+            DirectCompositionRetentionMode::ExactNative;
+        direct_protocol.identity.direct_composition_planner_key = direct_plan.cache_key;
+        direct_protocol
+            .identity
+            .direct_composition_occurrence_bitmap_hash =
+            direct_bitmap_hash(&direct_plan.direct_bitmap);
+        direct_protocol.direct_composition_retention = Some(direct_plan.clone());
+        for binding in direct_plan.bindings.iter().filter(|binding| binding.direct) {
+            let column = direct_plan.columns[binding.column];
+            direct_protocol
+                .commitments
+                .iter_mut()
+                .find(|commitment| commitment.id == column.tree)
+                .unwrap()
+                .direct_composition_evaluation_groups[column.group] = true;
+        }
+        let first_direct = direct_plan
+            .bindings
+            .iter()
+            .find(|binding| binding.direct)
+            .map(|binding| direct_plan.columns[binding.column])
+            .unwrap();
+        direct_protocol
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == first_direct.tree)
+            .unwrap()
+            .retained_evaluation_groups[first_direct.group] = true;
+        direct_protocol
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == CommitmentTreeId::Composition)
+            .unwrap()
+            .retained_evaluation_groups[0] = true;
+        let mut direct_bytes = 0usize;
+        let mut union_bytes = 0usize;
+        for commitment in &direct_protocol.commitments {
+            for ((logs, &decommit), &direct) in commitment
+                .grouped_column_log_sizes
+                .iter()
+                .zip(&commitment.retained_evaluation_groups)
+                .zip(&commitment.direct_composition_evaluation_groups)
+            {
+                let bytes = logs
+                    .iter()
+                    .map(|log| 1usize << (log + commitment.config.log_blowup_factor))
+                    .sum::<usize>()
+                    * core::mem::size_of::<u32>();
+                if direct {
+                    direct_bytes += bytes;
+                }
+                if direct || decommit {
+                    union_bytes += bytes;
+                }
+            }
+        }
+        direct_protocol
+            .identity
+            .direct_composition_group_rounded_bytes = direct_bytes;
+        direct_protocol.identity.retained_evaluation_union_bytes = union_bytes;
+        let mut changed_direct_bytes = direct_protocol.clone();
+        changed_direct_bytes
+            .identity
+            .direct_composition_group_rounded_bytes += core::mem::size_of::<u32>();
+        assert_ne!(direct_protocol.key(), changed_direct_bytes.key());
+        assert!(matches!(
+            ProofArenaPlan::build_inner(&proof, &changed_direct_bytes, &composition, None),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "direct composition physical retained byte identity drifted"
+            ))
+        ));
+        let mut changed_union_bytes = direct_protocol.clone();
+        changed_union_bytes.identity.retained_evaluation_union_bytes += core::mem::size_of::<u32>();
+        assert!(matches!(
+            ProofArenaPlan::build_inner(&proof, &changed_union_bytes, &composition, None),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "direct composition physical retained byte identity drifted"
+            ))
+        ));
+        let mut missing_direct_group = direct_protocol.clone();
+        missing_direct_group
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == first_direct.tree)
+            .unwrap()
+            .direct_composition_evaluation_groups[first_direct.group] = false;
+        assert!(matches!(
+            ProofArenaPlan::build_inner(&proof, &missing_direct_group, &composition, None),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "direct composition group closure has missing or extra groups"
+            ))
+        ));
+        let (extra_tree, extra_group) = direct_protocol
+            .commitments
+            .iter()
+            .find_map(|commitment| {
+                commitment
+                    .direct_composition_evaluation_groups
+                    .iter()
+                    .position(|&selected| !selected)
+                    .map(|group| (commitment.id, group))
+            })
+            .unwrap();
+        let mut extra_direct_group = direct_protocol.clone();
+        extra_direct_group
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == extra_tree)
+            .unwrap()
+            .direct_composition_evaluation_groups[extra_group] = true;
+        assert!(matches!(
+            ProofArenaPlan::build_inner(&proof, &extra_direct_group, &composition, None),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "direct composition group closure has missing or extra groups"
+            ))
+        ));
+        let mut changed_bitmap_hash = direct_protocol.clone();
+        changed_bitmap_hash
+            .identity
+            .direct_composition_occurrence_bitmap_hash ^= 1;
+        assert!(matches!(
+            ProofArenaPlan::build_inner(&proof, &changed_bitmap_hash, &composition, None),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "direct composition occurrence bitmap identity drifted"
+            ))
+        ));
+        assert!(matches!(
+            ProofArenaPlan::build(&proof, &direct_protocol, &composition),
+            Err(ArenaPlanError::DirectCompositionExecutionUnsupported)
+        ));
+        let direct_arena =
+            ProofArenaPlan::build_inner(&proof, &direct_protocol, &composition, None).unwrap();
+        assert_eq!(
+            direct_arena.composition().direct_bindings.len(),
+            direct_plan.bindings.len()
+        );
+        for (planned, oracle) in direct_arena
+            .composition()
+            .direct_bindings
+            .iter()
+            .zip(&direct_plan.bindings)
+        {
+            let column = direct_plan.columns[oracle.column];
+            assert_eq!(
+                (
+                    planned.consumer,
+                    planned.source,
+                    planned.tree,
+                    planned.proof_column,
+                    planned.group,
+                    planned.column_in_group,
+                    planned.canonical_column,
+                ),
+                (
+                    oracle.consumer,
+                    column.source,
+                    column.tree,
+                    column.proof_column,
+                    column.group,
+                    column.column_in_group,
+                    column.canonical_column,
+                )
+            );
+            assert_eq!(planned.evaluation.is_some(), oracle.direct);
+        }
+        let both = direct_arena
+            .composition()
+            .direct_bindings
+            .iter()
+            .find(|binding| {
+                binding.tree == first_direct.tree
+                    && binding.group == first_direct.group
+                    && binding.evaluation.is_some()
+            })
+            .unwrap()
+            .evaluation
+            .unwrap();
+        assert_eq!(
+            direct_arena.logical_buffers()[both.logical.0 as usize]
+                .lifetime
+                .last,
+            ProofEpoch::Decommit,
+            "direct plus decommit intent must retain through decommit"
+        );
+        let mut direct_only_protocol = direct_protocol.clone();
+        direct_only_protocol
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == first_direct.tree)
+            .unwrap()
+            .retained_evaluation_groups[first_direct.group] = false;
+        let direct_only_arena =
+            ProofArenaPlan::build_inner(&proof, &direct_only_protocol, &composition, None).unwrap();
+        let direct_only = direct_only_arena
+            .composition()
+            .direct_bindings
+            .iter()
+            .find(|binding| {
+                binding.evaluation.is_some()
+                    && binding.tree == first_direct.tree
+                    && binding.group == first_direct.group
+            })
+            .unwrap()
+            .evaluation
+            .unwrap();
+        assert_eq!(
+            direct_only_arena.logical_buffers()[direct_only.logical.0 as usize]
+                .lifetime
+                .last,
+            ProofEpoch::Composition,
+            "direct-only intent must end at composition"
+        );
+        let composition_commitment = direct_arena
+            .commitment(CommitmentTreeId::Composition)
+            .unwrap();
+        assert!(composition_commitment.direct_composition_evaluation_groups[0].is_none());
+        let decommit_only = composition_commitment.evaluation_output_groups[0]
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(
+            direct_arena.logical_buffers()[decommit_only.logical.0 as usize]
+                .lifetime
+                .last,
+            ProofEpoch::Decommit,
+            "decommit-only intent must retain through decommit"
+        );
+
+        let mut drifted_direct = direct_protocol.clone();
+        drifted_direct
+            .direct_composition_retention
+            .as_mut()
+            .unwrap()
+            .direct_bitmap[0] ^= 1;
+        assert!(matches!(
+            ProofArenaPlan::build_inner(&proof, &drifted_direct, &composition, None),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "direct composition occurrence bitmap identity drifted"
+            ))
+        ));
 
         let retained_numerator_arena =
             ProofArenaPlan::build(&proof, &retained_numerator, &composition).unwrap();

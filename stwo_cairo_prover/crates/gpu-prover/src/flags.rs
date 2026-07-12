@@ -73,6 +73,11 @@ pub const FLAGS: &[FlagDef] = &[
         purpose: "resident commitment: build leaves progressively across native evaluation domains",
         deletion_milestone: "M6 (remove only after full resident proof and flags-off baseline qualification)",
     },
+    FlagDef {
+        name: "STWO_CUDA_COMPOSITION_DIRECT_RETENTION",
+        purpose: "host-planned exact-native commitment evaluations for direct composition inputs",
+        deletion_milestone: "M6 (remove after direct composition execution is qualified and unconditional)",
+    },
 ];
 
 /// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed

@@ -21,6 +21,11 @@ use crate::arena_plan::{
     ProtocolIdentity, QuotientGeometry, TranscriptGeometry,
 };
 use crate::composition_plan::CompositionPlan;
+use crate::direct_composition_retention::{
+    derive_direct_composition_consumers, direct_bitmap_hash,
+    plan_direct_composition_retention_from_parts, DirectCompositionRetentionError,
+    DirectCompositionRetentionMode, DirectCompositionRetentionPlan,
+};
 use crate::plan::ProofPlan;
 use crate::protocol_discovery::ProtocolTranscriptDiscovery;
 use crate::relation::RelationTracePart;
@@ -50,6 +55,7 @@ pub struct ProtocolPlanPolicy {
     pub unretained_bottom_layers: u32,
     pub max_fused_tail_levels: u32,
     pub commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
+    pub direct_composition_retention_mode: DirectCompositionRetentionMode,
 }
 
 impl ProtocolPlanPolicy {
@@ -66,6 +72,7 @@ impl ProtocolPlanPolicy {
             unretained_bottom_layers: 4,
             max_fused_tail_levels: 12,
             commit_mode: stwo_backend_cuda::ProgressiveCommitMode::FullLifting,
+            direct_composition_retention_mode: DirectCompositionRetentionMode::Disabled,
         }
     }
 
@@ -82,6 +89,13 @@ impl ProtocolPlanPolicy {
         }
         let mut policy = Self::starknet_blake2s(hash, composition_max_kernel_instrs);
         policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::from_env();
+        policy.direct_composition_retention_mode = DirectCompositionRetentionMode::from_env();
+        if policy.direct_composition_retention_mode == DirectCompositionRetentionMode::ExactNative {
+            if policy.commit_mode != stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive {
+                return Err(ProtocolPlanError::DirectRetentionRequiresProgressiveCommit);
+            }
+            return Err(ProtocolPlanError::DirectRetentionExecutionUnsupported);
+        }
         if let Ok(value) = crate::flags::env_value("STWO_CUDA_RETAINED_LDE_BUDGET_BYTES") {
             policy.retained_lde_budget_bytes = value
                 .parse()
@@ -98,6 +112,14 @@ pub enum ProtocolPlanError {
     UnboundCompositionKernelCap,
     InvalidRetainedLdeBudget,
     UnsupportedRetainAllLde,
+    DirectRetentionRequiresProgressiveCommit,
+    DirectRetentionExecutionUnsupported,
+    DirectRetentionCompositionMissing,
+    DirectRetentionBudgetExceeded {
+        required_bytes: usize,
+        budget_bytes: usize,
+    },
+    DirectRetention(DirectCompositionRetentionError),
     CompositionKernelCapMismatch {
         policy: usize,
         plan: usize,
@@ -243,6 +265,7 @@ pub fn plan_protocol_geometry(
         },
         discovery,
         composition.key(),
+        Some(composition),
     )
 }
 
@@ -623,6 +646,7 @@ fn plan_protocol_from_logs(
     transcript: TranscriptGeometry,
     discovery: &ProtocolTranscriptDiscovery,
     composition_plan_hash: u64,
+    composition: Option<&CompositionPlan>,
 ) -> Result<ProtocolGeometry, ProtocolPlanError> {
     if policy.channel_tag == 0 {
         return Err(ProtocolPlanError::UnboundChannel);
@@ -632,6 +656,11 @@ fn plan_protocol_from_logs(
     }
     if policy.composition_max_kernel_instrs == 0 {
         return Err(ProtocolPlanError::UnboundCompositionKernelCap);
+    }
+    if policy.direct_composition_retention_mode == DirectCompositionRetentionMode::ExactNative
+        && policy.commit_mode != stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive
+    {
+        return Err(ProtocolPlanError::DirectRetentionRequiresProgressiveCommit);
     }
     if claim_log_sizes.len() != 2 {
         return Err(ProtocolPlanError::InvalidClaimTreeCount(
@@ -772,6 +801,7 @@ fn plan_protocol_from_logs(
             grouped_column_log_sizes: grouped_preprocessed_logs,
             grouped_column_sources: preprocessed_sources,
             retained_evaluation_groups: Vec::new(),
+            direct_composition_evaluation_groups: Vec::new(),
         },
         CommitmentGeometry {
             id: CommitmentTreeId::Base,
@@ -780,6 +810,7 @@ fn plan_protocol_from_logs(
             grouped_column_log_sizes: base_logs,
             grouped_column_sources: base_sources,
             retained_evaluation_groups: Vec::new(),
+            direct_composition_evaluation_groups: Vec::new(),
         },
         CommitmentGeometry {
             id: CommitmentTreeId::Interaction,
@@ -788,6 +819,7 @@ fn plan_protocol_from_logs(
             grouped_column_log_sizes: interaction_logs,
             grouped_column_sources: interaction_sources,
             retained_evaluation_groups: Vec::new(),
+            direct_composition_evaluation_groups: Vec::new(),
         },
         CommitmentGeometry {
             id: CommitmentTreeId::Composition,
@@ -796,12 +828,32 @@ fn plan_protocol_from_logs(
             grouped_column_log_sizes: vec![vec![composition_coefficient_log; 8]],
             grouped_column_sources: vec![composition_sources],
             retained_evaluation_groups: Vec::new(),
+            direct_composition_evaluation_groups: Vec::new(),
         },
     ];
-    select_retained_evaluation_groups(
+    let direct_composition_retention = match policy.direct_composition_retention_mode {
+        DirectCompositionRetentionMode::Disabled => None,
+        DirectCompositionRetentionMode::ExactNative => {
+            let composition =
+                composition.ok_or(ProtocolPlanError::DirectRetentionCompositionMissing)?;
+            let consumers = derive_direct_composition_consumers(&oods, composition)
+                .map_err(ProtocolPlanError::DirectRetention)?;
+            Some(
+                plan_direct_composition_retention_from_parts(
+                    &commitments,
+                    &oods.columns,
+                    blowup,
+                    &consumers,
+                )
+                .map_err(ProtocolPlanError::DirectRetention)?,
+            )
+        }
+    };
+    let retention = select_retained_evaluation_groups(
         &mut commitments,
         policy.decommit_strategy,
         policy.retained_lde_budget_bytes,
+        direct_composition_retention.as_ref(),
     )?;
 
     let fri_layer_log_sizes = fri_merkle_log_sizes(lifting, pcs.fri_config)?;
@@ -837,6 +889,17 @@ fn plan_protocol_from_logs(
             policy.kernel_manifest_hash,
             policy.decommit_strategy,
             policy.commit_mode,
+            policy.direct_composition_retention_mode,
+            direct_composition_retention
+                .as_ref()
+                .map_or(0, |plan| plan.cache_key),
+            direct_composition_retention
+                .as_ref()
+                .map_or(0, |plan| direct_bitmap_hash(&plan.direct_bitmap)),
+            retention.direct_group_rounded_bytes,
+            direct_composition_retention
+                .as_ref()
+                .map_or(0, |_| retention.union_group_rounded_bytes),
         ),
         preprocessed_column_ids: preprocessed_trace
             .ids()
@@ -857,6 +920,7 @@ fn plan_protocol_from_logs(
             partial_numerator_log_sizes: discovery.partial_numerator_log_sizes.clone(),
         },
         commitments,
+        direct_composition_retention,
         opened_tree_log_sizes,
         fri_layer_log_sizes,
     })
@@ -866,17 +930,125 @@ fn select_retained_evaluation_groups(
     commitments: &mut [CommitmentGeometry],
     strategy: DecommitStrategy,
     budget_bytes: usize,
-) -> Result<(), ProtocolPlanError> {
+    direct: Option<&DirectCompositionRetentionPlan>,
+) -> Result<RetentionSelection, ProtocolPlanError> {
     for commitment in commitments.iter_mut() {
         commitment.retained_evaluation_groups =
             vec![false; commitment.grouped_column_log_sizes.len()];
+        commitment.direct_composition_evaluation_groups =
+            vec![false; commitment.grouped_column_log_sizes.len()];
     }
-    match strategy {
-        DecommitStrategy::RecomputeQueriedLde => return Ok(()),
-        DecommitStrategy::RetainAllLde => return Err(ProtocolPlanError::UnsupportedRetainAllLde),
-        DecommitStrategy::HybridByGroup => {}
+    if let Some(plan) = direct {
+        for binding in plan.bindings.iter().filter(|binding| binding.direct) {
+            let column =
+                plan.columns
+                    .get(binding.column)
+                    .ok_or(ProtocolPlanError::DirectRetention(
+                        DirectCompositionRetentionError::PlanDrift,
+                    ))?;
+            let commitment = commitments
+                .iter_mut()
+                .find(|commitment| commitment.id == column.tree)
+                .ok_or(ProtocolPlanError::DirectRetention(
+                    DirectCompositionRetentionError::MissingCommitmentTree(column.tree),
+                ))?;
+            let selected = commitment
+                .direct_composition_evaluation_groups
+                .get_mut(column.group)
+                .ok_or(ProtocolPlanError::DirectRetention(
+                    DirectCompositionRetentionError::PlanDrift,
+                ))?;
+            *selected = true;
+        }
     }
 
+    let direct_words = commitments.iter().try_fold(0usize, |total, commitment| {
+        commitment
+            .grouped_column_log_sizes
+            .iter()
+            .zip(&commitment.direct_composition_evaluation_groups)
+            .try_fold(total, |total, (logs, &selected)| {
+                if selected {
+                    total
+                        .checked_add(retained_group_words(commitment, logs)?)
+                        .ok_or(ProtocolPlanError::SizeOverflow)
+                } else {
+                    Ok(total)
+                }
+            })
+    })?;
+    let budget_words = budget_bytes / core::mem::size_of::<u32>();
+    if direct_words > budget_words {
+        return Err(ProtocolPlanError::DirectRetentionBudgetExceeded {
+            required_bytes: direct_words
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(ProtocolPlanError::SizeOverflow)?,
+            budget_bytes,
+        });
+    }
+
+    match strategy {
+        DecommitStrategy::RecomputeQueriedLde => {}
+        DecommitStrategy::RetainAllLde => return Err(ProtocolPlanError::UnsupportedRetainAllLde),
+        DecommitStrategy::HybridByGroup => {
+            select_decommit_groups(commitments, budget_words - direct_words)?;
+        }
+    }
+
+    let union_words = commitments.iter().try_fold(0usize, |total, commitment| {
+        commitment
+            .grouped_column_log_sizes
+            .iter()
+            .zip(&commitment.retained_evaluation_groups)
+            .zip(&commitment.direct_composition_evaluation_groups)
+            .try_fold(total, |total, ((logs, &decommit), &direct)| {
+                if decommit || direct {
+                    total
+                        .checked_add(retained_group_words(commitment, logs)?)
+                        .ok_or(ProtocolPlanError::SizeOverflow)
+                } else {
+                    Ok(total)
+                }
+            })
+    })?;
+    Ok(RetentionSelection {
+        direct_group_rounded_bytes: direct_words
+            .checked_mul(core::mem::size_of::<u32>())
+            .ok_or(ProtocolPlanError::SizeOverflow)?,
+        union_group_rounded_bytes: union_words
+            .checked_mul(core::mem::size_of::<u32>())
+            .ok_or(ProtocolPlanError::SizeOverflow)?,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetentionSelection {
+    direct_group_rounded_bytes: usize,
+    union_group_rounded_bytes: usize,
+}
+
+fn retained_group_words(
+    commitment: &CommitmentGeometry,
+    logs: &[u32],
+) -> Result<usize, ProtocolPlanError> {
+    logs.iter().try_fold(0usize, |words, &log_size| {
+        let evaluation_log = log_size
+            .checked_add(commitment.config.log_blowup_factor)
+            .ok_or(ProtocolPlanError::SizeOverflow)?;
+        words
+            .checked_add(
+                1usize
+                    .checked_shl(evaluation_log)
+                    .ok_or(ProtocolPlanError::SizeOverflow)?,
+            )
+            .ok_or(ProtocolPlanError::SizeOverflow)
+    })
+}
+
+fn select_decommit_groups(
+    commitments: &mut [CommitmentGeometry],
+    mut remaining_words: usize,
+) -> Result<(), ProtocolPlanError> {
     #[derive(Clone, Copy)]
     struct Candidate {
         commitment: usize,
@@ -890,7 +1062,7 @@ fn select_retained_evaluation_groups(
     // Hybrid per-proof storage is reserved for the three dynamic trees.
     for (commitment_index, commitment) in commitments.iter().enumerate().skip(1) {
         for (group_index, logs) in commitment.grouped_column_log_sizes.iter().enumerate() {
-            let mut words = 0usize;
+            let words = retained_group_words(commitment, logs)?;
             let mut weighted_log = 0u128;
             for &log_size in logs {
                 let evaluation_log = log_size
@@ -898,9 +1070,6 @@ fn select_retained_evaluation_groups(
                     .ok_or(ProtocolPlanError::SizeOverflow)?;
                 let column_words = 1usize
                     .checked_shl(evaluation_log)
-                    .ok_or(ProtocolPlanError::SizeOverflow)?;
-                words = words
-                    .checked_add(column_words)
                     .ok_or(ProtocolPlanError::SizeOverflow)?;
                 weighted_log = weighted_log
                     .checked_add((column_words as u128) * u128::from(evaluation_log))
@@ -924,11 +1093,17 @@ fn select_retained_evaluation_groups(
             .then_with(|| left.group.cmp(&right.group))
     });
 
-    let mut remaining_words = budget_bytes / core::mem::size_of::<u32>();
     for candidate in candidates {
-        if candidate.words <= remaining_words {
+        let additional = if commitments[candidate.commitment].direct_composition_evaluation_groups
+            [candidate.group]
+        {
+            0
+        } else {
+            candidate.words
+        };
+        if additional <= remaining_words {
             commitments[candidate.commitment].retained_evaluation_groups[candidate.group] = true;
-            remaining_words -= candidate.words;
+            remaining_words -= additional;
         }
     }
     Ok(())
@@ -1093,6 +1268,7 @@ mod tests {
                 grouped_column_log_sizes: vec![vec![20]],
                 grouped_column_sources: vec![Vec::new()],
                 retained_evaluation_groups: Vec::new(),
+                direct_composition_evaluation_groups: Vec::new(),
             },
             CommitmentGeometry {
                 id: CommitmentTreeId::Base,
@@ -1101,6 +1277,7 @@ mod tests {
                 grouped_column_log_sizes: vec![vec![10], vec![12]],
                 grouped_column_sources: vec![Vec::new(), Vec::new()],
                 retained_evaluation_groups: Vec::new(),
+                direct_composition_evaluation_groups: Vec::new(),
             },
             CommitmentGeometry {
                 id: CommitmentTreeId::Interaction,
@@ -1109,17 +1286,162 @@ mod tests {
                 grouped_column_log_sizes: vec![vec![11]],
                 grouped_column_sources: vec![Vec::new()],
                 retained_evaluation_groups: Vec::new(),
+                direct_composition_evaluation_groups: Vec::new(),
             },
         ];
         select_retained_evaluation_groups(
             &mut commitments,
             DecommitStrategy::HybridByGroup,
             (1usize << 13) * core::mem::size_of::<u32>(),
+            None,
         )
         .unwrap();
         assert_eq!(commitments[0].retained_evaluation_groups, [false]);
         assert_eq!(commitments[1].retained_evaluation_groups, [false, true]);
         assert_eq!(commitments[2].retained_evaluation_groups, [false]);
+    }
+
+    fn direct_plan(
+        tree: CommitmentTreeId,
+        group: usize,
+        column_in_group: usize,
+    ) -> DirectCompositionRetentionPlan {
+        let source = OpenedColumnSource::Trace {
+            component: "test",
+            part: TracePartId::Main,
+            purpose: BufferPurpose::BaseCoefficients,
+            ordinal: u32::try_from(group * 16 + column_in_group).unwrap(),
+        };
+        DirectCompositionRetentionPlan {
+            columns: vec![
+                crate::direct_composition_retention::DirectCompositionColumn {
+                    source,
+                    tree,
+                    proof_column: group * 16 + column_in_group,
+                    group,
+                    column_in_group,
+                    canonical_column: group * 16 + column_in_group,
+                    coefficient_log_size: 4,
+                    evaluation_log_size: 5,
+                    lifetime: crate::arena_plan::BufferLifetime::new(
+                        ProofEpoch::BaseCommit,
+                        ProofEpoch::Composition,
+                    )
+                    .unwrap(),
+                },
+            ],
+            bindings: vec![
+                crate::direct_composition_retention::DirectCompositionBinding {
+                    consumer: 0,
+                    column: 0,
+                    consumer_evaluation_log_size: 5,
+                    direct: true,
+                },
+            ],
+            direct_bitmap: vec![1],
+            buckets: Vec::new(),
+            direct_column_count: 1,
+            direct_bytes: 1 << 7,
+            cache_key: 7,
+        }
+    }
+
+    fn grouped_base(column_count: usize) -> CommitmentGeometry {
+        let columns = (0..column_count)
+            .map(|ordinal| CommitmentColumnSource::Trace {
+                component: "test",
+                part: TracePartId::Main,
+                purpose: BufferPurpose::BaseCoefficients,
+                ordinal: ordinal as u32,
+            })
+            .collect::<Vec<_>>();
+        CommitmentGeometry {
+            id: CommitmentTreeId::Base,
+            created: ProofEpoch::BaseCommit,
+            config: CommitWorkspaceConfig {
+                log_blowup_factor: 1,
+                lifting_log_size: 5,
+                unretained_bottom_layers: 0,
+                max_fused_tail_levels: 0,
+            },
+            grouped_column_log_sizes: columns
+                .chunks(16)
+                .map(|group| vec![4; group.len()])
+                .collect(),
+            grouped_column_sources: columns
+                .chunks(16)
+                .map(<[CommitmentColumnSource]>::to_vec)
+                .collect(),
+            retained_evaluation_groups: Vec::new(),
+            direct_composition_evaluation_groups: Vec::new(),
+        }
+    }
+
+    fn retention_fixture(column_count: usize) -> Vec<CommitmentGeometry> {
+        let mut preprocessed = grouped_base(1);
+        preprocessed.id = CommitmentTreeId::Preprocessed;
+        preprocessed.created = ProofEpoch::Ingest;
+        vec![preprocessed, grouped_base(column_count)]
+    }
+
+    #[test]
+    fn direct_group_closure_rounds_15_16_17_and_shares_budget_by_intent() {
+        for count in [15usize, 16, 17] {
+            let group = (count - 1) / 16;
+            let in_group = (count - 1) % 16;
+            let direct = direct_plan(CommitmentTreeId::Base, group, in_group);
+            let rounded_columns = if count == 17 { 1 } else { count };
+            let rounded_bytes = rounded_columns * (1usize << 5) * core::mem::size_of::<u32>();
+
+            let mut direct_only = retention_fixture(count);
+            let selected = select_retained_evaluation_groups(
+                &mut direct_only,
+                DecommitStrategy::RecomputeQueriedLde,
+                rounded_bytes,
+                Some(&direct),
+            )
+            .unwrap();
+            assert!(direct_only[1].direct_composition_evaluation_groups[group]);
+            assert!(!direct_only[1].retained_evaluation_groups[group]);
+            assert_eq!(selected.direct_group_rounded_bytes, rounded_bytes);
+            assert_eq!(selected.union_group_rounded_bytes, rounded_bytes);
+
+            let mut both = retention_fixture(count);
+            select_retained_evaluation_groups(
+                &mut both,
+                DecommitStrategy::HybridByGroup,
+                rounded_bytes,
+                Some(&direct),
+            )
+            .unwrap();
+            assert!(both[1].direct_composition_evaluation_groups[group]);
+            assert!(both[1].retained_evaluation_groups[group]);
+
+            let mut decommit_only = retention_fixture(count);
+            select_retained_evaluation_groups(
+                &mut decommit_only,
+                DecommitStrategy::HybridByGroup,
+                rounded_bytes,
+                None,
+            )
+            .unwrap();
+            assert!(!decommit_only[1].direct_composition_evaluation_groups[group]);
+            assert!(decommit_only[1].retained_evaluation_groups[group]);
+
+            let mut insufficient = retention_fixture(count);
+            assert_eq!(
+                select_retained_evaluation_groups(
+                    &mut insufficient,
+                    DecommitStrategy::RecomputeQueriedLde,
+                    rounded_bytes - 1,
+                    Some(&direct),
+                ),
+                Err(ProtocolPlanError::DirectRetentionBudgetExceeded {
+                    required_bytes: rounded_bytes,
+                    budget_bytes: rounded_bytes - 1,
+                })
+            );
+        }
     }
 
     fn memory_plan() -> ProofPlan {
@@ -1306,6 +1628,24 @@ mod tests {
         ];
         let preprocessed = PreProcessedTrace::canonical();
         let discovery = discovery_for(&claim_logs, &preprocessed, &pcs(3));
+        let mut invalid_direct = ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048);
+        invalid_direct.direct_composition_retention_mode =
+            DirectCompositionRetentionMode::ExactNative;
+        assert_eq!(
+            plan_protocol_from_logs(
+                &plan,
+                &claim_logs,
+                &preprocessed,
+                &pcs(3),
+                false,
+                invalid_direct,
+                transcript_geometry(),
+                &discovery,
+                0x5678,
+                None,
+            ),
+            Err(ProtocolPlanError::DirectRetentionRequiresProgressiveCommit)
+        );
         let geometry = plan_protocol_from_logs(
             &plan,
             &claim_logs,
@@ -1316,6 +1656,7 @@ mod tests {
             transcript_geometry(),
             &discovery,
             0x5678,
+            None,
         )
         .unwrap();
         let blowup = pcs(3).fri_config.log_blowup_factor;
@@ -1353,6 +1694,7 @@ mod tests {
                 transcript_geometry(),
                 &discovery,
                 0x5678,
+                None,
             ),
             Err(ProtocolPlanError::InvalidLiftingLogSize {
                 lifting: base_height,
@@ -1459,6 +1801,173 @@ mod tests {
     }
 
     #[test]
+    fn exact_native_progressive_protocol_seals_physical_retention_identity() {
+        let proof_plan = memory_plan();
+        let TraceCommitmentLayout { base, interaction } =
+            trace_commitment_layout(&proof_plan).unwrap();
+        let claim_logs = vec![
+            base.iter().map(|column| column.log_size).collect(),
+            interaction.iter().map(|column| column.log_size).collect(),
+        ];
+        let preprocessed = PreProcessedTrace::canonical();
+        let pcs = pcs(3);
+        let discovery = discovery_for(&claim_logs, &preprocessed, &pcs);
+        let blowup = pcs.fri_config.log_blowup_factor;
+        let preprocessed_logs = preprocessed.log_sizes();
+        let (preprocessed_index, &preprocessed_log_size) = preprocessed_logs
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, log_size)| *log_size)
+            .unwrap();
+        let evaluation_log_size = preprocessed_log_size + blowup;
+        let trace_log_size = evaluation_log_size - blowup;
+        let composition = crate::composition_plan::CompositionPlan {
+            max_kernel_instrs: 2048,
+            total_constraints: 1,
+            max_evaluation_log_size: evaluation_log_size,
+            components: vec![crate::composition_plan::CompositionComponentPlan {
+                component: "phase2a_protocol_fixture",
+                instance: 0,
+                trace_locations: vec![
+                    stwo::core::pcs::TreeSubspan {
+                        tree_index: 0,
+                        col_start: 0,
+                        col_end: 0,
+                    },
+                    stwo::core::pcs::TreeSubspan {
+                        tree_index: 1,
+                        col_start: 0,
+                        col_end: base.len(),
+                    },
+                    stwo::core::pcs::TreeSubspan {
+                        tree_index: 2,
+                        col_start: 0,
+                        col_end: interaction.len(),
+                    },
+                ],
+                preprocessed_column_indices: vec![preprocessed_index],
+                trace_log_size,
+                evaluation_log_size,
+                n_constraints: 1,
+                random_coefficient_offset: 0,
+                denominator_inverses: vec![
+                    stwo::core::fields::m31::BaseField::from(1);
+                    1usize << blowup
+                ],
+                ext_param_values: Vec::new(),
+                ext_param_sources: Vec::new(),
+                kernels: vec![crate::composition_plan::CompositionKernelPart {
+                    kernel_name: "phase2a_protocol_fixture".to_owned(),
+                    cache_key: 7,
+                    semantic_hash: 11,
+                    source: "phase2a_protocol_fixture".to_owned(),
+                    rc_base: 0,
+                }],
+            }],
+        };
+        let mut policy = ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048);
+        policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive;
+        policy.decommit_strategy = DecommitStrategy::RecomputeQueriedLde;
+        policy.direct_composition_retention_mode = DirectCompositionRetentionMode::ExactNative;
+        let geometry = plan_protocol_from_logs(
+            &proof_plan,
+            &claim_logs,
+            &preprocessed,
+            &pcs,
+            false,
+            policy,
+            transcript_geometry(),
+            &discovery,
+            composition.key(),
+            Some(&composition),
+        )
+        .unwrap();
+        let direct = geometry.direct_composition_retention.as_ref().unwrap();
+        assert!(direct.bindings.iter().any(|binding| {
+            binding.direct
+                && matches!(
+                    direct.columns[binding.column].source,
+                    OpenedColumnSource::Preprocessed { ordinal }
+                        if ordinal as usize == preprocessed_index
+                )
+        }));
+
+        let mut expected_closure = geometry
+            .commitments
+            .iter()
+            .map(|commitment| vec![false; commitment.grouped_column_log_sizes.len()])
+            .collect::<Vec<_>>();
+        for binding in direct.bindings.iter().filter(|binding| binding.direct) {
+            let column = direct.columns[binding.column];
+            let tree = geometry
+                .commitments
+                .iter()
+                .position(|commitment| commitment.id == column.tree)
+                .unwrap();
+            expected_closure[tree][column.group] = true;
+        }
+        assert!(geometry.commitments.iter().zip(&expected_closure).all(
+            |(commitment, expected)| {
+                commitment.direct_composition_evaluation_groups == *expected
+            }
+        ));
+        let direct_words = geometry
+            .commitments
+            .iter()
+            .try_fold(0usize, |total, commitment| {
+                commitment
+                    .grouped_column_log_sizes
+                    .iter()
+                    .zip(&commitment.direct_composition_evaluation_groups)
+                    .try_fold(total, |total, (logs, &selected)| {
+                        if selected {
+                            total
+                                .checked_add(retained_group_words(commitment, logs).unwrap())
+                                .ok_or(())
+                        } else {
+                            Ok(total)
+                        }
+                    })
+            })
+            .unwrap();
+        let direct_bytes = direct_words * core::mem::size_of::<u32>();
+        assert_eq!(
+            geometry.identity.direct_composition_occurrence_bitmap_hash,
+            direct_bitmap_hash(&direct.direct_bitmap)
+        );
+        assert_eq!(
+            geometry.identity.direct_composition_group_rounded_bytes,
+            direct_bytes
+        );
+        assert_eq!(
+            geometry.identity.retained_evaluation_union_bytes,
+            direct_bytes
+        );
+        assert_eq!(
+            geometry.identity.direct_composition_planner_key,
+            direct.cache_key
+        );
+
+        let identity_mutations: [fn(&mut ProtocolIdentity); 4] = [
+            |identity: &mut ProtocolIdentity| identity.direct_composition_planner_key ^= 1,
+            |identity: &mut ProtocolIdentity| {
+                identity.direct_composition_occurrence_bitmap_hash ^= 1
+            },
+            |identity: &mut ProtocolIdentity| {
+                identity.direct_composition_group_rounded_bytes += core::mem::size_of::<u32>()
+            },
+            |identity: &mut ProtocolIdentity| {
+                identity.retained_evaluation_union_bytes += core::mem::size_of::<u32>()
+            },
+        ];
+        for mutate in identity_mutations {
+            let mut drifted = geometry.clone();
+            mutate(&mut drifted.identity);
+            assert_ne!(geometry.key(), drifted.key());
+        }
+    }
+
+    #[test]
     fn fixed_table_policy_and_manifest_are_part_of_identity() {
         let trace = PreProcessedTrace::canonical_small();
         let config = pcs(3);
@@ -1482,6 +1991,7 @@ mod tests {
                 transcript_geometry(),
                 &discovery,
                 0x5678,
+                None,
             ),
             Err(ProtocolPlanError::UnboundKernelManifest)
         );

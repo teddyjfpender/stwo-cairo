@@ -4,14 +4,55 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use stwo_backend_cuda::ArenaSlotId;
 use stwo_cairo_prover::witness::proof_shape::TracePartId;
 
 use crate::arena_plan::{
     BufferLifetime, BufferPurpose, CommitmentGeometry, CommitmentTreeId, OodsColumnGeometry,
-    OpenedColumnSource, ProofEpoch, ProtocolGeometry,
+    OodsGeometry, OpenedColumnSource, ProofEpoch, ProtocolGeometry,
+};
+use crate::composition_plan::CompositionPlan;
+use crate::prepared_composition::{
+    composition_workspace_requirements, CompositionCoefficientSource, CompositionTraceTopology,
+    PreparedCompositionError,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
+
+pub(crate) fn direct_bitmap_hash(words: &[u64]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in b"direct-composition-occurrence-bitmap-v1\0" {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for byte in words.iter().flat_map(|word| word.to_le_bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum DirectCompositionRetentionMode {
+    #[default]
+    Disabled = 0,
+    ExactNative = 1,
+}
+
+impl DirectCompositionRetentionMode {
+    pub fn from_env() -> Self {
+        static MODE: std::sync::OnceLock<DirectCompositionRetentionMode> =
+            std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            if crate::flags::flag_on("STWO_CUDA_COMPOSITION_DIRECT_RETENTION") {
+                Self::ExactNative
+            } else {
+                Self::Disabled
+            }
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectCompositionConsumer {
@@ -124,6 +165,11 @@ pub enum DirectCompositionRetentionError {
     CountDrift,
     BitmapDrift,
     CacheIdentityDrift,
+    Composition(PreparedCompositionError),
+    MissingProofColumn {
+        tree: usize,
+        column: usize,
+    },
 }
 
 impl core::fmt::Display for DirectCompositionRetentionError {
@@ -133,6 +179,83 @@ impl core::fmt::Display for DirectCompositionRetentionError {
 }
 
 impl std::error::Error for DirectCompositionRetentionError {}
+
+impl From<PreparedCompositionError> for DirectCompositionRetentionError {
+    fn from(value: PreparedCompositionError) -> Self {
+        Self::Composition(value)
+    }
+}
+
+/// Derive composition consumers from the same baseline requirements that own
+/// the prepared component/source order. No AIR traversal is duplicated here.
+pub fn derive_direct_composition_consumers(
+    oods: &OodsGeometry,
+    composition: &CompositionPlan,
+) -> Result<Vec<DirectCompositionConsumer>, DirectCompositionRetentionError> {
+    let mut proof_sources = [Vec::new(), Vec::new(), Vec::new()];
+    let mut trace_trees = vec![Vec::new(), Vec::new(), Vec::new()];
+    for (flat, column) in oods.columns.iter().enumerate() {
+        let tree = match column.source {
+            OpenedColumnSource::Preprocessed { .. } => 0,
+            OpenedColumnSource::Trace {
+                purpose: BufferPurpose::BaseCoefficients,
+                ..
+            } => 1,
+            OpenedColumnSource::Trace {
+                purpose: BufferPurpose::InteractionCoefficients,
+                ..
+            } => 2,
+            OpenedColumnSource::Composition { .. } => continue,
+            source => {
+                return Err(DirectCompositionRetentionError::UnsupportedOodsSource(
+                    source,
+                ));
+            }
+        };
+        proof_sources[tree].push(column.source);
+        trace_trees[tree].push(CompositionCoefficientSource {
+            slot: ArenaSlotId(
+                u32::try_from(flat)
+                    .map_err(|_| DirectCompositionRetentionError::SizeOverflow)?
+                    .checked_add(1)
+                    .ok_or(DirectCompositionRetentionError::SizeOverflow)?,
+            ),
+            log_size: column.coefficient_log_size,
+        });
+    }
+    let requirements = composition_workspace_requirements(
+        composition,
+        &CompositionTraceTopology { trees: trace_trees },
+    )?;
+    let mut consumers = Vec::new();
+    for component in &requirements.components {
+        for source in &component.sources {
+            let opened = proof_sources
+                .get(source.tree)
+                .and_then(|tree| tree.get(source.column))
+                .copied()
+                .ok_or(DirectCompositionRetentionError::MissingProofColumn {
+                    tree: source.tree,
+                    column: source.column,
+                })?;
+            consumers.push(DirectCompositionConsumer {
+                source: opened,
+                evaluation_log_size: component.evaluation_log_size,
+                force_direct: false,
+            });
+        }
+    }
+    Ok(consumers)
+}
+
+pub(crate) fn plan_direct_composition_retention_from_parts(
+    commitments: &[CommitmentGeometry],
+    oods_columns: &[OodsColumnGeometry],
+    log_blowup_factor: u32,
+    consumers: &[DirectCompositionConsumer],
+) -> Result<DirectCompositionRetentionPlan, DirectCompositionRetentionError> {
+    plan_topology(commitments, oods_columns, log_blowup_factor, consumers)
+}
 
 pub fn plan_direct_composition_retention(
     protocol: &ProtocolGeometry,
@@ -616,11 +739,14 @@ fn feed(hash: &mut u64, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use stwo_backend_cuda::CommitWorkspaceConfig;
+    use stwo::core::fields::m31::BaseField;
+    use stwo::core::pcs::TreeSubspan;
+    use stwo_backend_cuda::{CommitWorkspaceConfig, TranscriptInputId, TranscriptOutputId};
     use stwo_cairo_prover::witness::proof_shape::TracePartId;
 
     use super::*;
     use crate::arena_plan::CommitmentColumnSource;
+    use crate::composition_plan::{CompositionComponentPlan, CompositionKernelPart};
 
     fn source(ordinal: u32, purpose: BufferPurpose) -> CommitmentColumnSource {
         CommitmentColumnSource::Trace {
@@ -672,6 +798,7 @@ mod tests {
                 .map(|group| group.iter().map(|column| column.0).collect())
                 .collect(),
             retained_evaluation_groups: Vec::new(),
+            direct_composition_evaluation_groups: Vec::new(),
         }
     }
 
@@ -1119,5 +1246,112 @@ mod tests {
             validate_against(&drift, &expected),
             Err(DirectCompositionRetentionError::CacheIdentityDrift)
         );
+    }
+
+    #[test]
+    fn consumers_follow_baseline_component_and_source_order_exactly() {
+        let sources = [
+            (0..3)
+                .map(|ordinal| OpenedColumnSource::Preprocessed { ordinal })
+                .collect::<Vec<_>>(),
+            (0..4)
+                .map(|ordinal| source(ordinal, BufferPurpose::BaseCoefficients).into())
+                .collect(),
+            (0..3)
+                .map(|ordinal| source(ordinal, BufferPurpose::InteractionCoefficients).into())
+                .collect(),
+        ];
+        let oods = OodsGeometry {
+            mask_log_size: 7,
+            sampled_values_input: TranscriptInputId(1),
+            point_parameter_output: TranscriptOutputId(2),
+            quotient_random_coefficient_output: TranscriptOutputId(3),
+            columns: sources
+                .iter()
+                .flatten()
+                .copied()
+                .map(|source| oods(source, 4))
+                .collect(),
+        };
+        let component = |name: &'static str,
+                         eval_log: u32,
+                         offset: usize,
+                         preprocessed: Vec<usize>,
+                         base: core::ops::Range<usize>,
+                         interaction: core::ops::Range<usize>| {
+            CompositionComponentPlan {
+                component: name,
+                instance: 0,
+                trace_locations: vec![
+                    TreeSubspan {
+                        tree_index: 0,
+                        col_start: 0,
+                        col_end: 0,
+                    },
+                    TreeSubspan {
+                        tree_index: 1,
+                        col_start: base.start,
+                        col_end: base.end,
+                    },
+                    TreeSubspan {
+                        tree_index: 2,
+                        col_start: interaction.start,
+                        col_end: interaction.end,
+                    },
+                ],
+                preprocessed_column_indices: preprocessed,
+                trace_log_size: 4,
+                evaluation_log_size: eval_log,
+                n_constraints: 1,
+                random_coefficient_offset: offset,
+                denominator_inverses: vec![BaseField::from(1); 1 << (eval_log - 4)],
+                ext_param_values: Vec::new(),
+                ext_param_sources: Vec::new(),
+                kernels: vec![CompositionKernelPart {
+                    kernel_name: "kernel".to_owned(),
+                    cache_key: 7,
+                    semantic_hash: 9,
+                    source: "kernel".to_owned(),
+                    rc_base: 0,
+                }],
+            }
+        };
+        let composition = CompositionPlan {
+            max_kernel_instrs: 2048,
+            total_constraints: 2,
+            max_evaluation_log_size: 7,
+            components: vec![
+                component("a", 7, 0, vec![2, 0], 1..4, 0..2),
+                component("b", 6, 1, vec![1], 0..2, 1..3),
+            ],
+        };
+        let consumers = derive_direct_composition_consumers(&oods, &composition).unwrap();
+        let expected = [
+            sources[0][2],
+            sources[0][0],
+            sources[1][1],
+            sources[1][2],
+            sources[1][3],
+            sources[2][0],
+            sources[2][1],
+            sources[0][1],
+            sources[1][0],
+            sources[1][1],
+            sources[2][1],
+            sources[2][2],
+        ];
+        assert_eq!(
+            consumers
+                .iter()
+                .map(|consumer| consumer.source)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(consumers[..7]
+            .iter()
+            .all(|consumer| consumer.evaluation_log_size == 7));
+        assert!(consumers[7..]
+            .iter()
+            .all(|consumer| consumer.evaluation_log_size == 6));
     }
 }
