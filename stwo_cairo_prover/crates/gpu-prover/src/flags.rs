@@ -79,6 +79,11 @@ pub const FLAGS: &[FlagDef] = &[
         deletion_milestone: "M6 (remove after direct composition execution is qualified and unconditional)",
     },
     FlagDef {
+        name: "STWO_CUDA_B2N_STAGE_FUSED",
+        purpose: "resident interpolation: coalesce same-log inverse transforms into fused intervals while preserving exact in-place aliases",
+        deletion_milestone: "M6 (remove after fused in-place interpolation is qualified and unconditional)",
+    },
+    FlagDef {
         name: "STWO_RESIDENT_OODS_DIAGNOSTIC",
         purpose: "print resident composition OODS inputs and opening topology after validation fails",
         deletion_milestone: "M6 (remove after resident whole-proof byte identity is qualified)",
@@ -174,6 +179,7 @@ mod tests {
         for name in [
             "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES",
             "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
+            "STWO_CUDA_B2N_STAGE_FUSED",
         ] {
             assert!(FLAGS.iter().any(|flag| flag.name == name));
         }

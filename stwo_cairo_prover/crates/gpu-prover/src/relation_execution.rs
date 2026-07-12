@@ -4,8 +4,8 @@
 
 use stwo_backend_cuda::{
     RelationBatchProgram, RelationColumnDescriptor, RelationGraphError, RelationGraphRequirements,
-    RelationKernelProgram, RelationMultiplicityKind, RelationRowExtent, RelationSourceLayout,
-    RelationTupleKind, RelationUseDescriptor,
+    RelationKernelProgram, RelationLaunchMode, RelationMultiplicityKind, RelationRowExtent,
+    RelationSourceLayout, RelationTupleKind, RelationUseDescriptor,
 };
 use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId};
 
@@ -20,6 +20,24 @@ use crate::schedule::ComponentId;
 pub struct RelationBatchKey {
     pub component: ComponentId,
     pub trace_part: RelationTracePart,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelationSourcePlane {
+    LookupWords,
+    BaseTrace,
+}
+
+/// Canonical source columns for one lowered relation instance.  Arena liveness
+/// and runtime binding consume this same plan so a retained evaluation cannot
+/// silently drift from the kernel ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelationInstanceSourcePlan {
+    pub batch: RelationBatchKey,
+    pub instance_index: usize,
+    pub part: TracePartId,
+    pub plane: RelationSourcePlane,
+    pub column_count: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +143,65 @@ impl RelationExecutionPlan {
         self.kernel_program
             .requirements()
             .map_err(RelationExecutionError::BackendPlan)
+    }
+
+    pub fn requirements_for_mode(
+        &self,
+        mode: RelationLaunchMode,
+    ) -> Result<RelationGraphRequirements, RelationExecutionError> {
+        self.kernel_program
+            .requirements_for_mode(mode)
+            .map_err(RelationExecutionError::BackendPlan)
+    }
+
+    pub fn source_plan(&self) -> Result<Vec<RelationInstanceSourcePlan>, RelationExecutionError> {
+        let mut sources = Vec::new();
+        for (batch_index, kernel_batch) in self.kernel_program.batches.iter().enumerate() {
+            let batch = *self
+                .batches
+                .get(batch_index)
+                .ok_or(RelationExecutionError::SourcePlanDrift)?;
+            let (plane, column_count) = match kernel_batch.source_layout {
+                RelationSourceLayout::LookupWords { .. } => (RelationSourcePlane::LookupWords, 1),
+                RelationSourceLayout::MemoryAddress { chunks } => (
+                    RelationSourcePlane::BaseTrace,
+                    chunks
+                        .checked_mul(2)
+                        .ok_or(RelationExecutionError::SizeOverflow)?,
+                ),
+                RelationSourceLayout::MemoryBig { value_words }
+                | RelationSourceLayout::MemorySmall { value_words } => (
+                    RelationSourcePlane::BaseTrace,
+                    value_words
+                        .checked_add(1)
+                        .ok_or(RelationExecutionError::SizeOverflow)?,
+                ),
+                RelationSourceLayout::BitwiseXor12 {
+                    multiplicity_columns,
+                } => (RelationSourcePlane::BaseTrace, multiplicity_columns),
+            };
+            for instance_index in 0..kernel_batch.instances.len() {
+                let part = match batch.trace_part {
+                    RelationTracePart::Component => TracePartId::Main,
+                    RelationTracePart::EachMemoryBig => TracePartId::MemoryBig(
+                        u32::try_from(instance_index)
+                            .map_err(|_| RelationExecutionError::SizeOverflow)?,
+                    ),
+                    RelationTracePart::MemorySmall => TracePartId::MemorySmall,
+                };
+                sources.push(RelationInstanceSourcePlan {
+                    batch,
+                    instance_index,
+                    part,
+                    plane,
+                    column_count,
+                });
+            }
+        }
+        if sources.len() != self.requirements()?.instances.len() {
+            return Err(RelationExecutionError::SourcePlanDrift);
+        }
+        Ok(sources)
     }
 }
 
@@ -399,6 +476,7 @@ pub enum RelationExecutionError {
         expected: usize,
         actual: usize,
     },
+    SourcePlanDrift,
     SizeOverflow,
     BackendPlan(RelationGraphError),
 }
@@ -414,6 +492,9 @@ impl std::error::Error for RelationExecutionError {}
 #[cfg(test)]
 mod tests {
     use stwo_cairo_prover::witness::cairo_claim_generator::CairoClaimGenerator;
+    use stwo_cairo_prover::witness::proof_shape::{
+        ProofShape, RuntimeComponentShape, TracePartShape,
+    };
 
     use super::*;
     use crate::plan::ProofPlan;
@@ -440,6 +521,13 @@ mod tests {
         );
         assert_eq!(execution.relation_graph_hash, 0x7396_3831_c53d_f4a2);
         execution.requirements().unwrap();
+        let sources = execution.source_plan().unwrap();
+        let requirements = execution.requirements().unwrap();
+        assert_eq!(sources.len(), requirements.instances.len());
+        for (source, requirement) in sources.iter().zip(&requirements.instances) {
+            assert_eq!(source.batch, execution.batches[requirement.batch_index]);
+            assert_eq!(source.instance_index, requirement.instance_index);
+        }
     }
 
     #[test]
@@ -470,5 +558,93 @@ mod tests {
                 multiplicity_columns: 16
             }
         );
+    }
+
+    #[test]
+    fn source_plan_pins_every_source_layout_to_its_trace_plane() {
+        let default_shape = CairoClaimGenerator::default().proof_shape(None).unwrap();
+        let mut components = default_shape.components().to_vec();
+        let mut set = |shape: RuntimeComponentShape| {
+            let destination = components
+                .iter_mut()
+                .find(|component| component.id == shape.id)
+                .unwrap();
+            *destination = shape;
+        };
+        set(RuntimeComponentShape::uniform("add_ap_opcode", 5, 16).unwrap());
+        set(RuntimeComponentShape::uniform("memory_address_to_id", 5, 16).unwrap());
+        set(RuntimeComponentShape::parts(
+            "memory_id_to_big",
+            vec![
+                TracePartShape {
+                    part: TracePartId::MemoryBig(0),
+                    n_real_rows: 33,
+                    padded_rows: 64,
+                },
+                TracePartShape {
+                    part: TracePartId::MemoryBig(1),
+                    n_real_rows: 17,
+                    padded_rows: 32,
+                },
+                TracePartShape {
+                    part: TracePartId::MemorySmall,
+                    n_real_rows: 9,
+                    padded_rows: 16,
+                },
+            ],
+        )
+        .unwrap());
+        let xor12_rows = 1u64 << 20;
+        set(
+            RuntimeComponentShape::uniform("verify_bitwise_xor_12", xor12_rows, xor12_rows)
+                .unwrap(),
+        );
+        let shape = ProofShape::new(components).unwrap();
+        let proof =
+            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
+        let execution =
+            RelationExecutionPlan::from_proof_plan(&proof, &CAIRO_RELATION_GRAPH).unwrap();
+        let sources = execution.source_plan().unwrap();
+        let find = |component, trace_part| {
+            sources
+                .iter()
+                .filter(|source| {
+                    source.batch.component == component && source.batch.trace_part == trace_part
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let lookup = find("add_ap_opcode", RelationTracePart::Component);
+        assert_eq!(lookup.len(), 1);
+        assert_eq!(lookup[0].part, TracePartId::Main);
+        assert_eq!(lookup[0].plane, RelationSourcePlane::LookupWords);
+        assert_eq!(lookup[0].column_count, 1);
+
+        let address = find("memory_address_to_id", RelationTracePart::Component);
+        assert_eq!(address.len(), 1);
+        assert_eq!(address[0].part, TracePartId::Main);
+        assert_eq!(address[0].plane, RelationSourcePlane::BaseTrace);
+        assert_eq!(address[0].column_count, 32);
+
+        let big = find("memory_id_to_big", RelationTracePart::EachMemoryBig);
+        assert!(!big.is_empty());
+        for (index, source) in big.into_iter().enumerate() {
+            assert_eq!(source.instance_index, index);
+            assert_eq!(source.part, TracePartId::MemoryBig(index as u32));
+            assert_eq!(source.plane, RelationSourcePlane::BaseTrace);
+            assert_eq!(source.column_count, 29);
+        }
+
+        let small = find("memory_id_to_big", RelationTracePart::MemorySmall);
+        assert_eq!(small.len(), 1);
+        assert_eq!(small[0].part, TracePartId::MemorySmall);
+        assert_eq!(small[0].plane, RelationSourcePlane::BaseTrace);
+        assert_eq!(small[0].column_count, 9);
+
+        let xor12 = find("verify_bitwise_xor_12", RelationTracePart::Component);
+        assert_eq!(xor12.len(), 1);
+        assert_eq!(xor12[0].part, TracePartId::Main);
+        assert_eq!(xor12[0].plane, RelationSourcePlane::BaseTrace);
+        assert_eq!(xor12[0].column_count, 16);
     }
 }

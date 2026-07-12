@@ -1172,6 +1172,10 @@ pub struct ResidentPreflightReport {
     pub arena: Arc<ProofArenaPlan>,
     pub transcript_segments: usize,
     pub manifest_policy: PreflightManifestPolicy,
+    /// Exact environment-derived topology/residency policy modeled by this
+    /// host plan, retained so preflight artifacts prove which lane they sized.
+    pub protocol_policy: ProtocolPlanPolicy,
+    pub interpolation_mode: stwo_backend_cuda::InterpolationLaunchMode,
 }
 
 /// Plan the strict resident session end-to-end WITHOUT touching CUDA: the same
@@ -1221,7 +1225,8 @@ pub fn plan_resident_preflight(
         | Err(ProtocolPlanError::UnboundCompositionKernelCap) => {
             // Off-CUDA probe trick (see the fixture parity test above): geometry
             // never reads the manifest hash, only the composition kernel cap.
-            let policy = ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048);
+            let policy = ProtocolPlanPolicy::starknet_blake2s_from_env(0x1234, 2048)
+                .map_err(ResidentSessionError::from)?;
             (
                 policy,
                 PreflightManifestPolicy::Fake {
@@ -1273,6 +1278,8 @@ pub fn plan_resident_preflight(
         arena: planned.arena,
         transcript_segments: planned.transcript.segments().len(),
         manifest_policy,
+        protocol_policy,
+        interpolation_mode: stwo_backend_cuda::InterpolationLaunchMode::from_env(),
     })
 }
 
@@ -1481,11 +1488,10 @@ mod tests {
         )
         .unwrap();
         let memory = &recorded.execution_memory;
-        let public_memory_entries =
-            public_memory_multiplicity_seed_words(&planned_claim, memory)
-                .unwrap()
-                .len()
-                / 2;
+        let public_memory_entries = public_memory_multiplicity_seed_words(&planned_claim, memory)
+            .unwrap()
+            .len()
+            / 2;
         let arena = ProofArenaPlan::build_with_execution_tables(
             &exact_plan,
             &protocol,

@@ -6,7 +6,7 @@
 //! lifetimes are disjoint. The resulting alias proof is computed before CUDA is
 //! touched; graph capture therefore never discovers residency by allocation luck.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use stwo::core::circle::CirclePoint;
 use stwo::core::fields::m31::BaseField;
@@ -46,9 +46,9 @@ use stwo_backend_cuda::{
     QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
     QuotientNumeratorWorkspaceSlots, QuotientOodsSample, QuotientWorkspaceConfig,
     QuotientWorkspaceRequirements, QuotientWorkspaceSlots, RelationGraphError,
-    RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots, TraceDecommitGeometry,
-    TraceDecommitSlots, TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRole,
-    TranscriptInputId, TranscriptOutputId, WitnessFeedClearWorkspaceRequirements,
+    RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots, RelationLaunchMode,
+    TraceDecommitGeometry, TraceDecommitSlots, TraceSourceGroupGeometry, TraceSourceGroupSlots,
+    TraceTreeRole, TranscriptInputId, TranscriptOutputId, WitnessFeedClearWorkspaceRequirements,
     WitnessFeedClearWorkspaceSlots, WitnessFeedWorkspaceSlots, WitnessInputCompactLayout,
     WitnessInputCompactRequirements, WitnessInputCompactSlots, WitnessInputGatherEdge,
     WitnessInputGatherRequirements, WitnessInputGatherSlots, WitnessInputSeedRequirements,
@@ -78,7 +78,9 @@ use crate::prepared_composition::{
 };
 use crate::proof_bundle::{ResidentProofBundleError, ResidentProofBundleLayout};
 use crate::relation::RelationTracePart;
-use crate::relation_execution::{RelationExecutionError, RelationExecutionPlan};
+use crate::relation_execution::{
+    RelationExecutionError, RelationExecutionPlan, RelationInstanceSourcePlan, RelationSourcePlane,
+};
 use crate::relation_table::CAIRO_RELATION_GRAPH;
 use crate::schedule::{InputEdge, TraceColumnCount, WitnessWriterKind};
 use crate::transcript_plan::{CairoTranscriptInput, CairoTranscriptOutput};
@@ -87,6 +89,7 @@ use crate::transcript_plan::{CairoTranscriptInput, CairoTranscriptOutput};
 pub const ARENA_ALIGNMENT_WORDS: usize = 128 / core::mem::size_of::<u32>();
 const BLAKE2S_HASH_WORDS: usize = 8;
 const SECURE_FIELD_WORDS: usize = 4;
+const CAIRO_RELATION_LAUNCH_MODE: RelationLaunchMode = RelationLaunchMode::Fused;
 
 /// Coarse protocol epochs. Lifetimes are inclusive because a producer and a
 /// consumer executing in the same epoch must not alias.
@@ -1815,7 +1818,7 @@ impl ProtocolGeometry {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
         };
-        feed(b"stwo-cairo-protocol-geometry-v9\0");
+        feed(b"stwo-cairo-protocol-geometry-v11\0");
         feed(&self.identity.pow_bits.to_le_bytes());
         feed(&self.identity.log_blowup_factor.to_le_bytes());
         feed(&self.identity.log_last_layer_degree_bound.to_le_bytes());
@@ -2014,6 +2017,12 @@ fn execution_tables_protocol_key(mut protocol_key: u64, geometry: ExecutionTable
 fn graph_a_multiplicity_protocol_key(mut protocol_key: u64, topology_hash: u64) -> u64 {
     feed_hash(&mut protocol_key, b"resident-graph-a-multiplicity-v1\0");
     feed_hash(&mut protocol_key, &topology_hash.to_le_bytes());
+    protocol_key
+}
+
+fn relation_protocol_key(mut protocol_key: u64, mode: RelationLaunchMode) -> u64 {
+    feed_hash(&mut protocol_key, b"resident-relation-launch-v1\0");
+    feed_hash(&mut protocol_key, &(mode as u32).to_le_bytes());
     protocol_key
 }
 
@@ -2627,6 +2636,8 @@ struct LogicalRelationInstanceSlots {
 #[derive(Clone, Debug)]
 struct LogicalRelationWorkspace {
     execution: RelationExecutionPlan,
+    source_plan: Vec<RelationInstanceSourcePlan>,
+    launch_mode: RelationLaunchMode,
     requirements: RelationGraphRequirements,
     descriptors: LogicalBufferId,
     alphas: LogicalBufferId,
@@ -3002,6 +3013,8 @@ pub struct PlannedTranscriptWorkspace {
 #[derive(Clone, Debug)]
 pub struct PlannedRelationWorkspace {
     pub execution: RelationExecutionPlan,
+    pub source_plan: Vec<RelationInstanceSourcePlan>,
+    pub launch_mode: RelationLaunchMode,
     pub requirements: RelationGraphRequirements,
     pub slots: RelationGraphSlots,
 }
@@ -3087,7 +3100,21 @@ impl ProofArenaPlan {
             });
         }
 
+        let relation_execution =
+            RelationExecutionPlan::from_proof_plan(plan, &CAIRO_RELATION_GRAPH)
+                .map_err(ArenaPlanError::RelationExecution)?;
+        let retained_base_trace = relation_execution
+            .source_plan()
+            .map_err(ArenaPlanError::RelationExecution)?
+            .into_iter()
+            .filter(|source| source.plane == RelationSourcePlane::BaseTrace)
+            .flat_map(|source| {
+                (0..source.column_count)
+                    .map(move |ordinal| (source.batch.component, source.part, ordinal))
+            })
+            .collect::<HashSet<_>>();
         let mut logical = Vec::new();
+        let mut transition_aliases = Vec::new();
         for component in &plan.components {
             let parts = capacity_parts(&component.runtime.rows)?;
             for part in parts {
@@ -3100,24 +3127,37 @@ impl ProofArenaPlan {
                     });
                 }
                 let trace_columns = trace_width(component.node.facts.trace_columns, part.part)?;
-                push_component_columns(
-                    &mut logical,
-                    component.node.id,
-                    part.part,
-                    BufferPurpose::BaseTrace,
-                    trace_columns,
-                    part.padded_rows,
-                    BufferLifetime::new(ProofEpoch::Witness, ProofEpoch::Interaction)?,
-                )?;
-                push_component_columns(
-                    &mut logical,
-                    component.node.id,
-                    part.part,
-                    BufferPurpose::BaseCoefficients,
-                    trace_columns,
-                    part.padded_rows,
-                    BufferLifetime::new(ProofEpoch::Witness, ProofEpoch::Decommit)?,
-                )?;
+                let trace_words =
+                    usize::try_from(part.padded_rows).map_err(|_| ArenaPlanError::SizeOverflow)?;
+                for ordinal in 0..trace_columns {
+                    let retained =
+                        retained_base_trace.contains(&(component.node.id, part.part, ordinal));
+                    let evaluations = push_buffer_id(
+                        &mut logical,
+                        Some(component.node.id),
+                        Some(part.part),
+                        BufferPurpose::BaseTrace,
+                        ordinal,
+                        trace_words,
+                        if retained {
+                            BufferLifetime::new(ProofEpoch::Witness, ProofEpoch::Interaction)?
+                        } else {
+                            BufferLifetime::at(ProofEpoch::Witness)
+                        },
+                    )?;
+                    let coefficients = push_buffer_id(
+                        &mut logical,
+                        Some(component.node.id),
+                        Some(part.part),
+                        BufferPurpose::BaseCoefficients,
+                        ordinal,
+                        trace_words,
+                        BufferLifetime::new(ProofEpoch::BaseCommit, ProofEpoch::Decommit)?,
+                    )?;
+                    if !retained {
+                        transition_aliases.push((evaluations, coefficients));
+                    }
+                }
                 if let Some(words) = component.node.facts.lookup_words {
                     push_component_flat_buffer(
                         &mut logical,
@@ -3143,24 +3183,30 @@ impl ProofArenaPlan {
                 if let Some(columns) = component.node.facts.logup_columns {
                     let coordinate_columns =
                         columns.checked_mul(4).ok_or(ArenaPlanError::SizeOverflow)?;
-                    push_component_columns(
-                        &mut logical,
-                        component.node.id,
-                        part.part,
-                        BufferPurpose::InteractionTrace,
-                        coordinate_columns,
-                        part.padded_rows,
-                        BufferLifetime::new(ProofEpoch::Interaction, ProofEpoch::Composition)?,
-                    )?;
-                    push_component_columns(
-                        &mut logical,
-                        component.node.id,
-                        part.part,
-                        BufferPurpose::InteractionCoefficients,
-                        coordinate_columns,
-                        part.padded_rows,
-                        BufferLifetime::new(ProofEpoch::Interaction, ProofEpoch::Decommit)?,
-                    )?;
+                    for ordinal in 0..coordinate_columns {
+                        let evaluations = push_buffer_id(
+                            &mut logical,
+                            Some(component.node.id),
+                            Some(part.part),
+                            BufferPurpose::InteractionTrace,
+                            ordinal,
+                            trace_words,
+                            BufferLifetime::at(ProofEpoch::Interaction),
+                        )?;
+                        let coefficients = push_buffer_id(
+                            &mut logical,
+                            Some(component.node.id),
+                            Some(part.part),
+                            BufferPurpose::InteractionCoefficients,
+                            ordinal,
+                            trace_words,
+                            BufferLifetime::new(
+                                ProofEpoch::InteractionCommit,
+                                ProofEpoch::Decommit,
+                            )?,
+                        )?;
+                        transition_aliases.push((evaluations, coefficients));
+                    }
                 }
             }
         }
@@ -3169,7 +3215,8 @@ impl ProofArenaPlan {
             .transpose()?;
         let logical_witness =
             append_witness_buffers(&mut logical, plan, logical_execution_tables.is_some())?;
-        let logical_relation = append_relation_buffers(&mut logical, plan)?;
+        let logical_relation =
+            append_relation_buffers(&mut logical, relation_execution, &mut transition_aliases)?;
         let multiplicity_plan = logical_execution_tables
             .is_some()
             .then(|| plan_graph_a_multiplicities(plan).map_err(ArenaPlanError::MultiplicityPlan))
@@ -3221,7 +3268,7 @@ impl ProofArenaPlan {
         )?;
         validate_commitment_sources(&logical, &logical_commitments)?;
 
-        let (bindings, specs, total_words) = color_logical_buffers(&logical)?;
+        let (bindings, specs, total_words) = color_logical_buffers(&logical, &transition_aliases)?;
         let layout = ArenaLayout::new(total_words, &specs).map_err(ArenaPlanError::Arena)?;
         validate_aliases(&logical, &bindings)?;
         let high_water_words = ProofEpoch::ALL
@@ -3324,6 +3371,7 @@ impl ProofArenaPlan {
             protocol_key =
                 graph_a_multiplicity_protocol_key(protocol_key, multiplicity.topology_hash);
         }
+        protocol_key = relation_protocol_key(protocol_key, relation.launch_mode);
 
         Ok(Self {
             shape_key: plan.shape_key,
@@ -3638,30 +3686,6 @@ fn trace_width(columns: TraceColumnCount, part: TracePartId) -> Result<u32, Aren
             trace_columns,
         }),
     }
-}
-
-fn push_component_columns(
-    logical: &mut Vec<LogicalBuffer>,
-    component: &'static str,
-    part: TracePartId,
-    purpose: BufferPurpose,
-    columns: u32,
-    rows: u64,
-    lifetime: BufferLifetime,
-) -> Result<(), ArenaPlanError> {
-    let len_words = usize::try_from(rows).map_err(|_| ArenaPlanError::SizeOverflow)?;
-    for column in 0..columns {
-        push_buffer(
-            logical,
-            Some(component),
-            Some(part),
-            purpose,
-            column,
-            len_words,
-            lifetime,
-        )?;
-    }
-    Ok(())
 }
 
 fn push_component_flat_buffer(
@@ -5165,14 +5189,25 @@ fn append_witness_input_gather(
 
 fn append_relation_buffers(
     logical: &mut Vec<LogicalBuffer>,
-    proof: &ProofPlan,
+    execution: RelationExecutionPlan,
+    transition_aliases: &mut Vec<(LogicalBufferId, LogicalBufferId)>,
 ) -> Result<LogicalRelationWorkspace, ArenaPlanError> {
-    let execution = RelationExecutionPlan::from_proof_plan(proof, &CAIRO_RELATION_GRAPH)
+    let launch_mode = CAIRO_RELATION_LAUNCH_MODE;
+    let requirements =
+        execution
+            .requirements_for_mode(launch_mode)
+            .map_err(|error| match error {
+                RelationExecutionError::BackendPlan(error) => ArenaPlanError::Relation(error),
+                other => ArenaPlanError::RelationExecution(other),
+            })?;
+    let source_plan = execution
+        .source_plan()
         .map_err(ArenaPlanError::RelationExecution)?;
-    let requirements = execution.requirements().map_err(|error| match error {
-        RelationExecutionError::BackendPlan(error) => ArenaPlanError::Relation(error),
-        other => ArenaPlanError::RelationExecution(other),
-    })?;
+    if source_plan.len() != requirements.instances.len() {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "relation source plan count drifted from requirements",
+        ));
+    }
     // Captured relation kernels dereference these immutable tables on every
     // warm replay, so their lifetime crosses the Assemble -> Ingest cycle.
     let persistent = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble)?;
@@ -5282,20 +5317,20 @@ fn append_relation_buffers(
     )?;
 
     let mut instances = Vec::with_capacity(requirements.instances.len());
-    for (ordinal, requirement) in requirements.instances.iter().enumerate() {
+    for (ordinal, (requirement, source)) in
+        requirements.instances.iter().zip(&source_plan).enumerate()
+    {
         let batch = execution.batches.get(requirement.batch_index).ok_or(
             ArenaPlanError::InvalidProtocolGeometry(
                 "relation requirement references an unknown batch",
             ),
         )?;
-        let part = match batch.trace_part {
-            RelationTracePart::Component => TracePartId::Main,
-            RelationTracePart::EachMemoryBig => TracePartId::MemoryBig(
-                u32::try_from(requirement.instance_index)
-                    .map_err(|_| ArenaPlanError::SizeOverflow)?,
-            ),
-            RelationTracePart::MemorySmall => TracePartId::MemorySmall,
-        };
+        if *batch != source.batch || requirement.instance_index != source.instance_index {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "relation source plan order drifted from requirements",
+            ));
+        }
+        let part = source.part;
         let mut output_coordinates: Vec<_> = logical
             .iter()
             .filter(|buffer| {
@@ -5312,11 +5347,12 @@ fn append_relation_buffers(
         // relation graph. Materialize those graph-derived coordinates directly
         // in the arena so the relation kernels write the columns committed by
         // PreparedCommitGraph without an intermediate scatter/copy.
-        let output_coordinates = if output_coordinates.is_empty()
+        let graph_derived_outputs = output_coordinates.is_empty()
             && matches!(
                 batch.trace_part,
                 RelationTracePart::EachMemoryBig | RelationTracePart::MemorySmall
-            ) {
+            );
+        let output_coordinates = if graph_derived_outputs {
             (0..requirement.output_coordinate_count)
                 .map(|coordinate| {
                     push_buffer_id(
@@ -5326,7 +5362,7 @@ fn append_relation_buffers(
                         BufferPurpose::InteractionTrace,
                         u32::try_from(coordinate).map_err(|_| ArenaPlanError::SizeOverflow)?,
                         requirement.output_coordinate_words,
-                        BufferLifetime::new(ProofEpoch::Interaction, ProofEpoch::Composition)?,
+                        BufferLifetime::at(ProofEpoch::Interaction),
                     )
                 })
                 .collect::<Result<Vec<_>, ArenaPlanError>>()?
@@ -5365,9 +5401,9 @@ fn append_relation_buffers(
                 })
                 .collect::<Result<Vec<_>, ArenaPlanError>>()?
         };
-        // Every relation output is committed as a polynomial. Evaluations and
-        // coefficients are different live values; materialize the latter even
-        // for graph-derived split-memory traces.
+        // Every relation output is committed as a polynomial. Materialize the
+        // logical coefficient identity even when the selected interpolation
+        // path transforms a dead evaluation in place.
         let mut coefficient_coordinates: Vec<_> = logical
             .iter()
             .filter(|buffer| {
@@ -5378,23 +5414,24 @@ fn append_relation_buffers(
             .map(|buffer| (buffer.ordinal, buffer.id, buffer.len_words))
             .collect();
         coefficient_coordinates.sort_unstable_by_key(|(ordinal, ..)| *ordinal);
-        if coefficient_coordinates.is_empty()
+        let coefficient_coordinates = if coefficient_coordinates.is_empty()
             && matches!(
                 batch.trace_part,
                 RelationTracePart::EachMemoryBig | RelationTracePart::MemorySmall
-            )
-        {
-            for coordinate in 0..requirement.output_coordinate_count {
-                push_buffer_id(
-                    logical,
-                    Some(batch.component),
-                    Some(part),
-                    BufferPurpose::InteractionCoefficients,
-                    u32::try_from(coordinate).map_err(|_| ArenaPlanError::SizeOverflow)?,
-                    requirement.output_coordinate_words,
-                    BufferLifetime::new(ProofEpoch::Interaction, ProofEpoch::Decommit)?,
-                )?;
-            }
+            ) {
+            (0..requirement.output_coordinate_count)
+                .map(|coordinate| {
+                    push_buffer_id(
+                        logical,
+                        Some(batch.component),
+                        Some(part),
+                        BufferPurpose::InteractionCoefficients,
+                        u32::try_from(coordinate).map_err(|_| ArenaPlanError::SizeOverflow)?,
+                        requirement.output_coordinate_words,
+                        BufferLifetime::new(ProofEpoch::InteractionCommit, ProofEpoch::Decommit)?,
+                    )
+                })
+                .collect::<Result<Vec<_>, ArenaPlanError>>()?
         } else {
             if coefficient_coordinates.len() != requirement.output_coordinate_count {
                 return Err(ArenaPlanError::RelationOutputCountMismatch {
@@ -5404,28 +5441,39 @@ fn append_relation_buffers(
                     actual: coefficient_coordinates.len(),
                 });
             }
-            for (coordinate, (actual_ordinal, _, len_words)) in
-                coefficient_coordinates.into_iter().enumerate()
-            {
-                let ordinal =
-                    u32::try_from(coordinate).map_err(|_| ArenaPlanError::SizeOverflow)?;
-                if actual_ordinal != ordinal {
-                    return Err(ArenaPlanError::MissingRelationOutput {
-                        component: batch.component,
-                        part,
-                        ordinal,
-                    });
-                }
-                if len_words < requirement.output_coordinate_words {
-                    return Err(ArenaPlanError::RelationOutputTooSmall {
-                        component: batch.component,
-                        part,
-                        ordinal,
-                        required_words: requirement.output_coordinate_words,
-                        actual_words: len_words,
-                    });
-                }
-            }
+            coefficient_coordinates
+                .into_iter()
+                .enumerate()
+                .map(|(coordinate, (actual_ordinal, id, len_words))| {
+                    let ordinal =
+                        u32::try_from(coordinate).map_err(|_| ArenaPlanError::SizeOverflow)?;
+                    if actual_ordinal != ordinal {
+                        return Err(ArenaPlanError::MissingRelationOutput {
+                            component: batch.component,
+                            part,
+                            ordinal,
+                        });
+                    }
+                    if len_words < requirement.output_coordinate_words {
+                        return Err(ArenaPlanError::RelationOutputTooSmall {
+                            component: batch.component,
+                            part,
+                            ordinal,
+                            required_words: requirement.output_coordinate_words,
+                            actual_words: len_words,
+                        });
+                    }
+                    Ok(id)
+                })
+                .collect::<Result<Vec<_>, ArenaPlanError>>()?
+        };
+        if graph_derived_outputs {
+            transition_aliases.extend(
+                output_coordinates
+                    .iter()
+                    .copied()
+                    .zip(coefficient_coordinates.iter().copied()),
+            );
         }
         let ordinal = u32::try_from(ordinal).map_err(|_| ArenaPlanError::SizeOverflow)?;
         instances.push(LogicalRelationInstanceSlots {
@@ -5471,6 +5519,8 @@ fn append_relation_buffers(
 
     Ok(LogicalRelationWorkspace {
         execution,
+        source_plan,
+        launch_mode,
         requirements,
         descriptors,
         alphas,
@@ -8933,6 +8983,8 @@ fn resolve_relation_slots(
         .map_err(ArenaPlanError::Relation)?;
     Ok(PlannedRelationWorkspace {
         execution: logical.execution,
+        source_plan: logical.source_plan,
+        launch_mode: logical.launch_mode,
         requirements: logical.requirements,
         slots,
     })
@@ -8968,58 +9020,128 @@ struct ColoredSlot {
 #[cfg(debug_assertions)]
 const COLORING_REFERENCE_CHECK_BUFFERS: usize = 256;
 
+#[derive(Debug)]
+struct ColorUnit {
+    members: Vec<usize>,
+    first: ProofEpoch,
+    id: LogicalBufferId,
+    len_words: usize,
+    occupied_epochs: u16,
+}
+
 fn color_logical_buffers(
     logical: &[LogicalBuffer],
+    transition_aliases: &[(LogicalBufferId, LogicalBufferId)],
 ) -> Result<(Vec<ArenaBinding>, Vec<ArenaSlotSpec>, usize), ArenaPlanError> {
-    let mut order: Vec<usize> = (0..logical.len()).collect();
-    order.sort_unstable_by_key(|&index| {
-        let buffer = &logical[index];
-        (
-            buffer.lifetime.first,
-            core::cmp::Reverse(buffer.len_words),
-            buffer.id,
-        )
-    });
+    let mut indices = BTreeMap::new();
+    for (index, buffer) in logical.iter().enumerate() {
+        if indices.insert(buffer.id, index).is_some() {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "duplicate logical buffer id",
+            ));
+        }
+    }
+    let mut paired = BTreeMap::new();
+    for &(evaluations, coefficients) in transition_aliases {
+        let evaluation_index = *indices
+            .get(&evaluations)
+            .ok_or(ArenaPlanError::MissingBinding(evaluations))?;
+        let coefficient_index = *indices
+            .get(&coefficients)
+            .ok_or(ArenaPlanError::MissingBinding(coefficients))?;
+        let evaluation = &logical[evaluation_index];
+        let coefficient = &logical[coefficient_index];
+        let valid_purpose = matches!(
+            (evaluation.purpose, coefficient.purpose),
+            (BufferPurpose::BaseTrace, BufferPurpose::BaseCoefficients)
+                | (
+                    BufferPurpose::InteractionTrace,
+                    BufferPurpose::InteractionCoefficients
+                )
+        );
+        if !valid_purpose
+            || evaluation.component != coefficient.component
+            || evaluation.part != coefficient.part
+            || evaluation.ordinal != coefficient.ordinal
+            || evaluation.len_words != coefficient.len_words
+            || evaluation.lifetime.overlaps(coefficient.lifetime)
+            || (evaluation.lifetime.last as u8).checked_add(1)
+                != Some(coefficient.lifetime.first as u8)
+            || paired.insert(evaluation_index, coefficient_index).is_some()
+            || paired.insert(coefficient_index, evaluation_index).is_some()
+        {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "invalid interpolation transition alias",
+            ));
+        }
+    }
+
+    let mut units = Vec::with_capacity(logical.len() - transition_aliases.len());
+    let mut visited = BTreeSet::new();
+    for index in 0..logical.len() {
+        if !visited.insert(index) {
+            continue;
+        }
+        let mut members = vec![index];
+        if let Some(&other) = paired.get(&index) {
+            if !visited.insert(other) {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "logical buffer appears in multiple transition aliases",
+                ));
+            }
+            members.push(other);
+        }
+        let first = members
+            .iter()
+            .map(|&member| logical[member].lifetime.first)
+            .min()
+            .expect("color unit is non-empty");
+        let id = members
+            .iter()
+            .map(|&member| logical[member].id)
+            .min()
+            .expect("color unit is non-empty");
+        let len_words = members
+            .iter()
+            .map(|&member| logical[member].len_words)
+            .max()
+            .expect("color unit is non-empty");
+        let occupied_epochs = members.iter().fold(0, |mask, &member| {
+            mask | logical[member].lifetime.epoch_mask()
+        });
+        units.push(ColorUnit {
+            members,
+            first,
+            id,
+            len_words,
+            occupied_epochs,
+        });
+    }
+    // Admit larger units first so a slot's capacity is fixed by its first
+    // occupant and can never grow later. First-compatible placement is a
+    // deterministic memory heuristic, not a general optimal-coloring claim;
+    // exact PIE preflight measures the resulting arena before admission.
+    // `first` and `id` make equal-capacity ties deterministic.
+    units.sort_unstable_by_key(|unit| (core::cmp::Reverse(unit.len_words), unit.first, unit.id));
 
     let mut slots: Vec<ColoredSlot> = Vec::new();
     let mut bindings = Vec::with_capacity(logical.len());
-    for index in order {
-        let buffer = &logical[index];
-        let buffer_mask = buffer.lifetime.epoch_mask();
+    for unit in units {
         let candidate = slots
             .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.occupied_epochs & buffer_mask == 0)
-            .min_by_key(|(_, slot)| {
-                (
-                    buffer.len_words.saturating_sub(slot.len_words),
-                    slot.len_words.max(buffer.len_words),
-                    slot.id,
-                )
-            })
-            .map(|(index, _)| index);
+            .position(|slot| slot.occupied_epochs & unit.occupied_epochs == 0);
         // The mask filter must admit exactly the slots the per-lifetime
-        // overlap scan admitted; the selection key is untouched, so equal
-        // candidate sets imply an identical choice. Cross-check the first
+        // overlap scan admitted. Cross-check first-fit selection for the first
         // buffers against the original scan in debug builds.
         #[cfg(debug_assertions)]
         if bindings.len() < COLORING_REFERENCE_CHECK_BUFFERS {
-            let reference = slots
-                .iter()
-                .enumerate()
-                .filter(|(_, slot)| {
+            let reference = slots.iter().position(|slot| {
+                unit.members.iter().all(|&member| {
                     slot.lifetimes
                         .iter()
-                        .all(|&(_, lifetime)| !lifetime.overlaps(buffer.lifetime))
+                        .all(|&(_, lifetime)| !lifetime.overlaps(logical[member].lifetime))
                 })
-                .min_by_key(|(_, slot)| {
-                    (
-                        buffer.len_words.saturating_sub(slot.len_words),
-                        slot.len_words.max(buffer.len_words),
-                        slot.id,
-                    )
-                })
-                .map(|(index, _)| index);
+            });
             debug_assert_eq!(
                 candidate, reference,
                 "epoch-mask slot selection diverged from the per-lifetime overlap scan"
@@ -9042,15 +9164,22 @@ fn color_logical_buffers(
             }
         };
         let slot = &mut slots[slot_index];
-        slot.len_words = slot.len_words.max(buffer.len_words);
-        slot.occupied_epochs |= buffer_mask;
+        debug_assert!(slot.len_words == 0 || slot.len_words >= unit.len_words);
+        slot.len_words = slot.len_words.max(unit.len_words);
+        slot.occupied_epochs |= unit.occupied_epochs;
         #[cfg(debug_assertions)]
-        slot.lifetimes.push((buffer.id, buffer.lifetime));
-        bindings.push(ArenaBinding {
-            logical: buffer.id,
-            physical: slot.id,
-            len_words: buffer.len_words,
-        });
+        slot.lifetimes.extend(unit.members.iter().map(|&member| {
+            let buffer = &logical[member];
+            (buffer.id, buffer.lifetime)
+        }));
+        bindings.extend(unit.members.into_iter().map(|member| {
+            let buffer = &logical[member];
+            ArenaBinding {
+                logical: buffer.id,
+                physical: slot.id,
+                len_words: buffer.len_words,
+            }
+        }));
     }
     bindings.sort_unstable_by_key(|binding| binding.logical);
 
@@ -9209,7 +9338,7 @@ mod tests {
             test_buffer(1, 96, ProofEpoch::Interaction, ProofEpoch::Interaction),
             test_buffer(2, 64, ProofEpoch::Witness, ProofEpoch::Interaction),
         ];
-        let (bindings, specs, total) = color_logical_buffers(&logical).unwrap();
+        let (bindings, specs, total) = color_logical_buffers(&logical, &[]).unwrap();
         ArenaLayout::new(total, &specs).unwrap();
         validate_aliases(&logical, &bindings).unwrap();
 
@@ -9226,12 +9355,82 @@ mod tests {
     }
 
     #[test]
+    fn transition_alias_reserves_one_slot_for_both_values() {
+        let mut evaluations = test_buffer(0, 128, ProofEpoch::Witness, ProofEpoch::Witness);
+        evaluations.component = Some("component");
+        evaluations.part = Some(TracePartId::Main);
+        evaluations.purpose = BufferPurpose::BaseTrace;
+        evaluations.ordinal = 7;
+        let mut coefficients = test_buffer(1, 128, ProofEpoch::BaseCommit, ProofEpoch::Decommit);
+        coefficients.component = evaluations.component;
+        coefficients.part = evaluations.part;
+        coefficients.purpose = BufferPurpose::BaseCoefficients;
+        coefficients.ordinal = evaluations.ordinal;
+        let blocker = test_buffer(2, 128, ProofEpoch::Interaction, ProofEpoch::Composition);
+        let logical = vec![evaluations, coefficients, blocker];
+
+        let (bindings, specs, total) =
+            color_logical_buffers(&logical, &[(LogicalBufferId(0), LogicalBufferId(1))]).unwrap();
+        ArenaLayout::new(total, &specs).unwrap();
+        validate_aliases(&logical, &bindings).unwrap();
+        let physical = |id| {
+            find_binding(&bindings, LogicalBufferId(id))
+                .unwrap()
+                .physical
+        };
+        assert_eq!(physical(0), physical(1));
+        assert_ne!(physical(0), physical(2));
+    }
+
+    #[test]
+    fn transition_alias_rejects_a_still_live_evaluation() {
+        let mut evaluations = test_buffer(0, 128, ProofEpoch::Witness, ProofEpoch::Interaction);
+        evaluations.component = Some("component");
+        evaluations.part = Some(TracePartId::Main);
+        evaluations.purpose = BufferPurpose::BaseTrace;
+        let mut coefficients = test_buffer(1, 128, ProofEpoch::BaseCommit, ProofEpoch::Decommit);
+        coefficients.component = evaluations.component;
+        coefficients.part = evaluations.part;
+        coefficients.purpose = BufferPurpose::BaseCoefficients;
+        assert!(matches!(
+            color_logical_buffers(
+                &[evaluations, coefficients],
+                &[(LogicalBufferId(0), LogicalBufferId(1))],
+            ),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "invalid interpolation transition alias"
+            ))
+        ));
+    }
+
+    #[test]
+    fn transition_alias_rejects_an_epoch_gap() {
+        let mut evaluations = test_buffer(0, 128, ProofEpoch::Witness, ProofEpoch::Witness);
+        evaluations.component = Some("component");
+        evaluations.part = Some(TracePartId::Main);
+        evaluations.purpose = BufferPurpose::BaseTrace;
+        let mut coefficients = test_buffer(1, 128, ProofEpoch::Interaction, ProofEpoch::Decommit);
+        coefficients.component = evaluations.component;
+        coefficients.part = evaluations.part;
+        coefficients.purpose = BufferPurpose::BaseCoefficients;
+        assert!(matches!(
+            color_logical_buffers(
+                &[evaluations, coefficients],
+                &[(LogicalBufferId(0), LogicalBufferId(1))],
+            ),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "invalid interpolation transition alias"
+            ))
+        ));
+    }
+
+    #[test]
     fn physical_slots_are_128_byte_aligned() {
         let logical = vec![
             test_buffer(0, 33, ProofEpoch::Witness, ProofEpoch::Witness),
             test_buffer(1, 65, ProofEpoch::Witness, ProofEpoch::Witness),
         ];
-        let (_, specs, total) = color_logical_buffers(&logical).unwrap();
+        let (_, specs, total) = color_logical_buffers(&logical, &[]).unwrap();
         assert_eq!(total % ARENA_ALIGNMENT_WORDS, 0);
         assert!(specs
             .iter()
@@ -9267,10 +9466,9 @@ mod tests {
         }
     }
 
-    /// Verbatim copy of the pre-bitmask coloring loop: the compatibility
-    /// filter scans every lifetime already pooled into a slot. Kept as the
-    /// reference the optimized colorer must match bit-for-bit, because slot
-    /// ids, insertion order, and specs are part of plan identity.
+    /// Per-lifetime reference for the descending-capacity colorer: compatibility
+    /// scans every lifetime already pooled into a slot, while production uses
+    /// the equivalent epoch-union mask.
     fn reference_color_logical_buffers(
         logical: &[LogicalBuffer],
     ) -> (Vec<ArenaBinding>, Vec<ArenaSlotSpec>, usize) {
@@ -9283,8 +9481,8 @@ mod tests {
         order.sort_unstable_by_key(|&index| {
             let buffer = &logical[index];
             (
-                buffer.lifetime.first,
                 core::cmp::Reverse(buffer.len_words),
+                buffer.lifetime.first,
                 buffer.id,
             )
         });
@@ -9292,22 +9490,11 @@ mod tests {
         let mut bindings = Vec::with_capacity(logical.len());
         for index in order {
             let buffer = &logical[index];
-            let candidate = slots
-                .iter()
-                .enumerate()
-                .filter(|(_, slot)| {
-                    slot.lifetimes
-                        .iter()
-                        .all(|&lifetime| !lifetime.overlaps(buffer.lifetime))
-                })
-                .min_by_key(|(_, slot)| {
-                    (
-                        buffer.len_words.saturating_sub(slot.len_words),
-                        slot.len_words.max(buffer.len_words),
-                        slot.id,
-                    )
-                })
-                .map(|(index, _)| index);
+            let candidate = slots.iter().position(|slot| {
+                slot.lifetimes
+                    .iter()
+                    .all(|&lifetime| !lifetime.overlaps(buffer.lifetime))
+            });
             let slot_index = candidate.unwrap_or_else(|| {
                 slots.push(ReferenceSlot {
                     id: ArenaSlotId(u32::try_from(slots.len() + 1).unwrap()),
@@ -9317,6 +9504,7 @@ mod tests {
                 slots.len() - 1
             });
             let slot = &mut slots[slot_index];
+            assert!(slot.len_words == 0 || slot.len_words >= buffer.len_words);
             slot.len_words = slot.len_words.max(buffer.len_words);
             slot.lifetimes.push(buffer.lifetime);
             bindings.push(ArenaBinding {
@@ -9345,10 +9533,9 @@ mod tests {
         )
     }
 
-    /// The optimized colorer must reproduce the reference coloring exactly —
-    /// same slot ids, same bindings, same specs, same total — across a
-    /// deterministic population that exercises pooling, ties, and every epoch
-    /// range shape well past the debug-only cross-check window.
+    /// The optimized colorer must reproduce the per-lifetime first-fit
+    /// reference exactly across a deterministic population that exercises
+    /// pooling, ties, and every epoch range shape past the debug check window.
     #[test]
     fn bitmask_coloring_matches_reference_coloring_exactly() {
         let mut state = 0x243f_6a88_85a3_08d3u64; // deterministic LCG
@@ -9374,7 +9561,7 @@ mod tests {
                 lifetime: BufferLifetime::new(first, last).unwrap(),
             });
         }
-        let (bindings, specs, total) = color_logical_buffers(&logical).unwrap();
+        let (bindings, specs, total) = color_logical_buffers(&logical, &[]).unwrap();
         let (expected_bindings, expected_specs, expected_total) =
             reference_color_logical_buffers(&logical);
         assert_eq!(bindings, expected_bindings);
@@ -9943,7 +10130,10 @@ mod tests {
         );
         let arena = ProofArenaPlan::build(&proof, &protocol, &composition).unwrap();
         arena.validate_aliases().unwrap();
-        assert_eq!(arena.protocol_key, protocol.key());
+        assert_eq!(
+            arena.protocol_key,
+            relation_protocol_key(protocol.key(), CAIRO_RELATION_LAUNCH_MODE)
+        );
 
         let mut progressive = protocol.clone();
         progressive.identity.commit_mode = ProgressiveCommitMode::DomainProgressive;
@@ -10504,6 +10694,52 @@ mod tests {
         let fused_arena =
             ProofArenaPlan::build(&proof, &fused_interpolation, &composition).unwrap();
         let fused_base = fused_arena.commitment(CommitmentTreeId::Base).unwrap();
+        let fused_retained_base = fused_arena
+            .relation()
+            .source_plan
+            .iter()
+            .filter(|source| source.plane == RelationSourcePlane::BaseTrace)
+            .flat_map(|source| {
+                (0..source.column_count)
+                    .map(move |ordinal| (source.batch.component, source.part, ordinal))
+            })
+            .collect::<HashSet<_>>();
+        assert!(!fused_retained_base.is_empty());
+        for evaluation in fused_arena.logical_buffers().iter().filter(|buffer| {
+            matches!(
+                buffer.purpose,
+                BufferPurpose::BaseTrace | BufferPurpose::InteractionTrace
+            )
+        }) {
+            let coefficient_purpose = match evaluation.purpose {
+                BufferPurpose::BaseTrace => BufferPurpose::BaseCoefficients,
+                BufferPurpose::InteractionTrace => BufferPurpose::InteractionCoefficients,
+                _ => unreachable!(),
+            };
+            let coefficient = fused_arena
+                .find(
+                    evaluation.component,
+                    evaluation.part,
+                    coefficient_purpose,
+                    evaluation.ordinal,
+                )
+                .expect("every evaluation has one coefficient destination")
+                .1;
+            let should_alias = match evaluation.purpose {
+                BufferPurpose::BaseTrace => !fused_retained_base.contains(&(
+                    evaluation.component.unwrap(),
+                    evaluation.part.unwrap(),
+                    evaluation.ordinal,
+                )),
+                BufferPurpose::InteractionTrace => true,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                fused_arena.binding(evaluation.id).unwrap().physical == coefficient.physical,
+                should_alias,
+                "fused interpolation transition alias drifted from evaluation liveness"
+            );
+        }
         let distinct_base_logs = fused_interpolation
             .commitments
             .iter()
@@ -10513,7 +10749,7 @@ mod tests {
             .iter()
             .flatten()
             .copied()
-            .collect::<BTreeSet<_>>();
+            .collect::<HashSet<_>>();
         assert_eq!(
             fused_base.interpolation_batches.len(),
             distinct_base_logs.len()
@@ -10884,26 +11120,57 @@ mod tests {
             "composition coefficient sources overlap during their live range"
         );
         assert_eq!(arena.relation().execution.template_use_count, 1566);
-        let physical_ids = |purpose| {
-            arena
-                .logical_buffers()
-                .iter()
-                .filter(|buffer| buffer.purpose == purpose)
-                .map(|buffer| arena.binding(buffer.id).unwrap().physical)
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        let base_evaluations = physical_ids(BufferPurpose::BaseTrace);
-        let base_coefficients = physical_ids(BufferPurpose::BaseCoefficients);
-        let interaction_evaluations = physical_ids(BufferPurpose::InteractionTrace);
-        let interaction_coefficients = physical_ids(BufferPurpose::InteractionCoefficients);
-        assert!(
-            base_evaluations.is_disjoint(&base_coefficients),
-            "base evaluations and coefficients overlap while both are live"
-        );
-        assert!(
-            interaction_evaluations.is_disjoint(&interaction_coefficients),
-            "interaction evaluations and coefficients overlap while both are live"
-        );
+        let retained_base = arena
+            .relation()
+            .source_plan
+            .iter()
+            .filter(|source| source.plane == RelationSourcePlane::BaseTrace)
+            .flat_map(|source| {
+                (0..source.column_count)
+                    .map(move |ordinal| (source.batch.component, source.part, ordinal))
+            })
+            .collect::<HashSet<_>>();
+        for evaluation in arena
+            .logical_buffers()
+            .iter()
+            .filter(|buffer| buffer.purpose == BufferPurpose::BaseTrace)
+        {
+            let coefficients = arena
+                .find(
+                    evaluation.component,
+                    evaluation.part,
+                    BufferPurpose::BaseCoefficients,
+                    evaluation.ordinal,
+                )
+                .expect("every base evaluation has one coefficient destination")
+                .1;
+            let evaluations = arena.binding(evaluation.id).unwrap();
+            let retained = retained_base.contains(&(
+                evaluation.component.unwrap(),
+                evaluation.part.unwrap(),
+                evaluation.ordinal,
+            ));
+            assert_eq!(evaluations.physical == coefficients.physical, !retained);
+        }
+        for evaluation in arena
+            .logical_buffers()
+            .iter()
+            .filter(|buffer| buffer.purpose == BufferPurpose::InteractionTrace)
+        {
+            let coefficients = arena
+                .find(
+                    evaluation.component,
+                    evaluation.part,
+                    BufferPurpose::InteractionCoefficients,
+                    evaluation.ordinal,
+                )
+                .expect("every interaction evaluation has one coefficient destination")
+                .1;
+            assert_eq!(
+                arena.binding(evaluation.id).unwrap().physical,
+                coefficients.physical
+            );
+        }
         assert_eq!(
             arena
                 .logical_buffers()

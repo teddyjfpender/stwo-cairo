@@ -37,6 +37,7 @@
 //! (pow_bits=26, FriConfig(0, 1, 70, 3)) — the same "do not change" config in
 //! gpu_bench. Exit code 0 iff the verdict is PASS.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
 
 use stwo::core::fri::FriConfig;
@@ -55,6 +56,17 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// Budget in bytes for a GiB budget flag value.
 fn budget_bytes_of(vram_budget_gb: f64) -> usize {
     (vram_budget_gb * GIB) as usize
+}
+
+fn parse_vram_budget_gb(value: Option<&str>) -> Result<f64, String> {
+    let value = value.unwrap_or("79");
+    let budget = value
+        .parse::<f64>()
+        .map_err(|error| format!("--vram-budget-gb must be an f64: {error}"))?;
+    if !budget.is_finite() || budget <= 0.0 {
+        return Err("--vram-budget-gb must be finite and greater than zero".to_owned());
+    }
+    Ok(budget)
 }
 
 /// The PASS verdict: full capture-safe coverage, no multiplicity coverage gaps
@@ -199,14 +211,64 @@ fn report_json(
     let arena = &report.arena;
     let total_words = arena.total_words();
     let total_bytes = total_words * WORD_BYTES;
+    let mut slot_capacity = BTreeMap::new();
+    for binding in arena.bindings() {
+        let capacity = slot_capacity.entry(binding.physical).or_insert(0usize);
+        *capacity = (*capacity).max(binding.len_words);
+    }
     let peak_by_epoch: Vec<serde_json::Value> = ProofEpoch::ALL
         .iter()
         .map(|&epoch| {
             let words = arena.high_water_words(epoch);
+            let logical_words = arena
+                .logical_buffers()
+                .iter()
+                .filter(|buffer| buffer.lifetime.contains(epoch))
+                .try_fold(0usize, |total, buffer| total.checked_add(buffer.len_words))
+                .expect("logical epoch words overflow");
+            assert!(
+                logical_words <= words,
+                "logical epoch occupancy exceeds physical high-water"
+            );
+            let mut seen = BTreeSet::new();
+            let mut by_purpose_words = BTreeMap::<String, usize>::new();
+            let mut logical_by_purpose_words = BTreeMap::<String, usize>::new();
+            for buffer in arena
+                .logical_buffers()
+                .iter()
+                .filter(|buffer| buffer.lifetime.contains(epoch))
+            {
+                *logical_by_purpose_words
+                    .entry(format!("{:?}", buffer.purpose))
+                    .or_default() += buffer.len_words;
+                let binding = arena.binding(buffer.id).unwrap();
+                if seen.insert(binding.physical) {
+                    *by_purpose_words
+                        .entry(format!("{:?}", buffer.purpose))
+                        .or_default() += slot_capacity[&binding.physical];
+                }
+            }
+            assert_eq!(
+                by_purpose_words.values().sum::<usize>(),
+                words,
+                "per-purpose physical-slot attribution must partition the epoch high-water"
+            );
+            let by_purpose_bytes = by_purpose_words
+                .into_iter()
+                .map(|(purpose, words)| (purpose, words * WORD_BYTES))
+                .collect::<BTreeMap<_, _>>();
+            let logical_by_purpose_bytes = logical_by_purpose_words
+                .into_iter()
+                .map(|(purpose, words)| (purpose, words * WORD_BYTES))
+                .collect::<BTreeMap<_, _>>();
             serde_json::json!({
                 "epoch": format!("{epoch:?}"),
                 "words": words,
                 "bytes": words * WORD_BYTES,
+                "logical_live_bytes": logical_words * WORD_BYTES,
+                "slot_slack_bytes": (words - logical_words) * WORD_BYTES,
+                "by_purpose_bytes": by_purpose_bytes,
+                "logical_by_purpose_bytes": logical_by_purpose_bytes,
             })
         })
         .collect();
@@ -261,6 +323,18 @@ fn report_json(
         },
         "transcript_segments": report.transcript_segments,
         "manifest_policy": format!("{:?}", report.manifest_policy),
+        "runtime_policy": {
+            "commit_mode": format!("{:?}", report.protocol_policy.commit_mode),
+            "direct_composition_retention_mode": format!(
+                "{:?}", report.protocol_policy.direct_composition_retention_mode
+            ),
+            "quotient_numerator_source_policy": format!(
+                "{:?}", report.protocol_policy.quotient_numerator_source_policy
+            ),
+            "retained_lde_budget_bytes": report.protocol_policy.retained_lde_budget_bytes,
+            "interpolation_mode": format!("{:?}", report.interpolation_mode),
+            "relation_launch_mode": format!("{:?}", report.arena.relation().launch_mode),
+        },
         "vram_budget_gib": vram_budget_gb,
         "vram_budget_bytes": budget_bytes,
         "vram_fit": total_bytes <= budget_bytes,
@@ -270,12 +344,10 @@ fn report_json(
 }
 
 fn main() -> ExitCode {
-    let vram_budget_gb: f64 = match arg("--vram-budget-gb")
-        .map(|value| value.parse::<f64>())
-        .transpose()
-    {
-        Ok(value) => value.unwrap_or(79.0),
-        Err(error) => return fail("args", format!("--vram-budget-gb must be an f64: {error}")),
+    let budget_arg = arg("--vram-budget-gb");
+    let vram_budget_gb = match parse_vram_budget_gb(budget_arg.as_deref()) {
+        Ok(value) => value,
+        Err(error) => return fail("args", error),
     };
     let variant_override = arg("--preprocessed");
     let (input, variant, source) = match load_input(variant_override.as_deref()) {
@@ -319,13 +391,26 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{budget_bytes_of, verdict, GIB, WORD_BYTES};
+    use super::{budget_bytes_of, parse_vram_budget_gb, verdict, GIB, WORD_BYTES};
 
     #[test]
     fn budget_bytes_is_gib_scaled() {
         assert_eq!(budget_bytes_of(1.0), 1024 * 1024 * 1024);
         assert_eq!(budget_bytes_of(79.0), 79 * 1024 * 1024 * 1024);
         assert_eq!(budget_bytes_of(0.5), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn vram_budget_requires_a_positive_finite_number() {
+        assert_eq!(parse_vram_budget_gb(None), Ok(79.0));
+        assert_eq!(parse_vram_budget_gb(Some("76")), Ok(76.0));
+        assert_eq!(budget_bytes_of(76.0), 76 * 1024 * 1024 * 1024);
+        for invalid in ["0", "-1", "NaN", "inf"] {
+            assert!(
+                parse_vram_budget_gb(Some(invalid)).is_err(),
+                "accepted invalid budget {invalid}"
+            );
+        }
     }
 
     #[test]

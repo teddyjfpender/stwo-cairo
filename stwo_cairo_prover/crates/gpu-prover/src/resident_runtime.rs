@@ -29,10 +29,9 @@ use stwo_backend_cuda::{
     PreparedWitnessFeedError, PreparedWitnessFeedGraph, PreparedWitnessGraph,
     PreparedWitnessInputCompactGraph, PreparedWitnessInputGatherError,
     PreparedWitnessInputGatherGraph, PreparedWitnessInputSeedGraph, PreparedWitnessMode,
-    RelationChallenges, RelationGraphError, RelationInstanceSources, RelationSourceLayout,
-    TraceDecommitSources, TraceSourceGroup, TranscriptInputBinding, TranscriptInputId,
-    TranscriptMirrorReport, TranscriptOutputBinding, TranscriptOutputId, TranscriptSegmentCursor,
-    TranscriptSegmentStart,
+    RelationChallenges, RelationGraphError, RelationInstanceSources, TraceDecommitSources,
+    TraceSourceGroup, TranscriptInputBinding, TranscriptInputId, TranscriptMirrorReport,
+    TranscriptOutputBinding, TranscriptOutputId, TranscriptSegmentCursor, TranscriptSegmentStart,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
@@ -47,7 +46,7 @@ use crate::proof_bundle::{
     ResidentProofBundle, ResidentProofBundleError, ResidentProofBundleLayout,
 };
 use crate::relation::RelationTracePart;
-use crate::relation_execution::RelationBatchKey;
+use crate::relation_execution::{RelationBatchKey, RelationSourcePlane};
 use crate::resident_composition::{prepare_resident_composition, ResidentCompositionError};
 use crate::resident_oods::{ResidentOodsError, ResidentOodsPipeline};
 use crate::resident_sources::{
@@ -1295,9 +1294,10 @@ impl<'a> ResidentGraphRuntime<'a> {
         )?;
         let transcript_cursor = transcript.segment_cursor();
         let relation_plan = workspace.plan().relation();
-        let relation = PreparedRelationGraph::prepare(
+        let relation = PreparedRelationGraph::prepare_with_mode(
             arena,
             relation_plan.execution.kernel_program(),
+            relation_plan.launch_mode,
             &relation_plan.slots,
             &relation_sources,
             setup_relation_challenges,
@@ -3184,6 +3184,40 @@ impl<'a> ResidentGraphRuntime<'a> {
         Ok(self.decommit.read_assembly_once()?)
     }
 
+    /// DIAGNOSTIC-ONLY replay of the witness-generation prefix without base
+    /// interpolation or commitment, so the trace auditor can inspect the exact
+    /// prepared witness writers. Call this before any base-commit replay: the
+    /// ingest inputs are not live after `ProofEpoch::Witness` and are not
+    /// re-uploaded by this diagnostic seam.
+    pub fn replay_witness_only_for_diagnostics(&self) -> Result<(), ResidentRuntimeError> {
+        if let Some(execution_tables) = &self.execution_tables {
+            execution_tables.launch()?;
+        }
+        if let Some(multiplicity) = &self.multiplicity {
+            multiplicity.clear.launch()?;
+            if let Some(seed) = &multiplicity.public_memory_seed {
+                seed.launch()?;
+            }
+        }
+        enqueue_witness_lane_levels(
+            self.workspace.arena(),
+            &self.witness,
+            self.ec_op.as_ref(),
+            &self.witness_lane_levels,
+            self.multiplicity.as_ref(),
+        )?;
+        if let Some(multiplicity) = &self.multiplicity {
+            if let Some(memory) = &multiplicity.memory_traces {
+                memory.launch()?;
+            }
+            for fixed in &multiplicity.fixed_tables {
+                fixed.launch()?;
+            }
+        }
+        self.workspace.arena().context().sync()?;
+        Ok(())
+    }
+
     /// DIAGNOSTIC-ONLY base-trace readback: every planned `BaseTrace`
     /// evaluation column of one component part (ordinals `0..width`, each
     /// `padded_rows` u32 words), copied D2H and drained with one stream
@@ -3195,10 +3229,10 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// surface. Production replay must never call this: it crosses PCIe and
     /// synchronizes, deliberately violating the resident hot-path budget.
     ///
-    /// Content is only meaningful while the buffers' planned lifetime is live
-    /// (`ProofEpoch::Witness..=Interaction`): read between the base-commit
-    /// boundary replay and the interaction replay — later epochs may reuse the
-    /// pooled arena slots.
+    /// Content is only meaningful immediately after a pre-base-commit
+    /// [`Self::replay_witness_only_for_diagnostics`]. Base interpolation may
+    /// overwrite dead evaluations in place, and later epochs may reuse pooled
+    /// arena slots.
     pub fn read_base_trace_columns_for_diagnostics(
         &self,
         component: &'static str,
@@ -3217,9 +3251,12 @@ impl<'a> ResidentGraphRuntime<'a> {
         let mut columns: Vec<Vec<u32>> = Vec::new();
         loop {
             let ordinal = u32::try_from(columns.len()).map_err(|_| missing(u32::MAX))?;
-            let Some((logical, binding)) =
-                plan.find(Some(component), Some(part), BufferPurpose::BaseTrace, ordinal)
-            else {
+            let Some((logical, binding)) = plan.find(
+                Some(component),
+                Some(part),
+                BufferPurpose::BaseTrace,
+                ordinal,
+            ) else {
                 break;
             };
             let words = logical.len_words;
@@ -3877,64 +3914,25 @@ fn arena_relation_sources(
     workspace: &GraphWorkspace,
 ) -> Result<Vec<RelationInstanceSources>, ResidentRuntimeError> {
     let relation = workspace.plan().relation();
-    let mut ordered = Vec::with_capacity(relation.requirements.instances.len());
-    for requirement in &relation.requirements.instances {
-        let batch = relation.execution.batches[requirement.batch_index];
-        let kernel_batch = &relation.execution.kernel_program().batches[requirement.batch_index];
-        let part = match batch.trace_part {
-            RelationTracePart::Component => {
-                stwo_cairo_prover::witness::proof_shape::TracePartId::Main
-            }
-            RelationTracePart::EachMemoryBig => {
-                stwo_cairo_prover::witness::proof_shape::TracePartId::MemoryBig(
-                    u32::try_from(requirement.instance_index).map_err(|_| {
-                        ResidentRuntimeError::MissingRelationSource {
-                            batch,
-                            instance_index: requirement.instance_index,
-                            ordinal: u32::MAX,
-                        }
-                    })?,
-                )
-            }
-            RelationTracePart::MemorySmall => {
-                stwo_cairo_prover::witness::proof_shape::TracePartId::MemorySmall
-            }
+    let mut ordered = Vec::with_capacity(relation.source_plan.len());
+    for source_plan in &relation.source_plan {
+        let purpose = match source_plan.plane {
+            RelationSourcePlane::LookupWords => BufferPurpose::LookupInputs,
+            RelationSourcePlane::BaseTrace => BufferPurpose::BaseTrace,
         };
-        let (purpose, count) = match kernel_batch.source_layout {
-            RelationSourceLayout::LookupWords { .. } => (BufferPurpose::LookupInputs, 1),
-            RelationSourceLayout::MemoryAddress { chunks } => (
-                BufferPurpose::BaseTrace,
-                chunks
-                    .checked_mul(2)
-                    .ok_or(ResidentRuntimeError::MissingRelationSource {
-                        batch,
-                        instance_index: requirement.instance_index,
-                        ordinal: u32::MAX,
-                    })?,
-            ),
-            RelationSourceLayout::MemoryBig { value_words }
-            | RelationSourceLayout::MemorySmall { value_words } => (
-                BufferPurpose::BaseTrace,
-                value_words
-                    .checked_add(1)
-                    .ok_or(ResidentRuntimeError::MissingRelationSource {
-                        batch,
-                        instance_index: requirement.instance_index,
-                        ordinal: u32::MAX,
-                    })?,
-            ),
-            RelationSourceLayout::BitwiseXor12 {
-                multiplicity_columns,
-            } => (BufferPurpose::BaseTrace, multiplicity_columns),
-        };
-        let columns = (0..count)
+        let columns = (0..source_plan.column_count)
             .map(|ordinal| {
                 let (_, binding) = workspace
                     .plan()
-                    .find(Some(batch.component), Some(part), purpose, ordinal)
+                    .find(
+                        Some(source_plan.batch.component),
+                        Some(source_plan.part),
+                        purpose,
+                        ordinal,
+                    )
                     .ok_or(ResidentRuntimeError::MissingRelationSource {
-                        batch,
-                        instance_index: requirement.instance_index,
+                        batch: source_plan.batch,
+                        instance_index: source_plan.instance_index,
                         ordinal,
                     })?;
                 let source = bind_arena_binding(workspace.arena(), binding)?;

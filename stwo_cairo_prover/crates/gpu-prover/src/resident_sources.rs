@@ -232,8 +232,10 @@ impl From<PreparedProgressiveCommitError> for ResidentSourceStageError {
 /// `BaseTrace::Polys` is rejected: already-interpolated coefficients cannot
 /// reconstruct the canonical evaluations required by memory/xor relation
 /// kernels. All source identities and logs are validated before the first
-/// migration copy. Evaluation-to-coefficient interpolation then runs in place in
-/// the distinct coefficient slots on the arena's explicit stream.
+/// migration copy. Evaluation-to-coefficient interpolation then runs on the
+/// arena's explicit stream: relation-retained evaluations use distinct
+/// coefficient slots, while evaluations proven dead by the arena plan may be
+/// transformed in their exactly aliased slot.
 pub fn stage_base_trace_coefficients(
     workspace: &mut GraphWorkspace,
     proof_plan: &ProofPlan,
@@ -259,11 +261,14 @@ pub fn stage_base_trace_coefficients(
     let mut base_words = 0usize;
     let mut direct_base_columns = 0usize;
     let mut migration_base_words = 0usize;
+    let mut interpolation_copy_words = 0usize;
+    let mut interpolation_copy_columns = 0usize;
     for (column, eval) in columns.iter().copied().zip(&evals) {
         // The migration source is an evaluation. Stage it into the evaluation
         // slot; `PreparedInterpolationGraph` then copies that value into the
         // distinct coefficient slot before applying the inverse transform.
-        let (destination, _) = bind_trace_pair(workspace, CommitmentTreeId::Base, column.source)?;
+        let (destination, coefficients) =
+            bind_trace_pair(workspace, CommitmentTreeId::Base, column.source)?;
         let logical = destination.len_words();
         let expected_words = checked_words(column.log_size)?;
         if logical != expected_words {
@@ -276,6 +281,12 @@ pub fn stage_base_trace_coefficients(
         base_words = base_words
             .checked_add(expected_words)
             .ok_or(ResidentSourceStageError::SizeOverflow)?;
+        if destination.id() != coefficients.id() {
+            interpolation_copy_words = interpolation_copy_words
+                .checked_add(expected_words)
+                .ok_or(ResidentSourceStageError::SizeOverflow)?;
+            interpolation_copy_columns += 1;
+        }
         if destination.as_u32_ptr().cast_const() == eval.values.device_ptr {
             direct_base_columns += 1;
         } else {
@@ -382,10 +393,10 @@ pub fn stage_base_trace_coefficients(
         (None, None)
     };
 
-    // Interpolation copies each resident evaluation into its distinct
-    // coefficient slot once. Only non-aliased source columns add a migration
-    // copy into BaseTrace first.
-    let d2d_words = base_words
+    // Interpolation copies only relation-retained evaluations whose coefficient
+    // slot is physically distinct. Exact transition aliases transform in place;
+    // nonresident source columns separately add one migration into BaseTrace.
+    let d2d_words = interpolation_copy_words
         .checked_add(migration_base_words)
         .and_then(|words| words.checked_add(twiddle_words))
         .ok_or(ResidentSourceStageError::SizeOverflow)?;
@@ -428,7 +439,7 @@ pub fn stage_base_trace_coefficients(
         d2d_bytes: d2d_words
             .checked_mul(core::mem::size_of::<u32>())
             .ok_or(ResidentSourceStageError::SizeOverflow)?,
-        d2d_copies: columns.len()
+        d2d_copies: interpolation_copy_columns
             + (columns.len() - direct_base_columns)
             + usize::from(stage_fixed_twiddles) * 4,
         used_migration_copy: direct_base_columns != columns.len(),

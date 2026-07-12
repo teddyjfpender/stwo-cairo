@@ -89,7 +89,19 @@ impl ProtocolPlanPolicy {
         if composition_max_kernel_instrs == 0 {
             return Err(ProtocolPlanError::UnboundCompositionKernelCap);
         }
-        let mut policy = Self::starknet_blake2s(hash, composition_max_kernel_instrs);
+        Self::starknet_blake2s_from_env(hash, composition_max_kernel_instrs)
+    }
+
+    /// Apply runtime topology/residency policy to a caller-supplied manifest
+    /// identity. Host-only preflight uses a nonzero stand-in identity because
+    /// geometry is manifest-independent, but it must still model the exact
+    /// environment policy that the CUDA runtime will consume.
+    pub(crate) fn starknet_blake2s_from_env(
+        kernel_manifest_hash: u64,
+        composition_max_kernel_instrs: usize,
+    ) -> Result<Self, ProtocolPlanError> {
+        let mut policy =
+            Self::starknet_blake2s(kernel_manifest_hash, composition_max_kernel_instrs);
         policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::from_env();
         policy.direct_composition_retention_mode = DirectCompositionRetentionMode::from_env();
         policy.quotient_numerator_source_policy = QuotientNumeratorSourcePolicy::from_env();

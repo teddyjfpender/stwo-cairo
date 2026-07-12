@@ -11,11 +11,9 @@
 //! the BASE-TRACE COMMITMENT root (claim and preprocessed root match exactly),
 //! so some component's device-generated base-trace witness CONTENT differs
 //! from the SIMD writer's. This runner names the culprit(s) exactly: it enters
-//! the strict resident session, captures, replays ONLY through the base-commit
-//! boundary (the `BaseTrace` buffers' planned lifetime is
-//! `ProofEpoch::Witness..=Interaction`, so their content is intact there and
-//! only there — replaying further may reuse the pooled arena slots), reads
-//! every component's base-trace evaluation columns D2H, independently realizes
+//! the strict resident session, captures, and replays the diagnostic
+//! witness-only prefix while its ingest inputs are still live. It reads every
+//! component's base-trace evaluation columns D2H, independently realizes
 //! the SIMD base trace for the same fixture input on the host, and compares
 //! per component, per column, over the full padded extent. Each component part
 //! gets a verdict:
@@ -145,8 +143,8 @@ fn resolved_rows(plan: &ProofPlan, component: &str, part: TracePartId) -> (u64, 
 }
 
 /// D2H every present component part's BaseTrace columns through the
-/// diagnostic-only runtime seam. Runs strictly between the base-commit replay
-/// and any later boundary — see the buffer-lifetime note in the module doc.
+/// diagnostic-only runtime seam. Runs immediately after the witness-only
+/// diagnostic replay — see the buffer-lifetime note in the module doc.
 fn collect_device_parts(
     runtime: &ResidentGraphRuntime<'_>,
     proof_plan: &ProofPlan,
@@ -430,9 +428,10 @@ fn audit_part(device: &AuditPart, simd: &AuditPart) -> (&'static str, Option<Str
     (verdict, Some(detail))
 }
 
-/// One strict resident session replayed ONLY through the base-commit boundary,
-/// every component's device base-trace columns read D2H, then compared against
-/// an independent host SIMD realization of the same fixture. Diagnostic
+/// One strict resident session replayed through the witness-only diagnostic
+/// prefix before base interpolation; every component's device base-trace
+/// columns are read D2H and compared against an independent host SIMD
+/// realization of the same fixture. Diagnostic
 /// instrument: per-boundary sync and bulk D2H deliberately violate the
 /// resident hot-path budget, which is why this never asserts it.
 #[test]
@@ -449,14 +448,17 @@ fn audit_resident_base_trace_against_simd_reference() {
         .with_strict_resident_session(resident_input(), params, |runtime, artifacts| {
             runtime.require_prepared_witness_coverage()?;
             runtime.capture_all_prepared_subgraphs()?;
+            runtime.replay_witness_only_for_diagnostics()?;
+            eprintln!("audit: witness-only prefix replayed; reading device base trace");
+            let device_parts = collect_device_parts(runtime, artifacts.proof_plan)?;
+
+            // Preserve the original base-boundary device-fault coverage after
+            // readback, while the ingest inputs are still within their planned
+            // lifetime. Never move the diagnostic witness replay after this.
             runtime.begin_transcript_generation(REPLAY_GENERATION)?;
             runtime.replay_base_commit_only()?;
-            // Diagnostic sync through the same public seam as resident_smoke:
-            // drain the stream so a device fault in the base-commit replay is
-            // attributed to the replay, not to the first column readback.
             runtime.read_commitment_root(CommitmentTreeId::Preprocessed)?;
-            eprintln!("audit: base-commit boundary replayed; reading device base trace");
-            collect_device_parts(runtime, artifacts.proof_plan)
+            Ok(device_parts)
         })
         .expect("strict resident session failed");
     drop(prover);
