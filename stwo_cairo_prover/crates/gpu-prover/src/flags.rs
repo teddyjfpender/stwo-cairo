@@ -58,6 +58,16 @@ pub const FLAGS: &[FlagDef] = &[
         purpose: "resident Graph C width: fan small composition components (evaluation rows <= 2^18) across component lanes inside capture so their LDE+eval kernels co-schedule; per-group private LDE-tile regions keep the topology race-free and byte-identical",
         deletion_milestone: "M6 (becomes the unconditional Graph C shape once the H100 A/B shows the width win)",
     },
+    FlagDef {
+        name: "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES",
+        purpose: "resident hybrid opener: override the default 8 GiB retained-LDE budget in bytes",
+        deletion_milestone: "never (hardware-capacity policy)",
+    },
+    FlagDef {
+        name: "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
+        purpose: "resident quotient numerator: opt in to reusing retained commitment evaluations instead of coefficients",
+        deletion_milestone: "M6 (remove after retained-source parity is the unconditional path)",
+    },
 ];
 
 /// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed
@@ -99,13 +109,23 @@ pub fn apply_gpu_native_defaults() {
     }
 }
 
-/// `true` iff `name` is registered in [`FLAGS`] and set to `1` in the environment.
-pub fn flag_on(name: &str) -> bool {
+fn assert_registered(name: &str) {
     debug_assert!(
         FLAGS.iter().any(|f| f.name == name),
         "unregistered flag read from gpu-prover: {name} (register it in flags::FLAGS, R4)"
     );
-    std::env::var(name).as_deref() == Ok("1")
+}
+
+/// Reads a registered non-boolean policy value without changing `std::env::var`
+/// semantics for missing or non-Unicode values.
+pub fn env_value(name: &str) -> Result<String, std::env::VarError> {
+    assert_registered(name);
+    std::env::var(name)
+}
+
+/// `true` iff `name` is registered in [`FLAGS`] and set to `1` in the environment.
+pub fn flag_on(name: &str) -> bool {
+    env_value(name).as_deref() == Ok("1")
 }
 
 #[cfg(test)]
@@ -125,5 +145,26 @@ mod tests {
     #[cfg(debug_assertions)]
     fn unregistered_flag_panics_in_debug() {
         let _ = flag_on("STWO_DEFINITELY_NOT_REGISTERED");
+    }
+
+    #[test]
+    #[should_panic(expected = "unregistered flag")]
+    #[cfg(debug_assertions)]
+    fn unregistered_policy_value_panics_in_debug() {
+        let _ = env_value("STWO_DEFINITELY_NOT_REGISTERED");
+    }
+
+    #[test]
+    fn resident_plan_policy_reads_stay_registry_checked() {
+        for name in [
+            "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES",
+            "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
+        ] {
+            assert!(FLAGS.iter().any(|flag| flag.name == name));
+        }
+        assert!(!include_str!("protocol_plan.rs")
+            .contains("std::env::var(\"STWO_CUDA_RETAINED_LDE_BUDGET_BYTES\")"));
+        assert!(!include_str!("arena_plan.rs")
+            .contains("std::env::var(\"STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS\")"));
     }
 }

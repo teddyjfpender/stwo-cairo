@@ -79,7 +79,7 @@ impl ProtocolPlanPolicy {
             return Err(ProtocolPlanError::UnboundCompositionKernelCap);
         }
         let mut policy = Self::starknet_blake2s(hash, composition_max_kernel_instrs);
-        if let Ok(value) = std::env::var("STWO_CUDA_RETAINED_LDE_BUDGET_BYTES") {
+        if let Ok(value) = crate::flags::env_value("STWO_CUDA_RETAINED_LDE_BUDGET_BYTES") {
             policy.retained_lde_budget_bytes = value
                 .parse()
                 .map_err(|_| ProtocolPlanError::InvalidRetainedLdeBudget)?;

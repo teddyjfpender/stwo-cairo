@@ -495,8 +495,7 @@ impl QuotientNumeratorSourcePolicy {
         static POLICY: std::sync::OnceLock<QuotientNumeratorSourcePolicy> =
             std::sync::OnceLock::new();
         *POLICY.get_or_init(|| {
-            if std::env::var("STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS").as_deref() == Ok("1")
-            {
+            if crate::flags::flag_on("STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS") {
                 Self::ReuseRetainedEvaluations
             } else {
                 Self::CoefficientsOnly
