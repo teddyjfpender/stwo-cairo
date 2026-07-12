@@ -29,13 +29,13 @@ STRICT_RESIDENT_REQUIRED_TESTS = (
     "strict_resident_same_shape_changed_memory_matches_second_simd_proof",
     "strict_resident_poseidon_graph_a_matches_simd_bytes",
     "strict_resident_transcript_mirror_diagnostic_once",
-    "strict_resident_composition_columns_match_simd",
-    "strict_resident_first_oods_sample_matches_simd",
-    "strict_resident_composition_accumulator_matches_simd",
-    "strict_resident_composition_buckets_match_simd",
-    "strict_resident_composition_log5_prefix_matches_simd",
-    "strict_resident_add_ap_composition_inputs_match_host",
     "strict_resident_mirrored_transcript_matches_host_channel",
+)
+
+QUALIFICATION_FLAGS = (
+    "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE",
+    "STWO_CUDA_COMPOSITION_DIRECT_RETENTION",
+    "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
 )
 
 
@@ -61,6 +61,30 @@ GATES = (
             "prepared_commit_native",
         ),
         2,
+    ),
+    (
+        "prepared_progressive_commit_reference",
+        (
+            "cargo",
+            "test",
+            "-p",
+            "stwo-backend-cuda",
+            "--test",
+            "prepared_progressive_commit_native",
+        ),
+        1,
+    ),
+    (
+        "prepared_merkle_from_progressive_leaves_reference",
+        (
+            "cargo",
+            "test",
+            "-p",
+            "stwo-backend-cuda",
+            "--test",
+            "prepared_merkle_from_leaves_native",
+        ),
+        1,
     ),
     (
         "prepared_fri_eager_capture_reference",
@@ -220,7 +244,7 @@ GATES = (
             "--test",
             "prepared_composition_native",
         ),
-        2,
+        3,
     ),
     (
         "strict_resident_whole_proof_simd_byte_identity",
@@ -365,6 +389,10 @@ def main() -> int:
         choices=RUNTIME_MODES,
         default="arena-graph",
     )
+    parser.add_argument("--synced-stwo-head")
+    parser.add_argument("--synced-stwo-worktree-hash")
+    parser.add_argument("--synced-stwo-cairo-head")
+    parser.add_argument("--synced-stwo-cairo-worktree-hash")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     stwo = args.stwo.resolve()
@@ -423,6 +451,15 @@ def main() -> int:
     stwo_head, stwo_dirty, stwo_worktree_hash = git_state(stwo)
     stwo_cairo_head, stwo_cairo_dirty, stwo_cairo_worktree_hash = git_state(stwo_cairo)
 
+    synced_values = (
+        args.synced_stwo_head,
+        args.synced_stwo_worktree_hash,
+        args.synced_stwo_cairo_head,
+        args.synced_stwo_cairo_worktree_hash,
+    )
+    if any(synced_values) and not all(synced_values):
+        raise SystemExit("synced source identity requires both heads and both worktree hashes")
+
     artifact = {
         "schema": "stwo.cuda.soundness-gate.v2",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -435,6 +472,29 @@ def main() -> int:
         "stwo_cairo_git_dirty": stwo_cairo_dirty,
         "stwo_cairo_worktree_hash": stwo_cairo_worktree_hash,
         "runtime_mode": args.runtime_mode,
+        "qualification_flags": {
+            key: int(os.environ.get(key) == "1") for key in QUALIFICATION_FLAGS
+        },
+        "effective_stwo_env": {
+            key: value
+            for key, value in sorted(os.environ.items())
+            if key.startswith("STWO_")
+        },
+        "synced_source": (
+            {
+                "stwo": {
+                    "head": args.synced_stwo_head,
+                    "worktree_hash": args.synced_stwo_worktree_hash,
+                },
+                "stwo_cairo": {
+                    "head": args.synced_stwo_cairo_head,
+                    "worktree_hash": args.synced_stwo_cairo_worktree_hash,
+                },
+                "transport": "rsync-archive-checksum",
+            }
+            if all(synced_values)
+            else None
+        ),
         "gates": [],
         "passed": False,
     }

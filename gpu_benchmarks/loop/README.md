@@ -6,7 +6,8 @@ impossible to confuse which code produced which number.
 
 ```
 cd gpu_benchmarks/loop
-./bench_loop.sh                 # gate + SN_PIE_2: 1 cold + 5 warm proofs on the pod
+./qualification_round.sh        # release gate + flags-off/on SN2 + all four fixed PIEs
+./bench_loop.sh --gate-only     # non-publishable correctness gate only
 ./ledger_report.py              # read the ledger back as a table
 ```
 
@@ -38,7 +39,7 @@ cd gpu_benchmarks/loop
 ## Usage
 
 ```
-./bench_loop.sh [--pie {1|2|3|4|10t}] [--reps N] [--full] [--simd]
+./bench_loop.sh [--pie {1|2|3|4|10t}] [--reps N] [--all-pies|--full] [--simd]
                 [--skip-sync] [--gate-only]
 ```
 
@@ -46,6 +47,7 @@ cd gpu_benchmarks/loop
 |---------------|-------------------------------------------------------------------------|
 | `--pie SEL`   | Which PIE to benchmark: `1..4` = `SN_PIE_<n>.zip`, `10t` = 10-transfer. Default `2`. |
 | `--reps N`    | Fixed-statement proofs (minimum 2). Published default `6`: one cold + five warm; the warm median is reported. |
+| `--all-pies`  | Benchmark `SN_PIE_1/2/3/4` without the rotate-mode fleet.          |
 | `--full`      | Also benchmark `SN_PIE_1/3/4` (CUDA) **and** run the rotate-mode fleet (pipelined stream over all four PIEs — the production one-pod-proving-a-block-stream shape). |
 | `--simd`      | Add a same-host SIMD run of the selected PIE (CPU baseline).            |
 | `--skip-sync` | Skip rsync **and** build; benchmark the binary already on the pod.      |
@@ -56,7 +58,8 @@ cd gpu_benchmarks/loop
 | Var             | Default    | Meaning                                                     |
 |-----------------|------------|-------------------------------------------------------------|
 | `BENCH_POD_ID`  | (pod.conf) | Pod id, overrides `POD_ID` in `pod.conf`.                   |
-| `BENCH_ENV`     | (empty)    | `"K=V K=V ..."` exported verbatim into **every** gpu_bench invocation (gate included) and **recorded in every ledger entry**. `STWO_BOOTLOADER_JSON` is reserved; use `POD_BOOTLOADER_JSON`. |
+| `BENCH_ENV`     | (empty)    | Shell-safe `"K=V K=V ..."` tokens exported into **every** gpu_bench invocation (gate included) and **recorded in every ledger entry**. `STWO_BOOTLOADER_JSON` is reserved; use `POD_BOOTLOADER_JSON`. |
+| `QUALIFICATION_ARTIFACT` | (unset) | Required for ordinary publishable performance runs; must be a passed `qualification_round.sh` artifact matching the exact source, environment, and runtime. |
 | `GPU_PCS_RUNTIME_MODE` | `arena-graph` | Required typed CUDA PCS runtime mode for every CUDA gate and performance run. `detached-eager` remains migration diagnostics only. |
 | `DRY_RUN=1`     | `0`        | Echo every ssh/rsync instead of executing, and fabricate run output so the provenance → ledger → summary path still runs for real. Use to trace logic offline. |
 | `FAKE_STALL`    | (unset)    | (DRY_RUN only) name of a run to simulate as stalled — exercises the stall → evidence → ledger → abort path. |
@@ -115,7 +118,7 @@ Every ledger entry records, at the moment of the run:
 
 - `stwo_rev`, `cairo_rev` — `git rev-parse HEAD` of each repo.
 - `stwo_dirty`, `cairo_dirty` — `"clean"` if the working tree matches HEAD, otherwise
-  the first 16 hex of a hash over tracked changes and untracked path/content. This makes a run reproducible **even with
+  the full SHA-256 over tracked changes and untracked path/content. This makes a run reproducible **even with
   uncommitted work**: the same rev + same dirty hash == the same source. A changed
   number with an unchanged (rev, dirty) pair on the same pod is a real signal; a changed
   dirty hash tells you the source moved.
@@ -155,6 +158,15 @@ CUDA performance record, closing the stale-binary
 case where an unknown CLI flag is silently ignored. A failed contract, verify, or crash
 aborts the run. **Performance is never reported from a build that failed the gate.**
 
+`qualification_round.sh` is the only release admission flow. Its internal A/B and
+fixed-PIE records are marked provisional until the final manifest binds their hashes.
+The passed manifest is the promoted performance artifact: it embeds the validated
+SN1–SN4 records and the six-repetition flags-off/optimized SN2 comparison.
+Every remote launcher first removes ambient `STWO_*` and blocking CUDA overrides,
+then exports only its recorded policy state and fixed harness variables.
+`bench_loop.sh` refuses an ordinary performance run without that passed, source- and
+environment-matching manifest; `--gate-only` remains available to create one.
+
 ## ⚠️ Only same-pod comparisons are meaningful
 
 `useful_mhz_median` depends heavily on the host (GPU model, CPU, memory bandwidth, and shared
@@ -190,6 +202,7 @@ sync + build would disturb the in-flight round's source tree.
 | File               | Role                                                            |
 |--------------------|-----------------------------------------------------------------|
 | `bench_loop.sh`    | The one command (steps 0 + a–h above).                          |
+| `qualification_round.sh` | One-build post-admission qualification, SN2 A/B, and all-four fixed round. |
 | `../validate_architecture_record.py` | Fail-closed validator for pulled gpu_bench architecture evidence. |
 | `ledger_report.py` | Read `ledger.jsonl` as a table / phase trend (stdlib only).     |
 | `pod.conf`         | Pod id + fallback endpoint (edit when the pod moves).           |

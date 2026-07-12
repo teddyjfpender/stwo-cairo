@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import re
 import unittest
 from pathlib import Path
@@ -13,6 +14,12 @@ from validate_architecture_record import (
     validate_record,
     validate_soundness_gate,
 )
+
+
+def source_roots() -> tuple[Path, Path]:
+    stwo_cairo = Path(__file__).resolve().parents[1]
+    stwo = Path(os.environ.get("STWO_LOCAL", stwo_cairo.parent / "stwo")).resolve()
+    return stwo, stwo_cairo
 
 
 def valid_record() -> dict:
@@ -286,18 +293,20 @@ class ArchitectureRecordTest(unittest.TestCase):
         self.assertEqual(validate_soundness_gate(detached, "detached-eager"), [])
 
     def test_soundness_manifest_covers_cfg_native_targets_with_exact_counts(self) -> None:
-        workspace = Path(__file__).resolve().parents[2]
+        stwo, stwo_cairo = source_roots()
         test_roots = (
-            (workspace / "stwo/crates/backend-cuda/tests", "stwo-backend-cuda"),
+            (stwo / "crates/backend-cuda/tests", "stwo-backend-cuda"),
             (
-                workspace / "stwo-cairo/stwo_cairo_prover/crates/gpu-prover/tests",
+                stwo_cairo / "stwo_cairo_prover/crates/gpu-prover/tests",
                 "stwo-cairo-gpu-prover",
             ),
             (
-                workspace / "stwo-cairo/stwo_cairo_prover/crates/prover/tests",
+                stwo_cairo / "stwo_cairo_prover/crates/prover/tests",
                 "stwo-cairo-prover",
             ),
         )
+        for root, _ in test_roots:
+            self.assertTrue(root.is_dir(), f"native-test root is absent: {root}")
         discovered = {}
         for root, package in test_roots:
             for path in root.glob("*_native.rs"):
@@ -342,8 +351,8 @@ class ArchitectureRecordTest(unittest.TestCase):
         )
 
     def test_reference_cache_tests_cannot_be_absorbed_by_strict_resident_target(self) -> None:
-        workspace = Path(__file__).resolve().parents[2]
-        tests = workspace / "stwo-cairo/stwo_cairo_prover/crates/gpu-prover/tests"
+        _, stwo_cairo = source_roots()
+        tests = stwo_cairo / "stwo_cairo_prover/crates/gpu-prover/tests"
         strict = (tests / "resident_parity_native.rs").read_text(encoding="utf-8")
         common = (tests / "common/reference_cache.rs").read_text(encoding="utf-8")
         host = (tests / "reference_cache_host.rs").read_text(encoding="utf-8")

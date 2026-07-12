@@ -38,7 +38,8 @@
 # certified. Run `./bench_loop.sh --gate-only` (or a full loop) first.
 #
 # Usage:
-#   ./perf_gates.sh [--lanes CSV] [--reps N] [--ncu] [--ncu-kernels REGEX]
+#   ./perf_gates.sh [--lanes CSV | --bundle NAME --candidate-env "K=V ..."]
+#                   [--reps N] [--ncu] [--ncu-kernels REGEX]
 #                   [--parity-only] [--help] [EXTRA_FLAG ...]
 #
 # One command per lane (the runbook lines):
@@ -49,6 +50,8 @@
 #
 # Flags:
 #   --lanes CSV       Replace the default lane set with a comma-separated list.
+#   --bundle NAME     Compare one named multi-flag candidate against flags-off.
+#   --candidate-env   Candidate K=V tokens used with --bundle.
 #   --reps N          Reps per arm (default 4; >=2 so in-run byte-equal is real).
 #   --ncu             After a lane's A/B pair passes, capture a targeted ncu
 #                     profile of that lane's kernels (flag ON). Report is
@@ -86,6 +89,8 @@ LOOP_DIR="${SCRIPT_DIR}"
 RESULTS_DIR="${RESULTS_DIR:-${LOOP_DIR}/results}"
 PERF_LEDGER="${PERF_LEDGER:-${LOOP_DIR}/perf_gates.jsonl}"
 POD_CONF="${POD_CONF:-${LOOP_DIR}/pod.conf}"
+ARCHITECTURE_CHECK="${CAIRO_LOCAL}/gpu_benchmarks/validate_architecture_record.py"
+ARCHITECTURE_SOUNDNESS_GATE="${ARCHITECTURE_SOUNDNESS_GATE:-}"
 
 STWO_POD="/workspace/stwo"
 CAIRO_POD="/workspace/stwo-cairo"
@@ -119,6 +124,15 @@ NCU_KERNELS_OVERRIDE=""
 DEFAULT_LANES=(STWO_CUDA_RELATION_FUSED STWO_CUDA_RELATION_SCAN_TAIL STWO_CUDA_BLAKE2S_LEAF_ILP)
 LANES=()
 EXTRA_LANES=()
+BUNDLE_NAME=""
+CANDIDATE_ENV=""
+APPROVED_BUNDLE_FLAGS=(
+  STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE
+  STWO_CUDA_COMPOSITION_DIRECT_RETENTION
+  STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS
+)
+BASELINE_STATE="{}"
+CANDIDATE_STATE="{}"
 
 # Set by resolve_pod().
 POD_HOST=""
@@ -205,6 +219,11 @@ run_ssh() {
 sha256_stream() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum; else LC_ALL=C shasum -a 256; fi
 }
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else LC_ALL=C shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Lane -> default ncu kernel-name regex (blake2s.cu / relation_*.cu kernels)
@@ -224,6 +243,8 @@ lane_kernel_regex() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --lanes)       IFS=',' read -r -a LANES <<<"${2:?--lanes needs a CSV value}"; shift 2 ;;
+    --bundle)      BUNDLE_NAME="${2:?--bundle needs a name}"; shift 2 ;;
+    --candidate-env) CANDIDATE_ENV="${2:?--candidate-env needs K=V tokens}"; shift 2 ;;
     --reps)        REPS="${2:?--reps needs a value}"; shift 2 ;;
     --ncu)         DO_NCU=1; shift ;;
     --ncu-kernels) NCU_KERNELS_OVERRIDE="${2:?--ncu-kernels needs a regex}"; shift 2 ;;
@@ -234,7 +255,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ${#LANES[@]} -eq 0 ]]; then LANES=("${DEFAULT_LANES[@]}"); fi
+[[ -z "$BUNDLE_NAME" || ${#LANES[@]} -eq 0 ]] \
+  || die "--bundle and --lanes are mutually exclusive"
+[[ -z "$BUNDLE_NAME" || ${#EXTRA_LANES[@]} -eq 0 ]] \
+  || die "--bundle does not accept positional lane flags"
+[[ -z "$BUNDLE_NAME" || -n "$CANDIDATE_ENV" ]] \
+  || die "--bundle requires --candidate-env"
+[[ -n "$BUNDLE_NAME" || -z "$CANDIDATE_ENV" ]] \
+  || die "--candidate-env requires --bundle"
+if [[ -n "$BUNDLE_NAME" ]]; then
+  [[ "$BUNDLE_NAME" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] \
+    || die "bundle name '$BUNDLE_NAME' is not a safe artifact label"
+  [[ "$PARITY_ONLY" == "0" ]] || die "--bundle does not support --parity-only"
+  LANES=("$BUNDLE_NAME")
+elif [[ ${#LANES[@]} -eq 0 ]]; then
+  LANES=("${DEFAULT_LANES[@]}")
+fi
 if [[ ${#EXTRA_LANES[@]} -gt 0 ]]; then LANES+=("${EXTRA_LANES[@]}"); fi
 
 [[ "$REPS" =~ ^[0-9]+$ && "$REPS" -ge 2 ]] \
@@ -246,15 +282,46 @@ case "$GPU_PCS_RUNTIME_MODE" in
 esac
 
 for lane in "${LANES[@]}"; do
-  [[ "$lane" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "lane '$lane' is not a valid env flag name"
+  if [[ -z "$BUNDLE_NAME" ]]; then
+    [[ "$lane" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "lane '$lane' is not a valid env flag name"
+  fi
 done
+
+for kv in $CANDIDATE_ENV; do
+  [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./,:+-]*$ ]] \
+    || die "candidate token '$kv' is not a shell-safe K=V token"
+  for common in $BENCH_ENV; do
+    [[ "${common%%=*}" != "${kv%%=*}" ]] \
+      || die "candidate flag ${kv%%=*} must not also appear in BENCH_ENV"
+  done
+  approved=0
+  for flag in "${APPROVED_BUNDLE_FLAGS[@]}"; do
+    [[ "${kv%%=*}" == "$flag" && "${kv#*=}" == "1" ]] && approved=1
+  done
+  [[ "$approved" == "1" ]] \
+    || die "bundle candidate token '$kv' is not an approved qualification flag set to 1"
+done
+if [[ -n "$BUNDLE_NAME" ]]; then
+  BASELINE_STATE='{"STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE":0,"STWO_CUDA_COMPOSITION_DIRECT_RETENTION":0,"STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS":0}'
+  CANDIDATE_STATE="$(CANDIDATE_ENV="$CANDIDATE_ENV" python3 - <<'PY'
+import json, os
+flags = (
+    "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE",
+    "STWO_CUDA_COMPOSITION_DIRECT_RETENTION",
+    "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
+)
+enabled = {token.split("=", 1)[0] for token in os.environ["CANDIDATE_ENV"].split()}
+print(json.dumps({flag: int(flag in enabled) for flag in flags}, sort_keys=True))
+PY
+)"
+fi
 
 # Validate BENCH_ENV shape and keep lane flags out of it (an arm's identity
 # must come from this script, never ambient env).
 if [[ -n "$BENCH_ENV" ]]; then
   for kv in $BENCH_ENV; do
-    [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*$ ]] \
-      || die "BENCH_ENV token '$kv' is not K=V (values must not contain spaces)"
+    [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./,:+-]*$ ]] \
+      || die "BENCH_ENV token '$kv' is not a shell-safe K=V token"
     [[ "${kv%%=*}" != "STWO_BOOTLOADER_JSON" ]] \
       || die "STWO_BOOTLOADER_JSON is reserved; set POD_BOOTLOADER_JSON instead"
     [[ "${kv%%=*}" != "STWO_DUMP_PROOF" ]] \
@@ -272,30 +339,31 @@ resolve_pod
 # Provenance (same fields as bench_loop's ledger)
 # ---------------------------------------------------------------------------
 git_rev() { git -C "$1" rev-parse HEAD 2>/dev/null || echo "UNKNOWN"; }
-git_dirty() {
+git_worktree_hash() {
   local repo="$1"
   if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then echo "NOGIT"; return; fi
-  if git -C "$repo" diff --quiet HEAD 2>/dev/null &&
-     [[ -z "$(git -C "$repo" ls-files --others --exclude-standard | head -1)" ]]; then
-    echo "clean"
-    return
-  fi
   (
-    git -C "$repo" diff --binary HEAD -- 2>/dev/null
+    git -C "$repo" diff --binary HEAD -- . ':(exclude)gpu_benchmarks/loop/results' 2>/dev/null
     git -C "$repo" ls-files --others --exclude-standard -z |
       while IFS= read -r -d '' path; do
+        [[ "$path" == gpu_benchmarks/loop/results/* ]] && continue
         printf 'untracked\0%s\0' "$path"
         cat "$repo/$path"
       done
-  ) | sha256_stream | cut -c1-16
+  ) | sha256_stream | cut -d' ' -f1
 }
 
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 STWO_REV="$(git_rev "$STWO_LOCAL")"
-STWO_DIRTY="$(git_dirty "$STWO_LOCAL")"
+STWO_WORKTREE_HASH="$(git_worktree_hash "$STWO_LOCAL")"
+STWO_DIRTY="$STWO_WORKTREE_HASH"
+[[ -n "$(git -C "$STWO_LOCAL" status --porcelain)" ]] || STWO_DIRTY="clean"
 CAIRO_REV="$(git_rev "$CAIRO_LOCAL")"
-CAIRO_DIRTY="$(git_dirty "$CAIRO_LOCAL")"
+CAIRO_WORKTREE_HASH="$(git_worktree_hash "$CAIRO_LOCAL")"
+CAIRO_DIRTY="$CAIRO_WORKTREE_HASH"
+[[ -n "$(git -C "$CAIRO_LOCAL" status --porcelain -- . ':(exclude)gpu_benchmarks/loop/results')" ]] \
+  || CAIRO_DIRTY="clean"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -321,10 +389,12 @@ synth_out() {
   local seed=$(( $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 40 ))
   local um_median
   um_median="$(awk -v s="$seed" 'BEGIN{printf "%.3f", 1.3 + s/100.0}')"
+  local stages='{"OodsEvaluation":1,"QuotientAndCompaction":1,"FriCommitAndFold":1,"ProofOfWork":1,"FriQueryAndDecommit":1,"TreeDecommit":1,"Assembly":1}'
+  local architecture='"gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"ArenaGraph","gpu_pcs_stage_started":'"$stages"',"gpu_pcs_stage_finished":'"$stages"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"arena-graph","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"performance_claim_admissible":true,"steps_per_s":1000000,"mhz":1.0,"useful_mhz":1.0,"gpu_host_syncs":1,"gpu_graph_launches":8,"gpu_kernel_launches":72,"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25,"gpu_graph_a_setup_gate_passed":true,"gpu_setup_base_migration_copies":0,"gpu_setup_lookup_host_copies":0,"gpu_setup_legacy_witness_fallbacks":0,"gpu_execution_tables_ingest_compact_h2d_bytes":4096,"gpu_execution_tables_ingest_compact_h2d_copies":3,"gpu_execution_tables_ingest_descriptor_h2d_bytes":64,"gpu_execution_tables_ingest_descriptor_h2d_copies":2,"gpu_execution_tables_ingest_syncs":1,"gpu_witness_ingest_syncs":1'
   {
     echo "{\"rep\":0,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":$((1200 + seed * 3)).5},\"fri\":{\"count\":1,\"total_ms\":$((560 + seed)).1}}}"
     echo "{\"rep\":1,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":$((1190 + seed * 3)).2},\"fri\":{\"count\":1,\"total_ms\":$((555 + seed)).8}}}"
-    echo "{\"program\":\"SN_PIE_2.zip\",\"backend\":\"cuda\",\"engine\":\"gpu-native\",\"verified_reps\":${REPS},\"proof_byte_equal\":true,\"proof_byte_equal_required\":true,\"proof_comparison_applicable\":true,\"useful_mhz_median\":${um_median},\"vram_peak_gb\":11.3,\"gpu\":\"${POD_GPU}\"}"
+    echo "{\"program\":\"SN_PIE_2.zip\",\"backend\":\"cuda\",\"engine\":\"gpu-native\",${architecture},\"verified_reps\":${REPS},\"proof_byte_equal\":true,\"proof_byte_equal_required\":true,\"proof_comparison_applicable\":true,\"useful_mhz_median\":${um_median},\"vram_peak_gb\":11.3,\"gpu\":\"${POD_GPU}\"}"
   } > "$dest"
 }
 
@@ -419,6 +489,10 @@ bench_body() {
 cd '${POD_PROVER_DIR}'
 . "\$HOME/.cargo/env" 2>/dev/null || true
 export PATH=/usr/local/cuda/bin:\$PATH
+while IFS='=' read -r stwo_name _; do
+  case "\$stwo_name" in STWO_*) unset "\$stwo_name" ;; esac
+done < <(env)
+unset CUDA_LAUNCH_BLOCKING CUDA_DEVICE_MAX_CONNECTIONS
 export RUST_MIN_STACK=${RUST_MIN_STACK_VAL}
 export STWO_BENCH_TRACE=json
 export STWO_JIT_LOG=1
@@ -442,6 +516,34 @@ pod_sha256() {
     | cut -d' ' -f1
 }
 
+proof_contract_ok() {
+  python3 - "$1" "$REPS" <<'PY'
+import json, sys
+record = None
+with open(sys.argv[1], encoding="utf-8") as stream:
+    for line in stream:
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and "verified_reps" in candidate:
+            record = candidate
+required = {
+    "verified_reps": int(sys.argv[2]),
+    "proof_comparison_applicable": True,
+    "proof_byte_equal_required": True,
+    "proof_byte_equal": True,
+}
+raise SystemExit(0 if record is not None and all(record.get(k) == v for k, v in required.items()) else 1)
+PY
+}
+
+architecture_contract_ok() {
+  [[ -n "$ARCHITECTURE_SOUNDNESS_GATE" && -f "$ARCHITECTURE_SOUNDNESS_GATE" ]] || return 1
+  python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE" \
+    --soundness-gate "$ARCHITECTURE_SOUNDNESS_GATE"
+}
+
 # ---------------------------------------------------------------------------
 # Ledger append + summary. status: ok | run_failed | stalled | proof_mismatch
 #                                | parity_ok | parity_failed
@@ -452,6 +554,10 @@ append_perf_ledger() {
   PG_STWO_REV="$STWO_REV" PG_STWO_DIRTY="$STWO_DIRTY" \
   PG_CAIRO_REV="$CAIRO_REV" PG_CAIRO_DIRTY="$CAIRO_DIRTY" \
   PG_GPU="$POD_GPU" PG_BENCH_ENV="$BENCH_ENV" PG_REPS="$REPS" \
+  PG_CANDIDATE_ENV="$CANDIDATE_ENV" \
+  PG_BASELINE_STATE="$BASELINE_STATE" PG_CANDIDATE_STATE="$CANDIDATE_STATE" \
+  PG_ARCH_SOUNDNESS="$ARCHITECTURE_SOUNDNESS_GATE" \
+  PG_ARCH_SOUNDNESS_SHA="$(sha256_file "$ARCHITECTURE_SOUNDNESS_GATE")" \
   PG_BASE_OUT="$base_out" PG_FLAG_OUT="$flag_out" \
   PG_BASE_SHA="$base_sha" PG_FLAG_SHA="$flag_sha" \
   PG_NCU="$ncu_report" PG_LEDGER="$PERF_LEDGER" python3 - <<'PY'
@@ -506,6 +612,17 @@ entry = {
     "cairo_dirty": os.environ["PG_CAIRO_DIRTY"],
     "pod_gpu": os.environ["PG_GPU"],
     "bench_env": os.environ.get("PG_BENCH_ENV", ""),
+    "candidate_env": os.environ.get("PG_CANDIDATE_ENV", ""),
+    "baseline_state": json.loads(os.environ["PG_BASELINE_STATE"]),
+    "candidate_state": json.loads(os.environ["PG_CANDIDATE_STATE"]),
+    "mode": "qualification_probe",
+    "provisional": True,
+    "performance_admissible": False,
+    "architecture_soundness": {
+        "path": os.environ["PG_ARCH_SOUNDNESS"],
+        "sha256": os.environ["PG_ARCH_SOUNDNESS_SHA"],
+        "scope": "source and runtime architecture only; policy state is normalized per arm",
+    },
     "reps": int(os.environ["PG_REPS"]),
     "pie": "SN_PIE_2",
     "baseline": {"useful_mhz_median": bm,
@@ -662,8 +779,14 @@ run_lane() {
 
   log "=== lane ${lane}: A/B SN_PIE_2 pair (reps=${REPS}) ==="
 
-  # Arm A: baseline (lane flag explicitly OFF — unset, matching default).
-  run_pod_job "${lane}.baseline" "$(bench_body "unset ${lane}" "$base_proof" "$args")"
+  local baseline_exports="unset ${lane}" candidate_exports="export ${lane}=1"
+  if [[ -n "$BUNDLE_NAME" ]]; then
+    baseline_exports="unset ${APPROVED_BUNDLE_FLAGS[*]};"
+    candidate_exports="$baseline_exports export ${CANDIDATE_ENV}"
+  fi
+
+  # Arm A: baseline flags explicitly OFF, matching production defaults.
+  run_pod_job "${lane}.baseline" "$(bench_body "$baseline_exports" "$base_proof" "$args")"
   [[ "$DRY_RUN" == "1" ]] && synth_out "${lane}.baseline" "$LAST_OUT"
   local base_out="$LAST_OUT" base_rc="$LAST_RC" base_stall="$LAST_STALL_FILE"
   if [[ "$base_rc" != "0" ]]; then
@@ -672,15 +795,25 @@ run_lane() {
     warn "lane ${lane}: baseline arm failed (rc=${base_rc}${base_stall:+, stall evidence ${base_stall}})"
     return 1
   fi
+  if ! proof_contract_ok "$base_out" || ! architecture_contract_ok "$base_out"; then
+    append_perf_ledger "$lane" "run_failed" "$base_out" "" "" "" ""
+    warn "lane ${lane}: baseline output contract failed"
+    return 1
+  fi
 
-  # Arm B: flagged (<lane>=1).
-  run_pod_job "${lane}.flagged" "$(bench_body "export ${lane}=1" "$flag_proof" "$args")"
+  # Arm B: one lane flag or the complete named candidate bundle.
+  run_pod_job "${lane}.flagged" "$(bench_body "$candidate_exports" "$flag_proof" "$args")"
   [[ "$DRY_RUN" == "1" ]] && synth_out "${lane}.flagged" "$LAST_OUT"
   local flag_out="$LAST_OUT" flag_rc="$LAST_RC" flag_stall="$LAST_STALL_FILE"
   if [[ "$flag_rc" != "0" ]]; then
     append_perf_ledger "$lane" "$([[ "$flag_rc" == "STALLED" ]] && echo stalled || echo run_failed)" \
       "$base_out" "$flag_out" "" "" ""
     warn "lane ${lane}: flagged arm failed (rc=${flag_rc}${flag_stall:+, stall evidence ${flag_stall}})"
+    return 1
+  fi
+  if ! proof_contract_ok "$flag_out" || ! architecture_contract_ok "$flag_out"; then
+    append_perf_ledger "$lane" "run_failed" "$base_out" "$flag_out" "" "" ""
+    warn "lane ${lane}: candidate output contract failed"
     return 1
   fi
 

@@ -33,7 +33,7 @@
 #                            for the SAME run_name, SAME pod_gpu, SAME bench_env.
 #
 # Usage:
-#   ./bench_loop.sh [--pie {1|2|3|4|10t}] [--reps N] [--full] [--simd]
+#   ./bench_loop.sh [--pie {1|2|3|4|10t}] [--reps N] [--all-pies|--full] [--simd]
 #                   [--skip-sync] [--gate-only] [--help]
 #
 # Flags:
@@ -43,6 +43,7 @@
 #                 five warm samples; published claims use the warm median.
 #   --full        Also benchmark SN_PIE_1/3/4 (CUDA) and run the rotate-mode fleet
 #                 (pipelined stream over all four PIEs).
+#   --all-pies    Benchmark SN_PIE_1/2/3/4 without the rotate-mode fleet.
 #   --simd        Add a same-host SIMD run of the selected PIE (CPU baseline).
 #   --skip-sync   Skip rsync AND build; benchmark the binary already on the pod.
 #   --gate-only   Run only the correctness gate (sync+build still happen unless
@@ -53,7 +54,7 @@
 #   BENCH_ENV     "K=V K=V ..." exported verbatim into EVERY gpu_bench invocation
 #                 (gate included) and recorded in each ledger entry as "bench_env".
 #                 For debug bisects: STWO_CUDA_DISABLE_STREAMS, STWO_CUDA_MEMORY_WITNESS,
-#                 STWO_CUDA_DEBUG_SYNC, CUDA_LAUNCH_BLOCKING, ... (no spaces in values).
+#                 STWO_CUDA_DEBUG_SYNC, CUDA_LAUNCH_BLOCKING, ... (shell-safe values only).
 #   DRY_RUN=1     Echo every ssh/rsync instead of executing; fabricate run output so
 #                 the provenance -> ledger -> summary path runs for real offline.
 #   FAKE_STALL    (DRY_RUN only) name of a run to simulate as stalled, to exercise
@@ -122,6 +123,10 @@ POD_SOUNDNESS_GATE="${POD_RUN_DIR}/cuda-soundness-gate.json"
 RUST_MIN_STACK_VAL=4194304
 BUILD_RUSTFLAGS="-C target-cpu=native"
 BENCH_ENV="${BENCH_ENV:-}"          # debug/bisect env, recorded in every ledger entry
+QUALIFICATION_PROBE="${QUALIFICATION_PROBE:-0}"
+QUALIFICATION_ARTIFACT="${QUALIFICATION_ARTIFACT:-}"
+BENCH_PROOF_HASHES="${BENCH_PROOF_HASHES:-0}"
+REUSE_SOUNDNESS_GATE="${REUSE_SOUNDNESS_GATE:-}"
 GPU_PCS_RUNTIME_MODE="${GPU_PCS_RUNTIME_MODE:-arena-graph}"
 GPU_NATIVE_ARGS="--engine gpu-native --require-gpu-native-architecture --require-gpu-pcs-runtime-mode ${GPU_PCS_RUNTIME_MODE}"
 
@@ -140,6 +145,7 @@ MAX_WAIT="${MAX_WAIT:-10800}"
 PIE_SEL="2"
 REPS="6"
 FULL=0
+ALL_PIES=0
 SIMD=0
 SKIP_SYNC=0
 GATE_ONLY=0
@@ -155,6 +161,8 @@ SSH_E=""
 LAST_OUT=""
 LAST_RC=""
 LAST_STALL_FILE=""
+LAST_PROOF_SHA=""
+LOCAL_SOUNDNESS_GATE_SHA=""
 
 # ---------------------------------------------------------------------------
 # Logging helpers ( logs -> stderr, human summary -> stdout )
@@ -280,7 +288,7 @@ check_local_input() {
 }
 
 required_sn_selectors() {
-  if [[ "$FULL" == "1" ]]; then
+  if [[ "$FULL" == "1" || "$ALL_PIES" == "1" ]]; then
     echo "1 2 3 4"
   elif [[ "$PIE_SEL" != "10t" ]]; then
     echo "$PIE_SEL"
@@ -353,6 +361,7 @@ while [[ $# -gt 0 ]]; do
     --pie)       PIE_SEL="${2:?--pie needs a value}"; shift 2 ;;
     --reps)      REPS="${2:?--reps needs a value}"; shift 2 ;;
     --full)      FULL=1; shift ;;
+    --all-pies)  ALL_PIES=1; shift ;;
     --simd)      SIMD=1; shift ;;
     --skip-sync) SKIP_SYNC=1; shift ;;
     --gate-only) GATE_ONLY=1; shift ;;
@@ -364,8 +373,10 @@ done
 [[ "$REPS" =~ ^[0-9]+$ && "$REPS" -ge 2 ]] || die "--reps must be at least 2 so proof-byte equality can be checked"
 pie_path "$PIE_SEL" >/dev/null   # validates selector early
 
-[[ -d "$CAIRO_LOCAL/.git" ]] || die "missing stwo-cairo checkout: $CAIRO_LOCAL"
-[[ -d "$STWO_LOCAL/.git" ]] || die "missing sibling stwo checkout: $STWO_LOCAL"
+git -C "$CAIRO_LOCAL" rev-parse --git-dir >/dev/null 2>&1 \
+  || die "missing stwo-cairo checkout: $CAIRO_LOCAL"
+git -C "$STWO_LOCAL" rev-parse --git-dir >/dev/null 2>&1 \
+  || die "missing sibling stwo checkout: $STWO_LOCAL"
 [[ -f "$INPUT_SHA256SUMS" ]] || die "input checksum manifest missing: $INPUT_SHA256SUMS"
 [[ -f "$ARCHITECTURE_CHECK" ]] || die "architecture record validator missing: $ARCHITECTURE_CHECK"
 [[ -f "$SOUNDNESS_RUNNER" ]] || die "CUDA soundness runner missing: $SOUNDNESS_RUNNER"
@@ -378,11 +389,11 @@ case "$GPU_PCS_RUNTIME_MODE" in
   *) die "GPU_PCS_RUNTIME_MODE must be detached-eager or arena-graph (got '$GPU_PCS_RUNTIME_MODE')" ;;
 esac
 
-# Validate BENCH_ENV shape early: every token must be K=V (no spaces in values).
+# Validate BENCH_ENV before interpolating it into a remote shell.
 if [[ -n "$BENCH_ENV" ]]; then
   for kv in $BENCH_ENV; do
-    [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*$ ]] \
-      || die "BENCH_ENV token '$kv' is not K=V (values must not contain spaces)"
+    [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./,:+-]*$ ]] \
+      || die "BENCH_ENV token '$kv' is not a shell-safe K=V token"
     [[ "${kv%%=*}" != "STWO_BOOTLOADER_JSON" ]] \
       || die "STWO_BOOTLOADER_JSON is reserved; set POD_BOOTLOADER_JSON instead"
   done
@@ -397,32 +408,62 @@ preflight_pod_inputs
 # (a) Provenance capture
 # ---------------------------------------------------------------------------
 git_rev() { git -C "$1" rev-parse HEAD 2>/dev/null || echo "UNKNOWN"; }
-# sha256 of tracked changes plus untracked paths/content. "clean" only when the
-# complete source tree matches HEAD, so newly generated CUDA files are not invisible.
-git_dirty() {
+# sha256 of tracked changes plus untracked paths/content. Newly generated CUDA
+# files are part of the identity even before they are staged.
+git_worktree_hash() {
   local repo="$1"
   if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then echo "NOGIT"; return; fi
-  if git -C "$repo" diff --quiet HEAD 2>/dev/null &&
-     [[ -z "$(git -C "$repo" ls-files --others --exclude-standard | head -1)" ]]; then
-    echo "clean"
-    return
-  fi
   (
-    git -C "$repo" diff --binary HEAD -- 2>/dev/null
+    git -C "$repo" diff --binary HEAD -- . ':(exclude)gpu_benchmarks/loop/results' 2>/dev/null
     git -C "$repo" ls-files --others --exclude-standard -z |
       while IFS= read -r -d '' path; do
+        [[ "$path" == gpu_benchmarks/loop/results/* ]] && continue
         printf 'untracked\0%s\0' "$path"
         cat "$repo/$path"
       done
-  ) | sha256_stream | cut -c1-16
+  ) | sha256_stream | cut -d' ' -f1
 }
 
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 STWO_REV="$(git_rev "$STWO_LOCAL")"
-STWO_DIRTY="$(git_dirty "$STWO_LOCAL")"
+STWO_WORKTREE_HASH="$(git_worktree_hash "$STWO_LOCAL")"
+STWO_DIRTY="$STWO_WORKTREE_HASH"
+[[ -n "$(git -C "$STWO_LOCAL" status --porcelain)" ]] || STWO_DIRTY="clean"
 CAIRO_REV="$(git_rev "$CAIRO_LOCAL")"
-CAIRO_DIRTY="$(git_dirty "$CAIRO_LOCAL")"
+CAIRO_WORKTREE_HASH="$(git_worktree_hash "$CAIRO_LOCAL")"
+CAIRO_DIRTY="$CAIRO_WORKTREE_HASH"
+[[ -n "$(git -C "$CAIRO_LOCAL" status --porcelain -- . ':(exclude)gpu_benchmarks/loop/results')" ]] \
+  || CAIRO_DIRTY="clean"
+
+if [[ "$GATE_ONLY" == "0" && "$QUALIFICATION_PROBE" != "1" ]]; then
+  [[ -n "$QUALIFICATION_ARTIFACT" && -f "$QUALIFICATION_ARTIFACT" ]] \
+    || die "publishable performance requires QUALIFICATION_ARTIFACT from a passed qualification_round"
+  QA_STWO_REV="$STWO_REV" QA_STWO_HASH="$STWO_WORKTREE_HASH" \
+  QA_CAIRO_REV="$CAIRO_REV" QA_CAIRO_HASH="$CAIRO_WORKTREE_HASH" \
+  QA_ENV="$BENCH_ENV" QA_RUNTIME="$GPU_PCS_RUNTIME_MODE" \
+  python3 - "$QUALIFICATION_ARTIFACT" <<'PY' || die "qualification artifact does not match this source/env/runtime"
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    artifact = json.load(stream)
+required = {
+    ("status",): "passed",
+    ("performance_admissible",): True,
+    ("optimized_env",): os.environ["QA_ENV"],
+    ("runtime_mode",): os.environ["QA_RUNTIME"],
+    ("source", "stwo", "head"): os.environ["QA_STWO_REV"],
+    ("source", "stwo", "worktree_hash"): os.environ["QA_STWO_HASH"],
+    ("source", "stwo_cairo", "head"): os.environ["QA_CAIRO_REV"],
+    ("source", "stwo_cairo", "worktree_hash"): os.environ["QA_CAIRO_HASH"],
+}
+for path, expected in required.items():
+    value = artifact
+    for key in path:
+        value = value.get(key) if isinstance(value, dict) else None
+    if value != expected:
+        raise SystemExit(f"qualification {'.'.join(path)}: expected {expected!r}, got {value!r}")
+PY
+fi
 
 mkdir -p "$RESULTS_DIR"
 
@@ -476,6 +517,8 @@ build_pod() {
   fi
   local out
   out="$(run_ssh "cd '${POD_PROVER_DIR}' && . \$HOME/.cargo/env 2>/dev/null; \
+      for stwo_name in \$(env | sed -n 's/^\(STWO_[A-Za-z0-9_]*\)=.*/\1/p'); do unset \"\$stwo_name\"; done; \
+      unset CUDA_LAUNCH_BLOCKING CUDA_DEVICE_MAX_CONNECTIONS; \
       PATH=/usr/local/cuda/bin:\$PATH RUSTFLAGS='${BUILD_RUSTFLAGS}' \
       STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache \
       STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}' \
@@ -496,15 +539,24 @@ build_pod() {
 # performance claim from this build.
 run_cuda_soundness_gate() {
   LOCAL_SOUNDNESS_GATE="${RESULTS_DIR}/${STAMP}.cuda-soundness-gate.json"
+  if [[ -n "$REUSE_SOUNDNESS_GATE" ]]; then
+    [[ "$QUALIFICATION_PROBE" == "1" && -f "$REUSE_SOUNDNESS_GATE" ]] \
+      || die "REUSE_SOUNDNESS_GATE is restricted to qualification-internal probes"
+    cp "$REUSE_SOUNDNESS_GATE" "$LOCAL_SOUNDNESS_GATE"
+    LOCAL_SOUNDNESS_GATE_SHA="$(sha256_file "$LOCAL_SOUNDNESS_GATE")"
+    log "CUDA soundness gate: reusing source/env-bound qualification artifact ${REUSE_SOUNDNESS_GATE}"
+    return 0
+  fi
   log "CUDA soundness gate: counted native differential targets"
   if [[ "$DRY_RUN" == "1" ]]; then
     dry "python3 gpu_benchmarks/run_cuda_soundness_gate.py --stwo ${STWO_POD} --runtime-mode ${GPU_PCS_RUNTIME_MODE} --output ${POD_SOUNDNESS_GATE}"
     PYTHONPATH="$(dirname "$ARCHITECTURE_CHECK")" \
-      STWO_HEAD="$STWO_REV" STWO_CAIRO_HEAD="$CAIRO_REV" \
+      STWO_HEAD="$STWO_REV" STWO_HASH="$STWO_WORKTREE_HASH" \
+      STWO_CAIRO_HEAD="$CAIRO_REV" STWO_CAIRO_HASH="$CAIRO_WORKTREE_HASH" \
       RUNTIME_MODE="$GPU_PCS_RUNTIME_MODE" \
       python3 - "$LOCAL_SOUNDNESS_GATE" <<'PY'
 import json, os, sys
-from run_cuda_soundness_gate import gates_for_runtime_mode
+from run_cuda_soundness_gate import QUALIFICATION_FLAGS, gates_for_runtime_mode
 
 runtime_mode = os.environ["RUNTIME_MODE"]
 gates = gates_for_runtime_mode(runtime_mode)
@@ -512,11 +564,39 @@ gates = gates_for_runtime_mode(runtime_mode)
 artifact = {
     "schema": "stwo.cuda.soundness-gate.v2",
     "dry_run": True,
-    "stwo_git_head": os.environ["STWO_HEAD"],
+    "stwo_git_head": ("f" * 40 if os.environ.get("FAKE_SOUNDNESS_HEAD_MISMATCH") == "1" else os.environ["STWO_HEAD"]),
+    "stwo_git_dirty": False,
     "stwo_cairo_git_head": os.environ["STWO_CAIRO_HEAD"],
+    "stwo_cairo_git_dirty": False,
     "stwo_worktree_hash": "0" * 64,
     "stwo_cairo_worktree_hash": "0" * 64,
+    "synced_source": {
+        "stwo": {
+            "head": ("f" * 40 if os.environ.get("FAKE_SOUNDNESS_HEAD_MISMATCH") == "1" else os.environ["STWO_HEAD"]),
+            "worktree_hash": os.environ["STWO_HASH"],
+        },
+        "stwo_cairo": {
+            "head": os.environ["STWO_CAIRO_HEAD"],
+            "worktree_hash": os.environ["STWO_CAIRO_HASH"],
+        },
+        "transport": "rsync-archive-checksum",
+    },
     "runtime_mode": runtime_mode,
+    "qualification_flags": {
+        key: int(dict(token.split("=", 1) for token in os.environ.get("BENCH_ENV", "").split()).get(key) == "1")
+        for key in QUALIFICATION_FLAGS
+    },
+    "effective_stwo_env": {
+        "STWO_CUDA_OBJ_CACHE": "/workspace/.cuda_obj_cache",
+        "STWO_PARITY_REF_CACHE": "/workspace/.parity_ref_cache",
+        **{
+            key: value
+            for key, value in dict(
+                token.split("=", 1) for token in os.environ.get("BENCH_ENV", "").split()
+            ).items()
+            if key.startswith("STWO_")
+        },
+    },
     "passed": True,
     "gates": [
         {"name": name, "command": list(command), "exit_code": 0,
@@ -525,10 +605,16 @@ artifact = {
         for name, command, required in gates
     ],
 }
+for gate in artifact["gates"]:
+    if gate["name"] == "strict_resident_whole_proof_simd_byte_identity":
+        from run_cuda_soundness_gate import STRICT_RESIDENT_REQUIRED_TESTS
+        gate["required_test_names"] = list(STRICT_RESIDENT_REQUIRED_TESTS)
+        gate["executed_test_names"] = list(STRICT_RESIDENT_REQUIRED_TESTS)
 with open(sys.argv[1], "w", encoding="utf-8") as stream:
     json.dump(artifact, stream)
     stream.write("\n")
 PY
+    LOCAL_SOUNDNESS_GATE_SHA="$(sha256_file "$LOCAL_SOUNDNESS_GATE")"
     return 0
   fi
   # Detached launcher + rc sentinel, same pattern as the benchmark step below:
@@ -546,10 +632,19 @@ PY
 cd '${CAIRO_POD}'
 . "\$HOME/.cargo/env" 2>/dev/null || true
 export PATH=/usr/local/cuda/bin:\$PATH
+while IFS='=' read -r stwo_name _; do
+  case "\$stwo_name" in STWO_*) unset "\$stwo_name" ;; esac
+done < <(env)
+unset CUDA_LAUNCH_BLOCKING CUDA_DEVICE_MAX_CONNECTIONS
 export STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache
 export STWO_PARITY_REF_CACHE=/workspace/.parity_ref_cache
+${BENCH_ENV:+export ${BENCH_ENV}}
 python3 gpu_benchmarks/run_cuda_soundness_gate.py \
   --stwo '${STWO_POD}' --runtime-mode '${GPU_PCS_RUNTIME_MODE}' \
+  --synced-stwo-head '${STWO_REV}' \
+  --synced-stwo-worktree-hash '${STWO_WORKTREE_HASH}' \
+  --synced-stwo-cairo-head '${CAIRO_REV}' \
+  --synced-stwo-cairo-worktree-hash '${CAIRO_WORKTREE_HASH}' \
   --output '${POD_SOUNDNESS_GATE}'
 echo \$? > '${gate_rc}'
 EOF
@@ -567,6 +662,7 @@ EOF
     sleep "$POLL_INTERVAL"
   done
   run_ssh "cat '${POD_SOUNDNESS_GATE}' 2>/dev/null" > "$LOCAL_SOUNDNESS_GATE" || true
+  LOCAL_SOUNDNESS_GATE_SHA="$(sha256_file "$LOCAL_SOUNDNESS_GATE")"
   if [[ "$code" != "0" ]]; then
     warn "CUDA soundness gate failed (exit=${code:-?}); artifact: ${LOCAL_SOUNDNESS_GATE}"
     run_ssh "tail -n 40 '${gate_log}' 2>/dev/null" || true
@@ -587,7 +683,7 @@ synth_out() {
     local runtime_report="DetachedEager"
     [[ "$GPU_PCS_RUNTIME_MODE" == "arena-graph" ]] && runtime_report="ArenaGraph"
     local stage_counts='{"OodsEvaluation":1,"QuotientAndCompaction":1,"FriCommitAndFold":1,"ProofOfWork":1,"FriQueryAndDecommit":1,"TreeDecommit":1,"Assembly":1}'
-    architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"gpu_host_syncs":1,"gpu_graph_launches":8,"gpu_kernel_launches":72,"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25'
+    architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"performance_claim_admissible":true,"gpu_host_syncs":1,"gpu_graph_launches":8,"gpu_kernel_launches":72,"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25,"gpu_graph_a_setup_gate_passed":true,"gpu_setup_base_migration_copies":0,"gpu_setup_lookup_host_copies":0,"gpu_setup_legacy_witness_fallbacks":0,"gpu_execution_tables_ingest_compact_h2d_bytes":4096,"gpu_execution_tables_ingest_compact_h2d_copies":3,"gpu_execution_tables_ingest_descriptor_h2d_bytes":64,"gpu_execution_tables_ingest_descriptor_h2d_copies":2,"gpu_execution_tables_ingest_syncs":1,"gpu_witness_ingest_syncs":1'
   fi
   local seed=$(( $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 40 ))
   local um um_median verified_reps=1
@@ -596,6 +692,7 @@ synth_out() {
   fi
   um="$(awk -v s="$seed" 'BEGIN{printf "%.3f", 1.4 + s/100.0}')"
   um_median="$(awk -v s="$seed" 'BEGIN{printf "%.3f", 1.3 + s/100.0}')"
+  [[ "${FAKE_MISSING_QUALIFICATION_METRICS:-}" == "$name" ]] && um_median="null"
   {
     echo "{\"rep\":0,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":1234.5},\"fri\":{\"count\":1,\"total_ms\":567.8}}}"
     echo "{\"rep\":1,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":1201.2},\"fri\":{\"count\":1,\"total_ms\":560.1}}}"
@@ -622,6 +719,10 @@ run_bench() {
   local pod_pid="${POD_RUN_DIR}/${STAMP}.${name}.pid"
   local pod_pgid="${POD_RUN_DIR}/${STAMP}.${name}.pgid"
   LAST_STALL_FILE=""
+  LAST_PROOF_SHA=""
+  local pod_proof="${POD_RUN_DIR}/${STAMP}.${name}.proof"
+  local proof_export=""
+  [[ "$BENCH_PROOF_HASHES" == "1" ]] && proof_export="export STWO_DUMP_PROOF='${pod_proof}'"
 
   log "run '${name}': gpu_bench ${args}${BENCH_ENV:+  [env: ${BENCH_ENV}]}"
 
@@ -645,6 +746,7 @@ run_bench() {
     : > "${base}.err"
     echo 0 > "${base}.rc"
     LAST_OUT="${base}.out"; LAST_RC=0
+    [[ "$BENCH_PROOF_HASHES" == "1" ]] && LAST_PROOF_SHA="dryrun-${name}-proof-sha256"
     return 0
   fi
 
@@ -660,11 +762,16 @@ run_bench() {
 cd '${POD_PROVER_DIR}'
 . "\$HOME/.cargo/env" 2>/dev/null || true
 export PATH=/usr/local/cuda/bin:\$PATH
+while IFS='=' read -r stwo_name _; do
+  case "\$stwo_name" in STWO_*) unset "\$stwo_name" ;; esac
+done < <(env)
+unset CUDA_LAUNCH_BLOCKING CUDA_DEVICE_MAX_CONNECTIONS
 export RUST_MIN_STACK=${RUST_MIN_STACK_VAL}
 export STWO_BENCH_TRACE=json
 export STWO_JIT_LOG=1
 ${BENCH_ENV:+export ${BENCH_ENV}}
 export STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}'
+${proof_export}
 echo \$\$ > '${pod_pgid}'
 ./${BIN} ${args} > '${pod_out}' 2> '${pod_err}' &
 GB_PID=\$!
@@ -730,13 +837,16 @@ EOF
   LAST_RC="$(cat "${base}.rc" 2>/dev/null || echo TIMEOUT)"
   [[ -n "$LAST_RC" ]] || LAST_RC="TIMEOUT"
   LAST_OUT="${base}.out"
+  if [[ "$BENCH_PROOF_HASHES" == "1" && "$LAST_RC" == "0" ]]; then
+    LAST_PROOF_SHA="$(run_ssh "sha256sum '${pod_proof}'" | cut -d' ' -f1)"
+  fi
   log "run '${name}' finished (rc=${LAST_RC})"
 }
 
 # A stale pre-contract binary silently ignores unknown CLI flags. Exit status alone
 # therefore cannot prove that all gate repetitions were verified and compared.
 gate_contract_ok() {
-  python3 - "$1" <<'PY'
+  python3 - "$1" "${2:-2}" <<'PY'
 import json
 import sys
 
@@ -755,7 +865,7 @@ except OSError as error:
     raise SystemExit(1)
 
 required = {
-    "verified_reps": 2,
+    "verified_reps": int(sys.argv[2]),
     "proof_comparison_applicable": True,
     "proof_byte_equal_required": True,
     "proof_byte_equal": True,
@@ -783,6 +893,8 @@ append_ledger() {
   LB_CAIRO_REV="$CAIRO_REV" LB_CAIRO_DIRTY="$CAIRO_DIRTY" LB_GPU="$POD_GPU" \
   LB_RUN="$run_name" LB_STATUS="$status" LB_OUT="$out_file" LB_ERR="$err_file" \
   LB_BENCH_ENV="$BENCH_ENV" LB_STALL="${LAST_STALL_FILE:-}" \
+  LB_PROOF_SHA="$LAST_PROOF_SHA" LB_PROBE="$QUALIFICATION_PROBE" \
+  LB_SOUNDNESS_PATH="${LOCAL_SOUNDNESS_GATE:-}" LB_SOUNDNESS_SHA="$LOCAL_SOUNDNESS_GATE_SHA" \
   LB_LEDGER="$LEDGER" python3 - <<'PY'
 import os, json
 
@@ -815,6 +927,7 @@ def parse_lines(path):
     return record, pipeline, phases
 
 record, pipeline, phases = parse_lines(os.environ.get("LB_OUT", ""))
+is_provisional = os.environ.get("LB_PROBE") == "1" or run in ("gate_correctness", "gate_failed")
 
 # The comparison metric: sustained useful MHz for a pipelined (fleet) run, else the
 # warm-sample median for a fixed statement. Legacy warm-best useful_mhz is retained
@@ -827,6 +940,8 @@ def metric_of(rec, pipe):
     return None, None
 
 new_metric, new_basis = metric_of(record, pipeline)
+if is_provisional:
+    new_metric, new_basis = None, None
 
 # Find the previous OK entry for the SAME run_name, SAME pod_gpu, and SAME bench_env.
 # Only same-pod comparisons are meaningful, and a number produced with debug env
@@ -844,6 +959,7 @@ try:
                 continue
             if (e.get("run_name") == run and e.get("pod_gpu") == gpu
                     and e.get("status", "ok") == "ok"
+                    and not e.get("provisional", False)
                     and e.get("bench_env", "") == benv):
                 m, _ = metric_of(e.get("record"), e.get("pipeline"))
                 if m is not None:
@@ -861,6 +977,12 @@ entry = {
     "run_name": run,
     "status": status,
     "bench_env": benv,
+    "proof_sha256": os.environ.get("LB_PROOF_SHA", ""),
+    "qualification_probe": os.environ.get("LB_PROBE") == "1",
+    "provisional": is_provisional,
+    "performance_admissible": not is_provisional,
+    "soundness_gate_path": os.environ.get("LB_SOUNDNESS_PATH", ""),
+    "soundness_gate_sha256": os.environ.get("LB_SOUNDNESS_SHA", ""),
     "mhz_basis": new_basis,
     "record": record,
     "phase_totals": phases,
@@ -908,7 +1030,7 @@ PY
 # ===========================================================================
 # Orchestration
 # ===========================================================================
-log "=== bench_loop start (pie=${PIE_SEL} reps=${REPS} full=${FULL} simd=${SIMD} skip_sync=${SKIP_SYNC} gate_only=${GATE_ONLY} dry=${DRY_RUN}) ==="
+log "=== bench_loop start (pie=${PIE_SEL} reps=${REPS} all_pies=${ALL_PIES} full=${FULL} simd=${SIMD} skip_sync=${SKIP_SYNC} gate_only=${GATE_ONLY} dry=${DRY_RUN}) ==="
 
 if [[ "$SKIP_SYNC" == "1" ]]; then
   log "--skip-sync: reusing the binary already on the pod (no repo sync, no build)"
@@ -968,14 +1090,16 @@ if [[ "$SIMD" == "1" ]]; then
   add_run "${SEL_NAME}_simd" "--pie ${SEL_PATH} --backend simd --reps ${REPS} --reuse-input --require-proof-byte-equal"
 fi
 
-if [[ "$FULL" == "1" ]]; then
+if [[ "$ALL_PIES" == "1" || "$FULL" == "1" ]]; then
   for s in 1 3 4; do
     nm="$(pie_name "$s")"
     [[ "$nm" == "$SEL_NAME" ]] && continue   # already queued as the selected PIE
     add_run "$nm" "--pie $(pie_path "$s") --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal"
   done
-  FLEET_LIST="${POD_SN_DIR}/SN_PIE_1.zip,${POD_SN_DIR}/SN_PIE_2.zip,${POD_SN_DIR}/SN_PIE_3.zip,${POD_SN_DIR}/SN_PIE_4.zip"
-  add_run "SN_fleet_rotate" "--pie ${FLEET_LIST} --backend cuda ${GPU_NATIVE_ARGS} --reps ${FLEET_REPS} --pipeline ${FLEET_DEPTH} --producers ${FLEET_PRODUCERS} --pie-mode rotate"
+  if [[ "$FULL" == "1" ]]; then
+    FLEET_LIST="${POD_SN_DIR}/SN_PIE_1.zip,${POD_SN_DIR}/SN_PIE_2.zip,${POD_SN_DIR}/SN_PIE_3.zip,${POD_SN_DIR}/SN_PIE_4.zip"
+    add_run "SN_fleet_rotate" "--pie ${FLEET_LIST} --backend cuda ${GPU_NATIVE_ARGS} --reps ${FLEET_REPS} --pipeline ${FLEET_DEPTH} --producers ${FLEET_PRODUCERS} --pie-mode rotate"
+  fi
 fi
 
 log "=== benchmarking ${#RUN_NAMES[@]} run(s) ==="
@@ -992,6 +1116,10 @@ for idx in "${!RUN_NAMES[@]}"; do
   if [[ "$LAST_RC" == "0" && "$ar" == *"--require-gpu-native-architecture"* ]] \
      && ! architecture_contract_ok "$LAST_OUT"; then
     LAST_RC="ARCHITECTURE_CONTRACT"
+  fi
+  if [[ "$LAST_RC" == "0" && "$ar" == *"--require-proof-byte-equal"* ]] \
+     && ! gate_contract_ok "$LAST_OUT" "$REPS"; then
+    LAST_RC="PROOF_CONTRACT"
   fi
   if [[ "$LAST_RC" != "0" ]]; then
     warn "run '${nm}' failed (rc=${LAST_RC})"

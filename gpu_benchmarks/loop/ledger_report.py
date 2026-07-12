@@ -46,6 +46,8 @@ def load(path):
 
 def metric_of(entry):
     """Return the auditable claim metric and its explicit basis."""
+    if entry.get("provisional") or entry.get("performance_admissible") is False:
+        return None, None
     pipe = entry.get("pipeline")
     if pipe and pipe.get("sustained_useful_mhz") is not None:
         return pipe["sustained_useful_mhz"], "sustained_useful_mhz"
@@ -91,7 +93,7 @@ def table(entries):
         else:
             p = prev[key]
             delta = f"{(m - p) / p * 100.0:+.1f}%" if p else "—"
-        if status == "ok" and m is not None:
+        if status == "ok" and m is not None and not e.get("provisional"):
             prev[key] = m
         rows.append({
             "ts": e.get("ts", "?"),
