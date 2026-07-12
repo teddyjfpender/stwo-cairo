@@ -11,6 +11,8 @@ from typing import Any
 
 from run_cuda_soundness_gate import (
     GATES as CUDA_SOUNDNESS_GATE_COMMANDS,
+    STRICT_RESIDENT_GATE,
+    STRICT_RESIDENT_REQUIRED_TESTS,
     gates_for_runtime_mode,
 )
 
@@ -129,6 +131,17 @@ def validate_soundness_gate(
         expected_command = expected_commands.get(name)
         if expected_command is not None and gate.get("command") != expected_command:
             errors.append(f"soundness gate {name!r}: command does not match manifest")
+        if name == STRICT_RESIDENT_GATE:
+            expected_names = list(STRICT_RESIDENT_REQUIRED_TESTS)
+            if gate.get("required_test_names") != expected_names:
+                errors.append(f"soundness gate {name!r}: required test names drifted")
+            executed_names = gate.get("executed_test_names")
+            if (
+                not isinstance(executed_names, list)
+                or len(executed_names) != len(expected_names)
+                or set(executed_names) != set(expected_names)
+            ):
+                errors.append(f"soundness gate {name!r}: executed test names drifted")
     missing = set(expected_gates) - names
     unexpected = names - set(expected_gates)
     if missing:

@@ -4,7 +4,7 @@ import re
 import unittest
 from pathlib import Path
 
-from run_cuda_soundness_gate import gates_for_runtime_mode
+from run_cuda_soundness_gate import STRICT_RESIDENT_REQUIRED_TESTS, gates_for_runtime_mode
 from validate_architecture_record import (
     ARCHITECTURE,
     SOUNDNESS_COMMANDS,
@@ -99,7 +99,7 @@ def valid_arena_graph_record() -> dict:
 
 def valid_soundness_artifact(runtime_mode: str = "detached-eager") -> dict:
     gates = gates_for_runtime_mode(runtime_mode)
-    return {
+    artifact = {
         "schema": "stwo.cuda.soundness-gate.v2",
         "stwo_git_head": "1" * 40,
         "stwo_cairo_git_head": "2" * 40,
@@ -119,6 +119,11 @@ def valid_soundness_artifact(runtime_mode: str = "detached-eager") -> dict:
             for name, command, required in gates
         ],
     }
+    for gate in artifact["gates"]:
+        if gate["name"] == "strict_resident_whole_proof_simd_byte_identity":
+            gate["required_test_names"] = list(STRICT_RESIDENT_REQUIRED_TESTS)
+            gate["executed_test_names"] = list(STRICT_RESIDENT_REQUIRED_TESTS)
+    return artifact
 
 
 class ArchitectureRecordTest(unittest.TestCase):
@@ -254,6 +259,32 @@ class ArchitectureRecordTest(unittest.TestCase):
         ]
         self.assertTrue(validate_soundness_gate(arena, "arena-graph"))
 
+    def test_strict_resident_named_manifest_is_exact(self) -> None:
+        artifact = valid_soundness_artifact("arena-graph")
+        self.assertEqual(validate_soundness_gate(artifact, "arena-graph"), [])
+        strict = next(
+            gate
+            for gate in artifact["gates"]
+            if gate["name"] == "strict_resident_whole_proof_simd_byte_identity"
+        )
+        for mutation in ("missing", "extra", "duplicate"):
+            with self.subTest(mutation=mutation):
+                candidate = valid_soundness_artifact("arena-graph")
+                gate = next(
+                    item for item in candidate["gates"] if item["name"] == strict["name"]
+                )
+                if mutation == "missing":
+                    gate["executed_test_names"].pop()
+                elif mutation == "extra":
+                    gate["executed_test_names"].append("unreviewed_test")
+                else:
+                    gate["executed_test_names"][-1] = gate["executed_test_names"][0]
+                self.assertTrue(validate_soundness_gate(candidate, "arena-graph"))
+
+        detached = valid_soundness_artifact("detached-eager")
+        detached["gates"][0]["executed_tests"] = detached["gates"][0]["required_tests"]
+        self.assertEqual(validate_soundness_gate(detached, "detached-eager"), [])
+
     def test_soundness_manifest_covers_cfg_native_targets_with_exact_counts(self) -> None:
         workspace = Path(__file__).resolve().parents[2]
         test_roots = (
@@ -302,8 +333,19 @@ class ArchitectureRecordTest(unittest.TestCase):
             1,
         )
         self.assertEqual(
-            SOUNDNESS_GATES["strict_resident_whole_proof_simd_byte_identity"], 4
+            SOUNDNESS_GATES["strict_resident_whole_proof_simd_byte_identity"],
+            len(STRICT_RESIDENT_REQUIRED_TESTS),
         )
+
+    def test_reference_cache_tests_cannot_be_absorbed_by_strict_resident_target(self) -> None:
+        workspace = Path(__file__).resolve().parents[2]
+        tests = workspace / "stwo-cairo/stwo_cairo_prover/crates/gpu-prover/tests"
+        strict = (tests / "resident_parity_native.rs").read_text(encoding="utf-8")
+        common = (tests / "common/reference_cache.rs").read_text(encoding="utf-8")
+        host = (tests / "reference_cache_host.rs").read_text(encoding="utf-8")
+        self.assertIn('#[path = "common/reference_cache.rs"]', strict)
+        self.assertIsNone(re.search(r"#\[(?:test|cfg\(test\))\]", common))
+        self.assertEqual(len(re.findall(r"(?m)^#\[test\]\s*$", host)), 5)
 
 
 if __name__ == "__main__":

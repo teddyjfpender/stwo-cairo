@@ -20,8 +20,23 @@ from pathlib import Path
 
 
 RESULT = re.compile(r"test result: ok\. (\d+) passed;")
+TEST_OK = re.compile(r"(?m)^test ([^ ]+) \.\.\. ok$")
 
 RESIDENT_FIXTURE = re.compile(r'STRICT_RESIDENT_FIXTURE: &str = "([^"]+)"')
+
+STRICT_RESIDENT_REQUIRED_TESTS = (
+    "strict_resident_cold_and_warm_proofs_match_simd_bytes",
+    "strict_resident_same_shape_changed_memory_matches_second_simd_proof",
+    "strict_resident_poseidon_graph_a_matches_simd_bytes",
+    "strict_resident_transcript_mirror_diagnostic_once",
+    "strict_resident_composition_columns_match_simd",
+    "strict_resident_first_oods_sample_matches_simd",
+    "strict_resident_composition_accumulator_matches_simd",
+    "strict_resident_composition_buckets_match_simd",
+    "strict_resident_composition_log5_prefix_matches_simd",
+    "strict_resident_add_ap_composition_inputs_match_host",
+    "strict_resident_mirrored_transcript_matches_host_channel",
+)
 
 
 GATES = (
@@ -219,7 +234,7 @@ GATES = (
             "--test",
             "resident_parity_native",
         ),
-        4,
+        len(STRICT_RESIDENT_REQUIRED_TESTS),
     ),
     (
         "prepared_final_fri_and_pow_eager_capture_reference",
@@ -298,7 +313,15 @@ def run_gate(stwo: Path, name: str, command: tuple[str, ...], expected: int) -> 
     )
     counts = [int(match.group(1)) for match in RESULT.finditer(process.stdout)]
     executed = max(counts, default=0)
-    passed = process.returncode == 0 and executed == expected
+    required_test_names = (
+        STRICT_RESIDENT_REQUIRED_TESTS if name == STRICT_RESIDENT_GATE else None
+    )
+    executed_test_names = tuple(TEST_OK.findall(process.stdout))
+    names_match = required_test_names is None or (
+        set(executed_test_names) == set(required_test_names)
+        and len(executed_test_names) == len(required_test_names)
+    )
+    passed = process.returncode == 0 and executed == expected and names_match
     record = {
         "name": name,
         "command": list(command),
@@ -309,6 +332,9 @@ def run_gate(stwo: Path, name: str, command: tuple[str, ...], expected: int) -> 
         "required_tests": expected,
         "passed": passed,
     }
+    if required_test_names is not None:
+        record["required_test_names"] = list(required_test_names)
+        record["executed_test_names"] = list(executed_test_names)
     if name == "strict_resident_whole_proof_simd_byte_identity":
         # Record which fixture the whole-proof gate ran on, read from the test
         # source so the provenance cannot drift from the code.
