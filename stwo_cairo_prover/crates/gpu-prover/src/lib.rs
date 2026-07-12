@@ -17,6 +17,7 @@
 
 pub mod arena_plan;
 pub mod composition_plan;
+pub mod direct_composition_retention;
 pub mod fixed_table;
 pub mod fixed_table_materializer;
 pub mod fixed_table_table;
