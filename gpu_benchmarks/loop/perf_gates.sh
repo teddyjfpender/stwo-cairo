@@ -343,12 +343,22 @@ git_worktree_hash() {
   local repo="$1"
   if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then echo "NOGIT"; return; fi
   (
-    git -C "$repo" diff --binary HEAD -- . ':(exclude)gpu_benchmarks/loop/results' 2>/dev/null
+    git -C "$repo" diff --binary HEAD -- . ':(exclude)gpu_benchmarks/loop/results' 2>/dev/null || exit 1
     git -C "$repo" ls-files --others --exclude-standard -z |
       while IFS= read -r -d '' path; do
         [[ "$path" == gpu_benchmarks/loop/results/* ]] && continue
-        printf 'untracked\0%s\0' "$path"
-        cat "$repo/$path"
+        if [[ -L "$repo/$path" ]]; then
+          link_hash="$(readlink -n "$repo/$path" | sha256_stream | cut -d' ' -f1)" || exit 1
+          printf 'untracked-symlink\0%s\0%s\0' "$path" "$link_hash"
+        elif [[ -f "$repo/$path" ]]; then
+          file_kind=regular
+          [[ -x "$repo/$path" ]] && file_kind=executable
+          file_hash="$(sha256_file "$repo/$path")" || exit 1
+          printf 'untracked-%s\0%s\0%s\0' "$file_kind" "$path" "$file_hash"
+        else
+          echo "unsupported untracked source path: $repo/$path" >&2
+          exit 1
+        fi
       done
   ) | sha256_stream | cut -d' ' -f1
 }

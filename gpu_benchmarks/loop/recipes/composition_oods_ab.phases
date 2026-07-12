@@ -1,0 +1,65 @@
+# One paid round, fail-fast by mode: prove the base trace first, then isolate
+# the first composition-OODS flag transition. A failing mirror gets one
+# same-mode smoke discriminator before the phase returns its original failure.
+composition_oods_ab() {
+  set -euo pipefail
+  cd "$CAIRO"
+
+  env \
+    STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE=0 \
+    STWO_CUDA_COMPOSITION_DIRECT_RETENTION=0 \
+    STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=0 \
+    STWO_RESIDENT_OODS_DIAGNOSTIC=1 \
+    cargo test -p stwo-cairo-gpu-prover \
+      --test resident_trace_audit \
+      audit_resident_base_trace_against_simd_reference \
+      -- --exact --nocapture --test-threads=1
+
+  run_mode() {
+    local label="$1" progressive="$2" direct="$3" numerator="$4" rc
+    echo "composition-OODS A/B mode: $label"
+    if env \
+      STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE="$progressive" \
+      STWO_CUDA_COMPOSITION_DIRECT_RETENTION="$direct" \
+      STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS="$numerator" \
+      STWO_RESIDENT_OODS_DIAGNOSTIC=1 \
+      cargo test -p stwo-cairo-gpu-prover \
+        --test resident_parity_native \
+        strict_resident_transcript_mirror_diagnostic_once \
+        -- --exact --nocapture --test-threads=1
+    then
+      return 0
+    else
+      rc=$?
+    fi
+
+    echo "composition-OODS A/B first failing mode: $label (rc=$rc)" >&2
+    env \
+      STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE="$progressive" \
+      STWO_CUDA_COMPOSITION_DIRECT_RETENTION="$direct" \
+      STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS="$numerator" \
+      STWO_RESIDENT_OODS_DIAGNOSTIC=1 \
+      cargo test -p stwo-cairo-gpu-prover \
+        --test resident_smoke \
+        smoke_single_resident_proof_boundary_stepped \
+        -- --exact --nocapture --test-threads=1 || true
+    return "$rc"
+  }
+
+  run_mode flags_off 0 0 0
+  run_mode progressive 1 0 0
+  run_mode progressive_direct 1 1 0
+  run_mode progressive_direct_numerator 1 1 1
+
+  env \
+    STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE=1 \
+    STWO_CUDA_COMPOSITION_DIRECT_RETENTION=1 \
+    STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=1 \
+    STWO_RESIDENT_OODS_DIAGNOSTIC=1 \
+    cargo test -p stwo-cairo-gpu-prover \
+      --test resident_smoke \
+      smoke_single_resident_proof_boundary_stepped \
+      -- --exact --nocapture --test-threads=1
+}
+
+phase composition_oods_ab composition_oods_ab

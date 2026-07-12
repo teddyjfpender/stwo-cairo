@@ -366,7 +366,7 @@ class ArchitectureRecordTest(unittest.TestCase):
         host = (tests / "reference_cache_host.rs").read_text(encoding="utf-8")
         self.assertIn('#[path = "common/reference_cache.rs"]', strict)
         self.assertIsNone(re.search(r"#\[(?:test|cfg\(test\))\]", common))
-        self.assertEqual(len(re.findall(r"(?m)^#\[test\]\s*$", host)), 5)
+        self.assertEqual(len(re.findall(r"(?m)^#\[test\]\s*$", host)), 8)
 
 
 if __name__ == "__main__":

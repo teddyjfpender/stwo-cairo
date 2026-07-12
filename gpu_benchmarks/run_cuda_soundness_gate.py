@@ -38,6 +38,13 @@ QUALIFICATION_FLAGS = (
     "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
 )
 
+REFERENCE_CACHE_SOURCE_ENV = (
+    "STWO_PARITY_REF_STWO_HEAD",
+    "STWO_PARITY_REF_STWO_WORKTREE_HASH",
+    "STWO_PARITY_REF_STWO_CAIRO_HEAD",
+    "STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH",
+)
+
 
 GATES = (
     (
@@ -461,6 +468,19 @@ def main() -> int:
     )
     if any(synced_values) and not all(synced_values):
         raise SystemExit("synced source identity requires both heads and both worktree hashes")
+    inherited_source_env = {
+        key: os.environ[key] for key in REFERENCE_CACHE_SOURCE_ENV if key in os.environ
+    }
+    if all(synced_values):
+        for value, length in zip(synced_values, (40, 64, 40, 64)):
+            if len(value) != length or any(char not in "0123456789abcdef" for char in value):
+                raise SystemExit("synced source identity must use lowercase hex heads and hashes")
+        source_env = dict(zip(REFERENCE_CACHE_SOURCE_ENV, synced_values))
+        if any(inherited_source_env.get(key, value) != value for key, value in source_env.items()):
+            raise SystemExit("ambient reference-cache source identity disagrees with synced source")
+        os.environ.update(source_env)
+    elif inherited_source_env:
+        raise SystemExit("reference-cache source identity requires runner-validated synced source")
 
     artifact = {
         "schema": "stwo.cuda.soundness-gate.v2",

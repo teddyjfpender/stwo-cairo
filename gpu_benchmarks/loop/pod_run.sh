@@ -17,7 +17,8 @@
 #      manifest exists on the pod.
 #   5. Upload a PHASES fragment (your file) into a detached, setsid on-pod
 #      session with per-phase rc/secs sentinels (an ssh drop can't kill it).
-#   6. POLL each phase in order; print a per-phase rc + duration.
+#   6. POLL each phase in order; print a per-phase rc + duration and stop on
+#      the first failure.
 #   7. Grep a standard evidence pattern set from every phase log.
 #   8. Fetch all phase logs (+ an optional divergence dir) to results/<label>/.
 #   9. STOP the pod on EVERY exit path (trap) — failed rounds cost cents, not
@@ -34,9 +35,10 @@
 # resolved by `runpodctl ssh info`.
 #
 # PHASE CONTRACT — the phases_file runs ON THE POD with these available:
-#   * function `phase NAME CMD...` : run CMD (never aborts siblings), record
-#       $RUN/NAME.rc and $RUN/NAME.secs. The driver polls exactly the NAMEs it
-#       finds by scanning your file for lines beginning `phase `.
+#   * function `phase NAME CMD...` : run CMD, record $RUN/NAME.rc and
+#       $RUN/NAME.secs, and abort the session on failure. The driver polls
+#       exactly the NAMEs it finds by scanning your file for lines beginning
+#       `phase `.
 #   * exported env: cargo/cuda on PATH, RUSTUP_HOME, CARGO_HOME, STWO_CUDA_OBJ_CACHE,
 #       STWO_PARITY_REF_CACHE, STWO_SMOKE_DIVERGENCE_DIR, RUST_MIN_STACK=32Mi,
 #       STWO_BOOTLOADER_JSON.
@@ -87,14 +89,81 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ConnectTimeou
 note() { echo "[pod_run $(date -u +%H:%M:%S)] $*"; }
 pssh() { ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "root@$HOST" "$@"; }
 
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum
+  else shasum -a 256
+  fi
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+source_head() {
+  git -C "$1" rev-parse HEAD 2>/dev/null
+}
+
+# Match the release runners: the head is recorded separately, while this hash
+# binds tracked changes plus untracked paths/content (excluding run results).
+source_hash() {
+  local repo="$1"
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || return 1
+  (
+    git -C "$repo" diff --binary HEAD -- . ':(exclude)gpu_benchmarks/loop/results' || exit 1
+    git -C "$repo" ls-files --others --exclude-standard -z |
+      while IFS= read -r -d '' path; do
+        [[ "$path" == gpu_benchmarks/loop/results/* ]] && continue
+        if [[ -L "$repo/$path" ]]; then
+          link_hash="$(readlink -n "$repo/$path" | sha256_stream | cut -d' ' -f1)" || exit 1
+          printf 'untracked-symlink\0%s\0%s\0' "$path" "$link_hash"
+        elif [[ -f "$repo/$path" ]]; then
+          file_kind=regular
+          [[ -x "$repo/$path" ]] && file_kind=executable
+          file_hash="$(sha256_file "$repo/$path")" || exit 1
+          printf 'untracked-%s\0%s\0%s\0' "$file_kind" "$path" "$file_hash"
+        else
+          echo "unsupported untracked source path: $repo/$path" >&2
+          exit 1
+        fi
+      done
+  ) | sha256_stream | cut -d' ' -f1
+}
+
+valid_source_identity() {
+  [[ ${#1} -eq 40 && "$1" != *[!0-9a-f]* &&
+     ${#2} -eq 64 && "$2" != *[!0-9a-f]* ]]
+}
+
+STWO_HEAD="$(source_head "$STWO_LOCAL")" \
+  || { echo "cannot resolve stwo source head: $STWO_LOCAL" >&2; exit 2; }
+STWO_WORKTREE_HASH="$(source_hash "$STWO_LOCAL")" \
+  || { echo "cannot hash stwo worktree: $STWO_LOCAL" >&2; exit 2; }
+CAIRO_HEAD="$(source_head "$CAIRO_LOCAL")" \
+  || { echo "cannot resolve stwo-cairo source head: $CAIRO_LOCAL" >&2; exit 2; }
+CAIRO_WORKTREE_HASH="$(source_hash "$CAIRO_LOCAL")" \
+  || { echo "cannot hash stwo-cairo worktree: $CAIRO_LOCAL" >&2; exit 2; }
+valid_source_identity "$STWO_HEAD" "$STWO_WORKTREE_HASH" \
+  || { echo "invalid stwo source identity" >&2; exit 2; }
+valid_source_identity "$CAIRO_HEAD" "$CAIRO_WORKTREE_HASH" \
+  || { echo "invalid stwo-cairo source identity" >&2; exit 2; }
+
 PHASE_NAMES="$(awk '$1=="phase"{print $2}' "$PHASES_FILE")"
 [[ -n "$PHASE_NAMES" ]] || { echo "no 'phase NAME ...' lines in $PHASES_FILE" >&2; exit 2; }
+PHASE_DUPLICATES="$(printf '%s\n' "$PHASE_NAMES" | sort | uniq -d)"
+[[ -z "$PHASE_DUPLICATES" ]] \
+  || { echo "duplicate phase names: $PHASE_DUPLICATES" >&2; exit 2; }
+INVALID_PHASE_NAMES="$(printf '%s\n' "$PHASE_NAMES" | awk '$0 !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/')"
+[[ -z "$INVALID_PHASE_NAMES" ]] \
+  || { echo "invalid phase names: $INVALID_PHASE_NAMES" >&2; exit 2; }
 note "phases: $(echo "$PHASE_NAMES" | tr '\n' ' ')"
 note "label:  $LABEL"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   note "DRY_RUN: pod=$POD_ID key=$KEY"
   note "DRY_RUN: RUSTUP_HOME=$POD_RUSTUP_HOME CARGO_HOME=$POD_CARGO_HOME"
+  note "DRY_RUN: source stwo=${STWO_HEAD}:${STWO_WORKTREE_HASH} stwo-cairo=${CAIRO_HEAD}:${CAIRO_WORKTREE_HASH}"
   note "DRY_RUN: would bootstrap, rsync $STWO_LOCAL and $CAIRO_LOCAL, install the pinned toolchain, run the phases above, fetch to $RESULTS_DIR/$LABEL, stop the pod."
   exit 0
 fi
@@ -102,12 +171,23 @@ fi
 POD_STOPPED=0
 stop_pod() {
   [[ "$POD_STOPPED" == 1 ]] && return 0
-  POD_STOPPED=1
   note "stopping pod $POD_ID"
-  runpodctl pod stop "$POD_ID" 2>/dev/null || runpodctl stop pod "$POD_ID" 2>/dev/null \
-    || note "WARN: pod stop FAILED — run 'runpodctl pod stop $POD_ID' manually!"
+  if runpodctl pod stop "$POD_ID" 2>/dev/null || runpodctl stop pod "$POD_ID" 2>/dev/null; then
+    POD_STOPPED=1
+    return 0
+  fi
+  note "ERROR: pod stop FAILED — run 'runpodctl pod stop $POD_ID' manually!"
+  return 1
 }
-trap stop_pod EXIT
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  if ! stop_pod; then
+    [[ "$rc" != 0 ]] || rc=1
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
 
 # --- 1. start + resolve endpoint (new port on every resume) ---
 note "starting pod $POD_ID"
@@ -150,6 +230,14 @@ rsync -azc --delete --partial --no-owner --no-group --exclude=target --exclude=.
   -e "ssh ${SSH_OPTS[*]} -i $KEY -p $PORT" \
   "${CAIRO_LOCAL}/" "root@${HOST}:${CAIRO_POD}/" || { note "SYNC stwo-cairo FAILED"; exit 1; }
 
+# The cache fallback below is valid only for the exact source tree transported
+# by this run. Reject a local edit racing the checksum sync.
+[[ "$STWO_HEAD" == "$(source_head "$STWO_LOCAL")" &&
+   "$STWO_WORKTREE_HASH" == "$(source_hash "$STWO_LOCAL")" &&
+   "$CAIRO_HEAD" == "$(source_head "$CAIRO_LOCAL")" &&
+   "$CAIRO_WORKTREE_HASH" == "$(source_hash "$CAIRO_LOCAL")" ]] \
+  || { note "LOCAL SOURCES CHANGED DURING SYNC"; exit 1; }
+
 # --- 4. install + verify the repo-pinned Rust toolchain ---
 note "install pinned Rust toolchain"
 pssh "set -e
@@ -165,9 +253,13 @@ note "upload + launch session"
 {
   cat <<'PROLOGUE_HEADER'
 #!/usr/bin/env bash
-set -u
+set -euo pipefail
 PROLOGUE_HEADER
   printf 'export RUSTUP_HOME=%q\nexport CARGO_HOME=%q\n' "$POD_RUSTUP_HOME" "$POD_CARGO_HOME"
+  printf 'export STWO_PARITY_REF_STWO_HEAD=%q\n' "$STWO_HEAD"
+  printf 'export STWO_PARITY_REF_STWO_WORKTREE_HASH=%q\n' "$STWO_WORKTREE_HASH"
+  printf 'export STWO_PARITY_REF_STWO_CAIRO_HEAD=%q\n' "$CAIRO_HEAD"
+  printf 'export STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH=%q\n' "$CAIRO_WORKTREE_HASH"
   cat <<'PROLOGUE'
 export PATH="$CARGO_HOME/bin:/usr/local/cuda/bin:$PATH"
 export STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache
@@ -182,36 +274,88 @@ mkdir -p "$RUN"
 phase() {
   local name="$1"; shift
   local t0=$SECONDS
-  ( "$@" ) > "$RUN/$name.log" 2>&1
-  local rc=$?
+  local rc
+  set +e
+  ( set -e; "$@" ) > "$RUN/$name.log" 2>&1
+  rc=$?
+  set -e
   echo $((SECONDS-t0)) > "$RUN/$name.secs"
   echo "$rc" > "$RUN/$name.rc"
+  return "$rc"
 }
 PROLOGUE
   cat "$PHASES_FILE"
   echo 'echo done > "$RUN/session.done"'
-} | pssh "mkdir -p '$RUN' && cat > '$RUN/session.sh'"
+} | pssh "mkdir -p '$RUN' && cat > '$RUN/session.sh'" \
+  || { note "UPLOAD FAILED"; exit 1; }
 # shellcheck disable=SC2016
 pssh "cd '$RUN' && rm -rf divergence *.log *.rc *.secs session.done && nohup setsid -f bash '$RUN/session.sh' </dev/null > session.out 2>&1 && echo LAUNCHED" \
   || { note "LAUNCH FAILED"; exit 1; }
 
 # --- 6. poll phases in order ---
 DEADLINE=$((SECONDS + ${MAX_WAIT:-10800}))
+RUN_RC=0
+OBSERVED_PHASES=""
 for p in $PHASE_NAMES; do
+  PHASE_FAILED=0
   note "waiting on phase: $p"
   while true; do
-    if (( SECONDS > DEADLINE )); then note "TIMEOUT on $p"; break; fi
+    if (( SECONDS > DEADLINE )); then
+      note "TIMEOUT on $p"
+      RUN_RC=1
+      PHASE_FAILED=1
+      break
+    fi
     rc="$(pssh "cat '$RUN/$p.rc' 2>/dev/null" 2>/dev/null || true)"
     if [[ -n "$rc" ]]; then
       secs="$(pssh "cat '$RUN/$p.secs' 2>/dev/null" 2>/dev/null || true)"
       note "phase $p rc=$rc (${secs:-?}s)"
+      OBSERVED_PHASES="${OBSERVED_PHASES}${p}"$'\n'
+      if [[ ! "$rc" =~ ^[0-9]+$ ]] || (( rc > 255 )); then
+        note "invalid phase rc for $p: $rc"
+        RUN_RC=1
+        PHASE_FAILED=1
+      elif [[ "$rc" != 0 ]]; then
+        RUN_RC="$rc"
+        PHASE_FAILED=1
+      fi
       break
     fi
     alive="$(pssh "pgrep -f '$RUN/[s]ession.sh' >/dev/null && echo yes || echo no" 2>/dev/null || echo unknown)"
-    [[ "$alive" == "no" ]] && { note "session died before $p"; pssh "tail -30 '$RUN/session.out'" || true; break; }
+    if [[ "$alive" == "no" ]]; then
+      note "session died before $p"
+      pssh "tail -30 '$RUN/session.out'" || true
+      RUN_RC=1
+      PHASE_FAILED=1
+      break
+    fi
     sleep 30
   done
+  (( PHASE_FAILED == 0 )) || break
 done
+
+# A phase writes its rc before the phase fragment has fully returned. A run is
+# successful only after the detached session reaches its final sentinel.
+if [[ "$RUN_RC" == 0 ]]; then
+  note "waiting on successful session completion"
+  while true; do
+    done_value="$(pssh "cat '$RUN/session.done' 2>/dev/null" 2>/dev/null || true)"
+    [[ "$done_value" == "done" ]] && break
+    if (( SECONDS > DEADLINE )); then
+      note "TIMEOUT waiting for session completion"
+      RUN_RC=1
+      break
+    fi
+    alive="$(pssh "pgrep -f '$RUN/[s]ession.sh' >/dev/null && echo yes || echo no" 2>/dev/null || echo unknown)"
+    if [[ "$alive" == no ]]; then
+      note "session died without successful completion"
+      pssh "tail -30 '$RUN/session.out'" || true
+      RUN_RC=1
+      break
+    fi
+    sleep 2
+  done
+fi
 
 # --- 7. standard evidence grep ---
 for p in $PHASE_NAMES; do
@@ -223,10 +367,24 @@ done
 note "fetching evidence to $RESULTS_DIR/$LABEL"
 mkdir -p "$RESULTS_DIR/$LABEL"
 scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" "root@${HOST}:$RUN/*.log" "root@${HOST}:$RUN/*.secs" \
-  "$RESULTS_DIR/$LABEL/" 2>/dev/null || note "WARN: log fetch failed"
+  "$RESULTS_DIR/$LABEL/" 2>/dev/null \
+  || { note "ERROR: phase log/secs fetch failed"; RUN_RC=1; }
+scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" "root@${HOST}:$RUN/*.rc" \
+  "$RESULTS_DIR/$LABEL/" 2>/dev/null \
+  || { note "ERROR: phase rc fetch failed"; RUN_RC=1; }
+for p in $OBSERVED_PHASES; do
+  for suffix in log secs rc; do
+    [[ -f "$RESULTS_DIR/$LABEL/$p.$suffix" ]] \
+      || { note "ERROR: missing local evidence $p.$suffix"; RUN_RC=1; }
+  done
+done
 pssh "test -d '$RUN/divergence'" 2>/dev/null \
   && scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" -r "root@${HOST}:$RUN/divergence" "$RESULTS_DIR/$LABEL/" 2>/dev/null
 
 # --- 9. stop (also via trap) ---
-stop_pod
+stop_pod || RUN_RC=1
+if [[ "$RUN_RC" != 0 ]]; then
+  note "FAILED (rc=$RUN_RC) — results in $RESULTS_DIR/$LABEL"
+  exit "$RUN_RC"
+fi
 note "done — results in $RESULTS_DIR/$LABEL"

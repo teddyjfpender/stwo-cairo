@@ -12,6 +12,10 @@ use stwo_cairo_serialize::CairoSerialize;
 
 const REFERENCE_SCHEMA: u32 = 2;
 const MAGIC: &[u8; 8] = b"STWOREF2";
+const STWO_HEAD_ENV: &str = "STWO_PARITY_REF_STWO_HEAD";
+const STWO_WORKTREE_HASH_ENV: &str = "STWO_PARITY_REF_STWO_WORKTREE_HASH";
+const STWO_CAIRO_HEAD_ENV: &str = "STWO_PARITY_REF_STWO_CAIRO_HEAD";
+const STWO_CAIRO_WORKTREE_HASH_ENV: &str = "STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH";
 static SOURCE_IDENTITIES: OnceLock<Option<(Vec<u8>, Vec<u8>)>> = OnceLock::new();
 static STAGING_ORDINAL: AtomicU64 = AtomicU64::new(0);
 
@@ -24,23 +28,83 @@ pub(crate) fn git_identity(repo: &Path) -> Option<Vec<u8>> {
             .ok()?;
         output.status.success().then_some(output.stdout)
     };
-    let mut identity = output(&["rev-parse", "HEAD"])?;
-    identity.extend(output(&["diff", "--binary", "HEAD", "--"])?);
+    let append_sized = |identity: &mut Vec<u8>, value: &[u8]| {
+        identity.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        identity.extend_from_slice(value);
+    };
+    let mut identity = b"git-source-identity-v2\0".to_vec();
+    append_sized(&mut identity, &output(&["rev-parse", "HEAD"])?);
+    append_sized(&mut identity, &output(&["diff", "--binary", "HEAD", "--"])?);
     let untracked = output(&["ls-files", "--others", "--exclude-standard", "-z"])?;
     for relative in untracked
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
     {
-        if let Ok(relative) = std::str::from_utf8(relative) {
-            let path = Path::new(relative);
-            if !is_source_relevant(path) {
-                continue;
+        let relative = std::str::from_utf8(relative).ok()?;
+        let path = Path::new(relative);
+        if !is_source_relevant(path) {
+            continue;
+        }
+        let full_path = repo.join(path);
+        let metadata = std::fs::symlink_metadata(&full_path).ok()?;
+        if metadata.file_type().is_symlink() {
+            identity.extend_from_slice(b"symlink\0");
+            append_sized(&mut identity, relative.as_bytes());
+            let target = std::fs::read_link(full_path).ok()?;
+            append_sized(&mut identity, target.to_str()?.as_bytes());
+        } else if metadata.is_file() {
+            identity.extend_from_slice(b"file\0");
+            append_sized(&mut identity, relative.as_bytes());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                identity.push(u8::from(metadata.permissions().mode() & 0o111 != 0));
             }
-            identity.extend(relative.as_bytes());
-            identity.extend(std::fs::read(repo.join(relative)).ok()?);
+            #[cfg(not(unix))]
+            identity.push(0);
+            identity.extend_from_slice(blake3::hash(&std::fs::read(full_path).ok()?).as_bytes());
+        } else {
+            return None;
         }
     }
     Some(identity)
+}
+
+pub(crate) fn runner_identity(head: Option<&str>, worktree_hash: Option<&str>) -> Option<Vec<u8>> {
+    let head = head?;
+    let worktree_hash = worktree_hash?;
+    let valid_hex = |value: &str, len: usize| {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !valid_hex(head, 40) || !valid_hex(worktree_hash, 64) {
+        return None;
+    }
+    Some(
+        [
+            b"runner-synced-source-v1\0".as_slice(),
+            head.as_bytes(),
+            b"\0",
+            worktree_hash.as_bytes(),
+        ]
+        .concat(),
+    )
+}
+
+pub(crate) fn source_identity(repo: &Path, runner_identity: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    if std::fs::symlink_metadata(repo.join(".git")).is_ok() {
+        git_identity(repo)
+    } else {
+        runner_identity
+    }
+}
+
+fn runner_identity_from_env(head: &str, worktree_hash: &str) -> Option<Vec<u8>> {
+    let head = std::env::var(head).ok();
+    let worktree_hash = std::env::var(worktree_hash).ok();
+    runner_identity(head.as_deref(), worktree_hash.as_deref())
 }
 
 fn is_source_relevant(path: &Path) -> bool {
@@ -83,9 +147,19 @@ fn cache_path(
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let stwo_cairo = manifest.ancestors().nth(3)?;
     let stwo = stwo_cairo.parent()?.join("stwo");
-    let identities = SOURCE_IDENTITIES
-        .get_or_init(|| Some((git_identity(&stwo)?, git_identity(stwo_cairo)?)))
-        .as_ref()?;
+    let identities = SOURCE_IDENTITIES.get_or_init(|| {
+        Some((
+            source_identity(
+                &stwo,
+                runner_identity_from_env(STWO_HEAD_ENV, STWO_WORKTREE_HASH_ENV),
+            )?,
+            source_identity(
+                stwo_cairo,
+                runner_identity_from_env(STWO_CAIRO_HEAD_ENV, STWO_CAIRO_WORKTREE_HASH_ENV),
+            )?,
+        ))
+    });
+    let identities = identities.as_ref()?;
     let input_bytes = bincode::serialize(input).expect("serialize adapted reference input");
     let fixture_bytes = std::fs::read(get_compiled_cairo_program_path(fixture))
         .expect("read compiled reference fixture");

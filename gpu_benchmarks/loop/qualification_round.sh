@@ -24,18 +24,32 @@ sha256_file() {
   else shasum -a 256 "$1" | cut -d' ' -f1
   fi
 }
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum
+  else shasum -a 256
+  fi
+}
 source_hash() {
   local repo="$1"
   (
-    git -C "$repo" diff --binary HEAD -- . ':(exclude)gpu_benchmarks/loop/results'
+    git -C "$repo" diff --binary HEAD -- . ':(exclude)gpu_benchmarks/loop/results' || exit 1
     git -C "$repo" ls-files --others --exclude-standard -z |
       while IFS= read -r -d '' path; do
         [[ "$path" == gpu_benchmarks/loop/results/* ]] && continue
-        printf 'untracked\0%s\0' "$path"
-        cat "$repo/$path"
+        if [[ -L "$repo/$path" ]]; then
+          link_hash="$(readlink -n "$repo/$path" | sha256_stream | cut -d' ' -f1)" || exit 1
+          printf 'untracked-symlink\0%s\0%s\0' "$path" "$link_hash"
+        elif [[ -f "$repo/$path" ]]; then
+          file_kind=regular
+          [[ -x "$repo/$path" ]] && file_kind=executable
+          file_hash="$(sha256_file "$repo/$path")" || exit 1
+          printf 'untracked-%s\0%s\0%s\0' "$file_kind" "$path" "$file_hash"
+        else
+          echo "unsupported untracked source path: $repo/$path" >&2
+          exit 1
+        fi
       done
-  ) | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } |
-    cut -d' ' -f1
+  ) | sha256_stream | cut -d' ' -f1
 }
 
 STWO_HEAD="$(git -C "$STWO_LOCAL" rev-parse HEAD)"
@@ -193,6 +207,10 @@ if qualified_env != states[3]:
 expected_stwo_env = {
     "STWO_CUDA_OBJ_CACHE": "/workspace/.cuda_obj_cache",
     "STWO_PARITY_REF_CACHE": "/workspace/.parity_ref_cache",
+    "STWO_PARITY_REF_STWO_HEAD": os.environ["Q_STWO_HEAD"],
+    "STWO_PARITY_REF_STWO_WORKTREE_HASH": os.environ["Q_STWO_HASH"],
+    "STWO_PARITY_REF_STWO_CAIRO_HEAD": os.environ["Q_CAIRO_HEAD"],
+    "STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH": os.environ["Q_CAIRO_HASH"],
     **{flag: "1" for flag in flags},
 }
 if soundness.get("effective_stwo_env") != expected_stwo_env:
