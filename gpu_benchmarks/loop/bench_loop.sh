@@ -934,18 +934,18 @@ seal_gpu_bench() {
 # differential suite on the pod and retain its JSON artifact before any proof or
 # performance claim from this build.
 run_cuda_soundness_gate() {
-  LOCAL_SOUNDNESS_GATE="${RESULTS_DIR}/${STAMP}.cuda-soundness-gate.json"
   if [[ -n "$REUSE_SOUNDNESS_GATE" ]]; then
     [[ "$QUALIFICATION_PROBE" == "1" && -f "$REUSE_SOUNDNESS_GATE" ]] \
       || die "REUSE_SOUNDNESS_GATE is restricted to qualification-internal probes"
     validate_reused_soundness_gate \
       || die "reused soundness artifact is not bound to the current source/runtime"
-    cp "$REUSE_SOUNDNESS_GATE" "$LOCAL_SOUNDNESS_GATE"
+    LOCAL_SOUNDNESS_GATE="$REUSE_SOUNDNESS_GATE"
     validate_remote_execution_target
     LOCAL_SOUNDNESS_GATE_SHA="$(sha256_file "$LOCAL_SOUNDNESS_GATE")"
     log "CUDA soundness gate: reusing source/env/remote-target-bound qualification artifact ${REUSE_SOUNDNESS_GATE}"
     return 0
   fi
+  LOCAL_SOUNDNESS_GATE="${RESULTS_DIR}/${STAMP}.cuda-soundness-gate.json"
   log "CUDA soundness gate: counted native differential targets"
   if [[ "$DRY_RUN" == "1" ]]; then
     dry "python3 gpu_benchmarks/run_cuda_soundness_gate.py --stwo ${STWO_POD} --runtime-mode ${GPU_PCS_RUNTIME_MODE} --pod-id ${POD_ID_RESOLVED} --gpu-bench ${SEALED_GPU_BENCH_PATH}$(soundness_input_cli) --output ${POD_SOUNDNESS_GATE}"

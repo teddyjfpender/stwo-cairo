@@ -36,6 +36,17 @@ printf '%s\n' "$body" | bash -n
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_qualification_probe_reuses_one_soundness_artifact(self) -> None:
+        source = (ROOT / "loop" / "bench_loop.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'LOCAL_SOUNDNESS_GATE="$REUSE_SOUNDNESS_GATE"',
+            source,
+        )
+        self.assertNotIn(
+            'cp "$REUSE_SOUNDNESS_GATE" "$LOCAL_SOUNDNESS_GATE"',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
