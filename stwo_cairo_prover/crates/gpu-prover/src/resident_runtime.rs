@@ -1342,6 +1342,21 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .transpose()
                 })
                 .collect::<Result<Vec<_>, ArenaError>>()?;
+            let evaluation_outputs = planned
+                .evaluation_output_groups
+                .iter()
+                .map(|group| {
+                    group
+                        .as_ref()
+                        .map(|columns| {
+                            columns
+                                .iter()
+                                .map(|&binding| bind_arena_binding(arena, binding))
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, ArenaError>>()?;
             let prepared = match (&planned.requirements, &planned.slots) {
                 (
                     ModeAwareCommitWorkspaceRequirements::FullLifting(_),
@@ -1366,14 +1381,11 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .collect::<Vec<_>>();
                     let flat_retained = groups
                         .iter()
-                        .zip(&retained_evaluations)
+                        .zip(&evaluation_outputs)
                         .flat_map(|(group, retained)| match retained {
-                            Some(retained) => retained
-                                .columns
-                                .iter()
-                                .copied()
-                                .map(Some)
-                                .collect::<Vec<_>>(),
+                            Some(retained) => {
+                                retained.iter().copied().map(Some).collect::<Vec<_>>()
+                            }
                             None => vec![None; group.columns.len()],
                         })
                         .collect::<Vec<_>>();

@@ -72,9 +72,9 @@ use crate::multiplicity_pipeline::{
 };
 use crate::plan::ProofPlan;
 use crate::prepared_composition::{
-    composition_workspace_requirements, CompositionCoefficientSource, CompositionExtParamBinding,
-    CompositionTraceTopology, CompositionWorkspaceRequirements, CompositionWorkspaceSlots,
-    PreparedCompositionError,
+    composition_workspace_requirements_with_retention, default_composition_launch_mode,
+    CompositionCoefficientSource, CompositionExtParamBinding, CompositionTraceTopology,
+    CompositionWorkspaceRequirements, CompositionWorkspaceSlots, PreparedCompositionError,
 };
 use crate::proof_bundle::{ResidentProofBundleError, ResidentProofBundleLayout};
 use crate::relation::RelationTracePart;
@@ -1996,12 +1996,14 @@ struct LogicalCompositionWorkspace {
     accumulators: LogicalBufferId,
     random_coefficient_powers: LogicalBufferId,
     composition_coefficients: [LogicalBufferId; 8],
+    direct_retention: Option<DirectCompositionRetentionPlan>,
     direct_bindings: Vec<LogicalDirectCompositionBinding>,
 }
 
 #[derive(Clone, Debug)]
 struct LogicalDirectCompositionBinding {
     consumer: usize,
+    plan_column: usize,
     source: OpenedColumnSource,
     tree: CommitmentTreeId,
     proof_column: usize,
@@ -2667,6 +2669,7 @@ pub struct PlannedCompositionTraceColumn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedDirectCompositionBinding {
     pub consumer: usize,
+    pub plan_column: usize,
     pub source: OpenedColumnSource,
     pub tree: CommitmentTreeId,
     pub proof_column: usize,
@@ -2696,6 +2699,7 @@ pub struct PlannedCompositionWorkspace {
     pub inverse_twiddles: ArenaBinding,
     pub ext_params: Vec<PlannedCompositionExtParams>,
     pub slots: CompositionWorkspaceSlots,
+    pub direct_retention: Option<DirectCompositionRetentionPlan>,
     pub direct_bindings: Vec<PlannedDirectCompositionBinding>,
 }
 
@@ -2911,11 +2915,6 @@ impl ProofArenaPlan {
         protocol: &ProtocolGeometry,
         composition: &CompositionPlan,
     ) -> Result<Self, ArenaPlanError> {
-        if protocol.identity.direct_composition_retention_mode
-            == DirectCompositionRetentionMode::ExactNative
-        {
-            return Err(ArenaPlanError::DirectCompositionExecutionUnsupported);
-        }
         Self::build_inner(plan, protocol, composition, None)
     }
 
@@ -2925,11 +2924,6 @@ impl ProofArenaPlan {
         composition: &CompositionPlan,
         geometry: ExecutionTableGeometry,
     ) -> Result<Self, ArenaPlanError> {
-        if protocol.identity.direct_composition_retention_mode
-            == DirectCompositionRetentionMode::ExactNative
-        {
-            return Err(ArenaPlanError::DirectCompositionExecutionUnsupported);
-        }
         Self::build_inner(plan, protocol, composition, Some(geometry))
     }
 
@@ -3383,7 +3377,6 @@ pub enum ArenaPlanError {
         last: ProofEpoch,
     },
     InvalidProtocolGeometry(&'static str),
-    DirectCompositionExecutionUnsupported,
     ComponentExceedsProtocolDomain {
         component: &'static str,
         padded_rows: u64,
@@ -5810,9 +5803,13 @@ fn append_protocol_buffers(
     )
     .map_err(ArenaPlanError::QuotientNumerator)?;
     let composition_trace_shape = address_free_composition_trace(&protocol.oods)?;
-    let composition_requirements =
-        composition_workspace_requirements(composition, &composition_trace_shape)
-            .map_err(ArenaPlanError::Composition)?;
+    let composition_requirements = composition_workspace_requirements_with_retention(
+        composition,
+        &composition_trace_shape,
+        default_composition_launch_mode(),
+        protocol.direct_composition_retention.as_ref(),
+    )
+    .map_err(ArenaPlanError::Composition)?;
     let max_commitment_twiddle_words = commit_requirements
         .iter()
         .map(|requirements| match requirements {
@@ -6804,6 +6801,7 @@ fn append_protocol_buffers(
                     )?;
                     Ok(LogicalDirectCompositionBinding {
                         consumer,
+                        plan_column: binding.column,
                         source: column.source,
                         tree: column.tree,
                         proof_column: column.proof_column,
@@ -6836,6 +6834,7 @@ fn append_protocol_buffers(
         accumulators: composition_accumulators,
         random_coefficient_powers: composition_random_powers,
         composition_coefficients,
+        direct_retention: protocol.direct_composition_retention.clone(),
         direct_bindings,
     };
     let opened_columns = protocol
@@ -7678,6 +7677,7 @@ fn resolve_composition_slots(
         .map(|direct| {
             Ok(PlannedDirectCompositionBinding {
                 consumer: direct.consumer,
+                plan_column: direct.plan_column,
                 source: direct.source,
                 tree: direct.tree,
                 proof_column: direct.proof_column,
@@ -7724,18 +7724,24 @@ fn resolve_composition_slots(
             })
             .collect(),
     };
-    let rebound_requirements = composition_workspace_requirements(&logical.plan, &trace_topology)
-        .map_err(ArenaPlanError::Composition)?;
-    if rebound_requirements.total_constraints != logical.requirements.total_constraints
-        || rebound_requirements.max_evaluation_log_size
-            != logical.requirements.max_evaluation_log_size
-        || rebound_requirements.descriptor_words != logical.requirements.descriptor_words
-        || rebound_requirements.lde_tile_words != logical.requirements.lde_tile_words
-        || rebound_requirements.accumulator_words != logical.requirements.accumulator_words
-        || rebound_requirements.random_power_words != logical.requirements.random_power_words
-        || rebound_requirements.output_coefficient_words
-            != logical.requirements.output_coefficient_words
-    {
+    let rebound_requirements = composition_workspace_requirements_with_retention(
+        &logical.plan,
+        &trace_topology,
+        default_composition_launch_mode(),
+        logical.direct_retention.as_ref(),
+    )
+    .map_err(ArenaPlanError::Composition)?;
+    let address_free = |mut requirements: CompositionWorkspaceRequirements| {
+        for source in requirements
+            .components
+            .iter_mut()
+            .flat_map(|component| &mut component.sources)
+        {
+            source.source.slot = ArenaSlotId(0);
+        }
+        requirements
+    };
+    if address_free(rebound_requirements) != address_free(logical.requirements.clone()) {
         return Err(ArenaPlanError::InvalidProtocolGeometry(
             "composition workspace changed while binding physical trace sources",
         ));
@@ -7749,6 +7755,7 @@ fn resolve_composition_slots(
         inverse_twiddles,
         ext_params,
         slots,
+        direct_retention: logical.direct_retention,
         direct_bindings,
     })
 }
@@ -9917,12 +9924,28 @@ mod tests {
                 "direct composition occurrence bitmap identity drifted"
             ))
         ));
-        assert!(matches!(
-            ProofArenaPlan::build(&proof, &direct_protocol, &composition),
-            Err(ArenaPlanError::DirectCompositionExecutionUnsupported)
-        ));
-        let direct_arena =
-            ProofArenaPlan::build_inner(&proof, &direct_protocol, &composition, None).unwrap();
+        let direct_arena = ProofArenaPlan::build(&proof, &direct_protocol, &composition).unwrap();
+        direct_arena.validate_aliases().unwrap();
+        assert_eq!(
+            direct_arena.composition().direct_retention.as_ref(),
+            Some(&direct_plan),
+            "resident preparation must receive the exact protocol retention plan"
+        );
+        assert_eq!(
+            direct_arena
+                .logical_buffers()
+                .iter()
+                .find(|buffer| buffer.purpose == BufferPurpose::CompositionDescriptors)
+                .unwrap()
+                .len_words,
+            direct_arena.composition().requirements.descriptor_words,
+            "the arena must allocate the exact retention-aware descriptor extent"
+        );
+        assert!(
+            direct_arena.composition().requirements.lde_tile_words
+                < progressive_arena.composition().requirements.lde_tile_words,
+            "direct sources must shrink the composition fallback LDE workspace"
+        );
         assert_eq!(
             direct_arena.composition().direct_bindings.len(),
             direct_plan.bindings.len()
@@ -9937,6 +9960,7 @@ mod tests {
             assert_eq!(
                 (
                     planned.consumer,
+                    planned.plan_column,
                     planned.source,
                     planned.tree,
                     planned.proof_column,
@@ -9946,6 +9970,7 @@ mod tests {
                 ),
                 (
                     oracle.consumer,
+                    oracle.column,
                     column.source,
                     column.tree,
                     column.proof_column,
@@ -9955,6 +9980,29 @@ mod tests {
                 )
             );
             assert_eq!(planned.evaluation.is_some(), oracle.direct);
+            if let Some(evaluation) = planned.evaluation {
+                let commitment = direct_arena.commitment(planned.tree).unwrap();
+                assert_eq!(
+                    commitment.evaluation_output_groups[planned.group]
+                        .as_ref()
+                        .unwrap()[planned.column_in_group],
+                    evaluation,
+                    "composition must bind the exact progressive producer output"
+                );
+                let lifetime =
+                    direct_arena.logical_buffers()[evaluation.logical.0 as usize].lifetime;
+                assert!(lifetime.contains(ProofEpoch::Composition));
+                assert!(
+                    direct_protocol
+                        .commitments
+                        .iter()
+                        .find(|commitment| commitment.id == planned.tree)
+                        .unwrap()
+                        .created
+                        < ProofEpoch::Composition,
+                    "every direct evaluation producer must precede composition capture/replay"
+                );
+            }
         }
         let both = direct_arena
             .composition()

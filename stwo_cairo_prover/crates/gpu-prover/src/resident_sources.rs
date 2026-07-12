@@ -776,6 +776,21 @@ pub fn stage_preprocessed_commitment(
     }
     let groups = commitment_groups(workspace, &commitment)?;
     let twiddles = workspace.bind(commitment.twiddles.logical)?.0;
+    let evaluation_outputs = commitment
+        .evaluation_output_groups
+        .iter()
+        .map(|group| {
+            group
+                .as_ref()
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|binding| workspace.bind(binding.logical).map(|bound| bound.0))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let (root, retained) = match (&commitment.requirements, &commitment.slots) {
         (
             ModeAwareCommitWorkspaceRequirements::FullLifting(_),
@@ -802,7 +817,14 @@ pub fn stage_preprocessed_commitment(
                 .iter()
                 .flat_map(|group| group.columns.iter().copied())
                 .collect::<Vec<_>>();
-            let retained_outputs = vec![None; coefficients.len()];
+            let retained_outputs = groups
+                .iter()
+                .zip(&evaluation_outputs)
+                .flat_map(|(group, retained)| match retained {
+                    Some(retained) => retained.iter().copied().map(Some).collect::<Vec<_>>(),
+                    None => vec![None; group.columns.len()],
+                })
+                .collect::<Vec<_>>();
             let commit = PreparedProgressiveCommitGraph::prepare(
                 workspace.arena(),
                 commitment.config,

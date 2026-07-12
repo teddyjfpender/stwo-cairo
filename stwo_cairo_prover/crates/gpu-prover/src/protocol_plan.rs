@@ -94,7 +94,6 @@ impl ProtocolPlanPolicy {
             if policy.commit_mode != stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive {
                 return Err(ProtocolPlanError::DirectRetentionRequiresProgressiveCommit);
             }
-            return Err(ProtocolPlanError::DirectRetentionExecutionUnsupported);
         }
         if let Ok(value) = crate::flags::env_value("STWO_CUDA_RETAINED_LDE_BUDGET_BYTES") {
             policy.retained_lde_budget_bytes = value
@@ -113,7 +112,6 @@ pub enum ProtocolPlanError {
     InvalidRetainedLdeBudget,
     UnsupportedRetainAllLde,
     DirectRetentionRequiresProgressiveCommit,
-    DirectRetentionExecutionUnsupported,
     DirectRetentionCompositionMissing,
     DirectRetentionBudgetExceeded {
         required_bytes: usize,
