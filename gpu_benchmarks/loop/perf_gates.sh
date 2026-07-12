@@ -1205,7 +1205,7 @@ run_parity_lane() {
   done <<<"$specs"
   names="${names% + }"
   local body
-  body="$(cat <<EOF
+  IFS= read -r -d '' body <<EOF || true
 . "\$HOME/.cargo/env" 2>/dev/null || true
 export PATH=/usr/local/cuda/bin:\$PATH
 export RUST_MIN_STACK=${RUST_MIN_STACK_VAL}
@@ -1213,7 +1213,6 @@ ${BENCH_ENV:+export ${BENCH_ENV}}
 export ${lane}=1
 ${cmds}
 EOF
-)"
   log "=== parity lane ${lane}: ${names} (${lane}=1) ==="
   run_pod_job "parity_${lane}" "$body" || return 1
 
@@ -1344,7 +1343,7 @@ run_lane() {
       || die "could not construct the sealed ncu launcher for ${lane}"
     ncu_quiescence_guard="$(remote_quiescence_guard)" \
       || die "could not construct the ncu isolation guard for ${lane}"
-    ncu_body="$(cat <<EOF
+    IFS= read -r -d '' ncu_body <<EOF || true
 cd '${POD_PROVER_DIR}'
 . "\$HOME/.cargo/env" 2>/dev/null || true
 export PATH=/usr/local/cuda/bin:\$PATH
@@ -1383,7 +1382,6 @@ printf '{"schema":"stwo.ncu-remote-observation.v1","report_sha256":"%s","report_
   "\$report_sha" "\$report_bytes" "\$import_sha" "\$import_bytes" "\$profiled_proof_sha" \
   > '${pod_observation}'
 EOF
-)"
     printf '%s\n' "$ncu_body" | bash -n \
       || die "generated ncu launcher is not valid bash for ${lane}"
     log "lane ${lane}: ncu targeted capture (kernels ~ /${kregex}/, ${NCU_LAUNCH_COUNT} launches)"
