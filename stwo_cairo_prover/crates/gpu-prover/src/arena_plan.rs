@@ -488,6 +488,9 @@ pub struct CommitmentGeometry {
     /// Exact-native evaluations retained only through composition. These are
     /// separate from decommit intent; allocation uses the union.
     pub direct_composition_evaluation_groups: Vec<bool>,
+    /// Exact-native evaluations retained through quotient-numerator evaluation.
+    /// This intent is independent of decommit and direct composition.
+    pub numerator_evaluation_groups: Vec<bool>,
 }
 
 fn commitment_workspace_requirements(
@@ -507,10 +510,15 @@ fn commitment_workspace_requirements(
                 .iter()
                 .zip(&commitment.retained_evaluation_groups)
                 .zip(&commitment.direct_composition_evaluation_groups)
+                .zip(&commitment.numerator_evaluation_groups)
                 .map(
-                    |((logs, &retain_decommit), &retain_direct)| ProgressiveCommitGroupGeometry {
-                        coefficient_log_sizes: logs.clone(),
-                        retain_evaluations: retain_decommit || retain_direct,
+                    |(((logs, &retain_decommit), &retain_direct), &retain_numerator)| {
+                        ProgressiveCommitGroupGeometry {
+                            coefficient_log_sizes: logs.clone(),
+                            retain_evaluations: retain_decommit
+                                || retain_direct
+                                || retain_numerator,
+                        }
                     },
                 )
                 .collect();
@@ -616,6 +624,7 @@ pub struct ProtocolIdentity {
     pub direct_composition_planner_key: u64,
     pub direct_composition_occurrence_bitmap_hash: u64,
     pub direct_composition_group_rounded_bytes: usize,
+    pub numerator_evaluation_group_rounded_bytes: usize,
     pub retained_evaluation_union_bytes: usize,
 }
 
@@ -634,6 +643,8 @@ impl ProtocolIdentity {
         direct_composition_planner_key: u64,
         direct_composition_occurrence_bitmap_hash: u64,
         direct_composition_group_rounded_bytes: usize,
+        quotient_numerator_source_policy: QuotientNumeratorSourcePolicy,
+        numerator_evaluation_group_rounded_bytes: usize,
         retained_evaluation_union_bytes: usize,
     ) -> Self {
         Self {
@@ -649,12 +660,13 @@ impl ProtocolIdentity {
             kernel_manifest_hash,
             decommit_strategy,
             interpolation_mode: InterpolationLaunchMode::from_env(),
-            quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::from_env(),
+            quotient_numerator_source_policy,
             commit_mode,
             direct_composition_retention_mode,
             direct_composition_planner_key,
             direct_composition_occurrence_bitmap_hash,
             direct_composition_group_rounded_bytes,
+            numerator_evaluation_group_rounded_bytes,
             retained_evaluation_union_bytes,
         }
     }
@@ -935,7 +947,7 @@ impl ProtocolGeometry {
                         }
                         retained = Some(
                             commitment
-                                .retained_evaluation_groups
+                                .numerator_evaluation_groups
                                 .get(group_index)
                                 .copied()
                                 .ok_or(ArenaPlanError::InvalidProtocolGeometry(
@@ -1440,8 +1452,7 @@ impl ProtocolGeometry {
             (DirectCompositionRetentionMode::Disabled, None)
                 if self.identity.direct_composition_planner_key == 0
                     && self.identity.direct_composition_occurrence_bitmap_hash == 0
-                    && self.identity.direct_composition_group_rounded_bytes == 0
-                    && self.identity.retained_evaluation_union_bytes == 0 => {}
+                    && self.identity.direct_composition_group_rounded_bytes == 0 => {}
             (DirectCompositionRetentionMode::ExactNative, Some(plan))
                 if self.identity.commit_mode == ProgressiveCommitMode::DomainProgressive
                     && self.identity.direct_composition_planner_key == plan.cache_key => {}
@@ -1482,6 +1493,8 @@ impl ProtocolGeometry {
                 || commitment.direct_composition_evaluation_groups.len()
                     != commitment.grouped_column_log_sizes.len()
                 || commitment.retained_evaluation_groups.len()
+                    != commitment.grouped_column_log_sizes.len()
+                || commitment.numerator_evaluation_groups.len()
                     != commitment.grouped_column_log_sizes.len()
                 || commitment
                     .grouped_column_sources
@@ -1611,33 +1624,127 @@ impl ProtocolGeometry {
                         "direct composition group closure has missing or extra groups",
                     ));
                 }
-                let mut direct_bytes = 0usize;
-                let mut union_bytes = 0usize;
-                for commitment in &self.commitments {
-                    for group in 0..commitment.grouped_column_log_sizes.len() {
-                        let direct = commitment.direct_composition_evaluation_groups[group];
-                        let decommit = commitment.retained_evaluation_groups[group];
-                        if direct || decommit {
-                            let bytes = commitment_group_evaluation_bytes(commitment, group)?;
-                            union_bytes = union_bytes
-                                .checked_add(bytes)
-                                .ok_or(ArenaPlanError::SizeOverflow)?;
-                            if direct {
-                                direct_bytes = direct_bytes
-                                    .checked_add(bytes)
-                                    .ok_or(ArenaPlanError::SizeOverflow)?;
+            }
+        }
+        let mut expected_numerator = self
+            .commitments
+            .iter()
+            .map(|commitment| vec![false; commitment.grouped_column_log_sizes.len()])
+            .collect::<Vec<_>>();
+        if self.identity.quotient_numerator_source_policy
+            == QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations
+        {
+            if self.identity.commit_mode != ProgressiveCommitMode::DomainProgressive {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "quotient numerator retention requires progressive commit",
+                ));
+            }
+            for column in self
+                .oods
+                .columns
+                .iter()
+                .filter(|column| !column.shape_points.is_empty())
+            {
+                let tree = match column.source {
+                    OpenedColumnSource::Preprocessed { .. } => continue,
+                    OpenedColumnSource::Trace {
+                        purpose: BufferPurpose::BaseCoefficients,
+                        ..
+                    } => CommitmentTreeId::Base,
+                    OpenedColumnSource::Trace {
+                        purpose: BufferPurpose::InteractionCoefficients,
+                        ..
+                    } => CommitmentTreeId::Interaction,
+                    OpenedColumnSource::Composition { .. } => CommitmentTreeId::Composition,
+                    OpenedColumnSource::Trace { .. } => {
+                        return Err(ArenaPlanError::InvalidProtocolGeometry(
+                            "quotient numerator source is not a committed coefficient column",
+                        ))
+                    }
+                };
+                let commitment_index = self
+                    .commitments
+                    .iter()
+                    .position(|commitment| commitment.id == tree)
+                    .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                        "quotient numerator source tree is missing",
+                    ))?;
+                let commitment = &self.commitments[commitment_index];
+                let mut matched = None;
+                for (group, (sources, logs)) in commitment
+                    .grouped_column_sources
+                    .iter()
+                    .zip(&commitment.grouped_column_log_sizes)
+                    .enumerate()
+                {
+                    for (&source, &log) in sources.iter().zip(logs) {
+                        if OpenedColumnSource::from(source) == column.source {
+                            if matched.is_some() || log != column.coefficient_log_size {
+                                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                                    "quotient numerator source mapping is ambiguous or has the wrong log",
+                                ));
                             }
+                            matched = Some(group);
                         }
                     }
                 }
-                if self.identity.direct_composition_group_rounded_bytes != direct_bytes
-                    || self.identity.retained_evaluation_union_bytes != union_bytes
-                {
-                    return Err(ArenaPlanError::InvalidProtocolGeometry(
-                        "direct composition physical retained byte identity drifted",
-                    ));
+                let group = matched.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                    "quotient numerator source is absent from its commitment",
+                ))?;
+                expected_numerator[commitment_index][group] = true;
+            }
+        }
+        if self
+            .commitments
+            .iter()
+            .zip(&expected_numerator)
+            .any(|(commitment, expected)| commitment.numerator_evaluation_groups != *expected)
+        {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "quotient numerator group closure has missing or extra groups",
+            ));
+        }
+        let mut direct_bytes = 0usize;
+        let mut numerator_bytes = 0usize;
+        let mut union_bytes = 0usize;
+        for commitment in &self.commitments {
+            for group in 0..commitment.grouped_column_log_sizes.len() {
+                let direct = commitment.direct_composition_evaluation_groups[group];
+                let numerator = commitment.numerator_evaluation_groups[group];
+                let decommit = commitment.retained_evaluation_groups[group];
+                if direct || numerator || decommit {
+                    let bytes = commitment_group_evaluation_bytes(commitment, group)?;
+                    union_bytes = union_bytes
+                        .checked_add(bytes)
+                        .ok_or(ArenaPlanError::SizeOverflow)?;
+                    if direct {
+                        direct_bytes = direct_bytes
+                            .checked_add(bytes)
+                            .ok_or(ArenaPlanError::SizeOverflow)?;
+                    }
+                    if numerator {
+                        numerator_bytes = numerator_bytes
+                            .checked_add(bytes)
+                            .ok_or(ArenaPlanError::SizeOverflow)?;
+                    }
                 }
             }
+        }
+        let identity_union_bytes = if self.direct_composition_retention.is_some()
+            || self.identity.quotient_numerator_source_policy
+                == QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations
+        {
+            union_bytes
+        } else {
+            0
+        };
+        if self.identity.direct_composition_group_rounded_bytes != direct_bytes
+            || self.identity.numerator_evaluation_group_rounded_bytes != numerator_bytes
+            || self.identity.retained_evaluation_union_bytes != identity_union_bytes
+        {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "retained evaluation physical byte identity drifted",
+            ));
         }
         if committed_opened_sources.len() != self.oods.columns.len()
             || self
@@ -1732,6 +1839,11 @@ impl ProtocolGeometry {
         );
         feed(&(self.identity.direct_composition_group_rounded_bytes as u64).to_le_bytes());
         feed(&(self.identity.retained_evaluation_union_bytes as u64).to_le_bytes());
+        if self.identity.quotient_numerator_source_policy
+            == QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations
+        {
+            feed(&(self.identity.numerator_evaluation_group_rounded_bytes as u64).to_le_bytes());
+        }
         for identity in &self.preprocessed_column_ids {
             feed(&(identity.len() as u64).to_le_bytes());
             feed(identity.as_bytes());
@@ -1788,6 +1900,14 @@ impl ProtocolGeometry {
             feed(&(commitment.direct_composition_evaluation_groups.len() as u64).to_le_bytes());
             for &retained in &commitment.direct_composition_evaluation_groups {
                 feed(&[u8::from(retained)]);
+            }
+            if self.identity.quotient_numerator_source_policy
+                == QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations
+            {
+                feed(&(commitment.numerator_evaluation_groups.len() as u64).to_le_bytes());
+                for &retained in &commitment.numerator_evaluation_groups {
+                    feed(&[u8::from(retained)]);
+                }
             }
             for group in &commitment.grouped_column_log_sizes {
                 feed(&(group.len() as u64).to_le_bytes());
@@ -2089,6 +2209,7 @@ struct LogicalCommitWorkspace {
     retained_evaluations: Vec<Option<Vec<LogicalBufferId>>>,
     decommit_evaluation_groups: Vec<bool>,
     direct_composition_evaluation_groups: Vec<bool>,
+    numerator_evaluation_groups: Vec<bool>,
     leaf_workspace: LogicalCommitLeafWorkspace,
     interpolation_batches: Vec<LogicalInterpolationBatch>,
 }
@@ -2793,6 +2914,7 @@ pub struct PlannedCommitment {
     pub retained_evaluation_groups: Vec<Option<Vec<ArenaBinding>>>,
     pub evaluation_output_groups: Vec<Option<Vec<ArenaBinding>>>,
     pub direct_composition_evaluation_groups: Vec<Option<Vec<ArenaBinding>>>,
+    pub numerator_evaluation_groups: Vec<Option<Vec<ArenaBinding>>>,
     /// Exact root and retained decommit layers, bound independently of the
     /// ephemeral `PreparedCommitGraph` value used for the cold fixed commit.
     pub root: ArenaBinding,
@@ -5704,6 +5826,16 @@ fn retained_quotient_numerator_source(
                     "evaluation-backed quotient numerator source mapping drifted",
                 ));
             }
+            if !commitment
+                .numerator_evaluation_groups
+                .get(group_index)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "quotient numerator group closure is missing",
+                ));
+            }
             let retained = commitment
                 .retained_evaluations
                 .get(group_index)
@@ -6086,40 +6218,53 @@ fn append_protocol_buffers(
                 "direct composition retention policy does not match its groups",
             ));
         }
+        if geometry.numerator_evaluation_groups.len() != geometry.grouped_column_log_sizes.len() {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "quotient numerator retention policy does not match its groups",
+            ));
+        }
         let retained_evaluations = geometry
             .grouped_column_log_sizes
             .iter()
             .zip(&geometry.retained_evaluation_groups)
             .zip(&geometry.direct_composition_evaluation_groups)
-            .map(|((logs, &keep_decommit), &keep_direct)| {
-                (keep_decommit || keep_direct)
-                    .then(|| {
-                        logs.iter()
-                            .map(|&log_size| {
-                                let evaluation_log = log_size
-                                    .checked_add(geometry.config.log_blowup_factor)
-                                    .ok_or(ArenaPlanError::SizeOverflow)?;
-                                push_buffer_id(
-                                    logical,
-                                    None,
-                                    None,
-                                    BufferPurpose::CommitRetainedEvaluation,
-                                    ordinal()?,
-                                    checked_pow2(evaluation_log)?,
-                                    if keep_decommit {
-                                        retained
-                                    } else {
-                                        BufferLifetime::new(
-                                            geometry.created,
-                                            ProofEpoch::Composition,
-                                        )?
-                                    },
-                                )
-                            })
-                            .collect::<Result<Vec<_>, ArenaPlanError>>()
-                    })
-                    .transpose()
-            })
+            .zip(&geometry.numerator_evaluation_groups)
+            .map(
+                |(((logs, &keep_decommit), &keep_direct), &keep_numerator)| {
+                    (keep_decommit || keep_direct || keep_numerator)
+                        .then(|| {
+                            logs.iter()
+                                .map(|&log_size| {
+                                    let evaluation_log = log_size
+                                        .checked_add(geometry.config.log_blowup_factor)
+                                        .ok_or(ArenaPlanError::SizeOverflow)?;
+                                    push_buffer_id(
+                                        logical,
+                                        None,
+                                        None,
+                                        BufferPurpose::CommitRetainedEvaluation,
+                                        ordinal()?,
+                                        checked_pow2(evaluation_log)?,
+                                        if keep_decommit {
+                                            retained
+                                        } else if keep_numerator {
+                                            BufferLifetime::new(
+                                                geometry.created,
+                                                ProofEpoch::Quotient,
+                                            )?
+                                        } else {
+                                            BufferLifetime::new(
+                                                geometry.created,
+                                                ProofEpoch::Composition,
+                                            )?
+                                        },
+                                    )
+                                })
+                                .collect::<Result<Vec<_>, ArenaPlanError>>()
+                        })
+                        .transpose()
+                },
+            )
             .collect::<Result<Vec<_>, ArenaPlanError>>()?;
         let leaf_workspace = match &requirements {
             ModeAwareCommitWorkspaceRequirements::FullLifting(requirements) => {
@@ -6278,6 +6423,7 @@ fn append_protocol_buffers(
             direct_composition_evaluation_groups: geometry
                 .direct_composition_evaluation_groups
                 .clone(),
+            numerator_evaluation_groups: geometry.numerator_evaluation_groups.clone(),
             leaf_workspace,
             interpolation_batches,
         });
@@ -7475,6 +7621,11 @@ fn resolve_commitment_slots(
         .zip(&logical.direct_composition_evaluation_groups)
         .map(|(group, &selected)| selected.then(|| group.clone().expect("union output exists")))
         .collect();
+    let numerator_evaluation_groups = evaluation_output_groups
+        .iter()
+        .zip(&logical.numerator_evaluation_groups)
+        .map(|(group, &selected)| selected.then(|| group.clone().expect("union output exists")))
+        .collect();
     let interpolation_batches = logical
         .interpolation_batches
         .iter()
@@ -7574,6 +7725,7 @@ fn resolve_commitment_slots(
         retained_evaluation_groups,
         evaluation_output_groups,
         direct_composition_evaluation_groups,
+        numerator_evaluation_groups,
         root,
         retained_layers_bottom_up,
         interpolation_mode: logical.interpolation_mode,
@@ -9517,6 +9669,7 @@ mod tests {
                 direct_composition_planner_key: 0,
                 direct_composition_occurrence_bitmap_hash: 0,
                 direct_composition_group_rounded_bytes: 0,
+                numerator_evaluation_group_rounded_bytes: 0,
                 retained_evaluation_union_bytes: 0,
             },
             preprocessed_column_ids: vec![
@@ -9556,6 +9709,7 @@ mod tests {
                     ]],
                     retained_evaluation_groups: vec![false],
                     direct_composition_evaluation_groups: vec![false],
+                    numerator_evaluation_groups: vec![false],
                 },
                 CommitmentGeometry {
                     id: CommitmentTreeId::Base,
@@ -9568,6 +9722,7 @@ mod tests {
                     },
                     retained_evaluation_groups: vec![false; base_logs.len()],
                     direct_composition_evaluation_groups: vec![false; base_logs.len()],
+                    numerator_evaluation_groups: vec![false; base_logs.len()],
                     grouped_column_log_sizes: base_logs,
                     grouped_column_sources: base_sources,
                 },
@@ -9582,6 +9737,7 @@ mod tests {
                     },
                     retained_evaluation_groups: vec![false; interaction_logs.len()],
                     direct_composition_evaluation_groups: vec![false; interaction_logs.len()],
+                    numerator_evaluation_groups: vec![false; interaction_logs.len()],
                     grouped_column_log_sizes: interaction_logs,
                     grouped_column_sources: interaction_sources,
                 },
@@ -9600,6 +9756,7 @@ mod tests {
                         .collect()],
                     retained_evaluation_groups: vec![false],
                     direct_composition_evaluation_groups: vec![false],
+                    numerator_evaluation_groups: vec![false],
                 },
             ],
             direct_composition_retention: None,
@@ -9617,15 +9774,20 @@ mod tests {
             InterpolationLaunchMode::StageFusedOutOfPlace;
         assert_ne!(protocol.key(), fused_interpolation.key());
         let mut retained_numerator = protocol.clone();
-        retained_numerator.identity.decommit_strategy = DecommitStrategy::HybridByGroup;
+        retained_numerator.identity.commit_mode = ProgressiveCommitMode::DomainProgressive;
         retained_numerator.identity.quotient_numerator_source_policy =
             QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations;
-        retained_numerator
+        let composition_commitment = retained_numerator
             .commitments
             .iter_mut()
             .find(|commitment| commitment.id == CommitmentTreeId::Composition)
-            .unwrap()
-            .retained_evaluation_groups[0] = true;
+            .unwrap();
+        composition_commitment.numerator_evaluation_groups[0] = true;
+        let numerator_bytes = commitment_group_evaluation_bytes(composition_commitment, 0).unwrap();
+        retained_numerator
+            .identity
+            .numerator_evaluation_group_rounded_bytes = numerator_bytes;
+        retained_numerator.identity.retained_evaluation_union_bytes = numerator_bytes;
         assert_ne!(protocol.key(), retained_numerator.key());
         let retained_kinds = retained_numerator
             .quotient_numerator_source_kinds()
@@ -9637,6 +9799,23 @@ mod tests {
                 .count(),
             1,
             "only the sampled retained composition column is eligible"
+        );
+        let mut sampled_preprocessed = retained_numerator.clone();
+        let sampled_shape = sampled_preprocessed
+            .oods
+            .columns
+            .iter()
+            .find(|column| !column.shape_points.is_empty())
+            .unwrap()
+            .shape_points
+            .clone();
+        sampled_preprocessed.oods.columns[0].shape_points = sampled_shape;
+        assert!(!sampled_preprocessed.commitments[0].numerator_evaluation_groups[0]);
+        assert_eq!(
+            sampled_preprocessed
+                .quotient_numerator_source_kinds()
+                .unwrap()[0],
+            QuotientNumeratorSourceKind::Coefficients
         );
         let coefficient_requirements = quotient_numerator_workspace_requirements(
             protocol.quotient_numerator_workspace_config().unwrap(),
@@ -9666,6 +9845,55 @@ mod tests {
             retained_requirements.coefficient_pointer_words
                 < coefficient_requirements.coefficient_pointer_words
         );
+        retained_numerator.validate().unwrap();
+        let retained_arena =
+            ProofArenaPlan::build(&proof, &retained_numerator, &composition).unwrap();
+        retained_arena.validate_aliases().unwrap();
+        let retained_commitment = retained_arena
+            .commitments()
+            .iter()
+            .find(|commitment| commitment.id == CommitmentTreeId::Composition)
+            .unwrap();
+        assert_eq!(
+            retained_commitment.numerator_evaluation_groups[0],
+            retained_commitment.evaluation_output_groups[0]
+        );
+        assert!(retained_commitment.retained_evaluation_groups[0].is_none());
+        assert!(retained_commitment.direct_composition_evaluation_groups[0].is_none());
+        for binding in retained_commitment.numerator_evaluation_groups[0]
+            .as_ref()
+            .unwrap()
+        {
+            let logical = retained_arena
+                .logical_buffers()
+                .iter()
+                .find(|buffer| buffer.id == binding.logical)
+                .unwrap();
+            assert_eq!(logical.lifetime.last, ProofEpoch::Quotient);
+        }
+        let mut missing_numerator_group = retained_numerator.clone();
+        missing_numerator_group
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == CommitmentTreeId::Composition)
+            .unwrap()
+            .numerator_evaluation_groups[0] = false;
+        assert!(matches!(
+            missing_numerator_group.validate(),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "quotient numerator group closure has missing or extra groups"
+            ))
+        ));
+        let mut drifted_numerator_identity = retained_numerator.clone();
+        drifted_numerator_identity
+            .identity
+            .numerator_evaluation_group_rounded_bytes += 4;
+        assert!(matches!(
+            drifted_numerator_identity.validate(),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "retained evaluation physical byte identity drifted"
+            ))
+        ));
         let mut invalid_oods_evaluation_log = protocol.clone();
         invalid_oods_evaluation_log.oods.columns[0].evaluation_log_size =
             invalid_oods_evaluation_log.oods.columns[0].coefficient_log_size;
@@ -9866,7 +10094,7 @@ mod tests {
         assert!(matches!(
             ProofArenaPlan::build_inner(&proof, &changed_direct_bytes, &composition, None),
             Err(ArenaPlanError::InvalidProtocolGeometry(
-                "direct composition physical retained byte identity drifted"
+                "retained evaluation physical byte identity drifted"
             ))
         ));
         let mut changed_union_bytes = direct_protocol.clone();
@@ -9874,7 +10102,7 @@ mod tests {
         assert!(matches!(
             ProofArenaPlan::build_inner(&proof, &changed_union_bytes, &composition, None),
             Err(ArenaPlanError::InvalidProtocolGeometry(
-                "direct composition physical retained byte identity drifted"
+                "retained evaluation physical byte identity drifted"
             ))
         ));
         let mut missing_direct_group = direct_protocol.clone();
@@ -10108,12 +10336,7 @@ mod tests {
             retained_source_buffer.purpose,
             BufferPurpose::CommitRetainedEvaluation
         );
-        assert!(retained_source_buffer
-            .lifetime
-            .contains(ProofEpoch::Quotient));
-        assert!(retained_source_buffer
-            .lifetime
-            .contains(ProofEpoch::Decommit));
+        assert_eq!(retained_source_buffer.lifetime.last, ProofEpoch::Quotient);
         let mut short_source = evaluation_column.numerator_source;
         short_source.len_words -= 1;
         assert_eq!(

@@ -18,7 +18,7 @@ use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId, TraceP
 use crate::arena_plan::{
     BufferPurpose, CommitmentColumnSource, CommitmentGeometry, CommitmentTreeId, DecommitStrategy,
     OodsColumnGeometry, OodsGeometry, OpenedColumnSource, ProofEpoch, ProtocolGeometry,
-    ProtocolIdentity, QuotientGeometry, TranscriptGeometry,
+    ProtocolIdentity, QuotientGeometry, QuotientNumeratorSourcePolicy, TranscriptGeometry,
 };
 use crate::composition_plan::CompositionPlan;
 use crate::direct_composition_retention::{
@@ -56,6 +56,7 @@ pub struct ProtocolPlanPolicy {
     pub max_fused_tail_levels: u32,
     pub commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
     pub direct_composition_retention_mode: DirectCompositionRetentionMode,
+    pub quotient_numerator_source_policy: QuotientNumeratorSourcePolicy,
 }
 
 impl ProtocolPlanPolicy {
@@ -73,6 +74,7 @@ impl ProtocolPlanPolicy {
             max_fused_tail_levels: 12,
             commit_mode: stwo_backend_cuda::ProgressiveCommitMode::FullLifting,
             direct_composition_retention_mode: DirectCompositionRetentionMode::Disabled,
+            quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::CoefficientsOnly,
         }
     }
 
@@ -90,10 +92,17 @@ impl ProtocolPlanPolicy {
         let mut policy = Self::starknet_blake2s(hash, composition_max_kernel_instrs);
         policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::from_env();
         policy.direct_composition_retention_mode = DirectCompositionRetentionMode::from_env();
+        policy.quotient_numerator_source_policy = QuotientNumeratorSourcePolicy::from_env();
         if policy.direct_composition_retention_mode == DirectCompositionRetentionMode::ExactNative {
             if policy.commit_mode != stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive {
                 return Err(ProtocolPlanError::DirectRetentionRequiresProgressiveCommit);
             }
+        }
+        if policy.quotient_numerator_source_policy
+            == QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations
+            && policy.commit_mode != stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive
+        {
+            return Err(ProtocolPlanError::NumeratorRetentionRequiresProgressiveCommit);
         }
         if let Ok(value) = crate::flags::env_value("STWO_CUDA_RETAINED_LDE_BUDGET_BYTES") {
             policy.retained_lde_budget_bytes = value
@@ -112,11 +121,17 @@ pub enum ProtocolPlanError {
     InvalidRetainedLdeBudget,
     UnsupportedRetainAllLde,
     DirectRetentionRequiresProgressiveCommit,
+    NumeratorRetentionRequiresProgressiveCommit,
     DirectRetentionCompositionMissing,
     DirectRetentionBudgetExceeded {
         required_bytes: usize,
         budget_bytes: usize,
     },
+    NumeratorRetentionBudgetExceeded {
+        required_bytes: usize,
+        budget_bytes: usize,
+    },
+    NumeratorRetention(&'static str),
     DirectRetention(DirectCompositionRetentionError),
     CompositionKernelCapMismatch {
         policy: usize,
@@ -660,6 +675,12 @@ fn plan_protocol_from_logs(
     {
         return Err(ProtocolPlanError::DirectRetentionRequiresProgressiveCommit);
     }
+    if policy.quotient_numerator_source_policy
+        == QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations
+        && policy.commit_mode != stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive
+    {
+        return Err(ProtocolPlanError::NumeratorRetentionRequiresProgressiveCommit);
+    }
     if claim_log_sizes.len() != 2 {
         return Err(ProtocolPlanError::InvalidClaimTreeCount(
             claim_log_sizes.len(),
@@ -800,6 +821,7 @@ fn plan_protocol_from_logs(
             grouped_column_sources: preprocessed_sources,
             retained_evaluation_groups: Vec::new(),
             direct_composition_evaluation_groups: Vec::new(),
+            numerator_evaluation_groups: Vec::new(),
         },
         CommitmentGeometry {
             id: CommitmentTreeId::Base,
@@ -809,6 +831,7 @@ fn plan_protocol_from_logs(
             grouped_column_sources: base_sources,
             retained_evaluation_groups: Vec::new(),
             direct_composition_evaluation_groups: Vec::new(),
+            numerator_evaluation_groups: Vec::new(),
         },
         CommitmentGeometry {
             id: CommitmentTreeId::Interaction,
@@ -818,6 +841,7 @@ fn plan_protocol_from_logs(
             grouped_column_sources: interaction_sources,
             retained_evaluation_groups: Vec::new(),
             direct_composition_evaluation_groups: Vec::new(),
+            numerator_evaluation_groups: Vec::new(),
         },
         CommitmentGeometry {
             id: CommitmentTreeId::Composition,
@@ -827,6 +851,7 @@ fn plan_protocol_from_logs(
             grouped_column_sources: vec![composition_sources],
             retained_evaluation_groups: Vec::new(),
             direct_composition_evaluation_groups: Vec::new(),
+            numerator_evaluation_groups: Vec::new(),
         },
     ];
     let direct_composition_retention = match policy.direct_composition_retention_mode {
@@ -849,9 +874,11 @@ fn plan_protocol_from_logs(
     };
     let retention = select_retained_evaluation_groups(
         &mut commitments,
+        &oods,
         policy.decommit_strategy,
         policy.retained_lde_budget_bytes,
         direct_composition_retention.as_ref(),
+        policy.quotient_numerator_source_policy,
     )?;
 
     let fri_layer_log_sizes = fri_merkle_log_sizes(lifting, pcs.fri_config)?;
@@ -895,9 +922,16 @@ fn plan_protocol_from_logs(
                 .as_ref()
                 .map_or(0, |plan| direct_bitmap_hash(&plan.direct_bitmap)),
             retention.direct_group_rounded_bytes,
-            direct_composition_retention
-                .as_ref()
-                .map_or(0, |_| retention.union_group_rounded_bytes),
+            policy.quotient_numerator_source_policy,
+            retention.numerator_group_rounded_bytes,
+            if direct_composition_retention.is_some()
+                || policy.quotient_numerator_source_policy
+                    == QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations
+            {
+                retention.union_group_rounded_bytes
+            } else {
+                0
+            },
         ),
         preprocessed_column_ids: preprocessed_trace
             .ids()
@@ -926,16 +960,21 @@ fn plan_protocol_from_logs(
 
 fn select_retained_evaluation_groups(
     commitments: &mut [CommitmentGeometry],
+    oods: &OodsGeometry,
     strategy: DecommitStrategy,
     budget_bytes: usize,
     direct: Option<&DirectCompositionRetentionPlan>,
+    numerator_policy: QuotientNumeratorSourcePolicy,
 ) -> Result<RetentionSelection, ProtocolPlanError> {
     for commitment in commitments.iter_mut() {
         commitment.retained_evaluation_groups =
             vec![false; commitment.grouped_column_log_sizes.len()];
         commitment.direct_composition_evaluation_groups =
             vec![false; commitment.grouped_column_log_sizes.len()];
+        commitment.numerator_evaluation_groups =
+            vec![false; commitment.grouped_column_log_sizes.len()];
     }
+    select_numerator_evaluation_groups(commitments, oods, numerator_policy)?;
     if let Some(plan) = direct {
         for binding in plan.bindings.iter().filter(|binding| binding.direct) {
             let column =
@@ -985,11 +1024,51 @@ fn select_retained_evaluation_groups(
         });
     }
 
+    let numerator_words = commitments.iter().try_fold(0usize, |total, commitment| {
+        commitment
+            .grouped_column_log_sizes
+            .iter()
+            .zip(&commitment.numerator_evaluation_groups)
+            .try_fold(total, |total, (logs, &selected)| {
+                if selected {
+                    total
+                        .checked_add(retained_group_words(commitment, logs)?)
+                        .ok_or(ProtocolPlanError::SizeOverflow)
+                } else {
+                    Ok(total)
+                }
+            })
+    })?;
+    let mandatory_words = commitments.iter().try_fold(0usize, |total, commitment| {
+        commitment
+            .grouped_column_log_sizes
+            .iter()
+            .zip(&commitment.direct_composition_evaluation_groups)
+            .zip(&commitment.numerator_evaluation_groups)
+            .try_fold(total, |total, ((logs, &direct), &numerator)| {
+                if direct || numerator {
+                    total
+                        .checked_add(retained_group_words(commitment, logs)?)
+                        .ok_or(ProtocolPlanError::SizeOverflow)
+                } else {
+                    Ok(total)
+                }
+            })
+    })?;
+    if mandatory_words > budget_words {
+        return Err(ProtocolPlanError::NumeratorRetentionBudgetExceeded {
+            required_bytes: mandatory_words
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(ProtocolPlanError::SizeOverflow)?,
+            budget_bytes,
+        });
+    }
+
     match strategy {
         DecommitStrategy::RecomputeQueriedLde => {}
         DecommitStrategy::RetainAllLde => return Err(ProtocolPlanError::UnsupportedRetainAllLde),
         DecommitStrategy::HybridByGroup => {
-            select_decommit_groups(commitments, budget_words - direct_words)?;
+            select_decommit_groups(commitments, budget_words - mandatory_words)?;
         }
     }
 
@@ -999,18 +1078,25 @@ fn select_retained_evaluation_groups(
             .iter()
             .zip(&commitment.retained_evaluation_groups)
             .zip(&commitment.direct_composition_evaluation_groups)
-            .try_fold(total, |total, ((logs, &decommit), &direct)| {
-                if decommit || direct {
-                    total
-                        .checked_add(retained_group_words(commitment, logs)?)
-                        .ok_or(ProtocolPlanError::SizeOverflow)
-                } else {
-                    Ok(total)
-                }
-            })
+            .zip(&commitment.numerator_evaluation_groups)
+            .try_fold(
+                total,
+                |total, (((logs, &decommit), &direct), &numerator)| {
+                    if decommit || direct || numerator {
+                        total
+                            .checked_add(retained_group_words(commitment, logs)?)
+                            .ok_or(ProtocolPlanError::SizeOverflow)
+                    } else {
+                        Ok(total)
+                    }
+                },
+            )
     })?;
     Ok(RetentionSelection {
         direct_group_rounded_bytes: direct_words
+            .checked_mul(core::mem::size_of::<u32>())
+            .ok_or(ProtocolPlanError::SizeOverflow)?,
+        numerator_group_rounded_bytes: numerator_words
             .checked_mul(core::mem::size_of::<u32>())
             .ok_or(ProtocolPlanError::SizeOverflow)?,
         union_group_rounded_bytes: union_words
@@ -1022,7 +1108,70 @@ fn select_retained_evaluation_groups(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RetentionSelection {
     direct_group_rounded_bytes: usize,
+    numerator_group_rounded_bytes: usize,
     union_group_rounded_bytes: usize,
+}
+
+fn select_numerator_evaluation_groups(
+    commitments: &mut [CommitmentGeometry],
+    oods: &OodsGeometry,
+    policy: QuotientNumeratorSourcePolicy,
+) -> Result<(), ProtocolPlanError> {
+    if policy == QuotientNumeratorSourcePolicy::CoefficientsOnly {
+        return Ok(());
+    }
+    for column in &oods.columns {
+        if column.shape_points.is_empty() {
+            continue;
+        }
+        let tree = match column.source {
+            OpenedColumnSource::Preprocessed { .. } => continue,
+            OpenedColumnSource::Trace {
+                purpose: BufferPurpose::BaseCoefficients,
+                ..
+            } => CommitmentTreeId::Base,
+            OpenedColumnSource::Trace {
+                purpose: BufferPurpose::InteractionCoefficients,
+                ..
+            } => CommitmentTreeId::Interaction,
+            OpenedColumnSource::Composition { .. } => CommitmentTreeId::Composition,
+            OpenedColumnSource::Trace { .. } => {
+                return Err(ProtocolPlanError::NumeratorRetention(
+                    "source is not a committed coefficient column",
+                ));
+            }
+        };
+        let commitment = commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == tree)
+            .ok_or(ProtocolPlanError::NumeratorRetention(
+                "source tree is missing",
+            ))?;
+        let mut selected = None;
+        for (group, (sources, logs)) in commitment
+            .grouped_column_sources
+            .iter()
+            .zip(&commitment.grouped_column_log_sizes)
+            .enumerate()
+        {
+            for (&source, &log) in sources.iter().zip(logs) {
+                if OpenedColumnSource::from(source) != column.source {
+                    continue;
+                }
+                if selected.is_some() || log != column.coefficient_log_size {
+                    return Err(ProtocolPlanError::NumeratorRetention(
+                        "source mapping is ambiguous or has the wrong log",
+                    ));
+                }
+                selected = Some(group);
+            }
+        }
+        let group = selected.ok_or(ProtocolPlanError::NumeratorRetention(
+            "source is absent from its commitment",
+        ))?;
+        commitment.numerator_evaluation_groups[group] = true;
+    }
+    Ok(())
 }
 
 fn retained_group_words(
@@ -1094,6 +1243,7 @@ fn select_decommit_groups(
     for candidate in candidates {
         let additional = if commitments[candidate.commitment].direct_composition_evaluation_groups
             [candidate.group]
+            || commitments[candidate.commitment].numerator_evaluation_groups[candidate.group]
         {
             0
         } else {
@@ -1250,6 +1400,16 @@ mod tests {
         }
     }
 
+    fn empty_oods() -> OodsGeometry {
+        OodsGeometry {
+            mask_log_size: 1,
+            sampled_values_input: TranscriptInputId(1),
+            point_parameter_output: TranscriptOutputId(1),
+            quotient_random_coefficient_output: TranscriptOutputId(2),
+            columns: Vec::new(),
+        }
+    }
+
     #[test]
     fn hybrid_opening_budget_prefers_highest_fft_work_per_word() {
         let config = CommitWorkspaceConfig {
@@ -1267,6 +1427,7 @@ mod tests {
                 grouped_column_sources: vec![Vec::new()],
                 retained_evaluation_groups: Vec::new(),
                 direct_composition_evaluation_groups: Vec::new(),
+                numerator_evaluation_groups: Vec::new(),
             },
             CommitmentGeometry {
                 id: CommitmentTreeId::Base,
@@ -1276,6 +1437,7 @@ mod tests {
                 grouped_column_sources: vec![Vec::new(), Vec::new()],
                 retained_evaluation_groups: Vec::new(),
                 direct_composition_evaluation_groups: Vec::new(),
+                numerator_evaluation_groups: Vec::new(),
             },
             CommitmentGeometry {
                 id: CommitmentTreeId::Interaction,
@@ -1285,13 +1447,16 @@ mod tests {
                 grouped_column_sources: vec![Vec::new()],
                 retained_evaluation_groups: Vec::new(),
                 direct_composition_evaluation_groups: Vec::new(),
+                numerator_evaluation_groups: Vec::new(),
             },
         ];
         select_retained_evaluation_groups(
             &mut commitments,
+            &empty_oods(),
             DecommitStrategy::HybridByGroup,
             (1usize << 13) * core::mem::size_of::<u32>(),
             None,
+            QuotientNumeratorSourcePolicy::CoefficientsOnly,
         )
         .unwrap();
         assert_eq!(commitments[0].retained_evaluation_groups, [false]);
@@ -1372,6 +1537,7 @@ mod tests {
                 .collect(),
             retained_evaluation_groups: Vec::new(),
             direct_composition_evaluation_groups: Vec::new(),
+            numerator_evaluation_groups: Vec::new(),
         }
     }
 
@@ -1394,9 +1560,11 @@ mod tests {
             let mut direct_only = retention_fixture(count);
             let selected = select_retained_evaluation_groups(
                 &mut direct_only,
+                &empty_oods(),
                 DecommitStrategy::RecomputeQueriedLde,
                 rounded_bytes,
                 Some(&direct),
+                QuotientNumeratorSourcePolicy::CoefficientsOnly,
             )
             .unwrap();
             assert!(direct_only[1].direct_composition_evaluation_groups[group]);
@@ -1407,9 +1575,11 @@ mod tests {
             let mut both = retention_fixture(count);
             select_retained_evaluation_groups(
                 &mut both,
+                &empty_oods(),
                 DecommitStrategy::HybridByGroup,
                 rounded_bytes,
                 Some(&direct),
+                QuotientNumeratorSourcePolicy::CoefficientsOnly,
             )
             .unwrap();
             assert!(both[1].direct_composition_evaluation_groups[group]);
@@ -1418,9 +1588,11 @@ mod tests {
             let mut decommit_only = retention_fixture(count);
             select_retained_evaluation_groups(
                 &mut decommit_only,
+                &empty_oods(),
                 DecommitStrategy::HybridByGroup,
                 rounded_bytes,
                 None,
+                QuotientNumeratorSourcePolicy::CoefficientsOnly,
             )
             .unwrap();
             assert!(!decommit_only[1].direct_composition_evaluation_groups[group]);
@@ -1430,9 +1602,11 @@ mod tests {
             assert_eq!(
                 select_retained_evaluation_groups(
                     &mut insufficient,
+                    &empty_oods(),
                     DecommitStrategy::RecomputeQueriedLde,
                     rounded_bytes - 1,
                     Some(&direct),
+                    QuotientNumeratorSourcePolicy::CoefficientsOnly,
                 ),
                 Err(ProtocolPlanError::DirectRetentionBudgetExceeded {
                     required_bytes: rounded_bytes,
@@ -1440,6 +1614,123 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn numerator_group_closure_is_exact_and_independent_of_decommit() {
+        let mut commitments = retention_fixture(17);
+        let source = OpenedColumnSource::Trace {
+            component: "test",
+            part: TracePartId::Main,
+            purpose: BufferPurpose::BaseCoefficients,
+            ordinal: 0,
+        };
+        let offset = stwo::core::poly::circle::CanonicCoset::new(4).step();
+        let mut oods = empty_oods();
+        oods.columns = vec![OodsColumnGeometry {
+            source,
+            coefficient_log_size: 4,
+            evaluation_log_size: 5,
+            shape_points: vec![
+                stwo::core::circle::SECURE_FIELD_CIRCLE_GEN
+                    + offset.into_ef::<stwo::core::fields::qm31::SecureField>(),
+            ],
+            offset_points: vec![offset],
+        }];
+        let rounded_bytes = 16 * (1usize << 5) * core::mem::size_of::<u32>();
+        let selected = select_retained_evaluation_groups(
+            &mut commitments,
+            &oods,
+            DecommitStrategy::RecomputeQueriedLde,
+            rounded_bytes,
+            None,
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+        )
+        .unwrap();
+        assert_eq!(commitments[1].numerator_evaluation_groups, [true, false]);
+        assert_eq!(commitments[1].retained_evaluation_groups, [false, false]);
+        assert_eq!(selected.numerator_group_rounded_bytes, rounded_bytes);
+        assert_eq!(selected.union_group_rounded_bytes, rounded_bytes);
+
+        let mut one_word_short = retention_fixture(17);
+        assert_eq!(
+            select_retained_evaluation_groups(
+                &mut one_word_short,
+                &oods,
+                DecommitStrategy::RecomputeQueriedLde,
+                rounded_bytes - core::mem::size_of::<u32>(),
+                None,
+                QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+            ),
+            Err(ProtocolPlanError::NumeratorRetentionBudgetExceeded {
+                required_bytes: rounded_bytes,
+                budget_bytes: rounded_bytes - core::mem::size_of::<u32>(),
+            })
+        );
+
+        let direct = direct_plan(CommitmentTreeId::Base, 0, 0);
+        let mut overlapping = retention_fixture(17);
+        let overlap = select_retained_evaluation_groups(
+            &mut overlapping,
+            &oods,
+            DecommitStrategy::RecomputeQueriedLde,
+            rounded_bytes,
+            Some(&direct),
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+        )
+        .unwrap();
+        assert!(overlapping[1].direct_composition_evaluation_groups[0]);
+        assert!(overlapping[1].numerator_evaluation_groups[0]);
+        assert_eq!(overlap.direct_group_rounded_bytes, rounded_bytes);
+        assert_eq!(overlap.numerator_group_rounded_bytes, rounded_bytes);
+        assert_eq!(overlap.union_group_rounded_bytes, rounded_bytes);
+
+        let mut hybrid_overlap = retention_fixture(17);
+        select_retained_evaluation_groups(
+            &mut hybrid_overlap,
+            &oods,
+            DecommitStrategy::HybridByGroup,
+            rounded_bytes,
+            Some(&direct),
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+        )
+        .unwrap();
+        assert!(hybrid_overlap[1].retained_evaluation_groups[0]);
+
+        let mut coefficients_only = retention_fixture(17);
+        select_retained_evaluation_groups(
+            &mut coefficients_only,
+            &oods,
+            DecommitStrategy::RecomputeQueriedLde,
+            0,
+            None,
+            QuotientNumeratorSourcePolicy::CoefficientsOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            coefficients_only[1].numerator_evaluation_groups,
+            [false, false]
+        );
+
+        let mut sampled_preprocessed = oods.clone();
+        sampled_preprocessed.columns.push(OodsColumnGeometry {
+            source: OpenedColumnSource::Preprocessed { ordinal: 0 },
+            coefficient_log_size: 4,
+            evaluation_log_size: 5,
+            shape_points: sampled_preprocessed.columns[0].shape_points.clone(),
+            offset_points: sampled_preprocessed.columns[0].offset_points.clone(),
+        });
+        let mut preprocessed_ignored = retention_fixture(17);
+        select_retained_evaluation_groups(
+            &mut preprocessed_ignored,
+            &sampled_preprocessed,
+            DecommitStrategy::RecomputeQueriedLde,
+            rounded_bytes,
+            None,
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+        )
+        .unwrap();
+        assert_eq!(preprocessed_ignored[0].numerator_evaluation_groups, [false]);
     }
 
     fn memory_plan() -> ProofPlan {

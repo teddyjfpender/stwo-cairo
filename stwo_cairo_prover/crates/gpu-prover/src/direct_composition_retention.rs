@@ -803,6 +803,7 @@ mod tests {
                 .collect(),
             retained_evaluation_groups: Vec::new(),
             direct_composition_evaluation_groups: Vec::new(),
+            numerator_evaluation_groups: Vec::new(),
         }
     }
 
