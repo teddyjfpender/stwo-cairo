@@ -6,13 +6,16 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use cairo_air::claims::lookup_sum;
+use cairo_air::cairo_components::CairoComponents;
+use cairo_air::claims::{lookup_sum, CairoClaim, CairoInteractionClaim};
 use cairo_air::relations::CommonLookupElements;
 use cairo_air::verifier::INTERACTION_POW_BITS;
 use cairo_air::CairoProof;
 use num_traits::Zero;
 use stwo::core::channel::{Channel, MerkleChannel};
-use stwo::core::fields::qm31::SecureField;
+use stwo::core::circle::CirclePoint;
+use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
+use stwo::core::pcs::{CommitmentSchemeVerifier, TreeVec};
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::proof_of_work::GrindOps;
 use stwo::core::utils::MaybeOwned;
@@ -217,6 +220,101 @@ fn transcript_mirror_telemetry(
             .ok_or(ResidentRuntimeError::SizeOverflow)?,
         performance_admissible: false,
     })
+}
+
+fn require_composition_oods_consistency(
+    oods_point: CirclePoint<SecureField>,
+    max_log_degree_bound: u32,
+    sampled_values: &TreeVec<Vec<Vec<SecureField>>>,
+    evaluate_from_trace: impl FnOnce(&TreeVec<Vec<Vec<SecureField>>>) -> SecureField,
+) -> Result<(), GpuError> {
+    match stwo::core::proof::validate_composition_oods(
+        sampled_values,
+        oods_point,
+        max_log_degree_bound,
+        || evaluate_from_trace(sampled_values),
+    ) {
+        Ok(()) => Ok(()),
+        Err(stwo::core::proof::CompositionOodsValidationError::InvalidStructure) => Err(
+            GpuError::Config("malformed composition OODS opening".to_string()),
+        ),
+        Err(stwo::core::proof::CompositionOodsValidationError::Mismatch) => {
+            Err(GpuError::Proving(ProvingError::ConstraintsNotSatisfied))
+        }
+    }
+}
+
+fn validate_resident_composition_oods(
+    claim: &CairoClaim,
+    interaction_claim: &CairoInteractionClaim,
+    interaction_pow: u64,
+    proof: &stwo::core::proof::ExtendedStarkProof<Blake2sMerkleHasher>,
+    params: &ProverParameters,
+    lifting_log_size: u32,
+) -> Result<(), GpuError> {
+    let channel = &mut <Blake2sMerkleChannel as MerkleChannel>::C::default();
+    channel.mix_felts(&[params.channel_salt.into()]);
+    params.pcs_config.mix_into(channel);
+    let mut commitment_scheme =
+        CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(params.pcs_config);
+    let preprocessed_trace = params.preprocessed_trace.to_preprocessed_trace();
+    let mut log_sizes = claim.log_sizes();
+    log_sizes.insert(0, preprocessed_trace.log_sizes());
+    let stark_proof = &proof.proof.0;
+    let [preprocessed_root, base_root, interaction_root, composition_root] =
+        stark_proof.commitments.as_slice()
+    else {
+        return Err(GpuError::Config(
+            "malformed resident commitment root structure".to_string(),
+        ));
+    };
+    let [preprocessed_logs, base_logs, interaction_logs] = log_sizes.as_slice() else {
+        return Err(GpuError::Config(
+            "malformed resident trace log-size structure".to_string(),
+        ));
+    };
+    commitment_scheme.commit(*preprocessed_root, preprocessed_logs, channel);
+    claim.mix_into::<Blake2sMerkleChannel>(channel);
+    commitment_scheme.commit(*base_root, base_logs, channel);
+    channel.mix_u64(interaction_pow);
+    let interaction_elements = CommonLookupElements::draw(channel);
+    interaction_claim.mix_into(channel);
+    commitment_scheme.commit(*interaction_root, interaction_logs, channel);
+
+    let component_generator = CairoComponents::new(
+        claim,
+        &interaction_elements,
+        interaction_claim,
+        &preprocessed_trace.ids(),
+    );
+    let components = stwo::core::air::Components {
+        components: component_generator.components(),
+        n_preprocessed_columns: preprocessed_logs.len(),
+    };
+    let max_log_degree_bound = lifting_log_size
+        .checked_sub(params.pcs_config.fri_config.log_blowup_factor)
+        .ok_or(ProvingError::ConstraintsNotSatisfied)?;
+    let random_coefficient = channel.draw_secure_felt();
+    commitment_scheme.commit(
+        *composition_root,
+        &[max_log_degree_bound; 2 * SECURE_EXTENSION_DEGREE],
+        channel,
+    );
+    let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
+    require_composition_oods_consistency(
+        oods_point,
+        max_log_degree_bound,
+        &stark_proof.sampled_values,
+        |sampled_values| {
+            components.eval_composition_polynomial_at_point(
+                oods_point,
+                sampled_values,
+                random_coefficient,
+                max_log_degree_bound,
+            )
+        },
+    )?;
+    Ok(())
 }
 
 impl From<ProvingError> for GpuError {
@@ -1027,8 +1125,8 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
         self.last_aot_stats = None;
         aot::reset_runtime_stats();
 
-        let ((claim, bundle, shape, exec, transcript_mirror), session_telemetry) = self
-            .with_strict_resident_session(input, params, |runtime, artifacts| {
+        let ((claim, bundle, shape, lifting_log_size, exec, transcript_mirror), session_telemetry) =
+            self.with_strict_resident_session(input, params, |runtime, artifacts| {
                 runtime.require_prepared_witness_coverage()?;
                 runtime.capture_all_prepared_subgraphs()?;
                 let expected_graphs = u64::try_from(runtime.captured_graph_count())
@@ -1061,6 +1159,7 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
                     artifacts.claim.clone(),
                     bundle,
                     runtime.proof_assembly_shape().clone(),
+                    artifacts.discovery.lifting_log_size,
                     exec,
                     transcript_mirror,
                 ))
@@ -1080,6 +1179,14 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
             fri_commitments: bundle.fri_commitments,
             decommitment: bundle.decommitment,
         })?;
+        validate_resident_composition_oods(
+            &claim,
+            &interaction_claim,
+            bundle.interaction_pow,
+            &proof,
+            &params,
+            lifting_log_size,
+        )?;
 
         self.last_pcs_telemetry = Some(CudaPcsDriverTelemetry::completed_arena_graph(exec));
         self.last_resident_session_telemetry = Some(session_telemetry);
@@ -1123,6 +1230,33 @@ mod resident_transcript_mirror_tests {
             final_digest: Blake2sHash::default(),
             final_n_draws: 9,
         }
+    }
+
+    #[test]
+    fn composition_oods_consistency_rejects_corrupted_trace_or_composition_opening() {
+        let zero = SecureField::default();
+        let one = SecureField::from(1u32);
+        let point = CirclePoint { x: one, y: zero };
+        let mut sampled_values = TreeVec(vec![
+            vec![vec![zero]],
+            vec![vec![zero]; 2 * SECURE_EXTENSION_DEGREE],
+        ]);
+        require_composition_oods_consistency(point, 2, &sampled_values, |_| zero).unwrap();
+
+        assert!(matches!(
+            require_composition_oods_consistency(point, 2, &sampled_values, |_| one),
+            Err(GpuError::Proving(ProvingError::ConstraintsNotSatisfied))
+        ));
+        sampled_values.last_mut().unwrap()[0][0] = one;
+        assert!(matches!(
+            require_composition_oods_consistency(point, 2, &sampled_values, |_| zero),
+            Err(GpuError::Proving(ProvingError::ConstraintsNotSatisfied))
+        ));
+        sampled_values[1].pop();
+        assert!(matches!(
+            require_composition_oods_consistency(point, 2, &sampled_values, |_| zero),
+            Err(GpuError::Config(message)) if message == "malformed composition OODS opening"
+        ));
     }
 
     #[test]
