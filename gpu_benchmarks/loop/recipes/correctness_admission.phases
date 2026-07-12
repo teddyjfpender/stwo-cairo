@@ -1,0 +1,36 @@
+# Fail-fast hardware admission for the locally sealed progressive/direct/
+# numerator-retention line. One phase is intentional: any failed native oracle
+# stops before whole-proof smoke or performance work, and pod_run.sh's EXIT trap
+# stops the pod.
+correctness_admission() {
+  set -euo pipefail
+
+  cd "$STWO"
+  cargo test -p stwo-backend-cuda \
+    --test prepared_progressive_commit_native -- --nocapture --test-threads=1
+
+  cd "$CAIRO"
+  cargo test -p stwo-cairo-gpu-prover \
+    --features direct-retention-test-api \
+    --test prepared_composition_native -- --nocapture --test-threads=1
+
+  env \
+    STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE=1 \
+    STWO_CUDA_COMPOSITION_DIRECT_RETENTION=1 \
+    STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=1 \
+    cargo test -p stwo-cairo-gpu-prover \
+      --test resident_parity_native \
+      strict_resident_cold_and_warm_proofs_match_simd_bytes \
+      -- --exact --nocapture --test-threads=1
+
+  env \
+    STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE=1 \
+    STWO_CUDA_COMPOSITION_DIRECT_RETENTION=1 \
+    STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=1 \
+    cargo test -p stwo-cairo-gpu-prover \
+      --test resident_smoke \
+      smoke_single_resident_proof_boundary_stepped \
+      -- --exact --nocapture --test-threads=1
+}
+
+phase correctness_admission correctness_admission
