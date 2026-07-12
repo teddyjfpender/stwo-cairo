@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,9 +13,11 @@ from unittest import mock
 
 from run_cuda_soundness_gate import (
     QUALIFICATION_FLAGS,
+    REFERENCE_CACHE_SOURCE_ENV,
     STRICT_RESIDENT_GATE,
     STRICT_RESIDENT_REQUIRED_TESTS,
     gates_for_runtime_mode,
+    main as run_soundness_main,
     run_gate,
 )
 from validate_architecture_record import (
@@ -103,8 +106,8 @@ def valid_arena_graph_record() -> dict:
             "mhz": 11.4,
             "useful_mhz": 10.6,
             "gpu_host_syncs": 1,
-            "gpu_graph_launches": 8,
-            "gpu_kernel_launches": 72,
+            "gpu_graph_launches": 29,
+            "gpu_kernel_launches": 7_859,
             "gpu_hot_h2d_bytes": 0,
             "gpu_hot_d2h_bytes": 1024,
             "gpu_hot_allocations": 0,
@@ -175,6 +178,11 @@ def valid_soundness_artifact(runtime_mode: str = "detached-eager") -> dict:
         "execution_target": execution_target,
         "execution_target_sha256": target_sha,
         "execution_target_postcheck": True,
+        "synced_source": {
+            "stwo": {"head": "1" * 40, "worktree_hash": "3" * 64},
+            "stwo_cairo": {"head": "2" * 40, "worktree_hash": "4" * 64},
+            "transport": "rsync-archive-checksum",
+        },
         "source_projection": {
             "method": "rsync-archive-checksum-dry-run-clean",
             "verified_after_soundness": True,
@@ -378,12 +386,19 @@ class ArchitectureRecordTest(unittest.TestCase):
         self.assertTrue(any("performance_claim_admissible" in error for error in errors))
         self.assertTrue(any("useful_mhz" in error for error in errors))
 
-    def test_arena_graph_requires_one_sync_bounded_launches_and_no_hot_setup(self) -> None:
+    def test_arena_graph_requires_one_sync_exact_graphs_bounded_kernels_and_no_hot_setup(
+        self,
+    ) -> None:
         record = valid_arena_graph_record()
         self.assertEqual(validate_record(record, "arena-graph"), [])
-        record["gpu_kernel_launches"] = 100
+        record["gpu_graph_launches"] = 72
         self.assertTrue(validate_record(record, "arena-graph"))
-        record["gpu_kernel_launches"] = 72
+        record["gpu_graph_launches"] = 29
+        record["gpu_kernel_launches"] = 0
+        self.assertTrue(validate_record(record, "arena-graph"))
+        record["gpu_kernel_launches"] = 100_000
+        self.assertTrue(validate_record(record, "arena-graph"))
+        record["gpu_kernel_launches"] = 7_859
         record["gpu_host_syncs"] = 0
         self.assertTrue(validate_record(record, "arena-graph"))
         record["gpu_host_syncs"] = 1
@@ -473,6 +488,27 @@ class ArchitectureRecordTest(unittest.TestCase):
                 mutate(artifact)
                 self.assertTrue(validate_soundness_gate(artifact))
 
+    def test_bench_loop_verifies_source_projection_after_sync_and_soundness(self) -> None:
+        script = (Path(__file__).parent / "loop/bench_loop.sh").read_text(
+            encoding="utf-8"
+        )
+        orchestration = script.split("# Orchestration", 1)[1]
+        self.assertLess(
+            orchestration.index("sync_repos"),
+            orchestration.index("verify_remote_source_projection"),
+        )
+        self.assertLess(
+            orchestration.index("verify_remote_source_projection"),
+            orchestration.index("build_pod"),
+        )
+        soundness = script.split("run_cuda_soundness_gate() {", 1)[1].split(
+            "# Synthetic run output", 1
+        )[0]
+        self.assertLess(
+            soundness.index("verify_remote_source_projection"),
+            soundness.index('seal_source_projection "$LOCAL_SOUNDNESS_GATE"'),
+        )
+
     def test_soundness_gate_rejects_truncated_or_forged_manifest(self) -> None:
         artifact = valid_soundness_artifact()
         artifact["gates"].pop()
@@ -484,6 +520,13 @@ class ArchitectureRecordTest(unittest.TestCase):
         ]
         artifact["gates"][-1]["command"] = ["true"]
         self.assertTrue(validate_soundness_gate(artifact))
+
+        reordered = valid_soundness_artifact("arena-graph")
+        reordered["gates"][-2], reordered["gates"][-1] = (
+            reordered["gates"][-1],
+            reordered["gates"][-2],
+        )
+        self.assertTrue(validate_soundness_gate(reordered, "arena-graph"))
 
     def test_soundness_manifest_is_scoped_to_the_requested_runtime(self) -> None:
         detached = valid_soundness_artifact("detached-eager")
@@ -585,6 +628,18 @@ class ArchitectureRecordTest(unittest.TestCase):
 
     def test_soundness_manifest_covers_cfg_native_targets_with_exact_counts(self) -> None:
         stwo, stwo_cairo = source_roots()
+        arena_gates = gates_for_runtime_mode("arena-graph")
+        self.assertEqual(len(arena_gates), 24)
+        self.assertEqual(sum(required for _name, _command, required in arena_gates), 44)
+        self.assertEqual(
+            [name for name, _command, _required in arena_gates[-4:]],
+            [
+                "prepared_final_fri_and_pow_eager_capture_reference",
+                "prepared_decommit_eager_capture_reference",
+                "device_transcript_eager_capture_reference",
+                STRICT_RESIDENT_GATE,
+            ],
+        )
         test_roots = (
             (stwo / "crates/backend-cuda/tests", "stwo-backend-cuda"),
             (
@@ -603,6 +658,13 @@ class ArchitectureRecordTest(unittest.TestCase):
             for path in root.glob("*_native.rs"):
                 source = path.read_text(encoding="utf-8")
                 if "#![cfg(stwo_cuda_link)]" in source:
+                    self.assertIsNone(
+                        re.search(
+                            r'(?m)^#\[ignore(?:\s*=\s*"[^"]*"|\([^]]*\))?\]\s*$',
+                            source,
+                        ),
+                        f"manifested native test is ignored: {path}",
+                    )
                     discovered[(package, path.stem)] = len(
                         re.findall(r"(?m)^#\[test\]\s*$", source)
                     )
@@ -822,6 +884,185 @@ class PrePodValidationTest(unittest.TestCase):
                         expected_dry_run=False,
                     )
                 )
+
+    def test_unsealed_runner_rejects_synced_identity_before_cache_environment(self) -> None:
+        source = qualification_source()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stwo = root / "stwo"
+            stwo_cairo = root / "stwo-cairo"
+            (stwo / "Cargo.toml").parent.mkdir(parents=True)
+            (stwo / "Cargo.toml").touch()
+            cairo_manifest = stwo_cairo / "stwo_cairo_prover/Cargo.toml"
+            cairo_manifest.parent.mkdir(parents=True)
+            cairo_manifest.touch()
+
+            def fake_git(command, **kwargs):
+                text_mode = kwargs.get("text", False)
+                if tuple(command[1:3]) == ("rev-parse", "HEAD"):
+                    stdout = source[
+                        "stwo_cairo" if kwargs.get("cwd") == stwo_cairo else "stwo"
+                    ]["head"]
+                else:
+                    stdout = "" if text_mode else b""
+                return subprocess.CompletedProcess(command, 0, stdout, None)
+
+            argv = [
+                "run_cuda_soundness_gate.py",
+                "--stwo",
+                str(stwo),
+                "--stwo-cairo",
+                str(stwo_cairo),
+                "--synced-stwo-head",
+                source["stwo"]["head"],
+                "--synced-stwo-worktree-hash",
+                source["stwo"]["worktree_hash"],
+                "--synced-stwo-cairo-head",
+                source["stwo_cairo"]["head"],
+                "--synced-stwo-cairo-worktree-hash",
+                source["stwo_cairo"]["worktree_hash"],
+                "--output",
+                str(root / "soundness.json"),
+            ]
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+                "run_cuda_soundness_gate.subprocess.run", side_effect=fake_git
+            ), mock.patch("sys.argv", argv):
+                with self.assertRaisesRegex(
+                    SystemExit, "synced source identity is valid only for sealed execution"
+                ):
+                    run_soundness_main()
+                self.assertTrue(
+                    all(key not in os.environ for key in REFERENCE_CACHE_SOURCE_ENV)
+                )
+
+    def test_sealed_nogit_projection_binds_final_soundness_identity(self) -> None:
+        source = qualification_source()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stwo = root / "stwo"
+            stwo_cairo = root / "stwo-cairo"
+            (stwo / "Cargo.toml").parent.mkdir(parents=True)
+            (stwo / "Cargo.toml").touch()
+            cairo_manifest = stwo_cairo / "stwo_cairo_prover/Cargo.toml"
+            cairo_manifest.parent.mkdir(parents=True)
+            cairo_manifest.touch()
+            strict_source = (
+                cairo_manifest.parent
+                / "crates/gpu-prover/tests/resident_parity_native.rs"
+            )
+            strict_source.parent.mkdir(parents=True)
+            strict_source.write_text(
+                'const STRICT_RESIDENT_FIXTURE: &str = "SN_PIE_2.zip";\n',
+                encoding="utf-8",
+            )
+
+            binary_contents = b"sealed binary"
+            binary_sha = hashlib.sha256(binary_contents).hexdigest()
+            gpu_bench = root / f"sealed/gpu_bench.{binary_sha}"
+            gpu_bench.parent.mkdir()
+            gpu_bench.write_bytes(binary_contents)
+            gate_input = root / "SN_PIE_2.zip"
+            gate_input.write_bytes(b"input")
+            output = root / "soundness.json"
+
+            expected_by_target = {
+                command[command.index("--test") + 1]: required
+                for _name, command, required in gates_for_runtime_mode("arena-graph")
+            }
+
+            def fake_run(command, **kwargs):
+                if command[0] == "nvidia-smi":
+                    value = (
+                        "GPU-00000000-0000-4000-8000-000000000001\n"
+                        if command[1] == "--query-gpu=uuid"
+                        else "NVIDIA H100 80GB HBM3\n"
+                    )
+                    return subprocess.CompletedProcess(command, 0, value, "")
+                if command[0] == "git":
+                    stdout = "" if kwargs.get("text") else b""
+                    return subprocess.CompletedProcess(command, 128, stdout, None)
+                target = command[command.index("--test") + 1]
+                required = expected_by_target[target]
+                lines = []
+                if target == "resident_parity_native":
+                    lines.extend(
+                        f"test {name} ... ok"
+                        for name in STRICT_RESIDENT_REQUIRED_TESTS
+                    )
+                lines.append(f"test result: ok. {required} passed;")
+                return subprocess.CompletedProcess(command, 0, "\n".join(lines), None)
+
+            environment = {
+                "STWO_CUDA_OBJ_CACHE": "/workspace/.cuda_obj_cache",
+                "STWO_PARITY_REF_CACHE": "/workspace/.parity_ref_cache",
+                RETAINED_BUDGET_FLAG: "29469326848",
+                **{flag: "1" for flag in QUALIFICATION_FLAGS},
+            }
+            argv = [
+                "run_cuda_soundness_gate.py",
+                "--stwo",
+                str(stwo),
+                "--stwo-cairo",
+                str(stwo_cairo),
+                "--runtime-mode",
+                "arena-graph",
+                "--synced-stwo-head",
+                source["stwo"]["head"],
+                "--synced-stwo-worktree-hash",
+                source["stwo"]["worktree_hash"],
+                "--synced-stwo-cairo-head",
+                source["stwo_cairo"]["head"],
+                "--synced-stwo-cairo-worktree-hash",
+                source["stwo_cairo"]["worktree_hash"],
+                "--pod-id",
+                "pod-id",
+                "--gpu-bench",
+                str(gpu_bench),
+                "--input-artifact",
+                f"gate={gate_input}",
+                "--output",
+                str(output),
+            ]
+            real_read_text = Path.read_text
+
+            def read_text(path, *args, **kwargs):
+                if str(path) == "/proc/sys/kernel/random/boot_id":
+                    return "00000000-0000-4000-8000-000000000001\n"
+                return real_read_text(path, *args, **kwargs)
+
+            with mock.patch.dict(os.environ, environment, clear=True), mock.patch(
+                "run_cuda_soundness_gate.subprocess.run", side_effect=fake_run
+            ), mock.patch("pathlib.Path.read_text", read_text), mock.patch(
+                "sys.argv", argv
+            ), mock.patch("builtins.print"):
+                self.assertEqual(run_soundness_main(), 0)
+
+            artifact = json.loads(output.read_text(encoding="utf-8"))
+            artifact["source_projection"] = {
+                "method": "rsync-archive-checksum-dry-run-clean",
+                "verified_after_soundness": True,
+                "source": source,
+            }
+            self.assertEqual(
+                validate_qualification_soundness_gate(
+                    artifact, expected_source=source, expected_dry_run=False
+                ),
+                [],
+            )
+            for field in (
+                "stwo_git_head",
+                "stwo_worktree_hash",
+                "stwo_cairo_git_head",
+                "stwo_cairo_worktree_hash",
+            ):
+                with self.subTest(field=field):
+                    candidate = copy.deepcopy(artifact)
+                    candidate[field] = "f" * len(candidate[field])
+                    self.assertTrue(
+                        validate_qualification_soundness_gate(
+                            candidate, expected_source=source, expected_dry_run=False
+                        )
+                    )
 
     def test_accepts_soundness_only_cli(self) -> None:
         artifact = valid_qualification_soundness_artifact()

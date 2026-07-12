@@ -985,8 +985,8 @@ artifact = {
     "stwo_git_dirty": False,
     "stwo_cairo_git_head": os.environ["STWO_CAIRO_HEAD"],
     "stwo_cairo_git_dirty": False,
-    "stwo_worktree_hash": "0" * 64,
-    "stwo_cairo_worktree_hash": "0" * 64,
+    "stwo_worktree_hash": os.environ["STWO_HASH"],
+    "stwo_cairo_worktree_hash": os.environ["STWO_CAIRO_HASH"],
     "synced_source": {
         "stwo": {
             "head": ("f" * 40 if os.environ.get("FAKE_SOUNDNESS_HEAD_MISMATCH") == "1" else os.environ["STWO_HEAD"]),
@@ -1145,7 +1145,7 @@ synth_out() {
     local runtime_report="DetachedEager"
     [[ "$GPU_PCS_RUNTIME_MODE" == "arena-graph" ]] && runtime_report="ArenaGraph"
     local stage_counts='{"OodsEvaluation":1,"QuotientAndCompaction":1,"FriCommitAndFold":1,"ProofOfWork":1,"FriQueryAndDecommit":1,"TreeDecommit":1,"Assembly":1}'
-    architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"performance_claim_admissible":true,"gpu_host_syncs":1,"gpu_graph_launches":8,"gpu_kernel_launches":72,"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25,"gpu_graph_a_setup_gate_passed":true,"gpu_setup_base_migration_copies":0,"gpu_setup_lookup_host_copies":0,"gpu_setup_legacy_witness_fallbacks":0,"gpu_execution_tables_ingest_compact_h2d_bytes":4096,"gpu_execution_tables_ingest_compact_h2d_copies":3,"gpu_execution_tables_ingest_descriptor_h2d_bytes":64,"gpu_execution_tables_ingest_descriptor_h2d_copies":2,"gpu_execution_tables_ingest_syncs":1,"gpu_witness_ingest_syncs":1'
+    architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"performance_claim_admissible":true,"gpu_host_syncs":1,"gpu_graph_launches":29,"gpu_kernel_launches":7859,"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25,"gpu_graph_a_setup_gate_passed":true,"gpu_setup_base_migration_copies":0,"gpu_setup_lookup_host_copies":0,"gpu_setup_legacy_witness_fallbacks":0,"gpu_execution_tables_ingest_compact_h2d_bytes":4096,"gpu_execution_tables_ingest_compact_h2d_copies":3,"gpu_execution_tables_ingest_descriptor_h2d_bytes":64,"gpu_execution_tables_ingest_descriptor_h2d_copies":2,"gpu_execution_tables_ingest_syncs":1,"gpu_witness_ingest_syncs":1'
   fi
   local seed=$(( $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 40 ))
   local um um_median mhz_median warm_s warm_rounded raw_samples program
@@ -1574,6 +1574,8 @@ if [[ "$SKIP_SYNC" == "1" ]]; then
   log "--skip-sync: reusing the binary already on the pod (no repo sync, no build)"
 else
   sync_repos
+  verify_remote_source_projection \
+    || die "remote source does not equal the checksum-synced local source"
   build_pod
   seal_gpu_bench
 fi

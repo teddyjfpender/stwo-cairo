@@ -190,7 +190,11 @@ fn strict_resident_cold_and_warm_proofs_match_simd_bytes() {
 
     let telemetry = prover.last_pcs_telemetry().unwrap();
     assert!(telemetry.is_complete());
-    assert!(telemetry.exec.is_some());
+    let exec = telemetry
+        .exec
+        .expect("strict whole-proof execution telemetry");
+    assert_eq!(exec.graph_launches, 29);
+    assert_eq!(exec.kernel_launches, 7_859);
 }
 
 /// Same workspace geometry with different compact memory content must rebuild

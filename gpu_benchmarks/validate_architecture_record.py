@@ -453,6 +453,12 @@ def validate_soundness_gate(
     gates = artifact.get("gates")
     if not isinstance(gates, list) or not gates:
         return errors + ["soundness artifact has no executed gates"]
+    expected_order = [name for name, _command, _required in expected_manifest]
+    actual_order = [
+        gate.get("name") if isinstance(gate, dict) else None for gate in gates
+    ]
+    if actual_order != expected_order:
+        errors.append("soundness artifact gate order does not match manifest")
     for field in ("stwo_git_head", "stwo_cairo_git_head"):
         value = artifact.get(field)
         if not isinstance(value, str) or len(value) != 40:
@@ -463,6 +469,35 @@ def validate_soundness_gate(
             errors.append(f"soundness artifact {field}: expected a 64-character source hash")
     if schema == "stwo.cuda.soundness-gate.v3":
         errors.extend(_validate_remote_execution_target(artifact))
+        synced = artifact.get("synced_source")
+        if (
+            not isinstance(synced, dict)
+            or set(synced) != {"stwo", "stwo_cairo", "transport"}
+            or synced.get("transport") != "rsync-archive-checksum"
+            or not _valid_source_identity(
+                {key: synced.get(key) for key in ("stwo", "stwo_cairo")}
+            )
+        ):
+            errors.append("soundness artifact: invalid synced source identity")
+        else:
+            source = {key: synced[key] for key in ("stwo", "stwo_cairo")}
+            projection = artifact.get("source_projection") or {}
+            if projection.get("source") != source:
+                errors.append("soundness artifact: projection disagrees with synced source")
+            if any(
+                artifact.get(field) != source[repo][key]
+                for field, repo, key in (
+                    ("stwo_git_head", "stwo", "head"),
+                    ("stwo_worktree_hash", "stwo", "worktree_hash"),
+                    ("stwo_cairo_git_head", "stwo_cairo", "head"),
+                    (
+                        "stwo_cairo_worktree_hash",
+                        "stwo_cairo",
+                        "worktree_hash",
+                    ),
+                )
+            ):
+                errors.append("soundness artifact: top-level source identity mismatch")
     names: set[str] = set()
     for index, gate in enumerate(gates):
         if not isinstance(gate, dict):
@@ -734,14 +769,25 @@ def validate_record(record: dict[str, Any], required_mode: str) -> list[str]:
                 "gpu_execution_tables_ingest_syncs: "
                 f"expected integer 1, got {execution_table_syncs!r}"
             )
-        for field in ("gpu_graph_launches", "gpu_kernel_launches"):
-            value = record.get(field)
-            if (
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or not 1 <= value < 100
-            ):
-                errors.append(f"{field}: expected integer in [1, 100), got {value!r}")
+        graph_launches = record.get("gpu_graph_launches")
+        if (
+            not isinstance(graph_launches, int)
+            or isinstance(graph_launches, bool)
+            or graph_launches != 29
+        ):
+            errors.append(
+                f"gpu_graph_launches: expected integer 29, got {graph_launches!r}"
+            )
+        kernel_launches = record.get("gpu_kernel_launches")
+        if (
+            not isinstance(kernel_launches, int)
+            or isinstance(kernel_launches, bool)
+            or not 29 <= kernel_launches < 100_000
+        ):
+            errors.append(
+                "gpu_kernel_launches: expected integer in [29, 100000), "
+                f"got {kernel_launches!r}"
+            )
         d2h = record.get("gpu_hot_d2h_bytes")
         if not isinstance(d2h, int) or isinstance(d2h, bool) or d2h <= 0:
             errors.append(f"gpu_hot_d2h_bytes: expected one positive final bundle, got {d2h!r}")

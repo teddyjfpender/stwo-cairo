@@ -152,7 +152,8 @@ GATES = (
             "--test",
             "prepared_interpolation_native",
         ),
-        # Logs 1..30, mixed aliased/distinct columns, eager/capture/mutation.
+        # Supported logs 3..30, mixed aliased/distinct columns, both launch
+        # modes, eager/capture/mutation.
         1,
     ),
     (
@@ -272,20 +273,6 @@ GATES = (
         3,
     ),
     (
-        "strict_resident_whole_proof_simd_byte_identity",
-        (
-            "cargo",
-            "test",
-            "--manifest-path",
-            "../stwo-cairo/stwo_cairo_prover/Cargo.toml",
-            "-p",
-            "stwo-cairo-gpu-prover",
-            "--test",
-            "resident_parity_native",
-        ),
-        len(STRICT_RESIDENT_REQUIRED_TESTS),
-    ),
-    (
         "prepared_final_fri_and_pow_eager_capture_reference",
         (
             "cargo",
@@ -320,6 +307,20 @@ GATES = (
             "device_transcript_native",
         ),
         1,
+    ),
+    (
+        "strict_resident_whole_proof_simd_byte_identity",
+        (
+            "cargo",
+            "test",
+            "--manifest-path",
+            "../stwo-cairo/stwo_cairo_prover/Cargo.toml",
+            "-p",
+            "stwo-cairo-gpu-prover",
+            "--test",
+            "resident_parity_native",
+        ),
+        len(STRICT_RESIDENT_REQUIRED_TESTS),
     ),
 )
 
@@ -561,6 +562,10 @@ def main() -> int:
     )
     if any(synced_values) and not all(synced_values):
         raise SystemExit("synced source identity requires both heads and both worktree hashes")
+    if all(synced_values) and not sealed_mode:
+        raise SystemExit("synced source identity is valid only for sealed execution")
+    if sealed_mode and not all(synced_values):
+        raise SystemExit("sealed execution requires a complete synced source identity")
     inherited_source_env = {
         key: os.environ[key] for key in REFERENCE_CACHE_SOURCE_ENV if key in os.environ
     }
@@ -574,6 +579,15 @@ def main() -> int:
         os.environ.update(source_env)
     elif inherited_source_env:
         raise SystemExit("reference-cache source identity requires runner-validated synced source")
+
+    # Sealed pod trees are checksum projections with .git deliberately excluded.
+    # Their controller-supplied identity is bound again by the post-soundness
+    # rsync projection check before this artifact is admitted.
+    if sealed_mode and all(synced_values):
+        stwo_head = args.synced_stwo_head
+        stwo_worktree_hash = args.synced_stwo_worktree_hash
+        stwo_cairo_head = args.synced_stwo_cairo_head
+        stwo_cairo_worktree_hash = args.synced_stwo_cairo_worktree_hash
 
     artifact = {
         "schema": (

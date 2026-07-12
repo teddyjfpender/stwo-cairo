@@ -391,10 +391,7 @@ fn report_section_offsets(proof: &cairo_air::CairoProof<Blake2sMerkleHasher>) {
 /// Debug dump of both felt vectors: first divergent index, a hex window
 /// around it, per-stream lengths, and (when STWO_SMOKE_DIVERGENCE_DIR is set)
 /// both streams dumped as raw 32-byte big-endian felts for offline diffing.
-fn report_divergence(
-    expected: &[starknet_ff::FieldElement],
-    actual: &[starknet_ff::FieldElement],
-) {
+fn report_divergence(expected: &[starknet_ff::FieldElement], actual: &[starknet_ff::FieldElement]) {
     let hex = |felt: &starknet_ff::FieldElement| {
         felt.to_bytes_be()
             .iter()
@@ -432,8 +429,7 @@ fn report_divergence(
          (plus {} length-tail positions)",
         expected.len().abs_diff(actual.len())
     );
-    if let Some(dir) = std::env::var_os("STWO_SMOKE_DIVERGENCE_DIR").map(std::path::PathBuf::from)
-    {
+    if let Some(dir) = std::env::var_os("STWO_SMOKE_DIVERGENCE_DIR").map(std::path::PathBuf::from) {
         let _ = std::fs::create_dir_all(&dir);
         for (name, felts) in [("expected_simd", expected), ("actual_resident", actual)] {
             let mut bytes = Vec::with_capacity(felts.len() * 32);

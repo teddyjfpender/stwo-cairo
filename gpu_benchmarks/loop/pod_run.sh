@@ -215,7 +215,7 @@ pssh "set -e
   mkdir -p \"\$RUSTUP_HOME\" \"\$CARGO_HOME\"
   command -v rsync >/dev/null 2>&1 || { apt-get update -qq >/dev/null && apt-get install -y -qq rsync >/dev/null; }
   if [ ! -x \"\$CARGO_HOME/bin/rustup\" ]; then
-    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none >/dev/null
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none >/dev/null
   fi" || { note "BOOTSTRAP FAILED"; exit 1; }
 
 # --- 3. rsync both repos (bench_loop-identical excludes) ---
@@ -285,10 +285,10 @@ phase() {
 }
 PROLOGUE
   cat "$PHASES_FILE"
+  # shellcheck disable=SC2016 # $RUN expands in the generated pod-side script.
   echo 'echo done > "$RUN/session.done"'
 } | pssh "mkdir -p '$RUN' && cat > '$RUN/session.sh'" \
   || { note "UPLOAD FAILED"; exit 1; }
-# shellcheck disable=SC2016
 pssh "cd '$RUN' && rm -rf divergence *.log *.rc *.secs session.done && nohup setsid -f bash '$RUN/session.sh' </dev/null > session.out 2>&1 && echo LAUNCHED" \
   || { note "LAUNCH FAILED"; exit 1; }
 
