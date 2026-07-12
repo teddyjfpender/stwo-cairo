@@ -10154,6 +10154,60 @@ mod tests {
         ));
         let direct_arena = ProofArenaPlan::build(&proof, &direct_protocol, &composition).unwrap();
         direct_arena.validate_aliases().unwrap();
+
+        let mut combined_protocol = direct_protocol.clone();
+        combined_protocol.identity.quotient_numerator_source_policy =
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations;
+        let combined_composition = combined_protocol
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == CommitmentTreeId::Composition)
+            .unwrap();
+        combined_composition.numerator_evaluation_groups[0] = true;
+        combined_protocol
+            .identity
+            .numerator_evaluation_group_rounded_bytes =
+            commitment_group_evaluation_bytes(combined_composition, 0).unwrap();
+        assert_eq!(
+            combined_protocol.transcript, protocol.transcript,
+            "retention policies must not move a Fiat-Shamir boundary"
+        );
+        combined_protocol.validate().unwrap();
+        let combined_arena =
+            ProofArenaPlan::build(&proof, &combined_protocol, &composition).unwrap();
+        combined_arena.validate_aliases().unwrap();
+        assert_eq!(
+            combined_arena
+                .composition()
+                .requirements
+                .direct_retention_plan_key,
+            Some(direct_plan.cache_key),
+            "normalized composition requirements must rebound the exact direct plan"
+        );
+        let combined_commitment = combined_arena
+            .commitment(CommitmentTreeId::Composition)
+            .unwrap();
+        assert_eq!(
+            combined_commitment.numerator_evaluation_groups[0],
+            combined_commitment.evaluation_output_groups[0]
+        );
+        for binding in combined_commitment.numerator_evaluation_groups[0]
+            .as_ref()
+            .unwrap()
+        {
+            assert_eq!(
+                combined_arena.logical_buffers()[binding.logical.0 as usize]
+                    .lifetime
+                    .last,
+                ProofEpoch::Decommit,
+                "hybrid decommit plus numerator union must retain through decommit"
+            );
+        }
+        assert_eq!(
+            combined_protocol.identity.retained_evaluation_union_bytes,
+            direct_protocol.identity.retained_evaluation_union_bytes,
+            "adding numerator intent to an already-retained group must not double-count the union"
+        );
         assert_eq!(
             direct_arena.composition().direct_retention.as_ref(),
             Some(&direct_plan),

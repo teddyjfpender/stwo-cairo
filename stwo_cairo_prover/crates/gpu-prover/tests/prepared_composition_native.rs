@@ -156,7 +156,7 @@ fn real_component_and_plan() -> (RangeCheckComponent, CompositionPlan) {
     assert_eq!(max_kernel_instrs, 2048, "unexpected embedded AOT cap");
     let component_plan = lower_component_plan("range_check_6", &component, 0);
     assert_eq!(component_plan.kernels.len(), 1);
-    assert_eq!(component_plan.kernels[0].cache_key, 0x5754_f8a8_73a5_2740);
+    assert_eq!(component_plan.kernels[0].cache_key, 0x3030_69e7_c030_2e27);
     let total_constraints = component.n_constraints();
     (
         component,

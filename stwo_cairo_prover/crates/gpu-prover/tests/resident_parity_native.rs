@@ -6,9 +6,11 @@
 
 #![cfg(stwo_cuda_link)]
 
+use cairo_air::verifier::verify_cairo;
+use cairo_air::CairoProof;
 use cairo_vm::types::layout_name::LayoutName;
 use stwo::core::pcs::PcsConfig;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
 use stwo::prover::backend::simd::SimdBackend;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
@@ -49,6 +51,20 @@ fn resident_params() -> ProverParameters {
         include_all_preprocessed_columns: false,
         opt_n_id_to_big_components: None,
     }
+}
+
+fn verify_and_roots(
+    proof: &CairoProof<Blake2sMerkleHasher>,
+) -> Vec<stwo::core::vcs::blake2_hash::Blake2sHash> {
+    verify_cairo::<Blake2sMerkleChannel>(proof.clone().into())
+        .expect("resident proof verification");
+    let roots = proof.extended_stark_proof.proof.0.commitments.0.clone();
+    assert_eq!(
+        roots.len(),
+        4,
+        "resident proof must carry four commitment roots"
+    );
+    roots
 }
 
 fn assert_capture_safe_fixture(input: &ProverInput, params: ProverParameters) {
@@ -150,6 +166,9 @@ fn strict_resident_cold_and_warm_proofs_match_simd_bytes() {
     let warm = prover
         .prove_resident_blake2s(resident_input(), params)
         .unwrap();
+    let cold_roots = verify_and_roots(&cold);
+    let warm_roots = verify_and_roots(&warm);
+    assert_eq!(cold_roots, warm_roots, "cold/warm commitment roots drifted");
 
     let expected = cached_reference_felts(
         STRICT_RESIDENT_FIXTURE,
@@ -207,6 +226,12 @@ fn strict_resident_same_shape_changed_memory_matches_second_simd_proof() {
     let resident_second = prover
         .prove_resident_blake2s(second.clone(), params)
         .unwrap();
+    let first_roots = verify_and_roots(&resident_first);
+    let second_roots = verify_and_roots(&resident_second);
+    assert_ne!(
+        first_roots, second_roots,
+        "mutated statement did not change the four commitment roots"
+    );
 
     let expected_first = cached_reference_felts(
         STRICT_RESIDENT_FIXTURE,

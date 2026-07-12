@@ -1548,6 +1548,119 @@ mod tests {
         vec![preprocessed, grouped_base(column_count)]
     }
 
+    fn sampled_base_oods(ordinal: u32) -> OodsGeometry {
+        let offset = stwo::core::poly::circle::CanonicCoset::new(4).step();
+        let mut oods = empty_oods();
+        oods.columns = vec![OodsColumnGeometry {
+            source: OpenedColumnSource::Trace {
+                component: "test",
+                part: TracePartId::Main,
+                purpose: BufferPurpose::BaseCoefficients,
+                ordinal,
+            },
+            coefficient_log_size: 4,
+            evaluation_log_size: 5,
+            shape_points: vec![
+                stwo::core::circle::SECURE_FIELD_CIRCLE_GEN
+                    + offset.into_ef::<stwo::core::fields::qm31::SecureField>(),
+            ],
+            offset_points: vec![offset],
+        }];
+        oods
+    }
+
+    #[test]
+    fn mixed_logs_and_blowup_flow_from_oods_planner_to_prepared_requirements() {
+        let point = stwo::core::circle::SECURE_FIELD_CIRCLE_GEN;
+        let offset = stwo::core::circle::CirclePoint {
+            x: stwo::core::fields::m31::BaseField::from(1),
+            y: stwo::core::fields::m31::BaseField::from(0),
+        };
+        let logs_by_tree = [vec![3, 5], vec![4], vec![2], vec![5; 8]];
+        let mut columns = Vec::new();
+        for (tree, logs) in logs_by_tree.iter().enumerate() {
+            for (column, &coefficient_log_size) in logs.iter().enumerate() {
+                columns.push(DiscoveredOodsColumn {
+                    tree,
+                    column,
+                    coefficient_log_size,
+                    shape_points: vec![point],
+                    offset_points: vec![offset],
+                });
+            }
+        }
+        let trace_column = |purpose, ordinal, log_size| TraceCommitmentColumn {
+            source: CommitmentColumnSource::Trace {
+                component: "test",
+                part: TracePartId::Main,
+                purpose,
+                ordinal,
+            },
+            log_size,
+        };
+        for blowup in [1, 2, 3] {
+            let discovery = ProtocolTranscriptDiscovery {
+                interaction_claim_felts: 1,
+                oods_sampled_value_felts: columns.len(),
+                sampled_value_felts_by_tree: logs_by_tree.iter().map(Vec::len).collect(),
+                partial_numerator_log_sizes: vec![5],
+                oods_topology: DiscoveredOodsTopology {
+                    tree_column_counts: logs_by_tree.iter().map(Vec::len).collect(),
+                    columns: columns.clone(),
+                },
+                lifting_log_size: 5 + blowup,
+                max_log_degree_bound: 5,
+            };
+            let oods = plan_oods_geometry(
+                &discovery,
+                &logs_by_tree[0],
+                &[trace_column(BufferPurpose::BaseCoefficients, 0, 4)],
+                &[trace_column(BufferPurpose::InteractionCoefficients, 0, 2)],
+                5,
+                blowup,
+            )
+            .unwrap();
+            assert_eq!(
+                oods.columns
+                    .iter()
+                    .map(|column| (column.coefficient_log_size, column.evaluation_log_size))
+                    .collect::<Vec<_>>(),
+                logs_by_tree
+                    .iter()
+                    .flatten()
+                    .map(|&log| (log, log + blowup))
+                    .collect::<Vec<_>>()
+            );
+            let requirements = stwo_backend_cuda::oods_workspace_requirements(
+                stwo_backend_cuda::OodsWorkspaceConfig {
+                    lifting_log_size: 5 + blowup,
+                    mask_log_size: 5,
+                },
+                &oods.column_topologies(),
+            )
+            .unwrap();
+            assert_eq!(requirements.sample_count, oods.sample_count());
+            assert_eq!(requirements.sampled_value_words, oods.sample_count() * 4);
+            assert_eq!(requirements.fold_count_words, oods.sample_count());
+            assert!(requirements
+                .evaluation_groups
+                .iter()
+                .all(|group| group.offset_point == offset));
+            assert_eq!(
+                requirements
+                    .column_ranges
+                    .iter()
+                    .map(|range| (range.source_log_size, range.evaluation_log_size))
+                    .collect::<Vec<_>>(),
+                logs_by_tree
+                    .iter()
+                    .flatten()
+                    .map(|&log| (log, log + blowup))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn direct_group_closure_rounds_15_16_17_and_shares_budget_by_intent() {
         for count in [15usize, 16, 17] {
@@ -1731,6 +1844,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(preprocessed_ignored[0].numerator_evaluation_groups, [false]);
+    }
+
+    #[test]
+    fn combined_direct_numerator_and_hybrid_retention_has_exact_union_and_lifetime() {
+        let mut commitments = retention_fixture(17);
+        let oods = sampled_base_oods(0);
+        let direct = direct_plan(CommitmentTreeId::Base, 0, 0);
+        let group_words = (1usize << 5) * core::mem::size_of::<u32>();
+        let budget = 17 * group_words;
+        let selected = select_retained_evaluation_groups(
+            &mut commitments,
+            &oods,
+            DecommitStrategy::HybridByGroup,
+            budget,
+            Some(&direct),
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+        )
+        .unwrap();
+
+        assert_eq!(
+            commitments[1].direct_composition_evaluation_groups,
+            [true, false]
+        );
+        assert_eq!(commitments[1].numerator_evaluation_groups, [true, false]);
+        assert_eq!(commitments[1].retained_evaluation_groups, [true, true]);
+        assert_eq!(selected.direct_group_rounded_bytes, 16 * group_words);
+        assert_eq!(selected.numerator_group_rounded_bytes, 16 * group_words);
+        assert_eq!(selected.union_group_rounded_bytes, budget);
+        assert_eq!(direct.columns[0].lifetime.first, ProofEpoch::BaseCommit);
+        assert_eq!(direct.columns[0].lifetime.last, ProofEpoch::Composition);
+    }
+
+    #[test]
+    fn malformed_direct_and_numerator_union_bindings_fail_closed() {
+        let budget = 16 * (1usize << 5) * core::mem::size_of::<u32>();
+
+        let mut bad_direct = direct_plan(CommitmentTreeId::Base, 0, 0);
+        bad_direct.bindings[0].column = bad_direct.columns.len();
+        assert_eq!(
+            select_retained_evaluation_groups(
+                &mut retention_fixture(17),
+                &sampled_base_oods(0),
+                DecommitStrategy::RecomputeQueriedLde,
+                budget,
+                Some(&bad_direct),
+                QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+            ),
+            Err(ProtocolPlanError::DirectRetention(
+                DirectCompositionRetentionError::PlanDrift
+            ))
+        );
+
+        assert_eq!(
+            select_retained_evaluation_groups(
+                &mut retention_fixture(17),
+                &sampled_base_oods(99),
+                DecommitStrategy::RecomputeQueriedLde,
+                budget,
+                None,
+                QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+            ),
+            Err(ProtocolPlanError::NumeratorRetention(
+                "source is absent from its commitment"
+            ))
+        );
+
+        let mut ambiguous = retention_fixture(17);
+        let source = ambiguous[1].grouped_column_sources[0][0];
+        ambiguous[1].grouped_column_sources[1][0] = source;
+        assert_eq!(
+            select_retained_evaluation_groups(
+                &mut ambiguous,
+                &sampled_base_oods(0),
+                DecommitStrategy::RecomputeQueriedLde,
+                budget,
+                None,
+                QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+            ),
+            Err(ProtocolPlanError::NumeratorRetention(
+                "source mapping is ambiguous or has the wrong log"
+            ))
+        );
     }
 
     fn memory_plan() -> ProofPlan {
