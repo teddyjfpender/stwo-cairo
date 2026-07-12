@@ -1,16 +1,36 @@
 #!/usr/bin/env python3
 
+import copy
+import hashlib
+import json
 import os
 import re
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from run_cuda_soundness_gate import STRICT_RESIDENT_REQUIRED_TESTS, gates_for_runtime_mode
+from run_cuda_soundness_gate import (
+    QUALIFICATION_FLAGS,
+    STRICT_RESIDENT_GATE,
+    STRICT_RESIDENT_REQUIRED_TESTS,
+    gates_for_runtime_mode,
+    run_gate,
+)
 from validate_architecture_record import (
     ARCHITECTURE,
+    PREFLIGHT_CAP_BYTES,
+    PREFLIGHT_SPECS,
+    QUALIFICATION_PROFILES,
+    RAW_INPUT_NAMES,
+    RETAINED_BUDGET_FLAG,
     SOUNDNESS_COMMANDS,
     SOUNDNESS_GATES,
     STAGES,
+    main,
+    validate_local_admission,
+    validate_benchmark_measurement,
+    validate_qualification_soundness_gate,
     validate_record,
     validate_soundness_gate,
 )
@@ -104,15 +124,65 @@ def valid_arena_graph_record() -> dict:
     return record
 
 
+def valid_measurement_record() -> dict:
+    record = valid_arena_graph_record()
+    record.update(
+        {
+            "program": "SN_PIE_2.zip",
+            "gpu": "NVIDIA H100 80GB HBM3",
+            "cycle_count": 9_900_000,
+            "pie_n_steps": 9_000_000,
+            "reps": 6,
+            "verified_reps": 6,
+            "warm_sample_count": 5,
+            "prove_s_warm_samples_raw": [0.7, 0.8, 0.9, 1.0, 1.1],
+            "prove_s_warm_median": 0.9,
+            "mhz_median": 11.0,
+            "useful_mhz_median": 10.0,
+            "throughput_distribution_applicable": True,
+        }
+    )
+    return record
+
+
 def valid_soundness_artifact(runtime_mode: str = "detached-eager") -> dict:
     gates = gates_for_runtime_mode(runtime_mode)
+    binary_sha = "b" * 64
+    execution_target = {
+        "schema": "stwo.remote-execution-target.v1",
+        "pod_id": "dry-run-pod",
+        "boot_id": "00000000-0000-4000-8000-000000000001",
+        "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000001",
+        "gpu_name": "DRY-RUN-GPU",
+        "gpu_bench": {
+            "path": f"/workspace/bench_loop_runs/sealed/gpu_bench.{binary_sha}",
+            "sha256": binary_sha,
+        },
+        "inputs": {
+            "gate": {"path": "/workspace/SN_PIE_2.zip", "sha256": "c" * 64}
+        },
+    }
+    target_sha = hashlib.sha256(
+        json.dumps(execution_target, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     artifact = {
-        "schema": "stwo.cuda.soundness-gate.v2",
+        "schema": "stwo.cuda.soundness-gate.v3",
         "stwo_git_head": "1" * 40,
         "stwo_cairo_git_head": "2" * 40,
         "stwo_worktree_hash": "3" * 64,
         "stwo_cairo_worktree_hash": "4" * 64,
         "runtime_mode": runtime_mode,
+        "execution_target": execution_target,
+        "execution_target_sha256": target_sha,
+        "execution_target_postcheck": True,
+        "source_projection": {
+            "method": "rsync-archive-checksum-dry-run-clean",
+            "verified_after_soundness": True,
+            "source": {
+                "stwo": {"head": "1" * 40, "worktree_hash": "3" * 64},
+                "stwo_cairo": {"head": "2" * 40, "worktree_hash": "4" * 64},
+            },
+        },
         "passed": True,
         "gates": [
             {
@@ -131,6 +201,132 @@ def valid_soundness_artifact(runtime_mode: str = "detached-eager") -> dict:
             gate["required_test_names"] = list(STRICT_RESIDENT_REQUIRED_TESTS)
             gate["executed_test_names"] = list(STRICT_RESIDENT_REQUIRED_TESTS)
     return artifact
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def qualification_source() -> dict:
+    return {
+        "stwo": {"head": "1" * 40, "worktree_hash": "3" * 64},
+        "stwo_cairo": {"head": "2" * 40, "worktree_hash": "4" * 64},
+    }
+
+
+def valid_qualification_soundness_artifact() -> dict:
+    artifact = valid_soundness_artifact("arena-graph")
+    source = qualification_source()
+    artifact.update(
+        {
+            "dry_run": False,
+            "synced_source": {**source, "transport": "rsync-archive-checksum"},
+            "qualification_flags": {flag: 1 for flag in QUALIFICATION_FLAGS},
+            "effective_stwo_env": {
+                "STWO_CUDA_OBJ_CACHE": "/workspace/.cuda_obj_cache",
+                "STWO_PARITY_REF_CACHE": "/workspace/.parity_ref_cache",
+                "STWO_PARITY_REF_STWO_HEAD": source["stwo"]["head"],
+                "STWO_PARITY_REF_STWO_WORKTREE_HASH": source["stwo"][
+                    "worktree_hash"
+                ],
+                "STWO_PARITY_REF_STWO_CAIRO_HEAD": source["stwo_cairo"]["head"],
+                "STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH": source["stwo_cairo"][
+                    "worktree_hash"
+                ],
+                **{flag: "1" for flag in QUALIFICATION_FLAGS},
+                RETAINED_BUDGET_FLAG: "29469326848",
+            },
+        }
+    )
+    return artifact
+
+
+def write_manifest(path: Path, entries: dict[str, str]) -> None:
+    path.write_text(
+        "".join(f"{digest}  {name}\n" for name, digest in sorted(entries.items())),
+        encoding="utf-8",
+    )
+
+
+def local_admission_fixture(root: Path) -> tuple[dict, Path, dict[str, Path]]:
+    adapted_dir = root / "adapted_inputs"
+    adapted_dir.mkdir()
+    adapted_entries = {}
+    for pie in range(1, 5):
+        name = f"SN_PIE_{pie}.adapted.bin"
+        path = adapted_dir / name
+        path.write_bytes(f"adapted-{pie}".encode())
+        adapted_entries[name] = sha256_file(path)
+
+    adapted_manifest = root / "adapted_sha256s"
+    pinned_adapted_manifest = root / "ADAPTED_SHA256SUMS"
+    write_manifest(adapted_manifest, adapted_entries)
+    write_manifest(pinned_adapted_manifest, adapted_entries)
+
+    bootloader = root / "simple_bootloader_compiled.json"
+    bootloader.write_text('{"bootloader":true}\n', encoding="utf-8")
+    raw_entries = {
+        name: hashlib.sha256(name.encode()).hexdigest() for name in RAW_INPUT_NAMES
+    }
+    raw_entries[bootloader.name] = sha256_file(bootloader)
+    raw_manifest = root / "SHA256SUMS"
+    write_manifest(raw_manifest, raw_entries)
+
+    gpu_bench = root / "gpu_bench"
+    gpu_bench.write_bytes(b"current-adapter-binary")
+    preflight_hashes = {}
+    for artifact_name, (input_name, runtime_policy) in PREFLIGHT_SPECS.items():
+        artifact_path = root / artifact_name
+        artifact_path.write_text(
+            json.dumps(
+                {
+                    "pass": True,
+                    "vram_fit": True,
+                    "vram_budget_bytes": PREFLIGHT_CAP_BYTES,
+                    "arena": {"total_bytes": PREFLIGHT_CAP_BYTES - 1},
+                    "runtime_policy": runtime_policy,
+                    "source": str(adapted_dir / input_name),
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        preflight_hashes[artifact_name] = sha256_file(artifact_path)
+
+    admission = {
+        "schema": "stwo.local-preflight-admission.v1",
+        "passed": True,
+        "dry_run": False,
+        "runtime_mode": "arena-graph",
+        "source": qualification_source(),
+        "profiles": QUALIFICATION_PROFILES,
+        "preflight_ceiling_bytes": PREFLIGHT_CAP_BYTES,
+        "preflight_artifact_sha256": preflight_hashes,
+        "adapted_input_manifest": str(adapted_manifest),
+        "adapted_input_manifest_sha256": sha256_file(adapted_manifest),
+        "adapter_reproduction": {
+            "byte_equal": True,
+            "gpu_bench_binary_sha256": sha256_file(gpu_bench),
+            "raw_input_manifest_sha256": sha256_file(raw_manifest),
+            "bootloader_sha256": sha256_file(bootloader),
+            "pinned_adapted_manifest_sha256": sha256_file(
+                pinned_adapted_manifest
+            ),
+        },
+    }
+    admission_path = root / "local_admission.json"
+    admission_path.write_text(json.dumps(admission) + "\n", encoding="utf-8")
+    paths = {
+        "gpu_bench_binary": gpu_bench,
+        "raw_input_manifest": raw_manifest,
+        "bootloader": bootloader,
+        "pinned_adapted_manifest": pinned_adapted_manifest,
+        "adapted_manifest": adapted_manifest,
+        "adapted_input": adapted_dir / "SN_PIE_1.adapted.bin",
+        "preflight": root / "preflight_universal_SN1.json",
+    }
+    return admission, admission_path, paths
 
 
 class ArchitectureRecordTest(unittest.TestCase):
@@ -218,6 +414,31 @@ class ArchitectureRecordTest(unittest.TestCase):
         extra_sync["gpu_execution_tables_ingest_syncs"] = 2
         self.assertTrue(validate_record(extra_sync, "arena-graph"))
 
+    def test_benchmark_measurement_binds_input_samples_and_headline_math(self) -> None:
+        record = valid_measurement_record()
+        arguments = {
+            "expected_program": "SN_PIE_2.zip",
+            "expected_reps": 6,
+            "expected_gpu": "NVIDIA H100 80GB HBM3",
+        }
+        self.assertEqual(validate_benchmark_measurement(record, **arguments), [])
+        mutations = (
+            ("program", lambda value: value.update({"program": "SN_PIE_1.zip"})),
+            ("gpu", lambda value: value.update({"gpu": "NVIDIA A100-SXM4-80GB"})),
+            ("reps", lambda value: value.update({"reps": 5})),
+            ("verified", lambda value: value.update({"verified_reps": 5})),
+            ("sample count", lambda value: value["prove_s_warm_samples_raw"].pop()),
+            ("nonfinite sample", lambda value: value["prove_s_warm_samples_raw"].__setitem__(0, float("inf"))),
+            ("median", lambda value: value.update({"prove_s_warm_median": 0.8})),
+            ("headline", lambda value: value.update({"useful_mhz_median": 12.0})),
+            ("cycle rate", lambda value: value.update({"mhz_median": 12.0})),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(record)
+                mutate(candidate)
+                self.assertTrue(validate_benchmark_measurement(candidate, **arguments))
+
     def test_soundness_gate_requires_nonzero_execution_for_every_command(self) -> None:
         artifact = valid_soundness_artifact()
         self.assertEqual(validate_soundness_gate(artifact), [])
@@ -231,6 +452,26 @@ class ArchitectureRecordTest(unittest.TestCase):
         artifact = valid_soundness_artifact()
         artifact["gates"][0]["executed_tests"] += 1
         self.assertTrue(validate_soundness_gate(artifact))
+
+    def test_soundness_gate_rejects_remote_execution_target_drift(self) -> None:
+        mutations = (
+            lambda value: value["execution_target"].update({"pod_id": "other-pod"}),
+            lambda value: value.update({"execution_target_postcheck": False}),
+            lambda value: value["execution_target"]["gpu_bench"].update(
+                {"path": "/workspace/target/release/gpu_bench"}
+            ),
+            lambda value: value["execution_target"]["inputs"]["gate"].update(
+                {"sha256": "not-a-hash"}
+            ),
+            lambda value: value["source_projection"].update(
+                {"verified_after_soundness": False}
+            ),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                artifact = valid_soundness_artifact()
+                mutate(artifact)
+                self.assertTrue(validate_soundness_gate(artifact))
 
     def test_soundness_gate_rejects_truncated_or_forged_manifest(self) -> None:
         artifact = valid_soundness_artifact()
@@ -291,6 +532,56 @@ class ArchitectureRecordTest(unittest.TestCase):
         detached = valid_soundness_artifact("detached-eager")
         detached["gates"][0]["executed_tests"] = detached["gates"][0]["required_tests"]
         self.assertEqual(validate_soundness_gate(detached, "detached-eager"), [])
+
+    def test_strict_runner_accepts_nocapture_interleaving_only_when_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stwo = Path(directory)
+            source = stwo / "crates/gpu-prover/tests/resident_parity_native.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                'const STRICT_RESIDENT_FIXTURE: &str = "fixture.zip";\n',
+                encoding="utf-8",
+            )
+            lines = [f"running {len(STRICT_RESIDENT_REQUIRED_TESTS)} tests"]
+            for name in STRICT_RESIDENT_REQUIRED_TESTS:
+                lines.extend((f"test {name} ... diagnostic output", "ok"))
+            lines.append(
+                f"test result: ok. {len(STRICT_RESIDENT_REQUIRED_TESTS)} passed; "
+                "0 failed; 0 ignored; 0 measured; 0 filtered out"
+            )
+            output = "\n".join(lines)
+
+            def run(candidate: str, returncode: int = 0) -> dict:
+                completed = mock.Mock(stdout=candidate, returncode=returncode)
+                with mock.patch(
+                    "run_cuda_soundness_gate.subprocess.run", return_value=completed
+                ), mock.patch("run_cuda_soundness_gate.sys.stderr"):
+                    return run_gate(
+                        stwo,
+                        STRICT_RESIDENT_GATE,
+                        ("cargo", "test"),
+                        len(STRICT_RESIDENT_REQUIRED_TESTS),
+                    )
+
+            record = run(output)
+            self.assertTrue(record["passed"])
+            self.assertEqual(
+                record["executed_test_names"], list(STRICT_RESIDENT_REQUIRED_TESTS)
+            )
+            self.assertFalse(
+                run(output.replace(STRICT_RESIDENT_REQUIRED_TESTS[-1], "mutated", 1))[
+                    "passed"
+                ]
+            )
+            self.assertFalse(
+                run(
+                    output.replace(
+                        f"{len(STRICT_RESIDENT_REQUIRED_TESTS)} passed",
+                        f"{len(STRICT_RESIDENT_REQUIRED_TESTS) - 1} passed",
+                    )
+                )["passed"]
+            )
+            self.assertFalse(run(output, returncode=1)["passed"])
 
     def test_soundness_manifest_covers_cfg_native_targets_with_exact_counts(self) -> None:
         stwo, stwo_cairo = source_roots()
@@ -367,6 +658,197 @@ class ArchitectureRecordTest(unittest.TestCase):
         self.assertIn('#[path = "common/reference_cache.rs"]', strict)
         self.assertIsNone(re.search(r"#\[(?:test|cfg\(test\))\]", common))
         self.assertEqual(len(re.findall(r"(?m)^#\[test\]\s*$", host)), 8)
+
+
+class PrePodValidationTest(unittest.TestCase):
+    def validate_fixture(
+        self, admission: dict, admission_path: Path, paths: dict[str, Path]
+    ) -> list[str]:
+        return validate_local_admission(
+            admission,
+            admission_path,
+            expected_source=qualification_source(),
+            expected_dry_run=False,
+            gpu_bench_binary=paths["gpu_bench_binary"],
+            raw_input_manifest=paths["raw_input_manifest"],
+            bootloader=paths["bootloader"],
+            pinned_adapted_manifest=paths["pinned_adapted_manifest"],
+        )
+
+    def test_accepts_complete_local_admission_and_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            admission, admission_path, paths = local_admission_fixture(Path(directory))
+            self.assertEqual(self.validate_fixture(admission, admission_path, paths), [])
+            source = qualification_source()
+            self.assertEqual(
+                main(
+                    [
+                        "--local-admission",
+                        str(admission_path),
+                        "--gpu-bench-binary",
+                        str(paths["gpu_bench_binary"]),
+                        "--raw-input-manifest",
+                        str(paths["raw_input_manifest"]),
+                        "--bootloader",
+                        str(paths["bootloader"]),
+                        "--pinned-adapted-manifest",
+                        str(paths["pinned_adapted_manifest"]),
+                        "--expected-dry-run",
+                        "0",
+                        "--stwo-head",
+                        source["stwo"]["head"],
+                        "--stwo-worktree-hash",
+                        source["stwo"]["worktree_hash"],
+                        "--stwo-cairo-head",
+                        source["stwo_cairo"]["head"],
+                        "--stwo-cairo-worktree-hash",
+                        source["stwo_cairo"]["worktree_hash"],
+                    ]
+                ),
+                0,
+            )
+
+    def test_local_admission_requires_exact_contract(self) -> None:
+        mutations = (
+            ("extra profile", lambda value: value["profiles"].update({"extra": "X=1"})),
+            (
+                "capacity drift",
+                lambda value: value.update(
+                    {"preflight_ceiling_bytes": PREFLIGHT_CAP_BYTES + 1}
+                ),
+            ),
+            (
+                "missing preflight",
+                lambda value: value["preflight_artifact_sha256"].pop(
+                    "preflight_flags_off_SN2.json"
+                ),
+            ),
+            (
+                "non-byte-equal adapter",
+                lambda value: value["adapter_reproduction"].update(
+                    {"byte_equal": False}
+                ),
+            ),
+            (
+                "extra adapter field",
+                lambda value: value["adapter_reproduction"].update({"extra": True}),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            admission, admission_path, paths = local_admission_fixture(Path(directory))
+            for name, mutate in mutations:
+                with self.subTest(name=name):
+                    candidate = copy.deepcopy(admission)
+                    mutate(candidate)
+                    self.assertTrue(
+                        self.validate_fixture(candidate, admission_path, paths)
+                    )
+
+    def test_local_admission_rehashes_every_referenced_artifact(self) -> None:
+        targets = (
+            "gpu_bench_binary",
+            "raw_input_manifest",
+            "bootloader",
+            "pinned_adapted_manifest",
+            "adapted_manifest",
+            "adapted_input",
+            "preflight",
+        )
+        for target in targets:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                admission, admission_path, paths = local_admission_fixture(Path(directory))
+                path = paths[target]
+                path.write_bytes(path.read_bytes() + b"stale")
+                self.assertTrue(self.validate_fixture(admission, admission_path, paths))
+
+    def test_local_admission_validates_preflight_policy_and_source(self) -> None:
+        for mutation in ("policy", "source", "capacity"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                admission, admission_path, paths = local_admission_fixture(Path(directory))
+                artifact = paths["preflight"]
+                record = json.loads(artifact.read_text(encoding="utf-8"))
+                if mutation == "policy":
+                    record["runtime_policy"]["commit_mode"] = "FullLifting"
+                elif mutation == "source":
+                    record["source"] = str(Path(directory) / "wrong.bin")
+                else:
+                    record["arena"]["total_bytes"] = PREFLIGHT_CAP_BYTES + 1
+                artifact.write_text(json.dumps(record) + "\n", encoding="utf-8")
+                admission["preflight_artifact_sha256"][artifact.name] = sha256_file(
+                    artifact
+                )
+                self.assertTrue(self.validate_fixture(admission, admission_path, paths))
+
+    def test_qualification_soundness_requires_full_manifest_and_headline_env(self) -> None:
+        artifact = valid_qualification_soundness_artifact()
+        self.assertEqual(
+            validate_qualification_soundness_gate(
+                artifact,
+                expected_source=qualification_source(),
+                expected_dry_run=False,
+            ),
+            [],
+        )
+        mutations = (
+            ("truncated gates", lambda value: value["gates"].pop()),
+            (
+                "wrong flag",
+                lambda value: value["qualification_flags"].update(
+                    {QUALIFICATION_FLAGS[0]: 0}
+                ),
+            ),
+            (
+                "extra environment",
+                lambda value: value["effective_stwo_env"].update(
+                    {"STWO_UNAPPROVED": "1"}
+                ),
+            ),
+            (
+                "wrong source",
+                lambda value: value["synced_source"]["stwo"].update(
+                    {"head": "f" * 40}
+                ),
+            ),
+            ("wrong dry state", lambda value: value.update({"dry_run": True})),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(artifact)
+                mutate(candidate)
+                self.assertTrue(
+                    validate_qualification_soundness_gate(
+                        candidate,
+                        expected_source=qualification_source(),
+                        expected_dry_run=False,
+                    )
+                )
+
+    def test_accepts_soundness_only_cli(self) -> None:
+        artifact = valid_qualification_soundness_artifact()
+        source = qualification_source()
+        with tempfile.TemporaryDirectory() as directory:
+            soundness_path = Path(directory) / "soundness.json"
+            soundness_path.write_text(json.dumps(artifact) + "\n", encoding="utf-8")
+            self.assertEqual(
+                main(
+                    [
+                        "--soundness-only",
+                        "--soundness-gate",
+                        str(soundness_path),
+                        "--expected-dry-run",
+                        "0",
+                        "--stwo-head",
+                        source["stwo"]["head"],
+                        "--stwo-worktree-hash",
+                        source["stwo"]["worktree_hash"],
+                        "--stwo-cairo-head",
+                        source["stwo_cairo"]["head"],
+                        "--stwo-cairo-worktree-hash",
+                        source["stwo_cairo"]["worktree_hash"],
+                    ]
+                ),
+                0,
+            )
 
 
 if __name__ == "__main__":

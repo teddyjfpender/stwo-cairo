@@ -93,6 +93,7 @@ RESULTS_DIR="${RESULTS_DIR:-${LOOP_DIR}/results}"
 LEDGER="${LEDGER:-${LOOP_DIR}/ledger.jsonl}"
 POD_CONF="${POD_CONF:-${LOOP_DIR}/pod.conf}"
 INPUT_SHA256SUMS="${CAIRO_LOCAL}/gpu_benchmarks/pie/SHA256SUMS"
+PINNED_ADAPTED_SHA256SUMS="${CAIRO_LOCAL}/gpu_benchmarks/pie/ADAPTED_SHA256SUMS"
 ARCHITECTURE_CHECK="${CAIRO_LOCAL}/gpu_benchmarks/validate_architecture_record.py"
 SOUNDNESS_RUNNER="${CAIRO_LOCAL}/gpu_benchmarks/run_cuda_soundness_gate.py"
 
@@ -111,7 +112,7 @@ POD_USER="root"
 
 # PIE inputs on the pod (already present, hash-verified — never synced).
 POD_SN_DIR="${CAIRO_POD}/gpu_benchmarks/pie/sn"
-POD_GATE_PIE="${GATE_PIE:-${CAIRO_POD}/gpu_benchmarks/pie/cairo_pie_10_transfers_with_6_ecop.zip}"
+POD_GATE_PIE="${GATE_PIE:-${POD_SN_DIR}/SN_PIE_2.zip}"
 POD_BOOTLOADER_JSON="${POD_BOOTLOADER_JSON:-/workspace/bench_inputs/simple_bootloader_compiled.json}"
 
 # Pod scratch (outside the repo tree so rsync never touches it).
@@ -127,7 +128,9 @@ QUALIFICATION_PROBE="${QUALIFICATION_PROBE:-0}"
 QUALIFICATION_ARTIFACT="${QUALIFICATION_ARTIFACT:-}"
 BENCH_PROOF_HASHES="${BENCH_PROOF_HASHES:-0}"
 REUSE_SOUNDNESS_GATE="${REUSE_SOUNDNESS_GATE:-}"
+LOCAL_PREFLIGHT_ADMISSION="${LOCAL_PREFLIGHT_ADMISSION:-}"
 GPU_PCS_RUNTIME_MODE="${GPU_PCS_RUNTIME_MODE:-arena-graph}"
+EXPECTED_POD_GPU="${EXPECTED_POD_GPU:-}"
 GPU_NATIVE_ARGS="--engine gpu-native --require-gpu-native-architecture --require-gpu-pcs-runtime-mode ${GPU_PCS_RUNTIME_MODE}"
 
 # Fleet (rotate) run parameters.
@@ -154,6 +157,7 @@ GATE_ONLY=0
 POD_HOST=""
 POD_PORT=""
 POD_KEY=""
+POD_ID_RESOLVED=""
 SSH_OPTS=()
 SSH_E=""
 
@@ -162,7 +166,13 @@ LAST_OUT=""
 LAST_RC=""
 LAST_STALL_FILE=""
 LAST_PROOF_SHA=""
+LAST_REMOTE_QUIESCENCE_PASSED=false
 LOCAL_SOUNDNESS_GATE_SHA=""
+SEALED_BOOT_ID=""
+SEALED_GPU_UUID=""
+SEALED_GPU_NAME=""
+SEALED_GPU_BENCH_PATH=""
+SEALED_GPU_BENCH_SHA=""
 
 # ---------------------------------------------------------------------------
 # Logging helpers ( logs -> stderr, human summary -> stdout )
@@ -187,13 +197,21 @@ resolve_pod() {
     pod_id="$POD_ID"; fb_host="$FALLBACK_HOST"; fb_port="$FALLBACK_PORT"; fb_key="$FALLBACK_KEY"
   fi
   pod_id="${BENCH_POD_ID:-$pod_id}"   # env wins over pod.conf
+  if [[ "$DRY_RUN" == "1" ]]; then
+    POD_ID_RESOLVED="DRY-RUN-POD"
+    POD_HOST="dry-run.invalid"; POD_PORT="22"; POD_KEY="/dev/null"
+    SSH_OPTS=(-p "$POD_PORT" -i "$POD_KEY")
+    SSH_E="ssh -p ${POD_PORT} -i ${POD_KEY}"
+    return 0
+  fi
   [[ -n "$pod_id" ]] || die "no pod id — set BENCH_POD_ID or POD_ID in ${POD_CONF}"
+  POD_ID_RESOLVED="$pod_id"
 
   if command -v runpodctl >/dev/null 2>&1; then
     local info parsed
     if info="$(runpodctl ssh info "$pod_id" 2>/dev/null)" &&
        parsed="$(RP_INFO="$info" python3 -c '
-import json, os, sys
+import hashlib, json, os, sys
 d = json.loads(os.environ["RP_INFO"])
 ip = d.get("ip") or d.get("host")
 port = d.get("port") or d.get("sshPort")
@@ -282,7 +300,9 @@ check_local_input() {
   [[ -f "$path" ]] || die "$label missing: $path"
   actual="$(sha256_file "$path")"
   expected="$(expected_sha256 "$path")"
-  [[ -z "$expected" || "$actual" == "$expected" ]] \
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] \
+    || die "$label is not pinned in $INPUT_SHA256SUMS: $(basename "$path")"
+  [[ "$actual" == "$expected" ]] \
     || die "$label SHA-256 mismatch: $path (expected $expected, got $actual)"
   log "$label: $path sha256=$actual${expected:+ (manifest match)}"
 }
@@ -341,9 +361,11 @@ preflight_pod_inputs() {
   for sel in $(required_sn_selectors); do paths+=("$(pie_path "$sel")"); done
   for path in "${paths[@]}"; do
     expected="$(expected_sha256 "$path")"
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] \
+      || die "required pod input is not pinned in $INPUT_SHA256SUMS: $(basename "$path")"
     printf -v quoted_path '%q' "$path"
     printf -v quoted_expected '%q' "$expected"
-    remote_cmd+=" path=${quoted_path}; expected=${quoted_expected}; if [ ! -f \"\$path\" ]; then echo \"MISSING required input: \$path\" >&2; missing=1; else actual=\$(hash_input \"\$path\"); echo \"\$actual  \$path\"; if [ -n \"\$expected\" ] && [ \"\$actual\" != \"\$expected\" ]; then echo \"SHA-256 mismatch: \$path (expected \$expected, got \$actual)\" >&2; missing=1; fi; fi;"
+    remote_cmd+=" path=${quoted_path}; expected=${quoted_expected}; if [ ! -f \"\$path\" ]; then echo \"MISSING required input: \$path\" >&2; missing=1; else actual=\$(hash_input \"\$path\"); echo \"\$actual  \$path\"; if [ \"\$actual\" != \"\$expected\" ]; then echo \"SHA-256 mismatch: \$path (expected \$expected, got \$actual)\" >&2; missing=1; fi; fi;"
   done
   remote_cmd+=' exit $missing'
 
@@ -351,6 +373,262 @@ preflight_pod_inputs() {
   if ! run_ssh "$remote_cmd"; then
     die "required pod input missing or unpinned; seed it explicitly or update the configured fixture paths, then retry"
   fi
+}
+
+soundness_input_specs() {
+  local sel path
+  path="$POD_GATE_PIE"
+  printf 'gate|%s|%s\n' "$path" "$(expected_sha256 "$path")"
+  path="$POD_BOOTLOADER_JSON"
+  printf 'bootloader|%s|%s\n' "$path" "$(expected_sha256 "$path")"
+  for sel in $(required_sn_selectors); do
+    path="$(pie_path "$sel")"
+    printf 'SN_PIE_%s|%s|%s\n' "$sel" "$path" "$(expected_sha256 "$path")"
+  done
+}
+
+soundness_input_cli() {
+  local label path expected quoted
+  while IFS='|' read -r label path expected; do
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] \
+      || die "soundness input is not manifest-pinned: $path"
+    printf -v quoted '%q' "${label}=${path}"
+    printf ' --input-artifact %s' "$quoted"
+  done < <(soundness_input_specs)
+}
+
+load_execution_target() {
+  local artifact="$1" key value
+  SEALED_BOOT_ID=""; SEALED_GPU_UUID=""; SEALED_GPU_NAME=""
+  SEALED_GPU_BENCH_PATH=""; SEALED_GPU_BENCH_SHA=""
+  while IFS=$'\t' read -r key value; do
+    case "$key" in
+      pod_id) [[ "$value" == "$POD_ID_RESOLVED" ]] \
+        || die "soundness target pod mismatch: expected $POD_ID_RESOLVED, got $value" ;;
+      boot_id) SEALED_BOOT_ID="$value" ;;
+      gpu_uuid) SEALED_GPU_UUID="$value" ;;
+      gpu_name) SEALED_GPU_NAME="$value" ;;
+      gpu_bench_path) SEALED_GPU_BENCH_PATH="$value" ;;
+      gpu_bench_sha256) SEALED_GPU_BENCH_SHA="$value" ;;
+    esac
+  done < <(EXPECTED_INPUT_SPECS="$(soundness_input_specs)" python3 - "$artifact" <<'PY'
+import hashlib, json, os, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    artifact = json.load(stream)
+target = artifact.get("execution_target") or {}
+canonical = json.dumps(target, sort_keys=True, separators=(",", ":")).encode()
+if artifact.get("schema") != "stwo.cuda.soundness-gate.v3":
+    raise SystemExit("invalid soundness schema for remote execution target")
+if target.get("schema") != "stwo.remote-execution-target.v1":
+    raise SystemExit("invalid remote execution target schema")
+if artifact.get("execution_target_sha256") != hashlib.sha256(canonical).hexdigest():
+    raise SystemExit("remote execution target hash mismatch")
+if artifact.get("execution_target_postcheck") is not True:
+    raise SystemExit("remote execution target changed during soundness")
+expected_inputs = {}
+for line in os.environ["EXPECTED_INPUT_SPECS"].splitlines():
+    label, path, digest = line.split("|", 2)
+    # dict() avoids a macOS Bash 3.2 brace-expansion bug when this heredoc is
+    # nested inside the process substitution consumed by the shell loop.
+    expected_inputs[label] = dict(path=path, sha256=digest)
+if target.get("inputs") != dict(sorted(expected_inputs.items())):
+    raise SystemExit("remote execution target inputs do not match the pinned manifest")
+binary = target.get("gpu_bench") or {}
+for key, value in (
+    ("pod_id", target.get("pod_id")),
+    ("boot_id", target.get("boot_id")),
+    ("gpu_uuid", target.get("gpu_uuid")),
+    ("gpu_name", target.get("gpu_name")),
+    ("gpu_bench_path", binary.get("path")),
+    ("gpu_bench_sha256", binary.get("sha256")),
+):
+    if not isinstance(value, str) or not value or "\t" in value or "\n" in value:
+        raise SystemExit(f"invalid execution target field: {key}")
+    print(f"{key}\t{value}")
+PY
+  )
+  [[ "$SEALED_GPU_BENCH_SHA" =~ ^[0-9a-f]{64}$ ]] \
+    || die "soundness target binary hash is invalid"
+  [[ "$SEALED_GPU_BENCH_PATH" == "${POD_RUN_DIR}/sealed/gpu_bench.${SEALED_GPU_BENCH_SHA}" ]] \
+    || die "soundness target is not the expected content-addressed gpu_bench: $SEALED_GPU_BENCH_PATH"
+  [[ "$SEALED_GPU_NAME" == "$POD_GPU" ]] \
+    || die "soundness target GPU name mismatch: expected $POD_GPU, got $SEALED_GPU_NAME"
+}
+
+sealed_input_sha() {
+  python3 - "$LOCAL_SOUNDNESS_GATE" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    inputs = (json.load(stream).get("execution_target") or {}).get("inputs") or {}
+matches = {value.get("sha256") for value in inputs.values()
+           if isinstance(value, dict) and value.get("path") == sys.argv[2]}
+if len(matches) != 1:
+    raise SystemExit(f"sealed input path is absent or ambiguous: {sys.argv[2]}")
+value = matches.pop()
+if not isinstance(value, str) or len(value) != 64:
+    raise SystemExit(f"sealed input hash is invalid: {sys.argv[2]}")
+print(value)
+PY
+}
+
+sealed_input_paths() {
+  python3 - "$LOCAL_SOUNDNESS_GATE" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    inputs = (json.load(stream).get("execution_target") or {}).get("inputs") or {}
+for path in sorted({value.get("path") for value in inputs.values()
+                    if isinstance(value, dict) and isinstance(value.get("path"), str)}):
+    print(path)
+PY
+}
+
+remote_execution_guard() {
+  local paths_csv="$1" script quoted expected path
+  printf -v quoted '%q' "$SEALED_BOOT_ID"
+  script="actual=\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); [[ \"\$actual\" == ${quoted} ]] || { echo 'remote seal: pod boot id changed' >&2; exit 96; };"
+  printf -v quoted '%q' "$SEALED_GPU_UUID"
+  script+=" actual=\$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -1 | tr -d '\\r'); [[ \"\$actual\" == ${quoted} ]] || { echo 'remote seal: GPU UUID changed' >&2; exit 96; };"
+  printf -v quoted '%q' "$SEALED_GPU_NAME"
+  script+=" actual=\$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\\r'); [[ \"\$actual\" == ${quoted} ]] || { echo 'remote seal: GPU name changed' >&2; exit 96; };"
+  script+=" hash_sealed() { if command -v sha256sum >/dev/null 2>&1; then sha256sum \"\$1\" | cut -d' ' -f1; else LC_ALL=C shasum -a 256 \"\$1\" | cut -d' ' -f1; fi; };"
+  printf -v quoted '%q' "$SEALED_GPU_BENCH_PATH"
+  printf -v expected '%q' "$SEALED_GPU_BENCH_SHA"
+  script+=" exec 9<${quoted} || { echo 'remote seal: gpu_bench missing' >&2; exit 96; }; actual=\$(hash_sealed /proc/self/fd/9); [[ \"\$actual\" == ${expected} ]] || { echo 'remote seal: gpu_bench changed' >&2; exit 96; };"
+  local old_ifs="$IFS"
+  IFS=','
+  for path in $paths_csv; do
+    [[ -n "$path" ]] || continue
+    expected="$(sealed_input_sha "$path")" || die "input is absent from the remote seal: $path"
+    printf -v quoted '%q' "$path"
+    printf -v expected '%q' "$expected"
+    script+=" actual=\$(hash_sealed ${quoted}); [[ \"\$actual\" == ${expected} ]] || { echo 'remote seal: input changed: ${quoted}' >&2; exit 96; };"
+  done
+  IFS="$old_ifs"
+  printf '%s\n' "$script"
+}
+
+remote_quiescence_guard() {
+  local quoted_uuid quoted_binary
+  printf -v quoted_uuid '%q' "$SEALED_GPU_UUID"
+  printf -v quoted_binary '%q' "$SEALED_GPU_BENCH_PATH"
+  cat <<EOF
+sealed_inode=\$(stat -Lc '%d:%i' ${quoted_binary} 2>/dev/null) || { echo 'remote isolation: cannot stat sealed gpu_bench' >&2; exit 97; }
+gpu_pids=\$(nvidia-smi --id=${quoted_uuid} --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null) || { echo 'remote isolation: compute-process query failed' >&2; exit 97; }
+[[ -z "\$(printf '%s' "\$gpu_pids" | tr -d '[:space:]')" ]] || { echo "remote isolation: GPU compute PIDs present: \$gpu_pids" >&2; exit 97; }
+offenders=''
+for proc in /proc/[0-9]*; do
+  [[ -r "\$proc/comm" ]] || continue
+  stat_line=\$(cat "\$proc/stat" 2>/dev/null) || continue
+  stat_rest=\${stat_line##*)}; set -- \$stat_rest
+  [[ "\${1:-}" != Z ]] || continue
+  comm=\$(cat "\$proc/comm" 2>/dev/null) || continue
+  exe=\$(readlink "\$proc/exe" 2>/dev/null || true)
+  exe_name=\${exe##*/}
+  proc_inode=\$(stat -Lc '%d:%i' "\$proc/exe" 2>/dev/null || true)
+  case "\$comm" in cargo|rustc|nvcc|ptxas|gpu_bench|gpu_bench.*) offenders="\$offenders \${proc##*/}:\$comm" ;; esac
+  case "\$exe_name" in cargo|rustc|nvcc|ptxas|gpu_bench|gpu_bench.*) offenders="\$offenders \${proc##*/}:\$exe_name" ;; esac
+  [[ -z "\$proc_inode" || "\$proc_inode" != "\$sealed_inode" ]] || offenders="\$offenders \${proc##*/}:sealed-gpu_bench"
+done
+[[ -z "\$offenders" ]] || { echo "remote isolation: worker PIDs present:\$offenders" >&2; exit 97; }
+EOF
+}
+
+remote_process_group_gone() {
+  local pgid_file="$1" quoted
+  printf -v quoted '%q' "$pgid_file"
+  run_ssh "pgid=\$(cat ${quoted} 2>/dev/null) || exit 1; [[ \"\$pgid\" =~ ^[0-9]+\$ ]] && (( pgid > 1 )) || exit 1; \
+    for attempt in \$(seq 1 30); do members=''; \
+      for proc in /proc/[0-9]*; do stat=\$(cat \"\$proc/stat\" 2>/dev/null) || continue; \
+        rest=\${stat##*)}; set -- \$rest; [[ \"\${1:-}\" != Z && \"\${3:-}\" == \"\$pgid\" ]] && members=\"\$members \${proc##*/}\"; done; \
+      [[ -z \"\$members\" ]] && exit 0; sleep 0.1; done; \
+    echo \"remote isolation: process group \$pgid still has PIDs:\$members\" >&2; exit 1"
+}
+
+remote_detached_startup_ok() {
+  local pgid_file="$1" rc_file="$2" quoted_pgid quoted_rc
+  printf -v quoted_pgid '%q' "$pgid_file"
+  printf -v quoted_rc '%q' "$rc_file"
+  run_ssh "for ((attempt=0; attempt<50; attempt++)); do \
+      [[ -f ${quoted_rc} ]] && exit 0; \
+      pgid=\$(cat ${quoted_pgid} 2>/dev/null || true); \
+      if [[ \"\$pgid\" =~ ^[0-9]+\$ ]] && (( pgid > 1 )); then \
+        stat_line=\$(cat \"/proc/\$pgid/stat\" 2>/dev/null || true); \
+        if [[ -n \"\$stat_line\" ]]; then rest=\${stat_line##*)}; set -- \$rest; \
+          [[ \"\${1:-}\" != Z && \"\${3:-}\" == \"\$pgid\" && \"\${4:-}\" == \"\$pgid\" \
+             && \"\$(stat -c %u \"/proc/\$pgid\" 2>/dev/null)\" == \"\$(id -u)\" ]] && exit 0; \
+        fi; \
+      fi; \
+      sleep 0.1; \
+    done; exit 1"
+}
+
+kill_remote_process_group() {
+  local pgid_file="$1" quoted
+  printf -v quoted '%q' "$pgid_file"
+  run_ssh "pgid=\$(cat ${quoted} 2>/dev/null) || exit 1; [[ \"\$pgid\" =~ ^[0-9]+\$ ]] && (( pgid > 1 )) || exit 1; \
+    stat=\$(cat \"/proc/\$pgid/stat\" 2>/dev/null) || exit 1; rest=\${stat##*)}; set -- \$rest; \
+    [[ \"\${1:-}\" != Z && \"\${3:-}\" == \"\$pgid\" && \"\${4:-}\" == \"\$pgid\" ]] || exit 1; \
+    [[ \"\$(stat -c %u \"/proc/\$pgid\" 2>/dev/null)\" == \"\$(id -u)\" ]] || exit 1; \
+    kill -TERM -- -\"\$pgid\" 2>/dev/null || true; sleep 3; kill -KILL -- -\"\$pgid\" 2>/dev/null || true"
+  remote_process_group_gone "$pgid_file"
+}
+
+validate_remote_execution_target() {
+  local all_paths seal_guard
+  load_execution_target "$LOCAL_SOUNDNESS_GATE"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    [[ -z "${FAKE_REMOTE_TARGET_MISMATCH:-}" ]] \
+      || die "remote execution target mismatch (synthetic ${FAKE_REMOTE_TARGET_MISMATCH})"
+    return 0
+  fi
+  all_paths="$(sealed_input_paths | paste -sd, -)"
+  seal_guard="$(remote_execution_guard "$all_paths")" \
+    || die "could not construct the sealed remote-execution guard"
+  run_ssh "$seal_guard" \
+    || die "remote pod/GPU/binary/input target no longer matches the counted soundness gate"
+}
+
+verify_remote_source_projection() {
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  local stwo_changes cairo_changes
+  stwo_changes="$(run_rsync -azcnO --delete --itemize-changes --no-owner --no-group \
+    --exclude=target --exclude=.git -e "$SSH_E" \
+    "${STWO_LOCAL}/" "${POD_USER}@${POD_HOST}:${STWO_POD}/")" || return 1
+  cairo_changes="$(run_rsync -azcnO --delete --itemize-changes --no-owner --no-group \
+    --exclude=target --exclude=.git \
+    --exclude='gpu_benchmarks/pie/sn/*.zip' \
+    --exclude='gpu_benchmarks/pie/*.zip' \
+    --exclude='gpu_benchmarks/loop/results' \
+    --exclude='gpu_benchmarks/loop/ledger.jsonl' \
+    -e "$SSH_E" "${CAIRO_LOCAL}/" "${POD_USER}@${POD_HOST}:${CAIRO_POD}/")" || return 1
+  [[ -z "$stwo_changes" && -z "$cairo_changes" ]] || {
+    warn "remote source projection changed after sync/soundness"
+    printf '%s\n%s\n' "$stwo_changes" "$cairo_changes" >&2
+    return 1
+  }
+}
+
+seal_source_projection() {
+  local artifact="$1"
+  SP_STWO_HEAD="$STWO_REV" SP_STWO_HASH="$STWO_WORKTREE_HASH" \
+  SP_CAIRO_HEAD="$CAIRO_REV" SP_CAIRO_HASH="$CAIRO_WORKTREE_HASH" \
+  python3 - "$artifact" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    artifact = json.load(stream)
+artifact["source_projection"] = {
+    "method": "rsync-archive-checksum-dry-run-clean",
+    "verified_after_soundness": True,
+    "source": {
+        "stwo": {"head": os.environ["SP_STWO_HEAD"], "worktree_hash": os.environ["SP_STWO_HASH"]},
+        "stwo_cairo": {"head": os.environ["SP_CAIRO_HEAD"], "worktree_hash": os.environ["SP_CAIRO_HASH"]},
+    },
+}
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(artifact, stream, sort_keys=True)
+    stream.write("\n")
+PY
 }
 
 # ---------------------------------------------------------------------------
@@ -372,6 +650,10 @@ done
 
 [[ "$REPS" =~ ^[0-9]+$ && "$REPS" -ge 2 ]] || die "--reps must be at least 2 so proof-byte equality can be checked"
 pie_path "$PIE_SEL" >/dev/null   # validates selector early
+if [[ "$SKIP_SYNC" == "1" ]]; then
+  [[ "$QUALIFICATION_PROBE" == "1" && -n "$REUSE_SOUNDNESS_GATE" ]] \
+    || die "--skip-sync is restricted to the source-bound internal qualification continuation"
+fi
 
 git -C "$CAIRO_LOCAL" rev-parse --git-dir >/dev/null 2>&1 \
   || die "missing stwo-cairo checkout: $CAIRO_LOCAL"
@@ -399,10 +681,26 @@ if [[ -n "$BENCH_ENV" ]]; then
   done
 fi
 
+[[ -n "$LOCAL_PREFLIGHT_ADMISSION" && -f "$LOCAL_PREFLIGHT_ADMISSION" ]] \
+  || die "LOCAL_PREFLIGHT_ADMISSION from qualification_round is required before pod work"
+if ! LP_ENV="$BENCH_ENV" LP_RUNTIME="$GPU_PCS_RUNTIME_MODE" LP_DRY_RUN="$DRY_RUN" \
+  python3 - "$LOCAL_PREFLIGHT_ADMISSION" <<'PY'
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    admission = json.load(stream)
+profiles = admission.get("profiles") or {}
+if (admission.get("schema") != "stwo.local-preflight-admission.v1"
+        or admission.get("passed") is not True
+        or admission.get("runtime_mode") != os.environ["LP_RUNTIME"]
+        or admission.get("dry_run") is not (os.environ["LP_DRY_RUN"] == "1")
+        or os.environ["LP_ENV"] not in set(profiles.values())):
+    raise SystemExit(1)
+PY
+then
+  die "local preflight admission does not authorize this profile/runtime"
+fi
+
 preflight_local_sources
-resolve_pod
-print_seed_commands
-preflight_pod_inputs
 
 # ---------------------------------------------------------------------------
 # (a) Provenance capture
@@ -446,34 +744,93 @@ CAIRO_DIRTY="$CAIRO_WORKTREE_HASH"
 [[ -n "$(git -C "$CAIRO_LOCAL" status --porcelain -- . ':(exclude)gpu_benchmarks/loop/results')" ]] \
   || CAIRO_DIRTY="clean"
 
+python3 "$ARCHITECTURE_CHECK" \
+  --local-admission "$LOCAL_PREFLIGHT_ADMISSION" \
+  --gpu-bench-binary "${CAIRO_LOCAL}/stwo_cairo_prover/target/debug/gpu_bench" \
+  --raw-input-manifest "$INPUT_SHA256SUMS" \
+  --bootloader "$BOOTLOADER_JSON_SOURCE" \
+  --pinned-adapted-manifest "$PINNED_ADAPTED_SHA256SUMS" \
+  --runtime-mode "$GPU_PCS_RUNTIME_MODE" --expected-dry-run "$DRY_RUN" \
+  --stwo-head "$STWO_REV" --stwo-worktree-hash "$STWO_WORKTREE_HASH" \
+  --stwo-cairo-head "$CAIRO_REV" --stwo-cairo-worktree-hash "$CAIRO_WORKTREE_HASH" \
+  || die "full local input/capacity admission is stale or incomplete"
+
+validate_counted_soundness_gate() {
+  local artifact="$1"
+  python3 "$ARCHITECTURE_CHECK" --soundness-only --soundness-gate "$artifact" \
+    --runtime-mode "$GPU_PCS_RUNTIME_MODE" --expected-dry-run "$DRY_RUN" \
+    --stwo-head "$STWO_REV" --stwo-worktree-hash "$STWO_WORKTREE_HASH" \
+    --stwo-cairo-head "$CAIRO_REV" --stwo-cairo-worktree-hash "$CAIRO_WORKTREE_HASH"
+}
+
+validate_reused_soundness_gate() {
+  validate_counted_soundness_gate "$REUSE_SOUNDNESS_GATE"
+}
+
+if [[ -n "$REUSE_SOUNDNESS_GATE" ]]; then
+  [[ "$QUALIFICATION_PROBE" == "1" && -f "$REUSE_SOUNDNESS_GATE" ]] \
+    || die "REUSE_SOUNDNESS_GATE is restricted to qualification-internal probes"
+  validate_reused_soundness_gate \
+    || die "reused soundness artifact is not bound to the current source/runtime"
+fi
+
 if [[ "$GATE_ONLY" == "0" && "$QUALIFICATION_PROBE" != "1" ]]; then
   [[ -n "$QUALIFICATION_ARTIFACT" && -f "$QUALIFICATION_ARTIFACT" ]] \
     || die "publishable performance requires QUALIFICATION_ARTIFACT from a passed qualification_round"
   QA_STWO_REV="$STWO_REV" QA_STWO_HASH="$STWO_WORKTREE_HASH" \
   QA_CAIRO_REV="$CAIRO_REV" QA_CAIRO_HASH="$CAIRO_WORKTREE_HASH" \
   QA_ENV="$BENCH_ENV" QA_RUNTIME="$GPU_PCS_RUNTIME_MODE" \
+  QA_PIE="$PIE_SEL" QA_ALL_PIES="$ALL_PIES" QA_FULL="$FULL" QA_SIMD="$SIMD" \
   python3 - "$QUALIFICATION_ARTIFACT" <<'PY' || die "qualification artifact does not match this source/env/runtime"
 import json, os, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     artifact = json.load(stream)
+if artifact.get("schema") != "stwo.qualification-round.v4":
+    raise SystemExit(f"qualification schema: expected v4, got {artifact.get('schema')!r}")
+profiles = artifact.get("profiles") or {}
+if set(profiles) != {"universal_sn1_sn4", "sn2_headline"}:
+    raise SystemExit("qualification profiles are incomplete or unexpected")
+allowed_envs = {profile.get("env") for profile in profiles.values() if isinstance(profile, dict)}
+if os.environ["QA_ENV"] not in allowed_envs:
+    raise SystemExit("BENCH_ENV is not one of the two exactly qualified profiles")
+profile_name = next(
+    name for name, profile in profiles.items() if profile.get("env") == os.environ["QA_ENV"]
+)
+selector = {
+    "pie": os.environ["QA_PIE"],
+    "all_pies": os.environ["QA_ALL_PIES"] == "1",
+    "full": os.environ["QA_FULL"] == "1",
+    "simd": os.environ["QA_SIMD"] == "1",
+}
+if selector["full"] or selector["simd"] or selector["pie"] not in {"1", "2", "3", "4"}:
+    raise SystemExit("qualification covers only GPU-native fixed SN PIE selectors")
+if profile_name == "sn2_headline" and (selector["pie"] != "2" or selector["all_pies"]):
+    raise SystemExit("SN2 headline profile is qualified only for the single SN_PIE_2 selector")
 required = {
     ("status",): "passed",
     ("performance_admissible",): True,
-    ("optimized_env",): os.environ["QA_ENV"],
     ("runtime_mode",): os.environ["QA_RUNTIME"],
     ("source", "stwo", "head"): os.environ["QA_STWO_REV"],
     ("source", "stwo", "worktree_hash"): os.environ["QA_STWO_HASH"],
     ("source", "stwo_cairo", "head"): os.environ["QA_CAIRO_REV"],
     ("source", "stwo_cairo", "worktree_hash"): os.environ["QA_CAIRO_HASH"],
+    ("remote_execution_target", "remote_quiescence_passed"): True,
 }
 for path, expected in required.items():
     value = artifact
     for key in path:
         value = value.get(key) if isinstance(value, dict) else None
-    if value != expected:
+    mismatch = value is not expected if isinstance(expected, bool) else value != expected
+    if mismatch:
         raise SystemExit(f"qualification {'.'.join(path)}: expected {expected!r}, got {value!r}")
 PY
 fi
+
+# Do not resolve or contact a paid pod until every local source, admission, and
+# qualification binding has passed.
+resolve_pod
+print_seed_commands
+preflight_pod_inputs
 
 mkdir -p "$RESULTS_DIR"
 
@@ -492,6 +849,8 @@ else
   [[ -n "$POD_GPU" ]] || POD_GPU="unknown"
 fi
 log "pod GPU: ${POD_GPU}"
+[[ -z "$EXPECTED_POD_GPU" || "$POD_GPU" == "$EXPECTED_POD_GPU" ]] \
+  || die "qualification requires GPU '${EXPECTED_POD_GPU}', got '${POD_GPU}'"
 
 # ---------------------------------------------------------------------------
 # (b) Sync repositories
@@ -522,7 +881,7 @@ build_pod() {
   log "incremental build on pod (gpu_bench, --features pie-bench)"
   run_ssh "mkdir -p '${POD_RUN_DIR}'"
   if [[ "$DRY_RUN" == "1" ]]; then
-    dry "build: STWO_BOOTLOADER_JSON=${POD_BOOTLOADER_JSON} cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench"
+    dry "build: STWO_CUDA_BUILD_JOBS=16 STWO_BOOTLOADER_JSON=${POD_BOOTLOADER_JSON} cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench"
     return 0
   fi
   local out
@@ -531,6 +890,7 @@ build_pod() {
       unset CUDA_LAUNCH_BLOCKING CUDA_DEVICE_MAX_CONNECTIONS; \
       PATH=/usr/local/cuda/bin:\$PATH RUSTFLAGS='${BUILD_RUSTFLAGS}' \
       STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache \
+      STWO_CUDA_BUILD_JOBS=16 \
       STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}' \
       cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench \
       > '${POD_BUILD_LOG}' 2>&1; echo BUILD_EXIT=\$?")"
@@ -544,6 +904,30 @@ build_pod() {
   log "build OK"
 }
 
+seal_gpu_bench() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    SEALED_GPU_BENCH_SHA="$(printf 'b%.0s' {1..64})"
+    SEALED_GPU_BENCH_PATH="${POD_RUN_DIR}/sealed/gpu_bench.${SEALED_GPU_BENCH_SHA}"
+    dry "seal gpu_bench -> ${SEALED_GPU_BENCH_PATH}"
+    return 0
+  fi
+  local source_path="${POD_PROVER_DIR}/${BIN}" digest sealed_dir sealed_path
+  digest="$(run_ssh "sha256sum '${source_path}'" | cut -d' ' -f1)"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "could not hash built gpu_bench"
+  sealed_dir="${POD_RUN_DIR}/sealed"
+  sealed_path="${sealed_dir}/gpu_bench.${digest}"
+  run_ssh "set -e; mkdir -p '${sealed_dir}'; \
+    if [ ! -f '${sealed_path}' ]; then \
+      install -m 0555 '${source_path}' '${sealed_path}.tmp'; \
+      mv -f '${sealed_path}.tmp' '${sealed_path}'; \
+    fi; \
+    actual=\$(sha256sum '${sealed_path}' | cut -d' ' -f1); \
+    [ \"\$actual\" = '${digest}' ]; chmod 0555 '${sealed_path}'"
+  SEALED_GPU_BENCH_PATH="$sealed_path"
+  SEALED_GPU_BENCH_SHA="$digest"
+  log "sealed gpu_bench: ${digest}"
+}
+
 # Native cfg-gated tests can exit zero after executing nothing. Run the counted
 # differential suite on the pod and retain its JSON artifact before any proof or
 # performance claim from this build.
@@ -552,27 +936,50 @@ run_cuda_soundness_gate() {
   if [[ -n "$REUSE_SOUNDNESS_GATE" ]]; then
     [[ "$QUALIFICATION_PROBE" == "1" && -f "$REUSE_SOUNDNESS_GATE" ]] \
       || die "REUSE_SOUNDNESS_GATE is restricted to qualification-internal probes"
+    validate_reused_soundness_gate \
+      || die "reused soundness artifact is not bound to the current source/runtime"
     cp "$REUSE_SOUNDNESS_GATE" "$LOCAL_SOUNDNESS_GATE"
+    validate_remote_execution_target
     LOCAL_SOUNDNESS_GATE_SHA="$(sha256_file "$LOCAL_SOUNDNESS_GATE")"
-    log "CUDA soundness gate: reusing source/env-bound qualification artifact ${REUSE_SOUNDNESS_GATE}"
+    log "CUDA soundness gate: reusing source/env/remote-target-bound qualification artifact ${REUSE_SOUNDNESS_GATE}"
     return 0
   fi
   log "CUDA soundness gate: counted native differential targets"
   if [[ "$DRY_RUN" == "1" ]]; then
-    dry "python3 gpu_benchmarks/run_cuda_soundness_gate.py --stwo ${STWO_POD} --runtime-mode ${GPU_PCS_RUNTIME_MODE} --output ${POD_SOUNDNESS_GATE}"
+    dry "python3 gpu_benchmarks/run_cuda_soundness_gate.py --stwo ${STWO_POD} --runtime-mode ${GPU_PCS_RUNTIME_MODE} --pod-id ${POD_ID_RESOLVED} --gpu-bench ${SEALED_GPU_BENCH_PATH}$(soundness_input_cli) --output ${POD_SOUNDNESS_GATE}"
     PYTHONPATH="$(dirname "$ARCHITECTURE_CHECK")" \
       STWO_HEAD="$STWO_REV" STWO_HASH="$STWO_WORKTREE_HASH" \
       STWO_CAIRO_HEAD="$CAIRO_REV" STWO_CAIRO_HASH="$CAIRO_WORKTREE_HASH" \
-      RUNTIME_MODE="$GPU_PCS_RUNTIME_MODE" \
+      RUNTIME_MODE="$GPU_PCS_RUNTIME_MODE" POD_ID_VALUE="$POD_ID_RESOLVED" \
+      GPU_NAME_VALUE="$POD_GPU" GPU_BENCH_PATH="$SEALED_GPU_BENCH_PATH" \
+      GPU_BENCH_SHA="$SEALED_GPU_BENCH_SHA" \
+      TARGET_INPUT_SPECS="$(soundness_input_specs)" \
       python3 - "$LOCAL_SOUNDNESS_GATE" <<'PY'
-import json, os, sys
+import hashlib, json, os, sys
 from run_cuda_soundness_gate import QUALIFICATION_FLAGS, gates_for_runtime_mode
 
 runtime_mode = os.environ["RUNTIME_MODE"]
 gates = gates_for_runtime_mode(runtime_mode)
+inputs = {}
+for line in os.environ["TARGET_INPUT_SPECS"].splitlines():
+    label, path, digest = line.split("|", 2)
+    inputs[label] = {"path": path, "sha256": digest}
+
+execution_target = {
+    "schema": "stwo.remote-execution-target.v1",
+    "pod_id": os.environ["POD_ID_VALUE"],
+    "boot_id": "00000000-0000-4000-8000-000000000001",
+    "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000001",
+    "gpu_name": os.environ["GPU_NAME_VALUE"],
+    "gpu_bench": {"path": os.environ["GPU_BENCH_PATH"], "sha256": os.environ["GPU_BENCH_SHA"]},
+    "inputs": dict(sorted(inputs.items())),
+}
+target_sha = hashlib.sha256(json.dumps(
+    execution_target, sort_keys=True, separators=(",", ":")
+).encode()).hexdigest()
 
 artifact = {
-    "schema": "stwo.cuda.soundness-gate.v2",
+    "schema": "stwo.cuda.soundness-gate.v3",
     "dry_run": True,
     "stwo_git_head": ("f" * 40 if os.environ.get("FAKE_SOUNDNESS_HEAD_MISMATCH") == "1" else os.environ["STWO_HEAD"]),
     "stwo_git_dirty": False,
@@ -592,6 +999,17 @@ artifact = {
         "transport": "rsync-archive-checksum",
     },
     "runtime_mode": runtime_mode,
+    "execution_target": execution_target,
+    "execution_target_sha256": target_sha,
+    "execution_target_postcheck": True,
+    "source_projection": {
+        "method": "rsync-archive-checksum-dry-run-clean",
+        "verified_after_soundness": True,
+        "source": {
+            "stwo": {"head": os.environ["STWO_HEAD"], "worktree_hash": os.environ["STWO_HASH"]},
+            "stwo_cairo": {"head": os.environ["STWO_CAIRO_HEAD"], "worktree_hash": os.environ["STWO_CAIRO_HASH"]},
+        },
+    },
     "qualification_flags": {
         key: int(dict(token.split("=", 1) for token in os.environ.get("BENCH_ENV", "").split()).get(key) == "1")
         for key in QUALIFICATION_FLAGS
@@ -628,6 +1046,9 @@ with open(sys.argv[1], "w", encoding="utf-8") as stream:
     json.dump(artifact, stream)
     stream.write("\n")
 PY
+    validate_counted_soundness_gate "$LOCAL_SOUNDNESS_GATE" \
+      || die "synthetic counted soundness artifact failed its full contract"
+    validate_remote_execution_target
     LOCAL_SOUNDNESS_GATE_SHA="$(sha256_file "$LOCAL_SOUNDNESS_GATE")"
     return 0
   fi
@@ -640,9 +1061,13 @@ PY
   local gate_sh="${POD_RUN_DIR}/soundness_gate.sh"
   local gate_rc="${POD_RUN_DIR}/soundness_gate.rc"
   local gate_log="${POD_RUN_DIR}/soundness_gate.log"
+  local gate_pgid="${POD_RUN_DIR}/soundness_gate.pgid"
+  local input_cli
+  input_cli="$(soundness_input_cli)"
   run_ssh "mkdir -p '${POD_RUN_DIR}'"
   run_ssh "cat > '${gate_sh}'" <<EOF
 #!/usr/bin/env bash
+echo \$\$ > '${gate_pgid}'
 cd '${CAIRO_POD}'
 . "\$HOME/.cargo/env" 2>/dev/null || true
 export PATH=/usr/local/cuda/bin:\$PATH
@@ -659,10 +1084,23 @@ python3 gpu_benchmarks/run_cuda_soundness_gate.py \
   --synced-stwo-worktree-hash '${STWO_WORKTREE_HASH}' \
   --synced-stwo-cairo-head '${CAIRO_REV}' \
   --synced-stwo-cairo-worktree-hash '${CAIRO_WORKTREE_HASH}' \
+  --pod-id '${POD_ID_RESOLVED}' \
+  --gpu-bench '${SEALED_GPU_BENCH_PATH}' \
+  ${input_cli} \
   --output '${POD_SOUNDNESS_GATE}'
 echo \$? > '${gate_rc}'
 EOF
-  run_ssh "rm -f '${gate_rc}' '${POD_SOUNDNESS_GATE}'; nohup setsid bash '${gate_sh}' > '${gate_log}' 2>&1 & echo LAUNCHED"
+  run_ssh "rm -f '${gate_rc}' '${gate_pgid}' '${POD_SOUNDNESS_GATE}'; \
+    nohup setsid bash '${gate_sh}' > '${gate_log}' 2>&1 & echo LAUNCHED"
+  if ! remote_detached_startup_ok "$gate_pgid" "$gate_rc"; then
+    warn "CUDA soundness gate failed its detached-launch startup contract"
+    kill_remote_process_group "$gate_pgid" \
+      || remote_process_group_gone "$gate_pgid" \
+      || warn "CUDA soundness startup left an unverified process group"
+    run_ssh "cat '${POD_SOUNDNESS_GATE}' 2>/dev/null" > "$LOCAL_SOUNDNESS_GATE" || true
+    run_ssh "cat '${gate_log}' 2>/dev/null" > "${RESULTS_DIR}/${STAMP}.cuda-soundness-gate.startup.log" || true
+    return 1
+  fi
   local waited=0 code=""
   while true; do
     code="$(run_ssh "cat '${gate_rc}' 2>/dev/null" 2>/dev/null || true)"
@@ -671,17 +1109,27 @@ EOF
     if (( waited >= MAX_WAIT )); then
       warn "CUDA soundness gate exceeded MAX_WAIT (${MAX_WAIT}s); log tail:"
       run_ssh "tail -n 20 '${gate_log}' 2>/dev/null" || true
+      kill_remote_process_group "$gate_pgid" \
+        || warn "CUDA soundness gate process group remained after TERM/KILL"
+      run_ssh "cat '${POD_SOUNDNESS_GATE}' 2>/dev/null" > "$LOCAL_SOUNDNESS_GATE" || true
+      run_ssh "cat '${gate_log}' 2>/dev/null" > "${RESULTS_DIR}/${STAMP}.cuda-soundness-gate.timeout.log" || true
       return 1
     fi
     sleep "$POLL_INTERVAL"
   done
   run_ssh "cat '${POD_SOUNDNESS_GATE}' 2>/dev/null" > "$LOCAL_SOUNDNESS_GATE" || true
-  LOCAL_SOUNDNESS_GATE_SHA="$(sha256_file "$LOCAL_SOUNDNESS_GATE")"
   if [[ "$code" != "0" ]]; then
     warn "CUDA soundness gate failed (exit=${code:-?}); artifact: ${LOCAL_SOUNDNESS_GATE}"
     run_ssh "tail -n 40 '${gate_log}' 2>/dev/null" || true
     return 1
   fi
+  verify_remote_source_projection \
+    || die "remote source no longer equals the checksum-synced local source"
+  seal_source_projection "$LOCAL_SOUNDNESS_GATE"
+  validate_counted_soundness_gate "$LOCAL_SOUNDNESS_GATE" \
+    || die "counted soundness artifact failed its full contract"
+  validate_remote_execution_target
+  LOCAL_SOUNDNESS_GATE_SHA="$(sha256_file "$LOCAL_SOUNDNESS_GATE")"
   log "CUDA soundness gate PASSED: ${LOCAL_SOUNDNESS_GATE}"
 }
 
@@ -700,17 +1148,30 @@ synth_out() {
     architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"performance_claim_admissible":true,"gpu_host_syncs":1,"gpu_graph_launches":8,"gpu_kernel_launches":72,"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25,"gpu_graph_a_setup_gate_passed":true,"gpu_setup_base_migration_copies":0,"gpu_setup_lookup_host_copies":0,"gpu_setup_legacy_witness_fallbacks":0,"gpu_execution_tables_ingest_compact_h2d_bytes":4096,"gpu_execution_tables_ingest_compact_h2d_copies":3,"gpu_execution_tables_ingest_descriptor_h2d_bytes":64,"gpu_execution_tables_ingest_descriptor_h2d_copies":2,"gpu_execution_tables_ingest_syncs":1,"gpu_witness_ingest_syncs":1'
   fi
   local seed=$(( $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 40 ))
-  local um um_median verified_reps=1
+  local um um_median mhz_median warm_s warm_rounded raw_samples program
+  local verified_reps=1 warm_count rep
   if [[ "$args" =~ --reps[[:space:]]+([0-9]+) ]]; then
     verified_reps="${BASH_REMATCH[1]}"
   fi
-  um="$(awk -v s="$seed" 'BEGIN{printf "%.3f", 1.4 + s/100.0}')"
-  um_median="$(awk -v s="$seed" 'BEGIN{printf "%.3f", 1.3 + s/100.0}')"
+  warm_count=$((verified_reps - 1))
+  warm_s="$(awk -v s="$seed" 'BEGIN{printf "%.9f", 8.0 + s/100.0}')"
+  warm_rounded="$(awk -v s="$warm_s" 'BEGIN{printf "%.3f", s}')"
+  um_median="$(awk -v s="$warm_s" 'BEGIN{printf "%.3f", 12.0/s}')"
+  mhz_median="$(awk -v s="$warm_s" 'BEGIN{printf "%.3f", 14.6/s}')"
+  um="$um_median"
+  raw_samples="["
+  for ((rep = 0; rep < warm_count; rep++)); do
+    [[ "$rep" == "0" ]] || raw_samples+=","
+    raw_samples+="$warm_s"
+  done
+  raw_samples+="]"
+  program="${name}.zip"
+  [[ "$name" == "gate_correctness" ]] && program="SN_PIE_2.zip"
   [[ "${FAKE_MISSING_QUALIFICATION_METRICS:-}" == "$name" ]] && um_median="null"
   {
     echo "{\"rep\":0,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":1234.5},\"fri\":{\"count\":1,\"total_ms\":567.8}}}"
     echo "{\"rep\":1,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":1201.2},\"fri\":{\"count\":1,\"total_ms\":560.1}}}"
-    echo "{\"program\":\"${name}.zip\",\"backend\":\"${backend}\",${architecture_fields},\"n\":1,\"cycle_count\":14600000,\"pie_n_steps\":12000000,\"bootloader_overhead_pct\":21.6,\"prove_s_cold\":9.9,\"prove_s_warm\":8.1,\"prove_s_warm_median\":8.7,\"verify_ms\":42.0,\"verified_reps\":${verified_reps},\"proof_kb\":210.5,\"peak_rss_gb\":18.2,\"vram_end_gb\":6.1,\"vram_peak_gb\":11.3,\"steps_per_s\":1802469.0,\"mhz\":1.802,\"mhz_median\":1.678,\"useful_mhz\":${um},\"useful_mhz_median\":${um_median},\"proof_comparison_applicable\":true,\"proof_byte_equal\":true,\"proof_byte_equal_required\":true,\"vm_s\":30.2,\"adapt_s\":5.1,\"security_bits\":96,\"n_queries\":70,\"pow_bits\":26,\"fold_step\":3,\"gpu\":\"${POD_GPU}\",\"nproc\":32,\"host_mem_gb\":125.6}"
+    echo "{\"program\":\"${program}\",\"backend\":\"${backend}\",${architecture_fields},\"n\":1,\"cycle_count\":14600000,\"pie_n_steps\":12000000,\"bootloader_overhead_pct\":21.6,\"reps\":${verified_reps},\"warm_sample_count\":${warm_count},\"prove_s_warm_samples_raw\":${raw_samples},\"prove_s_warm_samples_rounded\":${raw_samples},\"prove_s_cold\":9.9,\"prove_s_warm\":${warm_rounded},\"prove_s_warm_median\":${warm_rounded},\"verify_ms\":42.0,\"verified_reps\":${verified_reps},\"proof_kb\":210.5,\"peak_rss_gb\":18.2,\"vram_end_gb\":6.1,\"vram_peak_gb\":11.3,\"steps_per_s\":$(awk -v s="$warm_s" 'BEGIN{printf "%.0f",14600000/s}'),\"mhz\":${mhz_median},\"mhz_median\":${mhz_median},\"useful_mhz\":${um},\"useful_mhz_median\":${um_median},\"throughput_distribution_applicable\":true,\"proof_comparison_applicable\":true,\"proof_byte_equal\":true,\"proof_byte_equal_required\":true,\"vm_s\":30.2,\"adapt_s\":5.1,\"security_bits\":96,\"n_queries\":70,\"pow_bits\":26,\"fold_step\":3,\"gpu\":\"${POD_GPU}\",\"nproc\":32,\"host_mem_gb\":125.6}"
     if [[ "$args" == *"--pipeline"* ]]; then
       echo "{\"pipeline\":${FLEET_DEPTH},\"producers\":${FLEET_PRODUCERS},\"pie_mode\":\"rotate\",\"reps\":${FLEET_REPS},\"total_s\":80.5,\"feed_starved_s\":2.1,\"sustained_steps_per_s\":1450000.0,\"sustained_mhz\":1.45,\"sustained_useful_mhz\":$(awk -v s="$seed" 'BEGIN{printf "%.3f",1.1+s/100.0}')}"
     fi
@@ -724,7 +1185,7 @@ synth_out() {
 # or STALLED), LAST_STALL_FILE (evidence file, when stalled).
 # ---------------------------------------------------------------------------
 run_bench() {
-  local name="$1" args="$2"
+  local name="$1" args="$2" input_paths="${3:-}"
   local base="${RESULTS_DIR}/${STAMP}.${name}"
   local pod_out="${POD_RUN_DIR}/${STAMP}.${name}.out"
   local pod_err="${POD_RUN_DIR}/${STAMP}.${name}.err"
@@ -732,8 +1193,11 @@ run_bench() {
   local pod_sh="${POD_RUN_DIR}/${STAMP}.${name}.sh"
   local pod_pid="${POD_RUN_DIR}/${STAMP}.${name}.pid"
   local pod_pgid="${POD_RUN_DIR}/${STAMP}.${name}.pgid"
+  local pod_quiescence="${POD_RUN_DIR}/${STAMP}.${name}.quiescence"
+  local pod_launcher_log="${POD_RUN_DIR}/${STAMP}.${name}.launcher.log"
   LAST_STALL_FILE=""
   LAST_PROOF_SHA=""
+  LAST_REMOTE_QUIESCENCE_PASSED=false
   local pod_proof="${POD_RUN_DIR}/${STAMP}.${name}.proof"
   local proof_export=""
   [[ "$BENCH_PROOF_HASHES" == "1" ]] && proof_export="export STWO_DUMP_PROOF='${pod_proof}'"
@@ -760,9 +1224,16 @@ run_bench() {
     : > "${base}.err"
     echo 0 > "${base}.rc"
     LAST_OUT="${base}.out"; LAST_RC=0
+    LAST_REMOTE_QUIESCENCE_PASSED=true
     [[ "$BENCH_PROOF_HASHES" == "1" ]] && LAST_PROOF_SHA="dryrun-${name}-proof-sha256"
     return 0
   fi
+
+  local seal_guard quiescence_guard
+  seal_guard="$(remote_execution_guard "${input_paths}${input_paths:+,}${POD_BOOTLOADER_JSON}")" \
+    || die "could not construct the sealed guard for run '${name}'"
+  quiescence_guard="$(remote_quiescence_guard)" \
+    || die "could not construct the remote quiescence guard for run '${name}'"
 
   # Write a detached launcher to the pod scratch dir (avoids nested-quote hell), then
   # start it with setsid+nohup so it survives ssh channel close. The launcher records
@@ -773,6 +1244,8 @@ run_bench() {
   run_ssh "mkdir -p '${POD_RUN_DIR}'"
   run_ssh "cat > '${pod_sh}'" <<EOF
 #!/usr/bin/env bash
+trap 'rc=\$?; printf "%s\\n" "\$rc" > "${pod_rc}"' EXIT
+set -euo pipefail
 cd '${POD_PROVER_DIR}'
 . "\$HOME/.cargo/env" 2>/dev/null || true
 export PATH=/usr/local/cuda/bin:\$PATH
@@ -786,21 +1259,35 @@ export STWO_JIT_LOG=1
 ${BENCH_ENV:+export ${BENCH_ENV}}
 export STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}'
 ${proof_export}
+${seal_guard}
+${quiescence_guard}
+printf 'pre-passed\n' > '${pod_quiescence}'
 echo \$\$ > '${pod_pgid}'
-./${BIN} ${args} > '${pod_out}' 2> '${pod_err}' &
+/proc/self/fd/9 ${args} > '${pod_out}' 2> '${pod_err}' &
 GB_PID=\$!
 echo \$GB_PID > '${pod_pid}'
 wait \$GB_PID
-echo \$? > '${pod_rc}'
 EOF
-  run_ssh "rm -f '${pod_rc}' '${pod_pid}' '${pod_pgid}'; nohup setsid bash '${pod_sh}' >/dev/null 2>&1 & echo LAUNCHED"
+  run_ssh "rm -f '${pod_rc}' '${pod_pid}' '${pod_pgid}' '${pod_quiescence}' '${pod_launcher_log}'; \
+    nohup setsid bash '${pod_sh}' >'${pod_launcher_log}' 2>&1 & echo LAUNCHED"
+  if ! remote_detached_startup_ok "$pod_pgid" "$pod_rc"; then
+    warn "run '${name}' failed its detached-launch startup contract"
+    kill_remote_process_group "$pod_pgid" \
+      || remote_process_group_gone "$pod_pgid" \
+      || warn "run '${name}' startup left an unverified process group"
+    run_ssh "cat '${pod_out}' 2>/dev/null" > "${base}.out" || true
+    run_ssh "cat '${pod_err}' 2>/dev/null" > "${base}.err" || true
+    run_ssh "cat '${pod_launcher_log}' 2>/dev/null" > "${base}.startup.log" || true
+    LAST_OUT="${base}.out"; LAST_RC=STARTUP_CONTRACT
+    return 0
+  fi
 
   # Poll until the rc sentinel appears. Each poll is ONE ssh round-trip that reports
   # completion, the run's stderr size, and the GPU utilization. Today's failure mode
   # was "process alive forever, zero output": if (stderr size, gpu util) is frozen for
   # STALL_SECS, the run is declared stalled — evidence captured, process group killed,
   # LAST_RC=STALLED. MAX_WAIT stays as the hard backstop.
-  local waited=0 last_sig="__init__" stall_at now st err_size gpu_util sig
+  local waited=0 last_sig="__init__" stall_at now st err_size gpu_util sig timed_out=0
   stall_at="$(date +%s)"
   while true; do
     st="$(run_ssh "if [ -f '${pod_rc}' ]; then echo DONE; fi; \
@@ -826,9 +1313,8 @@ EOF
                echo '--- last 30 stderr lines ---'; tail -n 30 '${pod_err}' 2>/dev/null; true" \
         > "$stall_file" || true
       # Kill the whole process group (launcher is the setsid session leader).
-      run_ssh "pgid=\$(cat '${pod_pgid}' 2>/dev/null); \
-               if [ -n \"\$pgid\" ]; then kill -TERM -\"\$pgid\" 2>/dev/null; sleep 3; \
-               kill -KILL -\"\$pgid\" 2>/dev/null; fi; true" || true
+      kill_remote_process_group "$pod_pgid" \
+        || warn "run '${name}' process group remained after TERM/KILL"
       run_ssh "cat '${pod_out}' 2>/dev/null" > "${base}.out" || true
       run_ssh "cat '${pod_err}' 2>/dev/null" > "${base}.err" || true
       LAST_OUT="${base}.out"; LAST_RC="STALLED"; LAST_STALL_FILE="$stall_file"
@@ -839,6 +1325,9 @@ EOF
     waited=$(( waited + POLL_INTERVAL ))
     if (( waited >= MAX_WAIT )); then
       warn "run '${name}' exceeded MAX_WAIT (${MAX_WAIT}s). Fetching partial output."
+      timed_out=1
+      kill_remote_process_group "$pod_pgid" \
+        || warn "run '${name}' process group remained after TERM/KILL"
       break
     fi
     sleep "$POLL_INTERVAL"
@@ -849,8 +1338,17 @@ EOF
   run_ssh "cat '${pod_err}' 2>/dev/null" > "${base}.err" || true
   run_ssh "cat '${pod_rc}'  2>/dev/null" > "${base}.rc"  || true
   LAST_RC="$(cat "${base}.rc" 2>/dev/null || echo TIMEOUT)"
+  [[ "$timed_out" == "0" ]] || LAST_RC=TIMEOUT
   [[ -n "$LAST_RC" ]] || LAST_RC="TIMEOUT"
   LAST_OUT="${base}.out"
+  if [[ "$LAST_RC" == "0" ]] \
+     && [[ "$(run_ssh "cat '${pod_quiescence}' 2>/dev/null" 2>/dev/null || true)" == "pre-passed" ]] \
+     && remote_process_group_gone "$pod_pgid" \
+     && run_ssh "$(remote_quiescence_guard)"; then
+    LAST_REMOTE_QUIESCENCE_PASSED=true
+  elif [[ "$LAST_RC" == "0" ]]; then
+    LAST_RC=REMOTE_QUIESCENCE_CONTRACT
+  fi
   if [[ "$BENCH_PROOF_HASHES" == "1" && "$LAST_RC" == "0" ]]; then
     LAST_PROOF_SHA="$(run_ssh "sha256sum '${pod_proof}'" | cut -d' ' -f1)"
   fi
@@ -893,8 +1391,14 @@ PY
 # The binary accepts flags by manual lookup, so an older binary can ignore an
 # unknown architecture flag and still exit zero. Validate the primary record too.
 architecture_contract_ok() {
-  python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE" \
-    --soundness-gate "$LOCAL_SOUNDNESS_GATE"
+  local out="$1" expected_program="${2:-}" expected_reps="${3:-}" expected_gpu="${4:-}"
+  local -a measurement_args=()
+  if [[ -n "$expected_program" ]]; then
+    measurement_args=(--expected-program "$expected_program" --expected-reps "$expected_reps")
+    [[ -z "$expected_gpu" ]] || measurement_args+=(--expected-gpu "$expected_gpu")
+  fi
+  python3 "$ARCHITECTURE_CHECK" "$out" --runtime-mode "$GPU_PCS_RUNTIME_MODE" \
+    --soundness-gate "$LOCAL_SOUNDNESS_GATE" "${measurement_args[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -908,6 +1412,8 @@ append_ledger() {
   LB_RUN="$run_name" LB_STATUS="$status" LB_OUT="$out_file" LB_ERR="$err_file" \
   LB_BENCH_ENV="$BENCH_ENV" LB_STALL="${LAST_STALL_FILE:-}" \
   LB_PROOF_SHA="$LAST_PROOF_SHA" LB_PROBE="$QUALIFICATION_PROBE" \
+  LB_REMOTE_QUIESCENCE="$LAST_REMOTE_QUIESCENCE_PASSED" \
+  LB_DRY_RUN="$DRY_RUN" \
   LB_SOUNDNESS_PATH="${LOCAL_SOUNDNESS_GATE:-}" LB_SOUNDNESS_SHA="$LOCAL_SOUNDNESS_GATE_SHA" \
   LB_LEDGER="$LEDGER" python3 - <<'PY'
 import os, json
@@ -941,7 +1447,19 @@ def parse_lines(path):
     return record, pipeline, phases
 
 record, pipeline, phases = parse_lines(os.environ.get("LB_OUT", ""))
+execution_target, source_projection = None, None
+execution_target_sha256 = None
+soundness_path = os.environ.get("LB_SOUNDNESS_PATH", "")
+if soundness_path:
+    with open(soundness_path, encoding="utf-8") as stream:
+        soundness = json.load(stream)
+    execution_target = soundness.get("execution_target")
+    execution_target_sha256 = soundness.get("execution_target_sha256")
+    source_projection = soundness.get("source_projection")
 is_provisional = os.environ.get("LB_PROBE") == "1" or run in ("gate_correctness", "gate_failed")
+performance_admissible = (
+    not is_provisional and status == "ok" and os.environ.get("LB_DRY_RUN") != "1"
+)
 
 # The comparison metric: sustained useful MHz for a pipelined (fleet) run, else the
 # warm-sample median for a fixed statement. Legacy warm-best useful_mhz is retained
@@ -954,7 +1472,7 @@ def metric_of(rec, pipe):
     return None, None
 
 new_metric, new_basis = metric_of(record, pipeline)
-if is_provisional:
+if not performance_admissible:
     new_metric, new_basis = None, None
 
 # Find the previous OK entry for the SAME run_name, SAME pod_gpu, and SAME bench_env.
@@ -972,6 +1490,7 @@ try:
             except json.JSONDecodeError:
                 continue
             if (e.get("run_name") == run and e.get("pod_gpu") == gpu
+                    and e.get("execution_target") == execution_target
                     and e.get("status", "ok") == "ok"
                     and not e.get("provisional", False)
                     and e.get("bench_env", "") == benv):
@@ -994,9 +1513,14 @@ entry = {
     "proof_sha256": os.environ.get("LB_PROOF_SHA", ""),
     "qualification_probe": os.environ.get("LB_PROBE") == "1",
     "provisional": is_provisional,
-    "performance_admissible": not is_provisional,
+    "performance_admissible": performance_admissible,
     "soundness_gate_path": os.environ.get("LB_SOUNDNESS_PATH", ""),
     "soundness_gate_sha256": os.environ.get("LB_SOUNDNESS_SHA", ""),
+    "execution_target": execution_target,
+    "execution_target_sha256": execution_target_sha256,
+    "source_projection": source_projection,
+    "execution_guard_passed": status == "ok",
+    "remote_quiescence_passed": status == "ok" and os.environ.get("LB_REMOTE_QUIESCENCE") == "true",
     "mhz_basis": new_basis,
     "record": record,
     "phase_totals": phases,
@@ -1051,11 +1575,12 @@ if [[ "$SKIP_SYNC" == "1" ]]; then
 else
   sync_repos
   build_pod
+  seal_gpu_bench
 fi
 
-if ! run_cuda_soundness_gate; then
-  die "counted CUDA soundness suite failed — refusing to launch the proof gate."
-fi
+# Keep this as a simple command: invoking a function under `if !` disables
+# errexit inside it, which could turn a failed remote launch into a 3h poll.
+run_cuda_soundness_gate
 
 # Abort helper for a stalled run: self-documenting ledger entry with evidence, then die.
 abort_stalled() {
@@ -1069,14 +1594,16 @@ abort_stalled() {
 # BENCH_ENV for every run including this one).
 GATE_ARGS="--pie ${POD_GATE_PIE} --backend cuda ${GPU_NATIVE_ARGS} --reps 2 --reuse-input --require-proof-byte-equal"
 log "=== CORRECTNESS GATE: ${POD_GATE_PIE} CUDA prove+verify ==="
-run_bench "gate_correctness" "$GATE_ARGS"
+run_bench "gate_correctness" "$GATE_ARGS" "$POD_GATE_PIE"
+validate_remote_execution_target
 if [[ "$LAST_RC" == "STALLED" ]]; then
   abort_stalled "gate_correctness"
 fi
 if [[ "$LAST_RC" == "0" ]] && ! gate_contract_ok "$LAST_OUT"; then
   LAST_RC="GATE_CONTRACT"
 fi
-if [[ "$LAST_RC" == "0" ]] && ! architecture_contract_ok "$LAST_OUT"; then
+if [[ "$LAST_RC" == "0" ]] \
+   && ! architecture_contract_ok "$LAST_OUT" "SN_PIE_2.zip" 2 "$POD_GPU"; then
   LAST_RC="ARCHITECTURE_CONTRACT"
 fi
 if [[ "$LAST_RC" != "0" ]]; then
@@ -1093,26 +1620,27 @@ if [[ "$GATE_ONLY" == "1" ]]; then
 fi
 
 # Build the benchmark run list.
-declare -a RUN_NAMES RUN_ARGS
-add_run() { RUN_NAMES+=("$1"); RUN_ARGS+=("$2"); }
+declare -a RUN_NAMES RUN_ARGS RUN_INPUTS
+add_run() { RUN_NAMES+=("$1"); RUN_ARGS+=("$2"); RUN_INPUTS+=("$3"); }
 
 SEL_PATH="$(pie_path "$PIE_SEL")"
 SEL_NAME="$(pie_name "$PIE_SEL")"
-add_run "$SEL_NAME" "--pie ${SEL_PATH} --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal"
+add_run "$SEL_NAME" "--pie ${SEL_PATH} --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal" "$SEL_PATH"
 
 if [[ "$SIMD" == "1" ]]; then
-  add_run "${SEL_NAME}_simd" "--pie ${SEL_PATH} --backend simd --reps ${REPS} --reuse-input --require-proof-byte-equal"
+  add_run "${SEL_NAME}_simd" "--pie ${SEL_PATH} --backend simd --reps ${REPS} --reuse-input --require-proof-byte-equal" "$SEL_PATH"
 fi
 
 if [[ "$ALL_PIES" == "1" || "$FULL" == "1" ]]; then
   for s in 1 3 4; do
     nm="$(pie_name "$s")"
     [[ "$nm" == "$SEL_NAME" ]] && continue   # already queued as the selected PIE
-    add_run "$nm" "--pie $(pie_path "$s") --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal"
+    pie="$(pie_path "$s")"
+    add_run "$nm" "--pie ${pie} --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal" "$pie"
   done
   if [[ "$FULL" == "1" ]]; then
     FLEET_LIST="${POD_SN_DIR}/SN_PIE_1.zip,${POD_SN_DIR}/SN_PIE_2.zip,${POD_SN_DIR}/SN_PIE_3.zip,${POD_SN_DIR}/SN_PIE_4.zip"
-    add_run "SN_fleet_rotate" "--pie ${FLEET_LIST} --backend cuda ${GPU_NATIVE_ARGS} --reps ${FLEET_REPS} --pipeline ${FLEET_DEPTH} --producers ${FLEET_PRODUCERS} --pie-mode rotate"
+    add_run "SN_fleet_rotate" "--pie ${FLEET_LIST} --backend cuda ${GPU_NATIVE_ARGS} --reps ${FLEET_REPS} --pipeline ${FLEET_DEPTH} --producers ${FLEET_PRODUCERS} --pie-mode rotate" "$FLEET_LIST"
   fi
 fi
 
@@ -1122,14 +1650,19 @@ echo "=== bench_loop summary (${TS}) — pod ${POD_GPU} ==="
 echo "    revs: stwo=${STWO_REV:0:8}${STWO_DIRTY:+(${STWO_DIRTY})} cairo=${CAIRO_REV:0:8}${CAIRO_DIRTY:+(${CAIRO_DIRTY})}"
 [[ -n "$BENCH_ENV" ]] && echo "    bench_env(!): ${BENCH_ENV}  — NOT comparable with clean runs"
 for idx in "${!RUN_NAMES[@]}"; do
-  nm="${RUN_NAMES[$idx]}"; ar="${RUN_ARGS[$idx]}"
-  run_bench "$nm" "$ar"
+  nm="${RUN_NAMES[$idx]}"; ar="${RUN_ARGS[$idx]}"; input_paths="${RUN_INPUTS[$idx]}"
+  run_bench "$nm" "$ar" "$input_paths"
+  validate_remote_execution_target
   if [[ "$LAST_RC" == "STALLED" ]]; then
     abort_stalled "$nm"
   fi
-  if [[ "$LAST_RC" == "0" && "$ar" == *"--require-gpu-native-architecture"* ]] \
-     && ! architecture_contract_ok "$LAST_OUT"; then
-    LAST_RC="ARCHITECTURE_CONTRACT"
+  if [[ "$LAST_RC" == "0" && "$ar" == *"--require-gpu-native-architecture"* ]]; then
+    if [[ "$nm" == SN_PIE_[1-4] ]]; then
+      architecture_contract_ok "$LAST_OUT" "${nm}.zip" "$REPS" "$POD_GPU" \
+        || LAST_RC="ARCHITECTURE_CONTRACT"
+    elif ! architecture_contract_ok "$LAST_OUT"; then
+      LAST_RC="ARCHITECTURE_CONTRACT"
+    fi
   fi
   if [[ "$LAST_RC" == "0" && "$ar" == *"--require-proof-byte-equal"* ]] \
      && ! gate_contract_ok "$LAST_OUT" "$REPS"; then

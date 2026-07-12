@@ -30,6 +30,7 @@ use reference_cache::{cached_reference_felts, serialize_felts};
 // one real `generic_opcode` row. Keep that statement as the generic-writer oracle;
 // strict resident parity uses this broad, capture-safe opcode + Poseidon statement.
 const STRICT_RESIDENT_FIXTURE: &str = "test_prove_verify_sn2_profile";
+const UNCHANGED_REFERENCE_TAG: &str = "shared";
 
 fn resident_input() -> ProverInput {
     run_and_adapt(
@@ -172,7 +173,7 @@ fn strict_resident_cold_and_warm_proofs_match_simd_bytes() {
 
     let expected = cached_reference_felts(
         STRICT_RESIDENT_FIXTURE,
-        "cold-warm",
+        UNCHANGED_REFERENCE_TAG,
         reference_input,
         params,
     );
@@ -235,7 +236,7 @@ fn strict_resident_same_shape_changed_memory_matches_second_simd_proof() {
 
     let expected_first = cached_reference_felts(
         STRICT_RESIDENT_FIXTURE,
-        "changed-memory-first",
+        UNCHANGED_REFERENCE_TAG,
         first,
         params,
     );
@@ -287,8 +288,12 @@ fn strict_resident_poseidon_graph_a_matches_simd_bytes() {
         .prove_resident_blake2s(resident_input(), params)
         .unwrap();
 
-    let expected =
-        cached_reference_felts(STRICT_RESIDENT_FIXTURE, "shared", reference_input, params);
+    let expected = cached_reference_felts(
+        STRICT_RESIDENT_FIXTURE,
+        UNCHANGED_REFERENCE_TAG,
+        reference_input,
+        params,
+    );
     assert_eq!(
         expected,
         serialize_felts(&actual),
@@ -342,8 +347,12 @@ fn strict_resident_mirrored_transcript_matches_host_channel() {
             .unwrap(),
     );
 
-    let expected =
-        cached_reference_felts(STRICT_RESIDENT_FIXTURE, "shared", reference_input, params);
+    let expected = cached_reference_felts(
+        STRICT_RESIDENT_FIXTURE,
+        UNCHANGED_REFERENCE_TAG,
+        reference_input,
+        params,
+    );
 
     for round in 0..3 {
         let mirrored = match first_mirrored.take() {

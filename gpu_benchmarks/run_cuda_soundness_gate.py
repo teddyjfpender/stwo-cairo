@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 RESULT = re.compile(r"test result: ok\. (\d+) passed;")
-TEST_OK = re.compile(r"(?m)^test ([^ ]+) \.\.\. ok$")
+TEST_STARTED = re.compile(r"(?m)^test ([^ ]+) \.\.\.(?: |$)")
 
 RESIDENT_FIXTURE = re.compile(r'STRICT_RESIDENT_FIXTURE: &str = "([^"]+)"')
 
@@ -36,6 +36,7 @@ QUALIFICATION_FLAGS = (
     "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE",
     "STWO_CUDA_COMPOSITION_DIRECT_RETENTION",
     "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
+    "STWO_CUDA_B2N_STAGE_FUSED",
 )
 
 REFERENCE_CACHE_SOURCE_ENV = (
@@ -44,6 +45,8 @@ REFERENCE_CACHE_SOURCE_ENV = (
     "STWO_PARITY_REF_STWO_CAIRO_HEAD",
     "STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH",
 )
+
+REMOTE_EXECUTION_TARGET_SCHEMA = "stwo.remote-execution-target.v1"
 
 
 GATES = (
@@ -140,6 +143,19 @@ GATES = (
         1,
     ),
     (
+        "prepared_interpolation_fused_exact_alias_reference",
+        (
+            "cargo",
+            "test",
+            "-p",
+            "stwo-backend-cuda",
+            "--test",
+            "prepared_interpolation_native",
+        ),
+        # Logs 1..30, mixed aliased/distinct columns, eager/capture/mutation.
+        1,
+    ),
+    (
         "prepared_relation_eager_capture_reference",
         (
             "cargo",
@@ -149,9 +165,9 @@ GATES = (
             "--test",
             "prepared_relation_native",
         ),
-        # 2x2 launch-mode matrix: {ThreeStage, Fused} bodies x {Segmented,
-        # Scan} tails, each eager/captured/mutated-replay byte-identical.
-        4,
+        # 2x2 launch-mode matrix plus compact fused implicit-launch parity;
+        # every case covers eager/captured/mutated replay byte identity.
+        5,
     ),
     (
         "prepared_witness_eager_capture_cpu_reference",
@@ -349,7 +365,7 @@ def run_gate(stwo: Path, name: str, command: tuple[str, ...], expected: int) -> 
     required_test_names = (
         STRICT_RESIDENT_REQUIRED_TESTS if name == STRICT_RESIDENT_GATE else None
     )
-    executed_test_names = tuple(TEST_OK.findall(process.stdout))
+    executed_test_names = tuple(TEST_STARTED.findall(process.stdout))
     names_match = required_test_names is None or (
         set(executed_test_names) == set(required_test_names)
         and len(executed_test_names) == len(required_test_names)
@@ -402,6 +418,15 @@ def main() -> int:
     parser.add_argument("--synced-stwo-worktree-hash")
     parser.add_argument("--synced-stwo-cairo-head")
     parser.add_argument("--synced-stwo-cairo-worktree-hash")
+    parser.add_argument("--pod-id")
+    parser.add_argument("--gpu-bench", type=Path)
+    parser.add_argument(
+        "--input-artifact",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help="remote benchmark input to hash into the execution target",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     stwo = args.stwo.resolve()
@@ -410,6 +435,74 @@ def main() -> int:
         raise SystemExit(f"not a stwo workspace: {stwo}")
     if not (stwo_cairo / "stwo_cairo_prover" / "Cargo.toml").is_file():
         raise SystemExit(f"not a stwo-cairo workspace: {stwo_cairo}")
+
+    def sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def gpu_property(name: str) -> str:
+        value = subprocess.run(
+            ("nvidia-smi", f"--query-gpu={name}", "--format=csv,noheader"),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout.splitlines()
+        if not value or not value[0].strip():
+            raise SystemExit(f"nvidia-smi did not report {name}")
+        return value[0].strip()
+
+    sealed_mode = bool(args.pod_id or args.gpu_bench or args.input_artifact)
+    if sealed_mode and (not args.pod_id or args.gpu_bench is None or not args.input_artifact):
+        raise SystemExit(
+            "sealed execution requires --pod-id, --gpu-bench, and --input-artifact"
+        )
+    gpu_bench = args.gpu_bench.resolve() if args.gpu_bench is not None else None
+    if sealed_mode and (gpu_bench is None or not gpu_bench.is_file()):
+        raise SystemExit(f"gpu_bench binary does not exist: {gpu_bench}")
+    input_paths: dict[str, Path] = {}
+    for item in args.input_artifact:
+        label, separator, raw_path = item.partition("=")
+        if not separator or not label or label in input_paths:
+            raise SystemExit(f"invalid or duplicate --input-artifact: {item!r}")
+        path = Path(raw_path).resolve()
+        if not path.is_file():
+            raise SystemExit(f"input artifact does not exist: {path}")
+        input_paths[label] = path
+    if sealed_mode and not input_paths:
+        raise SystemExit("at least one --input-artifact is required")
+    boot_id_path = Path("/proc/sys/kernel/random/boot_id")
+
+    def capture_execution_target() -> dict[str, object]:
+        if gpu_bench is None or args.pod_id is None:
+            raise RuntimeError("sealed execution target is not configured")
+        boot_id = boot_id_path.read_text(encoding="utf-8").strip()
+        if not boot_id:
+            raise RuntimeError(f"empty pod boot id: {boot_id_path}")
+        inputs = {
+            label: {"path": str(path), "sha256": sha256_file(path)}
+            for label, path in sorted(input_paths.items())
+        }
+        return {
+            "schema": REMOTE_EXECUTION_TARGET_SCHEMA,
+            "pod_id": args.pod_id,
+            "boot_id": boot_id,
+            "gpu_uuid": gpu_property("uuid"),
+            "gpu_name": gpu_property("name"),
+            "gpu_bench": {"path": str(gpu_bench), "sha256": sha256_file(gpu_bench)},
+            "inputs": inputs,
+        }
+
+    def canonical_sha256(value: object) -> str:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    execution_target = capture_execution_target() if sealed_mode else None
 
     def git_state(repo: Path) -> tuple[str | None, bool, str]:
         head = subprocess.run(
@@ -483,7 +576,12 @@ def main() -> int:
         raise SystemExit("reference-cache source identity requires runner-validated synced source")
 
     artifact = {
-        "schema": "stwo.cuda.soundness-gate.v2",
+        "schema": (
+            "stwo.cuda.soundness-gate.v3"
+            if sealed_mode
+            else "stwo.cuda.soundness-gate.v2"
+        ),
+        "dry_run": False,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "stwo": str(stwo),
         "stwo_git_head": stwo_head,
@@ -520,6 +618,15 @@ def main() -> int:
         "gates": [],
         "passed": False,
     }
+    if sealed_mode:
+        artifact.update(
+            {
+                "execution_target": execution_target,
+                "execution_target_sha256": canonical_sha256(execution_target),
+                "execution_target_postcheck": False,
+                "source_projection": None,
+            }
+        )
     try:
         for name, command, expected in gates_for_runtime_mode(args.runtime_mode):
             gate = run_gate(stwo, name, command, expected)
@@ -531,8 +638,22 @@ def main() -> int:
                 )
         artifact["passed"] = True
     finally:
+        if sealed_mode:
+            try:
+                post_target = capture_execution_target()
+                artifact["execution_target_postcheck"] = post_target == execution_target
+                if not artifact["execution_target_postcheck"]:
+                    artifact["passed"] = False
+                    artifact["execution_target_postcheck_error"] = (
+                        "pod, GPU, sealed binary, or input identity changed during soundness"
+                    )
+            except Exception as error:  # preserve an artifact for infrastructure failures.
+                artifact["passed"] = False
+                artifact["execution_target_postcheck_error"] = str(error)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(artifact, indent=2) + "\n")
+    if sealed_mode and artifact["execution_target_postcheck"] is not True:
+        raise RuntimeError(artifact["execution_target_postcheck_error"])
     print(json.dumps(artifact, separators=(",", ":")))
     return 0
 

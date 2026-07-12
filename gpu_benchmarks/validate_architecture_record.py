@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
+import statistics
 import sys
 from pathlib import Path
 from typing import Any
 
 from run_cuda_soundness_gate import (
     GATES as CUDA_SOUNDNESS_GATE_COMMANDS,
+    QUALIFICATION_FLAGS,
     STRICT_RESIDENT_GATE,
     STRICT_RESIDENT_REQUIRED_TESTS,
     gates_for_runtime_mode,
@@ -37,6 +41,74 @@ SOUNDNESS_COMMANDS = {
     name: list(command) for name, command, _required in CUDA_SOUNDNESS_GATE_COMMANDS
 }
 
+PREFLIGHT_CAP_BYTES = 81_604_378_624
+RETAINED_BUDGET_FLAG = "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES"
+UNIVERSAL_ENV = (
+    "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE=1 "
+    "STWO_CUDA_B2N_STAGE_FUSED=1 "
+    "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES=4563402752"
+)
+SN2_HEADLINE_ENV = (
+    "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE=1 "
+    "STWO_CUDA_COMPOSITION_DIRECT_RETENTION=1 "
+    "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=1 "
+    "STWO_CUDA_B2N_STAGE_FUSED=1 "
+    "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES=29469326848"
+)
+QUALIFICATION_PROFILES = {
+    "flags_off": "",
+    "universal_sn1_sn4": UNIVERSAL_ENV,
+    "sn2_headline": SN2_HEADLINE_ENV,
+}
+
+FLAGS_OFF_POLICY = {
+    "commit_mode": "FullLifting",
+    "direct_composition_retention_mode": "Disabled",
+    "quotient_numerator_source_policy": "CoefficientsOnly",
+    "interpolation_mode": "StageWiseCopyThenInPlace",
+    "relation_launch_mode": "Fused",
+    "retained_lde_budget_bytes": 8_589_934_592,
+}
+UNIVERSAL_POLICY = {
+    "commit_mode": "DomainProgressive",
+    "direct_composition_retention_mode": "Disabled",
+    "quotient_numerator_source_policy": "CoefficientsOnly",
+    "interpolation_mode": "StageFusedOutOfPlace",
+    "relation_launch_mode": "Fused",
+    "retained_lde_budget_bytes": 4_563_402_752,
+}
+HEADLINE_POLICY = {
+    "commit_mode": "DomainProgressive",
+    "direct_composition_retention_mode": "ExactNative",
+    "quotient_numerator_source_policy": "ReuseRetainedEvaluations",
+    "interpolation_mode": "StageFusedOutOfPlace",
+    "relation_launch_mode": "Fused",
+    "retained_lde_budget_bytes": 29_469_326_848,
+}
+PREFLIGHT_SPECS = {
+    "preflight_flags_off_SN2.json": ("SN_PIE_2.adapted.bin", FLAGS_OFF_POLICY),
+    **{
+        f"preflight_universal_SN{pie}.json": (
+            f"SN_PIE_{pie}.adapted.bin",
+            UNIVERSAL_POLICY,
+        )
+        for pie in range(1, 5)
+    },
+    "preflight_sn2_headline.json": ("SN_PIE_2.adapted.bin", HEADLINE_POLICY),
+}
+ADAPTER_REPRODUCTION_KEYS = {
+    "byte_equal",
+    "gpu_bench_binary_sha256",
+    "raw_input_manifest_sha256",
+    "bootloader_sha256",
+    "pinned_adapted_manifest_sha256",
+}
+RAW_INPUT_NAMES = {
+    *(f"SN_PIE_{pie}.zip" for pie in range(1, 5)),
+    "simple_bootloader_compiled.json",
+}
+ADAPTED_INPUT_NAMES = {f"SN_PIE_{pie}.adapted.bin" for pie in range(1, 5)}
+
 
 def load_main_record(path: Path) -> dict[str, Any]:
     record = None
@@ -61,12 +133,304 @@ def load_soundness_gate(path: Path) -> dict[str, Any]:
     return artifact
 
 
+def _is_lower_hex(value: object, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _is_sha256(value: object) -> bool:
+    return _is_lower_hex(value, 64)
+
+
+def _valid_source_identity(source: object) -> bool:
+    if not isinstance(source, dict) or set(source) != {"stwo", "stwo_cairo"}:
+        return False
+    for repo in ("stwo", "stwo_cairo"):
+        value = source.get(repo)
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"head", "worktree_hash"}
+            or not _is_lower_hex(value.get("head"), 40)
+            or not _is_sha256(value.get("worktree_hash"))
+        ):
+            return False
+    return True
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _check_file_hash(
+    path: Path, expected: object, label: str, errors: list[str]
+) -> str | None:
+    if not _is_sha256(expected):
+        errors.append(f"{label}: invalid SHA-256")
+        return None
+    try:
+        actual = _sha256_file(path)
+    except OSError as error:
+        errors.append(f"{label}: {error}")
+        return None
+    if actual != expected:
+        errors.append(f"{label}: SHA-256 mismatch")
+    return actual
+
+
+def _manifest(
+    path: Path, expected_names: set[str], label: str, errors: list[str]
+) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        errors.append(f"{label}: {error}")
+        return entries
+    for line_number, line in enumerate(lines, 1):
+        fields = line.split()
+        if len(fields) != 2 or not _is_sha256(fields[0]) or fields[1] in entries:
+            errors.append(f"{label}: invalid entry at line {line_number}")
+            continue
+        entries[fields[1]] = fields[0]
+    if set(entries) != expected_names:
+        errors.append(f"{label}: file set is not exact")
+    return entries
+
+
+def _resolved_reference(path: object, base: Path) -> Path | None:
+    if not isinstance(path, str) or not path:
+        return None
+    reference = Path(path)
+    return (reference if reference.is_absolute() else base / reference).resolve()
+
+
+def validate_local_admission(
+    admission: dict[str, Any],
+    admission_path: Path,
+    *,
+    expected_source: dict[str, Any],
+    expected_dry_run: bool,
+    gpu_bench_binary: Path,
+    raw_input_manifest: Path,
+    bootloader: Path,
+    pinned_adapted_manifest: Path,
+    required_runtime_mode: str = "arena-graph",
+) -> list[str]:
+    """Validate the complete local capacity/input admission before pod contact."""
+
+    errors: list[str] = []
+    if required_runtime_mode != "arena-graph":
+        errors.append("local admission: release runtime must be arena-graph")
+    if not _valid_source_identity(expected_source):
+        errors.append("local admission: expected source identity is invalid")
+    if admission.get("schema") != "stwo.local-preflight-admission.v1":
+        errors.append("local admission: wrong schema")
+    if admission.get("passed") is not True:
+        errors.append("local admission: did not pass")
+    if admission.get("dry_run") is not expected_dry_run:
+        errors.append("local admission: dry-run state mismatch")
+    if admission.get("runtime_mode") != required_runtime_mode:
+        errors.append("local admission: runtime mode mismatch")
+    if admission.get("source") != expected_source:
+        errors.append("local admission: source mismatch")
+    if admission.get("profiles") != QUALIFICATION_PROFILES:
+        errors.append("local admission: profile map is not exact")
+    if admission.get("preflight_ceiling_bytes") != PREFLIGHT_CAP_BYTES:
+        errors.append("local admission: preflight ceiling mismatch")
+
+    reproduction = admission.get("adapter_reproduction")
+    if not isinstance(reproduction, dict):
+        errors.append("local admission: adapter reproduction contract is not exact")
+        reproduction = {}
+    elif set(reproduction) != ADAPTER_REPRODUCTION_KEYS:
+        errors.append("local admission: adapter reproduction contract is not exact")
+    if reproduction.get("byte_equal") is not True:
+        errors.append("local admission: adapter reproduction is not byte-equal")
+
+    root = admission_path.resolve().parent
+    preflight_hashes = admission.get("preflight_artifact_sha256")
+    if not isinstance(preflight_hashes, dict):
+        errors.append("local admission: preflight artifact set is not exact")
+        preflight_hashes = {}
+    elif set(preflight_hashes) != set(PREFLIGHT_SPECS):
+        errors.append("local admission: preflight artifact set is not exact")
+
+    adapted_manifest_path = _resolved_reference(
+        admission.get("adapted_input_manifest"), root
+    )
+    if adapted_manifest_path is None:
+        errors.append("local admission: adapted manifest path is absent")
+        adapted_manifest: dict[str, str] = {}
+    else:
+        _check_file_hash(
+            adapted_manifest_path,
+            admission.get("adapted_input_manifest_sha256"),
+            "adapted manifest",
+            errors,
+        )
+        adapted_manifest = _manifest(
+            adapted_manifest_path,
+            ADAPTED_INPUT_NAMES,
+            "adapted manifest",
+            errors,
+        )
+
+    _check_file_hash(
+        raw_input_manifest,
+        reproduction.get("raw_input_manifest_sha256"),
+        "raw input manifest",
+        errors,
+    )
+    raw_manifest = _manifest(
+        raw_input_manifest, RAW_INPUT_NAMES, "raw input manifest", errors
+    )
+    bootloader_sha = _check_file_hash(
+        bootloader,
+        reproduction.get("bootloader_sha256"),
+        "bootloader",
+        errors,
+    )
+    if bootloader_sha is not None and raw_manifest.get(bootloader.name) != bootloader_sha:
+        errors.append("raw input manifest: bootloader digest mismatch")
+
+    _check_file_hash(
+        pinned_adapted_manifest,
+        reproduction.get("pinned_adapted_manifest_sha256"),
+        "pinned adapted manifest",
+        errors,
+    )
+    pinned_manifest = _manifest(
+        pinned_adapted_manifest,
+        ADAPTED_INPUT_NAMES,
+        "pinned adapted manifest",
+        errors,
+    )
+    if adapted_manifest != pinned_manifest:
+        errors.append("adapted manifest: does not match pinned manifest")
+
+    _check_file_hash(
+        gpu_bench_binary,
+        reproduction.get("gpu_bench_binary_sha256"),
+        "gpu_bench binary",
+        errors,
+    )
+
+    for artifact_name, (input_name, expected_policy) in PREFLIGHT_SPECS.items():
+        artifact_path = root / artifact_name
+        _check_file_hash(
+            artifact_path,
+            preflight_hashes.get(artifact_name),
+            artifact_name,
+            errors,
+        )
+        try:
+            record = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            errors.append(f"{artifact_name}: {error}")
+            continue
+        if not isinstance(record, dict):
+            errors.append(f"{artifact_name}: artifact is not an object")
+            continue
+        arena = record.get("arena") or {}
+        if not isinstance(arena, dict):
+            errors.append(f"{artifact_name}: arena is not an object")
+            arena = {}
+        arena_bytes = arena.get("total_bytes")
+        if (
+            record.get("pass") is not True
+            or record.get("vram_fit") is not True
+            or record.get("vram_budget_bytes") != PREFLIGHT_CAP_BYTES
+            or not isinstance(arena_bytes, int)
+            or isinstance(arena_bytes, bool)
+            or not 0 <= arena_bytes <= PREFLIGHT_CAP_BYTES
+            or record.get("runtime_policy") != expected_policy
+        ):
+            errors.append(f"{artifact_name}: preflight contract mismatch")
+        source = _resolved_reference(record.get("source"), artifact_path.parent)
+        if source is None or source.name != input_name:
+            errors.append(f"{artifact_name}: adapted input mismatch")
+            continue
+        _check_file_hash(
+            source,
+            adapted_manifest.get(input_name),
+            f"{artifact_name} adapted input",
+            errors,
+        )
+    return errors
+
+
+def _validate_remote_execution_target(artifact: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    target = artifact.get("execution_target")
+    if not isinstance(target, dict) or set(target) != {
+        "schema", "pod_id", "boot_id", "gpu_uuid", "gpu_name", "gpu_bench", "inputs"
+    }:
+        errors.append("soundness artifact: invalid remote execution target shape")
+        target = {}
+    if target.get("schema") != "stwo.remote-execution-target.v1":
+        errors.append("soundness artifact: invalid remote execution target schema")
+    for field in ("pod_id", "boot_id", "gpu_uuid", "gpu_name"):
+        value = target.get(field)
+        if not isinstance(value, str) or not value or "\n" in value:
+            errors.append(f"soundness artifact execution target: invalid {field}")
+    binary = target.get("gpu_bench")
+    if (
+        not isinstance(binary, dict)
+        or set(binary) != {"path", "sha256"}
+        or not isinstance(binary.get("path"), str)
+        or not binary.get("path", "").startswith("/")
+        or not _is_sha256(binary.get("sha256"))
+        or not binary.get("path", "").endswith(f"/sealed/gpu_bench.{binary.get('sha256')}")
+    ):
+        errors.append("soundness artifact execution target: invalid sealed gpu_bench")
+    inputs = target.get("inputs")
+    if not isinstance(inputs, dict) or not inputs:
+        errors.append("soundness artifact execution target: no inputs")
+    else:
+        for label, value in inputs.items():
+            if (
+                not isinstance(label, str)
+                or not label
+                or not isinstance(value, dict)
+                or set(value) != {"path", "sha256"}
+                or not isinstance(value.get("path"), str)
+                or not value.get("path", "").startswith("/")
+                or not _is_sha256(value.get("sha256"))
+            ):
+                errors.append(f"soundness artifact execution target: invalid input {label!r}")
+    encoded = json.dumps(
+        target, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    if artifact.get("execution_target_sha256") != hashlib.sha256(encoded).hexdigest():
+        errors.append("soundness artifact: execution target hash mismatch")
+    if artifact.get("execution_target_postcheck") is not True:
+        errors.append("soundness artifact: execution target postcheck did not pass")
+    projection = artifact.get("source_projection")
+    if (
+        not isinstance(projection, dict)
+        or set(projection) != {"method", "verified_after_soundness", "source"}
+        or projection.get("method") != "rsync-archive-checksum-dry-run-clean"
+        or projection.get("verified_after_soundness") is not True
+        or not _valid_source_identity(projection.get("source"))
+    ):
+        errors.append("soundness artifact: source projection was not verified")
+    return errors
+
+
 def validate_soundness_gate(
     artifact: dict[str, Any], required_mode: str | None = None
 ) -> list[str]:
     errors: list[str] = []
-    if artifact.get("schema") != "stwo.cuda.soundness-gate.v2":
-        errors.append(f"soundness schema: got {artifact.get('schema')!r}")
+    schema = artifact.get("schema")
+    if schema not in {"stwo.cuda.soundness-gate.v2", "stwo.cuda.soundness-gate.v3"}:
+        errors.append(f"soundness schema: got {schema!r}")
     if artifact.get("passed") is not True:
         errors.append("soundness artifact did not pass")
     runtime_mode = artifact.get("runtime_mode")
@@ -97,6 +461,8 @@ def validate_soundness_gate(
         value = artifact.get(field)
         if not isinstance(value, str) or len(value) != 64:
             errors.append(f"soundness artifact {field}: expected a 64-character source hash")
+    if schema == "stwo.cuda.soundness-gate.v3":
+        errors.extend(_validate_remote_execution_target(artifact))
     names: set[str] = set()
     for index, gate in enumerate(gates):
         if not isinstance(gate, dict):
@@ -148,6 +514,58 @@ def validate_soundness_gate(
         errors.append(f"soundness artifact missing gates: {sorted(missing)!r}")
     if unexpected:
         errors.append(f"soundness artifact has unexpected gates: {sorted(unexpected)!r}")
+    return errors
+
+
+def validate_qualification_soundness_gate(
+    artifact: dict[str, Any],
+    *,
+    expected_source: dict[str, Any],
+    expected_dry_run: bool,
+    required_mode: str = "arena-graph",
+) -> list[str]:
+    """Validate the counted gate plus its exact headline qualification environment."""
+
+    errors = validate_soundness_gate(artifact, required_mode)
+    if artifact.get("schema") != "stwo.cuda.soundness-gate.v3":
+        errors.append("soundness artifact: qualification requires sealed v3 schema")
+    if required_mode != "arena-graph":
+        errors.append("soundness artifact: qualification runtime must be arena-graph")
+    if not _valid_source_identity(expected_source):
+        errors.append("soundness artifact: expected source identity is invalid")
+    if artifact.get("dry_run") is not expected_dry_run:
+        errors.append("soundness artifact: dry-run state mismatch")
+    source_identity = expected_source if isinstance(expected_source, dict) else {}
+    expected_synced = {**source_identity, "transport": "rsync-archive-checksum"}
+    if artifact.get("synced_source") != expected_synced:
+        errors.append("soundness artifact: synced source mismatch")
+    projection = artifact.get("source_projection") or {}
+    if not isinstance(projection, dict) or projection.get("source") != expected_source:
+        errors.append("soundness artifact: source projection identity mismatch")
+    if artifact.get("qualification_flags") != {
+        flag: 1 for flag in QUALIFICATION_FLAGS
+    }:
+        errors.append("soundness artifact: headline flags mismatch")
+    stwo = source_identity.get("stwo") or {}
+    stwo_cairo = source_identity.get("stwo_cairo") or {}
+    if not isinstance(stwo, dict):
+        stwo = {}
+    if not isinstance(stwo_cairo, dict):
+        stwo_cairo = {}
+    expected_env = {
+        "STWO_CUDA_OBJ_CACHE": "/workspace/.cuda_obj_cache",
+        "STWO_PARITY_REF_CACHE": "/workspace/.parity_ref_cache",
+        "STWO_PARITY_REF_STWO_HEAD": stwo.get("head"),
+        "STWO_PARITY_REF_STWO_WORKTREE_HASH": stwo.get("worktree_hash"),
+        "STWO_PARITY_REF_STWO_CAIRO_HEAD": stwo_cairo.get("head"),
+        "STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH": stwo_cairo.get(
+            "worktree_hash"
+        ),
+        **{flag: "1" for flag in QUALIFICATION_FLAGS},
+        RETAINED_BUDGET_FLAG: "29469326848",
+    }
+    if artifact.get("effective_stwo_env") != expected_env:
+        errors.append("soundness artifact: effective headline environment mismatch")
     return errors
 
 
@@ -339,9 +757,96 @@ def validate_record(record: dict[str, Any], required_mode: str) -> list[str]:
     return errors
 
 
-def main() -> int:
+def validate_benchmark_measurement(
+    record: dict[str, Any],
+    *,
+    expected_program: str,
+    expected_reps: int,
+    expected_gpu: str | None = None,
+) -> list[str]:
+    """Bind the published warm median to one exact input and its raw samples."""
+
+    errors: list[str] = []
+    if record.get("program") != expected_program:
+        errors.append(
+            f"program: expected {expected_program!r}, got {record.get('program')!r}"
+        )
+    if expected_gpu is not None and record.get("gpu") != expected_gpu:
+        errors.append(f"gpu: expected {expected_gpu!r}, got {record.get('gpu')!r}")
+    if not isinstance(expected_reps, int) or isinstance(expected_reps, bool) or expected_reps < 2:
+        return errors + ["expected_reps: must be an integer >= 2"]
+
+    for field, expected in (
+        ("reps", expected_reps),
+        ("verified_reps", expected_reps),
+        ("warm_sample_count", expected_reps - 1),
+    ):
+        value = record.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value != expected:
+            errors.append(f"{field}: expected integer {expected}, got {value!r}")
+
+    samples = record.get("prove_s_warm_samples_raw")
+    if (
+        not isinstance(samples, list)
+        or len(samples) != expected_reps - 1
+        or any(
+            not isinstance(sample, (int, float))
+            or isinstance(sample, bool)
+            or not math.isfinite(sample)
+            or sample <= 0
+            for sample in samples
+        )
+    ):
+        errors.append(
+            "prove_s_warm_samples_raw: expected exact finite positive warm samples"
+        )
+        return errors
+
+    raw_median = float(statistics.median(samples))
+
+    def rounded3(value: float) -> float:
+        # All measurement values are positive; this matches Rust f64::round().
+        return math.floor(value * 1000.0 + 0.5) / 1000.0
+
+    def require_rounded(field: str, expected: float) -> None:
+        value = record.get(field)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or abs(float(value) - rounded3(expected)) > 1e-9
+        ):
+            errors.append(
+                f"{field}: expected rounded measurement {rounded3(expected)!r}, got {value!r}"
+            )
+
+    require_rounded("prove_s_warm_median", raw_median)
+    for work_field, rate_field in (
+        ("cycle_count", "mhz_median"),
+        ("pie_n_steps", "useful_mhz_median"),
+    ):
+        work = record.get(work_field)
+        if not isinstance(work, int) or isinstance(work, bool) or work <= 0:
+            errors.append(f"{work_field}: expected a positive integer, got {work!r}")
+        else:
+            require_rounded(rate_field, work / raw_median / 1e6)
+    if record.get("throughput_distribution_applicable") is not True:
+        errors.append("throughput_distribution_applicable: expected true")
+    return errors
+
+
+def _print_contract_errors(label: str, errors: list[str]) -> int:
+    if not errors:
+        return 0
+    print(f"{label} failed:", file=sys.stderr)
+    for error in errors:
+        print(f"  - {error}", file=sys.stderr)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("record", type=Path, help="gpu_bench stdout file")
+    parser.add_argument("record", type=Path, nargs="?", help="gpu_bench stdout file")
     parser.add_argument(
         "--runtime-mode",
         choices=tuple(RUNTIME_MODES),
@@ -351,28 +856,126 @@ def main() -> int:
     parser.add_argument(
         "--soundness-gate",
         type=Path,
-        required=True,
         help="counted CUDA differential-test artifact from run_cuda_soundness_gate.py",
     )
-    args = parser.parse_args()
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
+        "--soundness-only",
+        action="store_true",
+        help="validate the complete headline soundness artifact before pod work",
+    )
+    modes.add_argument(
+        "--local-admission",
+        type=Path,
+        help="validate the complete local input/capacity admission before pod work",
+    )
+    parser.add_argument("--gpu-bench-binary", type=Path)
+    parser.add_argument("--raw-input-manifest", type=Path)
+    parser.add_argument("--bootloader", type=Path)
+    parser.add_argument("--pinned-adapted-manifest", type=Path)
+    parser.add_argument("--expected-dry-run", type=int, choices=(0, 1))
+    parser.add_argument("--expected-program")
+    parser.add_argument("--expected-reps", type=int)
+    parser.add_argument("--expected-gpu")
+    parser.add_argument("--stwo-head")
+    parser.add_argument("--stwo-worktree-hash")
+    parser.add_argument("--stwo-cairo-head")
+    parser.add_argument("--stwo-cairo-worktree-hash")
+    args = parser.parse_args(argv)
+
+    pre_pod_mode = args.local_admission is not None or args.soundness_only
+    source_values = (
+        args.stwo_head,
+        args.stwo_worktree_hash,
+        args.stwo_cairo_head,
+        args.stwo_cairo_worktree_hash,
+    )
+    if pre_pod_mode and (not all(source_values) or args.expected_dry_run is None):
+        parser.error(
+            "pre-pod validation requires both source heads, both worktree hashes, "
+            "and --expected-dry-run"
+        )
+    expected_source = {
+        "stwo": {
+            "head": args.stwo_head,
+            "worktree_hash": args.stwo_worktree_hash,
+        },
+        "stwo_cairo": {
+            "head": args.stwo_cairo_head,
+            "worktree_hash": args.stwo_cairo_worktree_hash,
+        },
+    }
+
+    if args.local_admission is not None:
+        required_paths = {
+            "--gpu-bench-binary": args.gpu_bench_binary,
+            "--raw-input-manifest": args.raw_input_manifest,
+            "--bootloader": args.bootloader,
+            "--pinned-adapted-manifest": args.pinned_adapted_manifest,
+        }
+        missing = [name for name, value in required_paths.items() if value is None]
+        if missing:
+            parser.error(f"--local-admission requires {', '.join(missing)}")
+        try:
+            admission = json.loads(args.local_admission.read_text(encoding="utf-8"))
+            if not isinstance(admission, dict):
+                raise ValueError("artifact is not an object")
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            return _print_contract_errors("Local admission contract", [str(error)])
+        errors = validate_local_admission(
+            admission,
+            args.local_admission,
+            expected_source=expected_source,
+            expected_dry_run=bool(args.expected_dry_run),
+            gpu_bench_binary=args.gpu_bench_binary,
+            raw_input_manifest=args.raw_input_manifest,
+            bootloader=args.bootloader,
+            pinned_adapted_manifest=args.pinned_adapted_manifest,
+            required_runtime_mode=args.runtime_mode,
+        )
+        return _print_contract_errors("Local admission contract", errors)
+
+    if args.soundness_only:
+        if args.soundness_gate is None:
+            parser.error("--soundness-only requires --soundness-gate")
+        try:
+            soundness = load_soundness_gate(args.soundness_gate)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            return _print_contract_errors("CUDA soundness contract", [str(error)])
+        errors = validate_qualification_soundness_gate(
+            soundness,
+            expected_source=expected_source,
+            expected_dry_run=bool(args.expected_dry_run),
+            required_mode=args.runtime_mode,
+        )
+        return _print_contract_errors("CUDA soundness contract", errors)
+
+    if args.record is None or args.soundness_gate is None:
+        parser.error("record validation requires RECORD and --soundness-gate")
     try:
         record = load_main_record(args.record)
     except (OSError, ValueError) as error:
         print(f"GPU-native architecture contract: {error}", file=sys.stderr)
         return 1
     errors = validate_record(record, args.runtime_mode)
+    if (args.expected_program is None) != (args.expected_reps is None):
+        parser.error("record measurement validation requires both --expected-program and --expected-reps")
+    if args.expected_program is not None and args.expected_reps is not None:
+        errors.extend(
+            validate_benchmark_measurement(
+                record,
+                expected_program=args.expected_program,
+                expected_reps=args.expected_reps,
+                expected_gpu=args.expected_gpu,
+            )
+        )
     try:
         soundness = load_soundness_gate(args.soundness_gate)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         errors.append(f"CUDA soundness artifact: {error}")
     else:
         errors.extend(validate_soundness_gate(soundness, args.runtime_mode))
-    if errors:
-        print("GPU-native architecture contract failed:", file=sys.stderr)
-        for error in errors:
-            print(f"  - {error}", file=sys.stderr)
-        return 1
-    return 0
+    return _print_contract_errors("GPU-native architecture contract", errors)
 
 
 if __name__ == "__main__":
