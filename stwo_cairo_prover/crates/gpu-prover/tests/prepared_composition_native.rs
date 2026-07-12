@@ -456,9 +456,8 @@ fn interpolate_and_split(
     })
 }
 
-fn read_outputs(arena: &DeviceArena, slots: &CompositionWorkspaceSlots) -> [Vec<u32>; 8] {
-    slots.composition_coefficients.map(|slot| {
-        let source = arena.bind(slot).unwrap();
+fn read_outputs(arena: &DeviceArena, prepared: &PreparedCompositionGraph<'_>) -> [Vec<u32>; 8] {
+    prepared.composition_coefficients().map(|source| {
         let mut words = vec![0u32; source.len_words()];
         unsafe {
             arena
@@ -592,7 +591,7 @@ fn real_range_check_6_matches_cpu_eager_and_capture_replay() {
     upload_coefficients(&arena, &eager_coefficients);
     arena.context().sync().unwrap();
     prepared.launch().unwrap();
-    let eager = read_outputs(&arena, &slots);
+    let eager = read_outputs(&arena, &prepared);
     arena.context().sync().unwrap();
     assert_eq!(
         eager,
@@ -606,7 +605,7 @@ fn real_range_check_6_matches_cpu_eager_and_capture_replay() {
     upload_coefficients(&arena, &replay_coefficients);
     arena.context().sync().unwrap();
     graph.launch(arena.context()).unwrap();
-    let replay = read_outputs(&arena, &slots);
+    let replay = read_outputs(&arena, &prepared);
     arena.context().sync().unwrap();
     assert_eq!(
         replay,
@@ -906,7 +905,7 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
     };
     let prepared = prepare(&bindings).unwrap();
     prepared.launch().unwrap();
-    let eager = read_outputs(&arena, &slots);
+    let eager = read_outputs(&arena, &prepared);
     arena.context().sync().unwrap();
     assert_eq!(eager, expected(&coefficients_0));
 
@@ -917,7 +916,7 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
     upload_coefficients(&arena, &coefficients_1);
     upload_mixed_direct(&coefficients_1);
     graph.launch(arena.context()).unwrap();
-    let replay = read_outputs(&arena, &slots);
+    let replay = read_outputs(&arena, &prepared);
     arena.context().sync().unwrap();
     assert_eq!(replay, expected(&coefficients_1));
     assert_ne!(eager, replay);
@@ -1108,11 +1107,22 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
         &all_direct_bindings,
     )
     .unwrap();
+    assert!(all_direct_prepared
+        .composition_coefficients()
+        .iter()
+        .all(|output| output.len_words() == all_direct_requirements.output_coefficient_words));
+    assert!(
+        arena
+            .bind(slots.composition_coefficients[0])
+            .unwrap()
+            .len_words()
+            > all_direct_requirements.output_coefficient_words
+    );
     let all_direct_coefficients_0 = coefficients(2000);
     upload_coefficients(&arena, &all_direct_coefficients_0);
     upload_all_direct(&all_direct_coefficients_0);
     all_direct_prepared.launch().unwrap();
-    let all_direct_eager = read_outputs(&arena, &slots);
+    let all_direct_eager = read_outputs(&arena, &all_direct_prepared);
     arena.context().sync().unwrap();
     assert_eq!(
         all_direct_eager,
@@ -1125,7 +1135,7 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
     upload_coefficients(&arena, &all_direct_coefficients_1);
     upload_all_direct(&all_direct_coefficients_1);
     graph.launch(arena.context()).unwrap();
-    let all_direct_replay = read_outputs(&arena, &slots);
+    let all_direct_replay = read_outputs(&arena, &all_direct_prepared);
     arena.context().sync().unwrap();
     assert_eq!(
         all_direct_replay,
@@ -1366,7 +1376,7 @@ fn serial_and_wide_modes_match_cpu_and_each_other() {
         )
         .unwrap();
         prepared.launch().unwrap();
-        let eager = read_outputs(&arena, &slots);
+        let eager = read_outputs(&arena, &prepared);
         arena.context().sync().unwrap();
         assert_eq!(eager, expected, "{mode:?} eager output mismatch");
 
@@ -1374,7 +1384,7 @@ fn serial_and_wide_modes_match_cpu_and_each_other() {
         prepared.launch().unwrap();
         let graph = capture.finish().unwrap();
         graph.launch(arena.context()).unwrap();
-        let replay = read_outputs(&arena, &slots);
+        let replay = read_outputs(&arena, &prepared);
         arena.context().sync().unwrap();
         assert_eq!(replay, expected, "{mode:?} captured replay mismatch");
         replays.push(replay);
