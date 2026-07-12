@@ -13,6 +13,7 @@ export GPU_PCS_RUNTIME_MODE=arena-graph
 # be able to replace the first counted native suite with a prior artifact.
 unset BENCH_ENV QUALIFICATION_PROBE QUALIFICATION_ARTIFACT BENCH_PROOF_HASHES \
   REUSE_SOUNDNESS_GATE ARCHITECTURE_SOUNDNESS_GATE LOCAL_PREFLIGHT_ADMISSION \
+  REQUIRE_NCU_PROFILE NCU_LAUNCH_COUNT \
   FAKE_REMOTE_TARGET_MISMATCH FAKE_SOUNDNESS_HEAD_MISMATCH \
   FAKE_MISSING_QUALIFICATION_METRICS FAKE_STALL
 
@@ -352,8 +353,8 @@ export ARCHITECTURE_SOUNDNESS_GATE="$SOUNDNESS_GATE"
 
 # One normalized SN2 flags-off/headline A/B. Migration-only intermediate
 # bundles are deliberately excluded from the paid release round.
-BENCH_ENV="" "$SCRIPT_DIR/perf_gates.sh" --bundle sn2_headline \
-  --candidate-env "$SN2_HEADLINE_ENV" --reps 6
+REQUIRE_NCU_PROFILE=1 BENCH_ENV="" "$SCRIPT_DIR/perf_gates.sh" \
+  --bundle sn2_headline --candidate-env "$SN2_HEADLINE_ENV" --reps 6 --ncu
 
 # Reuse the exact counted artifact: no second native-suite execution. These
 # records remain qualification probes until the final bound manifest passes.
@@ -404,7 +405,10 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, os.environ["Q_VALIDATOR_DIR"])
-from validate_architecture_record import validate_benchmark_measurement
+from validate_architecture_record import (
+    validate_benchmark_measurement,
+    validate_gpu_telemetry_artifact,
+)
 
 boolean_flags = (
     "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE",
@@ -423,6 +427,14 @@ universal_state = {
 headline_state = {**{flag: 1 for flag in boolean_flags}, budget_flag: 29469326848}
 round_dry_run = os.environ["Q_DRY_RUN"] == "1"
 load_jsonl = lambda path: [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
 perf = load_jsonl(os.environ["Q_PERF"])
 bench = load_jsonl(os.environ["Q_BENCH"])
 if len(perf) != 1 or perf[0].get("status") != "ok":
@@ -441,6 +453,50 @@ if (headline_ab.get("lane") != "sn2_headline"
            != headline_ab.get("flagged", {}).get("proof_sha256")
         or not headline_ab.get("baseline", {}).get("proof_sha256")):
     raise SystemExit("invalid normalized SN2 headline A/B entry")
+ncu = headline_ab.get("ncu_profile") or {}
+if (headline_ab.get("ncu_profile_required") is not True
+        or headline_ab.get("ncu_profile_requested") is not True
+        or headline_ab.get("ncu_profile_attempted") is not True
+        or headline_ab.get("ncu_profile_status") != "validated"
+        or ncu.get("schema") != "stwo.ncu-profile.v1"
+        or ncu.get("kernel_regex")
+           != "relation_fused|relation_scan|stream_leaf_update"
+        or ncu.get("launch_count") != 10
+        or ncu.get("set") != "full"
+        or not isinstance(ncu.get("ncu_version"), str)
+        or not ncu["ncu_version"].startswith(
+            "NVIDIA (R) Nsight Compute Command Line Profiler"
+        )
+        or ncu.get("remote_import_validated") is not True
+        or not isinstance(ncu.get("profiled_kernel_rows"), int)
+        or isinstance(ncu.get("profiled_kernel_rows"), bool)
+        or ncu["profiled_kernel_rows"] <= 0
+        or ncu.get("synthetic") is not round_dry_run
+        or ncu.get("profiled_proof_sha256")
+           != headline_ab["baseline"]["proof_sha256"]):
+    raise SystemExit("required SN2 Nsight Compute profile contract is incomplete")
+for label, path_field, sha_field, bytes_field, remote_sha_field, remote_bytes_field in (
+    ("report", "path", "sha256", "bytes", "remote_sha256", "remote_bytes"),
+    (
+        "import output",
+        "import_output_path",
+        "import_output_sha256",
+        "import_output_bytes",
+        "remote_import_output_sha256",
+        "remote_import_output_bytes",
+    ),
+):
+    path = Path(ncu.get(path_field, ""))
+    expected_sha = ncu.get(sha_field)
+    expected_bytes = ncu.get(bytes_field)
+    if (not path.is_file()
+            or not isinstance(expected_sha, str) or len(expected_sha) != 64
+            or any(char not in "0123456789abcdef" for char in expected_sha)
+            or sha256(path) != expected_sha
+            or path.stat().st_size != expected_bytes
+            or ncu.get(remote_sha_field) != expected_sha
+            or ncu.get(remote_bytes_field) != expected_bytes):
+        raise SystemExit(f"required SN2 ncu {label} artifact is not content-bound")
 for arm in ("baseline", "flagged"):
     arm_record = headline_ab.get(arm, {}).get("record") or {}
     measurement_errors = validate_benchmark_measurement(
@@ -476,9 +532,15 @@ for name, entry in pies.items():
         expected_program=f"{name}.zip",
         expected_reps=6,
         expected_gpu=os.environ["Q_EXPECTED_GPU"],
+        require_fresh_simd_reference=True,
     )
     if measurement_errors:
         raise SystemExit(f"invalid fixed-PIE measurement {name}: {measurement_errors}")
+    telemetry_errors = validate_gpu_telemetry_artifact(
+        record, entry.get("gpu_telemetry") or {}
+    )
+    if telemetry_errors:
+        raise SystemExit(f"invalid fixed-PIE GPU telemetry {name}: {telemetry_errors}")
     if (entry.get("status") != "ok"
             or entry.get("bench_env") != os.environ["Q_UNIVERSAL_ENV"]
             or not entry.get("qualification_probe") or not entry.get("proof_sha256")
@@ -601,13 +663,6 @@ for entry in bench:
     if entry.get("soundness_gate_sha256") != os.environ["Q_SOUNDNESS_SHA"]:
         raise SystemExit("benchmark ledger references a different soundness artifact")
 
-def sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
 preflight_root = Path(os.environ["Q_PREFLIGHT_DIR"])
 adapted_root = Path(os.environ["Q_PREFLIGHT_INPUT_DIR"])
 preflight_cap = int(os.environ["Q_PREFLIGHT_CAP"])
@@ -664,7 +719,7 @@ def preflight_summary(artifact_name, input_name, expected_policy):
         "adapted_input": str(input_path),
         "adapted_input_sha256": input_sha,
         "arena_bytes": arena["total_bytes"],
-        "arena_gib": arena.get("total_gib"),
+        "arena_gib": arena["total_bytes"] / 1024**3,
         "runtime_policy": record["runtime_policy"],
     }
 
@@ -764,7 +819,7 @@ artifact = {
         "ledger_entries_guarded": len(bench) + 1,
         "remote_quiescence_passed": True,
         "quiescent_ledger_entries": len(bench) + len(perf),
-        "quiescent_measurement_launches": len(bench) + 2,
+        "quiescent_measurement_launches": len(bench) + 3,
     },
     "soundness": {"path": os.environ["Q_SOUNDNESS"], "sha256": os.environ["Q_SOUNDNESS_SHA"],
                   "effective_stwo_env": soundness.get("effective_stwo_env"),
@@ -787,6 +842,18 @@ artifact = {
         "fixed_pies": {name: entry["proof_sha256"] for name, entry in sorted(pies.items())},
     },
     "benchmarks": {name: entry["record"] for name, entry in sorted(pies.items())},
+    "gpu_telemetry": {
+        name: entry["gpu_telemetry"] for name, entry in sorted(pies.items())
+    },
+    "profiling": {
+        "ncu": {
+            "required": True,
+            "requested": True,
+            "attempted": True,
+            "status": "validated",
+            "profile": ncu,
+        },
+    },
     "comparisons": {"sn2_flags_off_vs_headline": headline_comparison},
     "ledgers": {
         "bench": {"path": os.environ["Q_BENCH"], "sha256": os.environ["Q_BENCH_SHA"]},

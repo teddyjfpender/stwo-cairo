@@ -25,8 +25,9 @@
 #       only, full-prove capture is impractical, so warm-cache TARGETED capture:
 #       kernel-name regex + launch-count cap). Default kernel regex per lane:
 #       relation_fused | relation_scan | stream_leaf_update (blake2s.cu /
-#       relation_*.cu kernel names). The A/B runs in (a) warm the on-disk JIT
-#       cache first, as §11d.1 requires.
+#       relation_*.cu kernel names). The report is re-imported remotely to raw
+#       CSV; binary, CSV, and profiled proof are content-bound in the ledger.
+#       The A/B runs in (a) warm the on-disk JIT cache first, as §11d.1 requires.
 #
 # --parity-only skips benchmarking entirely and just reruns the two counted
 # native differential suites (prepared_relation_native, prepared_commit_native
@@ -52,8 +53,9 @@
 #   --candidate-env   Candidate K=V tokens used with --bundle.
 #   --reps N          Reps per arm (default 4; >=2 so in-run byte-equal is real).
 #   --ncu             After a lane's A/B pair passes, capture a targeted ncu
-#                     profile of that lane's kernels (flag ON). Report is
-#                     fetched to loop/results/ and its pod path recorded.
+#                     profile of that lane's kernels (flag ON). Its gpu_bench
+#                     record is contract-checked and the fetched report is
+#                     content-bound in the ledger.
 #   --ncu-kernels RE  Override the lane's default kernel-name regex.
 #   --parity-only     Only rerun prepared_relation_native + prepared_commit_native
 #                     with each lane flag exported. No benchmarks, no ledger
@@ -71,6 +73,8 @@
 #                  check before any timed arm, for fail-closed harness testing.
 #   POLL_INTERVAL / STALL_SECS / MAX_WAIT   As in bench_loop.sh.
 #   NCU_LAUNCH_COUNT  Kernel launches captured per ncu profile (default 10).
+#   REQUIRE_NCU_PROFILE=1  Require a validated ncu profile for every perf lane;
+#                  any capture, record-contract, fetch, or metadata failure is fatal.
 #   POD_BOOTLOADER_JSON / GPU_PCS_RUNTIME_MODE   As in bench_loop.sh.
 #
 # NOTE: only same-pod, same-bench_env comparisons are meaningful; the A/B pair
@@ -89,6 +93,7 @@ RESULTS_DIR="${RESULTS_DIR:-${LOOP_DIR}/results}"
 PERF_LEDGER="${PERF_LEDGER:-${LOOP_DIR}/perf_gates.jsonl}"
 POD_CONF="${POD_CONF:-${LOOP_DIR}/pod.conf}"
 ARCHITECTURE_CHECK="${CAIRO_LOCAL}/gpu_benchmarks/validate_architecture_record.py"
+NCU_PROFILE_CHECK="${CAIRO_LOCAL}/gpu_benchmarks/validate_ncu_profile.py"
 ARCHITECTURE_SOUNDNESS_GATE="${ARCHITECTURE_SOUNDNESS_GATE:-}"
 LOCAL_PREFLIGHT_ADMISSION="${LOCAL_PREFLIGHT_ADMISSION:-}"
 INPUT_SHA256SUMS="${CAIRO_LOCAL}/gpu_benchmarks/pie/SHA256SUMS"
@@ -118,6 +123,8 @@ POLL_INTERVAL="${POLL_INTERVAL:-15}"
 STALL_SECS="${STALL_SECS:-600}"
 MAX_WAIT="${MAX_WAIT:-10800}"
 NCU_LAUNCH_COUNT="${NCU_LAUNCH_COUNT:-10}"
+NCU_SET="full"
+REQUIRE_NCU_PROFILE="${REQUIRE_NCU_PROFILE:-0}"
 
 # Flag defaults.
 REPS="4"
@@ -536,6 +543,17 @@ elif [[ ${#LANES[@]} -eq 0 ]]; then
 fi
 [[ "$REPS" =~ ^[0-9]+$ && "$REPS" -ge 2 ]] \
   || die "--reps must be >= 2 so in-run proof-byte equality is a real check"
+[[ "$NCU_LAUNCH_COUNT" =~ ^[1-9][0-9]{0,6}$ \
+  && "$NCU_LAUNCH_COUNT" -le 1000000 ]] \
+  || die "NCU_LAUNCH_COUNT must be an integer in [1, 1000000]"
+[[ "$REQUIRE_NCU_PROFILE" == "0" || "$REQUIRE_NCU_PROFILE" == "1" ]] \
+  || die "REQUIRE_NCU_PROFILE must be 0 or 1"
+if [[ "$REQUIRE_NCU_PROFILE" == "1" ]]; then
+  [[ "$PARITY_ONLY" == "0" ]] || die "REQUIRE_NCU_PROFILE is incompatible with --parity-only"
+  DO_NCU=1
+fi
+[[ "$DO_NCU" == "0" || -f "$NCU_PROFILE_CHECK" ]] \
+  || die "missing ncu profile validator: $NCU_PROFILE_CHECK"
 
 case "$GPU_PCS_RUNTIME_MODE" in
   detached-eager|arena-graph) ;;
@@ -747,16 +765,16 @@ validate_remote_execution_target
 # DRY_RUN synthetic gpu_bench output (exercises the A/B -> ledger path offline)
 # ---------------------------------------------------------------------------
 synth_out() {
-  # $1 name  $2 destfile — deterministic mock numbers keyed off the name so the
+  # $1 name  $2 destfile  $3 optional reps — deterministic mock numbers keyed off the name so the
   # flagged arm's delta is nonzero.
-  local name="$1" dest="$2"
+  local name="$1" dest="$2" reps="${3:-$REPS}"
   local seed=$(( $(printf '%s' "$name" | cksum | cut -d' ' -f1) % 40 ))
   local um_median warm_s warm_rounded mhz_median raw_samples="[" rep
   um_median="$(awk -v s="$seed" 'BEGIN{printf "%.3f", 1.3 + s/100.0}')"
   warm_s="$(awk -v m="$um_median" 'BEGIN{printf "%.9f", 7.706864/m}')"
   warm_rounded="$(awk -v s="$warm_s" 'BEGIN{printf "%.3f", s}')"
   mhz_median="$(awk -v s="$warm_s" 'BEGIN{printf "%.3f", 7.977397/s}')"
-  for ((rep = 1; rep < REPS; rep++)); do
+  for ((rep = 1; rep < reps; rep++)); do
     [[ "$rep" == "1" ]] || raw_samples+=","
     raw_samples+="$warm_s"
   done
@@ -766,7 +784,7 @@ synth_out() {
   {
     echo "{\"rep\":0,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":$((1200 + seed * 3)).5},\"fri\":{\"count\":1,\"total_ms\":$((560 + seed)).1}}}"
     echo "{\"rep\":1,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":$((1190 + seed * 3)).2},\"fri\":{\"count\":1,\"total_ms\":$((555 + seed)).8}}}"
-    echo "{\"program\":\"SN_PIE_2.zip\",\"backend\":\"cuda\",\"engine\":\"gpu-native\",${architecture},\"cycle_count\":7977397,\"pie_n_steps\":7706864,\"reps\":${REPS},\"warm_sample_count\":$((REPS - 1)),\"prove_s_warm_samples_raw\":${raw_samples},\"prove_s_warm_samples_rounded\":${raw_samples},\"prove_s_warm_median\":${warm_rounded},\"mhz_median\":${mhz_median},\"throughput_distribution_applicable\":true,\"verified_reps\":${REPS},\"proof_byte_equal\":true,\"proof_byte_equal_required\":true,\"proof_comparison_applicable\":true,\"useful_mhz_median\":${um_median},\"vram_peak_gb\":11.3,\"gpu\":\"${POD_GPU}\"}"
+    echo "{\"program\":\"SN_PIE_2.zip\",\"backend\":\"cuda\",\"engine\":\"gpu-native\",${architecture},\"cycle_count\":7977397,\"pie_n_steps\":7706864,\"reps\":${reps},\"gpu_proof_loop_started_unix_ns\":1700000000000000000,\"gpu_proof_loop_finished_unix_ns\":1700000060000000000,\"warm_sample_count\":$((reps - 1)),\"prove_s_warm_samples_raw\":${raw_samples},\"prove_s_warm_samples_rounded\":${raw_samples},\"prove_s_warm_median\":${warm_rounded},\"prove_s_warm_p95\":${warm_rounded},\"prove_s_cold\":9.9,\"mhz_median\":${mhz_median},\"mhz_at_warm_p95\":${mhz_median},\"throughput_distribution_applicable\":true,\"verified_reps\":${reps},\"proof_byte_equal\":true,\"proof_byte_equal_required\":true,\"proof_comparison_applicable\":true,\"verify_ms\":42.0,\"proof_kb\":210.5,\"peak_rss_gb\":18.2,\"useful_mhz_median\":${um_median},\"useful_mhz_at_warm_p95\":${um_median},\"vram_peak_gb\":11.3,\"vram_end_gb\":6.1,\"pool_used_high_gb\":5.0,\"pool_reserved_high_gb\":6.0,\"security_bits\":96,\"n_queries\":70,\"pow_bits\":26,\"fold_step\":3,\"gpu\":\"${POD_GPU}\"}"
   } > "$dest"
 }
 
@@ -946,7 +964,7 @@ pod_sha256() {
 }
 
 proof_contract_ok() {
-  python3 - "$1" "$REPS" <<'PY'
+  python3 - "$1" "${2:-$REPS}" <<'PY'
 import json, sys
 record = None
 with open(sys.argv[1], encoding="utf-8") as stream:
@@ -968,18 +986,19 @@ PY
 }
 
 architecture_contract_ok() {
+  local expected_reps="${2:-$REPS}"
   [[ -n "$ARCHITECTURE_SOUNDNESS_GATE" && -f "$ARCHITECTURE_SOUNDNESS_GATE" ]] || return 1
   python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE" \
     --soundness-gate "$ARCHITECTURE_SOUNDNESS_GATE" \
-    --expected-program SN_PIE_2.zip --expected-reps "$REPS" --expected-gpu "$POD_GPU"
+    --expected-program SN_PIE_2.zip --expected-reps "$expected_reps" --expected-gpu "$POD_GPU"
 }
 
 # ---------------------------------------------------------------------------
-# Ledger append + summary. status: ok | run_failed | stalled | proof_mismatch
+# Ledger append + summary. status: ok | run_failed | stalled | proof_mismatch | ncu_failed
 #                                | parity_ok | parity_failed
 # ---------------------------------------------------------------------------
 append_perf_ledger() {
-  local lane="$1" status="$2" base_out="$3" flag_out="$4" base_sha="$5" flag_sha="$6" ncu_report="$7"
+  local lane="$1" status="$2" base_out="$3" flag_out="$4" base_sha="$5" flag_sha="$6" ncu_metadata="$7"
   PG_TS="$TS" PG_LANE="$lane" PG_STATUS="$status" \
   PG_STWO_REV="$STWO_REV" PG_STWO_DIRTY="$STWO_DIRTY" \
   PG_CAIRO_REV="$CAIRO_REV" PG_CAIRO_DIRTY="$CAIRO_DIRTY" \
@@ -991,7 +1010,9 @@ append_perf_ledger() {
   PG_BASE_OUT="$base_out" PG_FLAG_OUT="$flag_out" \
   PG_BASE_SHA="$base_sha" PG_FLAG_SHA="$flag_sha" \
   PG_REMOTE_QUIESCENCE="$([[ "$BASELINE_QUIESCENCE_PASSED" == 1 && "$FLAGGED_QUIESCENCE_PASSED" == 1 ]] && echo 1 || echo 0)" \
-  PG_NCU="$ncu_report" PG_LEDGER="$PERF_LEDGER" python3 - <<'PY'
+  PG_NCU="$ncu_metadata" PG_NCU_REQUIRED="$REQUIRE_NCU_PROFILE" \
+  PG_NCU_REQUESTED="$DO_NCU" PG_NCU_STATUS="${NCU_CAPTURE_STATUS:-not_requested}" \
+  PG_LEDGER="$PERF_LEDGER" python3 - <<'PY'
 import json, os
 
 def parse_lines(path):
@@ -1075,9 +1096,13 @@ entry = {
                 "record": flag_rec},
     "useful_mhz_median_delta_pct": round(delta_pct, 2) if delta_pct is not None else None,
     "phase_deltas": phase_deltas,
+    "ncu_profile_required": os.environ["PG_NCU_REQUIRED"] == "1",
+    "ncu_profile_requested": os.environ["PG_NCU_REQUESTED"] == "1",
+    "ncu_profile_attempted": os.environ["PG_NCU_STATUS"] not in ("not_requested", "not_started"),
+    "ncu_profile_status": os.environ["PG_NCU_STATUS"],
 }
 if os.environ.get("PG_NCU"):
-    entry["ncu_report"] = os.environ["PG_NCU"]
+    entry["ncu_profile"] = json.loads(os.environ["PG_NCU"])
 
 led = os.environ["PG_LEDGER"]
 os.makedirs(os.path.dirname(led), exist_ok=True)
@@ -1221,6 +1246,8 @@ run_lane() {
   local base_proof="${POD_RUN_DIR}/${STAMP}.${lane}.baseline.proof"
   local flag_proof="${POD_RUN_DIR}/${STAMP}.${lane}.flagged.proof"
   local body
+  local NCU_CAPTURE_STATUS="not_requested"
+  [[ "$DO_NCU" == "0" ]] || NCU_CAPTURE_STATUS="not_started"
   BASELINE_QUIESCENCE_PASSED=0
   FLAGGED_QUIESCENCE_PASSED=0
 
@@ -1276,11 +1303,13 @@ run_lane() {
 
   # FAIL CLOSED: cross-arm proof-byte identity. Every lane is documented
   # byte-identical; a mismatch is treated as a correctness failure of the lane.
-  local fake_flag_sha="dryrun-SN_PIE_2-proof-sha256"
+  local fake_base_sha fake_flag_sha
+  fake_base_sha="$(printf 'dryrun-proof:SN_PIE_2' | sha256_stream | cut -d' ' -f1)"
+  fake_flag_sha="$fake_base_sha"
   [[ "${FAKE_PROOF_MISMATCH:-}" == "$lane" ]] \
-    && fake_flag_sha="dryrun-SN_PIE_2-proof-sha256-DIFFERENT"
+    && fake_flag_sha="$(printf 'dryrun-proof:SN_PIE_2:mismatch' | sha256_stream | cut -d' ' -f1)"
   local base_sha flag_sha
-  base_sha="$(pod_sha256 "$base_proof" "dryrun-SN_PIE_2-proof-sha256")"
+  base_sha="$(pod_sha256 "$base_proof" "$fake_base_sha")"
   flag_sha="$(pod_sha256 "$flag_proof" "$fake_flag_sha")"
   if [[ -z "$base_sha" || -z "$flag_sha" ]]; then
     append_perf_ledger "$lane" "run_failed" "$base_out" "$flag_out" "$base_sha" "$flag_sha" ""
@@ -1297,12 +1326,17 @@ run_lane() {
 
   # Optional targeted ncu profile of the lane's kernels, flag ON. The A/B pair
   # above already warmed the on-disk JIT cache (the §11d.1 precondition).
-  local ncu_report=""
+  local ncu_metadata=""
   if [[ "$DO_NCU" == "1" ]]; then
     local kregex="${NCU_KERNELS_OVERRIDE:-$(lane_kernel_regex "$lane")}"
     local pod_rep="${POD_RUN_DIR}/${STAMP}.${lane}.ncu"
+    local pod_version="${pod_rep}.version"
+    local pod_import="${pod_rep}.import.csv"
+    local pod_observation="${pod_rep}.observed.json"
+    local pod_ncu_proof="${pod_rep}.proof"
     local ncu_args="--pie ${POD_PIE} --backend cuda ${GPU_NATIVE_ARGS} --reps 2 --reuse-input --require-proof-byte-equal"
-    local ncu_body ncu_exports="export ${lane}=1" ncu_guard ncu_quiescence_guard
+    local ncu_body ncu_exports="export ${lane}=1" ncu_guard ncu_quiescence_guard kregex_arg
+    printf -v kregex_arg '%q' "regex:${kregex}"
     if [[ -n "$BUNDLE_NAME" ]]; then
       ncu_exports="unset ${APPROVED_BUNDLE_BOOLEAN_FLAGS[*]} ${RETAINED_BUDGET_POLICY}; export ${CANDIDATE_ENV}"
     fi
@@ -1314,43 +1348,134 @@ run_lane() {
 cd '${POD_PROVER_DIR}'
 . "\$HOME/.cargo/env" 2>/dev/null || true
 export PATH=/usr/local/cuda/bin:\$PATH
+while IFS='=' read -r stwo_name _; do
+  case "\$stwo_name" in STWO_*) unset "\$stwo_name" ;; esac
+done < <(env)
+unset CUDA_LAUNCH_BLOCKING CUDA_DEVICE_MAX_CONNECTIONS
 export RUST_MIN_STACK=${RUST_MIN_STACK_VAL}
 export STWO_BENCH_TRACE=json
 export STWO_JIT_LOG=1
 ${BENCH_ENV:+export ${BENCH_ENV}}
 export STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}'
+export STWO_DUMP_PROOF='${pod_ncu_proof}'
 ${ncu_exports}
 ${ncu_guard}
 ${ncu_quiescence_guard}
+ncu --version > '${pod_version}' 2>&1
 ncu --target-processes all \
-    --kernel-name 'regex:${kregex}' \
+    --kernel-name ${kregex_arg} \
     --launch-count ${NCU_LAUNCH_COUNT} \
-    --set full -f -o '${pod_rep}' \
+    --set ${NCU_SET} -f -o '${pod_rep}' \
     /proc/self/fd/9 ${ncu_args}
+ncu --import '${pod_rep}.ncu-rep' --page raw --csv > '${pod_import}'
+[[ -s '${pod_import}' ]]
+ncu_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "\$1" | cut -d' ' -f1
+  else shasum -a 256 "\$1" | cut -d' ' -f1
+  fi
+}
+report_sha=\$(ncu_hash '${pod_rep}.ncu-rep')
+import_sha=\$(ncu_hash '${pod_import}')
+profiled_proof_sha=\$(ncu_hash '${pod_ncu_proof}')
+report_bytes=\$(stat -c %s '${pod_rep}.ncu-rep')
+import_bytes=\$(stat -c %s '${pod_import}')
+printf '{"schema":"stwo.ncu-remote-observation.v1","report_sha256":"%s","report_bytes":%s,"import_output_sha256":"%s","import_output_bytes":%s,"import_validated":true,"profiled_proof_sha256":"%s"}\n' \
+  "\$report_sha" "\$report_bytes" "\$import_sha" "\$import_bytes" "\$profiled_proof_sha" \
+  > '${pod_observation}'
 EOF
 )"
+    printf '%s\n' "$ncu_body" | bash -n \
+      || die "generated ncu launcher is not valid bash for ${lane}"
     log "lane ${lane}: ncu targeted capture (kernels ~ /${kregex}/, ${NCU_LAUNCH_COUNT} launches)"
+    local ncu_failed=0
+    NCU_CAPTURE_STATUS="capturing"
     if ! run_pod_job "${lane}.ncu" "$ncu_body"; then
-      warn "lane ${lane}: ncu remote launch failed — perf numbers above still stand"
+      warn "lane ${lane}: ncu remote launch failed"
+      ncu_failed=1
     else
       validate_completed_arm
       if [[ "$LAST_RC" == "0" ]]; then
-        ncu_report="${RESULTS_DIR}/${STAMP}.${lane}.ncu-rep"
+        [[ "$DRY_RUN" == "1" ]] && synth_out "${lane}.ncu" "$LAST_OUT" 2
+        if ! proof_contract_ok "$LAST_OUT" 2 || ! architecture_contract_ok "$LAST_OUT" 2; then
+          warn "lane ${lane}: profiled gpu_bench output contract failed"
+          ncu_failed=1
+        fi
+        local profiled_proof_sha=""
+        if ! profiled_proof_sha="$(pod_sha256 "$pod_ncu_proof" "$fake_base_sha")"; then
+          warn "lane ${lane}: failed to hash profiled proof"
+          ncu_failed=1
+        elif [[ -z "$profiled_proof_sha" || "$profiled_proof_sha" != "$base_sha" ]]; then
+          warn "lane ${lane}: profiled proof differs from accepted A/B proof"
+          ncu_failed=1
+        fi
+        local ncu_report="${RESULTS_DIR}/${STAMP}.${lane}.ncu-rep"
+        local ncu_version="${ncu_report}.version"
+        local ncu_import="${ncu_report}.import.csv"
+        local ncu_observation="${ncu_report}.observed.json"
         if [[ "$DRY_RUN" == "1" ]]; then
           dry "ssh: cat '${pod_rep}.ncu-rep' -> ${ncu_report}"
-          : > "$ncu_report"
+          printf 'STWO synthetic Nsight Compute report v1\nlane=%s\nkernels=%s\nlaunch_count=%s\nset=%s\n' \
+            "$lane" "$kregex" "$NCU_LAUNCH_COUNT" "$NCU_SET" > "$ncu_report"
+          printf 'NVIDIA (R) Nsight Compute Command Line Profiler\nVersion 2022.3.0.0\nSynthetic dry-run\n' \
+            > "$ncu_version"
+          printf 'STWO synthetic ncu import validation v1\n"ID","Kernel Name","Metric Name"\n"1","%s","synthetic"\n' \
+            "$kregex" > "$ncu_import"
+          local dry_report_sha dry_report_bytes dry_import_sha dry_import_bytes
+          dry_report_sha="$(sha256_file "$ncu_report")"
+          dry_report_bytes="$(wc -c < "$ncu_report" | tr -d ' ')"
+          dry_import_sha="$(sha256_file "$ncu_import")"
+          dry_import_bytes="$(wc -c < "$ncu_import" | tr -d ' ')"
+          printf '{"schema":"stwo.ncu-remote-observation.v1","report_sha256":"%s","report_bytes":%s,"import_output_sha256":"%s","import_output_bytes":%s,"import_validated":true,"profiled_proof_sha256":"%s"}\n' \
+            "$dry_report_sha" "$dry_report_bytes" "$dry_import_sha" "$dry_import_bytes" \
+            "$profiled_proof_sha" > "$ncu_observation"
         else
-          run_ssh "cat '${pod_rep}.ncu-rep' 2>/dev/null" > "$ncu_report" || true
-          [[ -s "$ncu_report" ]] || { warn "lane ${lane}: ncu report missing/empty on pod"; ncu_report=""; }
+          if ! run_ssh "cat '${pod_rep}.ncu-rep'" > "$ncu_report"; then
+            warn "lane ${lane}: failed to fetch ncu report"
+            ncu_failed=1
+          fi
+          if ! run_ssh "cat '${pod_version}'" > "$ncu_version"; then
+            warn "lane ${lane}: failed to fetch ncu version"
+            ncu_failed=1
+          fi
+          if ! run_ssh "cat '${pod_import}'" > "$ncu_import"; then
+            warn "lane ${lane}: failed to fetch ncu import output"
+            ncu_failed=1
+          fi
+          if ! run_ssh "cat '${pod_observation}'" > "$ncu_observation"; then
+            warn "lane ${lane}: failed to fetch ncu remote observation"
+            ncu_failed=1
+          fi
         fi
-        [[ -n "$ncu_report" ]] && log "lane ${lane}: ncu report fetched -> ${ncu_report}"
+        if [[ "$ncu_failed" == "0" ]]; then
+          local synthetic_arg=()
+          [[ "$DRY_RUN" == "0" ]] || synthetic_arg=(--synthetic)
+          if ncu_metadata="$(python3 "$NCU_PROFILE_CHECK" "$ncu_report" \
+            --version-file "$ncu_version" --import-output "$ncu_import" \
+            --observation-file "$ncu_observation" --kernel-regex "$kregex" \
+            --launch-count "$NCU_LAUNCH_COUNT" --set-name "$NCU_SET" \
+            --profiled-proof-sha256 "$profiled_proof_sha" "${synthetic_arg[@]}")"; then
+            NCU_CAPTURE_STATUS="validated"
+            log "lane ${lane}: validated ncu report fetched -> ${ncu_report}"
+          else
+            warn "lane ${lane}: ncu report or metadata validation failed"
+            ncu_failed=1
+          fi
+        fi
       else
-        warn "lane ${lane}: ncu capture failed (rc=${LAST_RC}) — perf numbers above still stand"
+        warn "lane ${lane}: ncu capture failed (rc=${LAST_RC})"
+        ncu_failed=1
+      fi
+    fi
+    if [[ "$ncu_failed" == "1" ]]; then
+      NCU_CAPTURE_STATUS="$([[ "$REQUIRE_NCU_PROFILE" == "1" ]] && echo failed_required || echo failed_optional)"
+      if [[ "$REQUIRE_NCU_PROFILE" == "1" ]]; then
+        append_perf_ledger "$lane" "ncu_failed" "$base_out" "$flag_out" "$base_sha" "$flag_sha" ""
+        return 1
       fi
     fi
   fi
 
-  append_perf_ledger "$lane" "ok" "$base_out" "$flag_out" "$base_sha" "$flag_sha" "$ncu_report"
+  append_perf_ledger "$lane" "ok" "$base_out" "$flag_out" "$base_sha" "$flag_sha" "$ncu_metadata"
 }
 
 # ===========================================================================

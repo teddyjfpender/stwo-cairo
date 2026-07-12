@@ -15,6 +15,7 @@
 //!             [--engine legacy|gpu-native] \
 //!             [--reps 3] [--pipeline <depth>] [--reuse-input] [--adapt-only] \
 //!             [--require-proof-byte-equal] [--require-gpu-native-architecture] \
+//!             [--require-simd-reference-byte-equal] \
 //!             [--require-gpu-pcs-runtime-mode detached-eager|arena-graph]
 //!   gpu_bench --pie a.zip[,b.zip,...] [--pie-copies N] [--pie-mode aggregate|rotate] \
 //!             [--producers N] --backend cuda|simd ...
@@ -34,6 +35,11 @@
 //! same-statement repetition byte drift or an inapplicable comparison a non-zero
 //! benchmark failure. Rotate-mode pipeline reps prove different statements, so their
 //! comparison and per-repetition throughput distribution are reported null.
+//! `--require-simd-reference-byte-equal` is a stronger, CUDA gpu-native standard-run
+//! gate: outside the measured GPU window it computes and verifies one fresh SIMD
+//! proof for the same adapted input and parameters, then exact-compares every
+//! serialized GPU proof to it. The record reports this separately from same-backend
+//! repetition determinism.
 //! `--require-gpu-native-architecture` (or
 //! STWO_BENCH_REQUIRE_GPU_NATIVE_ARCHITECTURE=1) is a fail-closed benchmark gate:
 //! CUDA + gpu-native, the typed CUDA PCS driver, one start and finish for every
@@ -69,8 +75,12 @@
 //!   --program), bootloader_overhead_pct (null for --program), prove_s_cold,
 //!   prove_s_warm (legacy warm-best), prove_s_warm_best,
 //!   prove_s_warm_median, prove_s_warm_p95, mhz_median, useful_mhz_median,
-//!   throughput_distribution_applicable, proof_byte_equal,
+//!   gpu_proof_loop_started_unix_ns, gpu_proof_loop_finished_unix_ns,
+//!   throughput_distribution_applicable, proof_byte_equal, gpu_proof_blake3,
 //!   proof_comparison_applicable, verified_reps,
+//!   simd_reference_required, simd_reference_comparison_applicable,
+//!   simd_reference_byte_equal, simd_reference_blake3,
+//!   simd_reference_fresh, simd_reference_s,
 //!   gpu_pcs_driver_architecture, gpu_pcs_runtime_mode,
 //!   gpu_pcs_stage_started, gpu_pcs_stage_finished,
 //!   gpu_pcs_batched_tree_decommit, gpu_pcs_driver_complete,
@@ -91,7 +101,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cairo_air::verifier::verify_cairo;
 use cairo_air::CairoProof;
@@ -1073,18 +1083,47 @@ fn merge_json(mut base: serde_json::Value, extra: serde_json::Value) -> serde_js
 
 struct RepOutcome {
     times: Vec<f64>,
+    proof_loop_started_unix_ns: u64,
+    proof_loop_finished_unix_ns: u64,
     proof_size: usize,
+    gpu_proof_blake3: String,
     verify_ms: f64,
     verified_reps: usize,
     proof_byte_equal: Option<bool>,
+    simd_reference_byte_equal: Option<bool>,
+    simd_reference: Option<SimdReferenceRecord>,
     vram_peak_gb: f64,
+}
+
+fn unix_time_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_nanos()
+        .try_into()
+        .expect("Unix nanosecond timestamp exceeds u64")
+}
+
+#[derive(Clone, Debug)]
+struct SimdReferenceRecord {
+    blake3: String,
+    fresh: bool,
+    elapsed_s: f64,
+}
+
+struct SimdReference {
+    bytes: Vec<u8>,
+    record: SimdReferenceRecord,
 }
 
 struct ProofValidation {
     proof_size: usize,
+    gpu_proof_blake3: String,
     verify_ms: f64,
     verified_reps: usize,
     proof_byte_equal: Option<bool>,
+    simd_reference_byte_equal: Option<bool>,
+    simd_reference: Option<SimdReferenceRecord>,
 }
 
 fn initial_proof_byte_equal(compare_to_rep0: bool, proof_count: usize) -> Option<bool> {
@@ -1093,6 +1132,38 @@ fn initial_proof_byte_equal(compare_to_rep0: bool, proof_count: usize) -> Option
 
 fn proof_byte_equal_gate_passes(required: bool, proof_byte_equal: Option<bool>) -> bool {
     !required || proof_byte_equal == Some(true)
+}
+
+fn simd_reference_required() -> bool {
+    flag("--require-simd-reference-byte-equal")
+        || std::env::var("STWO_BENCH_REQUIRE_SIMD_REFERENCE_BYTE_EQUAL").as_deref() == Ok("1")
+}
+
+fn simd_reference_gate_passes(required: bool, byte_equal: Option<bool>) -> bool {
+    !required || byte_equal == Some(true)
+}
+
+fn simd_reference_reuse_input_gate_passes(required: bool, reuse_input: bool) -> bool {
+    !required || reuse_input
+}
+
+/// Compute and verify one fresh SIMD reference after the timed CUDA repetitions.
+fn compute_simd_reference(input: ProverInput, params: ProverParameters) -> SimdReference {
+    let started = Instant::now();
+    let proof = prove_cairo::<SimdBackend, Blake2sMerkleChannel>(input, params)
+        .expect("fresh SIMD reference proof failed");
+    let bytes = bincode::serialize(&proof).expect("serialize fresh SIMD reference proof");
+    verify_cairo::<Blake2sMerkleChannel>(proof.into())
+        .expect("fresh SIMD reference proof failed verification");
+    let blake3 = blake3::hash(&bytes).to_hex().to_string();
+    SimdReference {
+        bytes,
+        record: SimdReferenceRecord {
+            blake3,
+            fresh: true,
+            elapsed_s: started.elapsed().as_secs_f64(),
+        },
+    }
 }
 
 /// Serialize and verify every proof after the timed proving window. Exact byte
@@ -1104,18 +1175,25 @@ fn validate_proofs(
     proofs: Vec<BenchProof>,
     dump_rep0: bool,
     compare_to_rep0: bool,
+    simd_reference: Option<&SimdReference>,
 ) -> ProofValidation {
     assert!(!proofs.is_empty(), "at least one proof is required");
 
     let verified_reps = proofs.len();
     let mut rep0_bytes = None;
     let mut proof_size = 0;
+    let mut gpu_proof_blake3 = None;
     let mut verify_ms = 0.0;
     let mut proof_byte_equal = initial_proof_byte_equal(compare_to_rep0, verified_reps);
+    let mut simd_reference_byte_equal = simd_reference.map(|_| true);
     for (rep, proof) in proofs.into_iter().enumerate() {
         let bytes = bincode::serialize(&proof).expect("serialize proof");
+        if let (Some(equal), Some(reference)) = (&mut simd_reference_byte_equal, simd_reference) {
+            *equal &= bytes.as_slice() == reference.bytes.as_slice();
+        }
         if rep == 0 {
             proof_size = bytes.len();
+            gpu_proof_blake3 = Some(blake3::hash(&bytes).to_hex().to_string());
             if dump_rep0 {
                 if let Ok(path) = std::env::var("STWO_DUMP_PROOF") {
                     std::fs::write(&path, &bytes).expect("write proof dump");
@@ -1140,9 +1218,12 @@ fn validate_proofs(
 
     ProofValidation {
         proof_size,
+        gpu_proof_blake3: gpu_proof_blake3.expect("repetition 0 proof digest must exist"),
         verify_ms,
         verified_reps,
         proof_byte_equal,
+        simd_reference_byte_equal,
+        simd_reference: simd_reference.map(|reference| reference.record.clone()),
     }
 }
 
@@ -1155,6 +1236,13 @@ fn enforce_proof_byte_equal(proof_byte_equal: Option<bool>) {
     assert!(
         proof_byte_equal_gate_passes(proof_byte_equal_required(), proof_byte_equal),
         "proof byte equality gate failed: comparison was unavailable or repetitions did not match repetition 0"
+    );
+}
+
+fn enforce_simd_reference_byte_equal(byte_equal: Option<bool>) {
+    assert!(
+        simd_reference_gate_passes(simd_reference_required(), byte_equal),
+        "SIMD reference byte equality gate failed: a fresh verified SIMD reference was unavailable or GPU proof bytes differed"
     );
 }
 
@@ -1223,6 +1311,7 @@ fn print_main_record(
     } else {
         0.0
     };
+    let simd_reference = outcome.simd_reference.as_ref();
 
     let record = json!({
         "program": program,
@@ -1249,6 +1338,7 @@ fn print_main_record(
         "deterministic": outcome.proof_byte_equal,
         "proof_byte_equal": outcome.proof_byte_equal,
         "proof_byte_equal_required": proof_byte_equal_required(),
+        "gpu_proof_blake3": &outcome.gpu_proof_blake3,
         "proof_kb": round3(outcome.proof_size as f64 / 1024.0),
         "peak_rss_gb": round3(peak_rss_gb()),
         "vram_end_gb": round3(vram_end_gb),
@@ -1275,6 +1365,19 @@ fn print_main_record(
         "vm_s": round3(vm_s),
         "adapt_s": round3(adapt_s),
     });
+    let record = merge_json(
+        record,
+        json!({
+            "gpu_proof_loop_started_unix_ns": outcome.proof_loop_started_unix_ns,
+            "gpu_proof_loop_finished_unix_ns": outcome.proof_loop_finished_unix_ns,
+            "simd_reference_required": simd_reference_required(),
+            "simd_reference_comparison_applicable": outcome.simd_reference_byte_equal.is_some(),
+            "simd_reference_byte_equal": outcome.simd_reference_byte_equal,
+            "simd_reference_blake3": simd_reference.map(|reference| &reference.blake3),
+            "simd_reference_fresh": simd_reference.map(|reference| reference.fresh),
+            "simd_reference_s": simd_reference.map(|reference| round3(reference.elapsed_s)),
+        }),
+    );
     println!("{}", merge_json(record, record_context(backend)));
 }
 
@@ -1323,7 +1426,7 @@ fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
     let wall_s = wall_start.elapsed().as_secs_f64();
 
     // All N proofs prove the SAME statement. Validate outside the timed window.
-    let validation = validate_proofs(proofs, false, true);
+    let validation = validate_proofs(proofs, false, true, None);
 
     let per_proof_s = times.iter().sum::<f64>() / n as f64;
     let total_steps = pie_n_steps.map(|s| s * n);
@@ -1480,6 +1583,7 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
         results.into_iter().map(|(_, proof)| proof).collect(),
         false,
         true,
+        None,
     );
     let total_steps = pie_n_steps.map(|s| s * n);
     let performance_claim_admissible = performance_claim_admissible();
@@ -1587,6 +1691,7 @@ fn run_pipelined(
     let mut vram_peak_gb = 0.0f64;
     let mut times = Vec::new();
     let mut proofs = Vec::with_capacity(reps);
+    let proof_loop_started_unix_ns = unix_time_ns();
     for rep in 0..reps {
         let recv_start = Instant::now();
         let loaded = rx.recv().expect("producer threads died");
@@ -1614,6 +1719,7 @@ fn run_pipelined(
         eprintln!("rep={rep} prove_s={elapsed:.3}");
         emit_phase_totals(rep);
     }
+    let proof_loop_finished_unix_ns = unix_time_ns();
     let total_s = total_start.elapsed().as_secs_f64();
     for handle in producer_handles {
         handle.join().expect("producer thread panicked");
@@ -1621,14 +1727,19 @@ fn run_pipelined(
 
     // Validate every proof outside the sustained-throughput window. Rep 0 is still
     // the proof written by STWO_DUMP_PROOF.
-    let validation = validate_proofs(proofs, true, pie_mode == PieMode::Aggregate);
+    let validation = validate_proofs(proofs, true, pie_mode == PieMode::Aggregate, None);
 
     let outcome = RepOutcome {
         times,
+        proof_loop_started_unix_ns,
+        proof_loop_finished_unix_ns,
         proof_size: validation.proof_size,
+        gpu_proof_blake3: validation.gpu_proof_blake3,
         verify_ms: validation.verify_ms,
         verified_reps: validation.verified_reps,
         proof_byte_equal: validation.proof_byte_equal,
+        simd_reference_byte_equal: validation.simd_reference_byte_equal,
+        simd_reference: validation.simd_reference,
         vram_peak_gb,
     };
     print_main_record(
@@ -1827,6 +1938,18 @@ fn main() {
     }
     let backend = arg("--backend").unwrap_or_else(|| "cuda".to_string());
     enforce_gpu_native_architecture_invocation(&backend);
+    let reuse_input = flag("--reuse-input");
+    if simd_reference_required() {
+        assert_eq!(
+            (backend.as_str(), engine().as_str()),
+            ("cuda", "gpu-native"),
+            "--require-simd-reference-byte-equal requires --backend cuda --engine gpu-native"
+        );
+        assert!(
+            simd_reference_reuse_input_gate_passes(true, reuse_input),
+            "--require-simd-reference-byte-equal requires --reuse-input"
+        );
+    }
     let reps: usize = arg("--reps")
         .unwrap_or_else(|| "3".to_string())
         .parse()
@@ -1841,6 +1964,10 @@ fn main() {
     // Useful for validating that large PIEs are accepted by the bootloader/adapter
     // without paying for a full (slow) SIMD prove locally.
     if flag("--adapt-only") || std::env::var("STWO_ADAPT_ONLY").as_deref() == Ok("1") {
+        assert!(
+            !simd_reference_required(),
+            "--require-simd-reference-byte-equal requires a standard proof run"
+        );
         reject_gpu_native_architecture_gate_without_proof("adapt-only mode");
         let loaded = source.load();
         let cycle_count = cycle_count_of(&loaded.input);
@@ -1879,6 +2006,10 @@ fn main() {
     // N x single ≈ 22.5s at M5c 11.23s) to establish the harness + metrics before
     // the stream-explicit concurrent scheduler lands.
     if let Some(n) = arg("--resident-pipeline") {
+        assert!(
+            !simd_reference_required(),
+            "--require-simd-reference-byte-equal is not supported by resident-pipeline mode"
+        );
         let n: usize = n.parse().expect("--resident-pipeline <N>");
         run_resident_pipeline(&source, &backend, n);
         return;
@@ -1889,6 +2020,10 @@ fn main() {
     // metrics plus overlap_speedup (serial_wall / wall). This is the throughput
     // experiment the M6 gates measure (<14.8s / <11s / <8s two-proof wall).
     if let Some(n) = arg("--resident-concurrent") {
+        assert!(
+            !simd_reference_required(),
+            "--require-simd-reference-byte-equal is not supported by resident-concurrent mode"
+        );
         let n: usize = n.parse().expect("--resident-concurrent <N>");
         run_resident_concurrent(&source, &backend, n);
         return;
@@ -1896,6 +2031,10 @@ fn main() {
 
     // P5 sustained-throughput mode; absent flag keeps today's behavior exactly.
     if let Some(depth) = arg("--pipeline") {
+        assert!(
+            !simd_reference_required(),
+            "--require-simd-reference-byte-equal is not supported by pipeline mode"
+        );
         let depth: usize = depth.parse().expect("--pipeline <depth>");
         run_pipelined(&source, &backend, reps, depth, producers, pie_mode);
         return;
@@ -1917,6 +2056,10 @@ fn main() {
     // states, then exit before proving (fast iteration). See
     // stwo_backend_cuda::exec_tables.
     if std::env::var("STWO_WITNESS_JIT_SELFTEST").as_deref() == Ok("1") {
+        assert!(
+            !simd_reference_required(),
+            "--require-simd-reference-byte-equal requires a standard proof run"
+        );
         reject_gpu_native_architecture_gate_without_proof("witness JIT self-test mode");
         // STWO_WITNESS_JIT_SOURCE=emitted: register the transformer-EMITTED full-width
         // writer recordings (strictly wider than the built-in hand decode-subsets:
@@ -1935,6 +2078,10 @@ fn main() {
     // built from the SAME device lookup words via the host path and the device
     // path (logup_pairs.cu + device finalize), byte-compared. Exits before proving.
     if std::env::var("STWO_DEVICE_INTERACTION_SELFTEST").as_deref() == Ok("1") {
+        assert!(
+            !simd_reference_required(),
+            "--require-simd-reference-byte-equal requires a standard proof run"
+        );
         reject_gpu_native_architecture_gate_without_proof("device interaction self-test mode");
         let ok = stwo_cairo_prover::witness::jit_witness_hook::run_device_interaction_selftest(
             &loaded.input,
@@ -1957,15 +2104,12 @@ fn main() {
     // extra resident copy of the ProverInput (peak RSS grows by roughly the input's
     // in-memory size) while a rep is proving.
     let (mut last_vm_s, mut last_adapt_s) = (loaded.vm_s, loaded.adapt_s);
-    let reusable_input = if flag("--reuse-input") {
-        Some(loaded.input)
-    } else {
-        None
-    };
+    let mut reusable_input = reuse_input.then_some(loaded.input);
 
     let mut times = Vec::new();
     let mut proofs = Vec::with_capacity(reps);
     let mut vram_peak_gb = 0.0f64;
+    let proof_loop_started_unix_ns = unix_time_ns();
     for rep in 0..reps {
         let input = match &reusable_input {
             Some(input) => input.clone(),
@@ -1982,13 +2126,29 @@ fn main() {
         eprintln!("rep={rep} prove_s={elapsed:.3}");
         emit_phase_totals(rep);
     }
-    let validation = validate_proofs(proofs, true, true);
+    let proof_loop_finished_unix_ns = unix_time_ns();
+    // This oracle is deliberately outside every reported GPU proving sample.
+    // The qualification path consumes the retained input only after the timed
+    // repetitions, so the SIMD proof adds neither a clone nor memory pressure
+    // to the measured GPU samples.
+    let simd_reference = simd_reference_required().then(|| {
+        let input = reusable_input
+            .take()
+            .expect("SIMD reference input must remain available");
+        compute_simd_reference(input, prover_params(variant))
+    });
+    let validation = validate_proofs(proofs, true, true, simd_reference.as_ref());
     let outcome = RepOutcome {
         times,
+        proof_loop_started_unix_ns,
+        proof_loop_finished_unix_ns,
         proof_size: validation.proof_size,
+        gpu_proof_blake3: validation.gpu_proof_blake3,
         verify_ms: validation.verify_ms,
         verified_reps: validation.verified_reps,
         proof_byte_equal: validation.proof_byte_equal,
+        simd_reference_byte_equal: validation.simd_reference_byte_equal,
+        simd_reference: validation.simd_reference,
         vram_peak_gb,
     };
     print_main_record(
@@ -2003,6 +2163,7 @@ fn main() {
         last_adapt_s,
     );
     enforce_proof_byte_equal(outcome.proof_byte_equal);
+    enforce_simd_reference_byte_equal(outcome.simd_reference_byte_equal);
     // Silence unused-import warnings when only one backend path is exercised.
     let _ = CairoSerialize::serialize as fn(&u64, &mut Vec<starknet_ff::FieldElement>);
 }
@@ -2011,7 +2172,8 @@ fn main() {
 mod tests {
     use super::{
         initial_proof_byte_equal, pcs_telemetry_json, performance_claim_admissible_for,
-        proof_byte_equal_gate_passes, quantile, resident_session_telemetry_json, throughput_mhz,
+        proof_byte_equal_gate_passes, quantile, resident_session_telemetry_json,
+        simd_reference_gate_passes, simd_reference_reuse_input_gate_passes, throughput_mhz,
         validate_gpu_native_architecture, validate_resident_session_architecture,
         validate_strict_aot_provenance, AotRuntimeStats, CudaPcsDriverTelemetry,
         CudaPcsRuntimeMode, RequiredCudaPcsRuntimeMode, ResidentSessionTelemetry,
@@ -2085,6 +2247,22 @@ mod tests {
         assert!(proof_byte_equal_gate_passes(true, Some(true)));
         assert!(!proof_byte_equal_gate_passes(true, None));
         assert!(!proof_byte_equal_gate_passes(true, Some(false)));
+    }
+
+    #[test]
+    fn simd_reference_gate_fails_closed() {
+        assert!(simd_reference_gate_passes(false, None));
+        assert!(simd_reference_gate_passes(true, Some(true)));
+        assert!(!simd_reference_gate_passes(true, None));
+        assert!(!simd_reference_gate_passes(true, Some(false)));
+    }
+
+    #[test]
+    fn simd_reference_cli_requires_reuse_input() {
+        assert!(simd_reference_reuse_input_gate_passes(false, false));
+        assert!(simd_reference_reuse_input_gate_passes(false, true));
+        assert!(simd_reference_reuse_input_gate_passes(true, true));
+        assert!(!simd_reference_reuse_input_gate_passes(true, false));
     }
 
     #[test]

@@ -41,6 +41,7 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 libc = "0.2"
 bincode = "1"
+blake3 = "1"
 starknet-ff.workspace = true
 
 # Optional: CairoPie bootloader ingestion for gpu_bench (--pie). Same pin as the
@@ -71,6 +72,5 @@ path = "../dev_utils"
 optional = true
 
 [dev-dependencies]
-blake3 = "1"
 stwo-cairo-dev-utils = { path = "../dev_utils" }
 test-log = { version = "0.2.17", features = ["trace"] }

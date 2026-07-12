@@ -22,6 +22,10 @@ from run_cuda_soundness_gate import (
 )
 from validate_architecture_record import (
     ARCHITECTURE,
+    GPU_TELEMETRY_COLUMNS,
+    GPU_TELEMETRY_MAX_GAP_NS,
+    GPU_TELEMETRY_SAMPLE_INTERVAL_MS,
+    GPU_TELEMETRY_SCHEMA,
     PREFLIGHT_CAP_BYTES,
     PREFLIGHT_SPECS,
     QUALIFICATION_PROFILES,
@@ -33,6 +37,7 @@ from validate_architecture_record import (
     main,
     validate_local_admission,
     validate_benchmark_measurement,
+    validate_gpu_telemetry_artifact,
     validate_qualification_soundness_gate,
     validate_record,
     validate_soundness_gate,
@@ -122,6 +127,13 @@ def valid_arena_graph_record() -> dict:
             "gpu_execution_tables_ingest_descriptor_h2d_copies": 2,
             "gpu_execution_tables_ingest_syncs": 1,
             "gpu_witness_ingest_syncs": 1,
+            "simd_reference_required": True,
+            "simd_reference_comparison_applicable": True,
+            "simd_reference_byte_equal": True,
+            "gpu_proof_blake3": "5" * 64,
+            "simd_reference_blake3": "5" * 64,
+            "simd_reference_fresh": True,
+            "simd_reference_s": 1.001,
         }
     )
     return record
@@ -138,10 +150,30 @@ def valid_measurement_record() -> dict:
             "reps": 6,
             "verified_reps": 6,
             "warm_sample_count": 5,
+            "gpu_proof_loop_started_unix_ns": 1_700_000_000_000_000_000,
+            "gpu_proof_loop_finished_unix_ns": 1_700_000_060_000_000_000,
             "prove_s_warm_samples_raw": [0.7, 0.8, 0.9, 1.0, 1.1],
             "prove_s_warm_median": 0.9,
+            "prove_s_warm_p95": 1.08,
             "mhz_median": 11.0,
             "useful_mhz_median": 10.0,
+            "mhz_at_warm_p95": 9.167,
+            "useful_mhz_at_warm_p95": 8.333,
+            "prove_s_cold": 1.2,
+            "verify_ms": 42.0,
+            "proof_kb": 210.5,
+            "peak_rss_gb": 18.2,
+            "vram_end_gb": 6.1,
+            "vram_peak_gb": 11.3,
+            "pool_used_high_gb": 5.0,
+            "pool_reserved_high_gb": 6.0,
+            "security_bits": 96,
+            "n_queries": 70,
+            "pow_bits": 26,
+            "fold_step": 3,
+            "proof_comparison_applicable": True,
+            "proof_byte_equal_required": True,
+            "proof_byte_equal": True,
             "throughput_distribution_applicable": True,
         }
     )
@@ -435,6 +467,7 @@ class ArchitectureRecordTest(unittest.TestCase):
             "expected_program": "SN_PIE_2.zip",
             "expected_reps": 6,
             "expected_gpu": "NVIDIA H100 80GB HBM3",
+            "require_fresh_simd_reference": True,
         }
         self.assertEqual(validate_benchmark_measurement(record, **arguments), [])
         mutations = (
@@ -442,17 +475,186 @@ class ArchitectureRecordTest(unittest.TestCase):
             ("gpu", lambda value: value.update({"gpu": "NVIDIA A100-SXM4-80GB"})),
             ("reps", lambda value: value.update({"reps": 5})),
             ("verified", lambda value: value.update({"verified_reps": 5})),
+            (
+                "missing proof window",
+                lambda value: value.pop("gpu_proof_loop_started_unix_ns"),
+            ),
+            (
+                "reversed proof window",
+                lambda value: value.update(
+                    {"gpu_proof_loop_finished_unix_ns": 1_699_999_999_000_000_000}
+                ),
+            ),
+            (
+                "proof window shorter than samples",
+                lambda value: value.update(
+                    {"gpu_proof_loop_finished_unix_ns": 1_700_000_001_000_000_000}
+                ),
+            ),
             ("sample count", lambda value: value["prove_s_warm_samples_raw"].pop()),
             ("nonfinite sample", lambda value: value["prove_s_warm_samples_raw"].__setitem__(0, float("inf"))),
             ("median", lambda value: value.update({"prove_s_warm_median": 0.8})),
+            ("p95", lambda value: value.update({"prove_s_warm_p95": 0.9})),
             ("headline", lambda value: value.update({"useful_mhz_median": 12.0})),
             ("cycle rate", lambda value: value.update({"mhz_median": 12.0})),
+            ("p95 rate", lambda value: value.update({"useful_mhz_at_warm_p95": 12.0})),
+            ("security", lambda value: value.update({"security_bits": 95})),
+            ("cold timing", lambda value: value.update({"prove_s_cold": 0.0})),
+            ("proof size", lambda value: value.update({"proof_kb": float("nan")})),
+            ("proof equality", lambda value: value.update({"proof_byte_equal": False})),
+            (
+                "pool high-water",
+                lambda value: value.update(
+                    {"pool_used_high_gb": 7.0, "pool_reserved_high_gb": 6.0}
+                ),
+            ),
+            (
+                "missing SIMD equality",
+                lambda value: value.update({"simd_reference_byte_equal": False}),
+            ),
+            (
+                "SIMD reference not required",
+                lambda value: value.update({"simd_reference_required": False}),
+            ),
+            (
+                "SIMD comparison inapplicable",
+                lambda value: value.update(
+                    {"simd_reference_comparison_applicable": False}
+                ),
+            ),
+            (
+                "invalid SIMD reference digest",
+                lambda value: value.update({"simd_reference_blake3": "not-a-digest"}),
+            ),
+            (
+                "GPU and SIMD digest mismatch",
+                lambda value: value.update({"gpu_proof_blake3": "6" * 64}),
+            ),
+            (
+                "cached SIMD reference",
+                lambda value: value.update({"simd_reference_fresh": False}),
+            ),
+            (
+                "invalid SIMD reference duration",
+                lambda value: value.update({"simd_reference_s": float("nan")}),
+            ),
         )
         for name, mutate in mutations:
             with self.subTest(name=name):
                 candidate = copy.deepcopy(record)
                 mutate(candidate)
                 self.assertTrue(validate_benchmark_measurement(candidate, **arguments))
+
+    def test_gpu_telemetry_is_byte_bound_and_overlaps_proof_window(self) -> None:
+        record = valid_measurement_record()
+        start = 1_700_000_000_000_000_000
+        finish = start + 4_000_000_000
+        record["gpu_proof_loop_started_unix_ns"] = start
+        record["gpu_proof_loop_finished_unix_ns"] = finish
+        header = ",".join(GPU_TELEMETRY_COLUMNS)
+
+        def row(timestamp: int) -> str:
+            return ",".join(
+                (
+                    str(timestamp),
+                    "98",
+                    "42",
+                    "12000",
+                    "680.5",
+                    "1980",
+                    "2619",
+                    "64",
+                    "570.86.15",
+                    "700",
+                    "1980",
+                    "2619",
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "SN_PIE_2.telemetry.csv"
+
+            def metadata_for(proof_window_sample_count: int) -> dict:
+                payload = path.read_bytes()
+                digest = hashlib.sha256(payload).hexdigest()
+                return {
+                    "schema": GPU_TELEMETRY_SCHEMA,
+                    "columns": list(GPU_TELEMETRY_COLUMNS),
+                    "path": str(path),
+                    "sha256": digest,
+                    "remote_sha256": digest,
+                    "size_bytes": len(payload),
+                    "remote_size_bytes": len(payload),
+                    "sample_count": len(payload.decode("utf-8").splitlines()) - 1,
+                    "proof_window_sample_count": proof_window_sample_count,
+                    "sampler_complete": True,
+                    "sample_interval_ms": GPU_TELEMETRY_SAMPLE_INTERVAL_MS,
+                    "max_gap_ns": GPU_TELEMETRY_MAX_GAP_NS,
+                    "transport_equal": True,
+                }
+
+            timestamps = range(start - 1_000_000_000, finish + 1_000_000_001, 1_000_000_000)
+            path.write_text(
+                header + "\n" + "\n".join(row(timestamp) for timestamp in timestamps) + "\n",
+                encoding="utf-8",
+            )
+            metadata = metadata_for(5)
+            self.assertEqual(validate_gpu_telemetry_artifact(record, metadata), [])
+            for name, mutate in (
+                ("digest", lambda value: value.update({"sha256": "0" * 64})),
+                ("size", lambda value: value.update({"size_bytes": 1})),
+                (
+                    "truncated remote digest",
+                    lambda value: value.update({"remote_sha256": "abc"}),
+                ),
+                (
+                    "truncated remote size",
+                    lambda value: value.update({"remote_size_bytes": 1}),
+                ),
+                (
+                    "transport mismatch",
+                    lambda value: value.update({"transport_equal": False}),
+                ),
+                (
+                    "schema",
+                    lambda value: value.update({"schema": "stwo.gpu-telemetry.csv.v0"}),
+                ),
+                ("incomplete", lambda value: value.update({"sampler_complete": False})),
+                (
+                    "wrong interval",
+                    lambda value: value.update({"sample_interval_ms": 1000}),
+                ),
+                (
+                    "no window sample",
+                    lambda value: value.update({"proof_window_sample_count": 0}),
+                ),
+            ):
+                with self.subTest(name=name):
+                    candidate = copy.deepcopy(metadata)
+                    mutate(candidate)
+                    self.assertTrue(validate_gpu_telemetry_artifact(record, candidate))
+
+            sparse = (start - 1_000_000_000, start + 500_000_000,
+                      start + 3_500_000_000, finish + 1_000_000_000)
+            path.write_text(
+                header + "\n" + "\n".join(row(timestamp) for timestamp in sparse) + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(validate_gpu_telemetry_artifact(record, metadata_for(2)))
+
+            path.write_text(
+                f"{header}\n{row(start - 1_000_000_000)}\n"
+                f"{start + 1_000_000_000},98,42\n{row(finish + 1_000_000_000)}\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(validate_gpu_telemetry_artifact(record, metadata_for(1)))
+
+            outside = (start - 2_000_000_000, start - 1_000_000_000)
+            path.write_text(
+                header + "\n" + "\n".join(row(timestamp) for timestamp in outside) + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(validate_gpu_telemetry_artifact(record, metadata_for(0)))
 
     def test_soundness_gate_requires_nonzero_execution_for_every_command(self) -> None:
         artifact = valid_soundness_artifact()
@@ -507,6 +709,30 @@ class ArchitectureRecordTest(unittest.TestCase):
         self.assertLess(
             soundness.index("verify_remote_source_projection"),
             soundness.index('seal_source_projection "$LOCAL_SOUNDNESS_GATE"'),
+        )
+
+    def test_bench_loop_drains_and_byte_checks_telemetry_transport(self) -> None:
+        script = (Path(__file__).parent / "loop/bench_loop.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("pod_telemetry_stop=", script)
+        self.assertIn("pod_telemetry_meta=", script)
+        self.assertNotIn('kill "\\$telemetry_pid"', script)
+        self.assertLess(
+            script.index('sample="\\$(timeout --signal=KILL 2s nvidia-smi'),
+            script.index('timestamp="\\$(date +%s%N)"'),
+        )
+        self.assertLess(
+            script.index("printf 'stop\\n' > '${pod_telemetry_stop}'"),
+            script.index('wait "\\$telemetry_pid"'),
+        )
+        self.assertLess(
+            script.index('wait "\\$telemetry_pid"'),
+            script.index("sha256sum '${pod_telemetry}'"),
+        )
+        self.assertIn(
+            'if ! run_ssh "cat \'${pod_telemetry}\'" > "$LAST_TELEMETRY_PATH"; then',
+            script,
         )
 
     def test_soundness_gate_rejects_truncated_or_forged_manifest(self) -> None:

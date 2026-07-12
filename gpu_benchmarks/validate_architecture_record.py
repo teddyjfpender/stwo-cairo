@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
@@ -40,6 +41,25 @@ SOUNDNESS_GATES = {
 SOUNDNESS_COMMANDS = {
     name: list(command) for name, command, _required in CUDA_SOUNDNESS_GATE_COMMANDS
 }
+
+GPU_TELEMETRY_SCHEMA = "stwo.gpu-telemetry.csv.v1"
+GPU_TELEMETRY_COLUMNS = (
+    "timestamp_unix_ns",
+    "utilization_gpu_pct",
+    "utilization_memory_pct",
+    "memory_used_mib",
+    "power_draw_w",
+    "clock_sm_mhz",
+    "clock_memory_mhz",
+    "temperature_gpu_c",
+    "driver_version",
+    "power_limit_w",
+    "clock_max_sm_mhz",
+    "clock_max_memory_mhz",
+)
+GPU_TELEMETRY_SAMPLE_INTERVAL_MS = 250
+GPU_TELEMETRY_MAX_GAP_NS = 2_000_000_000
+GPU_TELEMETRY_MIN_WINDOW_SAMPLES = 2
 
 PREFLIGHT_CAP_BYTES = 81_604_378_624
 RETAINED_BUDGET_FLAG = "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES"
@@ -809,10 +829,46 @@ def validate_benchmark_measurement(
     expected_program: str,
     expected_reps: int,
     expected_gpu: str | None = None,
+    require_fresh_simd_reference: bool = False,
 ) -> list[str]:
     """Bind the published warm median to one exact input and its raw samples."""
 
     errors: list[str] = []
+    if require_fresh_simd_reference:
+        for field in (
+            "simd_reference_required",
+            "simd_reference_comparison_applicable",
+            "simd_reference_byte_equal",
+            "simd_reference_fresh",
+        ):
+            if record.get(field) is not True:
+                errors.append(f"{field}: expected true, got {record.get(field)!r}")
+        digests = {}
+        for field in ("gpu_proof_blake3", "simd_reference_blake3"):
+            value = record.get(field)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+            ):
+                errors.append(f"{field}: expected a 64-character lowercase hex digest")
+            else:
+                digests[field] = value
+        if (
+            len(digests) == 2
+            and digests["gpu_proof_blake3"] != digests["simd_reference_blake3"]
+        ):
+            errors.append("GPU and fresh SIMD proof BLAKE3 digests differ")
+        reference_s = record.get("simd_reference_s")
+        if (
+            not isinstance(reference_s, (int, float))
+            or isinstance(reference_s, bool)
+            or not math.isfinite(reference_s)
+            or reference_s <= 0
+        ):
+            errors.append(
+                f"simd_reference_s: expected a finite positive duration, got {reference_s!r}"
+            )
     if record.get("program") != expected_program:
         errors.append(
             f"program: expected {expected_program!r}, got {record.get('program')!r}"
@@ -830,6 +886,26 @@ def validate_benchmark_measurement(
         value = record.get(field)
         if not isinstance(value, int) or isinstance(value, bool) or value != expected:
             errors.append(f"{field}: expected integer {expected}, got {value!r}")
+
+    window = {}
+    for field in (
+        "gpu_proof_loop_started_unix_ns",
+        "gpu_proof_loop_finished_unix_ns",
+    ):
+        value = record.get(field)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 1_000_000_000_000_000_000
+        ):
+            errors.append(f"{field}: expected a Unix nanosecond integer, got {value!r}")
+        else:
+            window[field] = value
+    if len(window) == 2 and (
+        window["gpu_proof_loop_finished_unix_ns"]
+        <= window["gpu_proof_loop_started_unix_ns"]
+    ):
+        errors.append("GPU proof-loop finish must be after its start")
 
     samples = record.get("prove_s_warm_samples_raw")
     if (
@@ -849,6 +925,12 @@ def validate_benchmark_measurement(
         return errors
 
     raw_median = float(statistics.median(samples))
+    ordered = sorted(float(sample) for sample in samples)
+    rank = 0.95 * (len(ordered) - 1)
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    weight = rank - lower
+    raw_p95 = ordered[lower] + (ordered[upper] - ordered[lower]) * weight
 
     def rounded3(value: float) -> float:
         # All measurement values are positive; this matches Rust f64::round().
@@ -867,6 +949,7 @@ def validate_benchmark_measurement(
             )
 
     require_rounded("prove_s_warm_median", raw_median)
+    require_rounded("prove_s_warm_p95", raw_p95)
     for work_field, rate_field in (
         ("cycle_count", "mhz_median"),
         ("pie_n_steps", "useful_mhz_median"),
@@ -876,8 +959,204 @@ def validate_benchmark_measurement(
             errors.append(f"{work_field}: expected a positive integer, got {work!r}")
         else:
             require_rounded(rate_field, work / raw_median / 1e6)
+            p95_rate_field = (
+                "mhz_at_warm_p95"
+                if work_field == "cycle_count"
+                else "useful_mhz_at_warm_p95"
+            )
+            require_rounded(p95_rate_field, work / raw_p95 / 1e6)
+    for field, expected in (
+        ("security_bits", 96),
+        ("n_queries", 70),
+        ("pow_bits", 26),
+        ("fold_step", 3),
+    ):
+        if record.get(field) != expected:
+            errors.append(f"{field}: expected {expected}, got {record.get(field)!r}")
+    for field in ("prove_s_cold", "verify_ms", "proof_kb"):
+        value = record.get(field)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            errors.append(f"{field}: expected a finite positive value, got {value!r}")
+    cold = record.get("prove_s_cold")
+    if (
+        len(window) == 2
+        and isinstance(cold, (int, float))
+        and not isinstance(cold, bool)
+        and math.isfinite(cold)
+        and cold > 0
+    ):
+        loop_seconds = (
+            window["gpu_proof_loop_finished_unix_ns"]
+            - window["gpu_proof_loop_started_unix_ns"]
+        ) / 1e9
+        recorded_prove_seconds = float(cold) + sum(float(sample) for sample in samples)
+        if loop_seconds + 0.01 < recorded_prove_seconds:
+            errors.append(
+                "GPU proof-loop wall duration is shorter than the summed prove samples"
+            )
+    for field in (
+        "peak_rss_gb",
+        "vram_end_gb",
+        "vram_peak_gb",
+        "pool_used_high_gb",
+        "pool_reserved_high_gb",
+    ):
+        value = record.get(field)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            errors.append(f"{field}: expected a finite non-negative value, got {value!r}")
+    pool_used = record.get("pool_used_high_gb")
+    pool_reserved = record.get("pool_reserved_high_gb")
+    if (
+        isinstance(pool_used, (int, float))
+        and not isinstance(pool_used, bool)
+        and math.isfinite(pool_used)
+        and isinstance(pool_reserved, (int, float))
+        and not isinstance(pool_reserved, bool)
+        and math.isfinite(pool_reserved)
+        and pool_reserved < pool_used
+    ):
+        errors.append("pool_reserved_high_gb: expected at least pool_used_high_gb")
+    for field in (
+        "proof_comparison_applicable",
+        "proof_byte_equal_required",
+        "proof_byte_equal",
+        "performance_claim_admissible",
+    ):
+        if record.get(field) is not True:
+            errors.append(f"{field}: expected true, got {record.get(field)!r}")
     if record.get("throughput_distribution_applicable") is not True:
         errors.append("throughput_distribution_applicable: expected true")
+    return errors
+
+
+def validate_gpu_telemetry_artifact(
+    record: dict[str, Any], metadata: dict[str, Any]
+) -> list[str]:
+    """Bind raw nvidia-smi samples to the proof-loop envelope.
+
+    The envelope includes per-repetition input clones and phase-report gaps; it ends
+    before the fresh SIMD reference and is not claimed to be pure kernel time.
+    """
+
+    errors: list[str] = []
+    expected_columns = list(GPU_TELEMETRY_COLUMNS)
+    if metadata.get("schema") != GPU_TELEMETRY_SCHEMA:
+        errors.append(f"telemetry schema: expected {GPU_TELEMETRY_SCHEMA!r}")
+    if metadata.get("columns") != expected_columns:
+        errors.append("telemetry columns do not match the fixed v1 schema")
+    if metadata.get("sampler_complete") is not True:
+        errors.append("telemetry sampler did not remain alive for the complete process")
+    if metadata.get("sample_interval_ms") != GPU_TELEMETRY_SAMPLE_INTERVAL_MS:
+        errors.append(
+            f"telemetry sample_interval_ms: expected {GPU_TELEMETRY_SAMPLE_INTERVAL_MS}"
+        )
+    if metadata.get("max_gap_ns") != GPU_TELEMETRY_MAX_GAP_NS:
+        errors.append(f"telemetry max_gap_ns: expected {GPU_TELEMETRY_MAX_GAP_NS}")
+    if metadata.get("transport_equal") is not True:
+        errors.append("telemetry transport equality was not established")
+
+    path_value = metadata.get("path")
+    if not isinstance(path_value, str) or not path_value:
+        return errors + ["telemetry path is missing"]
+    path = Path(path_value)
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        return errors + [f"telemetry artifact: {error}"]
+    actual_digest = hashlib.sha256(payload).hexdigest()
+    if metadata.get("sha256") != actual_digest:
+        errors.append("telemetry SHA256 does not match retained CSV bytes")
+    if metadata.get("remote_sha256") != actual_digest:
+        errors.append("remote telemetry SHA256 does not match retained CSV bytes")
+    if metadata.get("size_bytes") != len(payload) or not payload:
+        errors.append("telemetry size does not match retained CSV bytes")
+    if metadata.get("remote_size_bytes") != len(payload):
+        errors.append("remote telemetry size does not match retained CSV bytes")
+
+    try:
+        text = payload.decode("utf-8")
+        reader = csv.DictReader(text.splitlines())
+        if reader.fieldnames != expected_columns:
+            errors.append("telemetry CSV header does not match the fixed v1 schema")
+            return errors
+        rows = list(reader)
+    except (UnicodeDecodeError, csv.Error) as error:
+        return errors + [f"telemetry CSV: {error}"]
+    if not rows:
+        return errors + ["telemetry CSV has no samples"]
+    if metadata.get("sample_count") != len(rows):
+        errors.append("telemetry sample_count does not match retained CSV rows")
+
+    start = record.get("gpu_proof_loop_started_unix_ns")
+    finish = record.get("gpu_proof_loop_finished_unix_ns")
+    window_samples = 0
+    last_timestamp = 0
+    timestamps = []
+    bounded_fields = {
+        "utilization_gpu_pct": (0.0, 100.0),
+        "utilization_memory_pct": (0.0, 100.0),
+        "memory_used_mib": (0.0, math.inf),
+        "power_draw_w": (0.0, math.inf),
+        "clock_sm_mhz": (0.0, math.inf),
+        "clock_memory_mhz": (0.0, math.inf),
+        "temperature_gpu_c": (0.0, math.inf),
+        "power_limit_w": (0.0, math.inf),
+        "clock_max_sm_mhz": (0.0, math.inf),
+        "clock_max_memory_mhz": (0.0, math.inf),
+    }
+    for index, row in enumerate(rows, start=1):
+        if None in row or any(row.get(field) is None for field in GPU_TELEMETRY_COLUMNS):
+            errors.append(f"telemetry row {index}: column count does not match schema")
+            continue
+        try:
+            timestamp = int(row["timestamp_unix_ns"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"telemetry row {index}: invalid Unix-ns timestamp")
+            continue
+        if timestamp <= 0 or timestamp < last_timestamp:
+            errors.append(f"telemetry row {index}: timestamps are not monotonic")
+        last_timestamp = timestamp
+        timestamps.append(timestamp)
+        if isinstance(start, int) and isinstance(finish, int) and start <= timestamp <= finish:
+            window_samples += 1
+        if not row.get("driver_version", "").strip():
+            errors.append(f"telemetry row {index}: driver_version is empty")
+        for field, (lower, upper) in bounded_fields.items():
+            try:
+                value = float(row[field])
+            except (KeyError, TypeError, ValueError):
+                errors.append(f"telemetry row {index}: {field} is not numeric")
+                continue
+            if not math.isfinite(value) or value < lower or value > upper:
+                errors.append(f"telemetry row {index}: {field} is out of range")
+    if window_samples < GPU_TELEMETRY_MIN_WINDOW_SAMPLES:
+        errors.append(
+            "telemetry has fewer than "
+            f"{GPU_TELEMETRY_MIN_WINDOW_SAMPLES} samples inside the GPU proof-loop window"
+        )
+    if isinstance(start, int) and timestamps and timestamps[0] > start:
+        errors.append("telemetry sampling began after the GPU proof loop")
+    if isinstance(finish, int) and timestamps and timestamps[-1] < finish:
+        errors.append("telemetry sampling ended before the GPU proof loop")
+    for previous, current in zip(timestamps, timestamps[1:]):
+        if current - previous > GPU_TELEMETRY_MAX_GAP_NS:
+            errors.append(
+                "telemetry cadence gap exceeds "
+                f"{GPU_TELEMETRY_MAX_GAP_NS}ns: {current - previous}ns"
+            )
+            break
+    if metadata.get("proof_window_sample_count") != window_samples:
+        errors.append("telemetry proof_window_sample_count does not match CSV samples")
     return errors
 
 
@@ -923,6 +1202,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-program")
     parser.add_argument("--expected-reps", type=int)
     parser.add_argument("--expected-gpu")
+    parser.add_argument("--require-fresh-simd-reference", action="store_true")
+    parser.add_argument("--gpu-telemetry-csv", type=Path)
+    parser.add_argument("--gpu-telemetry-remote-sha256")
+    parser.add_argument("--gpu-telemetry-remote-size", type=int)
     parser.add_argument("--stwo-head")
     parser.add_argument("--stwo-worktree-hash")
     parser.add_argument("--stwo-cairo-head")
@@ -1006,6 +1289,17 @@ def main(argv: list[str] | None = None) -> int:
     errors = validate_record(record, args.runtime_mode)
     if (args.expected_program is None) != (args.expected_reps is None):
         parser.error("record measurement validation requires both --expected-program and --expected-reps")
+    if args.require_fresh_simd_reference and args.expected_program is None:
+        parser.error("--require-fresh-simd-reference requires measurement validation")
+    if args.gpu_telemetry_csv is not None and args.expected_program is None:
+        parser.error("--gpu-telemetry-csv requires measurement validation")
+    if args.gpu_telemetry_csv is not None and (
+        args.gpu_telemetry_remote_sha256 is None
+        or args.gpu_telemetry_remote_size is None
+    ):
+        parser.error(
+            "--gpu-telemetry-csv requires remote SHA256 and size transport metadata"
+        )
     if args.expected_program is not None and args.expected_reps is not None:
         errors.extend(
             validate_benchmark_measurement(
@@ -1013,8 +1307,53 @@ def main(argv: list[str] | None = None) -> int:
                 expected_program=args.expected_program,
                 expected_reps=args.expected_reps,
                 expected_gpu=args.expected_gpu,
+                require_fresh_simd_reference=args.require_fresh_simd_reference,
             )
         )
+        if args.gpu_telemetry_csv is not None:
+            try:
+                payload = args.gpu_telemetry_csv.read_bytes()
+                sample_count = max(0, len(payload.decode("utf-8").splitlines()) - 1)
+            except (OSError, UnicodeDecodeError) as error:
+                errors.append(f"telemetry artifact: {error}")
+            else:
+                start = record.get("gpu_proof_loop_started_unix_ns")
+                finish = record.get("gpu_proof_loop_finished_unix_ns")
+                proof_window_sample_count = 0
+                try:
+                    rows = list(csv.DictReader(payload.decode("utf-8").splitlines()))
+                    proof_window_sample_count = sum(
+                        isinstance(start, int)
+                        and isinstance(finish, int)
+                        and start <= int(row["timestamp_unix_ns"]) <= finish
+                        for row in rows
+                    )
+                except (csv.Error, KeyError, TypeError, ValueError):
+                    pass
+                errors.extend(
+                    validate_gpu_telemetry_artifact(
+                        record,
+                        {
+                            "schema": GPU_TELEMETRY_SCHEMA,
+                            "columns": list(GPU_TELEMETRY_COLUMNS),
+                            "path": str(args.gpu_telemetry_csv),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                            "remote_sha256": args.gpu_telemetry_remote_sha256,
+                            "size_bytes": len(payload),
+                            "remote_size_bytes": args.gpu_telemetry_remote_size,
+                            "sample_count": sample_count,
+                            "proof_window_sample_count": proof_window_sample_count,
+                            "sampler_complete": True,
+                            "sample_interval_ms": GPU_TELEMETRY_SAMPLE_INTERVAL_MS,
+                            "max_gap_ns": GPU_TELEMETRY_MAX_GAP_NS,
+                            "transport_equal": (
+                                args.gpu_telemetry_remote_sha256
+                                == hashlib.sha256(payload).hexdigest()
+                                and args.gpu_telemetry_remote_size == len(payload)
+                            ),
+                        },
+                    )
+                )
     try:
         soundness = load_soundness_gate(args.soundness_gate)
     except (OSError, ValueError, json.JSONDecodeError) as error:

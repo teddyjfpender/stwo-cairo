@@ -132,6 +132,8 @@ LOCAL_PREFLIGHT_ADMISSION="${LOCAL_PREFLIGHT_ADMISSION:-}"
 GPU_PCS_RUNTIME_MODE="${GPU_PCS_RUNTIME_MODE:-arena-graph}"
 EXPECTED_POD_GPU="${EXPECTED_POD_GPU:-}"
 GPU_NATIVE_ARGS="--engine gpu-native --require-gpu-native-architecture --require-gpu-pcs-runtime-mode ${GPU_PCS_RUNTIME_MODE}"
+GPU_TELEMETRY_COLUMNS="timestamp_unix_ns,utilization_gpu_pct,utilization_memory_pct,memory_used_mib,power_draw_w,clock_sm_mhz,clock_memory_mhz,temperature_gpu_c,driver_version,power_limit_w,clock_max_sm_mhz,clock_max_memory_mhz"
+GPU_TELEMETRY_SAMPLE_INTERVAL_SECONDS="0.25"
 
 # Fleet (rotate) run parameters.
 FLEET_REPS="${FLEET_REPS:-8}"
@@ -1141,6 +1143,12 @@ synth_out() {
   local name="$1" args="$2" dest="$3"
   local backend="cuda"; [[ "$args" == *"--backend simd"* ]] && backend="simd"
   local architecture_fields='"engine":"legacy","gpu_pcs_driver_architecture":null,"gpu_pcs_runtime_mode":null,"gpu_pcs_stage_started":null,"gpu_pcs_stage_finished":null,"gpu_pcs_batched_tree_decommit":null,"gpu_pcs_driver_complete":null,"gpu_native_architecture_required":false,"gpu_pcs_required_runtime_mode":null,"gpu_native_architecture_gate_passed":null,"gpu_aot_loads":null,"gpu_aot_cache_hits":null,"gpu_aot_manifest_hash":null,"gpu_aot_misses":null,"gpu_aot_runtime_loads":null,"gpu_aot_runtime_cache_hits":null,"gpu_aot_strict_rejections":null,"gpu_aot_provenance_gate_passed":null'
+  local proof_blake3
+  proof_blake3="$(printf 'c%.0s' {1..64})"
+  local simd_reference_fields='"simd_reference_required":false,"simd_reference_comparison_applicable":false,"simd_reference_byte_equal":null,"simd_reference_blake3":null,"simd_reference_fresh":null,"simd_reference_s":null'
+  if [[ "$args" == *"--require-simd-reference-byte-equal"* ]]; then
+    simd_reference_fields='"simd_reference_required":true,"simd_reference_comparison_applicable":true,"simd_reference_byte_equal":true,"simd_reference_blake3":"'"${proof_blake3}"'","simd_reference_fresh":true,"simd_reference_s":1.001'
+  fi
   if [[ "$args" == *"--require-gpu-native-architecture"* ]]; then
     local runtime_report="DetachedEager"
     [[ "$GPU_PCS_RUNTIME_MODE" == "arena-graph" ]] && runtime_report="ArenaGraph"
@@ -1169,9 +1177,10 @@ synth_out() {
   [[ "$name" == "gate_correctness" ]] && program="SN_PIE_2.zip"
   [[ "${FAKE_MISSING_QUALIFICATION_METRICS:-}" == "$name" ]] && um_median="null"
   {
-    echo "{\"rep\":0,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":1234.5},\"fri\":{\"count\":1,\"total_ms\":567.8}}}"
-    echo "{\"rep\":1,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":1201.2},\"fri\":{\"count\":1,\"total_ms\":560.1}}}"
-    echo "{\"program\":\"${program}\",\"backend\":\"${backend}\",${architecture_fields},\"n\":1,\"cycle_count\":14600000,\"pie_n_steps\":12000000,\"bootloader_overhead_pct\":21.6,\"reps\":${verified_reps},\"warm_sample_count\":${warm_count},\"prove_s_warm_samples_raw\":${raw_samples},\"prove_s_warm_samples_rounded\":${raw_samples},\"prove_s_cold\":9.9,\"prove_s_warm\":${warm_rounded},\"prove_s_warm_median\":${warm_rounded},\"verify_ms\":42.0,\"verified_reps\":${verified_reps},\"proof_kb\":210.5,\"peak_rss_gb\":18.2,\"vram_end_gb\":6.1,\"vram_peak_gb\":11.3,\"steps_per_s\":$(awk -v s="$warm_s" 'BEGIN{printf "%.0f",14600000/s}'),\"mhz\":${mhz_median},\"mhz_median\":${mhz_median},\"useful_mhz\":${um},\"useful_mhz_median\":${um_median},\"throughput_distribution_applicable\":true,\"proof_comparison_applicable\":true,\"proof_byte_equal\":true,\"proof_byte_equal_required\":true,\"vm_s\":30.2,\"adapt_s\":5.1,\"security_bits\":96,\"n_queries\":70,\"pow_bits\":26,\"fold_step\":3,\"gpu\":\"${POD_GPU}\",\"nproc\":32,\"host_mem_gb\":125.6}"
+    for ((rep = 0; rep < verified_reps; rep++)); do
+      echo "{\"rep\":${rep},\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":1234.5},\"fri\":{\"count\":1,\"total_ms\":567.8}}}"
+    done
+    echo "{\"program\":\"${program}\",\"backend\":\"${backend}\",${architecture_fields},${simd_reference_fields},\"n\":1,\"cycle_count\":14600000,\"pie_n_steps\":12000000,\"bootloader_overhead_pct\":21.6,\"reps\":${verified_reps},\"gpu_proof_loop_started_unix_ns\":1700000000000000000,\"gpu_proof_loop_finished_unix_ns\":1700000060000000000,\"warm_sample_count\":${warm_count},\"prove_s_warm_samples_raw\":${raw_samples},\"prove_s_warm_samples_rounded\":${raw_samples},\"prove_s_cold\":9.9,\"prove_s_warm\":${warm_rounded},\"prove_s_warm_median\":${warm_rounded},\"prove_s_warm_p95\":${warm_rounded},\"verify_ms\":42.0,\"verified_reps\":${verified_reps},\"proof_kb\":210.5,\"peak_rss_gb\":18.2,\"vram_end_gb\":6.1,\"vram_peak_gb\":11.3,\"pool_used_high_gb\":5.0,\"pool_reserved_high_gb\":6.0,\"steps_per_s\":$(awk -v s="$warm_s" 'BEGIN{printf "%.0f",14600000/s}'),\"mhz\":${mhz_median},\"mhz_median\":${mhz_median},\"mhz_at_warm_p95\":${mhz_median},\"useful_mhz\":${um},\"useful_mhz_median\":${um_median},\"useful_mhz_at_warm_p95\":${um_median},\"throughput_distribution_applicable\":true,\"proof_comparison_applicable\":true,\"proof_byte_equal\":true,\"proof_byte_equal_required\":true,\"gpu_proof_blake3\":\"${proof_blake3}\",\"vm_s\":30.2,\"adapt_s\":5.1,\"security_bits\":96,\"n_queries\":70,\"pow_bits\":26,\"fold_step\":3,\"gpu\":\"${POD_GPU}\",\"nproc\":32,\"host_mem_gb\":125.6}"
     if [[ "$args" == *"--pipeline"* ]]; then
       echo "{\"pipeline\":${FLEET_DEPTH},\"producers\":${FLEET_PRODUCERS},\"pie_mode\":\"rotate\",\"reps\":${FLEET_REPS},\"total_s\":80.5,\"feed_starved_s\":2.1,\"sustained_steps_per_s\":1450000.0,\"sustained_mhz\":1.45,\"sustained_useful_mhz\":$(awk -v s="$seed" 'BEGIN{printf "%.3f",1.1+s/100.0}')}"
     fi
@@ -1195,9 +1204,20 @@ run_bench() {
   local pod_pgid="${POD_RUN_DIR}/${STAMP}.${name}.pgid"
   local pod_quiescence="${POD_RUN_DIR}/${STAMP}.${name}.quiescence"
   local pod_launcher_log="${POD_RUN_DIR}/${STAMP}.${name}.launcher.log"
+  local telemetry_required=0
+  [[ "$name" == SN_PIE_[1-4] ]] && telemetry_required=1
+  local pod_telemetry="${POD_RUN_DIR}/${STAMP}.${name}.gpu-telemetry.csv"
+  local pod_telemetry_complete="${POD_RUN_DIR}/${STAMP}.${name}.gpu-telemetry.complete"
+  local pod_telemetry_stop="${POD_RUN_DIR}/${STAMP}.${name}.gpu-telemetry.stop"
+  local pod_telemetry_meta="${POD_RUN_DIR}/${STAMP}.${name}.gpu-telemetry.remote-meta"
   LAST_STALL_FILE=""
   LAST_PROOF_SHA=""
   LAST_REMOTE_QUIESCENCE_PASSED=false
+  LAST_TELEMETRY_PATH=""
+  LAST_TELEMETRY_SAMPLER_COMPLETE=false
+  LAST_TELEMETRY_REMOTE_SHA=""
+  LAST_TELEMETRY_REMOTE_SIZE=""
+  LAST_TELEMETRY_TRANSPORT_EQUAL=false
   local pod_proof="${POD_RUN_DIR}/${STAMP}.${name}.proof"
   local proof_export=""
   [[ "$BENCH_PROOF_HASHES" == "1" ]] && proof_export="export STWO_DUMP_PROOF='${pod_proof}'"
@@ -1221,11 +1241,32 @@ run_bench() {
       return 0
     fi
     synth_out "$name" "$args" "${base}.out"
+    if [[ "$telemetry_required" == "1" ]]; then
+      LAST_TELEMETRY_PATH="${base}.gpu-telemetry.csv"
+      {
+        echo "$GPU_TELEMETRY_COLUMNS"
+        local timestamp utilization
+        for ((timestamp = 1699999999000000000;
+              timestamp <= 1700000061000000000;
+              timestamp += 250000000)); do
+          utilization=0
+          ((timestamp >= 1700000000000000000 && timestamp <= 1700000060000000000)) \
+            && utilization=98
+          printf '%s,%s,42,12000,680.5,1980,2619,64,570.86.15,700,1980,2619\n' \
+            "$timestamp" "$utilization"
+        done
+      } > "$LAST_TELEMETRY_PATH"
+      LAST_TELEMETRY_SAMPLER_COMPLETE=true
+      LAST_TELEMETRY_REMOTE_SHA="$(sha256_file "$LAST_TELEMETRY_PATH")"
+      LAST_TELEMETRY_REMOTE_SIZE="$(wc -c < "$LAST_TELEMETRY_PATH" | tr -d '[:space:]')"
+      LAST_TELEMETRY_TRANSPORT_EQUAL=true
+    fi
     : > "${base}.err"
     echo 0 > "${base}.rc"
     LAST_OUT="${base}.out"; LAST_RC=0
     LAST_REMOTE_QUIESCENCE_PASSED=true
-    [[ "$BENCH_PROOF_HASHES" == "1" ]] && LAST_PROOF_SHA="dryrun-${name}-proof-sha256"
+    [[ "$BENCH_PROOF_HASHES" == "1" ]] \
+      && LAST_PROOF_SHA="$(printf 'dryrun-proof:%s' "$name" | sha256_stream | cut -d' ' -f1)"
     return 0
   fi
 
@@ -1263,12 +1304,48 @@ ${seal_guard}
 ${quiescence_guard}
 printf 'pre-passed\n' > '${pod_quiescence}'
 echo \$\$ > '${pod_pgid}'
+telemetry_pid=''
+if [[ '${telemetry_required}' == '1' ]]; then
+  printf '%s\n' '${GPU_TELEMETRY_COLUMNS}' > '${pod_telemetry}'
+  (
+    while [[ ! -e '${pod_telemetry_stop}' ]]; do
+      sample="\$(timeout --signal=KILL 2s nvidia-smi --id='${SEALED_GPU_UUID}' \
+        --query-gpu=utilization.gpu,utilization.memory,memory.used,power.draw,clocks.current.sm,clocks.current.memory,temperature.gpu,driver_version,power.limit,clocks.max.sm,clocks.max.memory \
+        --format=csv,noheader,nounits | head -1)"
+      timestamp="\$(date +%s%N)"
+      printf '%s,%s\n' "\$timestamp" "\$sample"
+      sleep '${GPU_TELEMETRY_SAMPLE_INTERVAL_SECONDS}'
+    done
+    ) >> '${pod_telemetry}' &
+  telemetry_pid=\$!
+fi
 /proc/self/fd/9 ${args} > '${pod_out}' 2> '${pod_err}' &
 GB_PID=\$!
 echo \$GB_PID > '${pod_pid}'
+set +e
 wait \$GB_PID
+gb_rc=\$?
+set -e
+telemetry_ok=1
+if [[ '${telemetry_required}' == '1' ]]; then
+  printf 'stop\n' > '${pod_telemetry_stop}'
+  set +e
+  wait "\$telemetry_pid"
+  telemetry_rc=\$?
+  set -e
+  [[ "\$telemetry_rc" == '0' ]] || telemetry_ok=0
+  if [[ "\$telemetry_ok" == '1' ]]; then
+    telemetry_sha="\$(sha256sum '${pod_telemetry}' | cut -d' ' -f1)"
+    telemetry_size="\$(stat -c %s '${pod_telemetry}')"
+    printf '%s %s\n' "\$telemetry_sha" "\$telemetry_size" > '${pod_telemetry_meta}'
+    printf 'complete\n' > '${pod_telemetry_complete}'
+  fi
+fi
+[[ "\$gb_rc" == '0' ]] || exit "\$gb_rc"
+[[ "\$telemetry_ok" == '1' ]] || exit 98
 EOF
-  run_ssh "rm -f '${pod_rc}' '${pod_pid}' '${pod_pgid}' '${pod_quiescence}' '${pod_launcher_log}'; \
+  run_ssh "rm -f '${pod_rc}' '${pod_pid}' '${pod_pgid}' '${pod_quiescence}' '${pod_launcher_log}' \
+    '${pod_telemetry}' '${pod_telemetry_complete}' '${pod_telemetry_stop}' '${pod_telemetry_meta}'; \
     nohup setsid bash '${pod_sh}' >'${pod_launcher_log}' 2>&1 & echo LAUNCHED"
   if ! remote_detached_startup_ok "$pod_pgid" "$pod_rc"; then
     warn "run '${name}' failed its detached-launch startup contract"
@@ -1337,9 +1414,43 @@ EOF
   run_ssh "cat '${pod_out}' 2>/dev/null" > "${base}.out" || true
   run_ssh "cat '${pod_err}' 2>/dev/null" > "${base}.err" || true
   run_ssh "cat '${pod_rc}'  2>/dev/null" > "${base}.rc"  || true
+  if [[ "$telemetry_required" == "1" ]]; then
+    local telemetry_transport_ok=1 telemetry_remote_meta telemetry_remote_extra=""
+    local telemetry_local_sha telemetry_local_size telemetry_complete
+    LAST_TELEMETRY_PATH="${base}.gpu-telemetry.csv"
+    if ! telemetry_remote_meta="$(run_ssh "cat '${pod_telemetry_meta}'")"; then
+      telemetry_transport_ok=0
+    elif ! read -r LAST_TELEMETRY_REMOTE_SHA LAST_TELEMETRY_REMOTE_SIZE telemetry_remote_extra \
+        <<< "$telemetry_remote_meta" \
+        || [[ ! "$LAST_TELEMETRY_REMOTE_SHA" =~ ^[0-9a-f]{64}$ ]] \
+        || [[ ! "$LAST_TELEMETRY_REMOTE_SIZE" =~ ^[0-9]+$ ]] \
+        || [[ -n "$telemetry_remote_extra" ]]; then
+      telemetry_transport_ok=0
+    fi
+    if ! run_ssh "cat '${pod_telemetry}'" > "$LAST_TELEMETRY_PATH"; then
+      telemetry_transport_ok=0
+    fi
+    telemetry_local_sha="$(sha256_file "$LAST_TELEMETRY_PATH")"
+    telemetry_local_size="$(wc -c < "$LAST_TELEMETRY_PATH" | tr -d '[:space:]')"
+    if [[ "$telemetry_local_sha" != "$LAST_TELEMETRY_REMOTE_SHA" \
+          || "$telemetry_local_size" != "$LAST_TELEMETRY_REMOTE_SIZE" ]]; then
+      telemetry_transport_ok=0
+    fi
+    if telemetry_complete="$(run_ssh "cat '${pod_telemetry_complete}'")" \
+        && [[ "$telemetry_complete" == "complete" ]]; then
+      LAST_TELEMETRY_SAMPLER_COMPLETE=true
+    else
+      telemetry_transport_ok=0
+    fi
+    [[ "$telemetry_transport_ok" == "1" ]] && LAST_TELEMETRY_TRANSPORT_EQUAL=true
+  fi
   LAST_RC="$(cat "${base}.rc" 2>/dev/null || echo TIMEOUT)"
   [[ "$timed_out" == "0" ]] || LAST_RC=TIMEOUT
   [[ -n "$LAST_RC" ]] || LAST_RC="TIMEOUT"
+  if [[ "$LAST_RC" == "0" && "$telemetry_required" == "1" \
+        && "$LAST_TELEMETRY_TRANSPORT_EQUAL" != "true" ]]; then
+    LAST_RC=TELEMETRY_TRANSPORT_CONTRACT
+  fi
   LAST_OUT="${base}.out"
   if [[ "$LAST_RC" == "0" ]] \
      && [[ "$(run_ssh "cat '${pod_quiescence}' 2>/dev/null" 2>/dev/null || true)" == "pre-passed" ]] \
@@ -1358,8 +1469,9 @@ EOF
 # A stale pre-contract binary silently ignores unknown CLI flags. Exit status alone
 # therefore cannot prove that all gate repetitions were verified and compared.
 gate_contract_ok() {
-  python3 - "$1" "${2:-2}" <<'PY'
+  python3 - "$1" "${2:-2}" "${3:-0}" <<'PY'
 import json
+import math
 import sys
 
 record = None
@@ -1382,20 +1494,63 @@ required = {
     "proof_byte_equal_required": True,
     "proof_byte_equal": True,
 }
+if sys.argv[3] == "1":
+    required.update({
+        "simd_reference_required": True,
+        "simd_reference_comparison_applicable": True,
+        "simd_reference_byte_equal": True,
+        "simd_reference_fresh": True,
+    })
 if record is None or any(record.get(key) != value for key, value in required.items()):
     print(f"gate contract missing or false: expected {required}, got {record}", file=sys.stderr)
     raise SystemExit(1)
+if sys.argv[3] == "1":
+    gpu_digest = record.get("gpu_proof_blake3")
+    simd_digest = record.get("simd_reference_blake3")
+    reference_s = record.get("simd_reference_s")
+    valid_digest = lambda value: (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+    if (not valid_digest(gpu_digest) or not valid_digest(simd_digest)
+            or gpu_digest != simd_digest
+            or not isinstance(reference_s, (int, float))
+            or isinstance(reference_s, bool)
+            or not math.isfinite(reference_s) or reference_s <= 0):
+        print("gate contract SIMD/GPU proof digest binding is invalid", file=sys.stderr)
+        raise SystemExit(1)
 PY
 }
 
 # The binary accepts flags by manual lookup, so an older binary can ignore an
 # unknown architecture flag and still exit zero. Validate the primary record too.
 architecture_contract_ok() {
-  local out="$1" expected_program="${2:-}" expected_reps="${3:-}" expected_gpu="${4:-}"
+  local out="$1" expected_program="${2:-}" expected_reps="${3:-}" expected_gpu="${4:-}" require_simd="${5:-0}" telemetry_csv="${6:-}"
   local -a measurement_args=()
   if [[ -n "$expected_program" ]]; then
     measurement_args=(--expected-program "$expected_program" --expected-reps "$expected_reps")
     [[ -z "$expected_gpu" ]] || measurement_args+=(--expected-gpu "$expected_gpu")
+    [[ "$require_simd" != "1" ]] || measurement_args+=(--require-fresh-simd-reference)
+    if [[ -n "$telemetry_csv" ]]; then
+      measurement_args+=(
+        --gpu-telemetry-csv "$telemetry_csv"
+        --gpu-telemetry-remote-sha256 "$LAST_TELEMETRY_REMOTE_SHA"
+        --gpu-telemetry-remote-size "$LAST_TELEMETRY_REMOTE_SIZE"
+      )
+    fi
+  fi
+  if [[ "$require_simd" == "1" && -z "$telemetry_csv" ]]; then
+    echo "fixed-SN benchmark is missing its retained GPU telemetry CSV" >&2
+    return 1
+  fi
+  if [[ -n "$telemetry_csv" && "$LAST_TELEMETRY_SAMPLER_COMPLETE" != "true" ]]; then
+    echo "GPU telemetry sampler did not cover the complete benchmark process" >&2
+    return 1
+  fi
+  if [[ -n "$telemetry_csv" && "$LAST_TELEMETRY_TRANSPORT_EQUAL" != "true" ]]; then
+    echo "GPU telemetry remote/local transport equality was not established" >&2
+    return 1
   fi
   python3 "$ARCHITECTURE_CHECK" "$out" --runtime-mode "$GPU_PCS_RUNTIME_MODE" \
     --soundness-gate "$LOCAL_SOUNDNESS_GATE" "${measurement_args[@]}"
@@ -1415,8 +1570,23 @@ append_ledger() {
   LB_REMOTE_QUIESCENCE="$LAST_REMOTE_QUIESCENCE_PASSED" \
   LB_DRY_RUN="$DRY_RUN" \
   LB_SOUNDNESS_PATH="${LOCAL_SOUNDNESS_GATE:-}" LB_SOUNDNESS_SHA="$LOCAL_SOUNDNESS_GATE_SHA" \
+  LB_TELEMETRY_PATH="${LAST_TELEMETRY_PATH:-}" \
+  LB_TELEMETRY_COMPLETE="${LAST_TELEMETRY_SAMPLER_COMPLETE:-false}" \
+  LB_TELEMETRY_REMOTE_SHA="${LAST_TELEMETRY_REMOTE_SHA:-}" \
+  LB_TELEMETRY_REMOTE_SIZE="${LAST_TELEMETRY_REMOTE_SIZE:-}" \
+  LB_TELEMETRY_TRANSPORT_EQUAL="${LAST_TELEMETRY_TRANSPORT_EQUAL:-false}" \
+  LB_VALIDATOR_DIR="$(dirname "$ARCHITECTURE_CHECK")" \
   LB_LEDGER="$LEDGER" python3 - <<'PY'
-import os, json
+import csv, hashlib, json, os, sys
+
+sys.path.insert(0, os.environ["LB_VALIDATOR_DIR"])
+from validate_architecture_record import (
+    GPU_TELEMETRY_COLUMNS,
+    GPU_TELEMETRY_MAX_GAP_NS,
+    GPU_TELEMETRY_SAMPLE_INTERVAL_MS,
+    GPU_TELEMETRY_SCHEMA,
+    validate_gpu_telemetry_artifact,
+)
 
 led   = os.environ["LB_LEDGER"]
 run   = os.environ["LB_RUN"]
@@ -1447,6 +1617,38 @@ def parse_lines(path):
     return record, pipeline, phases
 
 record, pipeline, phases = parse_lines(os.environ.get("LB_OUT", ""))
+telemetry = None
+telemetry_path = os.environ.get("LB_TELEMETRY_PATH", "")
+if telemetry_path and status == "ok":
+    with open(telemetry_path, "rb") as stream:
+        payload = stream.read()
+    rows = list(csv.DictReader(payload.decode("utf-8").splitlines()))
+    start = (record or {}).get("gpu_proof_loop_started_unix_ns")
+    finish = (record or {}).get("gpu_proof_loop_finished_unix_ns")
+    proof_window_sample_count = sum(
+        isinstance(start, int)
+        and isinstance(finish, int)
+        and start <= int(row["timestamp_unix_ns"]) <= finish
+        for row in rows
+    )
+    telemetry = {
+        "schema": GPU_TELEMETRY_SCHEMA,
+        "columns": list(GPU_TELEMETRY_COLUMNS),
+        "path": telemetry_path,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "remote_sha256": os.environ.get("LB_TELEMETRY_REMOTE_SHA", ""),
+        "size_bytes": len(payload),
+        "remote_size_bytes": int(os.environ.get("LB_TELEMETRY_REMOTE_SIZE", "-1")),
+        "sample_count": len(rows),
+        "proof_window_sample_count": proof_window_sample_count,
+        "sampler_complete": os.environ.get("LB_TELEMETRY_COMPLETE") == "true",
+        "sample_interval_ms": GPU_TELEMETRY_SAMPLE_INTERVAL_MS,
+        "max_gap_ns": GPU_TELEMETRY_MAX_GAP_NS,
+        "transport_equal": os.environ.get("LB_TELEMETRY_TRANSPORT_EQUAL") == "true",
+    }
+    telemetry_errors = validate_gpu_telemetry_artifact(record or {}, telemetry)
+    if telemetry_errors:
+        raise SystemExit(f"invalid retained GPU telemetry: {telemetry_errors}")
 execution_target, source_projection = None, None
 execution_target_sha256 = None
 soundness_path = os.environ.get("LB_SOUNDNESS_PATH", "")
@@ -1525,6 +1727,8 @@ entry = {
     "record": record,
     "phase_totals": phases,
 }
+if telemetry is not None:
+    entry["gpu_telemetry"] = telemetry
 if pipeline:
     entry["pipeline"] = pipeline
 if status != "ok":
@@ -1627,7 +1831,7 @@ add_run() { RUN_NAMES+=("$1"); RUN_ARGS+=("$2"); RUN_INPUTS+=("$3"); }
 
 SEL_PATH="$(pie_path "$PIE_SEL")"
 SEL_NAME="$(pie_name "$PIE_SEL")"
-add_run "$SEL_NAME" "--pie ${SEL_PATH} --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal" "$SEL_PATH"
+add_run "$SEL_NAME" "--pie ${SEL_PATH} --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal --require-simd-reference-byte-equal" "$SEL_PATH"
 
 if [[ "$SIMD" == "1" ]]; then
   add_run "${SEL_NAME}_simd" "--pie ${SEL_PATH} --backend simd --reps ${REPS} --reuse-input --require-proof-byte-equal" "$SEL_PATH"
@@ -1638,7 +1842,7 @@ if [[ "$ALL_PIES" == "1" || "$FULL" == "1" ]]; then
     nm="$(pie_name "$s")"
     [[ "$nm" == "$SEL_NAME" ]] && continue   # already queued as the selected PIE
     pie="$(pie_path "$s")"
-    add_run "$nm" "--pie ${pie} --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal" "$pie"
+    add_run "$nm" "--pie ${pie} --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal --require-simd-reference-byte-equal" "$pie"
   done
   if [[ "$FULL" == "1" ]]; then
     FLEET_LIST="${POD_SN_DIR}/SN_PIE_1.zip,${POD_SN_DIR}/SN_PIE_2.zip,${POD_SN_DIR}/SN_PIE_3.zip,${POD_SN_DIR}/SN_PIE_4.zip"
@@ -1660,14 +1864,14 @@ for idx in "${!RUN_NAMES[@]}"; do
   fi
   if [[ "$LAST_RC" == "0" && "$ar" == *"--require-gpu-native-architecture"* ]]; then
     if [[ "$nm" == SN_PIE_[1-4] ]]; then
-      architecture_contract_ok "$LAST_OUT" "${nm}.zip" "$REPS" "$POD_GPU" \
+      architecture_contract_ok "$LAST_OUT" "${nm}.zip" "$REPS" "$POD_GPU" 1 "$LAST_TELEMETRY_PATH" \
         || LAST_RC="ARCHITECTURE_CONTRACT"
     elif ! architecture_contract_ok "$LAST_OUT"; then
       LAST_RC="ARCHITECTURE_CONTRACT"
     fi
   fi
   if [[ "$LAST_RC" == "0" && "$ar" == *"--require-proof-byte-equal"* ]] \
-     && ! gate_contract_ok "$LAST_OUT" "$REPS"; then
+     && ! gate_contract_ok "$LAST_OUT" "$REPS" "$([[ "$ar" == *"--require-simd-reference-byte-equal"* ]] && echo 1 || echo 0)"; then
     LAST_RC="PROOF_CONTRACT"
   fi
   if [[ "$LAST_RC" != "0" ]]; then
