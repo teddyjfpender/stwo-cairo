@@ -78,6 +78,11 @@ pub const FLAGS: &[FlagDef] = &[
         purpose: "host-planned exact-native commitment evaluations for direct composition inputs",
         deletion_milestone: "M6 (remove after direct composition execution is qualified and unconditional)",
     },
+    FlagDef {
+        name: "STWO_RESIDENT_OODS_DIAGNOSTIC",
+        purpose: "print resident composition OODS inputs and opening topology after validation fails",
+        deletion_milestone: "M6 (remove after resident whole-proof byte identity is qualified)",
+    },
 ];
 
 /// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed

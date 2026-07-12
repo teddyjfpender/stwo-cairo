@@ -301,20 +301,39 @@ fn validate_resident_composition_oods(
         channel,
     );
     let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
-    require_composition_oods_consistency(
+    let mut trace_evaluation = None;
+    let validation = require_composition_oods_consistency(
         oods_point,
         max_log_degree_bound,
         &stark_proof.sampled_values,
         |sampled_values| {
-            components.eval_composition_polynomial_at_point(
+            let evaluation = components.eval_composition_polynomial_at_point(
                 oods_point,
                 sampled_values,
                 random_coefficient,
                 max_log_degree_bound,
-            )
+            );
+            trace_evaluation = Some(evaluation);
+            evaluation
         },
-    )?;
-    Ok(())
+    );
+    if validation.is_err() && flags::flag_on("STWO_RESIDENT_OODS_DIAGNOSTIC") {
+        let topology = stark_proof
+            .sampled_values
+            .iter()
+            .map(|tree| {
+                (
+                    tree.len(),
+                    tree.iter().map(|column| column.len()).sum::<usize>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "resident_oods_diagnostic: point={oods_point:?} random_coefficient={random_coefficient:?} max_log_degree_bound={max_log_degree_bound} trace_evaluation={trace_evaluation:?} composition_mask_coordinates={:?} topology(columns,total_samples)={topology:?}",
+            stark_proof.sampled_values.last(),
+        );
+    }
+    validation
 }
 
 impl From<ProvingError> for GpuError {
@@ -1243,10 +1262,15 @@ mod resident_transcript_mirror_tests {
         ]);
         require_composition_oods_consistency(point, 2, &sampled_values, |_| zero).unwrap();
 
+        let mut trace_evaluations = 0;
         assert!(matches!(
-            require_composition_oods_consistency(point, 2, &sampled_values, |_| one),
+            require_composition_oods_consistency(point, 2, &sampled_values, |_| {
+                trace_evaluations += 1;
+                one
+            }),
             Err(GpuError::Proving(ProvingError::ConstraintsNotSatisfied))
         ));
+        assert_eq!(trace_evaluations, 1);
         sampled_values.last_mut().unwrap()[0][0] = one;
         assert!(matches!(
             require_composition_oods_consistency(point, 2, &sampled_values, |_| zero),
