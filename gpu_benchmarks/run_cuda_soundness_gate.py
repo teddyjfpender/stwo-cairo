@@ -82,7 +82,7 @@ GATES = (
             "--test",
             "prepared_quotient_numerator_native",
         ),
-        1,
+        2,
     ),
     (
         "prepared_quotient_eager_capture_reference",

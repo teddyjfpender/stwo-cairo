@@ -333,6 +333,10 @@ class ArchitectureRecordTest(unittest.TestCase):
             1,
         )
         self.assertEqual(
+            SOUNDNESS_GATES["prepared_numerator_eager_capture_reference"],
+            2,
+        )
+        self.assertEqual(
             SOUNDNESS_GATES["strict_resident_whole_proof_simd_byte_identity"],
             len(STRICT_RESIDENT_REQUIRED_TESTS),
         )

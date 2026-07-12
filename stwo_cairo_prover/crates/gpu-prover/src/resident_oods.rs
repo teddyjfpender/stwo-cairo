@@ -9,7 +9,7 @@ use stwo_backend_cuda::{
     ArenaError, ArenaSlice, OodsCoefficientColumn, PreparedOodsError, PreparedOodsGraph,
     PreparedQuotientError, PreparedQuotientGraph, PreparedQuotientNumeratorError,
     PreparedQuotientNumeratorGraph, QuotientNumeratorColumn, QuotientNumeratorColumnSource,
-    QuotientNumeratorDestination,
+    QuotientNumeratorDestination, QuotientNumeratorSourceKind,
 };
 
 use crate::arena_plan::{ArenaBinding, OpenedColumnSource};
@@ -149,9 +149,30 @@ impl<'a> ResidentOodsPipeline<'a> {
                 words_for_log(column.topology.coefficient_log_size)?,
                 "quotient numerator coefficient column",
             )?;
+            let source = match column.topology.source_kind {
+                QuotientNumeratorSourceKind::Coefficients => {
+                    if column.numerator_source != column.coefficients {
+                        return Err(ResidentOodsError::ColumnBindingMismatch { index });
+                    }
+                    QuotientNumeratorColumnSource::Coefficients(coefficients)
+                }
+                QuotientNumeratorSourceKind::Evaluation => {
+                    let evaluation_log_size = column
+                        .topology
+                        .coefficient_log_size
+                        .checked_add(numerator_plan.config.log_blowup_factor)
+                        .ok_or(ResidentOodsError::SizeOverflow)?;
+                    QuotientNumeratorColumnSource::Evaluation(bind_exact(
+                        workspace,
+                        column.numerator_source,
+                        words_for_log(evaluation_log_size)?,
+                        "quotient numerator retained evaluation column",
+                    )?)
+                }
+            };
             numerator_columns.push(QuotientNumeratorColumn {
                 coefficient_log_size: column.topology.coefficient_log_size,
-                source: QuotientNumeratorColumnSource::Coefficients(coefficients),
+                source,
                 samples: column.topology.samples.clone(),
             });
         }

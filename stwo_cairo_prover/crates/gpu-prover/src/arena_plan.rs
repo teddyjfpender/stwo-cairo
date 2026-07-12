@@ -483,6 +483,28 @@ pub enum DecommitStrategy {
     HybridByGroup = 2,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum QuotientNumeratorSourcePolicy {
+    CoefficientsOnly = 0,
+    ReuseRetainedEvaluations = 1,
+}
+
+impl QuotientNumeratorSourcePolicy {
+    pub fn from_env() -> Self {
+        static POLICY: std::sync::OnceLock<QuotientNumeratorSourcePolicy> =
+            std::sync::OnceLock::new();
+        *POLICY.get_or_init(|| {
+            if std::env::var("STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS").as_deref() == Ok("1")
+            {
+                Self::ReuseRetainedEvaluations
+            } else {
+                Self::CoefficientsOnly
+            }
+        })
+    }
+}
+
 /// Proof-format and generated-code identity not implied by raw buffer sizes.
 /// Any change here gets a separate graph/workspace cache entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,6 +525,7 @@ pub struct ProtocolIdentity {
     pub kernel_manifest_hash: u64,
     pub decommit_strategy: DecommitStrategy,
     pub interpolation_mode: InterpolationLaunchMode,
+    pub quotient_numerator_source_policy: QuotientNumeratorSourcePolicy,
 }
 
 impl ProtocolIdentity {
@@ -529,6 +552,7 @@ impl ProtocolIdentity {
             kernel_manifest_hash,
             decommit_strategy,
             interpolation_mode: InterpolationLaunchMode::from_env(),
+            quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::from_env(),
         }
     }
 }
@@ -615,9 +639,9 @@ pub struct OodsColumnGeometry {
     pub offset_points: Vec<CirclePoint<BaseField>>,
 }
 
-/// Address-free OODS and quotient-numerator topology. All columns currently
-/// bind coefficient-form sources; the explicit kind remains in the backend
-/// topology so a future evaluation source cannot silently change graph shape.
+/// Address-free OODS and quotient-numerator topology. OODS always samples the
+/// canonical coefficients; the numerator may independently reuse a planned
+/// retained evaluation when the sealed policy marks that exact column eligible.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OodsGeometry {
     pub mask_log_size: u32,
@@ -650,11 +674,18 @@ impl OodsGeometry {
 
     pub fn quotient_numerator_topologies(
         &self,
+        source_kinds: &[QuotientNumeratorSourceKind],
     ) -> Result<Vec<QuotientNumeratorColumnTopology>, ArenaPlanError> {
+        if source_kinds.len() != self.columns.len() {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "quotient numerator source policy width mismatch",
+            ));
+        }
         let mut sample_index = 0usize;
         self.columns
             .iter()
-            .map(|column| {
+            .zip(source_kinds)
+            .map(|(column, &source_kind)| {
                 let samples = column
                     .shape_points
                     .iter()
@@ -672,7 +703,7 @@ impl OodsGeometry {
                     .collect::<Result<Vec<_>, ArenaPlanError>>()?;
                 Ok(QuotientNumeratorColumnTopology {
                     coefficient_log_size: column.coefficient_log_size,
-                    source_kind: QuotientNumeratorSourceKind::Coefficients,
+                    source_kind,
                     samples,
                 })
             })
@@ -743,6 +774,90 @@ pub struct ProtocolGeometry {
 }
 
 impl ProtocolGeometry {
+    pub fn quotient_numerator_source_kinds(
+        &self,
+    ) -> Result<Vec<QuotientNumeratorSourceKind>, ArenaPlanError> {
+        self.oods
+            .columns
+            .iter()
+            .map(|column| {
+                if self.identity.quotient_numerator_source_policy
+                    == QuotientNumeratorSourcePolicy::CoefficientsOnly
+                    || column.shape_points.is_empty()
+                {
+                    return Ok(QuotientNumeratorSourceKind::Coefficients);
+                }
+                let tree = match column.source {
+                    OpenedColumnSource::Preprocessed { .. } => {
+                        return Ok(QuotientNumeratorSourceKind::Coefficients);
+                    }
+                    OpenedColumnSource::Trace {
+                        purpose: BufferPurpose::BaseCoefficients,
+                        ..
+                    } => CommitmentTreeId::Base,
+                    OpenedColumnSource::Trace {
+                        purpose: BufferPurpose::InteractionCoefficients,
+                        ..
+                    } => CommitmentTreeId::Interaction,
+                    OpenedColumnSource::Composition { .. } => CommitmentTreeId::Composition,
+                    OpenedColumnSource::Trace { .. } => {
+                        return Err(ArenaPlanError::InvalidProtocolGeometry(
+                            "quotient numerator source is not a committed coefficient column",
+                        ));
+                    }
+                };
+                let commitment = self
+                    .commitments
+                    .iter()
+                    .find(|commitment| commitment.id == tree)
+                    .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                        "quotient numerator source tree is missing",
+                    ))?;
+                let mut retained = None;
+                for (group_index, (sources, logs)) in commitment
+                    .grouped_column_sources
+                    .iter()
+                    .zip(&commitment.grouped_column_log_sizes)
+                    .enumerate()
+                {
+                    for (&source, &log_size) in sources.iter().zip(logs) {
+                        if OpenedColumnSource::from(source) != column.source {
+                            continue;
+                        }
+                        if retained.is_some() || log_size != column.coefficient_log_size {
+                            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                                "quotient numerator retained source mapping is ambiguous or has the wrong log",
+                            ));
+                        }
+                        retained = Some(
+                            commitment
+                                .retained_evaluation_groups
+                                .get(group_index)
+                                .copied()
+                                .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                                    "quotient numerator retained source group is missing",
+                                ))?,
+                        );
+                    }
+                }
+                match retained {
+                    Some(true) => Ok(QuotientNumeratorSourceKind::Evaluation),
+                    Some(false) => Ok(QuotientNumeratorSourceKind::Coefficients),
+                    None => Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "quotient numerator source is absent from its commitment",
+                    )),
+                }
+            })
+            .collect()
+    }
+
+    pub fn quotient_numerator_topologies(
+        &self,
+    ) -> Result<Vec<QuotientNumeratorColumnTopology>, ArenaPlanError> {
+        self.oods
+            .quotient_numerator_topologies(&self.quotient_numerator_source_kinds()?)
+    }
+
     pub fn oods_workspace_config(&self) -> OodsWorkspaceConfig {
         OodsWorkspaceConfig {
             lifting_log_size: self.lifting_log_size,
@@ -1146,7 +1261,7 @@ impl ProtocolGeometry {
                 ));
             }
         }
-        let numerator_topologies = self.oods.quotient_numerator_topologies()?;
+        let numerator_topologies = self.quotient_numerator_topologies()?;
         let numerator_requirements = quotient_numerator_workspace_requirements(
             self.quotient_numerator_workspace_config()?,
             &numerator_topologies,
@@ -1381,7 +1496,7 @@ impl ProtocolGeometry {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
         };
-        feed(b"stwo-cairo-protocol-geometry-v6\0");
+        feed(b"stwo-cairo-protocol-geometry-v7\0");
         feed(&self.identity.pow_bits.to_le_bytes());
         feed(&self.identity.log_blowup_factor.to_le_bytes());
         feed(&self.identity.log_last_layer_degree_bound.to_le_bytes());
@@ -1393,6 +1508,7 @@ impl ProtocolGeometry {
         feed(&self.identity.composition_plan_hash.to_le_bytes());
         feed(&self.identity.kernel_manifest_hash.to_le_bytes());
         feed(&[self.identity.interpolation_mode as u8]);
+        feed(&[self.identity.quotient_numerator_source_policy as u8]);
         for identity in &self.preprocessed_column_ids {
             feed(&(identity.len() as u64).to_le_bytes());
             feed(identity.as_bytes());
@@ -1673,6 +1789,7 @@ struct LogicalQuotientNumeratorColumn {
     source: OpenedColumnSource,
     topology: QuotientNumeratorColumnTopology,
     coefficients: LogicalBufferId,
+    numerator_source: LogicalBufferId,
 }
 
 #[derive(Clone, Debug)]
@@ -2289,6 +2406,7 @@ pub struct PlannedQuotientNumeratorColumn {
     pub source: OpenedColumnSource,
     pub topology: QuotientNumeratorColumnTopology,
     pub coefficients: ArenaBinding,
+    pub numerator_source: ArenaBinding,
 }
 
 #[derive(Clone, Debug)]
@@ -2617,10 +2735,10 @@ impl ProofArenaPlan {
             .into_iter()
             .map(|epoch| (epoch, high_water_at(epoch, &logical, &bindings)))
             .collect();
-        let commitments = logical_commitments
+        let commitments: Vec<PlannedCommitment> = logical_commitments
             .into_iter()
             .map(|commitment| resolve_commitment_slots(commitment, &bindings))
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         let preprocessed = resolve_preprocessed_slots(logical_preprocessed, &bindings)?;
         let composition = resolve_composition_slots(logical_composition, &bindings)?;
         let oods = resolve_oods_slots(logical_oods, &bindings)?;
@@ -2630,6 +2748,7 @@ impl ProofArenaPlan {
         let fri = resolve_fri_slots(logical_fri, &bindings)?;
         let final_fri_pow = resolve_final_fri_pow_slots(logical_final_fri_pow, &bindings)?;
         let decommit = resolve_decommit_slots(logical_decommit, &bindings)?;
+        validate_decommit_group_bindings(&decommit.config, &commitments)?;
         if quotient.output_values != fri.input_values {
             return Err(ArenaPlanError::QuotientFriInputMismatch {
                 quotient: quotient.output_values,
@@ -5183,6 +5302,66 @@ fn interpolation_batch_geometry(
     }
 }
 
+fn retained_quotient_numerator_source(
+    commitments: &[LogicalCommitWorkspace],
+    source: OpenedColumnSource,
+    coefficient_log_size: u32,
+) -> Result<LogicalBufferId, ArenaPlanError> {
+    let tree = match source {
+        OpenedColumnSource::Trace {
+            purpose: BufferPurpose::BaseCoefficients,
+            ..
+        } => CommitmentTreeId::Base,
+        OpenedColumnSource::Trace {
+            purpose: BufferPurpose::InteractionCoefficients,
+            ..
+        } => CommitmentTreeId::Interaction,
+        OpenedColumnSource::Composition { .. } => CommitmentTreeId::Composition,
+        _ => {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "evaluation-backed quotient numerator source is not dynamic",
+            ));
+        }
+    };
+    let commitment = commitments
+        .iter()
+        .find(|commitment| commitment.id == tree)
+        .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+            "evaluation-backed quotient numerator commitment is missing",
+        ))?;
+    let mut selected = None;
+    for (group_index, (sources, logs)) in commitment
+        .grouped_column_sources
+        .iter()
+        .zip(&commitment.grouped_column_log_sizes)
+        .enumerate()
+    {
+        for (column_index, (&candidate, &log_size)) in sources.iter().zip(logs).enumerate() {
+            if OpenedColumnSource::from(candidate) != source {
+                continue;
+            }
+            if selected.is_some() || log_size != coefficient_log_size {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "evaluation-backed quotient numerator source mapping drifted",
+                ));
+            }
+            let retained = commitment
+                .retained_evaluations
+                .get(group_index)
+                .and_then(Option::as_ref)
+                .and_then(|columns| columns.get(column_index))
+                .copied()
+                .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                    "planned retained quotient numerator evaluation is missing",
+                ))?;
+            selected = Some(retained);
+        }
+    }
+    selected.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+        "planned retained quotient numerator source is absent",
+    ))
+}
+
 fn append_protocol_buffers(
     logical: &mut Vec<LogicalBuffer>,
     protocol: &ProtocolGeometry,
@@ -5227,7 +5406,7 @@ fn append_protocol_buffers(
     let oods_requirements =
         oods_workspace_requirements(oods_config, &oods_topologies).map_err(ArenaPlanError::Oods)?;
     let quotient_numerator_config = protocol.quotient_numerator_workspace_config()?;
-    let quotient_numerator_topologies = protocol.oods.quotient_numerator_topologies()?;
+    let quotient_numerator_topologies = protocol.quotient_numerator_topologies()?;
     let quotient_numerator_requirements = quotient_numerator_workspace_requirements(
         quotient_numerator_config,
         &quotient_numerator_topologies,
@@ -6387,12 +6566,23 @@ fn append_protocol_buffers(
     let numerator_columns = opened_columns
         .into_iter()
         .zip(quotient_numerator_topologies)
-        .map(|(column, topology)| LogicalQuotientNumeratorColumn {
-            source: column.geometry.source,
-            topology,
-            coefficients: column.coefficients,
+        .map(|(column, topology)| {
+            let numerator_source = match topology.source_kind {
+                QuotientNumeratorSourceKind::Coefficients => column.coefficients,
+                QuotientNumeratorSourceKind::Evaluation => retained_quotient_numerator_source(
+                    &logical_commitments,
+                    column.geometry.source,
+                    topology.coefficient_log_size,
+                )?,
+            };
+            Ok(LogicalQuotientNumeratorColumn {
+                source: column.geometry.source,
+                topology,
+                coefficients: column.coefficients,
+                numerator_source,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, ArenaPlanError>>()?;
     let logical_quotient_numerator = LogicalQuotientNumeratorWorkspace {
         config: quotient_numerator_config,
         requirements: quotient_numerator_requirements,
@@ -7076,10 +7266,19 @@ fn resolve_quotient_numerator_slots(
         .columns
         .into_iter()
         .map(|column| {
+            let coefficients = binding(column.coefficients)?;
+            let numerator_source = binding(column.numerator_source)?;
+            validate_quotient_numerator_source_binding(
+                logical.config,
+                &column.topology,
+                coefficients,
+                numerator_source,
+            )?;
             Ok(PlannedQuotientNumeratorColumn {
                 source: column.source,
                 topology: column.topology,
-                coefficients: binding(column.coefficients)?,
+                coefficients,
+                numerator_source,
             })
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
@@ -7104,6 +7303,11 @@ fn resolve_quotient_numerator_slots(
     let sample_points_destination = binding(logical.sample_points_destination)?;
     let first_linear_terms_destination = binding(logical.first_linear_terms_destination)?;
     let forward_twiddles = binding(logical.forward_twiddles)?;
+    if quotient_numerator_columns_alias_workspace(&columns, &workspace_ids) {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "quotient numerator external binding aliases a live workspace slot",
+        ));
+    }
     let external = columns
         .iter()
         .map(|column| column.coefficients)
@@ -7141,6 +7345,40 @@ fn resolve_quotient_numerator_slots(
         forward_twiddles,
         slots,
     })
+}
+
+fn quotient_numerator_columns_alias_workspace(
+    columns: &[PlannedQuotientNumeratorColumn],
+    workspace_ids: &BTreeSet<ArenaSlotId>,
+) -> bool {
+    columns.iter().any(|column| {
+        workspace_ids.contains(&column.coefficients.physical)
+            || workspace_ids.contains(&column.numerator_source.physical)
+    })
+}
+
+fn validate_quotient_numerator_source_binding(
+    config: QuotientNumeratorWorkspaceConfig,
+    topology: &QuotientNumeratorColumnTopology,
+    coefficients: ArenaBinding,
+    numerator_source: ArenaBinding,
+) -> Result<(), ArenaPlanError> {
+    let source_log_size = match topology.source_kind {
+        QuotientNumeratorSourceKind::Coefficients => topology.coefficient_log_size,
+        QuotientNumeratorSourceKind::Evaluation => topology
+            .coefficient_log_size
+            .checked_add(config.log_blowup_factor)
+            .ok_or(ArenaPlanError::SizeOverflow)?,
+    };
+    if numerator_source.len_words != checked_pow2(source_log_size)?
+        || (topology.source_kind == QuotientNumeratorSourceKind::Coefficients
+            && numerator_source != coefficients)
+    {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "quotient numerator source binding has the wrong kind or extent",
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_quotient_slots(
@@ -7450,6 +7688,48 @@ fn resolve_decommit_slots(
         proof_bundle_layout: logical.proof_bundle_layout,
         proof_bundle,
     })
+}
+
+fn validate_decommit_group_bindings(
+    config: &DecommitWorkspaceConfig,
+    commitments: &[PlannedCommitment],
+) -> Result<(), ArenaPlanError> {
+    if commitments.len() != 4 || config.trees.len() < commitments.len() {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "decommit group bindings require the canonical trace prefix",
+        ));
+    }
+    for (tree, commitment) in config.trees.iter().zip(commitments) {
+        let DecommitTreeGeometry::Trace(trace) = tree else {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "decommit group bindings disagree with trace topology",
+            ));
+        };
+        if trace.groups.len() != commitment.retained_evaluation_groups.len() {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "decommit group bindings disagree with opening groups",
+            ));
+        }
+        for (group, retained) in trace
+            .groups
+            .iter()
+            .zip(&commitment.retained_evaluation_groups)
+        {
+            let matches = match (group.mode, retained) {
+                (DecommitSourceMode::RecomputeQueriedLde, None) => true,
+                (DecommitSourceMode::ResidentEvaluations, Some(bindings)) => {
+                    bindings.len() == group.columns.len()
+                }
+                _ => false,
+            };
+            if !matches {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "decommit source mode disagrees with retained evaluation bindings",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_transcript_slots(
@@ -8617,6 +8897,7 @@ mod tests {
                 kernel_manifest_hash: 4,
                 decommit_strategy: DecommitStrategy::RecomputeQueriedLde,
                 interpolation_mode: InterpolationLaunchMode::StageWiseCopyThenInPlace,
+                quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::CoefficientsOnly,
             },
             preprocessed_column_ids: vec!["test_preprocessed".to_owned()],
             max_domain_log_size: 26,
@@ -8704,6 +8985,56 @@ mod tests {
         fused_interpolation.identity.interpolation_mode =
             InterpolationLaunchMode::StageFusedOutOfPlace;
         assert_ne!(protocol.key(), fused_interpolation.key());
+        let mut retained_numerator = protocol.clone();
+        retained_numerator.identity.decommit_strategy = DecommitStrategy::HybridByGroup;
+        retained_numerator.identity.quotient_numerator_source_policy =
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations;
+        retained_numerator
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == CommitmentTreeId::Composition)
+            .unwrap()
+            .retained_evaluation_groups[0] = true;
+        assert_ne!(protocol.key(), retained_numerator.key());
+        let retained_kinds = retained_numerator
+            .quotient_numerator_source_kinds()
+            .unwrap();
+        assert_eq!(
+            retained_kinds
+                .iter()
+                .filter(|&&kind| kind == QuotientNumeratorSourceKind::Evaluation)
+                .count(),
+            1,
+            "only the sampled retained composition column is eligible"
+        );
+        let coefficient_requirements = quotient_numerator_workspace_requirements(
+            protocol.quotient_numerator_workspace_config().unwrap(),
+            &protocol.quotient_numerator_topologies().unwrap(),
+        )
+        .unwrap();
+        let retained_requirements = quotient_numerator_workspace_requirements(
+            retained_numerator
+                .quotient_numerator_workspace_config()
+                .unwrap(),
+            &retained_numerator.quotient_numerator_topologies().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            coefficient_requirements.groups,
+            retained_requirements.groups
+        );
+        assert_eq!(
+            coefficient_requirements.term_count,
+            retained_requirements.term_count
+        );
+        assert_eq!(
+            coefficient_requirements.output_pointer_words,
+            retained_requirements.output_pointer_words
+        );
+        assert!(
+            retained_requirements.coefficient_pointer_words
+                < coefficient_requirements.coefficient_pointer_words
+        );
         let mut invalid_oods_evaluation_log = protocol.clone();
         invalid_oods_evaluation_log.oods.columns[0].evaluation_log_size =
             invalid_oods_evaluation_log.oods.columns[0].coefficient_log_size;
@@ -8733,6 +9064,123 @@ mod tests {
         let arena = ProofArenaPlan::build(&proof, &protocol, &composition).unwrap();
         arena.validate_aliases().unwrap();
         assert_eq!(arena.protocol_key, protocol.key());
+
+        let retained_numerator_arena =
+            ProofArenaPlan::build(&proof, &retained_numerator, &composition).unwrap();
+        let numerator_columns = &retained_numerator_arena.quotient_numerator().columns;
+        let evaluation_column = numerator_columns
+            .iter()
+            .find(|column| column.topology.source_kind == QuotientNumeratorSourceKind::Evaluation)
+            .unwrap();
+        assert_eq!(
+            evaluation_column.source,
+            OpenedColumnSource::Composition { ordinal: 0 }
+        );
+        assert_eq!(evaluation_column.numerator_source.len_words, 1 << 26);
+        assert_ne!(
+            evaluation_column.numerator_source,
+            evaluation_column.coefficients
+        );
+        assert!(numerator_columns.iter().all(|column| {
+            column.topology.source_kind == QuotientNumeratorSourceKind::Evaluation
+                || column.numerator_source == column.coefficients
+        }));
+        let retained_source_buffer = retained_numerator_arena
+            .logical_buffers()
+            .iter()
+            .find(|buffer| buffer.id == evaluation_column.numerator_source.logical)
+            .unwrap();
+        assert_eq!(
+            retained_source_buffer.purpose,
+            BufferPurpose::CommitRetainedEvaluation
+        );
+        assert!(retained_source_buffer
+            .lifetime
+            .contains(ProofEpoch::Quotient));
+        assert!(retained_source_buffer
+            .lifetime
+            .contains(ProofEpoch::Decommit));
+        let mut short_source = evaluation_column.numerator_source;
+        short_source.len_words -= 1;
+        assert_eq!(
+            validate_quotient_numerator_source_binding(
+                retained_numerator_arena.quotient_numerator().config,
+                &evaluation_column.topology,
+                evaluation_column.coefficients,
+                short_source,
+            ),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "quotient numerator source binding has the wrong kind or extent"
+            ))
+        );
+        let coefficient_column = numerator_columns
+            .iter()
+            .find(|column| column.topology.source_kind == QuotientNumeratorSourceKind::Coefficients)
+            .unwrap();
+        assert_eq!(
+            validate_quotient_numerator_source_binding(
+                retained_numerator_arena.quotient_numerator().config,
+                &coefficient_column.topology,
+                coefficient_column.coefficients,
+                evaluation_column.numerator_source,
+            ),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "quotient numerator source binding has the wrong kind or extent"
+            ))
+        );
+        let aliased_workspace = BTreeSet::from([evaluation_column.numerator_source.physical]);
+        assert!(quotient_numerator_columns_alias_workspace(
+            numerator_columns,
+            &aliased_workspace
+        ));
+
+        let mut hybrid = protocol.clone();
+        hybrid.identity.decommit_strategy = DecommitStrategy::HybridByGroup;
+        hybrid.commitments[1].retained_evaluation_groups[0] = true;
+        let hybrid_arena = ProofArenaPlan::build(&proof, &hybrid, &composition).unwrap();
+        let hybrid_config = hybrid.decommit_workspace_config().unwrap();
+        let DecommitTreeGeometry::Trace(base_decommit) = &hybrid_config.trees[1] else {
+            panic!("base trace")
+        };
+        assert_eq!(
+            base_decommit.groups[0].mode,
+            DecommitSourceMode::ResidentEvaluations
+        );
+        assert_eq!(
+            base_decommit.groups[1].mode,
+            DecommitSourceMode::RecomputeQueriedLde
+        );
+        let hybrid_base = hybrid_arena.commitment(CommitmentTreeId::Base).unwrap();
+        assert!(hybrid_base.retained_evaluation_groups[0].is_some());
+        assert!(hybrid_base.retained_evaluation_groups[1].is_none());
+        validate_decommit_group_bindings(&hybrid_config, &hybrid_arena.commitments).unwrap();
+
+        let mut missing_retained_binding = hybrid_arena.commitments.clone();
+        missing_retained_binding[1].retained_evaluation_groups[0] = None;
+        assert!(matches!(
+            validate_decommit_group_bindings(&hybrid_config, &missing_retained_binding),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "decommit source mode disagrees with retained evaluation bindings"
+            ))
+        ));
+        let mut wrong_mode = hybrid_config.clone();
+        let DecommitTreeGeometry::Trace(base) = &mut wrong_mode.trees[1] else {
+            panic!("base trace")
+        };
+        base.groups[1].mode = DecommitSourceMode::ResidentEvaluations;
+        assert!(matches!(
+            validate_decommit_group_bindings(&wrong_mode, &hybrid_arena.commitments),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "decommit source mode disagrees with retained evaluation bindings"
+            ))
+        ));
+        let mut wrong_binding_width = hybrid_arena.commitments.clone();
+        wrong_binding_width[1].retained_evaluation_groups[0]
+            .as_mut()
+            .unwrap()
+            .pop();
+        assert!(validate_decommit_group_bindings(&hybrid_config, &wrong_binding_width).is_err());
+
         let fused_arena =
             ProofArenaPlan::build(&proof, &fused_interpolation, &composition).unwrap();
         let fused_base = fused_arena.commitment(CommitmentTreeId::Base).unwrap();
