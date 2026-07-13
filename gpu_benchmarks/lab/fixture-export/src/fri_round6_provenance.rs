@@ -456,9 +456,31 @@ fn verify_artifact(
             seal.path
         ));
     }
+    rebind_artifact_path(root, &seal.path, &path, &after)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("rewind {}: {error}", path.display()))?;
     Ok(bytes)
+}
+
+pub(crate) fn rebind_artifact_path(
+    root: &Path,
+    relative: &str,
+    opened_path: &Path,
+    opened_metadata: &Metadata,
+) -> Result<(), String> {
+    let rebound = resolve_bundle_path(root, relative)
+        .map_err(|error| format!("rebind provenance artifact {relative}: {error}"))?;
+    let live = fs::symlink_metadata(&rebound)
+        .map_err(|error| format!("lstat rebound artifact {}: {error}", rebound.display()))?;
+    if !live.is_file()
+        || rebound != opened_path
+        || fingerprint(opened_metadata) != fingerprint(&live)
+    {
+        return Err(format!(
+            "artifact {relative} path no longer binds the hashed file"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn resolve_bundle_path(root: &Path, relative: &str) -> Result<PathBuf, String> {

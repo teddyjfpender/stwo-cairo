@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
-use std::fs::{self, hard_link};
+use std::fs::{self, hard_link, File};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fri_round6_provenance::{
-    register_identity, require_executable, resolve_bundle_path, validate_relative_path,
-    IDENTITY_PREFLIGHT_STATUS,
+    rebind_artifact_path, register_identity, require_executable, resolve_bundle_path,
+    validate_relative_path, IDENTITY_PREFLIGHT_STATUS,
 };
 
 static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -68,6 +68,40 @@ fn rejects_hardlink_alias_with_manifest_identity() {
         error.contains("manifest") && error.contains("proof"),
         "{error}"
     );
+}
+
+#[test]
+fn rejects_leaf_replacement_after_hash_even_when_bytes_match() {
+    let scratch = Scratch::new();
+    let root = scratch.path().canonicalize().unwrap();
+    let artifact = root.join("proof.bin");
+    let detached = root.join("detached.bin");
+    fs::write(&artifact, b"same sealed bytes").unwrap();
+    let resolved = resolve_bundle_path(&root, "proof.bin").unwrap();
+    let opened = File::open(&resolved).unwrap();
+    let opened_metadata = opened.metadata().unwrap();
+
+    fs::rename(&artifact, &detached).unwrap();
+    fs::write(&artifact, b"same sealed bytes").unwrap();
+    let error = rebind_artifact_path(&root, "proof.bin", &resolved, &opened_metadata).unwrap_err();
+    assert!(error.contains("no longer binds"), "{error}");
+}
+
+#[test]
+fn rejects_leaf_symlink_replacement_after_hash() {
+    let scratch = Scratch::new();
+    let root = scratch.path().canonicalize().unwrap();
+    let artifact = root.join("proof.bin");
+    let detached = root.join("detached.bin");
+    fs::write(&artifact, b"same sealed bytes").unwrap();
+    let resolved = resolve_bundle_path(&root, "proof.bin").unwrap();
+    let opened = File::open(&resolved).unwrap();
+    let opened_metadata = opened.metadata().unwrap();
+
+    fs::rename(&artifact, &detached).unwrap();
+    symlink(&detached, &artifact).unwrap();
+    let error = rebind_artifact_path(&root, "proof.bin", &resolved, &opened_metadata).unwrap_err();
+    assert!(error.contains("symlink"), "{error}");
 }
 
 #[test]
