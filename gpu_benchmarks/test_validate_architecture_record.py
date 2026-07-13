@@ -83,6 +83,9 @@ def valid_record() -> dict:
         "gpu_host_syncs": None,
         "gpu_graph_launches": None,
         "gpu_kernel_launches": None,
+        "gpu_expected_graph_launches": None,
+        "gpu_expected_kernel_launches": None,
+        "gpu_transcript_segments": None,
         "gpu_hot_h2d_bytes": None,
         "gpu_hot_d2h_bytes": None,
         "gpu_hot_allocations": None,
@@ -113,6 +116,9 @@ def valid_arena_graph_record() -> dict:
             "gpu_host_syncs": 1,
             "gpu_graph_launches": 29,
             "gpu_kernel_launches": 7_859,
+            "gpu_expected_graph_launches": 29,
+            "gpu_expected_kernel_launches": 7_859,
+            "gpu_transcript_segments": 30,
             "gpu_hot_h2d_bytes": 0,
             "gpu_hot_d2h_bytes": 1024,
             "gpu_hot_allocations": 0,
@@ -490,24 +496,67 @@ class ArchitectureRecordTest(unittest.TestCase):
         self.assertTrue(any("performance_claim_admissible" in error for error in errors))
         self.assertTrue(any("useful_mhz" in error for error in errors))
 
-    def test_arena_graph_requires_one_sync_exact_graphs_bounded_kernels_and_no_hot_setup(
+    def test_arena_graph_requires_one_sync_exact_captured_topology_and_no_hot_setup(
         self,
     ) -> None:
         record = valid_arena_graph_record()
         self.assertEqual(validate_record(record, "arena-graph"), [])
-        record["gpu_graph_launches"] = 72
+        record["gpu_graph_launches"] = 28
         self.assertTrue(validate_record(record, "arena-graph"))
         record["gpu_graph_launches"] = 29
+        record["gpu_expected_graph_launches"] = 0
+        self.assertTrue(validate_record(record, "arena-graph"))
+        record["gpu_expected_graph_launches"] = 29
+        record["gpu_transcript_segments"] = 29
+        self.assertTrue(validate_record(record, "arena-graph"))
+        record["gpu_transcript_segments"] = True
+        self.assertTrue(validate_record(record, "arena-graph"))
+        record["gpu_transcript_segments"] = None
+        self.assertTrue(validate_record(record, "arena-graph"))
+        record["gpu_transcript_segments"] = 30
         record["gpu_kernel_launches"] = 0
+        self.assertTrue(validate_record(record, "arena-graph"))
+        record["gpu_kernel_launches"] = 7_859
+        record["gpu_expected_kernel_launches"] = 28
+        self.assertTrue(validate_record(record, "arena-graph"))
+        record["gpu_expected_kernel_launches"] = 100_000
         self.assertTrue(validate_record(record, "arena-graph"))
         record["gpu_kernel_launches"] = 100_000
         self.assertTrue(validate_record(record, "arena-graph"))
         record["gpu_kernel_launches"] = 7_859
+        record["gpu_expected_kernel_launches"] = 7_859
         record["gpu_host_syncs"] = 0
         self.assertTrue(validate_record(record, "arena-graph"))
         record["gpu_host_syncs"] = 1
         record["gpu_setup_lookup_host_copies"] = 1
         self.assertTrue(validate_record(record, "arena-graph"))
+
+    def test_arena_graph_accepts_production_fold_step_three_topology(self) -> None:
+        record = valid_arena_graph_record()
+        record.update(
+            {
+                "gpu_graph_launches": 14,
+                "gpu_expected_graph_launches": 14,
+                "gpu_transcript_segments": 15,
+                "gpu_kernel_launches": 2_530,
+                "gpu_expected_kernel_launches": 2_530,
+            }
+        )
+        self.assertEqual(validate_record(record, "arena-graph"), [])
+
+    def test_arena_graph_topology_fields_fail_closed_without_type_errors(self) -> None:
+        for field in (
+            "gpu_graph_launches",
+            "gpu_expected_graph_launches",
+            "gpu_transcript_segments",
+            "gpu_kernel_launches",
+            "gpu_expected_kernel_launches",
+        ):
+            for value in (None, "14", True):
+                with self.subTest(field=field, value=value):
+                    record = valid_arena_graph_record()
+                    record[field] = value
+                    self.assertTrue(validate_record(record, "arena-graph"))
 
     def test_arena_graph_fails_closed_without_execution_table_ingest(self) -> None:
         record = valid_arena_graph_record()

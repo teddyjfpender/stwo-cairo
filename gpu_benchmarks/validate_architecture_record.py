@@ -1024,23 +1024,52 @@ def validate_record(record: dict[str, Any], required_mode: str) -> list[str]:
                 f"expected integer 1, got {execution_table_syncs!r}"
             )
         graph_launches = record.get("gpu_graph_launches")
+        expected_graph_launches = record.get("gpu_expected_graph_launches")
+        transcript_segments = record.get("gpu_transcript_segments")
+        expected_graphs_valid = (
+            isinstance(expected_graph_launches, int)
+            and not isinstance(expected_graph_launches, bool)
+            and 7 <= expected_graph_launches < 100
+        )
         if (
             not isinstance(graph_launches, int)
             or isinstance(graph_launches, bool)
-            or graph_launches != 29
+            or not expected_graphs_valid
+            or graph_launches != expected_graph_launches
         ):
             errors.append(
-                f"gpu_graph_launches: expected integer 29, got {graph_launches!r}"
+                "gpu_graph_launches: expected the captured integer topology in [7, 100), "
+                f"got actual={graph_launches!r} expected={expected_graph_launches!r}"
+            )
+        if (
+            not isinstance(transcript_segments, int)
+            or isinstance(transcript_segments, bool)
+            or not expected_graphs_valid
+            or transcript_segments != expected_graph_launches + 1
+        ):
+            errors.append(
+                "gpu_transcript_segments: expected one more segment than the captured graph "
+                f"topology, got segments={transcript_segments!r} "
+                f"graphs={expected_graph_launches!r}"
             )
         kernel_launches = record.get("gpu_kernel_launches")
+        expected_kernel_launches = record.get("gpu_expected_kernel_launches")
+        expected_kernels_valid = (
+            isinstance(expected_kernel_launches, int)
+            and not isinstance(expected_kernel_launches, bool)
+            and expected_graphs_valid
+            and expected_graph_launches <= expected_kernel_launches < 100_000
+        )
         if (
             not isinstance(kernel_launches, int)
             or isinstance(kernel_launches, bool)
-            or not 29 <= kernel_launches < 100_000
+            or not expected_kernels_valid
+            or kernel_launches != expected_kernel_launches
         ):
             errors.append(
-                "gpu_kernel_launches: expected integer in [29, 100000), "
-                f"got {kernel_launches!r}"
+                "gpu_kernel_launches: expected the captured integer topology between the "
+                "graph count and 100000, "
+                f"got actual={kernel_launches!r} expected={expected_kernel_launches!r}"
             )
         d2h = record.get("gpu_hot_d2h_bytes")
         if not isinstance(d2h, int) or isinstance(d2h, bool) or d2h <= 0:

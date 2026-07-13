@@ -962,6 +962,7 @@ fn gpu_native_session_context(telemetry: Option<&ResidentSessionTelemetry>) -> s
             "gpu_witness_ingest_h2d_bytes": null,
             "gpu_witness_ingest_h2d_copies": null,
             "gpu_witness_ingest_syncs": null,
+            "gpu_transcript_segments": null,
         });
     };
     resident_session_telemetry_json(telemetry)
@@ -983,6 +984,7 @@ fn resident_session_telemetry_json(telemetry: &ResidentSessionTelemetry) -> serd
         "gpu_witness_ingest_h2d_bytes": telemetry.recorded_witness_ingest.h2d_bytes,
         "gpu_witness_ingest_h2d_copies": telemetry.recorded_witness_ingest.h2d_copies,
         "gpu_witness_ingest_syncs": telemetry.recorded_witness_ingest.sync_calls,
+        "gpu_transcript_segments": telemetry.transcript_segments,
     })
 }
 
@@ -1001,6 +1003,8 @@ fn gpu_native_pcs_context(telemetry: Option<&CudaPcsDriverTelemetry>) -> serde_j
             "gpu_host_syncs": null,
             "gpu_graph_launches": null,
             "gpu_kernel_launches": null,
+            "gpu_expected_graph_launches": null,
+            "gpu_expected_kernel_launches": null,
             "gpu_hot_h2d_bytes": null,
             "gpu_hot_d2h_bytes": null,
             "gpu_hot_allocations": null,
@@ -1035,6 +1039,8 @@ fn pcs_telemetry_json(telemetry: &CudaPcsDriverTelemetry) -> serde_json::Value {
         "gpu_host_syncs": exec.map(|value| value.sync_calls),
         "gpu_graph_launches": exec.map(|value| value.graph_launches),
         "gpu_kernel_launches": exec.map(|value| value.kernel_launches),
+        "gpu_expected_graph_launches": telemetry.expected_graph_launches,
+        "gpu_expected_kernel_launches": telemetry.expected_kernel_launches,
         "gpu_hot_h2d_bytes": exec.map(|value| value.h2d_bytes),
         "gpu_hot_d2h_bytes": exec.map(|value| value.d2h_bytes),
         "gpu_hot_allocations": exec.map(|value| value.allocations),
@@ -2175,7 +2181,7 @@ mod tests {
         proof_byte_equal_gate_passes, quantile, resident_session_telemetry_json,
         simd_reference_gate_passes, simd_reference_reuse_input_gate_passes, throughput_mhz,
         validate_gpu_native_architecture, validate_resident_session_architecture,
-        validate_strict_aot_provenance, AotRuntimeStats, CudaPcsDriverTelemetry,
+        validate_strict_aot_provenance, AotRuntimeStats, CudaExecTelemetry, CudaPcsDriverTelemetry,
         CudaPcsRuntimeMode, RequiredCudaPcsRuntimeMode, ResidentSessionTelemetry,
         REQUIRED_CUDA_PCS_ARCHITECTURE,
     };
@@ -2188,6 +2194,8 @@ mod tests {
             stage_finished: [1; 7],
             batched_tree_decommit: true,
             exec: None,
+            expected_graph_launches: None,
+            expected_kernel_launches: None,
         }
     }
 
@@ -2279,8 +2287,24 @@ mod tests {
     }
 
     #[test]
+    fn pcs_execution_topology_expectations_are_machine_readable() {
+        let exec = CudaExecTelemetry {
+            graph_launches: 14,
+            kernel_launches: 2_530,
+            ..CudaExecTelemetry::default()
+        };
+        let telemetry = CudaPcsDriverTelemetry::completed_arena_graph(exec, 14, 2_530);
+        let json = pcs_telemetry_json(&telemetry);
+        assert_eq!(json["gpu_graph_launches"], 14);
+        assert_eq!(json["gpu_kernel_launches"], 2_530);
+        assert_eq!(json["gpu_expected_graph_launches"], 14);
+        assert_eq!(json["gpu_expected_kernel_launches"], 2_530);
+    }
+
+    #[test]
     fn execution_table_setup_telemetry_is_machine_readable() {
         let telemetry = ResidentSessionTelemetry {
+            transcript_segments: 15,
             execution_tables_ingest: Some(
                 stwo_backend_cuda::PreparedExecutionTablesIngestTelemetry {
                     compact_h2d_bytes: 4096,
@@ -2298,6 +2322,7 @@ mod tests {
         assert_eq!(json["gpu_execution_tables_ingest_descriptor_h2d_bytes"], 64);
         assert_eq!(json["gpu_execution_tables_ingest_descriptor_h2d_copies"], 2);
         assert_eq!(json["gpu_execution_tables_ingest_syncs"], 1);
+        assert_eq!(json["gpu_transcript_segments"], 15);
     }
 
     #[test]

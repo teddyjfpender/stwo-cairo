@@ -1144,45 +1144,58 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
         self.last_aot_stats = None;
         aot::reset_runtime_stats();
 
-        let ((claim, bundle, shape, lifting_log_size, exec, transcript_mirror), session_telemetry) =
-            self.with_strict_resident_session(input, params, |runtime, artifacts| {
-                runtime.require_prepared_witness_coverage()?;
-                runtime.capture_all_prepared_subgraphs()?;
-                let expected_graphs = u64::try_from(runtime.captured_graph_count())
-                    .map_err(|_| ResidentRuntimeError::FriRoundIndexTooLarge(usize::MAX))?;
-                let expected_kernel_launches = runtime.captured_graph_kernel_node_count()?;
-                let bundle_bytes = runtime
-                    .workspace_proof_bundle_bytes()
-                    .ok_or(ResidentRuntimeError::TranscriptRequirementsMismatch)?;
-                runtime.begin_hot_path_telemetry();
-                runtime.replay_all_prepared_subgraphs(2)?;
-                let bundle = runtime.read_proof_bundle_once()?;
-                let exec = runtime.require_hot_path_budget(resident_hot_path_budget(
-                    transcript_mode,
-                    expected_graphs,
-                    expected_kernel_launches,
-                    bundle_bytes,
-                ))?;
-                let transcript_mirror = match transcript_mode {
-                    ResidentTranscriptMode::DeviceOnly => None,
-                    ResidentTranscriptMode::DeviceMirrored => {
-                        // U4 correctness work is intentionally outside the hot
-                        // telemetry accepted immediately above.
-                        let before = runtime.hot_path_telemetry();
-                        let report = runtime.verify_transcript_mirror_correctness_only()?;
-                        let after = runtime.hot_path_telemetry();
-                        Some(transcript_mirror_telemetry(report, before, after)?)
-                    }
-                };
-                Ok((
-                    artifacts.claim.clone(),
-                    bundle,
-                    runtime.proof_assembly_shape().clone(),
-                    artifacts.discovery.lifting_log_size,
-                    exec,
-                    transcript_mirror,
-                ))
-            })?;
+        let (
+            (
+                claim,
+                bundle,
+                shape,
+                lifting_log_size,
+                exec,
+                expected_graphs,
+                expected_kernel_launches,
+                transcript_mirror,
+            ),
+            session_telemetry,
+        ) = self.with_strict_resident_session(input, params, |runtime, artifacts| {
+            runtime.require_prepared_witness_coverage()?;
+            runtime.capture_all_prepared_subgraphs()?;
+            let expected_graphs = u64::try_from(runtime.require_complete_captured_topology()?)
+                .map_err(|_| ResidentRuntimeError::FriRoundIndexTooLarge(usize::MAX))?;
+            let expected_kernel_launches = runtime.captured_graph_kernel_node_count()?;
+            let bundle_bytes = runtime
+                .workspace_proof_bundle_bytes()
+                .ok_or(ResidentRuntimeError::TranscriptRequirementsMismatch)?;
+            runtime.begin_hot_path_telemetry();
+            runtime.replay_all_prepared_subgraphs(2)?;
+            let bundle = runtime.read_proof_bundle_once()?;
+            let exec = runtime.require_hot_path_budget(resident_hot_path_budget(
+                transcript_mode,
+                expected_graphs,
+                expected_kernel_launches,
+                bundle_bytes,
+            ))?;
+            let transcript_mirror = match transcript_mode {
+                ResidentTranscriptMode::DeviceOnly => None,
+                ResidentTranscriptMode::DeviceMirrored => {
+                    // U4 correctness work is intentionally outside the hot
+                    // telemetry accepted immediately above.
+                    let before = runtime.hot_path_telemetry();
+                    let report = runtime.verify_transcript_mirror_correctness_only()?;
+                    let after = runtime.hot_path_telemetry();
+                    Some(transcript_mirror_telemetry(report, before, after)?)
+                }
+            };
+            Ok((
+                artifacts.claim.clone(),
+                bundle,
+                runtime.proof_assembly_shape().clone(),
+                artifacts.discovery.lifting_log_size,
+                exec,
+                expected_graphs,
+                expected_kernel_launches,
+                transcript_mirror,
+            ))
+        })?;
         session_telemetry.require_strict_graph_a()?;
 
         let interaction_claim = interaction_claim_from_flattened(&claim, &bundle.interaction_claim)
@@ -1207,7 +1220,11 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
             lifting_log_size,
         )?;
 
-        self.last_pcs_telemetry = Some(CudaPcsDriverTelemetry::completed_arena_graph(exec));
+        self.last_pcs_telemetry = Some(CudaPcsDriverTelemetry::completed_arena_graph(
+            exec,
+            expected_graphs,
+            expected_kernel_launches,
+        ));
         self.last_resident_session_telemetry = Some(session_telemetry);
         let aot_stats = aot::runtime_stats();
         if aot_stats.aot_misses != 0

@@ -291,6 +291,12 @@ pub enum ResidentRuntimeError {
         budget: ResidentHotPathBudget,
         actual: CudaExecTelemetry,
     },
+    CapturedGraphTopology {
+        fri_rounds: usize,
+        transcript_segments: usize,
+        expected: usize,
+        actual: usize,
+    },
     FriRoundOutOfOrder {
         expected: usize,
         actual: usize,
@@ -2488,6 +2494,16 @@ impl<'a> ResidentGraphRuntime<'a> {
         self.workspace.graph_count()
     }
 
+    /// Require the protocol topology independently of the replay counters: six
+    /// fixed transcript-boundary graphs plus one graph per FRI fold round.
+    pub fn require_complete_captured_topology(&self) -> Result<usize, ResidentRuntimeError> {
+        require_complete_captured_topology(
+            self.fri.round_count(),
+            self.captured_graph_count(),
+            self.transcript_segment_count(),
+        )
+    }
+
     pub fn captured_graph_kernel_node_count(&self) -> Result<u64, ResidentRuntimeError> {
         self.workspace
             .graph_kernel_node_count()
@@ -4019,6 +4035,30 @@ fn fri_round_segment(round_index: usize) -> Result<GraphSegment, ResidentRuntime
     Ok(GraphSegment::FriLayer(layer))
 }
 
+fn require_complete_captured_topology(
+    fri_rounds: usize,
+    actual: usize,
+    transcript_segments: usize,
+) -> Result<usize, ResidentRuntimeError> {
+    let expected = fri_rounds
+        .checked_add(6)
+        .ok_or(ResidentRuntimeError::SizeOverflow)?;
+    if actual != expected
+        || actual
+            .checked_add(1)
+            .ok_or(ResidentRuntimeError::SizeOverflow)?
+            != transcript_segments
+    {
+        return Err(ResidentRuntimeError::CapturedGraphTopology {
+            fri_rounds,
+            transcript_segments,
+            expected,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4029,6 +4069,30 @@ mod tests {
         assert_eq!(budget.expected_graph_launches, 29);
         assert_eq!(budget.expected_kernel_launches, Some(123));
         assert_eq!(budget.expected_d2h_bytes, 371_604);
+    }
+
+    #[test]
+    fn captured_topology_is_six_fixed_graphs_plus_fri_rounds() {
+        assert_eq!(require_complete_captured_topology(8, 14, 15).unwrap(), 14);
+        assert_eq!(require_complete_captured_topology(23, 29, 30).unwrap(), 29);
+        assert!(matches!(
+            require_complete_captured_topology(8, 13, 15),
+            Err(ResidentRuntimeError::CapturedGraphTopology {
+                fri_rounds: 8,
+                transcript_segments: 15,
+                expected: 14,
+                actual: 13,
+            })
+        ));
+        assert!(matches!(
+            require_complete_captured_topology(8, 14, 14),
+            Err(ResidentRuntimeError::CapturedGraphTopology {
+                fri_rounds: 8,
+                transcript_segments: 14,
+                expected: 14,
+                actual: 14,
+            })
+        ));
     }
 
     #[test]
