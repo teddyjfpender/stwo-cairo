@@ -21,9 +21,13 @@ use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerk
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{BackendForChannel, FromSimdColumns};
+use stwo::prover::fri::FriCommitObserver;
 use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::twiddles::TwiddleTree;
-use stwo::prover::{prove_ex, CommitmentSchemeProver, CommitmentTreeProver, ProvingError};
+use stwo::prover::{
+    prove_ex, prove_ex_with_fri_observer, CommitmentSchemeProver, CommitmentTreeProver,
+    ProvingError,
+};
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
     PreProcessedTrace, PreProcessedTraceVariant,
@@ -141,6 +145,60 @@ where
 pub fn prove_cairo<B, MC>(
     input: ProverInput,
     prover_params: ProverParameters,
+) -> Result<CairoProof<MC::H>, ProvingError>
+where
+    B: BackendForChannel<MC>
+        + FrameworkBackend
+        + FromSimdColumns
+        + stwo_constraint_framework::LogupFinalizeBackend
+        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + crate::witness::memory_witness_backend::MemoryIdToBigWitness
+        + crate::witness::blake_g_witness_backend::BlakeGWitness
+        + crate::witness::jit_prove_backend::OpcodeJitBackend
+        + crate::witness::jit_prove_backend::RecordedFlatWitness
+        + crate::witness::blake_round_witness_backend::BlakeRoundWitness
+        + crate::witness::jit_prove_backend::Cube252Witness
+        + crate::witness::pedersen_witness_backend::PartialEcMulGenericWitness
+        + crate::witness::pedersen_witness_backend::PartialEcMulWindowBits18Witness
+        + crate::witness::pedersen_witness_backend::PedersenAggregatorWindowBits18Witness
+        + 'static,
+    MC: MerkleChannel + 'static,
+{
+    prove_cairo_inner::<B, MC>(input, prover_params, None)
+}
+
+/// Proves a Cairo execution while exposing the reference FRI commit boundaries to `observer`.
+pub fn prove_cairo_with_fri_observer<B, MC, O>(
+    input: ProverInput,
+    prover_params: ProverParameters,
+    observer: &mut O,
+) -> Result<CairoProof<MC::H>, ProvingError>
+where
+    B: BackendForChannel<MC>
+        + FrameworkBackend
+        + FromSimdColumns
+        + stwo_constraint_framework::LogupFinalizeBackend
+        + crate::witness::preprocessed_trace_backend::GenPreprocessedTrace
+        + crate::witness::memory_witness_backend::MemoryIdToBigWitness
+        + crate::witness::blake_g_witness_backend::BlakeGWitness
+        + crate::witness::jit_prove_backend::OpcodeJitBackend
+        + crate::witness::jit_prove_backend::RecordedFlatWitness
+        + crate::witness::blake_round_witness_backend::BlakeRoundWitness
+        + crate::witness::jit_prove_backend::Cube252Witness
+        + crate::witness::pedersen_witness_backend::PartialEcMulGenericWitness
+        + crate::witness::pedersen_witness_backend::PartialEcMulWindowBits18Witness
+        + crate::witness::pedersen_witness_backend::PedersenAggregatorWindowBits18Witness
+        + 'static,
+    MC: MerkleChannel + 'static,
+    O: FriCommitObserver<B, MC>,
+{
+    prove_cairo_inner::<B, MC>(input, prover_params, Some(observer))
+}
+
+fn prove_cairo_inner<B, MC>(
+    input: ProverInput,
+    prover_params: ProverParameters,
+    fri_observer: Option<&mut dyn FriCommitObserver<B, MC>>,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
     B: BackendForChannel<MC>
@@ -290,6 +348,7 @@ where
         interaction_generator,
         witness_exec_context,
         prover_params,
+        fri_observer,
     )
 }
 
@@ -346,6 +405,7 @@ where
         interaction_generator,
         witness_exec_context,
         prover_params,
+        None,
     )
 }
 
@@ -359,6 +419,7 @@ fn prove_cairo_common<'a, B, MC>(
     interaction_generator: CairoInteractionClaimGenerator<B>,
     witness_exec_context: WitnessExecContext,
     prover_params: ProverParameters,
+    fri_observer: Option<&mut dyn FriCommitObserver<B, MC>>,
 ) -> Result<CairoProof<MC::H>, ProvingError>
 where
     B: BackendForChannel<MC>
@@ -496,12 +557,21 @@ where
 
     // Prove stark.
     let span = span!(Level::INFO, "Prove STARKs").entered();
-    let proof = prove_ex::<B, _>(
-        &components,
-        channel,
-        commitment_scheme,
-        include_all_preprocessed_columns,
-    )?;
+    let proof = match fri_observer {
+        Some(observer) => prove_ex_with_fri_observer::<B, _, _>(
+            &components,
+            channel,
+            commitment_scheme,
+            include_all_preprocessed_columns,
+            observer,
+        )?,
+        None => prove_ex::<B, _>(
+            &components,
+            channel,
+            commitment_scheme,
+            include_all_preprocessed_columns,
+        )?,
+    };
     span.exit();
 
     event!(name: "component_info", Level::DEBUG, "Components: {}", component_builder);
