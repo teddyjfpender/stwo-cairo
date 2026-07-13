@@ -4,6 +4,8 @@ mod fri_round6_capture;
 mod fri_round6_index;
 mod fri_round6_io;
 mod fri_round6_provenance;
+#[cfg(test)]
+mod fri_round6_provenance_tests;
 mod fri_round6_transcript;
 mod fri_round6_validation;
 mod legacy;
@@ -199,8 +201,10 @@ fn run() -> Result<(), String> {
                 .ok_or("provenance preflight requires --fri-round6-provenance-sha256")?,
         )?;
         println!(
-            "FRI_ROUND6_PROVENANCE_PREFLIGHT=PASS production_admissible=false proof_verification=pending manifest_sha256={} proof_shape_sha256={}",
-            verified.manifest_sha256, verified.proof_shape_sha256
+            "{} manifest_sha256={} proof_shape_sha256={}",
+            fri_round6_provenance::IDENTITY_PREFLIGHT_STATUS,
+            verified.manifest_sha256,
+            verified.proof_shape_sha256
         );
         return Ok(());
     }

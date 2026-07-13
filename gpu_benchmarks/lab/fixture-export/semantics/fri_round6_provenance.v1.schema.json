@@ -59,7 +59,7 @@
         "path": {
           "type": "string",
           "minLength": 1,
-          "pattern": "^[^/][^\\\\]*$"
+          "pattern": "^(?!/)(?!.*//)(?!.*\\\\)(?!\\.{1,2}(?:/|$))(?!.*(?:/\\.{1,2})(?:/|$))(?!.*/$).+$"
         },
         "byte_length": { "type": "integer", "minimum": 1 },
         "sha256": { "$ref": "#/$defs/sha256" }

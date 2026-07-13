@@ -187,6 +187,26 @@ exact SHA-256. Do not hand-author a capture seed: its source must identify
 observer-claimed proof-shape identity. Those declarations are evidence metadata, not the missing
 reference-proof provenance seal.
 
+The first provenance layer is identity-only and remains non-admissible. A reviewed manifest using
+[`semantics/fri_round6_provenance.v1.schema.json`](semantics/fri_round6_provenance.v1.schema.json)
+must be supplied with its out-of-band SHA-256:
+
+```bash
+"$EXPORTER" \
+  --preflight-fri-round6-provenance /absolute/path/to/fri_round6_provenance.v1.json \
+  --fri-round6-provenance-sha256 <64-lowercase-hex-manifest-sha256>
+```
+
+This preflight hashes bounded PIE, adapted-input, proof, transport, tool, invocation and source
+closure files; rejects unknown fields, aliases, path-component symlinks and ambiguous relative
+paths; and requires the adapter run record to cross-bind its exact inputs, output, invocation,
+executable and source closure. Its success line deliberately says `IDENTITY_PREFLIGHT=PASS` plus
+`production_admissible=false`, `proof_verification=pending`,
+`adapter_execution_attestation=pending` and `verifier_closure_match=pending`. A hash-pinned run
+record is a reviewed identity claim, not proof that the adapter executable produced the output.
+Only the later proof deserialization, canonical reserialization, verifier, current-source closure,
+proof-shape and transcript-prefix gates may close those pending labels.
+
 The headerless payload is fourteen consecutive little-endian-u32 chunks:
 
 | Chunk | Offset | Bytes |

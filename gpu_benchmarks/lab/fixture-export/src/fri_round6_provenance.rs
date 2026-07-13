@@ -1,5 +1,6 @@
 //! Fail-closed provenance preflight for captured FRI replay bundles.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -11,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::model::{canonical_value_hash, load_bounded, validate_sha256};
 
 pub const SCHEMA: &str = "stwo.gpu-lab.fri-round6-provenance.v1";
+pub const IDENTITY_PREFLIGHT_STATUS: &str = "FRI_ROUND6_PROVENANCE_IDENTITY_PREFLIGHT=PASS production_admissible=false proof_verification=pending adapter_execution_attestation=pending verifier_closure_match=pending";
 const ADAPTER_RUN_SCHEMA: &str = "stwo.gpu-lab.pie-adapter-run.v1";
 const SOURCE_CLOSURE_SCHEMA: &str = "stwo.gpu-lab.source-closure.v1";
 const PROOF_SHAPE_SCHEMA: &str = "stwo.gpu-lab.cairo-proof-shape.v1";
@@ -133,24 +135,32 @@ struct SourceIdentity {
     sha256: String,
 }
 
-pub struct VerifiedProvenanceInputs {
+pub struct PreflightedProvenanceInputs {
     pub manifest_sha256: String,
     pub proof_shape_sha256: String,
-    pub bundle_root: PathBuf,
-    pub extended_cairo_proof_bincode: ArtifactSeal,
-    pub canonical_cairo_transport: ArtifactSeal,
-    pub verifier_source_closure: ArtifactSeal,
-    pub expected_proof_shape: ProofShape,
 }
 
 pub fn preflight(
     manifest_path: &Path,
     expected_manifest_sha256: &str,
-) -> Result<VerifiedProvenanceInputs, String> {
+) -> Result<PreflightedProvenanceInputs, String> {
     validate_sha256(expected_manifest_sha256, "FRI provenance manifest sha256")?;
     reject_symlink(manifest_path, "FRI provenance manifest")?;
-    let (bytes, manifest_sha256) =
-        load_bounded(manifest_path, MAX_MANIFEST_BYTES, "FRI provenance manifest")?;
+    let resolved_manifest = manifest_path
+        .canonicalize()
+        .map_err(|error| format!("resolve FRI provenance manifest: {error}"))?;
+    let manifest_before = fs::metadata(&resolved_manifest)
+        .map_err(|error| format!("stat {}: {error}", resolved_manifest.display()))?;
+    let (bytes, manifest_sha256) = load_bounded(
+        &resolved_manifest,
+        MAX_MANIFEST_BYTES,
+        "FRI provenance manifest",
+    )?;
+    let manifest_after = fs::metadata(&resolved_manifest)
+        .map_err(|error| format!("restat {}: {error}", resolved_manifest.display()))?;
+    if !manifest_before.is_file() || fingerprint(&manifest_before) != fingerprint(&manifest_after) {
+        return Err("FRI provenance manifest changed while it was read".into());
+    }
     if manifest_sha256 != expected_manifest_sha256 {
         return Err(format!(
             "FRI provenance manifest sha256 {manifest_sha256} != required {expected_manifest_sha256}"
@@ -159,18 +169,21 @@ pub fn preflight(
     let manifest: ProvenanceManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse FRI provenance manifest: {error}"))?;
     validate_header(&manifest)?;
-    let root = manifest_path
+    let root = resolved_manifest
         .parent()
         .ok_or("FRI provenance manifest has no parent directory")?
         .canonicalize()
         .map_err(|error| format!("resolve FRI provenance bundle root: {error}"))?;
 
+    let mut identities = BTreeMap::new();
+    register_identity(&mut identities, &manifest_before, "FRI provenance manifest")?;
     verify_artifact(
         &root,
         &manifest.source_pie,
         "cairo-pie-zip",
         MAX_PIE_BYTES,
         false,
+        &mut identities,
     )?;
     verify_artifact(
         &root,
@@ -178,6 +191,7 @@ pub fn preflight(
         "stwo-prover-input-bincode-v1",
         MAX_PROVER_INPUT_BYTES,
         false,
+        &mut identities,
     )?;
     let run = verify_artifact(
         &root,
@@ -185,6 +199,7 @@ pub fn preflight(
         "adapter-run-json-v1",
         MAX_DOCUMENT_BYTES,
         true,
+        &mut identities,
     )?;
     verify_artifact(
         &root,
@@ -192,6 +207,7 @@ pub fn preflight(
         "adapter-invocation-json-v1",
         MAX_DOCUMENT_BYTES,
         false,
+        &mut identities,
     )?;
     verify_artifact(
         &root,
@@ -199,6 +215,7 @@ pub fn preflight(
         "adapter-executable",
         MAX_EXECUTABLE_BYTES,
         false,
+        &mut identities,
     )?;
     let adapter_sources = verify_artifact(
         &root,
@@ -206,6 +223,7 @@ pub fn preflight(
         "adapter-source-closure-json-v1",
         MAX_DOCUMENT_BYTES,
         true,
+        &mut identities,
     )?;
     verify_artifact(
         &root,
@@ -213,6 +231,7 @@ pub fn preflight(
         "extended-cairo-proof-bincode-v1",
         MAX_PROOF_BYTES,
         false,
+        &mut identities,
     )?;
     verify_artifact(
         &root,
@@ -220,6 +239,7 @@ pub fn preflight(
         "canonical-cairo-proof-felts-be32-v1",
         MAX_PROOF_BYTES,
         false,
+        &mut identities,
     )?;
     let verifier_sources = verify_artifact(
         &root,
@@ -227,6 +247,7 @@ pub fn preflight(
         "verifier-source-closure-json-v1",
         MAX_DOCUMENT_BYTES,
         true,
+        &mut identities,
     )?;
 
     let run: AdapterRunRecord = serde_json::from_slice(&run)
@@ -236,14 +257,9 @@ pub fn preflight(
     validate_source_closure(&verifier_sources, "verifier")?;
     validate_shape(&manifest.proof_shape)?;
 
-    Ok(VerifiedProvenanceInputs {
+    Ok(PreflightedProvenanceInputs {
         manifest_sha256,
         proof_shape_sha256: manifest.proof_shape.sha256,
-        bundle_root: root,
-        extended_cairo_proof_bincode: manifest.extended_cairo_proof_bincode,
-        canonical_cairo_transport: manifest.canonical_cairo_transport,
-        verifier_source_closure: manifest.verifier_source_closure,
-        expected_proof_shape: manifest.proof_shape.shape,
     })
 }
 
@@ -375,6 +391,7 @@ fn verify_artifact(
     expected_kind: &str,
     maximum: u64,
     load: bool,
+    identities: &mut BTreeMap<(u64, u64), String>,
 ) -> Result<Vec<u8>, String> {
     if seal.kind != expected_kind {
         return Err(format!(
@@ -405,6 +422,10 @@ fn verify_artifact(
             seal.path
         ));
     }
+    if expected_kind == "adapter-executable" {
+        require_executable(&before)?;
+    }
+    register_identity(identities, &before, &seal.path)?;
     let capacity = if load { seal.byte_length as usize } else { 0 };
     let mut bytes = Vec::with_capacity(capacity);
     let mut hasher = Sha256::new();
@@ -437,10 +458,16 @@ fn verify_artifact(
     Ok(bytes)
 }
 
-fn resolve_bundle_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_bundle_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     validate_relative_path(relative, "artifact path")?;
-    let joined = root.join(relative);
-    reject_symlink(&joined, "provenance artifact")?;
+    let mut joined = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        let Component::Normal(component) = component else {
+            return Err("artifact path stopped being normalized".into());
+        };
+        joined.push(component);
+        reject_symlink(&joined, "provenance artifact path component")?;
+    }
     let resolved = joined
         .canonicalize()
         .map_err(|error| format!("resolve {}: {error}", joined.display()))?;
@@ -450,15 +477,38 @@ fn resolve_bundle_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
-fn validate_relative_path(value: &str, label: &str) -> Result<(), String> {
+pub(crate) fn validate_relative_path(value: &str, label: &str) -> Result<(), String> {
     let path = Path::new(value);
     if value.is_empty()
+        || value.contains('\\')
+        || value.split('/').any(|component| component.is_empty())
         || path.is_absolute()
         || !path
             .components()
             .all(|part| matches!(part, Component::Normal(_)))
     {
         return Err(format!("{label} must be a normalized relative path"));
+    }
+    Ok(())
+}
+
+pub(crate) fn register_identity(
+    identities: &mut BTreeMap<(u64, u64), String>,
+    metadata: &Metadata,
+    label: &str,
+) -> Result<(), String> {
+    let identity = (metadata.dev(), metadata.ino());
+    if let Some(previous) = identities.insert(identity, label.to_owned()) {
+        return Err(format!(
+            "provenance artifacts alias the same file: {previous} and {label}"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_executable(metadata: &Metadata) -> Result<(), String> {
+    if metadata.mode() & 0o111 == 0 {
+        return Err("sealed adapter executable has no execute bit".into());
     }
     Ok(())
 }
