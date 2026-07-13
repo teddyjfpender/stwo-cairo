@@ -1,0 +1,82 @@
+{
+  "boundary": {
+    "entry": "cairo.witness.pedersen_builtin.logical-inputs",
+    "exit": "cairo.witness.pedersen_builtin.base-trace-and-facts"
+  },
+  "field": {
+    "canonical_encoding": "u32-le-less-than-modulus",
+    "modulus": 2147483647,
+    "name": "M31"
+  },
+  "inputs": [
+    {
+      "name": "segment_start",
+      "type": "M31"
+    },
+    {
+      "constant": 1,
+      "name": "enabler",
+      "type": "M31"
+    },
+    {
+      "name": "iota",
+      "role": "zero-based-row-ordinal",
+      "type": "u32"
+    },
+    {
+      "address_rule": "nonzero-and-in-bounds",
+      "name": "address_to_id",
+      "type": "M31-indexed-map"
+    }
+  ],
+  "outputs": {
+    "lookup_words": [
+      1444891767,
+      "a0",
+      "col0",
+      1444891767,
+      "a1",
+      "col1",
+      1444891767,
+      "a2",
+      "col2",
+      520578465,
+      "col0",
+      "col1",
+      "col2",
+      1
+    ],
+    "sub_input_words": [
+      "a0",
+      "a1",
+      "a2",
+      "col0",
+      "col1",
+      "col2"
+    ],
+    "trace_columns": [
+      "col0=address_to_id[a0]",
+      "col1=address_to_id[a1]",
+      "col2=address_to_id[a2]"
+    ]
+  },
+  "preprocessed": {
+    "pedersen_variant": "standard-window-bits-18",
+    "row_sequence": "Seq(log_size)"
+  },
+  "row_semantics": {
+    "address_formula": "a_j=(segment_start+3*iota+j) mod 2147483647",
+    "j": [
+      0,
+      1,
+      2
+    ]
+  },
+  "schema": "stwo.gpu-lab.slab-semantics.v1",
+  "scope": "cairo.witness.pedersen_builtin.base-trace-and-facts",
+  "valid_domain": {
+    "addresses": "a0,a1,a2 are nonzero and within address_to_id",
+    "minimum_rows": 16,
+    "row_count": "power-of-two"
+  }
+}
