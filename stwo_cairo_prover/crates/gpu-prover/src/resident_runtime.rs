@@ -129,11 +129,14 @@ pub struct ResidentWitnessIngestReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResidentHotPathBudget {
     pub expected_graph_launches: u64,
-    pub max_kernel_launches: u64,
+    /// Exact kernel-node total enumerated from the captured CUDA graphs. Graph-only
+    /// callers that do not yet have a complete capture may leave this unbounded.
+    pub expected_kernel_launches: Option<u64>,
     pub expected_sync_calls: u64,
     pub max_h2d_bytes: u64,
     pub expected_d2h_bytes: u64,
     pub max_allocations: u64,
+    pub max_frees: u64,
     pub max_graph_submit_gap_ns: u64,
 }
 
@@ -141,29 +144,56 @@ impl ResidentHotPathBudget {
     pub const fn graph_only(expected_graph_launches: u64) -> Self {
         Self {
             expected_graph_launches,
-            max_kernel_launches: u64::MAX,
+            expected_kernel_launches: None,
             expected_sync_calls: 0,
             max_h2d_bytes: 0,
             expected_d2h_bytes: 0,
             max_allocations: 0,
+            max_frees: 0,
             max_graph_submit_gap_ns: u64::MAX,
         }
     }
 
     pub const fn final_bundle(
         expected_graph_launches: u64,
-        max_kernel_launches: u64,
+        expected_kernel_launches: u64,
         d2h_bytes: u64,
     ) -> Self {
         Self {
             expected_graph_launches,
-            max_kernel_launches,
+            expected_kernel_launches: Some(expected_kernel_launches),
             expected_sync_calls: 1,
             max_h2d_bytes: 0,
             expected_d2h_bytes: d2h_bytes,
             max_allocations: 0,
+            max_frees: 0,
             max_graph_submit_gap_ns: 49_999_999,
         }
+    }
+
+    fn accepts(self, actual: CudaExecTelemetry) -> bool {
+        actual.graph_launches == self.expected_graph_launches
+            && actual.graph_launches != 0
+            && actual.graph_launches < 100
+            && actual.kernel_launches != 0
+            && self
+                .expected_kernel_launches
+                .is_none_or(|expected| actual.kernel_launches == expected)
+            && actual.sync_calls == self.expected_sync_calls
+            && actual.h2d_bytes <= self.max_h2d_bytes
+            && actual.d2h_bytes == self.expected_d2h_bytes
+            && actual.allocations <= self.max_allocations
+            && actual.allocation_bytes == 0
+            && actual.frees <= self.max_frees
+            && actual.memset_bytes == 0
+            && actual.fill_words == 0
+            && actual.d2d_bytes == 0
+            && actual.capture_begins == 0
+            && actual.capture_finishes == 0
+            && actual.capture_aborts == 0
+            && actual.lane_forks == 0
+            && actual.lane_joins == 0
+            && actual.graph_submit_gap_ns_max <= self.max_graph_submit_gap_ns
     }
 }
 
@@ -1726,17 +1756,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         budget: ResidentHotPathBudget,
     ) -> Result<CudaExecTelemetry, ResidentRuntimeError> {
         let actual = self.hot_path_telemetry();
-        if actual.graph_launches != budget.expected_graph_launches
-            || actual.graph_launches == 0
-            || actual.graph_launches >= 100
-            || actual.kernel_launches == 0
-            || actual.kernel_launches > budget.max_kernel_launches
-            || actual.sync_calls != budget.expected_sync_calls
-            || actual.h2d_bytes > budget.max_h2d_bytes
-            || actual.d2h_bytes != budget.expected_d2h_bytes
-            || actual.allocations > budget.max_allocations
-            || actual.graph_submit_gap_ns_max > budget.max_graph_submit_gap_ns
-        {
+        if !budget.accepts(actual) {
             return Err(ResidentRuntimeError::HotPathBudgetExceeded { budget, actual });
         }
         Ok(actual)
@@ -4003,10 +4023,50 @@ mod tests {
 
     #[test]
     fn final_bundle_budget_uses_the_captured_kernel_node_count() {
-        let budget = ResidentHotPathBudget::final_bundle(29, 7_859, 371_604);
+        let budget = ResidentHotPathBudget::final_bundle(29, 123, 371_604);
         assert_eq!(budget.expected_graph_launches, 29);
-        assert_eq!(budget.max_kernel_launches, 7_859);
+        assert_eq!(budget.expected_kernel_launches, Some(123));
         assert_eq!(budget.expected_d2h_bytes, 371_604);
+    }
+
+    #[test]
+    fn final_bundle_budget_requires_exact_kernel_nodes_and_zero_frees() {
+        let budget = ResidentHotPathBudget::final_bundle(29, 123, 371_604);
+        let exact = CudaExecTelemetry {
+            sync_calls: 1,
+            d2h_bytes: 371_604,
+            graph_launches: 29,
+            kernel_launches: 123,
+            ..CudaExecTelemetry::default()
+        };
+        assert!(budget.accepts(exact));
+        macro_rules! reject_counter {
+            ($field:ident, $value:expr) => {{
+                let mut changed = exact;
+                changed.$field = $value;
+                assert!(!budget.accepts(changed), stringify!($field));
+            }};
+        }
+        reject_counter!(graph_launches, 28);
+        reject_counter!(graph_launches, 100);
+        reject_counter!(kernel_launches, 0);
+        reject_counter!(kernel_launches, 122);
+        reject_counter!(kernel_launches, 124);
+        reject_counter!(sync_calls, 0);
+        reject_counter!(h2d_bytes, 1);
+        reject_counter!(d2h_bytes, 371_603);
+        reject_counter!(allocations, 1);
+        reject_counter!(allocation_bytes, 4);
+        reject_counter!(frees, 1);
+        reject_counter!(memset_bytes, 4);
+        reject_counter!(fill_words, 1);
+        reject_counter!(d2d_bytes, 4);
+        reject_counter!(capture_begins, 1);
+        reject_counter!(capture_finishes, 1);
+        reject_counter!(capture_aborts, 1);
+        reject_counter!(lane_forks, 1);
+        reject_counter!(lane_joins, 1);
+        reject_counter!(graph_submit_gap_ns_max, 50_000_000);
     }
 
     #[test]

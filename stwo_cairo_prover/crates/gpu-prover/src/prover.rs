@@ -189,12 +189,12 @@ enum ResidentTranscriptMode {
 fn resident_hot_path_budget(
     mode: ResidentTranscriptMode,
     expected_graph_launches: u64,
-    max_kernel_launches: u64,
+    expected_kernel_launches: u64,
     d2h_bytes: u64,
 ) -> ResidentHotPathBudget {
     let mut budget = ResidentHotPathBudget::final_bundle(
         expected_graph_launches,
-        max_kernel_launches,
+        expected_kernel_launches,
         d2h_bytes,
     );
     if mode == ResidentTranscriptMode::DeviceMirrored {
@@ -1306,16 +1306,16 @@ mod resident_transcript_mirror_tests {
     #[test]
     fn mirrored_budget_relaxes_only_submit_gap_timing() {
         let production =
-            resident_hot_path_budget(ResidentTranscriptMode::DeviceOnly, 29, 7_859, 371_604);
+            resident_hot_path_budget(ResidentTranscriptMode::DeviceOnly, 29, 123, 371_604);
         assert_eq!(
             production,
-            ResidentHotPathBudget::final_bundle(29, 7_859, 371_604)
+            ResidentHotPathBudget::final_bundle(29, 123, 371_604)
         );
 
         let mut expected_mirrored = production;
         expected_mirrored.max_graph_submit_gap_ns = u64::MAX;
         assert_eq!(
-            resident_hot_path_budget(ResidentTranscriptMode::DeviceMirrored, 29, 7_859, 371_604,),
+            resident_hot_path_budget(ResidentTranscriptMode::DeviceMirrored, 29, 123, 371_604,),
             expected_mirrored
         );
     }
