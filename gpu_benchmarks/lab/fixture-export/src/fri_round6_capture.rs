@@ -217,7 +217,9 @@ fn validate_shape(shape: &CaptureShape) -> Result<(), String> {
         || shape.fri_tree_count < 8
         || shape.pcs.log_last_layer_degree_bound >= 32
     {
-        return Err("capture is not an exact SN2-compatible fold-step-3 FRI shape".into());
+        return Err(
+            "capture is not the expected log24/fold-step3 observer-claimed FRI shape".into(),
+        );
     }
     Ok(())
 }

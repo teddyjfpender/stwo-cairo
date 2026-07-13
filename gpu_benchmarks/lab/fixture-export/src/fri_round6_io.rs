@@ -30,7 +30,7 @@ pub fn export_capture(
     ensure_executable_unchanged(&executable_sha256)
 }
 
-/// Rebuild both production artifacts from the authenticated capture and compare
+/// Rebuild both captured-unsealed artifacts from the hash-pinned observer claim and compare
 /// every payload and index byte. A matching digest declared by an arbitrary
 /// index is insufficient: the canonical CPU oracle is the acceptance source.
 pub fn validate_capture_dir(
@@ -87,7 +87,7 @@ fn verify_case(output_dir: &Path, case: Case, artifact: &Artifact) -> Result<(),
     let (payload, _) = load_bounded(&payload_path, artifact.payload.len() as u64, "FRI payload")?;
     if payload != artifact.payload {
         return Err(format!(
-            "{} is not the canonical payload rebuilt from the authenticated capture",
+            "{} is not the canonical payload rebuilt from the captured-unsealed observer claim",
             payload_path.display()
         ));
     }
@@ -97,7 +97,7 @@ fn verify_case(output_dir: &Path, case: Case, artifact: &Artifact) -> Result<(),
     expected.push(b'\n');
     if index != expected {
         return Err(format!(
-            "{} is not the canonical index rebuilt from the authenticated capture",
+            "{} is not the canonical index rebuilt from the captured-unsealed observer claim",
             index_path.display()
         ));
     }

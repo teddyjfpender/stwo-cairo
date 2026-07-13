@@ -15,7 +15,7 @@ pub fn source_index(capture: Option<&VerifiedCapture>, exporter_sha256: &str) ->
             cairo_schedule_key: None,
         },
         Some(capture) => Source {
-            kind: "hash-pinned-production-simd-observer-claim-unsealed",
+            kind: "captured-unsealed-production-simd-observer-claim",
             exporter_executable_sha256: exporter_sha256.to_owned(),
             capture_seed_sha256: Some(capture.capture_sha256.clone()),
             capture: Some(capture.source.clone()),
