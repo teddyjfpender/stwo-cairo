@@ -3,10 +3,11 @@ use stwo::core::vcs::blake2_hash::Blake2sHash;
 use crate::fri_round6_capture::VerifiedCapture;
 use crate::fri_round6_index::Source;
 
-pub fn source_index(capture: Option<&VerifiedCapture>) -> Source {
+pub fn source_index(capture: Option<&VerifiedCapture>, exporter_sha256: &str) -> Source {
     match capture {
         None => Source {
             kind: "synthetic-layout-self-test",
+            exporter_executable_sha256: exporter_sha256.to_owned(),
             capture_seed_sha256: None,
             capture: None,
             capture_shape: None,
@@ -14,7 +15,8 @@ pub fn source_index(capture: Option<&VerifiedCapture>) -> Source {
             cairo_schedule_key: None,
         },
         Some(capture) => Source {
-            kind: "authenticated-production-simd-capture",
+            kind: "hash-pinned-production-simd-observer-claim-unsealed",
+            exporter_executable_sha256: exporter_sha256.to_owned(),
             capture_seed_sha256: Some(capture.capture_sha256.clone()),
             capture: Some(capture.source.clone()),
             capture_shape: Some(capture.shape.clone()),

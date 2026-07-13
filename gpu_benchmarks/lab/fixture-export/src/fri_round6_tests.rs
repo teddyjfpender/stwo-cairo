@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn exact_layout_and_hostile_propagation() {
-    let context = synthetic_context().unwrap();
+    let context = synthetic_context("11".repeat(32)).unwrap();
     let primary = build(&context, Case::Primary).unwrap();
     let hostile = build(&context, Case::Hostile).unwrap();
     validate_pair(&primary, &hostile).unwrap();
@@ -13,8 +13,9 @@ fn exact_layout_and_hostile_propagation() {
         primary.index.shape.normalized_twiddle_offsets_words,
         [0, 32, 48]
     );
-    assert_eq!(primary.index.predecessor_seal.status, "PASS");
-    assert_eq!(primary.index.predecessor_seal.root6_leaf_count, 16);
+    assert_eq!(primary.index.predecessor_check.status, "PASS");
+    assert_eq!(primary.index.predecessor_check.root6_leaf_count, 16);
+    assert!(!primary.index.production_admissible);
     assert_eq!(
         primary.index.chunks.last().unwrap().offset_bytes + 64,
         PAYLOAD_BYTES
@@ -23,7 +24,7 @@ fn exact_layout_and_hostile_propagation() {
 
 #[test]
 fn generation_is_byte_deterministic() {
-    let context = synthetic_context().unwrap();
+    let context = synthetic_context("11".repeat(32)).unwrap();
     let left = build(&context, Case::Primary).unwrap();
     let right = build(&context, Case::Primary).unwrap();
     assert_eq!(left.payload, right.payload);

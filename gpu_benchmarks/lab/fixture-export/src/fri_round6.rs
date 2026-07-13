@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use stwo::core::circle::Coset;
 use stwo::core::fields::m31::{BaseField, P};
 use stwo::core::fields::qm31::SecureField;
@@ -14,10 +12,9 @@ use stwo::prover::secure_column::SecureColumnByCoords;
 use stwo::prover::vcs_lifted::ops::{MerkleOpsLifted, PackLeavesOps};
 use stwo_backend_cuda::BLAKE2S_TRANSCRIPT_PROTOCOL_TAG;
 
-use crate::artifact_io::{write_immutable_bytes, write_immutable_json};
 use crate::fri_round6_capture::VerifiedCapture;
 use crate::fri_round6_index::{
-    Chains, Chunk, Index, Oracle, Payload, PredecessorSeal, SemanticIds, Shape, Transcript,
+    Chains, Chunk, Index, Oracle, Payload, PredecessorCheck, SemanticIds, Shape, Transcript,
 };
 use crate::fri_round6_transcript::{
     cairo_schedule, cursor32_state, hash_words, independently_checked_chains, replay, schedule,
@@ -28,7 +25,7 @@ use crate::fri_round6_validation::{source_index, verify_observed, words_hash};
 use crate::model::sha256_hex;
 
 const SYNTHETIC_SCHEMA: &str = "stwo.gpu-lab.fri-round6-synthetic-layout-index.v1";
-const CAPTURED_SCHEMA: &str = "stwo.gpu-lab.fri-round6-captured-index.v1";
+const CAPTURED_UNSEALED_SCHEMA: &str = "stwo.gpu-lab.fri-round6-captured-unsealed-index.v1";
 const SOURCE_CIRCLE_LOG: u32 = 24;
 const ENTRY_LOG: u32 = 6;
 const EXIT_LOG: u32 = 3;
@@ -37,13 +34,13 @@ const FULL_TWIDDLE_WORDS: u32 = 1 << (SOURCE_CIRCLE_LOG - 1);
 const PAYLOAD_BYTES: usize = 1_936;
 
 #[derive(Clone, Copy)]
-enum Case {
+pub(crate) enum Case {
     Primary,
     Hostile,
 }
 
 impl Case {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Primary => "primary",
             Self::Hostile => "hostile",
@@ -58,9 +55,9 @@ impl Case {
     }
 }
 
-struct Artifact {
-    payload: Vec<u8>,
-    index: Index,
+pub(crate) struct Artifact {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) index: Index,
     entry: Vec<u32>,
     root: Vec<u32>,
     challenge: Vec<u32>,
@@ -73,19 +70,17 @@ enum Origin<'a> {
     Captured(&'a VerifiedCapture),
 }
 
-struct BuildContext<'a> {
+pub(crate) struct BuildContext<'a> {
     origin: Origin<'a>,
     primary: SecureColumnByCoords<CpuBackend>,
     cursor32: Vec<u32>,
     chains: [u64; 5],
+    exporter_executable_sha256: String,
 }
 
-pub fn export_synthetic(output_dir: &Path) -> Result<(), String> {
-    let context = synthetic_context()?;
-    export_context(output_dir, &context)
-}
-
-fn synthetic_context() -> Result<BuildContext<'static>, String> {
+pub(crate) fn synthetic_context(
+    exporter_executable_sha256: String,
+) -> Result<BuildContext<'static>, String> {
     let full_schedule = schedule(4)?;
     let chains = independently_checked_chains(&full_schedule)?;
     Ok(BuildContext {
@@ -93,49 +88,24 @@ fn synthetic_context() -> Result<BuildContext<'static>, String> {
         primary: synthetic_entry_values(),
         cursor32: cursor32_state(chains[0], SOURCE_CIRCLE_LOG, ENTRY_LOG),
         chains,
+        exporter_executable_sha256,
     })
 }
 
-pub fn export_capture(output_dir: &Path, capture: &VerifiedCapture) -> Result<(), String> {
-    let context = BuildContext {
+pub(crate) fn capture_context(
+    capture: &VerifiedCapture,
+    exporter_executable_sha256: String,
+) -> Result<BuildContext<'_>, String> {
+    Ok(BuildContext {
         origin: Origin::Captured(capture),
         primary: decode_column_words(&capture.entry_words)?,
         cursor32: capture.cursor32.clone(),
         chains: capture.chains,
-    };
-    export_context(output_dir, &context)
+        exporter_executable_sha256,
+    })
 }
 
-fn export_context(output_dir: &Path, context: &BuildContext<'_>) -> Result<(), String> {
-    let primary = build(context, Case::Primary)?;
-    let hostile = build(context, Case::Hostile)?;
-    validate_pair(&primary, &hostile)?;
-    write_case(output_dir, context, Case::Primary, &primary)?;
-    write_case(output_dir, context, Case::Hostile, &hostile)
-}
-
-fn write_case(
-    output_dir: &Path,
-    context: &BuildContext<'_>,
-    case: Case,
-    artifact: &Artifact,
-) -> Result<(), String> {
-    let family = match context.origin {
-        Origin::Synthetic => "synthetic-layout",
-        Origin::Captured(_) => "sn2",
-    };
-    let stem = format!("fri-round6-{family}-{}", case.name());
-    write_immutable_bytes(
-        &output_dir.join(format!("{stem}.payload.bin")),
-        &artifact.payload,
-    )?;
-    write_immutable_json(
-        &output_dir.join(format!("{stem}.index.json")),
-        &artifact.index,
-    )
-}
-
-fn build(context: &BuildContext<'_>, case: Case) -> Result<Artifact, String> {
+pub(crate) fn build(context: &BuildContext<'_>, case: Case) -> Result<Artifact, String> {
     let entry_values = case_values(&context.primary, case);
     let (root6_leaves, root6) = commit(&entry_values)?;
     let (prefix_schedule, full_schedule) = match context.origin {
@@ -210,9 +180,9 @@ fn build(context: &BuildContext<'_>, case: Case) -> Result<Artifact, String> {
             },
         ),
         Origin::Captured(_) => (
-            CAPTURED_SCHEMA,
-            "sn2",
-            "full-cairo-plan-cursor32-through-cursor36",
+            CAPTURED_UNSEALED_SCHEMA,
+            "captured-unsealed",
+            "observer-captured-cursor32-through-cursor36-unsealed-prefix",
             CAIRO_MAX_REJECTION_ROUNDS,
             SemanticIds {
                 cursor32_state_input: 0,
@@ -224,16 +194,29 @@ fn build(context: &BuildContext<'_>, case: Case) -> Result<Artifact, String> {
             },
         ),
     };
+    let admission_blocker = match (context.origin, case) {
+        (Origin::Synthetic, _) => "synthetic layout self-test; no production witness provenance",
+        (Origin::Captured(_), Case::Primary) => {
+            "requires verified reference proof replay through cursor32, PIE-to-ProverInput adapter seal, and recomputed proof-shape identity"
+        }
+        (Origin::Captured(_), Case::Hostile) => {
+            "deliberate hostile mutation; additionally lacks verified reference-proof prefix provenance"
+        }
+    };
     let payload_name = format!("fri-round6-{family}-{}.payload.bin", case.name());
     let index = Index {
         schema_version: schema,
         fixture_id: format!("{family}.fri.round6.{}.v1", case.name()),
         fixture_class: case.class(),
-        production_admissible: matches!(context.origin, Origin::Captured(_)),
-        source: source_index(match context.origin {
-            Origin::Synthetic => None,
-            Origin::Captured(capture) => Some(capture),
-        }),
+        production_admissible: false,
+        admission_blocker,
+        source: source_index(
+            match context.origin {
+                Origin::Synthetic => None,
+                Origin::Captured(capture) => Some(capture),
+            },
+            &context.exporter_executable_sha256,
+        ),
         payload: Payload {
             path: payload_name,
             byte_length: payload.len(),
@@ -264,7 +247,7 @@ fn build(context: &BuildContext<'_>, case: Case) -> Result<Artifact, String> {
             semantic_ids,
             chains: chain_strings(context.chains),
         },
-        predecessor_seal: PredecessorSeal {
+        predecessor_check: PredecessorCheck {
             status: "PASS",
             cursor32_state_words_sha256: sha256_words(&context.cursor32),
             cursor32_digest_blake2s: words_hash(&context.cursor32[..8])?.to_string(),
@@ -470,7 +453,7 @@ fn chain_strings(chains: [u64; 5]) -> Chains {
     }
 }
 
-fn validate_pair(primary: &Artifact, hostile: &Artifact) -> Result<(), String> {
+pub(crate) fn validate_pair(primary: &Artifact, hostile: &Artifact) -> Result<(), String> {
     if primary.chains != hostile.chains {
         return Err("hostile fixture changed the transcript graph chains".into());
     }

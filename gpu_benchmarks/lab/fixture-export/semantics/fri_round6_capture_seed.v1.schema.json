@@ -1,0 +1,265 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stwo.gpu-lab.fri-round6-capture-seed.v1",
+  "title": "Hash-pinned production SIMD observer capture for FRI round 6",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source",
+    "shape",
+    "schedule",
+    "cursor32_state_words",
+    "cursor32_state_words_sha256",
+    "entry_pong_words",
+    "entry_pong_words_sha256",
+    "observed"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "stwo.gpu-lab.fri-round6-capture-seed.v1"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observer",
+        "prover_input_sha256",
+        "prover_input_bytes",
+        "observer_proof_shape_id"
+      ],
+      "properties": {
+        "observer": {
+          "const": "stwo-cairo.production-simd-fri-observer.v1"
+        },
+        "prover_input_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "prover_input_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "observer_proof_shape_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "circle_log_size",
+        "claim_enable_felts",
+        "claim_log_size_felts",
+        "claim_public_data_felts",
+        "interaction_claim_felts",
+        "oods_sampled_values_felts",
+        "interaction_pow_bits",
+        "pcs",
+        "fri_tree_count"
+      ],
+      "properties": {
+        "circle_log_size": {
+          "const": 24
+        },
+        "claim_enable_felts": {
+          "$ref": "#/$defs/nonzero_u32"
+        },
+        "claim_log_size_felts": {
+          "$ref": "#/$defs/nonzero_u32"
+        },
+        "claim_public_data_felts": {
+          "$ref": "#/$defs/nonzero_u32"
+        },
+        "interaction_claim_felts": {
+          "$ref": "#/$defs/nonzero_u32"
+        },
+        "oods_sampled_values_felts": {
+          "$ref": "#/$defs/nonzero_u32"
+        },
+        "interaction_pow_bits": {
+          "$ref": "#/$defs/u32"
+        },
+        "pcs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "pow_bits",
+            "log_blowup_factor",
+            "n_queries",
+            "log_last_layer_degree_bound",
+            "fold_step",
+            "lifting_log_size"
+          ],
+          "properties": {
+            "pow_bits": {
+              "$ref": "#/$defs/u32"
+            },
+            "log_blowup_factor": {
+              "$ref": "#/$defs/u32"
+            },
+            "n_queries": {
+              "$ref": "#/$defs/nonzero_u32"
+            },
+            "log_last_layer_degree_bound": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 31
+            },
+            "fold_step": {
+              "const": 3
+            },
+            "lifting_log_size": {
+              "const": 24
+            }
+          }
+        },
+        "fri_tree_count": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device_protocol_key",
+        "cairo_schedule_key",
+        "c32",
+        "c33",
+        "c34",
+        "c35",
+        "c36"
+      ],
+      "properties": {
+        "device_protocol_key": {
+          "$ref": "#/$defs/u64_hex"
+        },
+        "cairo_schedule_key": {
+          "$ref": "#/$defs/u64_hex"
+        },
+        "c32": {
+          "$ref": "#/$defs/u64_hex"
+        },
+        "c33": {
+          "$ref": "#/$defs/u64_hex"
+        },
+        "c34": {
+          "$ref": "#/$defs/u64_hex"
+        },
+        "c35": {
+          "$ref": "#/$defs/u64_hex"
+        },
+        "c36": {
+          "$ref": "#/$defs/u64_hex"
+        }
+      }
+    },
+    "cursor32_state_words": {
+      "$ref": "#/$defs/state_words"
+    },
+    "cursor32_state_words_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "entry_pong_words": {
+      "type": "array",
+      "minItems": 256,
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/m31"
+      }
+    },
+    "entry_pong_words_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "observed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root6_words",
+        "alpha6_words",
+        "cursor34_state_words",
+        "root7_words",
+        "alpha7_words",
+        "cursor35_state_words",
+        "cursor36_state_words"
+      ],
+      "properties": {
+        "root6_words": {
+          "$ref": "#/$defs/digest_words"
+        },
+        "alpha6_words": {
+          "$ref": "#/$defs/secure_felt_words"
+        },
+        "cursor34_state_words": {
+          "$ref": "#/$defs/state_words"
+        },
+        "root7_words": {
+          "$ref": "#/$defs/digest_words"
+        },
+        "alpha7_words": {
+          "$ref": "#/$defs/secure_felt_words"
+        },
+        "cursor35_state_words": {
+          "$ref": "#/$defs/state_words"
+        },
+        "cursor36_state_words": {
+          "$ref": "#/$defs/state_words"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "nonzero_u32": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "m31": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2147483646
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "u64_hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "digest_words": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/u32"
+      }
+    },
+    "secure_felt_words": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "$ref": "#/$defs/m31"
+      }
+    },
+    "state_words": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/u32"
+      }
+    }
+  }
+}

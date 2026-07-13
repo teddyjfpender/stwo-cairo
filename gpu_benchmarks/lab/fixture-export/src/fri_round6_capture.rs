@@ -11,6 +11,7 @@ use crate::model::{load_bounded, sha256_hex, validate_sha256, M31_P};
 pub const CAPTURE_SCHEMA: &str = "stwo.gpu-lab.fri-round6-capture-seed.v1";
 const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
 const MAX_REJECTION_ROUNDS: u32 = 64;
+const MAX_SEED_DRAWS: u32 = 1 << 20;
 const CAIRO_SCHEDULE_TAG: &str = "stwo-cairo.blake2s.transcript.schedule.v1";
 const FRI_ID_BASE: u32 = 0x1_0000;
 
@@ -20,7 +21,7 @@ pub struct CaptureSource {
     pub observer: String,
     pub prover_input_sha256: String,
     pub prover_input_bytes: u64,
-    pub proof_shape_id: String,
+    pub observer_proof_shape_id: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -48,7 +49,7 @@ pub struct PcsShape {
     pub lifting_log_size: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CaptureSeed {
     schema_version: String,
@@ -62,7 +63,7 @@ struct CaptureSeed {
     observed: Observed,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ScheduleSeal {
     device_protocol_key: String,
@@ -74,7 +75,7 @@ struct ScheduleSeal {
     c36: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observed {
     pub root6_words: Vec<u32>,
@@ -163,6 +164,7 @@ fn verify(seed: CaptureSeed, capture_sha256: String) -> Result<VerifiedCapture, 
     let control = &seed.cursor32_state_words;
     let state_chain = u64::from(control[12]) | (u64::from(control[13]) << 32);
     if control[9] != 32
+        || control[8] > MAX_SEED_DRAWS
         || control[10] != 0
         || control[11] != 0
         || control[14] != 0
@@ -171,6 +173,7 @@ fn verify(seed: CaptureSeed, capture_sha256: String) -> Result<VerifiedCapture, 
     {
         return Err("captured cursor32 control state or C32 chain is invalid".into());
     }
+    validate_observed_controls(&seed.observed, &supplied)?;
     Ok(VerifiedCapture {
         capture_sha256,
         source: seed.source,
@@ -188,7 +191,7 @@ fn validate_source(source: &CaptureSource) -> Result<(), String> {
     validate_sha256(&source.prover_input_sha256, "source ProverInput sha256")?;
     if source.observer != "stwo-cairo.production-simd-fri-observer.v1"
         || source.prover_input_bytes == 0
-        || source.proof_shape_id.is_empty()
+        || source.observer_proof_shape_id.is_empty()
     {
         return Err(
             "capture source identity is incomplete or not the production SIMD observer".into(),
@@ -245,6 +248,45 @@ fn validate_observed(observed: &Observed) -> Result<(), String> {
         ),
     ] {
         validate_words(words, len, m31, label)?;
+    }
+    Ok(())
+}
+
+fn validate_observed_controls(observed: &Observed, chains: &[u64; 5]) -> Result<(), String> {
+    for (words, cursor, chain, draw_range, label) in [
+        (
+            &observed.cursor34_state_words,
+            34,
+            chains[2],
+            1..=MAX_REJECTION_ROUNDS,
+            "observed cursor34",
+        ),
+        (
+            &observed.cursor35_state_words,
+            35,
+            chains[3],
+            0..=0,
+            "observed cursor35",
+        ),
+        (
+            &observed.cursor36_state_words,
+            36,
+            chains[4],
+            1..=MAX_REJECTION_ROUNDS,
+            "observed cursor36",
+        ),
+    ] {
+        let state_chain = u64::from(words[12]) | (u64::from(words[13]) << 32);
+        if words[9] != cursor
+            || !draw_range.contains(&words[8])
+            || words[10] != 0
+            || words[11] != 0
+            || words[14] != 0
+            || words[15] != 0
+            || state_chain != chain
+        {
+            return Err(format!("{label} control state or prefix chain is invalid"));
+        }
     }
     Ok(())
 }
@@ -450,3 +492,7 @@ impl StableHash {
         self.0
     }
 }
+
+#[cfg(test)]
+#[path = "fri_round6_capture_tests.rs"]
+mod tests;

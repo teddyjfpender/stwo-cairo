@@ -8,11 +8,12 @@ pub struct Index {
     pub fixture_id: String,
     pub fixture_class: &'static str,
     pub production_admissible: bool,
+    pub admission_blocker: &'static str,
     pub source: Source,
     pub payload: Payload,
     pub shape: Shape,
     pub transcript: Transcript,
-    pub predecessor_seal: PredecessorSeal,
+    pub predecessor_check: PredecessorCheck,
     pub oracle: Oracle,
     pub chunks: Vec<Chunk>,
 }
@@ -20,6 +21,7 @@ pub struct Index {
 #[derive(Serialize)]
 pub struct Source {
     pub kind: &'static str,
+    pub exporter_executable_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_seed_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,7 +86,7 @@ pub struct Chains {
 }
 
 #[derive(Serialize)]
-pub struct PredecessorSeal {
+pub struct PredecessorCheck {
     pub status: &'static str,
     pub cursor32_state_words_sha256: String,
     pub cursor32_digest_blake2s: String,

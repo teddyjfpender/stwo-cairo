@@ -152,6 +152,117 @@ The exporter fails closed if a row cannot be represented by the canonical SIMD w
 zero, an address outside the memory table, and an M31 wrap into address zero remain transport/
 kernel-safety cases rather than Cairo witness semantics.
 
+## FRI round-6 replay fixture
+
+The FRI exporter has two deliberately separate namespaces:
+
+- `synthetic-layout` is a deterministic CPU self-test for the 1,936-byte binary layout. It is
+  always indexed with `production_admissible: false` and cannot create an `sn2` artifact.
+- `captured-unsealed` consumes a hash-pinned
+  `stwo.gpu-lab.fri-round6-capture-seed.v1`. The exporter rebuilds the Cairo transcript topology
+  and independently checks the device protocol key, Cairo segment key, C32-C36 prefix chains,
+  cursor32 controls, log-6 evaluation, root6, alpha6, fold result, root7, alpha7, and
+  cursor34-cursor36 states. It is still always `production_admissible: false`.
+
+The distinction is soundness-critical. Hashing a capture proves which bytes were consumed, but an
+observer can still supply an arbitrary self-consistent cursor32 digest and therefore manufacture a
+different alpha6. Topology-chain agreement does not authenticate that digest against the start of
+the real Cairo transcript. Consequently this exporter does not emit an `sn2` family today.
+
+Production admission remains blocked until one seal binds all of the following:
+
+1. the complete serialized reference Cairo proof and its full source SN2 PIE SHA-256;
+2. canonical verification of that proof and independent transcript replay through cursor32;
+3. root6/root7 from the proof to the recomputed log-6 entry and three-fold CPU oracle roots;
+4. a reviewed PIE-to-ProverInput adapter seal (the currently expected adapted input is SHA-256
+   `78b0995483a76e850c61cf7cb51861850f746ddf927344088014492b6752844c`, 162,102,412 bytes);
+5. proof-shape identity recomputed from the verified proof rather than supplied by the observer.
+
+The normative capture shape is
+[`semantics/fri_round6_capture_seed.v1.schema.json`](semantics/fri_round6_capture_seed.v1.schema.json).
+The Rust reader additionally enforces control-word and chain relationships that JSON Schema cannot
+express. A capture seed is bounded to 1 MiB, rejects unknown fields, and is always supplied with its
+exact SHA-256. Do not hand-author a capture seed: its source must identify
+`stwo-cairo.production-simd-fri-observer.v1`, the source ProverInput SHA-256 and byte size, and the
+observer-claimed proof-shape identity. Those declarations are evidence metadata, not the missing
+reference-proof provenance seal.
+
+The headerless payload is fourteen consecutive little-endian-u32 chunks:
+
+| Chunk | Offset | Bytes |
+| --- | ---: | ---: |
+| `entry_pong` | 0 | 1,024 |
+| `inverse_twiddles` | 1,024 | 224 |
+| `alpha6` | 1,248 | 16 |
+| `entry_state` | 1,264 | 64 |
+| `expected_final_ping` | 1,328 | 128 |
+| `expected_root` | 1,456 | 32 |
+| `expected_exit_state` | 1,488 | 64 |
+| `expected_challenge7` | 1,552 | 16 |
+| `expected_retained` | 1,568 | 128 |
+| `expected_leaves` | 1,696 | 64 |
+| `expected_mix_input` | 1,760 | 32 |
+| `expected_draw_output` | 1,792 | 16 |
+| `expected_boundary_mix` | 1,808 | 64 |
+| `expected_boundary_draw` | 1,872 | 64 |
+
+Each index binds the exact payload size and SHA-256, every chunk offset/length/SHA-256, normalized
+twiddle offsets `0/32/48`, their full log-24 offsets, semantic IDs, transcript keys and chains,
+capture/ProverInput declarations, and the exact exporter executable SHA-256. The hostile case is a
+deterministic mutation of the captured entry evaluation and must change root and challenge without
+changing the transcript graph. It is robustness evidence only and can never be an admissible SN2
+witness, even after primary-prefix provenance is sealed.
+
+Build the exporter once and authenticate that exact executable:
+
+```bash
+export EXPORTER=stwo_cairo_prover/target/debug/stwo-gpu-lab-fixture-export
+export EXPORTER_SHA256="$(python3 -c \
+  'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+  "$EXPORTER")"
+export CAPTURE=/absolute/path/to/fri-round6-capture-seed.v1.json
+export CAPTURE_SHA256=<64-lowercase-hex-capture-sha256>
+export FRI_CASE_DIR=/absolute/path/to/fri-round6-captured-unsealed
+```
+
+Captured-unsealed export has no default path and requires both hash-pinned inputs:
+
+```bash
+"$EXPORTER" \
+  --fri-round6-capture "$CAPTURE" \
+  --fri-round6-capture-sha256 "$CAPTURE_SHA256" \
+  --expected-exporter-sha256 "$EXPORTER_SHA256" \
+  --fri-round6-captured-unsealed-output-dir "$FRI_CASE_DIR"
+```
+
+It installs immutable
+`fri-round6-captured-unsealed-{primary,hostile}.{payload.bin,index.json}` files. Before using those
+bytes in a CUDA lab experiment, invoke the fail-closed capture validation gate:
+
+```bash
+"$EXPORTER" \
+  --validate-fri-round6-captured-unsealed-dir "$FRI_CASE_DIR" \
+  --fri-round6-capture "$CAPTURE" \
+  --fri-round6-capture-sha256 "$CAPTURE_SHA256" \
+  --expected-exporter-sha256 "$EXPORTER_SHA256"
+```
+
+Validation does not trust an index merely because its declared hashes match. It rehashes
+the capture, rehashes the exporter before and after, regenerates both artifacts with the canonical
+CPU fold/Merkle/transcript oracle, and compares every index and payload byte. Success emits one
+`FRI_ROUND6_CAPTURE_VALIDATE=PASS production_admissible=false` line; any missing, symlinked,
+renamed, stale, or altered artifact exits nonzero. This is not a production runner admission gate:
+production code must reject this family and its false admission bit until the reference-proof seal
+above exists.
+
+For layout development only:
+
+```bash
+"$EXPORTER" --fri-round6-synthetic-layout-output-dir /tmp/fri-round6-layout
+```
+
+Those files use `fri-round6-synthetic-layout-*` names and are never production-admissible.
+
 ## Development checks
 
 Run these from the `stwo-cairo` repository root. Reuse the repository target directory and disable
