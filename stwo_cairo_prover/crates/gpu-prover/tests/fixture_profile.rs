@@ -9,18 +9,24 @@
 use std::sync::Arc;
 
 use cairo_vm::types::layout_name::LayoutName;
+use stwo::core::pcs::PcsConfig;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
 use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
-use stwo_cairo_gpu_prover::phases;
 use stwo_cairo_gpu_prover::plan::ProofPlan;
 use stwo_cairo_gpu_prover::relation_table::CAIRO_RELATION_GRAPH;
+use stwo_cairo_gpu_prover::resident_session::plan_resident_preflight;
 use stwo_cairo_gpu_prover::schedule::WitnessWriterKind;
 use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
+use stwo_cairo_gpu_prover::{phases, WorkspaceKey};
 use stwo_cairo_prover::witness::exec_context::WitnessExecContext;
 use stwo_cairo_prover::witness::jit_prove_backend::recorded_input_compaction_geometry;
 use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId};
+
+#[path = "common/base_param_variant.rs"]
+mod base_param_variant;
+use base_param_variant::swap_bitwise_and_ec_op_segments;
 
 /// The device-compacted consumer set (RLE multiset compaction on device; the
 /// registry is `recorded_input_compaction_geometry`).
@@ -214,6 +220,75 @@ fn plan_time_compacted_rows_match_simd_realization_for_sn2_profile_fixture() {
     assert_plan_time_compacted_rows_match_simd_realization(
         "test_prove_verify_sn2_profile",
         PreProcessedTraceVariant::Canonical,
+    );
+}
+
+/// The actual SN2 fixture can change the hoisted bitwise/EC-op BASE values
+/// without changing the exact proof shape or resident workspace cache key.
+/// This is the host oracle for the hardware A/B workspace-reuse parity test.
+#[test]
+fn sn2_profile_base_param_variant_preserves_resident_workspace_key() {
+    let first = run_and_adapt(
+        &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .unwrap();
+    let first_bitwise = first.builtin_segments.bitwise_builtin.unwrap();
+    let first_ec_op = first.builtin_segments.ec_op_builtin.unwrap();
+    let second = swap_bitwise_and_ec_op_segments(first.clone());
+    let second_bitwise = second.builtin_segments.bitwise_builtin.unwrap();
+    let second_ec_op = second.builtin_segments.ec_op_builtin.unwrap();
+
+    assert_ne!(first_bitwise.begin_addr, second_bitwise.begin_addr);
+    assert_ne!(first_ec_op.begin_addr, second_ec_op.begin_addr);
+    assert_eq!(
+        first_bitwise.stop_ptr - first_bitwise.begin_addr,
+        second_bitwise.stop_ptr - second_bitwise.begin_addr
+    );
+    assert_eq!(
+        first_ec_op.stop_ptr - first_ec_op.begin_addr,
+        second_ec_op.stop_ptr - second_ec_op.begin_addr
+    );
+    assert_eq!(
+        (
+            first.memory.address_to_id.len(),
+            first.memory.f252_values.len(),
+            first.memory.small_values.len(),
+            first.public_memory_addresses.len(),
+        ),
+        (
+            second.memory.address_to_id.len(),
+            second.memory.f252_values.len(),
+            second.memory.small_values.len(),
+            second.public_memory_addresses.len(),
+        )
+    );
+
+    let first = phases::ingest::run(first, PreProcessedTraceVariant::Canonical, None);
+    let second = phases::ingest::run(second, PreProcessedTraceVariant::Canonical, None);
+    assert_eq!(first.proof_plan.shape_key, second.proof_plan.shape_key);
+
+    let first_preflight = plan_resident_preflight(
+        &first.generator,
+        &first.proof_plan,
+        &first.preprocessed_trace,
+        PcsConfig::default(),
+        false,
+    )
+    .unwrap();
+    let second_preflight = plan_resident_preflight(
+        &second.generator,
+        &second.proof_plan,
+        &second.preprocessed_trace,
+        PcsConfig::default(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        WorkspaceKey::from_plan(&first_preflight.arena),
+        WorkspaceKey::from_plan(&second_preflight.arena)
     );
 }
 

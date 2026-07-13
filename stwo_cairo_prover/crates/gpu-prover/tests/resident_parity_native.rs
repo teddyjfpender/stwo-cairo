@@ -11,7 +11,6 @@ use cairo_air::CairoProof;
 use cairo_vm::types::layout_name::LayoutName;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
-use stwo_cairo_adapter::builtins::MemorySegmentAddresses;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
@@ -22,8 +21,11 @@ use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
 use stwo_cairo_gpu_prover::{phases, GpuCairoProver, GpuProverConfig};
 use stwo_cairo_prover::prover::{ChannelHash, ProverParameters};
 
+#[path = "common/base_param_variant.rs"]
+mod base_param_variant;
 #[path = "common/reference_cache.rs"]
 mod reference_cache;
+use base_param_variant::swap_bitwise_and_ec_op_segments;
 use reference_cache::{cached_reference_felts, serialize_felts};
 
 // The all-opcode fixture intentionally calls `generic()`, whose indirect JNZ is
@@ -56,93 +58,6 @@ fn resident_input() -> ProverInput {
         None,
     )
     .unwrap()
-}
-
-/// Build an equivalent valid statement whose bitwise and EC-op segments occupy
-/// each other's contiguous relocation slots. The permutation preserves every
-/// table length and trace shape, but changes both components' hoisted BASE
-/// parameters. Rebase every address and pointer in the moved span so Cairo
-/// memory semantics remain unchanged.
-fn swap_bitwise_and_ec_op_segments(mut input: ProverInput) -> ProverInput {
-    let bitwise = input
-        .builtin_segments
-        .bitwise_builtin
-        .expect("strict resident fixture has a bitwise segment");
-    let ec_op = input
-        .builtin_segments
-        .ec_op_builtin
-        .expect("strict resident fixture has an EC-op segment");
-    assert_eq!(
-        bitwise.stop_ptr, ec_op.begin_addr,
-        "fixture bitwise and EC-op segments stopped being contiguous"
-    );
-    let bitwise_len = bitwise.stop_ptr - bitwise.begin_addr;
-    let ec_op_len = ec_op.stop_ptr - ec_op.begin_addr;
-    let rebase = |address: usize| {
-        if (bitwise.begin_addr..bitwise.stop_ptr).contains(&address) {
-            address + ec_op_len
-        } else if (ec_op.begin_addr..ec_op.stop_ptr).contains(&address) {
-            address - bitwise_len
-        } else {
-            address
-        }
-    };
-    let rebase_small =
-        |value: u128| usize::try_from(value).map_or(value, |address| rebase(address) as u128);
-
-    // Fail closed if a future fixture introduces an ordinary small felt in the
-    // relocation span. Today these are exactly the 51 bitwise pointers (stride
-    // five) and 51 EC-op pointers (stride seven), sharing one segment boundary.
-    let moved_small_values = input
-        .memory
-        .small_values
-        .iter()
-        .filter(|value| (bitwise.begin_addr as u128..ec_op.stop_ptr as u128).contains(value))
-        .collect::<Vec<_>>();
-    assert_eq!(moved_small_values.len(), 101);
-    assert!(moved_small_values.iter().all(|value| {
-        let address = **value as usize;
-        (address >= bitwise.begin_addr
-            && address <= bitwise.begin_addr + 50 * 5
-            && (address - bitwise.begin_addr) % 5 == 0)
-            || (address >= ec_op.begin_addr
-                && address <= ec_op.begin_addr + 50 * 7
-                && (address - ec_op.begin_addr) % 7 == 0)
-    }));
-    for (id, value) in input.memory.small_values.iter().enumerate() {
-        if rebase_small(*value) != *value {
-            assert!(
-                input
-                    .memory
-                    .address_to_id
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, encoded)| encoded.0 == id as u32)
-                    .all(|(address, _)| address < bitwise.begin_addr),
-                "moved small value {value} is not confined to execution pointers"
-            );
-        }
-    }
-
-    let original_address_to_id = input.memory.address_to_id.clone();
-    for address in bitwise.begin_addr..ec_op.stop_ptr {
-        input.memory.address_to_id[rebase(address)] = original_address_to_id[address];
-    }
-    for value in &mut input.memory.small_values {
-        *value = rebase_small(*value);
-    }
-    for address in &mut input.public_memory_addresses {
-        *address = rebase(*address as usize) as u32;
-    }
-    input.builtin_segments.ec_op_builtin = Some(MemorySegmentAddresses {
-        begin_addr: bitwise.begin_addr,
-        stop_ptr: bitwise.begin_addr + ec_op_len,
-    });
-    input.builtin_segments.bitwise_builtin = Some(MemorySegmentAddresses {
-        begin_addr: bitwise.begin_addr + ec_op_len,
-        stop_ptr: ec_op.stop_ptr,
-    });
-    input
 }
 
 fn resident_params() -> ProverParameters {
