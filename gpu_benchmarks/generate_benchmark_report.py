@@ -27,13 +27,21 @@ if BENCHMARK_DIR not in sys.path:
     sys.path.insert(0, BENCHMARK_DIR)
 
 from validate_architecture_record import (  # noqa: E402
+    AOT_ADMISSION_KEYS,
+    AOT_MANIFEST_ENTRY_KEYS,
+    AOT_PREFLIGHT_KEYS,
+    ARCHITECTURE,
     FLAGS_OFF_POLICY,
     HEADLINE_POLICY,
     PREFLIGHT_CAP_BYTES,
     QUALIFICATION_FLAGS,
     QUALIFICATION_PROFILES,
     RETAINED_BUDGET_FLAG,
+    STAGES,
     UNIVERSAL_POLICY,
+    _aot_occurrence_sort_key,
+    _valid_aot_occurrence,
+    validate_record,
     validate_qualification_soundness_gate,
 )
 
@@ -264,6 +272,11 @@ def _validate_measurement(
     _require(record.get("backend") == "cuda", f"{label}: backend must be cuda")
     _require(record.get("engine") == "gpu-native", f"{label}: engine must be gpu-native")
     _require(record.get("gpu") == expected_gpu, f"{label}: wrong GPU")
+    architecture_errors = validate_record(record, "arena-graph")
+    _require(
+        not architecture_errors,
+        f"{label}: resident architecture contract failed: {'; '.join(architecture_errors)}",
+    )
 
     reps = record.get("reps")
     _require(reps == 6 and not isinstance(reps, bool),
@@ -880,7 +893,40 @@ def _validate_preflight(
              f"{label}: artifact policy differs from qualification contract")
     source = _resolve_artifact(round_dir, record.get("source"), f"{label}.source")
     _require(source == adapted, f"{label}: artifact source differs from adapted input")
-    return {"arena_bytes": arena_bytes, "arena_gib": arena_bytes / 1024**3}
+    aot = record.get("aot_coverage")
+    _require(isinstance(aot, dict) and set(aot) == AOT_PREFLIGHT_KEYS,
+             f"{label}: AOT coverage shape mismatch")
+    occurrences = aot.get("required_occurrences")
+    _require(aot.get("pass") is True and aot.get("missing_occurrences") == []
+             and aot.get("missing_occurrence_count") == 0,
+             f"{label}: AOT coverage did not pass")
+    _require(isinstance(occurrences, list) and occurrences
+             and all(_valid_aot_occurrence(item) for item in occurrences)
+             and occurrences == sorted(occurrences, key=_aot_occurrence_sort_key),
+             f"{label}: AOT occurrence ledger is not canonical")
+    unique_keys = sorted({item["cache_key"] for item in occurrences})
+    _require(aot.get("required_occurrence_count") == len(occurrences)
+             and aot.get("required_unique_key_count") == len(unique_keys),
+             f"{label}: AOT coverage counts drifted")
+    summary_aot = summary.get("aot_coverage")
+    expected_summary_aot = {
+        "manifest": aot.get("manifest"),
+        "manifest_blake3": aot.get("manifest_blake3"),
+        "manifest_entries": aot.get("manifest_entries"),
+        "required_occurrence_count": len(occurrences),
+        "required_unique_key_count": len(unique_keys),
+        "required_occurrences_blake3": aot.get("required_occurrences_blake3"),
+        "required_unique_keys_blake3": aot.get("required_unique_keys_blake3"),
+        "missing_occurrence_count": 0,
+    }
+    _require(summary_aot == expected_summary_aot,
+             f"{label}: AOT summary differs from preflight artifact")
+    return {
+        "arena_bytes": arena_bytes,
+        "arena_gib": arena_bytes / 1024**3,
+        "aot_occurrences": occurrences,
+        "aot_coverage": expected_summary_aot,
+    }
 
 
 def _validate_qualification(
@@ -1090,6 +1136,145 @@ def _validate_qualification(
              "local admission preflight hashes mismatch")
     _require(admission.get("profiles") == QUALIFICATION_PROFILES,
              "local admission profiles mismatch")
+    aot_admission = admission.get("aot_coverage")
+    _require(isinstance(aot_admission, dict)
+             and set(aot_admission) == AOT_ADMISSION_KEYS,
+             "local admission AOT coverage contract is not exact")
+    _require(qualification.get("aot_coverage") == aot_admission,
+             "qualification AOT coverage differs from local admission")
+    aot_manifest = _resolve_artifact(
+        round_dir, aot_admission.get("manifest"), "aot_coverage.manifest"
+    )
+    manifest_sha = _sha256(aot_manifest)
+    _require(manifest_sha == aot_admission.get("manifest_sha256"),
+             "AOT manifest SHA-256 mismatch")
+    hashes["aot_manifest"] = manifest_sha
+    try:
+        manifest_entries = json.loads(aot_manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReportError(f"AOT manifest: cannot read JSON: {error}") from error
+    _require(isinstance(manifest_entries, list) and manifest_entries,
+             "AOT manifest: expected nonempty array")
+    manifest_by_key = {}
+    for index, entry in enumerate(manifest_entries):
+        _require(isinstance(entry, dict) and set(entry) == AOT_MANIFEST_ENTRY_KEYS
+                 and entry.get("kind") in {"constraint", "witness"}
+                 and isinstance(entry.get("label"), str) and entry["label"]
+                 and isinstance(entry.get("kernel_name"), str) and entry["kernel_name"]
+                 and isinstance(entry.get("file"), str) and entry["file"]
+                 and isinstance(entry.get("cache_key"), str)
+                 and len(entry["cache_key"]) == 16
+                 and all(char in "0123456789abcdef" for char in entry["cache_key"])
+                 and isinstance(entry.get("semantic_hash"), str)
+                 and len(entry["semantic_hash"]) == 16
+                 and all(char in "0123456789abcdef" for char in entry["semantic_hash"]),
+                 f"AOT manifest: malformed entry {index}")
+        _require(entry["cache_key"] not in manifest_by_key,
+                 f"AOT manifest: duplicate key {entry['cache_key']}")
+        manifest_by_key[entry["cache_key"]] = entry
+    _require(aot_admission.get("manifest_entry_count") == len(manifest_by_key)
+             and _is_sha256(aot_admission.get("manifest_blake3")),
+             "AOT manifest identity/count mismatch")
+
+    universal_aot_artifacts = {
+        Path(universal_preflights[f"SN_PIE_{number}"]["artifact"]).name:
+            preflights[f"SN_PIE_{number}"]
+        for number in range(1, 5)
+    }
+    flags_aot_artifact = Path(qualification["flags_off_preflight"]["artifact"]).name
+    headline_aot_artifact = Path(headline["preflight"]["artifact"]).name
+    sn2_universal_aot_artifact = Path(
+        universal_preflights["SN_PIE_2"]["artifact"]
+    ).name
+    aot_preflights = {
+        **universal_aot_artifacts,
+        flags_aot_artifact: preflights["SN2_flags_off"],
+        headline_aot_artifact: preflights["SN2_headline"],
+    }
+    occurrence_sha = {}
+    occurrence_blake3 = {}
+    key_blake3 = {}
+    all_occurrences = []
+    for artifact_name, preflight in aot_preflights.items():
+        coverage = preflight["aot_coverage"]
+        occurrences = preflight["aot_occurrences"]
+        _require(_resolve_artifact(
+            round_dir, coverage["manifest"], f"{artifact_name}.aot_manifest"
+        ) == aot_manifest
+                 and coverage["manifest_blake3"] == aot_admission["manifest_blake3"]
+                 and coverage["manifest_entries"] == len(manifest_by_key),
+                 f"{artifact_name}: AOT manifest binding mismatch")
+        for occurrence in occurrences:
+            entry = manifest_by_key.get(occurrence["cache_key"])
+            _require(entry is not None
+                     and entry["kind"] == occurrence["kind"]
+                     and entry["kernel_name"] == occurrence["kernel_name"]
+                     and entry["semantic_hash"] == occurrence["semantic_hash"],
+                     f"{artifact_name}: uncovered AOT key {occurrence['cache_key']}")
+        occurrence_sha[artifact_name] = _canonical_sha256(occurrences)
+        occurrence_blake3[artifact_name] = coverage["required_occurrences_blake3"]
+        key_blake3[artifact_name] = coverage["required_unique_keys_blake3"]
+        all_occurrences.extend(occurrences)
+    _require(occurrence_sha[flags_aot_artifact]
+             == occurrence_sha[sn2_universal_aot_artifact]
+             == occurrence_sha[headline_aot_artifact],
+             "SN2 AOT keys vary across runtime-only profiles")
+    by_record = {
+        json.dumps(item, sort_keys=True, separators=(",", ":")): item
+        for item in all_occurrences
+    }
+    occurrence_union = [by_record[key] for key in sorted(by_record)]
+    union_keys = sorted({item["cache_key"] for item in occurrence_union})
+    _require(aot_admission.get("required_occurrence_count") == len(occurrence_union)
+             and aot_admission.get("required_unique_key_count") == len(union_keys)
+             and aot_admission.get("required_unique_keys") == union_keys
+             and aot_admission.get("required_occurrences_sha256")
+             == _canonical_sha256(occurrence_union)
+             and aot_admission.get("required_unique_keys_sha256")
+             == _canonical_sha256(union_keys)
+             and aot_admission.get("preflight_occurrences_sha256") == occurrence_sha
+             and aot_admission.get("preflight_occurrences_blake3") == occurrence_blake3
+             and aot_admission.get("preflight_unique_keys_blake3") == key_blake3
+             and aot_admission.get("missing_occurrences") == [],
+             "local admission AOT union/hash contract mismatch")
+    expected_per_sn = {}
+    for number in range(1, 5):
+        occurrences = preflights[f"SN_PIE_{number}"]["aot_occurrences"]
+        keys = sorted({item["cache_key"] for item in occurrences})
+        expected_per_sn[f"SN_PIE_{number}"] = {
+            "required_occurrence_count": len(occurrences),
+            "required_unique_key_count": len(keys),
+            "required_occurrences_sha256": _canonical_sha256(occurrences),
+            "required_unique_keys_sha256": _canonical_sha256(keys),
+        }
+    _require(aot_admission.get("per_sn") == expected_per_sn,
+             "local admission AOT per-SN contract mismatch")
+    aot_index_path = _verified_artifact(
+        round_dir, qualification.get("aot_index_check"), "aot_index_check", hashes
+    )
+    aot_index = json.loads(aot_index_path.read_text(encoding="utf-8"))
+    checker = aot_index.get("checker_binary") if isinstance(aot_index, dict) else None
+    _require(isinstance(aot_index, dict)
+             and aot_index.get("schema") == "stwo.aot-index-check.v1"
+             and aot_index.get("pass") is True
+             and aot_index.get("dry_run") is dry_run
+             and aot_index.get("sm") == 90
+             and aot_index.get("missing_keys") == []
+             and aot_index.get("source") == source
+             and aot_index.get("required_unique_key_count") == len(union_keys)
+             and aot_index.get("required_unique_keys_sha256")
+             == aot_admission.get("required_unique_keys_sha256")
+             and isinstance(aot_index.get("loaded_manifest_hash"), str)
+             and len(aot_index["loaded_manifest_hash"]) == 16
+             and aot_index["loaded_manifest_hash"] != "0" * 16
+             and all(char in "0123456789abcdef"
+                     for char in aot_index["loaded_manifest_hash"])
+             and isinstance(checker, dict)
+             and isinstance(checker.get("path"), str)
+             and checker["path"].endswith("/target/release/aot_index_check")
+             and _is_sha256(checker.get("sha256")),
+             "post-build AOT index check is invalid")
+    embedded_manifest_hash = int(aot_index["loaded_manifest_hash"], 16)
     _require(admission.get("adapted_input_manifest_sha256")
              == qualification["inputs"]["adapted_manifest_sha256"],
              "local admission adapted manifest mismatch")
@@ -1115,6 +1300,11 @@ def _validate_qualification(
     benchmarks_raw = qualification.get("benchmarks")
     _require(isinstance(benchmarks_raw, dict) and set(benchmarks_raw) == set(SN_NAMES),
              "benchmarks: expected exactly SN1-SN4")
+    for name in SN_NAMES:
+        record = benchmarks_raw[name]
+        _require(isinstance(record, dict)
+                 and record.get("gpu_aot_manifest_hash") == embedded_manifest_hash,
+                 f"benchmarks.{name}: embedded AOT manifest hash mismatch")
     benchmarks = {
         name: _validate_measurement(
             benchmarks_raw[name], expected_program=f"{name}.zip", expected_gpu=gpu,
@@ -1194,6 +1384,10 @@ def _validate_qualification(
         arm = comparison.get(arm_name)
         _require(isinstance(arm, dict) and arm.get("proof_sha256") == ab_hashes[hash_name],
                  f"SN2 comparison {arm_name}: proof hash mismatch")
+        _require(isinstance(arm.get("record"), dict)
+                 and arm["record"].get("gpu_aot_manifest_hash")
+                 == embedded_manifest_hash,
+                 f"SN2 comparison {arm_name}: embedded AOT manifest hash mismatch")
         measured = _validate_measurement(
             arm.get("record"), expected_program="SN_PIE_2.zip", expected_gpu=gpu,
             label=f"comparisons.sn2.{arm_name}",

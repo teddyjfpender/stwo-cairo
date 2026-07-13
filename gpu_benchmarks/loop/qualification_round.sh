@@ -40,6 +40,7 @@ PINNED_ADAPTED_INPUT_MANIFEST="$CAIRO_LOCAL/gpu_benchmarks/pie/ADAPTED_SHA256SUM
 PREFLIGHT_BIN="$CAIRO_LOCAL/stwo_cairo_prover/target/debug/arena_preflight"
 GPU_BENCH_BIN="$CAIRO_LOCAL/stwo_cairo_prover/target/debug/gpu_bench"
 INPUT_MANIFEST="$CAIRO_LOCAL/gpu_benchmarks/pie/SHA256SUMS"
+AOT_MANIFEST="$STWO_LOCAL/crates/backend-cuda-kernels/cuda/generated/aot_manifest.json"
 ARCHITECTURE_CHECK="$CAIRO_LOCAL/gpu_benchmarks/validate_architecture_record.py"
 export GATE_PIE="/workspace/stwo-cairo/gpu_benchmarks/pie/sn/SN_PIE_2.zip"
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -142,6 +143,8 @@ trap write_failure_manifest EXIT
   || { echo "set BOOTLOADER_JSON_SOURCE to simple_bootloader_compiled.json" >&2; exit 1; }
 [[ -f "$PINNED_ADAPTED_INPUT_MANIFEST" ]] \
   || { echo "missing pinned adapted-input manifest: $PINNED_ADAPTED_INPUT_MANIFEST" >&2; exit 1; }
+[[ -f "$AOT_MANIFEST" ]] \
+  || { echo "missing generated AOT manifest: $AOT_MANIFEST" >&2; exit 1; }
 
 verify_source_inputs() {
   local path name expected actual
@@ -220,6 +223,7 @@ run_preflight() {
     # shellcheck disable=SC2086 # fixed, release-owned KEY=VALUE profile tokens.
     env $profile_env "$PREFLIGHT_BIN" \
       --input-bincode "$ADAPTED_INPUT_DIR/SN_PIE_${pie}.adapted.bin" \
+      --aot-manifest "$AOT_MANIFEST" \
       --vram-budget-gb "$PREFLIGHT_VRAM_GIB"
   ) > "$output"
 }
@@ -233,6 +237,7 @@ verify_adapted_inputs
 
 PREFLIGHT_CAP="$PREFLIGHT_VRAM_BYTES" PREFLIGHT_DIR="$ROUND_DIR" \
 PREFLIGHT_INPUTS="$ADAPTED_INPUT_DIR" PREFLIGHT_ADAPTED_MANIFEST="$ADAPTED_INPUT_MANIFEST" \
+PREFLIGHT_AOT_MANIFEST="$AOT_MANIFEST" \
 ADMISSION_STWO_HEAD="$STWO_HEAD" ADMISSION_STWO_HASH="$STWO_HASH" \
 ADMISSION_CAIRO_HEAD="$CAIRO_HEAD" ADMISSION_CAIRO_HASH="$CAIRO_HASH" \
 ADMISSION_UNIVERSAL_ENV="$UNIVERSAL_ENV" ADMISSION_HEADLINE_ENV="$SN2_HEADLINE_ENV" \
@@ -240,6 +245,7 @@ ADMISSION_ADAPTER_BINARY_SHA="$ADAPTER_BINARY_SHA" \
 ADMISSION_RAW_MANIFEST_SHA="$RAW_INPUT_MANIFEST_SHA" \
 ADMISSION_BOOTLOADER_SHA="$BOOTLOADER_SOURCE_SHA" \
 ADMISSION_PINNED_ADAPTED_MANIFEST_SHA="$PINNED_ADAPTED_MANIFEST_SHA" \
+ADMISSION_AOT_MANIFEST_SHA="$(sha256_file "$AOT_MANIFEST")" \
 ADMISSION_DRY_RUN="${DRY_RUN:-0}" \
 python3 - "$ROUND_DIR/local_admission.json" <<'PY'
 import hashlib, json, os, sys
@@ -275,6 +281,20 @@ profiles = [
     "retained_lde_budget_bytes": 29469326848,
 })]
 preflight_hashes = {}
+preflight_aot_hashes = {}
+preflight_aot_occurrences = {}
+preflight_aot_blake3 = {}
+preflight_key_blake3 = {}
+aot_occurrence_sets = []
+manifest_entry_count = None
+manifest_blake3 = None
+aot_manifest = Path(os.environ["PREFLIGHT_AOT_MANIFEST"]).resolve()
+occurrence_fields = {
+    "kind", "component", "instance", "kernel", "kernel_name", "semantic_hash", "cache_key"
+}
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
 for artifact_name, input_name, expected_policy in profiles:
     artifact_path = root / artifact_name
     with open(artifact_path, encoding="utf-8") as stream:
@@ -291,7 +311,69 @@ for artifact_name, input_name, expected_policy in profiles:
     source = Path(record.get("source", ""))
     if source.name != input_name or source.resolve() != (inputs / input_name).resolve():
         raise SystemExit(f"preflight input drift: {artifact_name}")
+    coverage = record.get("aot_coverage")
+    if (not isinstance(coverage, dict) or coverage.get("pass") is not True
+            or Path(coverage.get("manifest", "")).resolve() != aot_manifest
+            or coverage.get("missing_occurrences") != []
+            or coverage.get("missing_occurrence_count") != 0):
+        raise SystemExit(f"AOT coverage did not pass: {artifact_name}")
+    occurrences = coverage.get("required_occurrences")
+    if not isinstance(occurrences, list) or not occurrences:
+        raise SystemExit(f"AOT occurrence ledger is empty: {artifact_name}")
+    if coverage.get("required_occurrence_count") != len(occurrences):
+        raise SystemExit(f"AOT occurrence count drift: {artifact_name}")
+    if any(not isinstance(item, dict) or set(item) != occurrence_fields for item in occurrences):
+        raise SystemExit(f"AOT occurrence shape drift: {artifact_name}")
+    if occurrences != sorted(occurrences, key=lambda item: (
+            item["kind"], item["component"], item["instance"], item["kernel"],
+            item["kernel_name"], item["semantic_hash"], item["cache_key"])):
+        raise SystemExit(f"AOT occurrences are not canonical: {artifact_name}")
+    unique_keys = {item["cache_key"] for item in occurrences}
+    if coverage.get("required_unique_key_count") != len(unique_keys):
+        raise SystemExit(f"AOT unique-key count drift: {artifact_name}")
+    for field in ("manifest_blake3", "required_occurrences_blake3", "required_unique_keys_blake3"):
+        value = coverage.get(field)
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise SystemExit(f"AOT {field} drift: {artifact_name}")
+    if manifest_blake3 is None:
+        manifest_blake3 = coverage["manifest_blake3"]
+    elif manifest_blake3 != coverage["manifest_blake3"]:
+        raise SystemExit("AOT manifest hash changed between preflights")
+    entries = coverage.get("manifest_entries")
+    if not isinstance(entries, int) or isinstance(entries, bool) or entries <= 0:
+        raise SystemExit(f"AOT manifest entry count drift: {artifact_name}")
+    if manifest_entry_count is None:
+        manifest_entry_count = entries
+    elif manifest_entry_count != entries:
+        raise SystemExit("AOT manifest count changed between preflights")
+    digest = hashlib.sha256(canonical(occurrences)).hexdigest()
+    preflight_aot_hashes[artifact_name] = digest
+    preflight_aot_occurrences[artifact_name] = occurrences
+    preflight_aot_blake3[artifact_name] = coverage["required_occurrences_blake3"]
+    preflight_key_blake3[artifact_name] = coverage["required_unique_keys_blake3"]
+    aot_occurrence_sets.extend(occurrences)
     preflight_hashes[artifact_name] = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+
+for artifact_name in (
+    "preflight_flags_off_SN2.json", "preflight_universal_SN2.json", "preflight_sn2_headline.json"
+):
+    if preflight_aot_hashes[artifact_name] != preflight_aot_hashes["preflight_universal_SN2.json"]:
+        raise SystemExit("SN2 AOT keys changed across runtime-only profiles")
+
+union_by_record = {canonical(item): item for item in aot_occurrence_sets}
+aot_union = [union_by_record[key] for key in sorted(union_by_record)]
+aot_union_keys = sorted({item["cache_key"] for item in aot_union})
+per_sn = {}
+for pie in range(1, 5):
+    artifact_name = f"preflight_universal_SN{pie}.json"
+    occurrences = preflight_aot_occurrences[artifact_name]
+    unique_keys = sorted({item["cache_key"] for item in occurrences})
+    per_sn[f"SN_PIE_{pie}"] = {
+        "required_occurrence_count": len(occurrences),
+        "required_unique_key_count": len(unique_keys),
+        "required_occurrences_sha256": hashlib.sha256(canonical(occurrences)).hexdigest(),
+        "required_unique_keys_sha256": hashlib.sha256(canonical(unique_keys)).hexdigest(),
+    }
 
 adapted_manifest = Path(os.environ["PREFLIGHT_ADAPTED_MANIFEST"])
 admission = {
@@ -316,6 +398,22 @@ admission = {
     },
     "preflight_ceiling_bytes": cap,
     "preflight_artifact_sha256": preflight_hashes,
+    "aot_coverage": {
+        "manifest": str(aot_manifest),
+        "manifest_sha256": os.environ["ADMISSION_AOT_MANIFEST_SHA"],
+        "manifest_blake3": manifest_blake3,
+        "manifest_entry_count": manifest_entry_count,
+        "required_occurrence_count": len(aot_union),
+        "required_unique_key_count": len(aot_union_keys),
+        "required_unique_keys": aot_union_keys,
+        "required_occurrences_sha256": hashlib.sha256(canonical(aot_union)).hexdigest(),
+        "required_unique_keys_sha256": hashlib.sha256(canonical(aot_union_keys)).hexdigest(),
+        "preflight_occurrences_sha256": preflight_aot_hashes,
+        "preflight_occurrences_blake3": preflight_aot_blake3,
+        "preflight_unique_keys_blake3": preflight_key_blake3,
+        "per_sn": per_sn,
+        "missing_occurrences": [],
+    },
     "adapted_input_manifest": str(adapted_manifest),
     "adapted_input_manifest_sha256": hashlib.sha256(adapted_manifest.read_bytes()).hexdigest(),
     "adapter_reproduction": {
@@ -343,6 +441,12 @@ export LOCAL_PREFLIGHT_ADMISSION="$ROUND_DIR/local_admission.json"
 # The sole sync/build and counted native suite. The optimized environment is
 # normalized by this fresh process and recorded in the soundness JSON.
 BENCH_ENV="$SN2_HEADLINE_ENV" "$SCRIPT_DIR/bench_loop.sh" --gate-only --all-pies
+AOT_INDEX_CHECK_COUNT="$(find "$ROUND_DIR" -maxdepth 1 -name '*.aot-index-check.json' | wc -l | tr -d ' ')"
+[[ "$AOT_INDEX_CHECK_COUNT" == "1" ]] || {
+  echo "expected exactly one post-build AOT index artifact, got $AOT_INDEX_CHECK_COUNT" >&2
+  exit 1
+}
+AOT_INDEX_CHECK="$(find "$ROUND_DIR" -maxdepth 1 -name '*.aot-index-check.json' -print)"
 SOUNDNESS_GATE_COUNT="$(find "$ROUND_DIR" -maxdepth 1 -name '*.cuda-soundness-gate.json' | wc -l | tr -d ' ')"
 [[ "$SOUNDNESS_GATE_COUNT" == "1" ]] || {
   echo "expected exactly one counted soundness artifact, got $SOUNDNESS_GATE_COUNT" >&2
@@ -384,6 +488,7 @@ Q_CAIRO_HEAD="$CAIRO_HEAD" Q_CAIRO_HASH="$CAIRO_HASH" \
 Q_UNIVERSAL_ENV="$UNIVERSAL_ENV" Q_HEADLINE_ENV="$SN2_HEADLINE_ENV" \
 Q_RUNTIME="${GPU_PCS_RUNTIME_MODE:-arena-graph}" \
 Q_SOUNDNESS="$SOUNDNESS_GATE" Q_SOUNDNESS_SHA="$FINAL_SOUNDNESS_SHA" \
+Q_AOT_INDEX_CHECK="$AOT_INDEX_CHECK" Q_AOT_INDEX_CHECK_SHA="$(sha256_file "$AOT_INDEX_CHECK")" \
 Q_EXPECTED_GPU="$EXPECTED_POD_GPU" Q_VALIDATOR_DIR="$(dirname "$ARCHITECTURE_CHECK")" \
 Q_INPUT_MANIFEST="$INPUT_MANIFEST" Q_INPUT_MANIFEST_SHA="$(sha256_file "$INPUT_MANIFEST")" \
 Q_ADAPTED_MANIFEST="$ADAPTED_INPUT_MANIFEST" \
@@ -434,6 +539,34 @@ def sha256(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+with open(os.environ["Q_AOT_INDEX_CHECK"], encoding="utf-8") as stream:
+    aot_index_check = json.load(stream)
+if sha256(os.environ["Q_AOT_INDEX_CHECK"]) != os.environ["Q_AOT_INDEX_CHECK_SHA"]:
+    raise SystemExit("post-build AOT index artifact changed")
+checker_binary = aot_index_check.get("checker_binary") or {}
+expected_source = {
+    "stwo": {"head": os.environ["Q_STWO_HEAD"], "worktree_hash": os.environ["Q_STWO_HASH"]},
+    "stwo_cairo": {
+        "head": os.environ["Q_CAIRO_HEAD"], "worktree_hash": os.environ["Q_CAIRO_HASH"]
+    },
+}
+if (aot_index_check.get("schema") != "stwo.aot-index-check.v1"
+        or aot_index_check.get("pass") is not True
+        or aot_index_check.get("dry_run") is not round_dry_run
+        or aot_index_check.get("sm") != 90
+        or aot_index_check.get("missing_keys") != []
+        or aot_index_check.get("source") != expected_source
+        or not isinstance(aot_index_check.get("loaded_manifest_hash"), str)
+        or len(aot_index_check["loaded_manifest_hash"]) != 16
+        or aot_index_check["loaded_manifest_hash"] == "0" * 16
+        or any(c not in "0123456789abcdef" for c in aot_index_check["loaded_manifest_hash"])
+        or not isinstance(checker_binary.get("path"), str)
+        or not checker_binary["path"].endswith("/target/release/aot_index_check")
+        or not isinstance(checker_binary.get("sha256"), str)
+        or len(checker_binary["sha256"]) != 64
+        or any(c not in "0123456789abcdef" for c in checker_binary["sha256"])):
+    raise SystemExit("post-build AOT index artifact is invalid")
 
 perf = load_jsonl(os.environ["Q_PERF"])
 bench = load_jsonl(os.environ["Q_BENCH"])
@@ -554,6 +687,13 @@ for name, entry in pies.items():
         raise SystemExit(f"invalid fixed-PIE entry: {name}")
 if pies["SN_PIE_2"].get("proof_sha256") != headline_ab["baseline"]["proof_sha256"]:
     raise SystemExit("universal SN2 proof bytes differ from the flags-off/headline proof")
+embedded_manifest_hash = int(aot_index_check["loaded_manifest_hash"], 16)
+measured_records = [
+    headline_ab["baseline"]["record"], headline_ab["flagged"]["record"],
+    *(entry.get("record") or {} for entry in bench),
+]
+if any(record.get("gpu_aot_manifest_hash") != embedded_manifest_hash for record in measured_records):
+    raise SystemExit("measured binary AOT manifest differs from post-build index check")
 gpus = {entry.get("pod_gpu") for entry in bench}
 if gpus != {os.environ["Q_EXPECTED_GPU"]}:
     raise SystemExit("qualification records do not bind the exact release H100")
@@ -713,6 +853,12 @@ def preflight_summary(artifact_name, input_name, expected_policy):
             or Path(record.get("source", "")).resolve() != input_path.resolve()
             or input_sha != adapted_checksums[input_name]):
         raise SystemExit(f"preflight drift in {artifact_name}")
+    aot = record.get("aot_coverage") or {}
+    if (aot.get("pass") is not True or aot.get("missing_occurrences") != []
+            or aot.get("missing_occurrence_count") != 0
+            or not isinstance(aot.get("required_occurrences"), list)
+            or not aot["required_occurrences"]):
+        raise SystemExit(f"AOT preflight drift in {artifact_name}")
     return {
         "artifact": str(artifact_path),
         "artifact_sha256": sha256(artifact_path),
@@ -721,6 +867,16 @@ def preflight_summary(artifact_name, input_name, expected_policy):
         "arena_bytes": arena["total_bytes"],
         "arena_gib": arena["total_bytes"] / 1024**3,
         "runtime_policy": record["runtime_policy"],
+        "aot_coverage": {
+            "manifest": aot["manifest"],
+            "manifest_blake3": aot["manifest_blake3"],
+            "manifest_entries": aot["manifest_entries"],
+            "required_occurrence_count": aot["required_occurrence_count"],
+            "required_unique_key_count": aot["required_unique_key_count"],
+            "required_occurrences_blake3": aot["required_occurrences_blake3"],
+            "required_unique_keys_blake3": aot["required_unique_keys_blake3"],
+            "missing_occurrence_count": 0,
+        },
     }
 
 universal_preflights = {
@@ -736,6 +892,12 @@ headline_preflight = preflight_summary(
 )
 with open(os.environ["Q_LOCAL_ADMISSION"], encoding="utf-8") as stream:
     local_admission = json.load(stream)
+local_aot_coverage = local_admission.get("aot_coverage") or {}
+if (aot_index_check.get("required_unique_key_count")
+        != local_aot_coverage.get("required_unique_key_count")
+        or aot_index_check.get("required_unique_keys_sha256")
+        != local_aot_coverage.get("required_unique_keys_sha256")):
+    raise SystemExit("post-build AOT index check differs from local exact-key admission")
 expected_admission_source = {
     "stwo": {"head": os.environ["Q_STWO_HEAD"], "worktree_hash": os.environ["Q_STWO_HASH"]},
     "stwo_cairo": {
@@ -772,6 +934,8 @@ expected_adapter_reproduction = {
 }
 if local_admission.get("adapter_reproduction") != expected_adapter_reproduction:
     raise SystemExit("raw PIE adapter reproduction drifted during qualification")
+if not isinstance(local_admission.get("aot_coverage"), dict):
+    raise SystemExit("local AOT coverage admission is absent")
 
 artifact = {
     "schema": "stwo.qualification-round.v4",
@@ -811,6 +975,11 @@ artifact = {
         "sha256": os.environ["Q_LOCAL_ADMISSION_SHA"],
     },
     "adapter_reproduction": expected_adapter_reproduction,
+    "aot_coverage": local_admission["aot_coverage"],
+    "aot_index_check": {
+        "path": os.environ["Q_AOT_INDEX_CHECK"],
+        "sha256": os.environ["Q_AOT_INDEX_CHECK_SHA"],
+    },
     "remote_execution_target": {
         "target": execution_target,
         "sha256": target_sha,

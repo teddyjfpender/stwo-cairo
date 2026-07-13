@@ -2350,6 +2350,7 @@ mod tests {
                     stwo::core::fields::m31::BaseField::from(1);
                     1usize << blowup
                 ],
+                base_param_values: Vec::new(),
                 ext_param_values: Vec::new(),
                 ext_param_sources: Vec::new(),
                 kernels: vec![crate::composition_plan::CompositionKernelPart {

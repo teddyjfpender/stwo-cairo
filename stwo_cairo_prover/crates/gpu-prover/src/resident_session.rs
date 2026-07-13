@@ -516,6 +516,7 @@ fn run_materialized_session<R>(
             z: SecureField::zero(),
         },
         &planned.transcript,
+        &planned.composition,
         None,
         None,
         None,
@@ -1058,6 +1059,7 @@ pub fn with_resident_session_from_generator<R>(
                 z: SecureField::zero(),
             },
             &planned.transcript,
+            &planned.composition,
             Some(ExecutionTablesHostData {
                 addr_to_id: &raw_address_to_id,
                 f252_values: &memory.f252_values,

@@ -2,8 +2,9 @@
 //!
 //! This is the host-only preparation half of the resident composition graph. It
 //! lowers each concrete Cairo evaluator once, records the embedded-AOT identity,
-//! preserves its extension-parameter slot order, and assigns the exact descending
-//! random-coefficient range consumed by STWO's `DomainEvaluationAccumulator`.
+//! preserves its base- and extension-parameter slot order, and assigns the exact
+//! descending random-coefficient range consumed by STWO's
+//! `DomainEvaluationAccumulator`.
 
 use cairo_air::cairo_components::CairoComponents;
 use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
@@ -48,6 +49,10 @@ pub struct CompositionComponentPlan {
     /// component starts at zero, matching the accumulator's split/reverse order.
     pub random_coefficient_offset: usize,
     pub denominator_inverses: Vec<BaseField>,
+    /// Statement values for the base-field parameter slots encoded by every
+    /// kernel. They are runtime bindings and intentionally do not affect the
+    /// kernel identity or the reusable composition-plan key.
+    pub base_param_values: Vec<BaseField>,
     /// Setup values used only by differential/reference lanes. Resident replay
     /// binds the corresponding typed sources below directly on device.
     pub ext_param_values: Vec<SecureField>,
@@ -98,6 +103,10 @@ pub enum CompositionPlanError {
         instance: usize,
     },
     ProbeKernelMismatch {
+        component: &'static str,
+        instance: usize,
+    },
+    ProbeBaseParamMismatch {
         component: &'static str,
         instance: usize,
     },
@@ -333,7 +342,7 @@ impl CompositionPlan {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
         };
-        feed(b"stwo-cairo-composition-plan-v1\0");
+        feed(b"stwo-cairo-composition-plan-v2\0");
         feed(&(self.max_kernel_instrs as u64).to_le_bytes());
         feed(&(self.total_constraints as u64).to_le_bytes());
         feed(&self.max_evaluation_log_size.to_le_bytes());
@@ -359,6 +368,10 @@ impl CompositionPlan {
             for inverse in &component.denominator_inverses {
                 feed(&inverse.0.to_le_bytes());
             }
+            // The slot topology is load-bearing, while the statement values
+            // are rebound whenever a resident session is prepared. Including
+            // values here would prevent safe graph reuse across blocks.
+            feed(&(component.base_param_values.len() as u64).to_le_bytes());
             for source in &component.ext_param_sources {
                 match *source {
                     CompositionExtParamSource::Constant(value) => {
@@ -441,6 +454,12 @@ fn push_component<E: FrameworkEval>(
             instance,
         });
     }
+    if program.base_param_values != probe_program.base_param_values {
+        return Err(CompositionPlanError::ProbeBaseParamMismatch {
+            component: name,
+            instance,
+        });
+    }
     let ext_param_sources = classify_ext_params(
         name,
         instance,
@@ -465,6 +484,7 @@ fn push_component<E: FrameworkEval>(
         n_constraints,
         random_coefficient_offset: *consumed_constraints,
         denominator_inverses,
+        base_param_values: program.base_param_values,
         ext_param_values: program.ext_param_values,
         ext_param_sources,
         kernels,
@@ -741,6 +761,50 @@ mod tests {
     }
 
     #[test]
+    fn bitwise_statement_start_is_a_runtime_base_binding_not_kernel_identity() {
+        use cairo_air::components::bitwise_builtin;
+
+        let lookup = CommonLookupElements::dummy();
+        let claimed_sum = SecureField::from_u32_unchecked(3, 5, 7, 11);
+        let lower = |segment_start| {
+            constraint_program(
+                &bitwise_builtin::Eval {
+                    claim: bitwise_builtin::Claim { log_size: 4 },
+                    common_lookup_elements: lookup.clone(),
+                    bitwise_builtin_segment_start: segment_start,
+                },
+                3,
+                claimed_sum,
+                4,
+                2048,
+            )
+            .unwrap()
+        };
+        let first_start = 7_711;
+        let second_start = 6_606_534;
+        let first = lower(first_start);
+        let second = lower(second_start);
+
+        assert!(same_kernel_program(&first.kernels, &second.kernels));
+        assert_eq!(first.ext_param_values, second.ext_param_values);
+        assert_eq!(
+            first.base_param_values.len(),
+            second.base_param_values.len()
+        );
+        let differences = first
+            .base_param_values
+            .iter()
+            .zip(&second.base_param_values)
+            .filter(|(left, right)| left != right)
+            .collect::<Vec<_>>();
+        assert_eq!(differences.len(), 5);
+        assert!(differences.iter().all(|(left, right)| {
+            **left == BaseField::from_u32_unchecked(first_start)
+                && **right == BaseField::from_u32_unchecked(second_start)
+        }));
+    }
+
+    #[test]
     fn scaled_alpha_classifier_rejects_non_base_affine_and_mismatched_scales() {
         let lookup = CommonLookupElements::dummy();
         let probe = CommonLookupElements::from_z_alpha(LOOKUP_PROBE_Z, LOOKUP_PROBE_ALPHA);
@@ -789,6 +853,7 @@ mod tests {
                 n_constraints: 1,
                 random_coefficient_offset: 0,
                 denominator_inverses: Vec::new(),
+                base_param_values: Vec::new(),
                 ext_param_values: vec![SecureField::zero()],
                 ext_param_sources: vec![source],
                 kernels: Vec::new(),
@@ -809,5 +874,40 @@ mod tests {
                 scale: BaseField::from_u32_unchecked(32768),
             })
         );
+    }
+
+    #[test]
+    fn base_parameter_values_are_runtime_bindings_but_slot_count_is_topology() {
+        let mut plan = CompositionPlan {
+            max_kernel_instrs: 1,
+            total_constraints: 1,
+            max_evaluation_log_size: 5,
+            components: vec![CompositionComponentPlan {
+                component: "test",
+                instance: 0,
+                trace_locations: Vec::new(),
+                preprocessed_column_indices: Vec::new(),
+                trace_log_size: 4,
+                evaluation_log_size: 5,
+                n_constraints: 1,
+                random_coefficient_offset: 0,
+                denominator_inverses: Vec::new(),
+                base_param_values: vec![BaseField::from_u32_unchecked(7)],
+                ext_param_values: Vec::new(),
+                ext_param_sources: Vec::new(),
+                kernels: Vec::new(),
+            }],
+        };
+        let original = plan.key();
+        plan.components[0].base_param_values[0] = BaseField::from_u32_unchecked(11);
+        assert_eq!(
+            plan.key(),
+            original,
+            "statement values are rebound at setup"
+        );
+        plan.components[0]
+            .base_param_values
+            .push(BaseField::from_u32_unchecked(13));
+        assert_ne!(plan.key(), original, "slot topology changes the graph ABI");
     }
 }

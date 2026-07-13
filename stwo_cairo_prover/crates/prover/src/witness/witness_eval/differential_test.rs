@@ -2188,6 +2188,13 @@ fn stwo_wit_deduce_oracle_matches_fast_deduction() {
     use stwo_backend_cuda::jit_witness::interp::DeduceHost;
 
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        assert_ne!(
+            std::env::var("STWO_CUDA_SOUNDNESS_REQUIRED")
+                .ok()
+                .as_deref(),
+            Some("1"),
+            "deduce oracle requires a CUDA-linked test binary during soundness qualification"
+        );
         eprintln!("deduce oracle: SKIPPED (stub build)");
         return;
     }
@@ -2578,6 +2585,13 @@ fn poseidon_combination_37_strict_aot_captured_row() {
     assert_eq!(host.columns[114], 17_375_170, "captured host column 114");
 
     if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        assert_ne!(
+            std::env::var("STWO_CUDA_SOUNDNESS_REQUIRED")
+                .ok()
+                .as_deref(),
+            Some("1"),
+            "strict-AOT captured row requires a CUDA-linked test binary during soundness qualification"
+        );
         eprintln!("strict-AOT captured row: SKIPPED (stub build)");
         return;
     }

@@ -14,8 +14,9 @@
 //! kernels need component EVALUATORS, built from a fixture matrix chosen for
 //! union coverage (all-opcodes + all-builtins on Canonical; pedersen on
 //! CanonicalSmall for the narrow-windows/w9 family). The lowering hoists all
-//! statement constants into parameters, so any statement emits the same
-//! kernels; a component absent from every fixture FAILS the run (loud gap).
+//! statement constants into parameters, so structurally identical evaluator
+//! recordings emit the same kernels; a component absent from every fixture
+//! FAILS the run (loud gap).
 //!
 //! Usage: kernel_emit [--stwo-root <path>] [--max-instrs N]
 //!                    [--input-bincode <adapted-input>]... [--check]
@@ -402,7 +403,10 @@ fn main() -> ExitCode {
             }
         }
         if drift == 0 {
-            println!("kernel_emit --check: OK ({} kernels)", files.len() - 1);
+            println!(
+                "kernel_emit --check: OK ({} kernels)",
+                files.keys().filter(|file| file.ends_with(".cu")).count()
+            );
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE

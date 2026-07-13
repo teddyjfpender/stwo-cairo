@@ -101,6 +101,7 @@ fn lower_component_plan<E: FrameworkEval>(
         })
         .collect::<Vec<_>>();
     bit_reverse(&mut denominator_inverses);
+    let base_param_values = emitted.base_param_values;
     let ext_param_values = emitted.ext_param_values;
     let ext_param_sources = ext_param_values
         .iter()
@@ -128,6 +129,7 @@ fn lower_component_plan<E: FrameworkEval>(
         n_constraints: component.n_constraints(),
         random_coefficient_offset,
         denominator_inverses,
+        base_param_values,
         ext_param_values,
         ext_param_sources,
         kernels,
@@ -156,7 +158,7 @@ fn real_component_and_plan() -> (RangeCheckComponent, CompositionPlan) {
     assert_eq!(max_kernel_instrs, 2048, "unexpected embedded AOT cap");
     let component_plan = lower_component_plan("range_check_6", &component, 0);
     assert_eq!(component_plan.kernels.len(), 1);
-    assert_eq!(component_plan.kernels[0].cache_key, 0x3030_69e7_c030_2e27);
+    assert_eq!(component_plan.kernels[0].cache_key, 0xfe80_08c0_8878_f25a);
     let total_constraints = component.n_constraints();
     (
         component,

@@ -9836,6 +9836,7 @@ mod tests {
                 n_constraints: 1,
                 random_coefficient_offset: 0,
                 denominator_inverses: vec![BaseField::from(1); 2],
+                base_param_values: Vec::new(),
                 ext_param_values: vec![
                     SecureField::default(),
                     SecureField::default(),

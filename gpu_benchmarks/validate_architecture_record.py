@@ -123,6 +123,47 @@ ADAPTER_REPRODUCTION_KEYS = {
     "bootloader_sha256",
     "pinned_adapted_manifest_sha256",
 }
+AOT_OCCURRENCE_KEYS = {
+    "kind",
+    "component",
+    "instance",
+    "kernel",
+    "kernel_name",
+    "semantic_hash",
+    "cache_key",
+}
+AOT_PREFLIGHT_KEYS = {
+    "pass",
+    "manifest",
+    "manifest_blake3",
+    "manifest_entries",
+    "required_occurrences",
+    "required_occurrences_blake3",
+    "required_occurrence_count",
+    "required_unique_keys_blake3",
+    "required_unique_key_count",
+    "missing_occurrences",
+    "missing_occurrence_count",
+}
+AOT_ADMISSION_KEYS = {
+    "manifest",
+    "manifest_sha256",
+    "manifest_blake3",
+    "manifest_entry_count",
+    "required_occurrence_count",
+    "required_unique_key_count",
+    "required_unique_keys",
+    "required_occurrences_sha256",
+    "required_unique_keys_sha256",
+    "preflight_occurrences_sha256",
+    "preflight_occurrences_blake3",
+    "preflight_unique_keys_blake3",
+    "per_sn",
+    "missing_occurrences",
+}
+AOT_MANIFEST_ENTRY_KEYS = {
+    "kind", "label", "kernel_name", "cache_key", "semantic_hash", "file"
+}
 RAW_INPUT_NAMES = {
     *(f"SN_PIE_{pie}.zip" for pie in range(1, 5)),
     "simple_bootloader_compiled.json",
@@ -178,6 +219,46 @@ def _valid_source_identity(source: object) -> bool:
         ):
             return False
     return True
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _json_sha256(value: object) -> str:
+    return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _valid_aot_occurrence(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == AOT_OCCURRENCE_KEYS
+        and value.get("kind") in {"constraint", "witness"}
+        and isinstance(value.get("component"), str)
+        and bool(value["component"])
+        and isinstance(value.get("instance"), int)
+        and not isinstance(value["instance"], bool)
+        and value["instance"] >= 0
+        and isinstance(value.get("kernel"), int)
+        and not isinstance(value["kernel"], bool)
+        and value["kernel"] >= 0
+        and isinstance(value.get("kernel_name"), str)
+        and bool(value["kernel_name"])
+        and _is_lower_hex(value.get("semantic_hash"), 16)
+        and _is_lower_hex(value.get("cache_key"), 16)
+    )
+
+
+def _aot_occurrence_sort_key(value: dict[str, Any]) -> tuple[object, ...]:
+    return (
+        value["kind"],
+        value["component"],
+        value["instance"],
+        value["kernel"],
+        value["kernel_name"],
+        value["semantic_hash"],
+        value["cache_key"],
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -241,6 +322,7 @@ def validate_local_admission(
     raw_input_manifest: Path,
     bootloader: Path,
     pinned_adapted_manifest: Path,
+    aot_manifest: Path,
     required_runtime_mode: str = "arena-graph",
 ) -> list[str]:
     """Validate the complete local capacity/input admission before pod contact."""
@@ -273,6 +355,55 @@ def validate_local_admission(
         errors.append("local admission: adapter reproduction contract is not exact")
     if reproduction.get("byte_equal") is not True:
         errors.append("local admission: adapter reproduction is not byte-equal")
+
+    aot = admission.get("aot_coverage")
+    if not isinstance(aot, dict) or set(aot) != AOT_ADMISSION_KEYS:
+        errors.append("local admission: AOT coverage contract is not exact")
+        aot = {}
+    expected_aot_manifest = aot_manifest.resolve()
+    admission_aot_manifest = _resolved_reference(
+        aot.get("manifest"), admission_path.resolve().parent
+    )
+    if admission_aot_manifest != expected_aot_manifest:
+        errors.append("local admission: AOT manifest path mismatch")
+    _check_file_hash(
+        expected_aot_manifest,
+        aot.get("manifest_sha256"),
+        "AOT manifest",
+        errors,
+    )
+    try:
+        manifest_value = json.loads(expected_aot_manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        errors.append(f"AOT manifest: {error}")
+        manifest_value = []
+    manifest_by_key: dict[str, dict[str, Any]] = {}
+    if not isinstance(manifest_value, list) or not manifest_value:
+        errors.append("AOT manifest: expected a nonempty array")
+    else:
+        for index, entry in enumerate(manifest_value):
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != AOT_MANIFEST_ENTRY_KEYS
+                or entry.get("kind") not in {"constraint", "witness"}
+                or not isinstance(entry.get("label"), str)
+                or not entry["label"]
+                or not isinstance(entry.get("kernel_name"), str)
+                or not entry["kernel_name"]
+                or not _is_lower_hex(entry.get("cache_key"), 16)
+                or not _is_lower_hex(entry.get("semantic_hash"), 16)
+                or not isinstance(entry.get("file"), str)
+                or not entry["file"]
+            ):
+                errors.append(f"AOT manifest: malformed entry {index}")
+                continue
+            if entry["cache_key"] in manifest_by_key:
+                errors.append(f"AOT manifest: duplicate key {entry['cache_key']}")
+            manifest_by_key[entry["cache_key"]] = entry
+    if aot.get("manifest_entry_count") != len(manifest_by_key):
+        errors.append("local admission: AOT manifest entry count mismatch")
+    if not _is_lower_hex(aot.get("manifest_blake3"), 64):
+        errors.append("local admission: invalid AOT manifest BLAKE3")
 
     root = admission_path.resolve().parent
     preflight_hashes = admission.get("preflight_artifact_sha256")
@@ -342,6 +473,11 @@ def validate_local_admission(
         errors,
     )
 
+    preflight_aot_sha256: dict[str, str] = {}
+    preflight_aot_blake3: dict[str, str] = {}
+    preflight_key_blake3: dict[str, str] = {}
+    preflight_occurrences: dict[str, list[dict[str, Any]]] = {}
+    all_occurrences: list[dict[str, Any]] = []
     for artifact_name, (input_name, expected_policy) in PREFLIGHT_SPECS.items():
         artifact_path = root / artifact_name
         _check_file_hash(
@@ -373,6 +509,59 @@ def validate_local_admission(
             or record.get("runtime_policy") != expected_policy
         ):
             errors.append(f"{artifact_name}: preflight contract mismatch")
+        coverage = record.get("aot_coverage")
+        if not isinstance(coverage, dict) or set(coverage) != AOT_PREFLIGHT_KEYS:
+            errors.append(f"{artifact_name}: AOT coverage shape mismatch")
+            coverage = {}
+        coverage_manifest = _resolved_reference(
+            coverage.get("manifest"), artifact_path.parent
+        )
+        missing = coverage.get("missing_occurrences")
+        occurrences = coverage.get("required_occurrences")
+        if (
+            coverage.get("pass") is not True
+            or coverage_manifest != expected_aot_manifest
+            or coverage.get("manifest_blake3") != aot.get("manifest_blake3")
+            or coverage.get("manifest_entries") != len(manifest_by_key)
+            or missing != []
+            or coverage.get("missing_occurrence_count") != 0
+            or not isinstance(occurrences, list)
+            or not occurrences
+            or coverage.get("required_occurrence_count") != len(occurrences or [])
+            or not _is_lower_hex(coverage.get("required_occurrences_blake3"), 64)
+            or not _is_lower_hex(coverage.get("required_unique_keys_blake3"), 64)
+        ):
+            errors.append(f"{artifact_name}: AOT coverage did not pass")
+            occurrences = []
+        elif (
+            any(not _valid_aot_occurrence(item) for item in occurrences)
+            or occurrences != sorted(occurrences, key=_aot_occurrence_sort_key)
+        ):
+            errors.append(f"{artifact_name}: AOT occurrence ledger is not canonical")
+            occurrences = []
+        if occurrences:
+            unique_keys = {item["cache_key"] for item in occurrences}
+            if coverage.get("required_unique_key_count") != len(unique_keys):
+                errors.append(f"{artifact_name}: AOT unique-key count mismatch")
+            for occurrence in occurrences:
+                entry = manifest_by_key.get(occurrence["cache_key"])
+                if entry is None or (
+                    entry["kind"] != occurrence["kind"]
+                    or entry["kernel_name"] != occurrence["kernel_name"]
+                    or entry["semantic_hash"] != occurrence["semantic_hash"]
+                ):
+                    errors.append(
+                        f"{artifact_name}: uncovered AOT key {occurrence['cache_key']}"
+                    )
+            preflight_occurrences[artifact_name] = occurrences
+            preflight_aot_sha256[artifact_name] = _json_sha256(occurrences)
+            preflight_aot_blake3[artifact_name] = coverage[
+                "required_occurrences_blake3"
+            ]
+            preflight_key_blake3[artifact_name] = coverage[
+                "required_unique_keys_blake3"
+            ]
+            all_occurrences.extend(occurrences)
         source = _resolved_reference(record.get("source"), artifact_path.parent)
         if source is None or source.name != input_name:
             errors.append(f"{artifact_name}: adapted input mismatch")
@@ -383,6 +572,49 @@ def validate_local_admission(
             f"{artifact_name} adapted input",
             errors,
         )
+
+    if set(preflight_occurrences) != set(PREFLIGHT_SPECS):
+        errors.append("local admission: incomplete AOT preflight occurrence set")
+        return errors
+    if not (
+        preflight_aot_sha256["preflight_flags_off_SN2.json"]
+        == preflight_aot_sha256["preflight_universal_SN2.json"]
+        == preflight_aot_sha256["preflight_sn2_headline.json"]
+    ):
+        errors.append("local admission: SN2 AOT keys vary across runtime-only profiles")
+    union_by_record = {_canonical_json(item): item for item in all_occurrences}
+    occurrence_union = [union_by_record[key] for key in sorted(union_by_record)]
+    union_keys = sorted({item["cache_key"] for item in occurrence_union})
+    if aot.get("required_occurrence_count") != len(occurrence_union):
+        errors.append("local admission: AOT union occurrence count mismatch")
+    if aot.get("required_unique_key_count") != len(union_keys):
+        errors.append("local admission: AOT union key count mismatch")
+    if aot.get("required_unique_keys") != union_keys:
+        errors.append("local admission: AOT union key set mismatch")
+    if aot.get("required_occurrences_sha256") != _json_sha256(occurrence_union):
+        errors.append("local admission: AOT union occurrence hash mismatch")
+    if aot.get("required_unique_keys_sha256") != _json_sha256(union_keys):
+        errors.append("local admission: AOT union key hash mismatch")
+    if aot.get("preflight_occurrences_sha256") != preflight_aot_sha256:
+        errors.append("local admission: AOT preflight SHA-256 map mismatch")
+    if aot.get("preflight_occurrences_blake3") != preflight_aot_blake3:
+        errors.append("local admission: AOT preflight BLAKE3 map mismatch")
+    if aot.get("preflight_unique_keys_blake3") != preflight_key_blake3:
+        errors.append("local admission: AOT preflight key BLAKE3 map mismatch")
+    expected_per_sn = {}
+    for pie in range(1, 5):
+        occurrences = preflight_occurrences[f"preflight_universal_SN{pie}.json"]
+        keys = sorted({item["cache_key"] for item in occurrences})
+        expected_per_sn[f"SN_PIE_{pie}"] = {
+            "required_occurrence_count": len(occurrences),
+            "required_unique_key_count": len(keys),
+            "required_occurrences_sha256": _json_sha256(occurrences),
+            "required_unique_keys_sha256": _json_sha256(keys),
+        }
+    if aot.get("per_sn") != expected_per_sn:
+        errors.append("local admission: AOT per-SN coverage mismatch")
+    if aot.get("missing_occurrences") != []:
+        errors.append("local admission: AOT keys are missing")
     return errors
 
 
@@ -543,6 +775,8 @@ def validate_soundness_gate(
             )
         if gate.get("exit_code") != 0 or gate.get("passed") is not True:
             errors.append(f"soundness gate {name!r}: command did not pass")
+        if gate.get("stub_skip_detected") is not False:
+            errors.append(f"soundness gate {name!r}: CUDA stub skip was not excluded")
         expected_required = expected_gates.get(name)
         if expected_required is not None and required != expected_required:
             errors.append(
@@ -1198,6 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw-input-manifest", type=Path)
     parser.add_argument("--bootloader", type=Path)
     parser.add_argument("--pinned-adapted-manifest", type=Path)
+    parser.add_argument("--aot-manifest", type=Path)
     parser.add_argument("--expected-dry-run", type=int, choices=(0, 1))
     parser.add_argument("--expected-program")
     parser.add_argument("--expected-reps", type=int)
@@ -1241,6 +1476,7 @@ def main(argv: list[str] | None = None) -> int:
             "--raw-input-manifest": args.raw_input_manifest,
             "--bootloader": args.bootloader,
             "--pinned-adapted-manifest": args.pinned_adapted_manifest,
+            "--aot-manifest": args.aot_manifest,
         }
         missing = [name for name, value in required_paths.items() if value is None]
         if missing:
@@ -1260,6 +1496,7 @@ def main(argv: list[str] | None = None) -> int:
             raw_input_manifest=args.raw_input_manifest,
             bootloader=args.bootloader,
             pinned_adapted_manifest=args.pinned_adapted_manifest,
+            aot_manifest=args.aot_manifest,
             required_runtime_mode=args.runtime_mode,
         )
         return _print_contract_errors("Local admission contract", errors)

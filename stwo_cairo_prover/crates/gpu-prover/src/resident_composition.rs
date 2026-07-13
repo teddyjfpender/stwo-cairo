@@ -3,7 +3,7 @@
 use stwo_backend_cuda::{ArenaSlotId, PreparedRelationGraph};
 
 use crate::arena_plan::ArenaBinding;
-use crate::composition_plan::CompositionExtParamSource;
+use crate::composition_plan::{CompositionExtParamSource, CompositionPlan};
 use crate::direct_composition_retention::DirectCompositionRetentionPlan;
 use crate::graphs::{bind_arena_binding, GraphWorkspace};
 use crate::prepared_composition::{
@@ -14,6 +14,10 @@ use crate::relation::RelationTracePart;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResidentCompositionError {
+    CurrentPlanTopologyDrift {
+        cached_key: u64,
+        current_key: u64,
+    },
     MissingRelationBatch {
         component: &'static str,
         instance: usize,
@@ -59,10 +63,11 @@ impl From<PreparedCompositionError> for ResidentCompositionError {
 pub(crate) fn prepare_resident_composition<'a>(
     workspace: &'a GraphWorkspace,
     relation: &PreparedRelationGraph<'a>,
+    current_plan: &CompositionPlan,
 ) -> Result<PreparedCompositionGraph<'a>, ResidentCompositionError> {
-    let planned = workspace.plan().composition();
-    let claimed_sums = planned
-        .plan
+    let cached = workspace.plan().composition();
+    let current_plan = require_current_composition_plan(&cached.plan, current_plan)?;
+    let claimed_sums = current_plan
         .components
         .iter()
         .map(|component| {
@@ -114,10 +119,10 @@ pub(crate) fn prepare_resident_composition<'a>(
         })
         .collect::<Result<Vec<Option<ArenaSlotId>>, ResidentCompositionError>>()?;
     let inputs = CompositionDeviceInputs {
-        random_coefficient: planned.random_coefficient.physical,
-        forward_twiddles: bind_arena_binding(workspace.arena(), planned.forward_twiddles)
+        random_coefficient: cached.random_coefficient.physical,
+        forward_twiddles: bind_arena_binding(workspace.arena(), cached.forward_twiddles)
             .map_err(PreparedCompositionError::Arena)?,
-        inverse_twiddles: bind_arena_binding(workspace.arena(), planned.inverse_twiddles)
+        inverse_twiddles: bind_arena_binding(workspace.arena(), cached.inverse_twiddles)
             .map_err(PreparedCompositionError::Arena)?,
         // Pass the relation graph's logically-truncated challenge slices, not
         // slot ids: the composition alpha-power count derives from the slice
@@ -126,10 +131,10 @@ pub(crate) fn prepare_resident_composition<'a>(
         relation_z: relation.z_source(),
         relation_alpha_powers: relation.alpha_powers_source(),
         claimed_sums,
-        ext_params: planned.ext_param_bindings(),
+        ext_params: cached.ext_param_bindings(),
     };
     let direct_evaluations =
-        canonical_direct_evaluations(planned.direct_retention.as_ref(), &planned.direct_bindings)?
+        canonical_direct_evaluations(cached.direct_retention.as_ref(), &cached.direct_bindings)?
             .into_iter()
             .map(|(plan_column, binding)| {
                 Ok(CompositionDirectEvaluationBinding {
@@ -141,14 +146,46 @@ pub(crate) fn prepare_resident_composition<'a>(
             .collect::<Result<Vec<_>, ResidentCompositionError>>()?;
     Ok(PreparedCompositionGraph::prepare_with_mode_and_retention(
         workspace.arena(),
-        &planned.plan,
-        &planned.trace_topology(),
+        current_plan,
+        &cached.trace_topology(),
         &inputs,
-        &planned.slots,
+        &cached.slots,
         default_composition_launch_mode(),
-        planned.direct_retention.as_ref(),
+        cached.direct_retention.as_ref(),
         &direct_evaluations,
     )?)
+}
+
+/// Prove that the current statement has exactly the cached workspace topology,
+/// allowing only base-parameter values to differ. The full structural equality
+/// check is deliberate: the 64-bit plan key is an index, not a soundness proof.
+fn require_current_composition_plan<'a>(
+    cached: &CompositionPlan,
+    current: &'a CompositionPlan,
+) -> Result<&'a CompositionPlan, ResidentCompositionError> {
+    let drift = || ResidentCompositionError::CurrentPlanTopologyDrift {
+        cached_key: cached.key(),
+        current_key: current.key(),
+    };
+    if cached.components.len() != current.components.len() {
+        return Err(drift());
+    }
+    let mut normalized = current.clone();
+    for (normalized_component, cached_component) in
+        normalized.components.iter_mut().zip(&cached.components)
+    {
+        if normalized_component.base_param_values.len() != cached_component.base_param_values.len()
+        {
+            return Err(drift());
+        }
+        normalized_component
+            .base_param_values
+            .clone_from(&cached_component.base_param_values);
+    }
+    if normalized != *cached {
+        return Err(drift());
+    }
+    Ok(current)
 }
 
 fn canonical_direct_evaluations(
@@ -274,6 +311,7 @@ fn relation_claimed_sum_key(
 
 #[cfg(test)]
 mod tests {
+    use stwo::core::fields::m31::BaseField;
     use stwo_cairo_prover::witness::proof_shape::TracePartId;
 
     use super::*;
@@ -284,6 +322,33 @@ mod tests {
     use crate::direct_composition_retention::{
         DirectCompositionBinding, DirectCompositionColumn, DirectCompositionRetentionPlan,
     };
+
+    fn composition_fixture(base_values: &[u32]) -> CompositionPlan {
+        CompositionPlan {
+            max_kernel_instrs: 2048,
+            total_constraints: 1,
+            max_evaluation_log_size: 5,
+            components: vec![crate::composition_plan::CompositionComponentPlan {
+                component: "fixture",
+                instance: 0,
+                trace_locations: Vec::new(),
+                preprocessed_column_indices: Vec::new(),
+                trace_log_size: 4,
+                evaluation_log_size: 5,
+                n_constraints: 1,
+                random_coefficient_offset: 0,
+                denominator_inverses: Vec::new(),
+                base_param_values: base_values
+                    .iter()
+                    .copied()
+                    .map(BaseField::from_u32_unchecked)
+                    .collect(),
+                ext_param_values: Vec::new(),
+                ext_param_sources: Vec::new(),
+                kernels: Vec::new(),
+            }],
+        }
+    }
 
     fn direct_fixture() -> (
         DirectCompositionRetentionPlan,
@@ -364,6 +429,30 @@ mod tests {
             relation_claimed_sum_key("memory_id_to_small", 0),
             ("memory_id_to_big", RelationTracePart::MemorySmall, 0)
         );
+    }
+
+    #[test]
+    fn workspace_reuse_accepts_current_base_values_only_after_full_topology_check() {
+        let cached = composition_fixture(&[7, 11]);
+        let current = composition_fixture(&[17, 19]);
+        assert_eq!(cached.key(), current.key());
+        assert!(core::ptr::eq(
+            require_current_composition_plan(&cached, &current).unwrap(),
+            &current
+        ));
+
+        let wrong_slot_count = composition_fixture(&[17]);
+        assert!(matches!(
+            require_current_composition_plan(&cached, &wrong_slot_count),
+            Err(ResidentCompositionError::CurrentPlanTopologyDrift { .. })
+        ));
+
+        let mut structural_drift = current.clone();
+        structural_drift.components[0].trace_log_size += 1;
+        assert!(matches!(
+            require_current_composition_plan(&cached, &structural_drift),
+            Err(ResidentCompositionError::CurrentPlanTopologyDrift { .. })
+        ));
     }
 
     #[test]

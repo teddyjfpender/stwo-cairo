@@ -11,7 +11,7 @@ use cairo_air::CairoProof;
 use cairo_vm::types::layout_name::LayoutName;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
-use stwo::prover::backend::simd::SimdBackend;
+use stwo_cairo_adapter::builtins::MemorySegmentAddresses;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
@@ -56,6 +56,93 @@ fn resident_input() -> ProverInput {
         None,
     )
     .unwrap()
+}
+
+/// Build an equivalent valid statement whose bitwise and EC-op segments occupy
+/// each other's contiguous relocation slots. The permutation preserves every
+/// table length and trace shape, but changes both components' hoisted BASE
+/// parameters. Rebase every address and pointer in the moved span so Cairo
+/// memory semantics remain unchanged.
+fn swap_bitwise_and_ec_op_segments(mut input: ProverInput) -> ProverInput {
+    let bitwise = input
+        .builtin_segments
+        .bitwise_builtin
+        .expect("strict resident fixture has a bitwise segment");
+    let ec_op = input
+        .builtin_segments
+        .ec_op_builtin
+        .expect("strict resident fixture has an EC-op segment");
+    assert_eq!(
+        bitwise.stop_ptr, ec_op.begin_addr,
+        "fixture bitwise and EC-op segments stopped being contiguous"
+    );
+    let bitwise_len = bitwise.stop_ptr - bitwise.begin_addr;
+    let ec_op_len = ec_op.stop_ptr - ec_op.begin_addr;
+    let rebase = |address: usize| {
+        if (bitwise.begin_addr..bitwise.stop_ptr).contains(&address) {
+            address + ec_op_len
+        } else if (ec_op.begin_addr..ec_op.stop_ptr).contains(&address) {
+            address - bitwise_len
+        } else {
+            address
+        }
+    };
+    let rebase_small =
+        |value: u128| usize::try_from(value).map_or(value, |address| rebase(address) as u128);
+
+    // Fail closed if a future fixture introduces an ordinary small felt in the
+    // relocation span. Today these are exactly the 51 bitwise pointers (stride
+    // five) and 51 EC-op pointers (stride seven), sharing one segment boundary.
+    let moved_small_values = input
+        .memory
+        .small_values
+        .iter()
+        .filter(|value| (bitwise.begin_addr as u128..ec_op.stop_ptr as u128).contains(value))
+        .collect::<Vec<_>>();
+    assert_eq!(moved_small_values.len(), 101);
+    assert!(moved_small_values.iter().all(|value| {
+        let address = **value as usize;
+        (address >= bitwise.begin_addr
+            && address <= bitwise.begin_addr + 50 * 5
+            && (address - bitwise.begin_addr) % 5 == 0)
+            || (address >= ec_op.begin_addr
+                && address <= ec_op.begin_addr + 50 * 7
+                && (address - ec_op.begin_addr) % 7 == 0)
+    }));
+    for (id, value) in input.memory.small_values.iter().enumerate() {
+        if rebase_small(*value) != *value {
+            assert!(
+                input
+                    .memory
+                    .address_to_id
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, encoded)| encoded.0 == id as u32)
+                    .all(|(address, _)| address < bitwise.begin_addr),
+                "moved small value {value} is not confined to execution pointers"
+            );
+        }
+    }
+
+    let original_address_to_id = input.memory.address_to_id.clone();
+    for address in bitwise.begin_addr..ec_op.stop_ptr {
+        input.memory.address_to_id[rebase(address)] = original_address_to_id[address];
+    }
+    for value in &mut input.memory.small_values {
+        *value = rebase_small(*value);
+    }
+    for address in &mut input.public_memory_addresses {
+        *address = rebase(*address as usize) as u32;
+    }
+    input.builtin_segments.ec_op_builtin = Some(MemorySegmentAddresses {
+        begin_addr: bitwise.begin_addr,
+        stop_ptr: bitwise.begin_addr + ec_op_len,
+    });
+    input.builtin_segments.bitwise_builtin = Some(MemorySegmentAddresses {
+        begin_addr: bitwise.begin_addr + ec_op_len,
+        stop_ptr: ec_op.stop_ptr,
+    });
+    input
 }
 
 fn resident_params() -> ProverParameters {
@@ -292,6 +379,107 @@ fn strict_resident_same_shape_changed_memory_matches_second_simd_proof() {
             .cache_hit(),
         "changed-memory test did not reuse the exact workspace key"
     );
+}
+
+/// A workspace-cache hit must refresh statement-dependent BASE parameter
+/// buffers. This catches a stale captured bitwise/EC-op segment start even when
+/// the AOT kernel identity, proof shape, arena geometry, and graph topology are
+/// all unchanged.
+#[test]
+fn strict_resident_same_workspace_changed_base_params_matches_second_simd_proof() {
+    let params = resident_params();
+    let first = resident_input();
+    assert_capture_safe_fixture(&first, params);
+    let second = swap_bitwise_and_ec_op_segments(first.clone());
+    let first_bitwise_start = first
+        .builtin_segments
+        .bitwise_builtin
+        .expect("first bitwise segment")
+        .begin_addr;
+    let second_bitwise_start = second
+        .builtin_segments
+        .bitwise_builtin
+        .expect("second bitwise segment")
+        .begin_addr;
+    assert_ne!(
+        first_bitwise_start, second_bitwise_start,
+        "BASE-parameter variant did not move the bitwise segment"
+    );
+    assert_eq!(
+        first.memory.address_to_id.len(),
+        second.memory.address_to_id.len(),
+        "BASE-parameter variant changed execution-table geometry"
+    );
+
+    let mut config = GpuProverConfig::default();
+    config.strict = true;
+    let mut prover = GpuCairoProver::<Blake2sMerkleChannel>::new(config).unwrap();
+    let resident_first = prover.prove_resident_blake2s(first, params).unwrap();
+    let first_aot = prover
+        .last_aot_stats()
+        .expect("first strict AOT provenance telemetry");
+    let first_workspace = prover
+        .last_resident_session_telemetry()
+        .expect("first resident setup telemetry")
+        .workspace_key
+        .expect("first resident workspace key");
+    let resident_second = prover
+        .prove_resident_blake2s(second.clone(), params)
+        .unwrap();
+    let second_aot = prover
+        .last_aot_stats()
+        .expect("second strict AOT provenance telemetry");
+    let second_session = prover
+        .last_resident_session_telemetry()
+        .expect("second resident setup telemetry");
+    assert_eq!(
+        second_session.workspace_key,
+        Some(first_workspace),
+        "BASE-parameter variant changed the exact workspace key"
+    );
+    assert!(
+        second_session.cache_hit(),
+        "BASE-parameter variant did not reuse the resident workspace"
+    );
+
+    let first_roots = verify_and_roots(&resident_first);
+    let second_roots = verify_and_roots(&resident_second);
+    assert_ne!(
+        first_roots, second_roots,
+        "relocated statement did not change the four commitment roots"
+    );
+    let expected_second = cached_reference_felts(
+        STRICT_RESIDENT_FIXTURE,
+        "changed-base-params-second",
+        second,
+        params,
+    );
+    assert_eq!(
+        expected_second,
+        serialize_felts(&resident_second),
+        "same-workspace replay reused stale BASE parameter values"
+    );
+
+    assert!(
+        first_aot.aot_loads
+            + first_aot.aot_cache_hits
+            + second_aot.aot_loads
+            + second_aot.aot_cache_hits
+            > 0,
+        "BASE-parameter regression exercised no AOT kernel lookup"
+    );
+    for (round, stats) in [("first", first_aot), ("second", second_aot)] {
+        assert_eq!(stats.aot_misses, 0, "{round} strict proof missed AOT");
+        assert_eq!(stats.runtime_loads, 0, "{round} strict proof loaded JIT");
+        assert_eq!(
+            stats.runtime_cache_hits, 0,
+            "{round} strict proof reused JIT"
+        );
+        assert_eq!(
+            stats.strict_rejections, 0,
+            "{round} strict proof rejected AOT"
+        );
+    }
 }
 
 /// Graph-A admission for the active Starknet Poseidon chain.  This fixture makes

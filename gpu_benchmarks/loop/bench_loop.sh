@@ -108,6 +108,7 @@ STWO_POD="/workspace/stwo"
 CAIRO_POD="/workspace/stwo-cairo"
 POD_PROVER_DIR="${CAIRO_POD}/stwo_cairo_prover"
 BIN="target/release/gpu_bench"                      # relative to POD_PROVER_DIR
+AOT_INDEX_BIN="target/release/aot_index_check"       # same AOT pack, host-only
 POD_USER="root"
 
 # PIE inputs on the pod (already present, hash-verified — never synced).
@@ -773,6 +774,7 @@ python3 "$ARCHITECTURE_CHECK" \
   --raw-input-manifest "$INPUT_SHA256SUMS" \
   --bootloader "$BOOTLOADER_JSON_SOURCE" \
   --pinned-adapted-manifest "$PINNED_ADAPTED_SHA256SUMS" \
+  --aot-manifest "$STWO_LOCAL/crates/backend-cuda-kernels/cuda/generated/aot_manifest.json" \
   --runtime-mode "$GPU_PCS_RUNTIME_MODE" --expected-dry-run "$DRY_RUN" \
   --stwo-head "$STWO_REV" --stwo-worktree-hash "$STWO_WORKTREE_HASH" \
   --stwo-cairo-head "$CAIRO_REV" --stwo-cairo-worktree-hash "$CAIRO_WORKTREE_HASH" \
@@ -940,10 +942,10 @@ sync_repos() {
 # (c) Incremental build (abort loudly, with the log tail)
 # ---------------------------------------------------------------------------
 build_pod() {
-  log "incremental build on pod (gpu_bench, --features pie-bench)"
+  log "incremental build on pod (gpu_bench + AOT index checker, --features pie-bench)"
   run_ssh "mkdir -p '${POD_RUN_DIR}'"
   if [[ "$DRY_RUN" == "1" ]]; then
-    dry "build: STWO_CUDA_BUILD_JOBS=16 STWO_BOOTLOADER_JSON=${POD_BOOTLOADER_JSON} cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench"
+    dry "build: STWO_CUDA_BUILD_JOBS=16 STWO_BOOTLOADER_JSON=${POD_BOOTLOADER_JSON} cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --bin aot_index_check --features pie-bench"
     return 0
   fi
   local out
@@ -956,7 +958,7 @@ build_pod() {
       STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache \
       STWO_CUDA_BUILD_JOBS=16 \
       STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}' \
-      cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench \
+      cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --bin aot_index_check --features pie-bench \
       >> '${POD_BUILD_LOG}' 2>&1; echo BUILD_EXIT=\$?")"
   local code
   code="$(printf '%s\n' "$out" | sed -n 's/.*BUILD_EXIT=\([0-9][0-9]*\).*/\1/p' | tail -1)"
@@ -966,6 +968,78 @@ build_pod() {
     die "compile error — aborting before any benchmark. No ledger entry written."
   fi
   log "build OK"
+}
+
+check_embedded_aot_index() {
+  local artifact="${RESULTS_DIR}/${STAMP}.aot-index-check.json"
+  local keys key_args="" checker_sha raw
+  keys="$(python3 - "$LOCAL_PREFLIGHT_ADMISSION" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    admission = json.load(stream)
+for key in (admission.get("aot_coverage") or {}).get("required_unique_keys", []):
+    if not isinstance(key, str) or len(key) != 16 or any(c not in "0123456789abcdef" for c in key):
+        raise SystemExit("invalid admitted AOT key")
+    print(key)
+PY
+)"
+  [[ -n "$keys" ]] || die "local admission contains no exact AOT keys"
+  while IFS= read -r key; do key_args+=" --key ${key}"; done <<< "$keys"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    checker_sha="$(printf 'd%.0s' {1..64})"
+    raw="{\"pass\":true,\"sm\":90,\"loaded_manifest_hash\":\"000000000000c0da\",\"required_unique_key_count\":$(wc -l <<< "$keys" | tr -d ' '),\"missing_keys\":[]}"
+  else
+    checker_sha="$(run_ssh "sha256sum '${POD_PROVER_DIR}/${AOT_INDEX_BIN}' | cut -d' ' -f1")"
+    [[ "$checker_sha" =~ ^[0-9a-f]{64}$ ]] \
+      || die "could not hash the post-build AOT index checker"
+    if ! raw="$(run_ssh "cd '${POD_PROVER_DIR}' && './${AOT_INDEX_BIN}' --sm 90${key_args}")"; then
+      die "post-build embedded AOT index does not cover the locally admitted key union"
+    fi
+  fi
+  AOT_CHECK_RAW="$raw" AOT_CHECK_BINARY_SHA="$checker_sha" \
+  AOT_CHECK_BINARY_PATH="${POD_PROVER_DIR}/${AOT_INDEX_BIN}" \
+  AOT_CHECK_DRY_RUN="$DRY_RUN" AOT_CHECK_SOURCE_STWO_HEAD="$STWO_REV" \
+  AOT_CHECK_SOURCE_STWO_HASH="$STWO_WORKTREE_HASH" \
+  AOT_CHECK_SOURCE_CAIRO_HEAD="$CAIRO_REV" \
+  AOT_CHECK_SOURCE_CAIRO_HASH="$CAIRO_WORKTREE_HASH" \
+  python3 - "$LOCAL_PREFLIGHT_ADMISSION" "$artifact" <<'PY'
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    admission = json.load(stream)
+coverage = admission["aot_coverage"]
+result = json.loads(os.environ["AOT_CHECK_RAW"])
+if (set(result) != {"pass", "sm", "loaded_manifest_hash", "required_unique_key_count", "missing_keys"}
+        or result["pass"] is not True or result["sm"] != 90
+        or result["required_unique_key_count"] != coverage["required_unique_key_count"]
+        or result["missing_keys"] != []
+        or not isinstance(result["loaded_manifest_hash"], str)
+        or len(result["loaded_manifest_hash"]) != 16
+        or result["loaded_manifest_hash"] == "0" * 16
+        or any(c not in "0123456789abcdef" for c in result["loaded_manifest_hash"])
+        or not isinstance(os.environ["AOT_CHECK_BINARY_SHA"], str)
+        or len(os.environ["AOT_CHECK_BINARY_SHA"]) != 64):
+    raise SystemExit("invalid post-build AOT index check")
+artifact = {
+    "schema": "stwo.aot-index-check.v1",
+    "dry_run": os.environ["AOT_CHECK_DRY_RUN"] == "1",
+    **result,
+    "required_unique_keys_sha256": coverage["required_unique_keys_sha256"],
+    "checker_binary": {
+        "path": os.environ["AOT_CHECK_BINARY_PATH"],
+        "sha256": os.environ["AOT_CHECK_BINARY_SHA"],
+    },
+    "source": {
+        "stwo": {"head": os.environ["AOT_CHECK_SOURCE_STWO_HEAD"],
+                 "worktree_hash": os.environ["AOT_CHECK_SOURCE_STWO_HASH"]},
+        "stwo_cairo": {"head": os.environ["AOT_CHECK_SOURCE_CAIRO_HEAD"],
+                       "worktree_hash": os.environ["AOT_CHECK_SOURCE_CAIRO_HASH"]},
+    },
+}
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump(artifact, stream, sort_keys=True)
+    stream.write("\n")
+PY
+  log "post-build embedded AOT index: exact sm_90 union covered ($(wc -l <<< "$keys" | tr -d ' ') keys)"
 }
 
 seal_gpu_bench() {
@@ -1097,7 +1171,7 @@ artifact = {
     "gates": [
         {"name": name, "command": list(command), "exit_code": 0,
          "executed_tests": required,
-         "required_tests": required, "passed": True}
+         "required_tests": required, "stub_skip_detected": False, "passed": True}
         for name, command, required in gates
     ],
 }
@@ -1856,6 +1930,7 @@ else
   verify_remote_source_projection \
     || die "remote source does not equal the checksum-synced local source"
   build_pod
+  check_embedded_aot_index
   seal_gpu_bench
 fi
 

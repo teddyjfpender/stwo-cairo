@@ -27,6 +27,7 @@ RESIDENT_FIXTURE = re.compile(r'STRICT_RESIDENT_FIXTURE: &str = "([^"]+)"')
 STRICT_RESIDENT_REQUIRED_TESTS = (
     "strict_resident_cold_and_warm_proofs_match_simd_bytes",
     "strict_resident_same_shape_changed_memory_matches_second_simd_proof",
+    "strict_resident_same_workspace_changed_base_params_matches_second_simd_proof",
     "strict_resident_poseidon_graph_a_matches_simd_bytes",
     "strict_resident_transcript_mirror_diagnostic_once",
     "strict_resident_mirrored_transcript_matches_host_channel",
@@ -54,6 +55,42 @@ GATES = (
         "cuda_link_required",
         ("cargo", "test", "-p", "stwo-backend-cuda", "--test", "cuda_required"),
         3,
+    ),
+    (
+        "fp256_poseidon_deduce_kinds_4_11",
+        (
+            "env",
+            "STWO_CUDA_SOUNDNESS_REQUIRED=1",
+            "cargo",
+            "test",
+            "--manifest-path",
+            "../stwo-cairo/stwo_cairo_prover/Cargo.toml",
+            "-p",
+            "stwo-cairo-prover",
+            "--lib",
+            "stwo_wit_deduce_oracle_matches_fast_deduction",
+        ),
+        1,
+    ),
+    (
+        "poseidon_partial_strict_aot_captured_row",
+        (
+            "env",
+            "STWO_CUDA_SOUNDNESS_REQUIRED=1",
+            "STWO_CUDA_WITNESS_JIT_MAX_INSTRS=8192",
+            "cargo",
+            "test",
+            "--manifest-path",
+            "../stwo-cairo/stwo_cairo_prover/Cargo.toml",
+            "-p",
+            "stwo-cairo-prover",
+            "--lib",
+            "poseidon_combination_37_strict_aot_captured_row",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+        ),
+        1,
     ),
     (
         "backend_conformance_both_channels",
@@ -349,7 +386,9 @@ def run_gate(stwo: Path, name: str, command: tuple[str, ...], expected: int) -> 
     # The whole-proof gate builds full resident sessions (SN2-profile arenas
     # are ~15 GiB each plus the pedersen points table); four concurrent
     # sessions exhaust an 80 GiB device, so that target runs serially.
-    extra_args: tuple[str, ...] = ("--", "--nocapture")
+    extra_args: tuple[str, ...] = (
+        ("--nocapture",) if "--" in actual_command else ("--", "--nocapture")
+    )
     if name == STRICT_RESIDENT_GATE:
         extra_args = ("--", "--nocapture", "--test-threads=1")
     process = subprocess.run(
@@ -371,7 +410,13 @@ def run_gate(stwo: Path, name: str, command: tuple[str, ...], expected: int) -> 
         set(executed_test_names) == set(required_test_names)
         and len(executed_test_names) == len(required_test_names)
     )
-    passed = process.returncode == 0 and executed == expected and names_match
+    stub_skip_detected = "SKIPPED (stub build)" in process.stdout
+    passed = (
+        process.returncode == 0
+        and executed == expected
+        and names_match
+        and not stub_skip_detected
+    )
     record = {
         "name": name,
         "command": list(command),
@@ -380,6 +425,7 @@ def run_gate(stwo: Path, name: str, command: tuple[str, ...], expected: int) -> 
         "exit_code": process.returncode,
         "executed_tests": executed,
         "required_tests": expected,
+        "stub_skip_detected": stub_skip_detected,
         "passed": passed,
     }
     if required_test_names is not None:

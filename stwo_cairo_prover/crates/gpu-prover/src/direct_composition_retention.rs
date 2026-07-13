@@ -1310,6 +1310,7 @@ mod tests {
                 n_constraints: 1,
                 random_coefficient_offset: offset,
                 denominator_inverses: vec![BaseField::from(1); 1 << (eval_log - 4)],
+                base_param_values: Vec::new(),
                 ext_param_values: Vec::new(),
                 ext_param_sources: Vec::new(),
                 kernels: vec![CompositionKernelPart {

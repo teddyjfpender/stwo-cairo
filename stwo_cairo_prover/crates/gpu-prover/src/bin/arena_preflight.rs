@@ -23,7 +23,11 @@
 //!                                            test_data/<name>/compiled.json,
 //!                                            run through the VM + adapter
 //!                                            in-process (dev_utils run_and_adapt)
+//! Both input forms require `--aot-manifest <path>` so host admission proves
+//! every exact constraint and witness launch key is present before pod contact.
 //! Options:
+//!   --aot-manifest <path>     required generated/aot_manifest.json whose exact
+//!                             semantic keys must cover this statement
 //!   --vram-budget-gb <f64>   budget in GiB the arena must fit under (default 79)
 //!   --preprocessed <canonical|canonical-without-pedersen>
 //!                            preprocessed-trace variant override. Default is
@@ -53,6 +57,92 @@ use stwo_cairo_gpu_prover::resident_session::{
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AotKernelOccurrence {
+    kind: &'static str,
+    component: String,
+    instance: usize,
+    kernel: usize,
+    kernel_name: String,
+    semantic_hash: u64,
+    cache_key: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AotManifestKernel {
+    kind: String,
+    kernel_name: String,
+    semantic_hash: u64,
+}
+
+struct AotCoverage {
+    manifest_path: String,
+    manifest_blake3: String,
+    manifest_entries: usize,
+    required: Vec<AotKernelOccurrence>,
+    missing: Vec<(AotKernelOccurrence, &'static str)>,
+}
+
+impl AotKernelOccurrence {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": self.kind,
+            "component": self.component,
+            "instance": self.instance,
+            "kernel": self.kernel,
+            "kernel_name": self.kernel_name,
+            "semantic_hash": format!("{:016x}", self.semantic_hash),
+            "cache_key": format!("{:016x}", self.cache_key),
+        })
+    }
+}
+
+impl AotCoverage {
+    fn passed(&self) -> bool {
+        self.missing.is_empty()
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let unique_keys = self
+            .required
+            .iter()
+            .map(|kernel| kernel.cache_key)
+            .collect::<BTreeSet<_>>();
+        let required_occurrences = self
+            .required
+            .iter()
+            .map(AotKernelOccurrence::json)
+            .collect::<Vec<_>>();
+        let unique_key_values = unique_keys
+            .iter()
+            .map(|key| format!("{key:016x}"))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "pass": self.passed(),
+            "manifest": self.manifest_path,
+            "manifest_blake3": self.manifest_blake3,
+            "manifest_entries": self.manifest_entries,
+            "required_occurrences_blake3": blake3_hex(&serde_json::to_vec(&required_occurrences).unwrap()),
+            "required_unique_keys_blake3": blake3_hex(&serde_json::to_vec(&unique_key_values).unwrap()),
+            "required_occurrences": required_occurrences,
+            "required_occurrence_count": self.required.len(),
+            "required_unique_key_count": unique_keys.len(),
+            "missing_occurrences": self.missing.iter().map(|(kernel, reason)| {
+                let mut value = kernel.json();
+                value.as_object_mut().unwrap().insert(
+                    "reason".to_owned(), serde_json::Value::String((*reason).to_owned())
+                );
+                value
+            }).collect::<Vec<_>>(),
+            "missing_occurrence_count": self.missing.len(),
+        })
+    }
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
 /// Budget in bytes for a GiB budget flag value.
 fn budget_bytes_of(vram_budget_gb: f64) -> usize {
     (vram_budget_gb * GIB) as usize
@@ -77,8 +167,13 @@ fn verdict(
     blockers: usize,
     arena_bytes: usize,
     budget_bytes: usize,
+    aot_coverage_ok: bool,
 ) -> bool {
-    capture_safe_ok && coverage_gaps == 0 && blockers == 0 && arena_bytes <= budget_bytes
+    capture_safe_ok
+        && coverage_gaps == 0
+        && blockers == 0
+        && arena_bytes <= budget_bytes
+        && aot_coverage_ok
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -99,6 +194,145 @@ fn fail(stage: &str, error: String) -> ExitCode {
     });
     println!("{}", serde_json::to_string_pretty(&record).unwrap());
     ExitCode::FAILURE
+}
+
+fn lower_hex_u64(value: &serde_json::Value, field: &str) -> Result<u64, String> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("AOT manifest {field} must be a string"))?;
+    if value.len() != 16
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "AOT manifest {field} must be 16 lowercase hex digits"
+        ));
+    }
+    u64::from_str_radix(value, 16).map_err(|error| format!("invalid AOT manifest {field}: {error}"))
+}
+
+fn load_aot_manifest(path: &str) -> Result<(BTreeMap<u64, AotManifestKernel>, String), String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("failed to read AOT manifest {path}: {error}"))?;
+    let manifest_blake3 = blake3_hex(&bytes);
+    let entries: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to parse AOT manifest {path}: {error}"))?;
+    let entries = entries
+        .as_array()
+        .ok_or_else(|| "AOT manifest root must be an array".to_owned())?;
+    let mut manifest = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| format!("AOT manifest entry {index} must be an object"))?;
+        let string = |field: &str| -> Result<String, String> {
+            entry
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("AOT manifest entry {index} has invalid {field}"))
+        };
+        let cache_key = lower_hex_u64(
+            entry
+                .get("cache_key")
+                .ok_or_else(|| format!("AOT manifest entry {index} lacks cache_key"))?,
+            "cache_key",
+        )?;
+        string("label")?;
+        let kernel = AotManifestKernel {
+            kind: string("kind")?,
+            kernel_name: string("kernel_name")?,
+            semantic_hash: lower_hex_u64(
+                entry
+                    .get("semantic_hash")
+                    .ok_or_else(|| format!("AOT manifest entry {index} lacks semantic_hash"))?,
+                "semantic_hash",
+            )?,
+        };
+        if !matches!(kernel.kind.as_str(), "constraint" | "witness") {
+            return Err(format!("AOT manifest entry {index} has invalid kind"));
+        }
+        if manifest.insert(cache_key, kernel).is_some() {
+            return Err(format!("AOT manifest repeats cache key {cache_key:016x}"));
+        }
+    }
+    if manifest.is_empty() {
+        return Err("AOT manifest must not be empty".to_owned());
+    }
+    Ok((manifest, manifest_blake3))
+}
+
+fn required_aot_kernels(report: &ResidentPreflightReport) -> Vec<AotKernelOccurrence> {
+    let mut required = Vec::new();
+    for component in &report.arena.composition().plan.components {
+        for (kernel, part) in component.kernels.iter().enumerate() {
+            required.push(AotKernelOccurrence {
+                kind: "constraint",
+                component: component.component.to_owned(),
+                instance: component.instance,
+                kernel,
+                kernel_name: part.kernel_name.clone(),
+                semantic_hash: part.semantic_hash,
+                cache_key: part.cache_key,
+            });
+        }
+    }
+    let mut witness_instances = BTreeMap::<&str, usize>::new();
+    for component in &report.arena.witness().components {
+        let instance = witness_instances.entry(component.component).or_default();
+        let semantic_hash = component.program.semantic_hash();
+        required.push(AotKernelOccurrence {
+            kind: "witness",
+            component: component.component.to_owned(),
+            instance: *instance,
+            kernel: 0,
+            kernel_name: stwo_backend_cuda::jit_witness::codegen::witness_kernel_name(
+                semantic_hash,
+            ),
+            semantic_hash,
+            cache_key: stwo_backend_cuda::jit_witness::codegen::witness_jit_cache_key(
+                semantic_hash,
+            ),
+        });
+        *instance += 1;
+    }
+    required.sort();
+    required
+}
+
+fn missing_aot_kernels(
+    required: &[AotKernelOccurrence],
+    manifest: &BTreeMap<u64, AotManifestKernel>,
+) -> Vec<(AotKernelOccurrence, &'static str)> {
+    required
+        .iter()
+        .filter_map(|kernel| match manifest.get(&kernel.cache_key) {
+            None => Some((kernel.clone(), "missing_key")),
+            Some(entry)
+                if entry.kind != kernel.kind
+                    || entry.kernel_name != kernel.kernel_name
+                    || entry.semantic_hash != kernel.semantic_hash =>
+            {
+                Some((kernel.clone(), "identity_mismatch"))
+            }
+            Some(_) => None,
+        })
+        .collect()
+}
+
+fn aot_coverage(report: &ResidentPreflightReport, path: &str) -> Result<AotCoverage, String> {
+    let (manifest, manifest_blake3) = load_aot_manifest(path)?;
+    let required = required_aot_kernels(report);
+    let missing = missing_aot_kernels(&required, &manifest);
+    Ok(AotCoverage {
+        manifest_path: path.to_owned(),
+        manifest_blake3,
+        manifest_entries: manifest.len(),
+        required,
+        missing,
+    })
 }
 
 fn load_input(
@@ -204,6 +438,7 @@ fn compacted_consumer_rows(
 
 fn report_json(
     report: &ResidentPreflightReport,
+    aot_coverage: &AotCoverage,
     compacted_rows: Vec<serde_json::Value>,
     source: &str,
     vram_budget_gb: f64,
@@ -301,6 +536,7 @@ fn report_json(
         blockers.len(),
         total_bytes,
         budget_bytes,
+        aot_coverage.passed(),
     );
 
     serde_json::json!({
@@ -310,6 +546,7 @@ fn report_json(
         "capture_safe_components": report.capture_safe_components.len(),
         "capture_safe_coverage_ok": capture_safe_ok,
         "recorded_witness_lanes": report.recorded_lanes.len(),
+        "aot_coverage": aot_coverage.json(),
         "compacted_consumer_rows": compacted_rows,
         "multiplicity_coverage_gaps": coverage_gaps,
         "multiplicity_feed_blockers": blockers,
@@ -350,6 +587,10 @@ fn main() -> ExitCode {
         Err(error) => return fail("args", error),
     };
     let variant_override = arg("--preprocessed");
+    let aot_manifest = match arg("--aot-manifest") {
+        Some(path) => path,
+        None => return fail("args", "--aot-manifest <path> is required".to_owned()),
+    };
     let (input, variant, source) = match load_input(variant_override.as_deref()) {
         Ok(loaded) => loaded,
         Err(error) => return fail("load_input", error),
@@ -380,7 +621,18 @@ fn main() -> ExitCode {
         }
     };
 
-    let record = report_json(&report, compacted_rows, &source, vram_budget_gb);
+    let aot_coverage = match aot_coverage(&report, &aot_manifest) {
+        Ok(coverage) => coverage,
+        Err(error) => return fail("aot_manifest", error),
+    };
+
+    let record = report_json(
+        &report,
+        &aot_coverage,
+        compacted_rows,
+        &source,
+        vram_budget_gb,
+    );
     println!("{}", serde_json::to_string_pretty(&record).unwrap());
     if record["pass"].as_bool() == Some(true) {
         ExitCode::SUCCESS
@@ -391,7 +643,12 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{budget_bytes_of, parse_vram_budget_gb, verdict, GIB, WORD_BYTES};
+    use std::collections::BTreeMap;
+
+    use super::{
+        budget_bytes_of, missing_aot_kernels, parse_vram_budget_gb, verdict, AotKernelOccurrence,
+        AotManifestKernel, GIB, WORD_BYTES,
+    };
 
     #[test]
     fn budget_bytes_is_gib_scaled() {
@@ -422,11 +679,44 @@ mod tests {
     #[test]
     fn verdict_requires_every_gate() {
         // All green, at the budget boundary (inclusive).
-        assert!(verdict(true, 0, 0, 100, 100));
+        assert!(verdict(true, 0, 0, 100, 100, true));
         // Each individual failure flips the verdict.
-        assert!(!verdict(false, 0, 0, 100, 100));
-        assert!(!verdict(true, 1, 0, 100, 100));
-        assert!(!verdict(true, 0, 1, 100, 100));
-        assert!(!verdict(true, 0, 0, 101, 100));
+        assert!(!verdict(false, 0, 0, 100, 100, true));
+        assert!(!verdict(true, 1, 0, 100, 100, true));
+        assert!(!verdict(true, 0, 1, 100, 100, true));
+        assert!(!verdict(true, 0, 0, 101, 100, true));
+        assert!(!verdict(true, 0, 0, 100, 100, false));
+    }
+
+    #[test]
+    fn aot_coverage_requires_exact_launch_identity() {
+        let kernel = AotKernelOccurrence {
+            kind: "constraint",
+            component: "component".to_owned(),
+            instance: 0,
+            kernel: 0,
+            kernel_name: "kernel".to_owned(),
+            semantic_hash: 7,
+            cache_key: 11,
+        };
+        let mut manifest = BTreeMap::from([(
+            11,
+            AotManifestKernel {
+                kind: "constraint".to_owned(),
+                kernel_name: "kernel".to_owned(),
+                semantic_hash: 7,
+            },
+        )]);
+        assert!(missing_aot_kernels(&[kernel.clone()], &manifest).is_empty());
+        manifest.get_mut(&11).unwrap().semantic_hash ^= 1;
+        assert_eq!(
+            missing_aot_kernels(&[kernel.clone()], &manifest)[0].1,
+            "identity_mismatch"
+        );
+        manifest.clear();
+        assert_eq!(
+            missing_aot_kernels(&[kernel], &manifest)[0].1,
+            "missing_key"
+        );
     }
 }

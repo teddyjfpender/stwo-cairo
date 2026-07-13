@@ -242,6 +242,7 @@ pub struct CompositionComponentRequirements {
     pub fallback_count: usize,
     pub interaction_offsets: [u32; TRACE_TREES],
     pub denominator_words: usize,
+    pub base_param_words: usize,
     pub ext_param_words: usize,
     pub random_coefficient_offset: usize,
     pub accumulator_offset_words: usize,
@@ -269,6 +270,7 @@ struct ComponentDescriptorLayout {
     fallback_evaluation_pointers: Option<usize>,
     interaction_offsets: usize,
     denominator_inverses: usize,
+    base_params: usize,
 }
 
 /// Pure shape/sizing result. It contains logical source/slot identities but no
@@ -680,6 +682,7 @@ pub(crate) fn composition_workspace_requirements_with_retention(
             fallback_count: 0,
             interaction_offsets,
             denominator_words: expected_denominators,
+            base_param_words: component.base_param_values.len(),
             ext_param_words: component
                 .ext_param_values
                 .len()
@@ -744,6 +747,11 @@ pub(crate) fn composition_workspace_requirements_with_retention(
             .len()
             .checked_mul(POINTER_WORDS)
             .ok_or(PreparedCompositionError::SizeOverflow)?;
+        let base_params = if component.base_param_words == 0 {
+            zero_words
+        } else {
+            descriptor.take(component.base_param_words, 1)?
+        };
         component_descriptors.push(ComponentDescriptorLayout {
             coefficient_pointers: descriptor
                 .take(pointer_words, COMPOSITION_POINTER_ALIGNMENT_WORDS)?,
@@ -775,6 +783,7 @@ pub(crate) fn composition_workspace_requirements_with_retention(
                 .transpose()?,
             interaction_offsets: descriptor.take(TRACE_TREES, 1)?,
             denominator_inverses: descriptor.take(component.denominator_words, 1)?,
+            base_params,
         });
     }
 
@@ -1269,6 +1278,7 @@ struct PreparedComponent {
     fallback_evaluation_pointers: usize,
     interaction_offsets: usize,
     denominator_inverses: usize,
+    base_params: usize,
     ext_params: *const u32,
     accumulator_offset_words: usize,
     trace_log_size: u32,
@@ -1743,6 +1753,15 @@ impl<'a> PreparedCompositionGraph<'a> {
             {
                 *word = value.0;
             }
+            if component.base_param_words != 0 {
+                for (word, value) in descriptor_words
+                    [descriptor.base_params..descriptor.base_params + component.base_param_words]
+                    .iter_mut()
+                    .zip(&component_plan.base_param_values)
+                {
+                    *word = value.0;
+                }
+            }
 
             let ext_params = match (component.ext_param_words, ext_binding) {
                 (0, None) => unsafe { descriptors.as_u32_ptr().add(requirements.zero_words) },
@@ -1909,6 +1928,7 @@ impl<'a> PreparedCompositionGraph<'a> {
                     .unwrap_or(descriptor.evaluation_pointers),
                 interaction_offsets: descriptor.interaction_offsets,
                 denominator_inverses: descriptor.denominator_inverses,
+                base_params: descriptor.base_params,
                 ext_params,
                 accumulator_offset_words: component.accumulator_offset_words,
                 trace_log_size: component.trace_log_size,
@@ -2203,7 +2223,7 @@ impl<'a> PreparedCompositionGraph<'a> {
                     kernel.cache_key,
                     descriptor_ptr.add(component.evaluation_pointers),
                     descriptor_ptr.add(component.interaction_offsets),
-                    descriptor_ptr.add(self.requirements.zero_words),
+                    descriptor_ptr.add(component.base_params),
                     component.ext_params,
                     self.random_coefficient_powers.as_u32_ptr(),
                     descriptor_ptr.add(component.denominator_inverses),
@@ -2450,6 +2470,7 @@ mod tests {
             n_constraints: constraints,
             random_coefficient_offset: random_offset,
             denominator_inverses: vec![BaseField::from(1); 1usize << (eval_log - trace_log)],
+            base_param_values: Vec::new(),
             ext_param_values: Vec::new(),
             ext_param_sources: Vec::new(),
             kernels: vec![kernel(0)],
@@ -2482,6 +2503,28 @@ mod tests {
             max_evaluation_log_size: 8,
             components: vec![component("a", 5, 8, 2, 0, preprocessed, 1..4, 0..2)],
         }
+    }
+
+    #[test]
+    fn base_parameters_use_immutable_component_descriptor_storage() {
+        let mut plan = one_component_plan(vec![0]);
+        let without = composition_workspace_requirements(&plan, &trace()).unwrap();
+        assert_eq!(without.components[0].base_param_words, 0);
+        assert_eq!(
+            without.component_descriptors[0].base_params,
+            without.zero_words
+        );
+
+        plan.components[0].base_param_values = vec![
+            BaseField::from_u32_unchecked(7),
+            BaseField::from_u32_unchecked(11),
+        ];
+        let with = composition_workspace_requirements(&plan, &trace()).unwrap();
+        assert_eq!(with.components[0].base_param_words, 2);
+        let offset = with.component_descriptors[0].base_params;
+        assert_ne!(offset, with.zero_words);
+        assert!(offset + 2 <= with.descriptor_words);
+        assert!(with.descriptor_words >= without.descriptor_words + 2);
     }
 
     fn opened_source(tree: usize, column: usize) -> OpenedColumnSource {

@@ -14,6 +14,7 @@ from unittest import mock
 
 try:
     from gpu_benchmarks.generate_benchmark_report import (
+        ARCHITECTURE,
         FLAGS_OFF_POLICY,
         GPU_TELEMETRY_COLUMNS,
         HEADLINE_POLICY,
@@ -24,6 +25,7 @@ try:
         QUALIFICATION_PROFILES,
         ReportError,
         RETAINED_BUDGET_FLAG,
+        STAGES,
         UNIVERSAL_POLICY,
         generate_report,
     )
@@ -34,6 +36,7 @@ try:
     )
 except ModuleNotFoundError:  # Direct execution from gpu_benchmarks/.
     from generate_benchmark_report import (
+        ARCHITECTURE,
         FLAGS_OFF_POLICY,
         GPU_TELEMETRY_COLUMNS,
         HEADLINE_POLICY,
@@ -44,6 +47,7 @@ except ModuleNotFoundError:  # Direct execution from gpu_benchmarks/.
         QUALIFICATION_PROFILES,
         ReportError,
         RETAINED_BUDGET_FLAG,
+        STAGES,
         UNIVERSAL_POLICY,
         generate_report,
     )
@@ -145,6 +149,24 @@ class Fixture:
         )
 
         ceiling = PREFLIGHT_CAP_BYTES
+        self.aot_occurrences = [{
+            "kind": "constraint",
+            "component": "fixture_component",
+            "instance": 0,
+            "kernel": 0,
+            "kernel_name": "stwo_jit_fused_1111111111111111",
+            "semantic_hash": "1111111111111111",
+            "cache_key": "2222222222222222",
+        }]
+        self.aot_manifest = root / "aot_manifest.json"
+        self.aot_manifest.write_text(json.dumps([{
+            "kind": "constraint",
+            "label": "fixture_component",
+            "kernel_name": "stwo_jit_fused_1111111111111111",
+            "cache_key": "2222222222222222",
+            "semantic_hash": "1111111111111111",
+            "file": "constraint_fixture_component_2222222222222222.cu",
+        }]) + "\n")
         self.preflight_summaries = {}
         for label, number, arena in [
             *( (f"universal_SN{n}", n, 20 * 1024**3 + n) for n in range(1, 5) ),
@@ -166,6 +188,19 @@ class Fixture:
                 "arena": {"total_bytes": arena},
                 "runtime_policy": policy,
                 "source": str(adapted_path),
+                "aot_coverage": {
+                    "pass": True,
+                    "manifest": str(self.aot_manifest),
+                    "manifest_blake3": "a" * 64,
+                    "manifest_entries": 1,
+                    "required_occurrences": self.aot_occurrences,
+                    "required_occurrences_blake3": "b" * 64,
+                    "required_occurrence_count": 1,
+                    "required_unique_keys_blake3": "c" * 64,
+                    "required_unique_key_count": 1,
+                    "missing_occurrences": [],
+                    "missing_occurrence_count": 0,
+                },
             }))
             self.preflight_summaries[label] = {
                 "artifact": str(artifact),
@@ -175,6 +210,16 @@ class Fixture:
                 "arena_bytes": arena,
                 "arena_gib": arena / 1024**3,
                 "runtime_policy": policy,
+                "aot_coverage": {
+                    "manifest": str(self.aot_manifest),
+                    "manifest_blake3": "a" * 64,
+                    "manifest_entries": 1,
+                    "required_occurrence_count": 1,
+                    "required_unique_key_count": 1,
+                    "required_occurrences_blake3": "b" * 64,
+                    "required_unique_keys_blake3": "c" * 64,
+                    "missing_occurrence_count": 0,
+                },
             }
 
         pie_root = (
@@ -236,6 +281,7 @@ class Fixture:
                 "exit_code": 0,
                 "executed_tests": required,
                 "required_tests": required,
+                "stub_skip_detected": False,
                 "passed": True,
             }
             if name == STRICT_RESIDENT_GATE:
@@ -273,6 +319,56 @@ class Fixture:
             "bootloader_sha256": "5" * 64,
             "pinned_adapted_manifest_sha256": sha(self.pinned_manifest),
         }
+        occurrence_sha = canonical_sha(self.aot_occurrences)
+        key_sha = canonical_sha(["2222222222222222"])
+        preflight_occurrence_sha = {
+            Path(summary["artifact"]).name: occurrence_sha
+            for summary in self.preflight_summaries.values()
+        }
+        self.aot_admission = {
+            "manifest": str(self.aot_manifest),
+            "manifest_sha256": sha(self.aot_manifest),
+            "manifest_blake3": "a" * 64,
+            "manifest_entry_count": 1,
+            "required_occurrence_count": 1,
+            "required_unique_key_count": 1,
+            "required_unique_keys": ["2222222222222222"],
+            "required_occurrences_sha256": occurrence_sha,
+            "required_unique_keys_sha256": key_sha,
+            "preflight_occurrences_sha256": preflight_occurrence_sha,
+            "preflight_occurrences_blake3": {
+                name: "b" * 64 for name in preflight_occurrence_sha
+            },
+            "preflight_unique_keys_blake3": {
+                name: "c" * 64 for name in preflight_occurrence_sha
+            },
+            "per_sn": {
+                f"SN_PIE_{number}": {
+                    "required_occurrence_count": 1,
+                    "required_unique_key_count": 1,
+                    "required_occurrences_sha256": occurrence_sha,
+                    "required_unique_keys_sha256": key_sha,
+                }
+                for number in range(1, 5)
+            },
+            "missing_occurrences": [],
+        }
+        self.aot_index_check = root / "aot-index-check.json"
+        self.aot_index_check.write_text(json.dumps({
+            "schema": "stwo.aot-index-check.v1",
+            "dry_run": dry_run,
+            "pass": True,
+            "sm": 90,
+            "loaded_manifest_hash": "000000000000c0da",
+            "required_unique_key_count": 1,
+            "required_unique_keys_sha256": key_sha,
+            "missing_keys": [],
+            "checker_binary": {
+                "path": "/workspace/stwo-cairo/stwo_cairo_prover/target/release/aot_index_check",
+                "sha256": "d" * 64,
+            },
+            "source": self.source,
+        }))
         self.local_admission = root / "local_admission.json"
         self.local_admission.write_text(json.dumps({
             "schema": "stwo.local-preflight-admission.v1",
@@ -288,6 +384,7 @@ class Fixture:
                 Path(summary["artifact"]).name: summary["artifact_sha256"]
                 for summary in self.preflight_summaries.values()
             },
+            "aot_coverage": self.aot_admission,
             "adapted_input_manifest_sha256": sha(self.adapted_manifest),
             "adapter_reproduction": self.adapter_reproduction,
         }))
@@ -483,6 +580,11 @@ class Fixture:
             "normalized_states": copy.deepcopy(QUALIFICATION_NORMALIZED_STATES),
             "flags_off_preflight": self.preflight_summaries["flags_off_SN2"],
             "adapter_reproduction": copy.deepcopy(self.adapter_reproduction),
+            "aot_coverage": copy.deepcopy(self.aot_admission),
+            "aot_index_check": {
+                "path": str(self.aot_index_check),
+                "sha256": sha(self.aot_index_check),
+            },
             "local_admission": {"path": str(self.local_admission), "sha256": sha(self.local_admission)},
             "soundness": {
                 "path": str(self.soundness),
@@ -602,6 +704,17 @@ class Fixture:
             "backend": "cuda",
             "engine": "gpu-native",
             "gpu": self.gpu,
+            "gpu_pcs_driver_architecture": ARCHITECTURE,
+            "gpu_pcs_runtime_mode": "ArenaGraph",
+            "gpu_pcs_stage_started": {stage: 1 for stage in STAGES},
+            "gpu_pcs_stage_finished": {stage: 1 for stage in STAGES},
+            "gpu_pcs_batched_tree_decommit": True,
+            "gpu_pcs_driver_complete": True,
+            "gpu_native_architecture_required": True,
+            "gpu_pcs_required_runtime_mode": "arena-graph",
+            "gpu_native_architecture_gate_passed": True,
+            "gpu_aot_loads": 2,
+            "gpu_aot_cache_hits": 5,
             "reps": reps,
             "gpu_proof_loop_started_unix_ns": 1_700_000_000_000_000_000,
             "gpu_proof_loop_finished_unix_ns": 1_700_000_004_000_000_000,
@@ -619,6 +732,32 @@ class Fixture:
             "useful_mhz_at_warm_p95": round3(steps / p95 / 1e6),
             "throughput_distribution_applicable": True,
             "performance_claim_admissible": True,
+            "gpu_aot_manifest_hash": 0xC0DA,
+            "gpu_aot_misses": 0,
+            "gpu_aot_runtime_loads": 0,
+            "gpu_aot_runtime_cache_hits": 0,
+            "gpu_aot_strict_rejections": 0,
+            "gpu_aot_provenance_gate_passed": True,
+            "steps_per_s": steps / median,
+            "mhz": cycles / median / 1e6,
+            "useful_mhz": steps / median / 1e6,
+            "gpu_host_syncs": 1,
+            "gpu_graph_launches": 29,
+            "gpu_kernel_launches": 2_473,
+            "gpu_hot_h2d_bytes": 0,
+            "gpu_hot_d2h_bytes": 1024,
+            "gpu_hot_allocations": 0,
+            "gpu_max_graph_submit_gap_ms": 1.25,
+            "gpu_graph_a_setup_gate_passed": True,
+            "gpu_setup_base_migration_copies": 0,
+            "gpu_setup_lookup_host_copies": 0,
+            "gpu_setup_legacy_witness_fallbacks": 0,
+            "gpu_execution_tables_ingest_compact_h2d_bytes": 4096,
+            "gpu_execution_tables_ingest_compact_h2d_copies": 3,
+            "gpu_execution_tables_ingest_descriptor_h2d_bytes": 64,
+            "gpu_execution_tables_ingest_descriptor_h2d_copies": 2,
+            "gpu_execution_tables_ingest_syncs": 1,
+            "gpu_witness_ingest_syncs": 1,
             "proof_comparison_applicable": True,
             "proof_byte_equal_required": True,
             "proof_byte_equal": True,
@@ -737,6 +876,9 @@ class GenerateBenchmarkReportTests(unittest.TestCase):
             "SIMD unequal": lambda q: q["benchmarks"]["SN_PIE_1"].update({"simd_reference_byte_equal": False}),
             "SIMD hash": lambda q: q["benchmarks"]["SN_PIE_1"].update({"simd_reference_blake3": "D" * 64}),
             "GPU/SIMD digest mismatch": lambda q: q["benchmarks"]["SN_PIE_1"].update({"gpu_proof_blake3": "e" * 64}),
+            "resident runtime": lambda q: q["benchmarks"]["SN_PIE_1"].pop(
+                "gpu_pcs_runtime_mode"
+            ),
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
@@ -948,6 +1090,38 @@ class GenerateBenchmarkReportTests(unittest.TestCase):
             )
             fixture.write()
             with self.assertRaisesRegex(ReportError, "artifact source"):
+                generate_report(fixture.path, fixture.root / "report")
+
+    def test_aot_manifest_identity_is_rederived_from_preflight_occurrences(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            manifest = json.loads(fixture.aot_manifest.read_text())
+            manifest[0]["semantic_hash"] = "3" * 16
+            fixture.aot_manifest.write_text(json.dumps(manifest) + "\n")
+            admission = json.loads(fixture.local_admission.read_text())
+            admission["aot_coverage"]["manifest_sha256"] = sha(fixture.aot_manifest)
+            fixture.local_admission.write_text(json.dumps(admission))
+            fixture.qualification["aot_coverage"] = copy.deepcopy(
+                admission["aot_coverage"]
+            )
+            fixture.qualification["local_admission"]["sha256"] = sha(
+                fixture.local_admission
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "uncovered AOT key"):
+                generate_report(fixture.path, fixture.root / "report")
+
+    def test_embedded_aot_manifest_hash_must_match_every_measurement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            index = json.loads(fixture.aot_index_check.read_text())
+            index["loaded_manifest_hash"] = "deadbeefdeadbeef"
+            fixture.aot_index_check.write_text(json.dumps(index))
+            fixture.qualification["aot_index_check"]["sha256"] = sha(
+                fixture.aot_index_check
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "embedded AOT manifest hash mismatch"):
                 generate_report(fixture.path, fixture.root / "report")
 
     def test_full_soundness_contract_and_wrapper_are_bound(self) -> None:

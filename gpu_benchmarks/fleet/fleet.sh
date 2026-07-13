@@ -585,10 +585,15 @@ artifact = {
     "gates": [
         {"name": name, "command": list(command), "exit_code": 0,
          "executed_tests": required,
-         "required_tests": required, "passed": True}
+         "required_tests": required, "stub_skip_detected": False, "passed": True}
         for name, command, required in gates
     ],
 }
+for gate in artifact["gates"]:
+    if gate["name"] == "strict_resident_whole_proof_simd_byte_identity":
+        from run_cuda_soundness_gate import STRICT_RESIDENT_REQUIRED_TESTS
+        gate["required_test_names"] = list(STRICT_RESIDENT_REQUIRED_TESTS)
+        gate["executed_test_names"] = list(STRICT_RESIDENT_REQUIRED_TESTS)
 with open(sys.argv[1], "w", encoding="utf-8") as stream:
     json.dump(artifact, stream)
     stream.write("\n")

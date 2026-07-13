@@ -697,6 +697,7 @@ python3 "$ARCHITECTURE_CHECK" \
   --raw-input-manifest "$INPUT_SHA256SUMS" \
   --bootloader "$BOOTLOADER_JSON_SOURCE" \
   --pinned-adapted-manifest "$PINNED_ADAPTED_SHA256SUMS" \
+  --aot-manifest "$STWO_LOCAL/crates/backend-cuda-kernels/cuda/generated/aot_manifest.json" \
   --runtime-mode "$GPU_PCS_RUNTIME_MODE" --expected-dry-run "$DRY_RUN" \
   --stwo-head "$STWO_REV" --stwo-worktree-hash "$STWO_WORKTREE_HASH" \
   --stwo-cairo-head "$CAIRO_REV" --stwo-cairo-worktree-hash "$CAIRO_WORKTREE_HASH" \

@@ -231,6 +231,7 @@ def valid_soundness_artifact(runtime_mode: str = "detached-eager") -> dict:
                 "exit_code": 0,
                 "executed_tests": required,
                 "required_tests": required,
+                "stub_skip_detected": False,
                 "passed": True,
             }
             for name, command, required in gates
@@ -314,7 +315,29 @@ def local_admission_fixture(root: Path) -> tuple[dict, Path, dict[str, Path]]:
 
     gpu_bench = root / "gpu_bench"
     gpu_bench.write_bytes(b"current-adapter-binary")
+    occurrence = {
+        "kind": "constraint",
+        "component": "fixture_component",
+        "instance": 0,
+        "kernel": 0,
+        "kernel_name": "stwo_jit_fused_1111111111111111",
+        "semantic_hash": "1111111111111111",
+        "cache_key": "2222222222222222",
+    }
+    occurrences = [occurrence]
+    aot_manifest = root / "aot_manifest.json"
+    aot_manifest.write_text(json.dumps([{
+        "kind": "constraint",
+        "label": "fixture_component",
+        "kernel_name": occurrence["kernel_name"],
+        "cache_key": occurrence["cache_key"],
+        "semantic_hash": occurrence["semantic_hash"],
+        "file": "constraint_fixture_component_2222222222222222.cu",
+    }]) + "\n", encoding="utf-8")
     preflight_hashes = {}
+    preflight_occurrence_sha256 = {}
+    preflight_occurrence_blake3 = {}
+    preflight_key_blake3 = {}
     for artifact_name, (input_name, runtime_policy) in PREFLIGHT_SPECS.items():
         artifact_path = root / artifact_name
         artifact_path.write_text(
@@ -326,6 +349,19 @@ def local_admission_fixture(root: Path) -> tuple[dict, Path, dict[str, Path]]:
                     "arena": {"total_bytes": PREFLIGHT_CAP_BYTES - 1},
                     "runtime_policy": runtime_policy,
                     "source": str(adapted_dir / input_name),
+                    "aot_coverage": {
+                        "pass": True,
+                        "manifest": str(aot_manifest),
+                        "manifest_blake3": "a" * 64,
+                        "manifest_entries": 1,
+                        "required_occurrences": occurrences,
+                        "required_occurrences_blake3": "b" * 64,
+                        "required_occurrence_count": 1,
+                        "required_unique_keys_blake3": "c" * 64,
+                        "required_unique_key_count": 1,
+                        "missing_occurrences": [],
+                        "missing_occurrence_count": 0,
+                    },
                 },
                 sort_keys=True,
             )
@@ -333,6 +369,25 @@ def local_admission_fixture(root: Path) -> tuple[dict, Path, dict[str, Path]]:
             encoding="utf-8",
         )
         preflight_hashes[artifact_name] = sha256_file(artifact_path)
+        preflight_occurrence_sha256[artifact_name] = hashlib.sha256(
+            json.dumps(occurrences, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        preflight_occurrence_blake3[artifact_name] = "b" * 64
+        preflight_key_blake3[artifact_name] = "c" * 64
+
+    occurrence_sha = hashlib.sha256(
+        json.dumps(occurrences, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    key_sha = hashlib.sha256(b'["2222222222222222"]').hexdigest()
+    per_sn = {
+        f"SN_PIE_{pie}": {
+            "required_occurrence_count": 1,
+            "required_unique_key_count": 1,
+            "required_occurrences_sha256": occurrence_sha,
+            "required_unique_keys_sha256": key_sha,
+        }
+        for pie in range(1, 5)
+    }
 
     admission = {
         "schema": "stwo.local-preflight-admission.v1",
@@ -343,6 +398,22 @@ def local_admission_fixture(root: Path) -> tuple[dict, Path, dict[str, Path]]:
         "profiles": QUALIFICATION_PROFILES,
         "preflight_ceiling_bytes": PREFLIGHT_CAP_BYTES,
         "preflight_artifact_sha256": preflight_hashes,
+        "aot_coverage": {
+            "manifest": str(aot_manifest),
+            "manifest_sha256": sha256_file(aot_manifest),
+            "manifest_blake3": "a" * 64,
+            "manifest_entry_count": 1,
+            "required_occurrence_count": 1,
+            "required_unique_key_count": 1,
+            "required_unique_keys": ["2222222222222222"],
+            "required_occurrences_sha256": occurrence_sha,
+            "required_unique_keys_sha256": key_sha,
+            "preflight_occurrences_sha256": preflight_occurrence_sha256,
+            "preflight_occurrences_blake3": preflight_occurrence_blake3,
+            "preflight_unique_keys_blake3": preflight_key_blake3,
+            "per_sn": per_sn,
+            "missing_occurrences": [],
+        },
         "adapted_input_manifest": str(adapted_manifest),
         "adapted_input_manifest_sha256": sha256_file(adapted_manifest),
         "adapter_reproduction": {
@@ -362,6 +433,7 @@ def local_admission_fixture(root: Path) -> tuple[dict, Path, dict[str, Path]]:
         "raw_input_manifest": raw_manifest,
         "bootloader": bootloader,
         "pinned_adapted_manifest": pinned_adapted_manifest,
+        "aot_manifest": aot_manifest,
         "adapted_manifest": adapted_manifest,
         "adapted_input": adapted_dir / "SN_PIE_1.adapted.bin",
         "preflight": root / "preflight_universal_SN1.json",
@@ -855,8 +927,8 @@ class ArchitectureRecordTest(unittest.TestCase):
     def test_soundness_manifest_covers_cfg_native_targets_with_exact_counts(self) -> None:
         stwo, stwo_cairo = source_roots()
         arena_gates = gates_for_runtime_mode("arena-graph")
-        self.assertEqual(len(arena_gates), 24)
-        self.assertEqual(sum(required for _name, _command, required in arena_gates), 44)
+        self.assertEqual(len(arena_gates), 26)
+        self.assertEqual(sum(required for _name, _command, required in arena_gates), 47)
         self.assertEqual(
             [name for name, _command, _required in arena_gates[-4:]],
             [
@@ -937,6 +1009,51 @@ class ArchitectureRecordTest(unittest.TestCase):
             "direct-retention-test-api",
         )
 
+    def test_runner_preserves_existing_libtest_delimiter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            completed = mock.Mock(
+                stdout=(
+                    "test captured ... ok\n"
+                    "test result: ok. 1 passed; 0 failed; 0 ignored; "
+                    "0 measured; 0 filtered out\n"
+                ),
+                returncode=0,
+            )
+            with mock.patch(
+                "run_cuda_soundness_gate.subprocess.run", return_value=completed
+            ) as run:
+                record = run_gate(
+                    Path(directory),
+                    "captured",
+                    ("cargo", "test", "captured", "--", "--ignored"),
+                    1,
+                )
+
+            self.assertTrue(record["passed"])
+            command = run.call_args.args[0]
+            self.assertEqual(command.count("--"), 1)
+            self.assertEqual(command[-3:], ("--", "--ignored", "--nocapture"))
+
+    def test_runner_rejects_a_counted_stub_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            completed = mock.Mock(
+                stdout=(
+                    "test captured ... strict-AOT captured row: SKIPPED (stub build)\n"
+                    "ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; "
+                    "0 measured; 0 filtered out\n"
+                ),
+                returncode=0,
+            )
+            with mock.patch(
+                "run_cuda_soundness_gate.subprocess.run", return_value=completed
+            ):
+                record = run_gate(
+                    Path(directory), "captured", ("cargo", "test", "captured"), 1
+                )
+
+            self.assertFalse(record["passed"])
+            self.assertTrue(record["stub_skip_detected"])
+
     def test_reference_cache_tests_cannot_be_absorbed_by_strict_resident_target(self) -> None:
         _, stwo_cairo = source_roots()
         tests = stwo_cairo / "stwo_cairo_prover/crates/gpu-prover/tests"
@@ -961,6 +1078,7 @@ class PrePodValidationTest(unittest.TestCase):
             raw_input_manifest=paths["raw_input_manifest"],
             bootloader=paths["bootloader"],
             pinned_adapted_manifest=paths["pinned_adapted_manifest"],
+            aot_manifest=paths["aot_manifest"],
         )
 
     def test_accepts_complete_local_admission_and_cli(self) -> None:
@@ -981,6 +1099,8 @@ class PrePodValidationTest(unittest.TestCase):
                         str(paths["bootloader"]),
                         "--pinned-adapted-manifest",
                         str(paths["pinned_adapted_manifest"]),
+                        "--aot-manifest",
+                        str(paths["aot_manifest"]),
                         "--expected-dry-run",
                         "0",
                         "--stwo-head",
@@ -1021,6 +1141,18 @@ class PrePodValidationTest(unittest.TestCase):
                 "extra adapter field",
                 lambda value: value["adapter_reproduction"].update({"extra": True}),
             ),
+            (
+                "AOT union hash drift",
+                lambda value: value["aot_coverage"].update(
+                    {"required_occurrences_sha256": "0" * 64}
+                ),
+            ),
+            (
+                "AOT missing key",
+                lambda value: value["aot_coverage"].update(
+                    {"missing_occurrences": [{"cache_key": "2" * 16}]}
+                ),
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             admission, admission_path, paths = local_admission_fixture(Path(directory))
@@ -1038,6 +1170,7 @@ class PrePodValidationTest(unittest.TestCase):
             "raw_input_manifest",
             "bootloader",
             "pinned_adapted_manifest",
+            "aot_manifest",
             "adapted_manifest",
             "adapted_input",
             "preflight",
@@ -1048,6 +1181,17 @@ class PrePodValidationTest(unittest.TestCase):
                 path = paths[target]
                 path.write_bytes(path.read_bytes() + b"stale")
                 self.assertTrue(self.validate_fixture(admission, admission_path, paths))
+
+    def test_local_admission_rejects_self_consistent_aot_identity_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            admission, admission_path, paths = local_admission_fixture(Path(directory))
+            manifest = json.loads(paths["aot_manifest"].read_text(encoding="utf-8"))
+            manifest[0]["semantic_hash"] = "3" * 16
+            paths["aot_manifest"].write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+            admission["aot_coverage"]["manifest_sha256"] = sha256_file(
+                paths["aot_manifest"]
+            )
+            self.assertTrue(self.validate_fixture(admission, admission_path, paths))
 
     def test_local_admission_validates_preflight_policy_and_source(self) -> None:
         for mutation in ("policy", "source", "capacity"):
@@ -1191,8 +1335,12 @@ class PrePodValidationTest(unittest.TestCase):
             gate_input.write_bytes(b"input")
             output = root / "soundness.json"
 
+            def gate_target(command) -> str:
+                marker = "--test" if "--test" in command else "--lib"
+                return command[command.index(marker) + 1]
+
             expected_by_target = {
-                command[command.index("--test") + 1]: required
+                gate_target(command): required
                 for _name, command, required in gates_for_runtime_mode("arena-graph")
             }
 
@@ -1207,7 +1355,7 @@ class PrePodValidationTest(unittest.TestCase):
                 if command[0] == "git":
                     stdout = "" if kwargs.get("text") else b""
                     return subprocess.CompletedProcess(command, 128, stdout, None)
-                target = command[command.index("--test") + 1]
+                target = gate_target(command)
                 required = expected_by_target[target]
                 lines = []
                 if target == "resident_parity_native":
