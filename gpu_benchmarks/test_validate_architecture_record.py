@@ -544,6 +544,43 @@ class ArchitectureRecordTest(unittest.TestCase):
         )
         self.assertEqual(validate_record(record, "arena-graph"), [])
 
+    def test_graph_gap_diagnostic_softens_only_submit_timing(self) -> None:
+        record = valid_arena_graph_record()
+        record.update(
+            {
+                "benchmark_diagnostic_mode": True,
+                "benchmark_diagnostic_reason": "graph-submit-gap-only",
+                "performance_measurement_available": True,
+                "performance_claim_admissible": False,
+                "gpu_max_graph_submit_gap_ms": 918.959783,
+                "gpu_graph_submit_gap_strict_gate_passed": False,
+            }
+        )
+        self.assertEqual(
+            validate_record(record, "arena-graph", graph_gap_diagnostic=True), []
+        )
+        self.assertTrue(validate_record(record, "arena-graph"))
+
+        structural_regression = record.copy()
+        structural_regression["gpu_graph_launches"] = 13
+        self.assertTrue(
+            validate_record(
+                structural_regression,
+                "arena-graph",
+                graph_gap_diagnostic=True,
+            )
+        )
+
+        dishonest_strict_result = record.copy()
+        dishonest_strict_result["gpu_graph_submit_gap_strict_gate_passed"] = True
+        self.assertTrue(
+            validate_record(
+                dishonest_strict_result,
+                "arena-graph",
+                graph_gap_diagnostic=True,
+            )
+        )
+
     def test_arena_graph_topology_fields_fail_closed_without_type_errors(self) -> None:
         for field in (
             "gpu_graph_launches",

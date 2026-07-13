@@ -41,7 +41,7 @@
 # Usage:
 #   ./perf_gates.sh [--lanes CSV | --bundle NAME --candidate-env "K=V ..."]
 #                   [--reps N] [--ncu] [--ncu-kernels REGEX]
-#                   [--parity-only] [--help]
+#                   [--graph-gap-diagnostic] [--parity-only] [--help]
 #
 # One command per lane (the runbook lines):
 #   ./perf_gates.sh --lanes STWO_CUDA_RELATION_SCAN_TAIL
@@ -57,6 +57,8 @@
 #                     record is contract-checked and the fetched report is
 #                     content-bound in the ledger.
 #   --ncu-kernels RE  Override the lane's default kernel-name regex.
+#   --graph-gap-diagnostic  Preserve provisional timing when only the 50ms
+#                     graph-submit-gap gate fails. Structural/proof gates stay exact.
 #   --parity-only     Only rerun prepared_relation_native + prepared_commit_native
 #                     with each lane flag exported. No benchmarks, no ledger
 #                     perf entry (a parity entry is still appended).
@@ -130,6 +132,7 @@ REQUIRE_NCU_PROFILE="${REQUIRE_NCU_PROFILE:-0}"
 REPS="4"
 DO_NCU=0
 PARITY_ONLY=0
+GRAPH_GAP_DIAGNOSTIC=0
 NCU_KERNELS_OVERRIDE=""
 # The resident Cairo plan seals compact relation execution to Fused, so toggling
 # STWO_CUDA_RELATION_FUSED here would benchmark identical graph topologies.
@@ -520,6 +523,7 @@ while [[ $# -gt 0 ]]; do
     --reps)        REPS="${2:?--reps needs a value}"; shift 2 ;;
     --ncu)         DO_NCU=1; shift ;;
     --ncu-kernels) NCU_KERNELS_OVERRIDE="${2:?--ncu-kernels needs a regex}"; shift 2 ;;
+    --graph-gap-diagnostic) GRAPH_GAP_DIAGNOSTIC=1; shift ;;
     --parity-only) PARITY_ONLY=1; shift ;;
     -h|--help)     usage 0 ;;
     --*)           die "unknown flag: $1 (try --help)" ;;
@@ -791,7 +795,11 @@ synth_out() {
      && " $CANDIDATE_ENV " == *" STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=1 "* ]]; then
     synthetic_kernel_launches=2473
   fi
-  local architecture='"gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"ArenaGraph","gpu_pcs_stage_started":'"$stages"',"gpu_pcs_stage_finished":'"$stages"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"arena-graph","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"performance_claim_admissible":true,"steps_per_s":1000000,"mhz":1.0,"useful_mhz":1.0,"gpu_host_syncs":1,"gpu_graph_launches":14,"gpu_expected_graph_launches":14,"gpu_transcript_segments":15,"gpu_kernel_launches":'"$synthetic_kernel_launches"',"gpu_expected_kernel_launches":'"$synthetic_kernel_launches"',"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25,"gpu_graph_a_setup_gate_passed":true,"gpu_setup_base_migration_copies":0,"gpu_setup_lookup_host_copies":0,"gpu_setup_legacy_witness_fallbacks":0,"gpu_execution_tables_ingest_compact_h2d_bytes":4096,"gpu_execution_tables_ingest_compact_h2d_copies":3,"gpu_execution_tables_ingest_descriptor_h2d_bytes":64,"gpu_execution_tables_ingest_descriptor_h2d_copies":2,"gpu_execution_tables_ingest_syncs":1,"gpu_witness_ingest_syncs":1'
+  local diagnostic='"benchmark_diagnostic_mode":false,"benchmark_diagnostic_reason":null,"performance_measurement_available":true,"performance_claim_admissible":true'
+  if [[ "$GRAPH_GAP_DIAGNOSTIC" == "1" ]]; then
+    diagnostic='"benchmark_diagnostic_mode":true,"benchmark_diagnostic_reason":"graph-submit-gap-only","performance_measurement_available":true,"performance_claim_admissible":false'
+  fi
+  local architecture='"gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"ArenaGraph","gpu_pcs_stage_started":'"$stages"',"gpu_pcs_stage_finished":'"$stages"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"arena-graph","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,'"$diagnostic"',"steps_per_s":1000000,"mhz":1.0,"useful_mhz":1.0,"gpu_host_syncs":1,"gpu_graph_launches":14,"gpu_expected_graph_launches":14,"gpu_transcript_segments":15,"gpu_kernel_launches":'"$synthetic_kernel_launches"',"gpu_expected_kernel_launches":'"$synthetic_kernel_launches"',"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25,"gpu_graph_submit_gap_strict_gate_passed":true,"gpu_graph_a_setup_gate_passed":true,"gpu_setup_base_migration_copies":0,"gpu_setup_lookup_host_copies":0,"gpu_setup_legacy_witness_fallbacks":0,"gpu_execution_tables_ingest_compact_h2d_bytes":4096,"gpu_execution_tables_ingest_compact_h2d_copies":3,"gpu_execution_tables_ingest_descriptor_h2d_bytes":64,"gpu_execution_tables_ingest_descriptor_h2d_copies":2,"gpu_execution_tables_ingest_syncs":1,"gpu_witness_ingest_syncs":1'
   {
     echo "{\"rep\":0,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":$((1200 + seed * 3)).5},\"fri\":{\"count\":1,\"total_ms\":$((560 + seed)).1}}}"
     echo "{\"rep\":1,\"phase_totals\":{\"witness_generation\":{\"count\":1,\"total_ms\":$((1190 + seed * 3)).2},\"fri\":{\"count\":1,\"total_ms\":$((555 + seed)).8}}}"
@@ -998,10 +1006,13 @@ PY
 
 architecture_contract_ok() {
   local expected_reps="${2:-$REPS}"
+  local diagnostic_arg=()
+  [[ "$GRAPH_GAP_DIAGNOSTIC" == "0" ]] || diagnostic_arg=(--graph-gap-diagnostic)
   [[ -n "$ARCHITECTURE_SOUNDNESS_GATE" && -f "$ARCHITECTURE_SOUNDNESS_GATE" ]] || return 1
   python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE" \
     --soundness-gate "$ARCHITECTURE_SOUNDNESS_GATE" \
-    --expected-program SN_PIE_2.zip --expected-reps "$expected_reps" --expected-gpu "$POD_GPU"
+    --expected-program SN_PIE_2.zip --expected-reps "$expected_reps" --expected-gpu "$POD_GPU" \
+    "${diagnostic_arg[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1023,6 +1034,7 @@ append_perf_ledger() {
   PG_REMOTE_QUIESCENCE="$([[ "$BASELINE_QUIESCENCE_PASSED" == 1 && "$FLAGGED_QUIESCENCE_PASSED" == 1 ]] && echo 1 || echo 0)" \
   PG_NCU="$ncu_metadata" PG_NCU_REQUIRED="$REQUIRE_NCU_PROFILE" \
   PG_NCU_REQUESTED="$DO_NCU" PG_NCU_STATUS="${NCU_CAPTURE_STATUS:-not_requested}" \
+  PG_GRAPH_GAP_DIAGNOSTIC="$GRAPH_GAP_DIAGNOSTIC" \
   PG_LEDGER="$PERF_LEDGER" python3 - <<'PY'
 import json, os
 
@@ -1082,6 +1094,7 @@ entry = {
     "baseline_state": json.loads(os.environ["PG_BASELINE_STATE"]),
     "candidate_state": json.loads(os.environ["PG_CANDIDATE_STATE"]),
     "mode": "qualification_probe",
+    "graph_gap_diagnostic": os.environ["PG_GRAPH_GAP_DIAGNOSTIC"] == "1",
     "provisional": True,
     "performance_admissible": False,
     "architecture_soundness": {
@@ -1253,6 +1266,8 @@ EOF
 run_lane() {
   local lane="$1"
   local args="--pie ${POD_PIE} --backend cuda ${GPU_NATIVE_ARGS} --reps ${REPS} --reuse-input --require-proof-byte-equal"
+  [[ "$GRAPH_GAP_DIAGNOSTIC" == "0" ]] \
+    || args+=" --diagnostic-allow-slow-graph-submit"
   local base_proof="${POD_RUN_DIR}/${STAMP}.${lane}.baseline.proof"
   local flag_proof="${POD_RUN_DIR}/${STAMP}.${lane}.flagged.proof"
   local body
@@ -1345,6 +1360,8 @@ run_lane() {
     local pod_observation="${pod_rep}.observed.json"
     local pod_ncu_proof="${pod_rep}.proof"
     local ncu_args="--pie ${POD_PIE} --backend cuda ${GPU_NATIVE_ARGS} --reps 2 --reuse-input --require-proof-byte-equal"
+    [[ "$GRAPH_GAP_DIAGNOSTIC" == "0" ]] \
+      || ncu_args+=" --diagnostic-allow-slow-graph-submit"
     local ncu_body ncu_exports="export ${lane}=1" ncu_guard ncu_quiescence_guard kregex_arg
     printf -v kregex_arg '%q' "regex:${kregex}"
     if [[ -n "$BUNDLE_NAME" ]]; then

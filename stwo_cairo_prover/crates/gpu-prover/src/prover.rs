@@ -188,6 +188,7 @@ enum ResidentTranscriptMode {
 
 fn resident_hot_path_budget(
     mode: ResidentTranscriptMode,
+    allow_slow_graph_submit_diagnostic: bool,
     expected_graph_launches: u64,
     expected_kernel_launches: u64,
     d2h_bytes: u64,
@@ -197,7 +198,7 @@ fn resident_hot_path_budget(
         expected_kernel_launches,
         d2h_bytes,
     );
-    if mode == ResidentTranscriptMode::DeviceMirrored {
+    if mode == ResidentTranscriptMode::DeviceMirrored || allow_slow_graph_submit_diagnostic {
         budget.max_graph_submit_gap_ns = u64::MAX;
     }
     budget
@@ -434,6 +435,10 @@ pub struct GpuProverConfig {
     pub channel: ChannelMode,
     /// Post-M6: no fallbacks, any device failure aborts the prove (U3).
     pub strict: bool,
+    /// Explicit benchmark-diagnostic escape hatch for host graph-submit timing.
+    /// Structural/copy/synchronization budgets remain exact and the caller must
+    /// mark the resulting measurement non-formal.
+    pub allow_slow_graph_submit_diagnostic: bool,
 }
 
 impl Default for GpuProverConfig {
@@ -445,6 +450,7 @@ impl Default for GpuProverConfig {
             workspace_cache_capacity: 1,
             channel: ChannelMode::Host,
             strict: false,
+            allow_slow_graph_submit_diagnostic: false,
         }
     }
 }
@@ -1143,6 +1149,7 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
         self.last_pcs_telemetry = None;
         self.last_aot_stats = None;
         aot::reset_runtime_stats();
+        let allow_slow_graph_submit_diagnostic = self.config.allow_slow_graph_submit_diagnostic;
 
         let (
             (
@@ -1170,6 +1177,7 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
             let bundle = runtime.read_proof_bundle_once()?;
             let exec = runtime.require_hot_path_budget(resident_hot_path_budget(
                 transcript_mode,
+                allow_slow_graph_submit_diagnostic,
                 expected_graphs,
                 expected_kernel_launches,
                 bundle_bytes,
@@ -1323,7 +1331,7 @@ mod resident_transcript_mirror_tests {
     #[test]
     fn mirrored_budget_relaxes_only_submit_gap_timing() {
         let production =
-            resident_hot_path_budget(ResidentTranscriptMode::DeviceOnly, 29, 123, 371_604);
+            resident_hot_path_budget(ResidentTranscriptMode::DeviceOnly, false, 29, 123, 371_604);
         assert_eq!(
             production,
             ResidentHotPathBudget::final_bundle(29, 123, 371_604)
@@ -1332,8 +1340,37 @@ mod resident_transcript_mirror_tests {
         let mut expected_mirrored = production;
         expected_mirrored.max_graph_submit_gap_ns = u64::MAX;
         assert_eq!(
-            resident_hot_path_budget(ResidentTranscriptMode::DeviceMirrored, 29, 123, 371_604,),
+            resident_hot_path_budget(
+                ResidentTranscriptMode::DeviceMirrored,
+                false,
+                29,
+                123,
+                371_604,
+            ),
             expected_mirrored
+        );
+    }
+
+    #[test]
+    fn graph_submit_diagnostic_relaxes_only_submit_gap_timing() {
+        let strict = resident_hot_path_budget(
+            ResidentTranscriptMode::DeviceOnly,
+            false,
+            14,
+            14_205,
+            8_410_304,
+        );
+        let mut expected_diagnostic = strict;
+        expected_diagnostic.max_graph_submit_gap_ns = u64::MAX;
+        assert_eq!(
+            resident_hot_path_budget(
+                ResidentTranscriptMode::DeviceOnly,
+                true,
+                14,
+                14_205,
+                8_410_304,
+            ),
+            expected_diagnostic
         );
     }
 

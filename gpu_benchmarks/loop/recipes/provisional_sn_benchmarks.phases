@@ -1,0 +1,107 @@
+# Direct provisional SN benchmark/profile round. Proof/architecture structure
+# remains fail-closed; --diagnostic-allow-slow-graph-submit records the <50ms timing
+# verdict without aborting the measurement.
+
+GPU_ARGS=(
+  --backend cuda
+  --engine gpu-native
+  --require-gpu-native-architecture
+  --require-gpu-pcs-runtime-mode arena-graph
+  --diagnostic-allow-slow-graph-submit
+  --reuse-input
+  --require-proof-byte-equal
+)
+
+sampled_bench() {
+  local name="$1"
+  shift
+  local telemetry="$RUN/${name}.telemetry.csv"
+  local sampler=''
+  nvidia-smi \
+    --query-gpu=timestamp,name,uuid,utilization.gpu,utilization.memory,memory.used,power.draw,clocks.sm,clocks.mem,temperature.gpu \
+    --format=csv -lms 250 > "$telemetry" 2>&1 &
+  sampler=$!
+  set +e
+  "$@"
+  local rc=$?
+  set -e
+  kill "$sampler" 2>/dev/null || true
+  wait "$sampler" 2>/dev/null || true
+  echo "STWO_GPU_TELEMETRY_BEGIN $name"
+  cat "$telemetry"
+  echo "STWO_GPU_TELEMETRY_END $name"
+  return "$rc"
+}
+
+run_flags_off() {
+  sampled_bench sn2_flags_off env \
+    STWO_CUDA_B2N_STAGE_FUSED=0 \
+    STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE=0 \
+    STWO_CUDA_COMPOSITION_DIRECT_RETENTION=0 \
+    STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=0 \
+    STWO_CUDA_RETAINED_LDE_BUDGET_BYTES=8589934592 \
+    STWO_BENCH_TRACE=json \
+    "$CAIRO/target/release/gpu_bench" \
+    --pie /workspace/stwo-cairo/gpu_benchmarks/pie/sn/SN_PIE_2.zip \
+    "${GPU_ARGS[@]}" --reps 6
+}
+
+run_headline_sn2() {
+  sampled_bench sn2_headline env \
+    STWO_CUDA_B2N_STAGE_FUSED=1 \
+    STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE=1 \
+    STWO_CUDA_COMPOSITION_DIRECT_RETENTION=1 \
+    STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=1 \
+    STWO_CUDA_RETAINED_LDE_BUDGET_BYTES=29469326848 \
+    STWO_BENCH_TRACE=json \
+    "$CAIRO/target/release/gpu_bench" \
+    --pie /workspace/stwo-cairo/gpu_benchmarks/pie/sn/SN_PIE_2.zip \
+    "${GPU_ARGS[@]}" --reps 6
+}
+
+run_universal() {
+  local pie="$1"
+  sampled_bench "sn${pie}_universal" env \
+    STWO_CUDA_B2N_STAGE_FUSED=1 \
+    STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE=1 \
+    STWO_CUDA_COMPOSITION_DIRECT_RETENTION=0 \
+    STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=0 \
+    STWO_CUDA_RETAINED_LDE_BUDGET_BYTES=4563402752 \
+    STWO_BENCH_TRACE=json \
+    "$CAIRO/target/release/gpu_bench" \
+    --pie "/workspace/stwo-cairo/gpu_benchmarks/pie/sn/SN_PIE_${pie}.zip" \
+    "${GPU_ARGS[@]}" --reps 6
+}
+
+run_ncu_headline() {
+  local report="$RUN/sn2_headline_ncu"
+  env \
+    STWO_CUDA_B2N_STAGE_FUSED=1 \
+    STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE=1 \
+    STWO_CUDA_COMPOSITION_DIRECT_RETENTION=1 \
+    STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS=1 \
+    STWO_CUDA_RETAINED_LDE_BUDGET_BYTES=29469326848 \
+    STWO_BENCH_TRACE=json \
+    ncu --target-processes all \
+      --kernel-name 'regex:relation_fused|relation_scan|stream_leaf_update' \
+      --launch-count 10 --set full -f -o "$report" \
+      "$CAIRO/target/release/gpu_bench" \
+      --pie /workspace/stwo-cairo/gpu_benchmarks/pie/sn/SN_PIE_2.zip \
+      "${GPU_ARGS[@]}" --reps 2
+  ncu --import "${report}.ncu-rep" --page raw --csv
+}
+
+cd "$CAIRO"
+phase build env \
+  RUSTFLAGS='-C target-cpu=native' \
+  STWO_CUDA_BUILD_JOBS=16 \
+  STWO_BOOTLOADER_JSON=/workspace/bench_inputs/simple_bootloader_compiled.json \
+  cargo build --release -p stwo-cairo-gpu-prover \
+    --bin gpu_bench --bin aot_index_check --features pie-bench
+phase sn2_flags_off run_flags_off
+phase sn2_headline run_headline_sn2
+phase sn1_universal run_universal 1
+phase sn2_universal run_universal 2
+phase sn3_universal run_universal 3
+phase sn4_universal run_universal 4
+phase sn2_ncu run_ncu_headline

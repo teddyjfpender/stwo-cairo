@@ -15,6 +15,7 @@
 //!             [--engine legacy|gpu-native] \
 //!             [--reps 3] [--pipeline <depth>] [--reuse-input] [--adapt-only] \
 //!             [--require-proof-byte-equal] [--require-gpu-native-architecture] \
+//!             [--diagnostic-allow-slow-graph-submit] \
 //!             [--require-simd-reference-byte-equal] \
 //!             [--require-gpu-pcs-runtime-mode detached-eager|arena-graph]
 //!   gpu_bench --pie a.zip[,b.zip,...] [--pie-copies N] [--pie-mode aggregate|rotate] \
@@ -244,6 +245,11 @@ fn gpu_native_prover_config() -> GpuProverConfig {
     let mut config = GpuProverConfig::default();
     config.strict = gpu_native_architecture_required()
         && required_gpu_pcs_runtime_mode() == RequiredCudaPcsRuntimeMode::ArenaGraph;
+    config.allow_slow_graph_submit_diagnostic = graph_submit_gap_diagnostic();
+    assert!(
+        !config.allow_slow_graph_submit_diagnostic || config.strict,
+        "--diagnostic-allow-slow-graph-submit requires the strict ArenaGraph architecture gate"
+    );
     config
 }
 
@@ -264,6 +270,10 @@ fn gpu_native_architecture_required() -> bool {
         || std::env::var("STWO_BENCH_REQUIRE_GPU_NATIVE_ARCHITECTURE").as_deref() == Ok("1")
 }
 
+fn graph_submit_gap_diagnostic() -> bool {
+    flag("--diagnostic-allow-slow-graph-submit")
+}
+
 fn required_gpu_pcs_runtime_mode() -> RequiredCudaPcsRuntimeMode {
     let value = arg("--require-gpu-pcs-runtime-mode")
         .or_else(|| std::env::var("STWO_BENCH_REQUIRE_GPU_PCS_RUNTIME_MODE").ok())
@@ -276,10 +286,29 @@ fn performance_claim_admissible() -> bool {
         &engine(),
         gpu_native_architecture_required(),
         required_gpu_pcs_runtime_mode(),
+        graph_submit_gap_diagnostic(),
     )
 }
 
 fn performance_claim_admissible_for(
+    selected_engine: &str,
+    architecture_required: bool,
+    mode: RequiredCudaPcsRuntimeMode,
+    diagnostic: bool,
+) -> bool {
+    performance_measurement_available_for(selected_engine, architecture_required, mode)
+        && !diagnostic
+}
+
+fn performance_measurement_available() -> bool {
+    performance_measurement_available_for(
+        &engine(),
+        gpu_native_architecture_required(),
+        required_gpu_pcs_runtime_mode(),
+    )
+}
+
+fn performance_measurement_available_for(
     selected_engine: &str,
     architecture_required: bool,
     mode: RequiredCudaPcsRuntimeMode,
@@ -935,6 +964,10 @@ fn record_context(backend: &str) -> serde_json::Value {
         "gpu_native_architecture_required": architecture_required,
         "gpu_pcs_required_runtime_mode": required_mode.map(RequiredCudaPcsRuntimeMode::cli_name),
         "gpu_native_architecture_gate_passed": architecture_required.then_some(true),
+        "benchmark_diagnostic_mode": graph_submit_gap_diagnostic(),
+        "benchmark_diagnostic_reason": graph_submit_gap_diagnostic()
+            .then_some("graph-submit-gap-only"),
+        "performance_measurement_available": performance_measurement_available(),
         "performance_claim_admissible": performance_claim_admissible(),
     });
     merge_json(
@@ -1009,6 +1042,7 @@ fn gpu_native_pcs_context(telemetry: Option<&CudaPcsDriverTelemetry>) -> serde_j
             "gpu_hot_d2h_bytes": null,
             "gpu_hot_allocations": null,
             "gpu_max_graph_submit_gap_ms": null,
+            "gpu_graph_submit_gap_strict_gate_passed": null,
         });
     };
     pcs_telemetry_json(telemetry)
@@ -1046,6 +1080,9 @@ fn pcs_telemetry_json(telemetry: &CudaPcsDriverTelemetry) -> serde_json::Value {
         "gpu_hot_allocations": exec.map(|value| value.allocations),
         "gpu_max_graph_submit_gap_ms": exec.map(|value| {
             value.graph_submit_gap_ns_max as f64 / 1_000_000.0
+        }),
+        "gpu_graph_submit_gap_strict_gate_passed": exec.map(|value| {
+            value.graph_submit_gap_ns_max < 50_000_000
         }),
     })
 }
@@ -1307,9 +1344,10 @@ fn print_main_record(
     // DetachedEager remains useful as a proof-byte oracle, but it is the
     // CPU-owned orchestration path. Never let its timing become a GPU-resident
     // performance claim again.
+    let performance_measurement_available = performance_measurement_available();
     let performance_claim_admissible = performance_claim_admissible();
     let throughput_distribution_applicable =
-        throughput_distribution_applicable && performance_claim_admissible;
+        throughput_distribution_applicable && performance_measurement_available;
     let warm_samples_rounded: Vec<_> = warm_samples.iter().copied().map(round3).collect();
     let (free, total) = stwo_backend_cuda::gpu_memory_info();
     let vram_end_gb = if total > 0 {
@@ -1354,9 +1392,10 @@ fn print_main_record(
         "pool_used_high_gb": round3(stwo_backend_cuda::gpu_pool_highwater().0 as f64 / 1e9),
         "pool_reserved_high_gb": round3(stwo_backend_cuda::gpu_pool_highwater().1 as f64 / 1e9),
         "performance_claim_admissible": performance_claim_admissible,
-        "steps_per_s": performance_claim_admissible.then(|| (cycle_count as f64 / warm).round()),
-        "mhz": performance_claim_admissible.then(|| round3(cycle_count as f64 / warm / 1e6)),
-        "useful_mhz": performance_claim_admissible
+        "performance_measurement_available": performance_measurement_available,
+        "steps_per_s": performance_measurement_available.then(|| (cycle_count as f64 / warm).round()),
+        "mhz": performance_measurement_available.then(|| round3(cycle_count as f64 / warm / 1e6)),
+        "useful_mhz": performance_measurement_available
             .then(|| pie_n_steps.map(|s| round3(s as f64 / warm / 1e6)))
             .flatten(),
         "throughput_distribution_applicable": throughput_distribution_applicable,
@@ -2227,21 +2266,31 @@ mod tests {
             "gpu-native",
             true,
             RequiredCudaPcsRuntimeMode::DetachedEager,
+            false,
         ));
         assert!(!performance_claim_admissible_for(
             "gpu-native",
             false,
             RequiredCudaPcsRuntimeMode::ArenaGraph,
+            false,
         ));
         assert!(performance_claim_admissible_for(
             "gpu-native",
             true,
             RequiredCudaPcsRuntimeMode::ArenaGraph,
+            false,
         ));
         assert!(performance_claim_admissible_for(
             "legacy",
             false,
             RequiredCudaPcsRuntimeMode::DetachedEager,
+            false,
+        ));
+        assert!(!performance_claim_admissible_for(
+            "gpu-native",
+            true,
+            RequiredCudaPcsRuntimeMode::ArenaGraph,
+            true,
         ));
     }
 

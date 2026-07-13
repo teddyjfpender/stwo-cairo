@@ -858,7 +858,12 @@ def validate_qualification_soundness_gate(
     return errors
 
 
-def validate_record(record: dict[str, Any], required_mode: str) -> list[str]:
+def validate_record(
+    record: dict[str, Any],
+    required_mode: str,
+    *,
+    graph_gap_diagnostic: bool = False,
+) -> list[str]:
     errors: list[str] = []
     expected_mode = RUNTIME_MODES.get(required_mode)
     if expected_mode is None:
@@ -884,7 +889,8 @@ def validate_record(record: dict[str, Any], required_mode: str) -> list[str]:
         if record.get(field) != expected:
             errors.append(f"{field}: expected {expected!r}, got {record.get(field)!r}")
 
-    performance_admissible = required_mode == "arena-graph"
+    measurement_available = required_mode == "arena-graph"
+    performance_admissible = measurement_available and not graph_gap_diagnostic
     if record.get("performance_claim_admissible") is not performance_admissible:
         errors.append(
             "performance_claim_admissible: expected "
@@ -900,7 +906,22 @@ def validate_record(record: dict[str, Any], required_mode: str) -> list[str]:
         "mhz_at_warm_p95",
         "useful_mhz_at_warm_p95",
     )
-    if performance_admissible:
+    if graph_gap_diagnostic:
+        if record.get("benchmark_diagnostic_mode") is not True:
+            errors.append("benchmark_diagnostic_mode: expected true")
+        if record.get("benchmark_diagnostic_reason") != "graph-submit-gap-only":
+            errors.append(
+                "benchmark_diagnostic_reason: expected 'graph-submit-gap-only'"
+            )
+    elif record.get("benchmark_diagnostic_mode") is True:
+        errors.append("benchmark_diagnostic_mode: diagnostic record requires explicit admission")
+    if record.get("performance_measurement_available", measurement_available) is not measurement_available:
+        errors.append(
+            "performance_measurement_available: expected "
+            f"{measurement_available!r}, got "
+            f"{record.get('performance_measurement_available')!r}"
+        )
+    if measurement_available:
         for field in ("steps_per_s", "mhz", "useful_mhz"):
             value = record.get(field)
             if (
@@ -1075,14 +1096,25 @@ def validate_record(record: dict[str, Any], required_mode: str) -> list[str]:
         if not isinstance(d2h, int) or isinstance(d2h, bool) or d2h <= 0:
             errors.append(f"gpu_hot_d2h_bytes: expected one positive final bundle, got {d2h!r}")
         max_gap = record.get("gpu_max_graph_submit_gap_ms")
-        if (
-            not isinstance(max_gap, (int, float))
-            or isinstance(max_gap, bool)
-            or not 0 <= max_gap < 50
-        ):
+        valid_gap = (
+            isinstance(max_gap, (int, float))
+            and not isinstance(max_gap, bool)
+            and math.isfinite(max_gap)
+            and max_gap >= 0
+        )
+        if not valid_gap or (not graph_gap_diagnostic and max_gap >= 50):
             errors.append(
                 f"gpu_max_graph_submit_gap_ms: expected value in [0, 50), got {max_gap!r}"
             )
+        strict_gap_passed = valid_gap and max_gap < 50
+        reported_strict_gap = record.get("gpu_graph_submit_gap_strict_gate_passed")
+        if reported_strict_gap is not None and reported_strict_gap is not strict_gap_passed:
+            errors.append(
+                "gpu_graph_submit_gap_strict_gate_passed: expected "
+                f"{strict_gap_passed!r}, got {reported_strict_gap!r}"
+            )
+        if graph_gap_diagnostic and reported_strict_gap is not strict_gap_passed:
+            errors.append("diagnostic record must report the strict graph-submit-gap result")
     return errors
 
 
@@ -1467,6 +1499,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-reps", type=int)
     parser.add_argument("--expected-gpu")
     parser.add_argument("--require-fresh-simd-reference", action="store_true")
+    parser.add_argument(
+        "--graph-gap-diagnostic",
+        action="store_true",
+        help="admit only graph-submit-gap timing as provisional",
+    )
     parser.add_argument("--gpu-telemetry-csv", type=Path)
     parser.add_argument("--gpu-telemetry-remote-sha256")
     parser.add_argument("--gpu-telemetry-remote-size", type=int)
@@ -1552,7 +1589,11 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as error:
         print(f"GPU-native architecture contract: {error}", file=sys.stderr)
         return 1
-    errors = validate_record(record, args.runtime_mode)
+    errors = validate_record(
+        record,
+        args.runtime_mode,
+        graph_gap_diagnostic=args.graph_gap_diagnostic,
+    )
     if (args.expected_program is None) != (args.expected_reps is None):
         parser.error("record measurement validation requires both --expected-program and --expected-reps")
     if args.require_fresh_simd_reference and args.expected_program is None:
