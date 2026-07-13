@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stwo.gpu-lab.fri-round6-provenance.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "production_admissible",
+    "source_pie",
+    "adapted_prover_input",
+    "adapter",
+    "extended_cairo_proof_bincode",
+    "canonical_cairo_transport",
+    "verifier_source_closure",
+    "proof_shape"
+  ],
+  "properties": {
+    "schema_version": { "const": "stwo.gpu-lab.fri-round6-provenance.v1" },
+    "status": { "const": "captured-unsealed" },
+    "production_admissible": { "const": false },
+    "source_pie": { "$ref": "#/$defs/artifact" },
+    "adapted_prover_input": { "$ref": "#/$defs/artifact" },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_record", "invocation", "executable", "source_closure"],
+      "properties": {
+        "run_record": { "$ref": "#/$defs/artifact" },
+        "invocation": { "$ref": "#/$defs/artifact" },
+        "executable": { "$ref": "#/$defs/artifact" },
+        "source_closure": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "extended_cairo_proof_bincode": { "$ref": "#/$defs/artifact" },
+    "canonical_cairo_transport": { "$ref": "#/$defs/artifact" },
+    "verifier_source_closure": { "$ref": "#/$defs/artifact" },
+    "proof_shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "shape"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "shape": { "$ref": "#/$defs/proof_shape" }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "byte_length", "sha256"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^/][^\\\\]*$"
+        },
+        "byte_length": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "pcs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pow_bits",
+        "log_blowup_factor",
+        "log_last_layer_degree_bound",
+        "n_queries",
+        "fold_step",
+        "lifting_log_size"
+      ],
+      "properties": {
+        "pow_bits": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "log_blowup_factor": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "log_last_layer_degree_bound": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "n_queries": { "type": "integer", "minimum": 0 },
+        "fold_step": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "lifting_log_size": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+          ]
+        }
+      }
+    },
+    "u32_matrix": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+      }
+    },
+    "u64_matrix": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "proof_shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "pcs",
+        "channel_salt",
+        "preprocessed_trace_variant_sha256",
+        "component_slots",
+        "component_enable_bits_sha256",
+        "component_log_sizes",
+        "trace_column_log_sizes",
+        "public_data_word_counts",
+        "interaction_claim_felts",
+        "commitment_trees",
+        "sampled_value_counts",
+        "decommitment_trees",
+        "queried_value_counts",
+        "fri_inner_layers",
+        "fri_witness_counts",
+        "fri_last_layer_coefficients",
+        "unsorted_query_locations"
+      ],
+      "properties": {
+        "schema_version": { "const": "stwo.gpu-lab.cairo-proof-shape.v1" },
+        "pcs": { "$ref": "#/$defs/pcs" },
+        "channel_salt": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "preprocessed_trace_variant_sha256": { "$ref": "#/$defs/sha256" },
+        "component_slots": { "type": "integer", "minimum": 0 },
+        "component_enable_bits_sha256": { "$ref": "#/$defs/sha256" },
+        "component_log_sizes": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+        },
+        "trace_column_log_sizes": { "$ref": "#/$defs/u32_matrix" },
+        "public_data_word_counts": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "interaction_claim_felts": { "type": "integer", "minimum": 0 },
+        "commitment_trees": { "type": "integer", "minimum": 0 },
+        "sampled_value_counts": { "$ref": "#/$defs/u64_matrix" },
+        "decommitment_trees": { "type": "integer", "minimum": 0 },
+        "queried_value_counts": { "$ref": "#/$defs/u64_matrix" },
+        "fri_inner_layers": { "type": "integer", "minimum": 0 },
+        "fri_witness_counts": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "fri_last_layer_coefficients": { "type": "integer", "minimum": 0 },
+        "unsorted_query_locations": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
