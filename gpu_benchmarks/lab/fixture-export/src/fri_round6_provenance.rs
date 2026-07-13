@@ -1,4 +1,7 @@
 //! Fail-closed provenance preflight for captured FRI replay bundles.
+// gpu-lab-cohesion-review: Keep the serialized provenance contract and its
+// filesystem identity checks together so every admitted field crosses one
+// auditable fail-closed trust boundary.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata};
