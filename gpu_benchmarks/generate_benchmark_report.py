@@ -18,12 +18,34 @@ import os
 import re
 import statistics
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
+
+BENCHMARK_DIR = str(Path(__file__).resolve().parent)
+if BENCHMARK_DIR not in sys.path:
+    sys.path.insert(0, BENCHMARK_DIR)
+
+from validate_architecture_record import (  # noqa: E402
+    FLAGS_OFF_POLICY,
+    HEADLINE_POLICY,
+    PREFLIGHT_CAP_BYTES,
+    QUALIFICATION_FLAGS,
+    QUALIFICATION_PROFILES,
+    RETAINED_BUDGET_FLAG,
+    UNIVERSAL_POLICY,
+    validate_qualification_soundness_gate,
+)
+
+CANONICAL_RAW_MANIFEST_PATH = Path(BENCHMARK_DIR) / "pie" / "SHA256SUMS"
+CANONICAL_ADAPTED_MANIFEST_PATH = (
+    Path(BENCHMARK_DIR) / "pie" / "ADAPTED_SHA256SUMS"
+)
 
 
 QUALIFICATION_SCHEMA = "stwo.qualification-round.v4"
 REPORT_SCHEMA = "stwo.benchmark-report.v1"
+EMPTY_WORKTREE_SHA256 = hashlib.sha256(b"").hexdigest()
 EXPECTED_SECURITY = {
     "security_bits": 96,
     "n_queries": 70,
@@ -33,6 +55,14 @@ EXPECTED_SECURITY = {
 SN_NAMES = tuple(f"SN_PIE_{number}" for number in range(1, 5))
 RAW_INPUT_NAMES = (*tuple(f"{name}.zip" for name in SN_NAMES), "simple_bootloader_compiled.json")
 ADAPTED_INPUT_NAMES = tuple(f"{name}.adapted.bin" for name in SN_NAMES)
+REMOTE_INPUT_PATHS = {
+    "gate": "/workspace/stwo-cairo/gpu_benchmarks/pie/sn/SN_PIE_2.zip",
+    "bootloader": "/workspace/bench_inputs/simple_bootloader_compiled.json",
+    **{
+        name: f"/workspace/stwo-cairo/gpu_benchmarks/pie/sn/{name}.zip"
+        for name in SN_NAMES
+    },
+}
 TOP_PHASE_COUNT = 10
 GPU_TELEMETRY_SCHEMA = "stwo.gpu-telemetry.csv.v1"
 GPU_TELEMETRY_COLUMNS = (
@@ -87,6 +117,26 @@ NCU_PROFILE_KEYS = {
     "remote_import_output_bytes",
     "profiled_kernel_rows",
     "profiled_proof_sha256",
+}
+NCU_RELEASE_KERNEL_REGEX = "relation_fused|relation_scan|stream_leaf_update"
+NCU_RELEASE_LAUNCH_COUNT = 10
+NCU_RELEASE_SET = "full"
+QUALIFICATION_NORMALIZED_STATES = {
+    "flags_off": {
+        **{flag: 0 for flag in QUALIFICATION_FLAGS},
+        RETAINED_BUDGET_FLAG: FLAGS_OFF_POLICY["retained_lde_budget_bytes"],
+    },
+    "universal_sn1_sn4": {
+        **{flag: int(flag in {
+            "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE",
+            "STWO_CUDA_B2N_STAGE_FUSED",
+        }) for flag in QUALIFICATION_FLAGS},
+        RETAINED_BUDGET_FLAG: UNIVERSAL_POLICY["retained_lde_budget_bytes"],
+    },
+    "sn2_headline": {
+        **{flag: 1 for flag in QUALIFICATION_FLAGS},
+        RETAINED_BUDGET_FLAG: HEADLINE_POLICY["retained_lde_budget_bytes"],
+    },
 }
 
 
@@ -216,8 +266,8 @@ def _validate_measurement(
     _require(record.get("gpu") == expected_gpu, f"{label}: wrong GPU")
 
     reps = record.get("reps")
-    _require(isinstance(reps, int) and not isinstance(reps, bool) and reps >= 2,
-             f"{label}.reps: expected integer >= 2")
+    _require(reps == 6 and not isinstance(reps, bool),
+             f"{label}.reps: qualification requires exactly 6")
     _require(record.get("verified_reps") == reps, f"{label}: not every proof verified")
     _require(record.get("warm_sample_count") == reps - 1, f"{label}: warm sample count drift")
     samples_raw = record.get("prove_s_warm_samples_raw")
@@ -517,17 +567,16 @@ def _validate_ncu_profile(
              "profiling.ncu.profile: remote CSV import was not validated")
     _require(profile.get("profiled_proof_sha256") == qualified_sn2_proof,
              "profiling.ncu.profile: profiled proof differs from qualified SN2")
-    _require(isinstance(profile.get("kernel_regex"), str) and profile["kernel_regex"]
-             and isinstance(profile.get("set"), str) and profile["set"]
-             and isinstance(profile.get("ncu_version"), str)
+    _require(profile.get("kernel_regex") == NCU_RELEASE_KERNEL_REGEX
+             and profile.get("launch_count") == NCU_RELEASE_LAUNCH_COUNT
+             and profile.get("set") == NCU_RELEASE_SET,
+             "profiling.ncu.profile: capture settings differ from release contract")
+    _require(isinstance(profile.get("ncu_version"), str)
              and profile["ncu_version"].startswith(
                  "NVIDIA (R) Nsight Compute Command Line Profiler"
              ),
-             "profiling.ncu.profile: missing capture settings")
+             "profiling.ncu.profile: missing profiler version")
     launch_count = profile.get("launch_count")
-    _require(isinstance(launch_count, int) and not isinstance(launch_count, bool)
-             and 0 < launch_count <= 1_000_000,
-             "profiling.ncu.profile: invalid launch count")
     try:
         kernel_pattern = re.compile(profile["kernel_regex"])
     except re.error as error:
@@ -615,9 +664,32 @@ def _validate_ncu_profile(
 
 
 def _validate_phase_ledger(
-    path: Path, benchmark_records: dict[str, Any]
+    path: Path,
+    benchmark_records: dict[str, Any],
+    *,
+    expected_env: str,
+    expected_gpu: str,
+    expected_proof_hashes: dict[str, str],
+    expected_telemetry: dict[str, Any],
+    expected_soundness_sha256: str,
+    expected_target: dict[str, Any],
+    expected_target_sha256: str,
+    expected_projection: dict[str, Any],
 ) -> dict[str, Any]:
     entries = _load_jsonl(path, "ledger.bench")
+    _require(Counter(entry.get("run_name") for entry in entries) == Counter({
+        "gate_correctness": 2,
+        **{name: 1 for name in SN_NAMES},
+    }), "ledger.bench: entry set is incomplete, duplicated, or unexpected")
+    for entry in entries:
+        _require(entry.get("pod_gpu") == expected_gpu
+                 and entry.get("execution_target") == expected_target
+                 and entry.get("execution_target_sha256") == expected_target_sha256
+                 and entry.get("source_projection") == expected_projection
+                 and entry.get("soundness_gate_sha256") == expected_soundness_sha256
+                 and entry.get("execution_guard_passed") is True
+                 and entry.get("remote_quiescence_passed") is True,
+                 "ledger.bench: entry escaped the qualified execution seal")
     summaries = {}
     expected_reps = set(range(6))
     for sn_name in SN_NAMES:
@@ -626,6 +698,12 @@ def _validate_phase_ledger(
                  f"ledger.bench: expected exactly one {sn_name} entry, got {len(matches)}")
         entry = matches[0]
         _require(entry.get("status") == "ok", f"ledger.bench.{sn_name}: status is not ok")
+        _require(entry.get("bench_env") == expected_env
+                 and entry.get("qualification_probe") is True
+                 and entry.get("pod_gpu") == expected_gpu
+                 and entry.get("proof_sha256") == expected_proof_hashes[sn_name]
+                 and entry.get("gpu_telemetry") == expected_telemetry[sn_name],
+                 f"ledger.bench.{sn_name}: environment or qualification binding drifted")
         _require(entry.get("record") == benchmark_records[sn_name],
                  f"ledger.bench.{sn_name}: measurement differs from qualification")
         phase_reps = entry.get("phase_totals")
@@ -717,6 +795,12 @@ def _validate_inputs(
     _require(all(_is_sha256(value) for value in raw_files.values()), "inputs.files: invalid hash")
     _require(all(_is_sha256(value) for value in adapted_files.values()),
              "inputs.adapted_files: invalid hash")
+    _require(raw_files == _parse_checksum_manifest(
+        CANONICAL_RAW_MANIFEST_PATH, "canonical release raw manifest"
+    ), "inputs.files: differ from canonical release manifest")
+    _require(adapted_files == _parse_checksum_manifest(
+        CANONICAL_ADAPTED_MANIFEST_PATH, "canonical release adapted manifest"
+    ), "inputs.adapted_files: differ from canonical release manifest")
 
     manifest = _verified_artifact(
         round_dir,
@@ -734,7 +818,7 @@ def _validate_inputs(
     )
     _require(_parse_checksum_manifest(adapted_manifest, "inputs.adapted_manifest") == adapted_files,
              "inputs.adapted_manifest: contents do not match qualification")
-    _verified_artifact(
+    pinned_manifest = _verified_artifact(
         round_dir,
         {
             "path": inputs.get("pinned_adapted_manifest"),
@@ -743,6 +827,10 @@ def _validate_inputs(
         "inputs.pinned_adapted_manifest",
         hashes,
     )
+    _require(_parse_checksum_manifest(
+        pinned_manifest, "inputs.pinned_adapted_manifest"
+    ) == adapted_files,
+             "inputs.pinned_adapted_manifest: contents do not match adapted inputs")
     _require(inputs.get("gate") == "SN_PIE_2.zip", "inputs.gate: expected SN_PIE_2.zip")
     return {"raw_files": dict(sorted(raw_files.items())),
             "adapted_files": dict(sorted(adapted_files.items()))}
@@ -753,6 +841,8 @@ def _validate_preflight(
     *,
     label: str,
     ceiling: Any,
+    expected_policy: dict[str, Any],
+    expected_input_name: str,
     adapted_hashes: dict[str, str],
     round_dir: Path,
     hashes: dict[str, str],
@@ -763,6 +853,8 @@ def _validate_preflight(
              f"{label}: invalid preflight ceiling")
     _require(isinstance(arena_bytes, int) and not isinstance(arena_bytes, bool)
              and 0 < arena_bytes <= ceiling, f"{label}: arena exceeds ceiling")
+    _require(summary.get("runtime_policy") == expected_policy,
+             f"{label}: summary policy differs from qualification contract")
     artifact = _verified_artifact(
         round_dir,
         {"path": summary.get("artifact"), "sha256": summary.get("artifact_sha256")},
@@ -771,7 +863,8 @@ def _validate_preflight(
     )
     adapted = _resolve_artifact(round_dir, summary.get("adapted_input"), f"{label}.adapted_input")
     adapted_name = adapted.name
-    _require(adapted_name in adapted_hashes, f"{label}: unexpected adapted input")
+    _require(adapted_name == expected_input_name and adapted_name in adapted_hashes,
+             f"{label}: unexpected adapted input")
     adapted_sha = _sha256(adapted)
     _require(adapted_sha == summary.get("adapted_input_sha256") == adapted_hashes[adapted_name],
              f"{label}: adapted input hash mismatch")
@@ -783,8 +876,10 @@ def _validate_preflight(
     _require(record.get("vram_budget_bytes") == ceiling, f"{label}: preflight ceiling drift")
     _require((record.get("arena") or {}).get("total_bytes") == arena_bytes,
              f"{label}: preflight arena drift")
-    _require(record.get("runtime_policy") == summary.get("runtime_policy"),
-             f"{label}: preflight policy drift")
+    _require(record.get("runtime_policy") == expected_policy,
+             f"{label}: artifact policy differs from qualification contract")
+    source = _resolve_artifact(round_dir, record.get("source"), f"{label}.source")
+    _require(source == adapted, f"{label}: artifact source differs from adapted input")
     return {"arena_bytes": arena_bytes, "arena_gib": arena_bytes / 1024**3}
 
 
@@ -815,16 +910,27 @@ def _validate_qualification(
     _require(qualification.get("runtime_mode") == "arena-graph",
              "qualification.runtime_mode: expected arena-graph")
     gpu = qualification.get("gpu")
-    _require(isinstance(gpu, str) and gpu.strip(), "qualification.gpu: missing")
+    expected_gpu = "DRY-RUN-GPU" if dry_run else "NVIDIA H100 80GB HBM3"
+    _require(gpu == expected_gpu,
+             f"qualification.gpu: expected {expected_gpu}")
     source = _validate_source(qualification)
+    _require(qualification["source"].get("sync") == {
+        "method": "rsync checksum with target and result exclusions",
+        "release_requires_clean_commits": True,
+    }, "source.sync: release projection contract mismatch")
+    if status == "passed":
+        _require(all(repository["worktree_hash"] == EMPTY_WORKTREE_SHA256
+                     for repository in source.values()),
+                 "source: release qualification requires clean commits")
 
     hashes = {"qualification": _sha256(qualification_path)}
     inputs = _validate_inputs(qualification, round_dir, hashes)
     local_admission_path = _verified_artifact(
         round_dir, qualification.get("local_admission"), "local_admission", hashes
     )
+    soundness_reference = qualification.get("soundness")
     soundness_path = _verified_artifact(
-        round_dir, qualification.get("soundness"), "soundness", hashes
+        round_dir, soundness_reference, "soundness", hashes
     )
     ledgers = qualification.get("ledgers")
     _require(isinstance(ledgers, dict) and set(ledgers) == {"bench", "ab"},
@@ -832,7 +938,9 @@ def _validate_qualification(
     bench_ledger_path = _verified_artifact(
         round_dir, ledgers["bench"], "ledger.bench", hashes
     )
-    _verified_artifact(round_dir, ledgers["ab"], "ledger.ab", hashes)
+    ab_ledger_path = _verified_artifact(
+        round_dir, ledgers["ab"], "ledger.ab", hashes
+    )
 
     target_wrapper = qualification.get("remote_execution_target")
     _require(isinstance(target_wrapper, dict), "remote_execution_target: missing")
@@ -847,12 +955,19 @@ def _validate_qualification(
     binary = target.get("gpu_bench")
     _require(isinstance(binary, dict) and isinstance(binary.get("path"), str)
              and _is_sha256(binary.get("sha256")), "remote gpu_bench seal is invalid")
+    _require(binary["path"]
+             == f"/workspace/bench_loop_runs/sealed/gpu_bench.{binary['sha256']}",
+             "remote gpu_bench path differs from release harness")
     target_sha = _canonical_sha256(target)
     _require(target_wrapper.get("sha256") == target_sha,
              "remote execution target canonical hash mismatch")
     _require(target_wrapper.get("postcheck") is True, "remote execution postcheck failed")
     _require(target_wrapper.get("remote_quiescence_passed") is True,
              "remote execution was not quiescent")
+    _require(target_wrapper.get("ledger_entries_guarded") == 7
+             and target_wrapper.get("quiescent_ledger_entries") == 7
+             and target_wrapper.get("quiescent_measurement_launches") == 9,
+             "remote execution guard counts differ from release round")
     expected_remote_inputs = {
         "gate": inputs["raw_files"]["SN_PIE_2.zip"],
         "bootloader": inputs["raw_files"]["simple_bootloader_compiled.json"],
@@ -864,6 +979,7 @@ def _validate_qualification(
     for name, expected_sha in expected_remote_inputs.items():
         item = remote_inputs[name]
         _require(isinstance(item, dict) and isinstance(item.get("path"), str)
+                 and item.get("path") == REMOTE_INPUT_PATHS[name]
                  and item.get("sha256") == expected_sha,
                  f"remote execution input {name}: mismatch")
 
@@ -873,6 +989,11 @@ def _validate_qualification(
              "remote source projection is invalid")
 
     soundness = json.loads(soundness_path.read_text(encoding="utf-8"))
+    soundness_errors = validate_qualification_soundness_gate(
+        soundness, expected_source=source, expected_dry_run=bool(dry_run)
+    )
+    _require(not soundness_errors,
+             f"soundness qualification contract: {'; '.join(soundness_errors)}")
     _require(soundness.get("schema") == "stwo.cuda.soundness-gate.v3"
              and soundness.get("passed") is True, "soundness artifact did not pass")
     _require(soundness.get("runtime_mode") == "arena-graph"
@@ -888,6 +1009,14 @@ def _validate_qualification(
         "stwo_cairo": source["stwo_cairo"],
         "transport": "rsync-archive-checksum",
     }, "soundness synced source mismatch")
+    _require(isinstance(soundness_reference, dict)
+             and soundness_reference.get("effective_stwo_env")
+             == soundness.get("effective_stwo_env")
+             and soundness_reference.get("stwo_worktree_hash")
+             == source["stwo"]["worktree_hash"]
+             and soundness_reference.get("stwo_cairo_worktree_hash")
+             == source["stwo_cairo"]["worktree_hash"],
+             "soundness wrapper is not bound to source and effective environment")
 
     admission = json.loads(local_admission_path.read_text(encoding="utf-8"))
     _require(admission.get("schema") == "stwo.local-preflight-admission.v1"
@@ -897,30 +1026,50 @@ def _validate_qualification(
     _require(admission.get("source") == source, "local admission source mismatch")
 
     profiles = qualification.get("profiles")
-    _require(isinstance(profiles, dict), "profiles: missing")
+    _require(isinstance(profiles, dict) and set(profiles) == {
+        "universal_sn1_sn4", "sn2_headline"
+    }, "profiles: expected exactly universal and SN2 headline")
     universal = profiles.get("universal_sn1_sn4")
     headline = profiles.get("sn2_headline")
     _require(isinstance(universal, dict) and isinstance(headline, dict), "profiles: incomplete")
+    _require(universal.get("env") == QUALIFICATION_PROFILES["universal_sn1_sn4"]
+             and universal.get("effective_state")
+             == QUALIFICATION_NORMALIZED_STATES["universal_sn1_sn4"],
+             "profiles.universal_sn1_sn4: noncanonical environment or state")
+    _require(headline.get("env") == QUALIFICATION_PROFILES["sn2_headline"]
+             and headline.get("effective_state")
+             == QUALIFICATION_NORMALIZED_STATES["sn2_headline"],
+             "profiles.sn2_headline: noncanonical environment or state")
+    _require(qualification.get("normalized_states") == QUALIFICATION_NORMALIZED_STATES,
+             "normalized_states: noncanonical qualification state")
     universal_ceiling = universal.get("preflight_ceiling_bytes")
+    _require(universal_ceiling == PREFLIGHT_CAP_BYTES,
+             "preflight ceiling differs from qualification contract")
     universal_preflights = universal.get("preflights")
     _require(isinstance(universal_preflights, dict) and set(universal_preflights) == set(SN_NAMES),
              "universal preflights: expected SN1-SN4")
     preflights = {
         name: _validate_preflight(
             universal_preflights[name], label=f"preflight.universal.{name}",
-            ceiling=universal_ceiling, adapted_hashes=inputs["adapted_files"],
+            ceiling=universal_ceiling, expected_policy=UNIVERSAL_POLICY,
+            expected_input_name=f"{name}.adapted.bin",
+            adapted_hashes=inputs["adapted_files"],
             round_dir=round_dir, hashes=hashes,
         )
         for name in SN_NAMES
     }
     preflights["SN2_headline"] = _validate_preflight(
         headline.get("preflight"), label="preflight.headline.SN_PIE_2",
-        ceiling=headline.get("preflight_ceiling_bytes"), adapted_hashes=inputs["adapted_files"],
+        ceiling=headline.get("preflight_ceiling_bytes"), expected_policy=HEADLINE_POLICY,
+        expected_input_name="SN_PIE_2.adapted.bin",
+        adapted_hashes=inputs["adapted_files"],
         round_dir=round_dir, hashes=hashes,
     )
     preflights["SN2_flags_off"] = _validate_preflight(
         qualification.get("flags_off_preflight"), label="preflight.flags_off.SN_PIE_2",
-        ceiling=universal_ceiling, adapted_hashes=inputs["adapted_files"],
+        ceiling=universal_ceiling, expected_policy=FLAGS_OFF_POLICY,
+        expected_input_name="SN_PIE_2.adapted.bin",
+        adapted_hashes=inputs["adapted_files"],
         round_dir=round_dir, hashes=hashes,
     )
     expected_preflight_hashes = {
@@ -939,18 +1088,24 @@ def _validate_qualification(
              "local admission preflight ceiling mismatch")
     _require(admission.get("preflight_artifact_sha256") == expected_preflight_hashes,
              "local admission preflight hashes mismatch")
-    _require(admission.get("profiles") == {
-        "flags_off": "",
-        "universal_sn1_sn4": universal.get("env"),
-        "sn2_headline": headline.get("env"),
-    }, "local admission profiles mismatch")
+    _require(admission.get("profiles") == QUALIFICATION_PROFILES,
+             "local admission profiles mismatch")
     _require(admission.get("adapted_input_manifest_sha256")
              == qualification["inputs"]["adapted_manifest_sha256"],
              "local admission adapted manifest mismatch")
     reproduction = admission.get("adapter_reproduction")
-    _require(isinstance(reproduction, dict) and reproduction.get("byte_equal") is True
+    _require(isinstance(reproduction, dict)
+             and reproduction == qualification.get("adapter_reproduction")
+             and set(reproduction) == {
+                 "byte_equal", "gpu_bench_binary_sha256",
+                 "raw_input_manifest_sha256", "bootloader_sha256",
+                 "pinned_adapted_manifest_sha256",
+             }
+             and reproduction.get("byte_equal") is True
              and reproduction.get("raw_input_manifest_sha256")
              == qualification["inputs"]["manifest_sha256"]
+             and reproduction.get("bootloader_sha256")
+             == inputs["raw_files"]["simple_bootloader_compiled.json"]
              and reproduction.get("pinned_adapted_manifest_sha256")
              == qualification["inputs"]["pinned_adapted_manifest_sha256"]
              and _is_sha256(reproduction.get("gpu_bench_binary_sha256"))
@@ -967,7 +1122,6 @@ def _validate_qualification(
         )
         for name in SN_NAMES
     }
-    phase_profiles = _validate_phase_ledger(bench_ledger_path, benchmarks_raw)
     gpu_telemetry = _validate_gpu_telemetry(
         qualification, benchmarks_raw, round_dir, hashes
     )
@@ -985,6 +1139,18 @@ def _validate_qualification(
              "proof_sha256.ab.sn2_headline: arms are absent or unequal")
     _require(fixed_hashes["SN_PIE_2"] == ab_hashes["headline"],
              "proof_sha256: fixed SN2 and A/B proofs differ")
+    phase_profiles = _validate_phase_ledger(
+        bench_ledger_path,
+        benchmarks_raw,
+        expected_env=QUALIFICATION_PROFILES["universal_sn1_sn4"],
+        expected_gpu=gpu,
+        expected_proof_hashes=fixed_hashes,
+        expected_telemetry=qualification["gpu_telemetry"],
+        expected_soundness_sha256=hashes["soundness"],
+        expected_target=target,
+        expected_target_sha256=target_sha,
+        expected_projection=projection,
+    )
     ncu_profile = _validate_ncu_profile(
         qualification,
         dry_run=bool(dry_run),
@@ -997,6 +1163,32 @@ def _validate_qualification(
     comparison = (comparisons or {}).get("sn2_flags_off_vs_headline")
     _require(isinstance(comparison, dict) and comparison.get("status") == "ok"
              and comparison.get("reps") == 6, "SN2 comparison is incomplete")
+    _require(comparison.get("lane") == "sn2_headline"
+             and comparison.get("bench_env") == QUALIFICATION_PROFILES["flags_off"]
+             and comparison.get("candidate_env") == QUALIFICATION_PROFILES["sn2_headline"]
+             and comparison.get("baseline_state")
+             == QUALIFICATION_NORMALIZED_STATES["flags_off"]
+             and comparison.get("candidate_state")
+             == QUALIFICATION_NORMALIZED_STATES["sn2_headline"],
+             "SN2 comparison environment or normalized state is noncanonical")
+    _require(comparison.get("provisional") is True
+             and comparison.get("performance_admissible") is False
+             and comparison.get("pod_gpu") == gpu
+             and (comparison.get("architecture_soundness") or {}).get("sha256")
+             == hashes["soundness"]
+             and comparison.get("execution_target") == target
+             and comparison.get("execution_target_sha256") == target_sha
+             and comparison.get("source_projection") == projection
+             and comparison.get("execution_guard_passed") is True
+             and comparison.get("remote_quiescence_passed") is True,
+             "SN2 comparison escaped the qualified execution seal")
+    raw_ncu = ((qualification.get("profiling") or {}).get("ncu") or {}).get("profile")
+    _require(comparison.get("ncu_profile_required") is True
+             and comparison.get("ncu_profile_requested") is True
+             and comparison.get("ncu_profile_attempted") is True
+             and comparison.get("ncu_profile_status") == "validated"
+             and comparison.get("ncu_profile") == raw_ncu,
+             "SN2 comparison differs from the qualified NCU capture")
     comparison_results: dict[str, Any] = {}
     for arm_name, hash_name in (("baseline", "flags_off"), ("flagged", "headline")):
         arm = comparison.get(arm_name)
@@ -1016,6 +1208,10 @@ def _validate_qualification(
     reported_ratio = comparison.get("useful_mhz_ratio")
     _require(_is_number(reported_ratio) and abs(float(reported_ratio) - ratio) <= 1e-12,
              "SN2 comparison ratio drift")
+    ab_entries = _load_jsonl(ab_ledger_path, "ledger.ab")
+    _require(len(ab_entries) == 1, "ledger.ab: expected exactly one SN2 A/B entry")
+    _require(comparison == {**ab_entries[0], "useful_mhz_ratio": ratio},
+             "SN2 comparison differs from authoritative A/B ledger")
 
     measured_identity = status == "passed"
     identity = {

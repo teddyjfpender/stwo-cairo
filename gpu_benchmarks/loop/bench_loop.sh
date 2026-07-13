@@ -590,14 +590,35 @@ validate_remote_execution_target() {
     || die "remote pod/GPU/binary/input target no longer matches the counted soundness gate"
 }
 
+verify_projection_exclusions_are_ignored() {
+  local repo file
+  for repo in "$STWO_LOCAL" "$CAIRO_LOCAL"; do
+    while IFS= read -r -d '' file; do
+      case "$file" in
+        __pycache__/*|*/__pycache__/*|*.pyc|*.pyo)
+          warn "source projection cannot exclude tracked or unignored Python bytecode in ${repo}: ${file}"
+          return 1
+          ;;
+      esac
+    done < <(
+      git -C "$repo" ls-files -z
+      git -C "$repo" ls-files --others --exclude-standard -z
+    )
+  done
+}
+
 verify_remote_source_projection() {
   [[ "$DRY_RUN" == "1" ]] && return 0
+  verify_projection_exclusions_are_ignored || return 1
   local stwo_changes cairo_changes
   stwo_changes="$(run_rsync -azcnO --delete --itemize-changes --no-owner --no-group --no-perms \
-    --exclude=target --exclude=.git -e "$SSH_E" \
+    --exclude=target --exclude=.git \
+    --exclude='__pycache__/' --exclude='*.py[co]' \
+    -e "$SSH_E" \
     "${STWO_LOCAL}/" "${POD_USER}@${POD_HOST}:${STWO_POD}/")" || return 1
   cairo_changes="$(run_rsync -azcnO --delete --itemize-changes --no-owner --no-group --no-perms \
     --exclude=target --exclude=.git \
+    --exclude='__pycache__/' --exclude='*.py[co]' \
     --exclude='gpu_benchmarks/pie/sn/' \
     --exclude='gpu_benchmarks/pie/*.zip' \
     --exclude='gpu_benchmarks/loop/results' \
@@ -892,15 +913,20 @@ bootstrap_pod() {
 # (b) Sync repositories
 # ---------------------------------------------------------------------------
 sync_repos() {
+  verify_projection_exclusions_are_ignored \
+    || die "source projection cache exclusions are not limited to ignored files"
+
   log "rsync stwo -> pod (excludes target/.git; --delete: stale kernels break the auto-collecting build)"
   run_rsync -azc --delete --partial --no-owner --no-group --no-perms \
     --exclude=target --exclude=.git \
+    --exclude='__pycache__/' --exclude='*.py[co]' \
     -e "$SSH_E" \
     "${STWO_LOCAL}/" "${POD_USER}@${POD_HOST}:${STWO_POD}/"
 
   log "rsync stwo-cairo -> pod (excludes target/.git/PIE zips/ledger)"
   run_rsync -azc --delete --partial --no-owner --no-group --no-perms \
     --exclude=target --exclude=.git \
+    --exclude='__pycache__/' --exclude='*.py[co]' \
     --exclude='gpu_benchmarks/pie/sn/' \
     --exclude='gpu_benchmarks/pie/*.zip' \
     --exclude='gpu_benchmarks/loop/results' \
@@ -1115,7 +1141,10 @@ done < <(env)
 unset CUDA_LAUNCH_BLOCKING CUDA_DEVICE_MAX_CONNECTIONS
 export STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache
 export STWO_PARITY_REF_CACHE=/workspace/.parity_ref_cache
+export PYTHONDONTWRITEBYTECODE=1
 ${BENCH_ENV:+export ${BENCH_ENV}}
+find '${CAIRO_POD}/gpu_benchmarks' -type d -name __pycache__ -prune -exec rm -rf {} + &&
+find '${CAIRO_POD}/gpu_benchmarks' -type f \( -name '*.pyc' -o -name '*.pyo' \) -exec rm -f {} + &&
 python3 gpu_benchmarks/run_cuda_soundness_gate.py \
   --stwo '${STWO_POD}' --runtime-mode '${GPU_PCS_RUNTIME_MODE}' \
   --synced-stwo-head '${STWO_REV}' \

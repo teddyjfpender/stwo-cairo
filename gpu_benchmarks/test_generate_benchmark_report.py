@@ -10,15 +10,62 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 try:
     from gpu_benchmarks.generate_benchmark_report import (
+        FLAGS_OFF_POLICY,
         GPU_TELEMETRY_COLUMNS,
+        HEADLINE_POLICY,
+        NCU_RELEASE_KERNEL_REGEX,
+        PREFLIGHT_CAP_BYTES,
+        QUALIFICATION_FLAGS,
+        QUALIFICATION_NORMALIZED_STATES,
+        QUALIFICATION_PROFILES,
         ReportError,
+        RETAINED_BUDGET_FLAG,
+        UNIVERSAL_POLICY,
         generate_report,
     )
+    from gpu_benchmarks.run_cuda_soundness_gate import (
+        STRICT_RESIDENT_GATE,
+        STRICT_RESIDENT_REQUIRED_TESTS,
+        gates_for_runtime_mode,
+    )
 except ModuleNotFoundError:  # Direct execution from gpu_benchmarks/.
-    from generate_benchmark_report import GPU_TELEMETRY_COLUMNS, ReportError, generate_report
+    from generate_benchmark_report import (
+        FLAGS_OFF_POLICY,
+        GPU_TELEMETRY_COLUMNS,
+        HEADLINE_POLICY,
+        NCU_RELEASE_KERNEL_REGEX,
+        PREFLIGHT_CAP_BYTES,
+        QUALIFICATION_FLAGS,
+        QUALIFICATION_NORMALIZED_STATES,
+        QUALIFICATION_PROFILES,
+        ReportError,
+        RETAINED_BUDGET_FLAG,
+        UNIVERSAL_POLICY,
+        generate_report,
+    )
+    from run_cuda_soundness_gate import (
+        STRICT_RESIDENT_GATE,
+        STRICT_RESIDENT_REQUIRED_TESTS,
+        gates_for_runtime_mode,
+    )
+
+
+_REAL_GENERATE_REPORT = generate_report
+_TEST_CANONICAL_MANIFESTS = None
+
+
+def generate_report(*args, **kwargs):
+    assert _TEST_CANONICAL_MANIFESTS is not None
+    raw, adapted = _TEST_CANONICAL_MANIFESTS
+    with mock.patch.dict(_REAL_GENERATE_REPORT.__globals__, {
+        "CANONICAL_RAW_MANIFEST_PATH": raw,
+        "CANONICAL_ADAPTED_MANIFEST_PATH": adapted,
+    }):
+        return _REAL_GENERATE_REPORT(*args, **kwargs)
 
 
 def sha(path: Path) -> str:
@@ -42,14 +89,29 @@ def quantile(samples: list[float], q: float) -> float:
 
 
 class Fixture:
-    def __init__(self, root: Path, *, dry_run: bool):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        dry_run: bool,
+        canonical_target: bool = True,
+        gpu: str = "",
+        unclean_source: bool = False,
+    ):
         self.root = root
         self.dry_run = dry_run
+        clean_hash = hashlib.sha256(b"").hexdigest()
         self.source = {
-            "stwo": {"head": "1" * 40, "worktree_hash": "2" * 64},
-            "stwo_cairo": {"head": "3" * 40, "worktree_hash": "4" * 64},
+            "stwo": {
+                "head": "1" * 40,
+                "worktree_hash": "2" * 64 if dry_run or unclean_source else clean_hash,
+            },
+            "stwo_cairo": {
+                "head": "3" * 40,
+                "worktree_hash": "4" * 64 if dry_run or unclean_source else clean_hash,
+            },
         }
-        self.gpu = "NVIDIA H100 80GB HBM3"
+        self.gpu = gpu or ("DRY-RUN-GPU" if dry_run else "NVIDIA H100 80GB HBM3")
         self.raw_hashes = {
             **{f"SN_PIE_{number}.zip": f"{number}" * 64 for number in range(1, 5)},
             "simple_bootloader_compiled.json": "5" * 64,
@@ -72,8 +134,17 @@ class Fixture:
         )
         self.pinned_manifest = root / "pinned.sha256"
         self.pinned_manifest.write_text(self.adapted_manifest.read_text())
+        self.canonical_raw_manifest = root / "canonical-raw.sha256"
+        self.canonical_raw_manifest.write_text(self.raw_manifest.read_text())
+        self.canonical_adapted_manifest = root / "canonical-adapted.sha256"
+        self.canonical_adapted_manifest.write_text(self.adapted_manifest.read_text())
+        global _TEST_CANONICAL_MANIFESTS
+        _TEST_CANONICAL_MANIFESTS = (
+            self.canonical_raw_manifest,
+            self.canonical_adapted_manifest,
+        )
 
-        ceiling = 76 * 1024**3
+        ceiling = PREFLIGHT_CAP_BYTES
         self.preflight_summaries = {}
         for label, number, arena in [
             *( (f"universal_SN{n}", n, 20 * 1024**3 + n) for n in range(1, 5) ),
@@ -81,7 +152,12 @@ class Fixture:
             ("flags_off_SN2", 2, 40 * 1024**3),
         ]:
             adapted_path = adapted / f"SN_PIE_{number}.adapted.bin"
-            policy = {"profile": label}
+            if label.startswith("universal_"):
+                policy = copy.deepcopy(UNIVERSAL_POLICY)
+            elif label == "headline_SN2":
+                policy = copy.deepcopy(HEADLINE_POLICY)
+            else:
+                policy = copy.deepcopy(FLAGS_OFF_POLICY)
             artifact = root / f"preflight_{label}.json"
             artifact.write_text(json.dumps({
                 "pass": True,
@@ -89,6 +165,7 @@ class Fixture:
                 "vram_budget_bytes": ceiling,
                 "arena": {"total_bytes": arena},
                 "runtime_policy": policy,
+                "source": str(adapted_path),
             }))
             self.preflight_summaries[label] = {
                 "artifact": str(artifact),
@@ -100,12 +177,22 @@ class Fixture:
                 "runtime_policy": policy,
             }
 
+        pie_root = (
+            "/workspace/stwo-cairo/gpu_benchmarks/pie/sn"
+            if canonical_target else "/remote"
+        )
         remote_inputs = {
-            "gate": {"path": "/remote/SN_PIE_2.zip", "sha256": self.raw_hashes["SN_PIE_2.zip"]},
-            "bootloader": {"path": "/remote/bootloader.json", "sha256": self.raw_hashes["simple_bootloader_compiled.json"]},
+            "gate": {"path": f"{pie_root}/SN_PIE_2.zip", "sha256": self.raw_hashes["SN_PIE_2.zip"]},
+            "bootloader": {
+                "path": (
+                    "/workspace/bench_inputs/simple_bootloader_compiled.json"
+                    if canonical_target else "/remote/bootloader.json"
+                ),
+                "sha256": self.raw_hashes["simple_bootloader_compiled.json"],
+            },
             **{
                 f"SN_PIE_{number}": {
-                    "path": f"/remote/SN_PIE_{number}.zip",
+                    "path": f"{pie_root}/SN_PIE_{number}.zip",
                     "sha256": self.raw_hashes[f"SN_PIE_{number}.zip"],
                 }
                 for number in range(1, 5)
@@ -117,7 +204,13 @@ class Fixture:
             "boot_id": "boot-qualification-test",
             "gpu_uuid": "GPU-qualification-test",
             "gpu_name": self.gpu,
-            "gpu_bench": {"path": "/remote/gpu_bench", "sha256": "a" * 64},
+            "gpu_bench": {
+                "path": (
+                    f"/workspace/bench_loop_runs/sealed/gpu_bench.{'a' * 64}"
+                    if canonical_target else f"/remote/sealed/gpu_bench.{'a' * 64}"
+                ),
+                "sha256": "a" * 64,
+            },
             "inputs": remote_inputs,
         }
         self.projection = {
@@ -125,9 +218,36 @@ class Fixture:
             "verified_after_soundness": True,
             "source": self.source,
         }
-        self.soundness = root / "soundness.json"
-        self.soundness.write_text(json.dumps({
+        effective_stwo_env = {
+            "STWO_CUDA_OBJ_CACHE": "/workspace/.cuda_obj_cache",
+            "STWO_PARITY_REF_CACHE": "/workspace/.parity_ref_cache",
+            "STWO_PARITY_REF_STWO_HEAD": self.source["stwo"]["head"],
+            "STWO_PARITY_REF_STWO_WORKTREE_HASH": self.source["stwo"]["worktree_hash"],
+            "STWO_PARITY_REF_STWO_CAIRO_HEAD": self.source["stwo_cairo"]["head"],
+            "STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH": self.source["stwo_cairo"]["worktree_hash"],
+            **{flag: "1" for flag in QUALIFICATION_FLAGS},
+            RETAINED_BUDGET_FLAG: "29469326848",
+        }
+        gates = []
+        for name, command, required in gates_for_runtime_mode("arena-graph"):
+            gate = {
+                "name": name,
+                "command": list(command),
+                "exit_code": 0,
+                "executed_tests": required,
+                "required_tests": required,
+                "passed": True,
+            }
+            if name == STRICT_RESIDENT_GATE:
+                gate["required_test_names"] = list(STRICT_RESIDENT_REQUIRED_TESTS)
+                gate["executed_test_names"] = list(STRICT_RESIDENT_REQUIRED_TESTS)
+            gates.append(gate)
+        self.soundness_payload = {
             "schema": "stwo.cuda.soundness-gate.v3",
+            "stwo_git_head": self.source["stwo"]["head"],
+            "stwo_cairo_git_head": self.source["stwo_cairo"]["head"],
+            "stwo_worktree_hash": self.source["stwo"]["worktree_hash"],
+            "stwo_cairo_worktree_hash": self.source["stwo_cairo"]["worktree_hash"],
             "passed": True,
             "runtime_mode": "arena-graph",
             "dry_run": dry_run,
@@ -140,7 +260,19 @@ class Fixture:
             "execution_target_sha256": canonical_sha(self.target),
             "execution_target_postcheck": True,
             "source_projection": self.projection,
-        }))
+            "qualification_flags": {flag: 1 for flag in QUALIFICATION_FLAGS},
+            "effective_stwo_env": effective_stwo_env,
+            "gates": gates,
+        }
+        self.soundness = root / "soundness.json"
+        self.soundness.write_text(json.dumps(self.soundness_payload))
+        self.adapter_reproduction = {
+            "byte_equal": True,
+            "gpu_bench_binary_sha256": "c" * 64,
+            "raw_input_manifest_sha256": sha(self.raw_manifest),
+            "bootloader_sha256": "5" * 64,
+            "pinned_adapted_manifest_sha256": sha(self.pinned_manifest),
+        }
         self.local_admission = root / "local_admission.json"
         self.local_admission.write_text(json.dumps({
             "schema": "stwo.local-preflight-admission.v1",
@@ -149,9 +281,7 @@ class Fixture:
             "runtime_mode": "arena-graph",
             "source": self.source,
             "profiles": {
-                "flags_off": "",
-                "universal_sn1_sn4": "STWO_UNIVERSAL=1",
-                "sn2_headline": "STWO_HEADLINE=1",
+                **QUALIFICATION_PROFILES,
             },
             "preflight_ceiling_bytes": ceiling,
             "preflight_artifact_sha256": {
@@ -159,17 +289,10 @@ class Fixture:
                 for summary in self.preflight_summaries.values()
             },
             "adapted_input_manifest_sha256": sha(self.adapted_manifest),
-            "adapter_reproduction": {
-                "byte_equal": True,
-                "gpu_bench_binary_sha256": "c" * 64,
-                "raw_input_manifest_sha256": sha(self.raw_manifest),
-                "bootloader_sha256": "5" * 64,
-                "pinned_adapted_manifest_sha256": sha(self.pinned_manifest),
-            },
+            "adapter_reproduction": self.adapter_reproduction,
         }))
         self.bench_ledger = root / "bench.jsonl"
         self.ab_ledger = root / "sn2_ab.jsonl"
-        self.ab_ledger.write_text('{"status":"ok"}\n')
 
         fixed = {
             f"SN_PIE_{number}": self.measurement(
@@ -194,10 +317,35 @@ class Fixture:
         ab_hash = "b" * 64
         proof_hashes = {name: str(number) * 64 for number, name in enumerate(fixed, 1)}
         proof_hashes["SN_PIE_2"] = ab_hash
+        ledger_seal = {
+            "execution_target": self.target,
+            "execution_target_sha256": canonical_sha(self.target),
+            "source_projection": self.projection,
+            "soundness_gate_sha256": sha(self.soundness),
+            "execution_guard_passed": True,
+            "remote_quiescence_passed": True,
+        }
         self.bench_entries = [
+            {
+                "run_name": "gate_correctness",
+                "pod_gpu": self.gpu,
+                **copy.deepcopy(ledger_seal),
+            },
+            {
+                "run_name": "gate_correctness",
+                "pod_gpu": self.gpu,
+                **copy.deepcopy(ledger_seal),
+            },
+            *[
             {
                 "run_name": name,
                 "status": "ok",
+                "bench_env": QUALIFICATION_PROFILES["universal_sn1_sn4"],
+                "qualification_probe": True,
+                "pod_gpu": self.gpu,
+                "proof_sha256": proof_hashes[name],
+                "gpu_telemetry": copy.deepcopy(self.telemetry[name]),
+                **copy.deepcopy(ledger_seal),
                 "record": copy.deepcopy(fixed[name]),
                 "phase_totals": [
                     {
@@ -217,6 +365,7 @@ class Fixture:
                 ],
             }
             for number, name in enumerate(fixed, 1)
+            ],
         ]
         self.write_bench_ledger()
         self.ncu_report = root / "sn2_headline.ncu-rep"
@@ -241,7 +390,7 @@ class Fixture:
             "path": str(self.ncu_report),
             "sha256": sha(self.ncu_report),
             "bytes": self.ncu_report.stat().st_size,
-            "kernel_regex": "relation_fused",
+            "kernel_regex": NCU_RELEASE_KERNEL_REGEX,
             "launch_count": 10,
             "set": "full",
             "ncu_version": "NVIDIA (R) Nsight Compute Command Line Profiler",
@@ -258,6 +407,44 @@ class Fixture:
             "profiled_proof_sha256": ab_hash,
         }
         ratio = headline["useful_mhz_median"] / baseline["useful_mhz_median"]
+        self.ab_entry = {
+            "status": "ok",
+            "lane": "sn2_headline",
+            "bench_env": QUALIFICATION_PROFILES["flags_off"],
+            "candidate_env": QUALIFICATION_PROFILES["sn2_headline"],
+            "baseline_state": copy.deepcopy(
+                QUALIFICATION_NORMALIZED_STATES["flags_off"]
+            ),
+            "candidate_state": copy.deepcopy(
+                QUALIFICATION_NORMALIZED_STATES["sn2_headline"]
+            ),
+            "provisional": True,
+            "performance_admissible": False,
+            "pod_gpu": self.gpu,
+            "architecture_soundness": {"sha256": sha(self.soundness)},
+            "execution_target": copy.deepcopy(self.target),
+            "execution_target_sha256": canonical_sha(self.target),
+            "source_projection": copy.deepcopy(self.projection),
+            "execution_guard_passed": True,
+            "remote_quiescence_passed": True,
+            "reps": 6,
+            "baseline": {
+                "proof_sha256": ab_hash,
+                "useful_mhz_median": baseline["useful_mhz_median"],
+                "record": baseline,
+            },
+            "flagged": {
+                "proof_sha256": ab_hash,
+                "useful_mhz_median": headline["useful_mhz_median"],
+                "record": headline,
+            },
+            "ncu_profile_required": True,
+            "ncu_profile_requested": True,
+            "ncu_profile_attempted": True,
+            "ncu_profile_status": "validated",
+            "ncu_profile": copy.deepcopy(self.ncu_profile),
+        }
+        self.ab_ledger.write_text(json.dumps(self.ab_entry) + "\n")
         self.qualification = {
             "schema": "stwo.qualification-round.v4",
             "status": "dry_run" if dry_run else "passed",
@@ -265,10 +452,19 @@ class Fixture:
             "performance_admissible": not dry_run,
             "runtime_mode": "arena-graph",
             "gpu": self.gpu,
-            "source": self.source,
+            "source": {
+                **self.source,
+                "sync": {
+                    "method": "rsync checksum with target and result exclusions",
+                    "release_requires_clean_commits": True,
+                },
+            },
             "profiles": {
                 "universal_sn1_sn4": {
-                    "env": "STWO_UNIVERSAL=1",
+                    "env": QUALIFICATION_PROFILES["universal_sn1_sn4"],
+                    "effective_state": copy.deepcopy(
+                        QUALIFICATION_NORMALIZED_STATES["universal_sn1_sn4"]
+                    ),
                     "preflight_ceiling_bytes": ceiling,
                     "preflights": {
                         f"SN_PIE_{number}": self.preflight_summaries[f"universal_SN{number}"]
@@ -276,20 +472,34 @@ class Fixture:
                     },
                 },
                 "sn2_headline": {
-                    "env": "STWO_HEADLINE=1",
+                    "env": QUALIFICATION_PROFILES["sn2_headline"],
+                    "effective_state": copy.deepcopy(
+                        QUALIFICATION_NORMALIZED_STATES["sn2_headline"]
+                    ),
                     "preflight_ceiling_bytes": ceiling,
                     "preflight": self.preflight_summaries["headline_SN2"],
                 },
             },
+            "normalized_states": copy.deepcopy(QUALIFICATION_NORMALIZED_STATES),
             "flags_off_preflight": self.preflight_summaries["flags_off_SN2"],
+            "adapter_reproduction": copy.deepcopy(self.adapter_reproduction),
             "local_admission": {"path": str(self.local_admission), "sha256": sha(self.local_admission)},
-            "soundness": {"path": str(self.soundness), "sha256": sha(self.soundness)},
+            "soundness": {
+                "path": str(self.soundness),
+                "sha256": sha(self.soundness),
+                "effective_stwo_env": effective_stwo_env,
+                "stwo_worktree_hash": self.source["stwo"]["worktree_hash"],
+                "stwo_cairo_worktree_hash": self.source["stwo_cairo"]["worktree_hash"],
+            },
             "remote_execution_target": {
                 "target": self.target,
                 "sha256": canonical_sha(self.target),
                 "postcheck": True,
                 "source_projection": self.projection,
+                "ledger_entries_guarded": 7,
                 "remote_quiescence_passed": True,
+                "quiescent_ledger_entries": 7,
+                "quiescent_measurement_launches": 9,
             },
             "inputs": {
                 "manifest": str(self.raw_manifest),
@@ -319,20 +529,9 @@ class Fixture:
             },
             "comparisons": {
                 "sn2_flags_off_vs_headline": {
-                    "status": "ok",
-                    "reps": 6,
-                    "baseline": {
-                        "proof_sha256": ab_hash,
-                        "useful_mhz_median": baseline["useful_mhz_median"],
-                        "record": baseline,
-                    },
-                    "flagged": {
-                        "proof_sha256": ab_hash,
-                        "useful_mhz_median": headline["useful_mhz_median"],
-                        "record": headline,
-                    },
+                    **copy.deepcopy(self.ab_entry),
                     "useful_mhz_ratio": ratio,
-                }
+                },
             },
             "ledgers": {
                 "bench": {"path": str(self.bench_ledger), "sha256": sha(self.bench_ledger)},
@@ -394,19 +593,20 @@ class Fixture:
         cycles: int,
         samples: list[float],
         simd: bool = False,
+        reps: int = 6,
     ) -> dict:
-        median = sorted(samples)[2]
+        median = sorted(samples)[len(samples) // 2]
         p95 = quantile(samples, 0.95)
         record = {
             "program": program,
             "backend": "cuda",
             "engine": "gpu-native",
             "gpu": self.gpu,
-            "reps": 6,
+            "reps": reps,
             "gpu_proof_loop_started_unix_ns": 1_700_000_000_000_000_000,
             "gpu_proof_loop_finished_unix_ns": 1_700_000_004_000_000_000,
-            "verified_reps": 6,
-            "warm_sample_count": 5,
+            "verified_reps": reps,
+            "warm_sample_count": reps - 1,
             "prove_s_warm_samples_raw": samples,
             "prove_s_cold": 8.0,
             "prove_s_warm_median": round3(median),
@@ -553,7 +753,336 @@ class GenerateBenchmarkReportTests(unittest.TestCase):
             with self.assertRaisesRegex(ReportError, "ledger.bench: sha256 mismatch"):
                 generate_report(fixture.path, fixture.root / "report")
 
+    def test_noncanonical_profiles_states_and_admission_fail_closed(self) -> None:
+        mutations = {
+            "universal env": lambda q: q["profiles"]["universal_sn1_sn4"].update(
+                {"env": "STWO_UNIVERSAL=1"}
+            ),
+            "headline env": lambda q: q["profiles"]["sn2_headline"].update(
+                {"env": "STWO_HEADLINE=1"}
+            ),
+            "universal state": lambda q: q["profiles"]["universal_sn1_sn4"][
+                "effective_state"
+            ].update({"STWO_CUDA_B2N_STAGE_FUSED": 0}),
+            "headline state": lambda q: q["profiles"]["sn2_headline"][
+                "effective_state"
+            ].update({"STWO_CUDA_COMPOSITION_DIRECT_RETENTION": 0}),
+            "normalized flags-off state": lambda q: q["normalized_states"][
+                "flags_off"
+            ].update({"STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE": 1}),
+            "preflight ceiling": lambda q: q["profiles"]["universal_sn1_sn4"].update(
+                {"preflight_ceiling_bytes": PREFLIGHT_CAP_BYTES - 1}
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                fixture = Fixture(Path(temporary), dry_run=False)
+                mutate(fixture.qualification)
+                fixture.write()
+                with self.assertRaises(ReportError):
+                    generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            admission = json.loads(fixture.local_admission.read_text())
+            admission["profiles"]["sn2_headline"] = "STWO_HEADLINE=1"
+            fixture.local_admission.write_text(json.dumps(admission))
+            fixture.qualification["local_admission"]["sha256"] = sha(
+                fixture.local_admission
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "local admission profiles mismatch"):
+                generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            fixture.qualification.pop("adapter_reproduction")
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "adapter reproduction binding"):
+                generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            with self.assertRaisesRegex(ReportError, "canonical release manifest"):
+                _REAL_GENERATE_REPORT(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            entries = fixture.pinned_manifest.read_text().splitlines()
+            entries[0] = f"{'0' * 64}  SN_PIE_1.adapted.bin"
+            fixture.pinned_manifest.write_text("\n".join(entries) + "\n")
+            digest = sha(fixture.pinned_manifest)
+            fixture.qualification["inputs"]["pinned_adapted_manifest_sha256"] = digest
+            fixture.qualification["adapter_reproduction"][
+                "pinned_adapted_manifest_sha256"
+            ] = digest
+            admission = json.loads(fixture.local_admission.read_text())
+            admission["adapter_reproduction"][
+                "pinned_adapted_manifest_sha256"
+            ] = digest
+            fixture.local_admission.write_text(json.dumps(admission))
+            fixture.qualification["local_admission"]["sha256"] = sha(
+                fixture.local_admission
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "pinned_adapted_manifest"):
+                generate_report(fixture.path, fixture.root / "report")
+
+    def test_release_gpu_source_and_sync_are_exact(self) -> None:
+        cases = {
+            "GPU": {"gpu": "NVIDIA A100-SXM4-80GB"},
+            "clean source": {"unclean_source": True},
+        }
+        for name, options in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                fixture = Fixture(Path(temporary), dry_run=False, **options)
+                with self.assertRaises(ReportError):
+                    generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            fixture.qualification["source"]["sync"][
+                "release_requires_clean_commits"
+            ] = False
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "source.sync"):
+                generate_report(fixture.path, fixture.root / "report")
+
+    def test_every_qualification_measurement_requires_six_repetitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            prior = fixture.qualification["benchmarks"]["SN_PIE_1"]
+            reduced = fixture.measurement(
+                "SN_PIE_1.zip",
+                steps=prior["pie_n_steps"],
+                cycles=prior["cycle_count"],
+                samples=[2.0],
+                simd=True,
+                reps=2,
+            )
+            fixture.qualification["benchmarks"]["SN_PIE_1"] = reduced
+            entry = next(
+                item for item in fixture.bench_entries
+                if item.get("run_name") == "SN_PIE_1"
+            )
+            entry["record"] = copy.deepcopy(reduced)
+            fixture.write_bench_ledger()
+            fixture.qualification["ledgers"]["bench"]["sha256"] = sha(
+                fixture.bench_ledger
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "requires exactly 6"):
+                generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            prior = fixture.ab_entry["flagged"]["record"]
+            reduced = fixture.measurement(
+                "SN_PIE_2.zip",
+                steps=prior["pie_n_steps"],
+                cycles=prior["cycle_count"],
+                samples=[2.0],
+                reps=2,
+            )
+            for comparison in (
+                fixture.ab_entry,
+                fixture.qualification["comparisons"]["sn2_flags_off_vs_headline"],
+            ):
+                comparison["flagged"]["record"] = copy.deepcopy(reduced)
+                comparison["flagged"]["useful_mhz_median"] = reduced[
+                    "useful_mhz_median"
+                ]
+            qualified = fixture.qualification["comparisons"][
+                "sn2_flags_off_vs_headline"
+            ]
+            qualified["useful_mhz_ratio"] = (
+                reduced["useful_mhz_median"]
+                / qualified["baseline"]["useful_mhz_median"]
+            )
+            fixture.ab_ledger.write_text(json.dumps(fixture.ab_entry) + "\n")
+            fixture.qualification["ledgers"]["ab"]["sha256"] = sha(fixture.ab_ledger)
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "requires exactly 6"):
+                generate_report(fixture.path, fixture.root / "report")
+
+    def test_preflight_policy_must_match_canonical_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            summary = fixture.qualification["profiles"]["universal_sn1_sn4"][
+                "preflights"
+            ]["SN_PIE_1"]
+            artifact = Path(summary["artifact"])
+            record = json.loads(artifact.read_text())
+            noncanonical = {"profile": "self-consistent-but-unqualified"}
+            record["runtime_policy"] = noncanonical
+            artifact.write_text(json.dumps(record))
+            summary["runtime_policy"] = noncanonical
+            summary["artifact_sha256"] = sha(artifact)
+            admission = json.loads(fixture.local_admission.read_text())
+            admission["preflight_artifact_sha256"][artifact.name] = sha(artifact)
+            fixture.local_admission.write_text(json.dumps(admission))
+            fixture.qualification["local_admission"]["sha256"] = sha(
+                fixture.local_admission
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "qualification contract"):
+                generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            summary = fixture.qualification["profiles"]["universal_sn1_sn4"][
+                "preflights"
+            ]["SN_PIE_1"]
+            artifact = Path(summary["artifact"])
+            record = json.loads(artifact.read_text())
+            record["source"] = fixture.preflight_summaries["universal_SN2"][
+                "adapted_input"
+            ]
+            artifact.write_text(json.dumps(record))
+            summary["artifact_sha256"] = sha(artifact)
+            admission = json.loads(fixture.local_admission.read_text())
+            admission["preflight_artifact_sha256"][artifact.name] = sha(artifact)
+            fixture.local_admission.write_text(json.dumps(admission))
+            fixture.qualification["local_admission"]["sha256"] = sha(
+                fixture.local_admission
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "artifact source"):
+                generate_report(fixture.path, fixture.root / "report")
+
+    def test_full_soundness_contract_and_wrapper_are_bound(self) -> None:
+        mutations = {
+            "qualification flag": lambda value: value["qualification_flags"].update(
+                {"STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE": 0}
+            ),
+            "effective environment": lambda value: value["effective_stwo_env"].update(
+                {RETAINED_BUDGET_FLAG: "1"}
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                fixture = Fixture(Path(temporary), dry_run=False)
+                mutate(fixture.soundness_payload)
+                fixture.soundness.write_text(json.dumps(fixture.soundness_payload))
+                reference = fixture.qualification["soundness"]
+                reference["sha256"] = sha(fixture.soundness)
+                reference["effective_stwo_env"] = fixture.soundness_payload[
+                    "effective_stwo_env"
+                ]
+                fixture.write()
+                with self.assertRaisesRegex(ReportError, "soundness qualification contract"):
+                    generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            fixture.qualification["soundness"]["effective_stwo_env"] = {"unbound": "1"}
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "soundness wrapper"):
+                generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(
+                Path(temporary), dry_run=False, canonical_target=False
+            )
+            with self.assertRaisesRegex(ReportError, "release harness"):
+                generate_report(fixture.path, fixture.root / "report")
+
+    def test_embedded_comparison_must_equal_authoritative_ab_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            comparison = fixture.qualification["comparisons"][
+                "sn2_flags_off_vs_headline"
+            ]
+            prior = comparison["flagged"]["record"]
+            forged_seconds = prior["pie_n_steps"] / 6.1e6
+            forged = fixture.measurement(
+                "SN_PIE_2.zip",
+                steps=prior["pie_n_steps"],
+                cycles=prior["cycle_count"],
+                samples=[forged_seconds] * 5,
+            )
+            self.assertEqual(forged["useful_mhz_median"], 6.1)
+            comparison["flagged"]["record"] = forged
+            comparison["flagged"]["useful_mhz_median"] = 6.1
+            comparison["useful_mhz_ratio"] = (
+                6.1 / comparison["baseline"]["useful_mhz_median"]
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "authoritative A/B ledger"):
+                generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            fixture.ab_entry["unbound"] = "ledger changed after embedding"
+            fixture.ab_ledger.write_text(json.dumps(fixture.ab_entry) + "\n")
+            fixture.qualification["ledgers"]["ab"]["sha256"] = sha(fixture.ab_ledger)
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "authoritative A/B ledger"):
+                generate_report(fixture.path, fixture.root / "report")
+
+    def test_raw_ab_ncu_profile_must_equal_qualified_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            fixture.ab_entry["ncu_profile"]["kernel_regex"] = "relation_fused"
+            fixture.ab_ledger.write_text(json.dumps(fixture.ab_entry) + "\n")
+            fixture.qualification["ledgers"]["ab"]["sha256"] = sha(fixture.ab_ledger)
+            comparison = fixture.qualification["comparisons"][
+                "sn2_flags_off_vs_headline"
+            ]
+            comparison["ncu_profile"]["kernel_regex"] = "relation_fused"
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "qualified NCU capture"):
+                generate_report(fixture.path, fixture.root / "report")
+
+    def test_universal_bench_ledger_environment_is_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            entry = next(
+                item for item in fixture.bench_entries
+                if item.get("run_name") == "SN_PIE_1"
+            )
+            entry["bench_env"] = "STWO_UNIVERSAL=1"
+            fixture.write_bench_ledger()
+            fixture.qualification["ledgers"]["bench"]["sha256"] = sha(
+                fixture.bench_ledger
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "qualification binding drifted"):
+                generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            fixture.bench_entries[0]["pod_gpu"] = "NVIDIA A100-SXM4-80GB"
+            fixture.write_bench_ledger()
+            fixture.qualification["ledgers"]["bench"]["sha256"] = sha(
+                fixture.bench_ledger
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "execution seal"):
+                generate_report(fixture.path, fixture.root / "report")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Fixture(Path(temporary), dry_run=False)
+            entry = next(
+                item for item in fixture.bench_entries
+                if item.get("run_name") == "SN_PIE_1"
+            )
+            entry.pop("gpu_telemetry")
+            fixture.write_bench_ledger()
+            fixture.qualification["ledgers"]["bench"]["sha256"] = sha(
+                fixture.bench_ledger
+            )
+            fixture.write()
+            with self.assertRaisesRegex(ReportError, "qualification binding drifted"):
+                generate_report(fixture.path, fixture.root / "report")
+
     def test_phase_ledger_mutations_fail_closed(self) -> None:
+        def fixed(entries: list[dict]) -> dict:
+            return next(
+                entry for entry in entries
+                if entry.get("run_name", "").startswith("SN_PIE_")
+            )
+
         def duplicate(entries: list[dict]) -> None:
             entries.append(copy.deepcopy(entries[0]))
 
@@ -561,26 +1090,26 @@ class GenerateBenchmarkReportTests(unittest.TestCase):
             entries.pop(0)
 
         def missing_rep(entries: list[dict]) -> None:
-            entries[0]["phase_totals"].pop()
+            fixed(entries)["phase_totals"].pop()
 
         def duplicate_rep(entries: list[dict]) -> None:
-            entries[0]["phase_totals"][-1]["rep"] = 4
+            fixed(entries)["phase_totals"][-1]["rep"] = 4
 
         def phase_set_drift(entries: list[dict]) -> None:
-            entries[0]["phase_totals"][-1]["phase_totals"].pop("fri")
+            fixed(entries)["phase_totals"][-1]["phase_totals"].pop("fri")
 
         def empty_phase(entries: list[dict]) -> None:
-            phases = entries[0]["phase_totals"][0]["phase_totals"]
+            phases = fixed(entries)["phase_totals"][0]["phase_totals"]
             phases[""] = phases.pop("fri")
 
         def invalid_count(entries: list[dict]) -> None:
-            entries[0]["phase_totals"][0]["phase_totals"]["fri"]["count"] = True
+            fixed(entries)["phase_totals"][0]["phase_totals"]["fri"]["count"] = True
 
         def invalid_total(entries: list[dict]) -> None:
-            entries[0]["phase_totals"][0]["phase_totals"]["fri"]["total_ms"] = math.inf
+            fixed(entries)["phase_totals"][0]["phase_totals"]["fri"]["total_ms"] = math.inf
 
         def record_drift(entries: list[dict]) -> None:
-            entries[0]["record"]["proof_kb"] += 1
+            fixed(entries)["record"]["proof_kb"] += 1
 
         mutations = {
             "duplicate fixed SN": duplicate,
@@ -660,6 +1189,15 @@ class GenerateBenchmarkReportTests(unittest.TestCase):
             "synthetic": lambda q: q["profiling"]["ncu"]["profile"].update({"synthetic": True}),
             "proof": lambda q: q["profiling"]["ncu"]["profile"].update({"profiled_proof_sha256": "e" * 64}),
             "remote CSV hash": lambda q: q["profiling"]["ncu"]["profile"].update({"remote_import_output_sha256": "e" * 64}),
+            "broad kernel subset": lambda q: q["profiling"]["ncu"]["profile"].update(
+                {"kernel_regex": "relation_fused"}
+            ),
+            "launch count": lambda q: q["profiling"]["ncu"]["profile"].update(
+                {"launch_count": 11}
+            ),
+            "metric set": lambda q: q["profiling"]["ncu"]["profile"].update(
+                {"set": "basic"}
+            ),
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
