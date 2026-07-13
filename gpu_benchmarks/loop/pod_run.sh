@@ -220,12 +220,12 @@ pssh "set -e
 
 # --- 3. rsync both repos (bench_loop-identical excludes) ---
 note "rsync stwo"
-rsync -azc --delete --partial --no-owner --no-group --exclude=target --exclude=.git \
+rsync -azc --delete --partial --no-owner --no-group --no-perms --exclude=target --exclude=.git \
   -e "ssh ${SSH_OPTS[*]} -i $KEY -p $PORT" \
   "${STWO_LOCAL}/" "root@${HOST}:${STWO_POD}/" || { note "SYNC stwo FAILED"; exit 1; }
 note "rsync stwo-cairo"
-rsync -azc --delete --partial --no-owner --no-group --exclude=target --exclude=.git \
-  --exclude='gpu_benchmarks/pie/sn/*.zip' --exclude='gpu_benchmarks/pie/*.zip' \
+rsync -azc --delete --partial --no-owner --no-group --no-perms --exclude=target --exclude=.git \
+  --exclude='gpu_benchmarks/pie/sn/' --exclude='gpu_benchmarks/pie/*.zip' \
   --exclude='gpu_benchmarks/loop/results' --exclude='gpu_benchmarks/loop/ledger.jsonl' \
   -e "ssh ${SSH_OPTS[*]} -i $KEY -p $PORT" \
   "${CAIRO_LOCAL}/" "root@${HOST}:${CAIRO_POD}/" || { note "SYNC stwo-cairo FAILED"; exit 1; }

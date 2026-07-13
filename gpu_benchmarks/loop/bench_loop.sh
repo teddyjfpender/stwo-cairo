@@ -593,12 +593,12 @@ validate_remote_execution_target() {
 verify_remote_source_projection() {
   [[ "$DRY_RUN" == "1" ]] && return 0
   local stwo_changes cairo_changes
-  stwo_changes="$(run_rsync -azcnO --delete --itemize-changes --no-owner --no-group \
+  stwo_changes="$(run_rsync -azcnO --delete --itemize-changes --no-owner --no-group --no-perms \
     --exclude=target --exclude=.git -e "$SSH_E" \
     "${STWO_LOCAL}/" "${POD_USER}@${POD_HOST}:${STWO_POD}/")" || return 1
-  cairo_changes="$(run_rsync -azcnO --delete --itemize-changes --no-owner --no-group \
+  cairo_changes="$(run_rsync -azcnO --delete --itemize-changes --no-owner --no-group --no-perms \
     --exclude=target --exclude=.git \
-    --exclude='gpu_benchmarks/pie/sn/*.zip' \
+    --exclude='gpu_benchmarks/pie/sn/' \
     --exclude='gpu_benchmarks/pie/*.zip' \
     --exclude='gpu_benchmarks/loop/results' \
     --exclude='gpu_benchmarks/loop/ledger.jsonl' \
@@ -854,20 +854,54 @@ log "pod GPU: ${POD_GPU}"
 [[ -z "$EXPECTED_POD_GPU" || "$POD_GPU" == "$EXPECTED_POD_GPU" ]] \
   || die "qualification requires GPU '${EXPECTED_POD_GPU}', got '${POD_GPU}'"
 
+# Reset containers do not retain apt packages or $HOME, while the Rust/Cargo
+# homes and build caches live on /workspace. Recreate that small bridge before
+# rsync so release qualification is self-contained after every pod resume.
+bootstrap_pod() {
+  log "bootstrap reset pod container (rsync + persistent Rust homes)"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    dry "bootstrap: install rsync if absent; bind /workspace Rust/Cargo homes; validate CUDA, NCU, and launcher tools"
+    return 0
+  fi
+  run_ssh "set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    command -v rsync >/dev/null 2>&1 || { apt-get update -qq >/dev/null && apt-get install -y -qq rsync >/dev/null; }
+    command -v gcc >/dev/null 2>&1 && command -v g++ >/dev/null 2>&1 && \
+      command -v make >/dev/null 2>&1 && command -v ar >/dev/null 2>&1 && \
+      command -v ld >/dev/null 2>&1 || apt-get install -y -qq build-essential >/dev/null
+    mkdir -p /workspace/.rustup-persist /workspace/.cargo-persist \"\$HOME/.cargo\"
+    if [ ! -x /workspace/.cargo-persist/bin/rustup ]; then
+      command -v curl >/dev/null 2>&1
+      RUSTUP_HOME=/workspace/.rustup-persist CARGO_HOME=/workspace/.cargo-persist \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        RUSTUP_HOME=/workspace/.rustup-persist CARGO_HOME=/workspace/.cargo-persist \
+        sh -s -- -y --default-toolchain none >/dev/null
+    fi
+    printf '%s\\n' \
+      'export RUSTUP_HOME=/workspace/.rustup-persist' \
+      'export CARGO_HOME=/workspace/.cargo-persist' \
+      'export PATH=\"\$CARGO_HOME/bin:/usr/local/cuda/bin:\$PATH\"' \
+      > \"\$HOME/.cargo/env\"
+    . \"\$HOME/.cargo/env\"
+    for tool in rsync cargo rustc rustup nvcc ncu python3 sha256sum stat setsid nohup timeout nvidia-smi gcc g++ make ar ld; do
+      command -v \"\$tool\" >/dev/null 2>&1 || { echo \"missing remote prerequisite: \$tool\" >&2; exit 1; }
+    done" || die "pod bootstrap failed before source sync"
+}
+
 # ---------------------------------------------------------------------------
 # (b) Sync repositories
 # ---------------------------------------------------------------------------
 sync_repos() {
   log "rsync stwo -> pod (excludes target/.git; --delete: stale kernels break the auto-collecting build)"
-  run_rsync -azc --delete --partial --no-owner --no-group \
+  run_rsync -azc --delete --partial --no-owner --no-group --no-perms \
     --exclude=target --exclude=.git \
     -e "$SSH_E" \
     "${STWO_LOCAL}/" "${POD_USER}@${POD_HOST}:${STWO_POD}/"
 
   log "rsync stwo-cairo -> pod (excludes target/.git/PIE zips/ledger)"
-  run_rsync -azc --delete --partial --no-owner --no-group \
+  run_rsync -azc --delete --partial --no-owner --no-group --no-perms \
     --exclude=target --exclude=.git \
-    --exclude='gpu_benchmarks/pie/sn/*.zip' \
+    --exclude='gpu_benchmarks/pie/sn/' \
     --exclude='gpu_benchmarks/pie/*.zip' \
     --exclude='gpu_benchmarks/loop/results' \
     --exclude='gpu_benchmarks/loop/ledger.jsonl' \
@@ -890,12 +924,14 @@ build_pod() {
   out="$(run_ssh "cd '${POD_PROVER_DIR}' && . \$HOME/.cargo/env 2>/dev/null; \
       for stwo_name in \$(env | sed -n 's/^\(STWO_[A-Za-z0-9_]*\)=.*/\1/p'); do unset \"\$stwo_name\"; done; \
       unset CUDA_LAUNCH_BLOCKING CUDA_DEVICE_MAX_CONNECTIONS; \
+      : > '${POD_BUILD_LOG}'; \
+      rustup toolchain install >> '${POD_BUILD_LOG}' 2>&1 && \
       PATH=/usr/local/cuda/bin:\$PATH RUSTFLAGS='${BUILD_RUSTFLAGS}' \
       STWO_CUDA_OBJ_CACHE=/workspace/.cuda_obj_cache \
       STWO_CUDA_BUILD_JOBS=16 \
       STWO_BOOTLOADER_JSON='${POD_BOOTLOADER_JSON}' \
       cargo build --release -p stwo-cairo-gpu-prover --bin gpu_bench --features pie-bench \
-      > '${POD_BUILD_LOG}' 2>&1; echo BUILD_EXIT=\$?")"
+      >> '${POD_BUILD_LOG}' 2>&1; echo BUILD_EXIT=\$?")"
   local code
   code="$(printf '%s\n' "$out" | sed -n 's/.*BUILD_EXIT=\([0-9][0-9]*\).*/\1/p' | tail -1)"
   if [[ "$code" != "0" ]]; then
@@ -1777,6 +1813,7 @@ log "=== bench_loop start (pie=${PIE_SEL} reps=${REPS} all_pies=${ALL_PIES} full
 if [[ "$SKIP_SYNC" == "1" ]]; then
   log "--skip-sync: reusing the binary already on the pod (no repo sync, no build)"
 else
+  bootstrap_pod
   sync_repos
   verify_remote_source_projection \
     || die "remote source does not equal the checksum-synced local source"

@@ -47,6 +47,37 @@ printf '%s\n' "$body" | bash -n
             source,
         )
 
+    def test_reset_container_is_bootstrapped_before_content_only_sync(self) -> None:
+        source = (ROOT / "loop" / "bench_loop.sh").read_text(encoding="utf-8")
+        pod_run = (ROOT / "loop" / "pod_run.sh").read_text(encoding="utf-8")
+        orchestration = source.index("# Orchestration")
+        bootstrap = source.index("  bootstrap_pod", orchestration)
+        sync = source.index("  sync_repos", orchestration)
+        self.assertLess(bootstrap, sync)
+        self.assertIn("command -v rsync", source)
+        self.assertIn("apt-get install -y -qq build-essential", source)
+        self.assertIn("gcc g++ make ar ld", source)
+        self.assertIn("/workspace/.cargo-persist", source)
+        self.assertIn("rustup toolchain install >> '${POD_BUILD_LOG}' 2>&1 &&", source)
+
+        projection_body = source[
+            source.index("verify_remote_source_projection()") : source.index(
+                "seal_source_projection()"
+            )
+        ]
+        sync_body = source[
+            source.index("sync_repos()") : source.index("build_pod()")
+        ]
+        self.assertEqual(projection_body.count("--no-perms"), 2)
+        self.assertEqual(sync_body.count("--no-perms"), 2)
+        self.assertEqual(pod_run.count("--no-perms"), 2)
+        preserved_inputs = "--exclude='gpu_benchmarks/pie/sn/'"
+        self.assertEqual(projection_body.count(preserved_inputs), 1)
+        self.assertEqual(sync_body.count(preserved_inputs), 1)
+        self.assertEqual(pod_run.count(preserved_inputs), 1)
+        self.assertNotIn("gpu_benchmarks/pie/sn/*.zip", source)
+        self.assertNotIn("gpu_benchmarks/pie/sn/*.zip", pod_run)
+
 
 if __name__ == "__main__":
     unittest.main()
