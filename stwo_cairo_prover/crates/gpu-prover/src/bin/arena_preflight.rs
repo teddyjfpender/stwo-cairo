@@ -631,6 +631,8 @@ fn report_json(
             "range_view_count": arena.range_view_count(),
             "aggregate_range_view_words": arena.range_view_words(),
             "aggregate_range_view_bytes": bytes_of_words(arena.range_view_words()),
+            "process_owned_pedersen_evaluation_bytes": arena.process_owned_pedersen_evaluation_bytes(),
+            "requires_registered_pedersen_table": arena.requires_registered_pedersen_table(),
             "logical_buffer_count": arena.logical_buffers().len(),
             "logical_buffers": arena.logical_buffers().len(),
             "arena_idle_definition": ARENA_IDLE_DEFINITION,

@@ -16,7 +16,8 @@ use stwo_backend_cuda::{
     ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitEvaluationGroup,
     CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
     DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError, ExecutionTablesHostData,
-    FriDecommitOwnedSources, MemoryBaseTracePart, ModeAwareCommitWorkspaceRequirements,
+    FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
+    ModeAwareCommitWorkspaceRequirements,
     ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError, PreparedBlake2sPowGraph,
     PreparedBlake2sTranscript, PreparedCommitError, PreparedCommitGraph, PreparedDecommitError,
     PreparedDecommitGraph, PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
@@ -37,11 +38,14 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTra
 use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
 use stwo_cairo_prover::witness::proof_shape::{ProofShapeKey, TracePartId};
 
-use crate::arena_plan::{BufferPurpose, CommitmentColumnSource, CommitmentTreeId};
+use crate::arena_plan::{
+    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedFixedTableSource,
+};
 use crate::composition_plan::CompositionProofBindings;
 use crate::graphs::{
     bind_arena_binding, GraphCaptureStatus, GraphError, GraphSegment, GraphWorkspace,
 };
+use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
 use crate::multiplicity_pipeline::{FixedMultiplicityCoverageGap, MultiplicityFeedBlocker};
 use crate::proof_bundle::{
     ResidentProofBundle, ResidentProofBundleError, ResidentProofBundleLayout,
@@ -257,6 +261,12 @@ pub enum ResidentRuntimeError {
         component: &'static str,
         role: &'static str,
     },
+    RegisteredPedersenTableUnavailable,
+    RegisteredPedersenTableRows {
+        expected: usize,
+        actual: usize,
+    },
+    RegisteredPedersenTableColumn(usize),
     IncompleteFixedMultiplicityCoverage(Vec<FixedMultiplicityCoverageGap>),
     UnsupportedMultiplicityFeeds(Vec<MultiplicityFeedBlocker>),
     MissingPreprocessedTraceForMultiplicity,
@@ -1181,7 +1191,36 @@ impl<'a> ResidentGraphRuntime<'a> {
                         let sources = fixed
                             .sources
                             .iter()
-                            .map(|&binding| bind_arena_binding(arena, binding))
+                            .map(|source| match *source {
+                                PlannedFixedTableSource::Arena(binding) => {
+                                    bind_arena_binding(arena, binding)
+                                        .map(FixedTableSourceColumn::from)
+                                        .map_err(ResidentRuntimeError::from)
+                                }
+                                PlannedFixedTableSource::RegisteredPedersen18 { column } => {
+                                    let table = stwo_backend_cuda::pedersen_table::registered_borrowed_pedersen_table()
+                                        .ok_or(ResidentRuntimeError::RegisteredPedersenTableUnavailable)?;
+                                    if !table.has_exact_rows(PEDERSEN_POINTS_18_ROW_COUNT) {
+                                        return Err(ResidentRuntimeError::RegisteredPedersenTableRows {
+                                            expected: PEDERSEN_POINTS_18_ROW_COUNT,
+                                            actual: table.n_rows(),
+                                        });
+                                    }
+                                    let source = table
+                                        .column(column)
+                                        .filter(|source| {
+                                            source.index() == column
+                                                && source.len_words()
+                                                    == PEDERSEN_POINTS_18_ROW_COUNT
+                                        })
+                                        .ok_or(
+                                            ResidentRuntimeError::RegisteredPedersenTableColumn(
+                                                column,
+                                            ),
+                                        )?;
+                                    Ok(FixedTableSourceColumn::from(source))
+                                }
+                            })
                             .collect::<Result<Vec<_>, _>>()?;
                         PreparedFixedTableGraph::prepare_contiguous(
                             arena,
@@ -2780,8 +2819,16 @@ impl<'a> ResidentGraphRuntime<'a> {
                 if prepared
                     .source_columns()
                     .iter()
-                    .map(|slice| slice.id())
-                    .ne(planned.sources.iter().map(|source| source.physical))
+                    .zip(&planned.sources)
+                    .any(|(prepared, planned)| match planned {
+                        PlannedFixedTableSource::Arena(binding) => {
+                            prepared.arena_slot() != Some(binding.physical)
+                        }
+                        PlannedFixedTableSource::RegisteredPedersen18 { column } => {
+                            prepared.registered_pedersen_index() != Some(*column)
+                        }
+                    })
+                    || prepared.source_columns().len() != planned.sources.len()
                 {
                     return Err(reject("preprocessed sources"));
                 }

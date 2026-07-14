@@ -12,7 +12,8 @@ use cairo_air::claims::CairoClaim;
 use num_traits::Zero;
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
 use stwo::core::pcs::PcsConfig;
-use stwo::prover::poly::twiddles::TwiddleTree;
+use stwo::core::poly::circle::CanonicCoset;
+use stwo::prover::poly::circle::PolyOps;
 use stwo_backend_cuda::{
     CudaBackend, ExecutionTablesHostData, PreparedEcOpIngestTelemetry,
     PreparedExecutionTablesIngestTelemetry, RelationChallenges, WitnessInputGatherRequirements,
@@ -24,6 +25,9 @@ use stwo_cairo_prover::witness::relation_sources::RelationSourceError;
 
 use crate::arena_plan::{ArenaPlanError, ExecutionTableGeometry, ProofArenaPlan};
 use crate::composition_plan::{CompositionPlan, CompositionPlanError, CompositionProofBindings};
+use crate::fixed_table_materializer::{
+    PEDERSEN_POINTS_18_COLUMN_COUNT, PEDERSEN_POINTS_18_ROW_COUNT,
+};
 use crate::graphs::GraphWorkspace;
 use crate::plan::{ProofPlan, ProofPlanError};
 use crate::protocol_discovery::{ProtocolDiscoveryError, ProtocolTranscriptDiscovery};
@@ -66,7 +70,6 @@ pub struct ResidentSessionRequest {
     pub channel_salt: u32,
     pub pcs: PcsConfig,
     pub include_all_preprocessed_columns: bool,
-    pub twiddles: &'static TwiddleTree<CudaBackend>,
 }
 
 /// Strict device-born entry: claim/shape/protocol planning happens before the
@@ -79,7 +82,6 @@ pub struct ResidentPreWitnessSessionRequest {
     pub channel_salt: u32,
     pub pcs: PcsConfig,
     pub include_all_preprocessed_columns: bool,
-    pub twiddles: &'static TwiddleTree<CudaBackend>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,7 +399,6 @@ fn run_materialized_session<R>(
     witness: WitnessOutput<CudaBackend>,
     channel_salt: u32,
     pcs: PcsConfig,
-    twiddles: &'static TwiddleTree<CudaBackend>,
     executable: &ShapeExecutable,
     composition_bindings: &CompositionProofBindings,
     shape_executable_materialization: ShapeExecutableMaterialization,
@@ -426,7 +427,17 @@ fn run_materialized_session<R>(
         let residency = inspect_base_trace_residency(workspace, &proof_plan, &trace)?;
         require_device_born_base(residency)?;
     }
-    let base = stage_base_trace_coefficients(workspace, &proof_plan, trace, twiddles)?;
+    let twiddles = (!workspace.fixed_twiddles_ready()).then(|| {
+        CudaBackend::precompute_twiddles(
+            CanonicCoset::new(resident_twiddle_log_size(workspace))
+                .circle_domain()
+                .half_coset,
+        )
+    });
+    let base = stage_base_trace_coefficients(workspace, &proof_plan, trace, twiddles.as_ref())?;
+    // `stage_base_trace_coefficients` synchronizes its arena hand-off before
+    // returning. No replay node reads the detached source tree afterwards.
+    drop(twiddles);
     let preprocessed = stage_preprocessed_commitment(workspace, Arc::clone(&preprocessed_trace))?;
     let relation_sources =
         interaction_generator.into_relation_lookup_sources(&witness_exec_context)?;
@@ -498,6 +509,33 @@ fn run_materialized_session<R>(
     Ok((result, telemetry))
 }
 
+/// Largest commitment domain backed by the workspace's shared forward tree.
+///
+/// The fixed preprocessed tree may be taller than the dynamic quotient/FRI
+/// domain. Generating only the quotient-sized tree would make the cold stage
+/// reject that valid protocol geometry, so derive this from the exact compiled
+/// commitment plans rather than from one consumer.
+fn resident_twiddle_log_size(workspace: &GraphWorkspace) -> u32 {
+    let quotient = workspace.plan().quotient().config.lifting_log_size;
+    max_twiddle_log_size(
+        quotient,
+        workspace
+            .plan()
+            .commitments()
+            .iter()
+            .map(|commitment| commitment.config.lifting_log_size),
+    )
+}
+
+fn max_twiddle_log_size(
+    quotient_log_size: u32,
+    commitment_log_sizes: impl IntoIterator<Item = u32>,
+) -> u32 {
+    commitment_log_sizes
+        .into_iter()
+        .fold(quotient_log_size, u32::max)
+}
+
 fn require_device_born_base(residency: BaseTraceResidency) -> Result<(), ResidentSessionError> {
     if residency.migrated_columns == 0 && residency.direct_columns == residency.columns {
         Ok(())
@@ -563,6 +601,28 @@ fn public_memory_id_is_valid(id: u32, n_f252: usize, n_small: usize) -> bool {
     }
 }
 
+fn ensure_process_owned_pedersen_table(
+    executable: &ShapeExecutable,
+) -> Result<(), ResidentSessionError> {
+    if !executable.arena().requires_registered_pedersen_table() {
+        return Ok(());
+    }
+    if !stwo_cairo_prover::witness::jit_prove_backend::ensure_device_pedersen_table() {
+        return Err(ResidentSessionError::RecordedPedersenTableUnavailable);
+    }
+    let table = stwo_backend_cuda::pedersen_table::registered_borrowed_pedersen_table()
+        .ok_or(ResidentSessionError::RecordedPedersenTableUnavailable)?;
+    if !table.has_exact_rows(PEDERSEN_POINTS_18_ROW_COUNT)
+        || table.columns().len() != PEDERSEN_POINTS_18_COLUMN_COUNT
+        || !table.columns().iter().enumerate().all(|(index, column)| {
+            column.index() == index && column.len_words() == PEDERSEN_POINTS_18_ROW_COUNT
+        })
+    {
+        return Err(ResidentSessionError::RecordedPedersenTableUnavailable);
+    }
+    Ok(())
+}
+
 /// Compatibility hand-off for callers that already own a sealed witness. It
 /// still enforces arena-born base columns; a detached legacy witness is rejected
 /// before staging. New callers use [`with_resident_session_from_generator`].
@@ -581,7 +641,6 @@ pub fn with_resident_session<R>(
         channel_salt,
         pcs,
         include_all_preprocessed_columns,
-        twiddles,
     } = request;
     let selection = select_resident_executable(
         executable_cache,
@@ -598,6 +657,7 @@ pub fn with_resident_session<R>(
         bindings,
         materialization: executable_materialization,
     } = selection;
+    ensure_process_owned_pedersen_table(&executable)?;
     let (result, mut telemetry) = {
         let (workspace, materialization) = cache.materialize_or_reuse(&executable)?;
         run_materialized_session(
@@ -607,7 +667,6 @@ pub fn with_resident_session<R>(
             witness,
             channel_salt,
             pcs,
-            twiddles,
             &executable,
             &bindings,
             executable_materialization,
@@ -925,7 +984,6 @@ pub fn with_resident_session_from_generator<R>(
         channel_salt,
         pcs,
         include_all_preprocessed_columns,
-        twiddles,
     } = request;
     let exact_plan = Arc::new(capacity_plan.strict_resident_exact(
         &crate::schedule_table::CAIRO_SCHEDULE,
@@ -965,14 +1023,7 @@ pub fn with_resident_session_from_generator<R>(
         materialization: executable_materialization,
     } = selection;
 
-    if recorded
-        .lanes
-        .iter()
-        .any(|lane| lane.tables.host_pedersen_points_18)
-        && !stwo_cairo_prover::witness::jit_prove_backend::ensure_device_pedersen_table()
-    {
-        return Err(ResidentSessionError::RecordedPedersenTableUnavailable);
-    }
+    ensure_process_owned_pedersen_table(&executable)?;
     let raw_address_to_id = memory
         .address_to_id
         .iter()
@@ -992,7 +1043,22 @@ pub fn with_resident_session_from_generator<R>(
 
     let (result, mut telemetry) = {
         let (workspace, materialization) = cache.materialize_or_reuse(&executable)?;
-        let twiddle_report = stage_protocol_twiddles(workspace, twiddles)?;
+        let twiddle_report = if workspace.fixed_twiddles_ready() {
+            ResidentTwiddleStageReport {
+                cache_hit: true,
+                ..ResidentTwiddleStageReport::default()
+            }
+        } else {
+            let twiddles = CudaBackend::precompute_twiddles(
+                CanonicCoset::new(resident_twiddle_log_size(workspace))
+                    .circle_domain()
+                    .half_coset,
+            );
+            let report = stage_protocol_twiddles(workspace, &twiddles)?;
+            // The stage synchronizes the arena copies before returning.
+            drop(twiddles);
+            report
+        };
         let preprocessed =
             stage_preprocessed_commitment(workspace, Arc::clone(&preprocessed_trace))?;
 
@@ -2186,6 +2252,12 @@ mod tests {
                 required: 22
             })
         ));
+    }
+
+    #[test]
+    fn fixed_twiddle_tree_covers_the_tallest_commitment_domain() {
+        assert_eq!(max_twiddle_log_size(24, [21, 24, 23]), 24);
+        assert_eq!(max_twiddle_log_size(24, [27, 24, 23]), 27);
     }
 
     #[test]

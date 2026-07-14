@@ -16,6 +16,27 @@ use crate::fixed_table::{
 };
 use crate::fixed_table_table::CAIRO_FIXED_TABLE_MATERIALIZATION;
 
+pub const PEDERSEN_POINTS_18_COLUMN_COUNT: usize = 56;
+pub const PEDERSEN_POINTS_18_LOG_SIZE: u32 = 23;
+pub const PEDERSEN_POINTS_18_ROW_COUNT: usize = 1 << PEDERSEN_POINTS_18_LOG_SIZE;
+pub const PEDERSEN_POINTS_18_EVALUATION_BYTES: usize = PEDERSEN_POINTS_18_COLUMN_COUNT
+    * PEDERSEN_POINTS_18_ROW_COUNT
+    * core::mem::size_of::<u32>();
+
+/// Numeric column encoded by the exact canonical `pedersen_points_N` identity.
+/// Similar prefixes, leading-zero aliases and out-of-range columns fail closed.
+pub fn pedersen_points_18_column_index(identity: &str) -> Option<usize> {
+    let suffix = identity.strip_prefix("pedersen_points_")?;
+    if suffix.is_empty()
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+        || (suffix.len() > 1 && suffix.starts_with('0'))
+    {
+        return None;
+    }
+    let index = suffix.parse::<usize>().ok()?;
+    (index < PEDERSEN_POINTS_18_COLUMN_COUNT).then_some(index)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledFixedTableMaterialization {
     component: &'static str,
@@ -316,5 +337,40 @@ mod tests {
                 identity: component.preprocessed_sources[0],
             }
         );
+    }
+
+    #[test]
+    fn process_owned_pedersen_identity_and_bytes_are_exact() {
+        assert_eq!(PEDERSEN_POINTS_18_EVALUATION_BYTES, 1_879_048_192);
+        assert_eq!(PEDERSEN_POINTS_18_EVALUATION_BYTES >> 20, 1_792);
+        for index in 0..PEDERSEN_POINTS_18_COLUMN_COUNT {
+            assert_eq!(
+                pedersen_points_18_column_index(&format!("pedersen_points_{index}")),
+                Some(index)
+            );
+        }
+        for forged in [
+            "pedersen_points_",
+            "pedersen_points_00",
+            "pedersen_points_56",
+            "pedersen_points_small_0",
+            "pedersen_points_+1",
+            "seq_23",
+        ] {
+            assert_eq!(pedersen_points_18_column_index(forged), None, "{forged}");
+        }
+
+        let pedersen = compile_cairo_fixed_table_materializations()
+            .unwrap()
+            .into_iter()
+            .find(|plan| plan.component() == "pedersen_points_table_window_bits_18")
+            .unwrap();
+        let external = pedersen
+            .preprocessed_sources()
+            .iter()
+            .filter_map(|identity| pedersen_points_18_column_index(identity))
+            .collect::<Vec<_>>();
+        assert_eq!(external, (0..PEDERSEN_POINTS_18_COLUMN_COUNT).collect::<Vec<_>>());
+        assert_eq!(pedersen.config().row_count, PEDERSEN_POINTS_18_ROW_COUNT);
     }
 }

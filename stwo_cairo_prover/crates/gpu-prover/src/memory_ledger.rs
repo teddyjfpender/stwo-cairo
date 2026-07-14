@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::arena_plan::{
     BufferPurpose, LogicalBuffer, OpenedColumnSource, ProofArenaPlan, ProofEpoch,
 };
+use crate::fixed_table_materializer::PEDERSEN_POINTS_18_EVALUATION_BYTES;
+use crate::resident_sources::MAX_PREPROCESSED_DETACHED_STAGING_BYTES;
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 
@@ -210,6 +212,44 @@ impl PhysicalMemoryLedger {
             })
             .collect::<Result<BTreeMap<_, _>, &'static str>>()?;
         let arena_allocation_fit = ledger.arena_allocation_bytes <= operational_ceiling_bytes;
+        let process_owned_pedersen_table_bytes = plan
+            .requires_registered_pedersen_table()
+            .then_some(PEDERSEN_POINTS_18_EVALUATION_BYTES)
+            .unwrap_or(0);
+        let omitted_pedersen_evaluation_bytes = plan.process_owned_pedersen_evaluation_bytes();
+        if omitted_pedersen_evaluation_bytes != 0
+            && omitted_pedersen_evaluation_bytes != PEDERSEN_POINTS_18_EVALUATION_BYTES
+        {
+            return Err("process-owned Pedersen evaluation omission is not the complete table");
+        }
+        let known_allocation_subtotal_bytes = ledger
+            .arena_allocation_bytes
+            .checked_add(process_owned_pedersen_table_bytes)
+            .ok_or("known physical allocation subtotal overflow")?;
+        let known_allocation_subtotal_fit =
+            known_allocation_subtotal_bytes <= operational_ceiling_bytes;
+        let twiddle_detached_staging_payload_bytes = [
+            BufferPurpose::ForwardTwiddles,
+            BufferPurpose::PreprocessedInverseTwiddles,
+            BufferPurpose::InverseTwiddles,
+            BufferPurpose::QuotientInverseTwiddles,
+        ]
+        .into_iter()
+        .try_fold(0usize, |bytes, purpose| {
+            let (buffer, _) = plan
+                .find(None, None, purpose, 0)
+                .ok_or("fixed twiddle staging source is missing")?;
+            bytes
+                .checked_add(words_to_bytes(buffer.len_words)?)
+                .ok_or("fixed twiddle staging byte size overflow")
+        })?;
+        let known_cold_source_payload_peak_bytes =
+            twiddle_detached_staging_payload_bytes.max(MAX_PREPROCESSED_DETACHED_STAGING_BYTES);
+        let known_cold_payload_subtotal_bytes = known_allocation_subtotal_bytes
+            .checked_add(known_cold_source_payload_peak_bytes)
+            .ok_or("known cold payload subtotal overflow")?;
+        let known_cold_payload_subtotal_fit =
+            known_cold_payload_subtotal_bytes <= operational_ceiling_bytes;
         let record = serde_json::json!({
             "allocation_model": "one stable shape-arena allocation with lifetime-reused stable range views",
             "purpose_class_caveat": "purpose classes diagnose live logical/range views; the one arena allocation cannot be partitioned by purpose because addresses are reused over time, and shared commitment purposes do not encode exact allocation ownership",
@@ -217,6 +257,19 @@ impl PhysicalMemoryLedger {
             "arena_allocation_id": "shape_arena",
             "arena_allocation_count": 1,
             "arena_allocation_bytes": ledger.arena_allocation_bytes,
+            "process_owned_pedersen_table_bytes": process_owned_pedersen_table_bytes,
+            "omitted_duplicate_pedersen_evaluation_bytes": omitted_pedersen_evaluation_bytes,
+            "known_allocation_subtotal_bytes": known_allocation_subtotal_bytes,
+            "known_allocation_subtotal_fit": known_allocation_subtotal_fit,
+            "known_allocation_subtotal_headroom_bytes": operational_ceiling_bytes
+                .saturating_sub(known_allocation_subtotal_bytes),
+            "twiddle_detached_staging_payload_bytes": twiddle_detached_staging_payload_bytes,
+            "preprocessed_detached_staging_payload_bound_bytes": MAX_PREPROCESSED_DETACHED_STAGING_BYTES,
+            "known_cold_source_payload_peak_bytes": known_cold_source_payload_peak_bytes,
+            "known_cold_payload_subtotal_bytes": known_cold_payload_subtotal_bytes,
+            "known_cold_payload_subtotal_fit": known_cold_payload_subtotal_fit,
+            "known_cold_payload_subtotal_headroom_bytes": operational_ceiling_bytes
+                .saturating_sub(known_cold_payload_subtotal_bytes),
             "whole_slot_comparator_bytes": ledger.whole_slot_comparator_bytes,
             "raw_peak_bytes": ledger.raw_peak_bytes,
             "excess_over_raw_peak_bytes": ledger.excess_over_raw_peak_bytes,

@@ -12,16 +12,20 @@ use stwo::core::fields::m31::BaseField;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use stwo::prover::poly::BitReversedOrder;
+use stwo_backend_cuda::pedersen_table::{
+    registered_borrowed_pedersen_table, RegisteredPedersenColumn, RegisteredPedersenTableError,
+};
 use stwo_backend_cuda::{
-    synchronize_legacy_stream_for_arena_handoff, ArenaSlice, BaseFieldVec, CommitCoefficientColumn,
-    CommitCoefficientGroup, CudaBackend, CudaRuntimeError, InterpolationBatch, InterpolationColumn,
+    gpu_default_pool_memory, synchronize_legacy_stream_for_arena_handoff, trim_gpu_default_pool,
+    ArenaSlice, BaseFieldVec, CommitCoefficientColumn, CommitCoefficientGroup, CudaBackend,
+    CudaRuntimeError, InterpolationBatch, InterpolationColumn,
     ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedCommitError,
     PreparedCommitGraph, PreparedInterpolationError, PreparedInterpolationGraph,
     PreparedProgressiveCommitError, PreparedProgressiveCommitGraph,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::base_trace::BaseTrace;
-use stwo_cairo_prover::witness::preprocessed_trace_backend::GenPreprocessedTrace;
+use stwo_cairo_prover::witness::preprocessed_trace_backend::CudaPreprocessedColumnStreamer;
 use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
 use stwo_cairo_prover::witness::relation_sources::{
     CairoRelationSourceSet, DeviceRelationWord, RelationLookupTransfer, RelationSourceEncoding,
@@ -30,6 +34,10 @@ use stwo_cairo_prover::witness::relation_sources::{
 
 use crate::arena_plan::{
     BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedCommitment,
+};
+use crate::fixed_table_materializer::{
+    pedersen_points_18_column_index, PEDERSEN_POINTS_18_COLUMN_COUNT, PEDERSEN_POINTS_18_LOG_SIZE,
+    PEDERSEN_POINTS_18_ROW_COUNT,
 };
 use crate::graphs::{GraphError, GraphWorkspace};
 use crate::plan::ProofPlan;
@@ -85,6 +93,16 @@ pub struct ResidentPreprocessedStageReport {
     pub descriptor_h2d_copies: usize,
     pub interpolation_batches: usize,
     pub commitment_launches: usize,
+    /// Largest detached source family live while filling the resident arena.
+    pub max_detached_staging_bytes: usize,
+    /// One cross-stream handoff per bounded source; warm setup performs none.
+    pub source_sync_calls: usize,
+    /// Process-default pool footprint immediately before the cold-only trim.
+    pub default_pool_used_bytes_before_trim: usize,
+    pub default_pool_reserved_bytes_before_trim: usize,
+    /// Process-default pool footprint returned by the checked trim operation.
+    pub default_pool_used_bytes_after_trim: usize,
+    pub default_pool_reserved_bytes_after_trim: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -130,7 +148,26 @@ pub enum ResidentSourceStageError {
         expected: u32,
         actual: u32,
     },
+    PreprocessedColumnIdentityMismatch {
+        column: usize,
+        expected: String,
+        actual: String,
+    },
+    PreprocessedDetachedStagingBudget {
+        required_bytes: usize,
+        budget_bytes: usize,
+    },
+    RegisteredPedersenTableUnavailable,
+    RegisteredPedersenColumnCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    RegisteredPedersenTable(RegisteredPedersenTableError),
+    RegisteredPedersenEvaluationRetained {
+        column: usize,
+    },
     MissingPreprocessedColumn(u32),
+    FixedTwiddleSourceMissing,
     FixedTwiddlesNotReady,
     MissingPreprocessedRootInput,
     PreprocessedRootBindingMismatch {
@@ -209,6 +246,12 @@ impl From<CudaRuntimeError> for ResidentSourceStageError {
     }
 }
 
+impl From<RegisteredPedersenTableError> for ResidentSourceStageError {
+    fn from(value: RegisteredPedersenTableError) -> Self {
+        Self::RegisteredPedersenTable(value)
+    }
+}
+
 impl From<PreparedInterpolationError> for ResidentSourceStageError {
     fn from(value: PreparedInterpolationError) -> Self {
         Self::Interpolation(value)
@@ -227,6 +270,20 @@ impl From<PreparedProgressiveCommitError> for ResidentSourceStageError {
     }
 }
 
+/// Complete every isolated-stream read before its borrowed CUDA source may
+/// drop. The operation error remains the primary diagnosis; otherwise surface
+/// a synchronization failure. `fence` is evaluated unconditionally.
+fn fence_after<T, E>(
+    operation: Result<T, E>,
+    fence: impl FnOnce() -> Result<(), E>,
+) -> Result<T, E> {
+    let fence_result = fence();
+    match operation {
+        Err(error) => Err(error),
+        Ok(value) => fence_result.map(|()| value),
+    }
+}
+
 /// Consume canonical base evaluations and populate both resident trace forms.
 ///
 /// `BaseTrace::Polys` is rejected: already-interpolated coefficients cannot
@@ -240,7 +297,7 @@ pub fn stage_base_trace_coefficients(
     workspace: &mut GraphWorkspace,
     proof_plan: &ProofPlan,
     trace: BaseTrace<CudaBackend>,
-    twiddles: &'static TwiddleTree<CudaBackend>,
+    twiddles: Option<&TwiddleTree<CudaBackend>>,
 ) -> Result<ResidentSourceStageReport, ResidentSourceStageError> {
     if workspace.plan().shape_key != proof_plan.shape_key {
         return Err(ResidentSourceStageError::WorkspaceShapeMismatch {
@@ -304,6 +361,7 @@ pub fn stage_base_trace_coefficients(
     // lifting domain on every warm proof would defeat residency, so a cached
     // workspace stages them once and retries only after a failed setup.
     let (protocol_inverse, quotient_inverse) = if stage_fixed_twiddles {
+        let twiddles = twiddles.ok_or(ResidentSourceStageError::FixedTwiddleSourceMissing)?;
         let (forward_destination, forward_words) =
             bind_global_source(workspace, BufferPurpose::ForwardTwiddles)?;
         if twiddles.twiddles.size != forward_words {
@@ -401,24 +459,33 @@ pub fn stage_base_trace_coefficients(
         .and_then(|words| words.checked_add(twiddle_words))
         .ok_or(ResidentSourceStageError::SizeOverflow)?;
 
-    synchronize_legacy_stream_for_arena_handoff();
-    for (destination, source, words) in copies {
-        let bytes = words
-            .checked_mul(core::mem::size_of::<u32>())
-            .ok_or(ResidentSourceStageError::SizeOverflow)?;
-        // SAFETY: the metadata pass proved both live ranges contain `words`
-        // u32s. Sources are owned by `polys` until the final context sync and
-        // destinations are stable, non-overlapping arena ranges.
-        unsafe {
-            workspace.arena().context().memcpy_d2d_async(
-                destination.as_void_ptr(),
-                source.cast(),
-                bytes,
-            )?;
+    let stage_result = (|| {
+        synchronize_legacy_stream_for_arena_handoff();
+        for (destination, source, words) in copies {
+            let bytes = words
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(ResidentSourceStageError::SizeOverflow)?;
+            // SAFETY: the metadata pass proved both live ranges contain
+            // `words` u32s. Source owners remain in this scope until
+            // `fence_after` synchronizes every successfully enqueued read.
+            unsafe {
+                workspace.arena().context().memcpy_d2d_async(
+                    destination.as_void_ptr(),
+                    source.cast(),
+                    bytes,
+                )?;
+            }
         }
-    }
-    interpolation.launch()?;
-    workspace.arena().context().sync()?;
+        interpolation.launch()?;
+        Ok(())
+    })();
+    fence_after(stage_result, || {
+        workspace
+            .arena()
+            .context()
+            .sync()
+            .map_err(ResidentSourceStageError::from)
+    })?;
     drop(interpolation);
     drop(protocol_inverse);
     drop(quotient_inverse);
@@ -489,7 +556,7 @@ fn residency_counts(columns: usize, direct_columns: usize) -> BaseTraceResidency
 /// the captured graph.
 pub fn stage_protocol_twiddles(
     workspace: &mut GraphWorkspace,
-    twiddles: &'static TwiddleTree<CudaBackend>,
+    twiddles: &TwiddleTree<CudaBackend>,
 ) -> Result<ResidentTwiddleStageReport, ResidentSourceStageError> {
     if workspace.fixed_twiddles_ready() {
         return Ok(ResidentTwiddleStageReport {
@@ -573,24 +640,33 @@ pub fn stage_protocol_twiddles(
         expected_words,
     ));
 
-    synchronize_legacy_stream_for_arena_handoff();
-    for (destination, source, words) in &copies {
-        let bytes = words
-            .checked_mul(core::mem::size_of::<u32>())
-            .ok_or(ResidentSourceStageError::SizeOverflow)?;
-        unsafe {
-            workspace.arena().context().memcpy_d2d_async(
-                destination.as_void_ptr(),
-                source.cast(),
-                bytes,
-            )?;
+    let stage_result = (|| {
+        synchronize_legacy_stream_for_arena_handoff();
+        for (destination, source, words) in &copies {
+            let bytes = words
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(ResidentSourceStageError::SizeOverflow)?;
+            unsafe {
+                workspace.arena().context().memcpy_d2d_async(
+                    destination.as_void_ptr(),
+                    source.cast(),
+                    bytes,
+                )?;
+            }
+            report.d2d_bytes = report
+                .d2d_bytes
+                .checked_add(bytes)
+                .ok_or(ResidentSourceStageError::SizeOverflow)?;
         }
-        report.d2d_bytes = report
-            .d2d_bytes
-            .checked_add(bytes)
-            .ok_or(ResidentSourceStageError::SizeOverflow)?;
-    }
-    workspace.arena().context().sync()?;
+        Ok(())
+    })();
+    fence_after(stage_result, || {
+        workspace
+            .arena()
+            .context()
+            .sync()
+            .map_err(ResidentSourceStageError::from)
+    })?;
     report.d2d_copies = copies.len();
     report.sync_calls = 1;
     drop(protocol_inverse);
@@ -607,6 +683,14 @@ pub fn stage_protocol_twiddles(
 /// interpolates same-log batches, commits the canonical tree and stages its root
 /// into the device transcript. The ready bit is set only after the final
 /// synchronization, so a failed partial setup is retried.
+pub const MAX_PREPROCESSED_DETACHED_STAGING_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum PreprocessedStageSource {
+    Detached,
+    RegisteredPedersen(RegisteredPedersenColumn),
+}
+
 pub fn stage_preprocessed_commitment(
     workspace: &mut GraphWorkspace,
     trace: Arc<PreProcessedTrace>,
@@ -643,37 +727,108 @@ pub fn stage_preprocessed_commitment(
         return Err(ResidentSourceStageError::FixedTwiddlesNotReady);
     }
 
-    let evaluations = <CudaBackend as GenPreprocessedTrace>::gen_preprocessed_trace(trace);
-    if evaluations.len() != planned.columns.len() {
+    if trace.columns.len() != planned.columns.len() {
         return Err(ResidentSourceStageError::PreprocessedColumnCountMismatch {
             expected: planned.columns.len(),
-            actual: evaluations.len(),
+            actual: trace.columns.len(),
         });
     }
 
+    let uses_registered_pedersen = planned
+        .columns
+        .iter()
+        .any(|column| pedersen_points_18_column_index(&column.identity).is_some());
+    let registered_pedersen = uses_registered_pedersen
+        .then(|| {
+            let table = registered_borrowed_pedersen_table()
+                .ok_or(ResidentSourceStageError::RegisteredPedersenTableUnavailable)?;
+            let actual_columns = table.columns().len();
+            if actual_columns != PEDERSEN_POINTS_18_COLUMN_COUNT {
+                return Err(
+                    ResidentSourceStageError::RegisteredPedersenColumnCountMismatch {
+                        expected: PEDERSEN_POINTS_18_COLUMN_COUNT,
+                        actual: actual_columns,
+                    },
+                );
+            }
+            table.validate_exact_geometry(PEDERSEN_POINTS_18_ROW_COUNT)?;
+            Ok(table)
+        })
+        .transpose()?;
+
     let mut coefficient_words = 0usize;
     let mut evaluation_words = 0usize;
+    let mut max_detached_staging_bytes = 0usize;
     let mut destinations = Vec::with_capacity(planned.columns.len());
     let mut evaluation_destinations = Vec::with_capacity(planned.columns.len());
-    for (column, evaluation) in planned.columns.iter().zip(&evaluations) {
-        let actual_log = evaluation.domain.log_size();
+    let mut stage_sources = Vec::with_capacity(planned.columns.len());
+    for (index, (column, source)) in planned.columns.iter().zip(&trace.columns).enumerate() {
+        let actual_identity = source.id().id;
+        if actual_identity != column.identity {
+            return Err(
+                ResidentSourceStageError::PreprocessedColumnIdentityMismatch {
+                    column: index,
+                    expected: column.identity.clone(),
+                    actual: actual_identity,
+                },
+            );
+        }
+        let actual_log = source.log_size();
         if actual_log != column.log_size {
             return Err(ResidentSourceStageError::PreprocessedColumnLogMismatch {
-                column: column.ordinal as usize,
+                column: index,
                 expected: column.log_size,
                 actual: actual_log,
             });
         }
-        let expected_words = checked_words(column.log_size)?;
-        if evaluation.values.size != expected_words
-            || column.coefficients.len_words != expected_words
-        {
-            return Err(ResidentSourceStageError::ColumnValueSizeMismatch {
-                column: column.ordinal as usize,
-                expected_words,
-                actual_words: evaluation.values.size,
+        let pedersen_column = pedersen_points_18_column_index(&column.identity);
+        if pedersen_column.is_some() && column.log_size != PEDERSEN_POINTS_18_LOG_SIZE {
+            return Err(ResidentSourceStageError::PreprocessedColumnLogMismatch {
+                column: index,
+                expected: PEDERSEN_POINTS_18_LOG_SIZE,
+                actual: column.log_size,
             });
         }
+        let expected_words = checked_words(column.log_size)?;
+        if column.coefficients.len_words != expected_words {
+            return Err(ResidentSourceStageError::ColumnValueSizeMismatch {
+                column: index,
+                expected_words,
+                actual_words: column.coefficients.len_words,
+            });
+        }
+        let stage_source = if let Some(pedersen_column) = pedersen_column {
+            if column.evaluations.is_some() {
+                return Err(
+                    ResidentSourceStageError::RegisteredPedersenEvaluationRetained {
+                        column: pedersen_column,
+                    },
+                );
+            }
+            let table = registered_pedersen
+                .ok_or(ResidentSourceStageError::RegisteredPedersenTableUnavailable)?;
+            let registered = table.column(pedersen_column).ok_or(
+                ResidentSourceStageError::RegisteredPedersenColumnCountMismatch {
+                    expected: PEDERSEN_POINTS_18_COLUMN_COUNT,
+                    actual: table.columns().len(),
+                },
+            )?;
+            PreprocessedStageSource::RegisteredPedersen(registered)
+        } else {
+            let detached_bytes =
+                CudaPreprocessedColumnStreamer::detached_staging_bytes(source.as_ref())
+                    .ok_or(ResidentSourceStageError::SizeOverflow)?;
+            max_detached_staging_bytes = max_detached_staging_bytes.max(detached_bytes);
+            if max_detached_staging_bytes > MAX_PREPROCESSED_DETACHED_STAGING_BYTES {
+                return Err(
+                    ResidentSourceStageError::PreprocessedDetachedStagingBudget {
+                        required_bytes: max_detached_staging_bytes,
+                        budget_bytes: MAX_PREPROCESSED_DETACHED_STAGING_BYTES,
+                    },
+                );
+            }
+            PreprocessedStageSource::Detached
+        };
         coefficient_words = coefficient_words
             .checked_add(expected_words)
             .ok_or(ResidentSourceStageError::SizeOverflow)?;
@@ -695,46 +850,86 @@ pub fn stage_preprocessed_commitment(
                 .ok_or(ResidentSourceStageError::SizeOverflow)?;
         }
         evaluation_destinations.push(retained);
+        stage_sources.push(stage_source);
     }
 
-    synchronize_legacy_stream_for_arena_handoff();
-    for ((column, evaluation), destination) in
-        planned.columns.iter().zip(&evaluations).zip(&destinations)
-    {
-        let bytes = checked_words(column.log_size)?
+    let mut streamer = CudaPreprocessedColumnStreamer::new();
+    let mut source_sync_calls = 0usize;
+    for (index, source) in trace.columns.iter().enumerate() {
+        let column = &planned.columns[index];
+        let expected_words = checked_words(column.log_size)?;
+        let bytes = expected_words
             .checked_mul(core::mem::size_of::<u32>())
             .ok_or(ResidentSourceStageError::SizeOverflow)?;
-        unsafe {
-            workspace.arena().context().memcpy_d2d_async(
-                destination.as_void_ptr(),
-                evaluation.values.device_ptr.cast(),
-                bytes,
-            )?;
-        }
-    }
-    for (evaluation, destination) in evaluations.iter().zip(&evaluation_destinations) {
-        let Some(destination) = destination else {
+        if let PreprocessedStageSource::RegisteredPedersen(registered) = stage_sources[index] {
+            // Registration uses a synchronous H2D upload and intentionally
+            // retains these allocations for the process lifetime. The arena
+            // stream may therefore consume them directly without a detached
+            // source fence or a second retained evaluation.
+            unsafe {
+                workspace.arena().context().memcpy_d2d_async(
+                    destinations[index].as_void_ptr(),
+                    registered.as_u32_ptr().cast_const().cast(),
+                    bytes,
+                )?;
+            }
             continue;
-        };
-        let bytes = evaluation
-            .values
-            .size
-            .checked_mul(core::mem::size_of::<u32>())
-            .ok_or(ResidentSourceStageError::SizeOverflow)?;
-        unsafe {
-            workspace.arena().context().memcpy_d2d_async(
-                destination.as_void_ptr(),
-                evaluation.values.device_ptr.cast(),
-                bytes,
-            )?;
         }
+        let evaluation = streamer.generate(source.as_ref());
+        if evaluation.domain.log_size() != column.log_size {
+            return Err(ResidentSourceStageError::PreprocessedColumnLogMismatch {
+                column: index,
+                expected: column.log_size,
+                actual: evaluation.domain.log_size(),
+            });
+        }
+        if evaluation.values.size != expected_words {
+            return Err(ResidentSourceStageError::ColumnValueSizeMismatch {
+                column: index,
+                expected_words,
+                actual_words: evaluation.values.size,
+            });
+        }
+        synchronize_legacy_stream_for_arena_handoff();
+        let stage_result = (|| {
+            unsafe {
+                workspace.arena().context().memcpy_d2d_async(
+                    destinations[index].as_void_ptr(),
+                    evaluation.values.device_ptr.cast(),
+                    bytes,
+                )?;
+                if let Some(destination) = evaluation_destinations[index] {
+                    workspace.arena().context().memcpy_d2d_async(
+                        destination.as_void_ptr(),
+                        evaluation.values.device_ptr.cast(),
+                        bytes,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        // The detached source can be freed only after the isolated arena stream
+        // consumes it. Fence even when a later enqueue fails; otherwise the
+        // successful prefix could still read the stack-owned evaluation after
+        // this iteration unwinds.
+        fence_after(stage_result, || {
+            workspace
+                .arena()
+                .context()
+                .sync()
+                .map_err(ResidentSourceStageError::from)
+        })?;
+        source_sync_calls = source_sync_calls
+            .checked_add(1)
+            .ok_or(ResidentSourceStageError::SizeOverflow)?;
     }
+    drop(streamer);
+    synchronize_legacy_stream_for_arena_handoff();
 
     let inverse_twiddles = workspace.bind(planned.inverse_twiddles.logical)?.0;
     let inverse_words = u32::try_from(inverse_twiddles.len_words())
         .map_err(|_| ResidentSourceStageError::SizeOverflow)?;
     let stream = workspace.arena().context().stream_raw().as_ptr();
-    let mut descriptor_storage = Vec::with_capacity(planned.interpolation_batches.len());
     let mut descriptor_h2d_bytes = 0usize;
     for batch in &planned.interpolation_batches {
         let pointers = batch
@@ -764,7 +959,9 @@ pub fn stage_preprocessed_commitment(
                 bytes,
             )?;
         }
-        descriptor_storage.push(pointers);
+        // `pointers` is ordinary host memory. Fence its async upload before
+        // any later fallible prepare/launch can drop the backing Vec.
+        workspace.arena().context().sync()?;
         let count = u32::try_from(batch.column_ordinals.len())
             .map_err(|_| ResidentSourceStageError::SizeOverflow)?;
         let code = unsafe {
@@ -889,8 +1086,11 @@ pub fn stage_preprocessed_commitment(
         )?;
     }
     workspace.arena().context().sync()?;
-    drop(descriptor_storage);
-    drop(evaluations);
+    // Detached cold sources have now dropped and their legacy-stream frees
+    // were fenced during staging. Return only allocator reserve that is
+    // already unused; this cannot and does not reduce the cold setup peak.
+    let pool_before_trim = gpu_default_pool_memory()?;
+    let pool_after_trim = trim_gpu_default_pool(0)?;
     let (commit_descriptor_bytes, commit_descriptor_copies) =
         commitment_descriptor_transfers(&commitment)?;
     let report = ResidentPreprocessedStageReport {
@@ -925,6 +1125,12 @@ pub fn stage_preprocessed_commitment(
             .ok_or(ResidentSourceStageError::SizeOverflow)?,
         interpolation_batches: planned.interpolation_batches.len(),
         commitment_launches: 1,
+        max_detached_staging_bytes,
+        source_sync_calls,
+        default_pool_used_bytes_before_trim: pool_before_trim.used_bytes,
+        default_pool_reserved_bytes_before_trim: pool_before_trim.reserved_bytes,
+        default_pool_used_bytes_after_trim: pool_after_trim.used_bytes,
+        default_pool_reserved_bytes_after_trim: pool_after_trim.reserved_bytes,
     };
     workspace.mark_preprocessed_commitment_ready();
     Ok(report)
@@ -1556,7 +1762,27 @@ fn checked_words(log_size: u32) -> Result<usize, ResidentSourceStageError> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    #[test]
+    fn source_fence_is_unconditional_and_preserves_the_operation_error() {
+        let calls = Cell::new(0);
+        let result = fence_after::<(), _>(Err("enqueue"), || {
+            calls.set(calls.get() + 1);
+            Err("sync")
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result, Err("enqueue"));
+
+        let result = fence_after(Ok(7), || {
+            calls.set(calls.get() + 1);
+            Err("sync")
+        });
+        assert_eq!(calls.get(), 2);
+        assert_eq!(result, Err("sync"));
+    }
 
     #[test]
     fn checked_words_rejects_host_width_overflow() {

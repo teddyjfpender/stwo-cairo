@@ -53,15 +53,12 @@ use tracing::{span, Level};
 
 use crate::graphs::{GraphError, GraphWorkspace};
 use crate::protocol_discovery::interaction_claim_from_flattened;
-use crate::relation_table::CAIRO_RELATION_GRAPH;
 use crate::resident_runtime::{ResidentGraphRuntime, ResidentHotPathBudget, ResidentRuntimeError};
 use crate::resident_session::{
-    resident_max_domain_log_size, with_resident_session, with_resident_session_from_generator,
-    ResidentExecutionReadiness, ResidentPreWitnessSessionRequest, ResidentPreparationState,
-    ResidentSessionArtifacts, ResidentSessionError, ResidentSessionRequest,
-    ResidentSessionTelemetry,
+    with_resident_session, with_resident_session_from_generator, ResidentExecutionReadiness,
+    ResidentPreWitnessSessionRequest, ResidentPreparationState, ResidentSessionArtifacts,
+    ResidentSessionError, ResidentSessionRequest, ResidentSessionTelemetry,
 };
-use crate::resident_witness::{planned_cairo_claim, require_strict_resident_witness_coverage};
 use crate::schedule::ScheduleError;
 use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::shape_executable::{ShapeExecutable, ShapeExecutableCache};
@@ -653,16 +650,6 @@ where
             params.preprocessed_trace,
             params.opt_n_id_to_big_components,
         );
-        let exact_plan = proof_plan
-            .strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)
-            .map_err(ResidentSessionError::ProofPlan)?;
-        require_strict_resident_witness_coverage(&exact_plan)
-            .map_err(ResidentSessionError::ResidentWitness)?;
-        let planned_claim = planned_cairo_claim(&generator, &exact_plan)
-            .map_err(ResidentSessionError::ResidentWitness)?;
-        let max_domain =
-            resident_max_domain_log_size(&planned_claim, &preprocessed_trace, params.pcs_config)?;
-        let twiddles = self.twiddle_tree(max_domain);
         Ok(with_resident_session_from_generator(
             &mut self.shape_executable_cache,
             &mut self.workspace_cache,
@@ -673,7 +660,6 @@ where
                 channel_salt: params.channel_salt,
                 pcs: params.pcs_config,
                 include_all_preprocessed_columns: params.include_all_preprocessed_columns,
-                twiddles,
             },
             run,
         )?)
@@ -701,8 +687,6 @@ where
                 "resident session entrypoint requires strict GPU-native mode".to_string(),
             ));
         }
-        let max_domain = resident_max_domain_log_size(&witness.claim, &preprocessed_trace, pcs)?;
-        let twiddles = self.twiddle_tree(max_domain);
         Ok(with_resident_session(
             &mut self.shape_executable_cache,
             &mut self.workspace_cache,
@@ -712,7 +696,6 @@ where
                 channel_salt,
                 pcs,
                 include_all_preprocessed_columns,
-                twiddles,
             },
             run,
         )?)

@@ -65,6 +65,9 @@ use crate::direct_composition_retention::{
     validate_direct_composition_retention_plan, DirectCompositionRetentionMode,
     DirectCompositionRetentionPlan,
 };
+use crate::fixed_table_materializer::{
+    pedersen_points_18_column_index, PEDERSEN_POINTS_18_LOG_SIZE, PEDERSEN_POINTS_18_ROW_COUNT,
+};
 use crate::multiplicity_pipeline::{
     plan_graph_a_multiplicities, plan_public_memory_multiplicity_seed,
     FixedMultiplicityCoverageGap, GraphAMultiplicityPlan, GraphAMultiplicityPlanError,
@@ -93,6 +96,16 @@ pub const ARENA_ALIGNMENT_WORDS: usize = 128 / core::mem::size_of::<u32>();
 const BLAKE2S_HASH_WORDS: usize = 8;
 const SECURE_FIELD_WORDS: usize = 4;
 const CAIRO_RELATION_LAUNCH_MODE: RelationLaunchMode = RelationLaunchMode::Fused;
+
+fn retain_fixed_preprocessed_evaluation(identity: &str) -> bool {
+    pedersen_points_18_column_index(identity).is_none()
+}
+
+fn preprocessed_requires_registered_pedersen_table(columns: &[PlannedPreprocessedColumn]) -> bool {
+    columns
+        .iter()
+        .any(|column| pedersen_points_18_column_index(&column.identity).is_some())
+}
 
 /// Coarse protocol epochs. Lifetimes are inclusive because a producer and a
 /// consumer executing in the same epoch must not alias.
@@ -2585,7 +2598,7 @@ struct LogicalRecordedMultiplicityFeed {
 #[derive(Clone, Debug)]
 struct LogicalFixedTableMaterializer {
     plan: crate::multiplicity_pipeline::PlannedFixedMultiplicity,
-    sources: Vec<LogicalBufferId>,
+    sources: Vec<LogicalFixedTableSource>,
     multiplicity: LogicalBufferId,
     source_pointers: Option<LogicalBufferId>,
     multiplicity_pointers: LogicalBufferId,
@@ -2595,6 +2608,12 @@ struct LogicalFixedTableMaterializer {
     lookup_descriptors: LogicalBufferId,
     lookup_output: LogicalBufferId,
     lookup_output_pointers: LogicalBufferId,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LogicalFixedTableSource {
+    Arena(LogicalBufferId),
+    RegisteredPedersen18 { column: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -2720,9 +2739,15 @@ pub struct PlannedRecordedMultiplicityFeedGraph {
 #[derive(Clone, Debug)]
 pub struct PlannedFixedTableMaterializer {
     pub plan: crate::multiplicity_pipeline::PlannedFixedMultiplicity,
-    pub sources: Vec<ArenaBinding>,
+    pub sources: Vec<PlannedFixedTableSource>,
     pub multiplicity: ArenaBinding,
     pub slots: FixedTableContiguousWorkspaceSlots,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlannedFixedTableSource {
+    Arena(ArenaBinding),
+    RegisteredPedersen18 { column: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -3263,6 +3288,7 @@ impl ProofArenaPlan {
                 .fixed
                 .iter()
                 .flat_map(|fixed| fixed.materializer.preprocessed_sources().iter().copied())
+                .filter(|identity| retain_fixed_preprocessed_evaluation(identity))
                 .collect::<BTreeSet<_>>()
         });
         let (
@@ -3479,6 +3505,26 @@ impl ProofArenaPlan {
 
     pub fn total_words(&self) -> usize {
         self.layout.total_words()
+    }
+
+    /// Bytes omitted from this arena because the immutable process-lifetime
+    /// Pedersen registration is the sole owner of those evaluation columns.
+    pub fn process_owned_pedersen_evaluation_bytes(&self) -> usize {
+        let columns = self
+            .multiplicity
+            .iter()
+            .flat_map(|multiplicity| &multiplicity.fixed_tables)
+            .flat_map(|fixed| &fixed.sources)
+            .filter_map(|source| match source {
+                PlannedFixedTableSource::RegisteredPedersen18 { column } => Some(*column),
+                PlannedFixedTableSource::Arena(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        columns.len() * PEDERSEN_POINTS_18_ROW_COUNT * core::mem::size_of::<u32>()
+    }
+
+    pub fn requires_registered_pedersen_table(&self) -> bool {
+        preprocessed_requires_registered_pedersen_table(&self.preprocessed.columns)
     }
 
     /// Exact allocation produced by the superseded whole-slot colorer for the
@@ -4689,6 +4735,17 @@ fn append_graph_a_multiplicity_buffers(
                     .ok_or(ArenaPlanError::InvalidProtocolGeometry(
                         "fixed table references an unknown preprocessed column",
                     ))?;
+                if let Some(index) = pedersen_points_18_column_index(identity) {
+                    if column.log_size != PEDERSEN_POINTS_18_LOG_SIZE
+                        || fixed.row_count != PEDERSEN_POINTS_18_ROW_COUNT
+                        || column.evaluations.is_some()
+                    {
+                        return Err(ArenaPlanError::InvalidProtocolGeometry(
+                            "process-owned pedersen source has invalid geometry or arena retention",
+                        ));
+                    }
+                    return Ok(LogicalFixedTableSource::RegisteredPedersen18 { column: index });
+                }
                 let evaluation =
                     column
                         .evaluations
@@ -4700,7 +4757,7 @@ fn append_graph_a_multiplicity_buffers(
                         "fixed-table preprocessed source has the wrong row count",
                     ));
                 }
-                Ok(evaluation)
+                Ok(LogicalFixedTableSource::Arena(evaluation))
             })
             .collect::<Result<Vec<_>, ArenaPlanError>>()?;
         let multiplicity = *multiplicity_ids.get(fixed.component).ok_or(
@@ -9027,7 +9084,14 @@ fn resolve_graph_a_multiplicity_slots(
                 sources: fixed
                     .sources
                     .into_iter()
-                    .map(binding)
+                    .map(|source| match source {
+                        LogicalFixedTableSource::Arena(logical) => {
+                            binding(logical).map(PlannedFixedTableSource::Arena)
+                        }
+                        LogicalFixedTableSource::RegisteredPedersen18 { column } => {
+                            Ok(PlannedFixedTableSource::RegisteredPedersen18 { column })
+                        }
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
                 multiplicity: binding(fixed.multiplicity)?,
                 slots,
@@ -9427,6 +9491,57 @@ mod tests {
             ordinal: id,
             len_words: words,
             lifetime: BufferLifetime::new(first, last).unwrap(),
+        }
+    }
+
+    #[test]
+    fn process_owned_pedersen_removes_exactly_one_evaluation_table_from_arena() {
+        let omitted_words = (0..crate::fixed_table_materializer::PEDERSEN_POINTS_18_COLUMN_COUNT)
+            .map(|index| format!("pedersen_points_{index}"))
+            .filter(|identity| !retain_fixed_preprocessed_evaluation(identity))
+            .map(|_| PEDERSEN_POINTS_18_ROW_COUNT)
+            .sum::<usize>();
+        assert_eq!(
+            omitted_words * core::mem::size_of::<u32>(),
+            crate::fixed_table_materializer::PEDERSEN_POINTS_18_EVALUATION_BYTES
+        );
+        assert_eq!(
+            crate::fixed_table_materializer::PEDERSEN_POINTS_18_EVALUATION_BYTES,
+            1_879_048_192
+        );
+        assert!(retain_fixed_preprocessed_evaluation("seq_23"));
+        assert!(retain_fixed_preprocessed_evaluation(
+            "pedersen_points_small_0"
+        ));
+    }
+
+    #[test]
+    fn registration_requirement_is_driven_by_preprocessed_identity() {
+        let binding = ArenaBinding {
+            logical: LogicalBufferId(0),
+            physical: ArenaSlotId(0),
+            len_words: PEDERSEN_POINTS_18_ROW_COUNT,
+        };
+        let mut columns = vec![PlannedPreprocessedColumn {
+            identity: "pedersen_points_55".to_owned(),
+            ordinal: 0,
+            log_size: PEDERSEN_POINTS_18_LOG_SIZE,
+            evaluations: None,
+            coefficients: binding,
+        }];
+        assert!(preprocessed_requires_registered_pedersen_table(&columns));
+
+        for identity in [
+            "seq_23",
+            "pedersen_points_small_0",
+            "pedersen_points_055",
+            "pedersen_points_56",
+        ] {
+            columns[0].identity = identity.to_owned();
+            assert!(
+                !preprocessed_requires_registered_pedersen_table(&columns),
+                "forged/non-W18 identity {identity} must not request the global table"
+            );
         }
     }
 
