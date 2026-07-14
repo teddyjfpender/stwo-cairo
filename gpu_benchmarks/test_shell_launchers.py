@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 import shutil
@@ -15,9 +17,284 @@ from validate_replacement_v1_reuse import require_resident_reuse
 
 
 ROOT = Path(__file__).resolve().parent
+NUMERATOR_SCHEMA = "stwo.sn3_quotient_numerator_hybrid.host_wall.v5"
+SOURCE_SHA = "12" * 32
+MODULE_SHA = "34" * 32
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def valid_sn3_numerator_record() -> dict[str, object]:
+    digest = "56" * 32
+    identity = {
+        "topology_fixture_blake3": "ea31e3ff054c8d12d32d5b84a3d712987b31bb1fd3fb044fb27758453b49fbda",
+        "input_recipe_blake3": "e4c2f871c2d05b81588a5407f06cb49c7ed76834d2e363d2214bd34e7defcf31",
+        "timed_sample_index": 0,
+        "timed_sample_causally_validated": True,
+        "capture_revalidated": True,
+        "post_timing_revalidated": True,
+    }
+    for field in (
+        "eager_legacy_blake3",
+        "eager_hybrid_blake3",
+        "captured_legacy_blake3",
+        "captured_hybrid_blake3",
+        "timed_legacy_blake3",
+        "timed_hybrid_blake3",
+        "post_timing_legacy_blake3",
+        "post_timing_hybrid_blake3",
+    ):
+        identity[field] = digest
+    return {
+        "schema": NUMERATOR_SCHEMA,
+        "topology": {
+            "group_logs": [23, 19, 20, 6, 16, 18, 8, 7, 21, 14, 17, 11, 23, 15, 10, 4, 13, 12, 22],
+            "groups": 19,
+            "eligible_groups": 18,
+            "legacy_groups": 1,
+            "coefficient_columns": 161,
+            "coefficient_sources": 152,
+            "total_batches": 74,
+            "coefficient_batches": 71,
+            "terms": 6_341,
+        },
+        "bytes": {
+            "legacy_logical_output": 59_993_989_376,
+            "hybrid_logical_output": 20_266_867_968,
+            "validated_numerator_output": 402_644_224,
+            "validated_auxiliary_output": 912,
+            "validated_canonical_output": 402_645_136,
+            "shared_data_dual_workspace_arena": 41_889_121_376,
+            "workspace_span_each": 67_901_168,
+            "second_workspace_arena_delta": 67_901_152,
+        },
+        "device_memory": {
+            "total": 85_000_000_000,
+            "free_before_arena": 80_000_000_000,
+            "free_after_arena": 38_000_000_000,
+            "isolated_pool_used_after_arena": 41_889_121_376,
+            "isolated_pool_reserved_after_arena": 42_000_000_000,
+        },
+        "identity": identity,
+        "artifact_identity": {
+            "identity_complete": True,
+            "source_projection_sha256": SOURCE_SHA,
+            "cuda_module_sha256": MODULE_SHA,
+            "cuda_build_mode": "cuda",
+        },
+        "warmups": 3,
+        "iterations": 5,
+        "minimum_iterations": 5,
+        "samples_ms": {
+            "legacy": [10.0, 11.0, 12.0, 13.0, 14.0],
+            "hybrid": [5.0, 6.0, 7.0, 8.0, 9.0],
+        },
+        "host_wall_ms": {
+            "legacy": {"p50": 12.0, "p95": 14.0},
+            "hybrid": {"p50": 7.0, "p95": 9.0},
+        },
+        "speedup": {"p50": 1.714285714, "p95": 1.555555556},
+    }
 
 
 class ShellLauncherTests(unittest.TestCase):
+    def test_replacement_sn2_numerator_v5_seals_diagnostic(self) -> None:
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        source = common.read_text(encoding="utf-8")
+        self.assertIn(f"CHECKPOINT_NUMERATOR_SCHEMA={NUMERATOR_SCHEMA}", source)
+        self.assertEqual(source.count(NUMERATOR_SCHEMA), 1)
+        self.assertNotIn(NUMERATOR_SCHEMA.removesuffix("5") + "4", source)
+        self.assertIn(
+            'checkpoint_validate_numerator_record "$out" "$source_sha" "$module_sha"',
+            source,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gpu_bench = root / "gpu_bench"
+            aot_check = root / "aot_index_check"
+            aot_manifest = root / "aot_manifest.json"
+            proof = root / "fixture.proof.bin"
+            for path, payload in (
+                (gpu_bench, b"gpu-bench-v1"),
+                (aot_check, b"aot-check-v1"),
+                (aot_manifest, b"[]\n"),
+                (proof, b"proof-v1"),
+            ):
+                path.write_bytes(payload)
+
+            gpu_bench_sha = file_sha256(gpu_bench)
+            aot_check_sha = file_sha256(aot_check)
+            aot_manifest_sha = file_sha256(aot_manifest)
+            proof_sha = file_sha256(proof)
+            artifacts = {
+                "source_input_identity.json": {
+                    "schema": "stwo.replacement-v1-sn2.source-input-identity.v1",
+                    "source": {"stwo": "head-a", "stwo_cairo": "head-b"},
+                    "inputs": {"SN_PIE_2.zip": "input-a"},
+                },
+                "hardware_identity.json": {
+                    "schema": "stwo.replacement-v1-sn2.hardware-identity.v2",
+                    "name": "test H100",
+                },
+                "build_identity.json": {
+                    "schema": "stwo.replacement-v1-sn2.build-identity.v1",
+                    "gpu_bench_sha256": gpu_bench_sha,
+                    "aot_index_check_sha256": aot_check_sha,
+                    "aot_manifest_sha256": aot_manifest_sha,
+                },
+                "adapted_input_identity.json": {
+                    "schema": "stwo.replacement-v1-sn2.adapted-input-identity.v1",
+                    "sha256": "adapted-v1",
+                    "adapter_binary_sha256": gpu_bench_sha,
+                },
+                "fp256_carry_oracles.json": {"pass": True},
+                "numerator_ab.json": valid_sn3_numerator_record(),
+                "aot_identity.json": {
+                    "gpu_bench_sha256": gpu_bench_sha,
+                    "checker_binary_sha256": aot_check_sha,
+                    "manifest_sha256": aot_manifest_sha,
+                    "loaded_manifest_hash": "loaded-v1",
+                },
+                "record.json": {
+                    "checkpoint_validation": {
+                        "verdict": "PASS",
+                        "mode": "diagnostic",
+                    },
+                    "gpu_proof_blake3": "ab" * 32,
+                    "gpu_protocol_key": "protocol-v1",
+                    "gpu_shape_executable_topology_digest": "topology-v1",
+                    "gpu_prepared_numerator_eligible_groups": 18,
+                    "gpu_prepared_numerator_legacy_groups": 1,
+                },
+            }
+            for name, record in artifacts.items():
+                (root / f"fixture.{name}").write_text(
+                    json.dumps(record) + "\n", encoding="utf-8"
+                )
+            (root / "fixture.proof.sha256.txt").write_text(
+                f"{proof_sha}  {proof.name}\n", encoding="utf-8"
+            )
+
+            seal = root / "checkpoint.seal.json"
+            env = {
+                **os.environ,
+                "REPLACEMENT_SN2_MODE": "diagnostic",
+                "CAIRO": str(root / "stwo-cairo" / "stwo_cairo_prover"),
+                "STWO": str(root / "stwo"),
+                "RUN": str(root),
+                "COMMON": str(common),
+                "TEST_GPU_BENCH": str(gpu_bench),
+                "TEST_AOT_CHECK": str(aot_check),
+                "TEST_AOT_MANIFEST": str(aot_manifest),
+                "TEST_SEAL": str(seal),
+                "TEST_SOURCE_SHA": SOURCE_SHA,
+                "TEST_MODULE_SHA": MODULE_SHA,
+            }
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$COMMON"; CHECKPOINT_PREFIX=fixture; '
+                    'CHECKPOINT_GPU_BENCH="$TEST_GPU_BENCH"; '
+                    'CHECKPOINT_AOT_CHECK="$TEST_AOT_CHECK"; '
+                    'CHECKPOINT_AOT_MANIFEST="$TEST_AOT_MANIFEST"; '
+                    'CHECKPOINT_SEAL="$TEST_SEAL"; '
+                    'checkpoint_validate_numerator_record '
+                    '"$RUN/fixture.numerator_ab.json" "$TEST_SOURCE_SHA" "$TEST_MODULE_SHA"; '
+                    "checkpoint_seal_diagnostic",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            sealed = json.loads(seal.read_text(encoding="utf-8"))
+            self.assertTrue(sealed["diagnostic_pass"])
+            self.assertEqual(
+                sealed["receipts_sha256"]["numerator"],
+                file_sha256(root / "fixture.numerator_ab.json"),
+            )
+
+    def test_replacement_sn2_numerator_validator_rejects_mutations(self) -> None:
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record_path = root / "numerator.json"
+            env = {
+                **os.environ,
+                "REPLACEMENT_SN2_MODE": "diagnostic",
+                "CAIRO": str(root / "stwo-cairo" / "stwo_cairo_prover"),
+                "STWO": str(root / "stwo"),
+                "RUN": str(root),
+                "COMMON": str(common),
+                "RECORD": str(record_path),
+                "TEST_SOURCE_SHA": SOURCE_SHA,
+                "TEST_MODULE_SHA": MODULE_SHA,
+            }
+
+            def validate(record: dict[str, object]) -> subprocess.CompletedProcess[str]:
+                record_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+                return subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'source "$COMMON"; checkpoint_validate_numerator_record '
+                        '"$RECORD" "$TEST_SOURCE_SHA" "$TEST_MODULE_SHA"',
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+
+            valid = valid_sn3_numerator_record()
+            accepted = validate(valid)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn('"exact_numerator_ab": "PASS"', accepted.stdout)
+
+            mutations = (
+                ("schema", ("schema",), NUMERATOR_SCHEMA.removesuffix("5") + "4"),
+                ("group logs", ("topology", "group_logs", 0), 22),
+                ("group count", ("topology", "eligible_groups"), 17),
+                ("batch count", ("topology", "total_batches"), 73),
+                ("legacy modeled bytes", ("bytes", "legacy_logical_output"), 59_993_989_375),
+                ("hybrid modeled bytes", ("bytes", "hybrid_logical_output"), 20_266_867_967),
+                (
+                    "validated numerator bytes",
+                    ("bytes", "validated_numerator_output"),
+                    402_644_223,
+                ),
+                ("validated auxiliary bytes", ("bytes", "validated_auxiliary_output"), 913),
+                ("validated split", ("bytes", "validated_canonical_output"), 402_645_137),
+                ("warmups", ("warmups",), 2),
+                ("iterations", ("iterations",), 6),
+                ("causal flag", ("identity", "timed_sample_causally_validated"), False),
+                ("nonpositive sample", ("samples_ms", "legacy", 0), 0.0),
+                ("nonfinite sample", ("samples_ms", "hybrid", 0), float("nan")),
+                ("nearest-rank p50", ("host_wall_ms", "legacy", "p50"), 11.0),
+                ("nearest-rank p95", ("host_wall_ms", "hybrid", "p95"), 8.0),
+                ("speedup", ("speedup", "p95"), 2.0),
+                ("free-memory order", ("device_memory", "free_after_arena"), 81_000_000_000),
+                (
+                    "pool-memory order",
+                    ("device_memory", "isolated_pool_reserved_after_arena"),
+                    41_000_000_000,
+                ),
+            )
+            for label, path, value in mutations:
+                mutated = copy.deepcopy(valid)
+                target = mutated
+                for key in path[:-1]:
+                    target = target[key]  # type: ignore[index]
+                target[path[-1]] = value  # type: ignore[index]
+                with self.subTest(label=label):
+                    rejected = validate(mutated)
+                    self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+
     def test_replacement_sn2_ecc_policy_is_explicit_and_sealed(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
         source = common.read_text(encoding="utf-8")

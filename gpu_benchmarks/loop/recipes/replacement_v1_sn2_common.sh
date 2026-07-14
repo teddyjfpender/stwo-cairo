@@ -17,6 +17,7 @@ CHECKPOINT_AOT_MANIFEST="$STWO/crates/backend-cuda-kernels/cuda/generated/aot_ma
 CHECKPOINT_GPU_BENCH="$CAIRO/target/release/gpu_bench"
 CHECKPOINT_AOT_CHECK="$CAIRO/target/release/aot_index_check"
 CHECKPOINT_SEAL=/workspace/bench_inputs/replacement_v1_sn2_checkpoint.seal.json
+CHECKPOINT_NUMERATOR_SCHEMA=stwo.sn3_quotient_numerator_hybrid.host_wall.v5
 CHECKPOINT_EMPTY_WORKTREE_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 CHECKPOINT_AOT_MANIFEST_SHA256=3a6214cbf8417b74d7f6618d7840cc8269d2c7f69017263033f4a905866af954
 
@@ -270,6 +271,135 @@ checkpoint_numerator_source_sha() {
   sha256sum "${files[@]}" | sha256sum | cut -d' ' -f1
 }
 
+checkpoint_validate_numerator_record() {
+  local record="${1:?numerator record required}" source_sha="${2:?source SHA required}"
+  local module_sha="${3:?module SHA required}"
+  NUMERATOR_SCHEMA="$CHECKPOINT_NUMERATOR_SCHEMA" SOURCE_SHA="$source_sha" MODULE_SHA="$module_sha" \
+    python3 - "$record" <<'PY'
+import json, math, os, re, sys
+
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+group_logs = [23, 19, 20, 6, 16, 18, 8, 7, 21, 14, 17, 11, 23, 15, 10, 4, 13, 12, 22]
+topology = {"groups": 19, "eligible_groups": 18, "legacy_groups": 1,
+            "coefficient_columns": 161, "coefficient_sources": 152,
+            "total_batches": 74, "coefficient_batches": 71, "terms": 6341}
+geometry = {"legacy_logical_output": 59993989376, "hybrid_logical_output": 20266867968,
+            "validated_numerator_output": 402644224, "validated_auxiliary_output": 912,
+            "validated_canonical_output": 402645136,
+            "shared_data_dual_workspace_arena": 41889121376,
+            "workspace_span_each": 67901168, "second_workspace_arena_delta": 67901152}
+
+def require(condition, message):
+    if not condition: raise SystemExit(message)
+
+def exact_int(container, field, expected):
+    value = container.get(field)
+    require(isinstance(value, int) and not isinstance(value, bool) and value == expected,
+            f"{field}: expected integer {expected}, got {value!r}")
+
+def nonnegative_int(container, field):
+    value = container.get(field)
+    require(isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+            f"{field}: expected nonnegative integer, got {value!r}")
+    return value
+
+def positive(value, label):
+    require(isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0,
+            f"{label}: expected finite positive number, got {value!r}")
+    return float(value)
+
+def nearest_rank(samples, percentage):
+    ordered = sorted(samples)
+    return ordered[max(0, math.ceil(percentage * len(ordered) / 100) - 1)]
+
+require(r.get("schema") == os.environ["NUMERATOR_SCHEMA"], "exact numerator schema drifted")
+top = r.get("topology")
+require(isinstance(top, dict) and top.get("group_logs") == group_logs,
+        "exact numerator group logs drifted")
+for field, expected in topology.items(): exact_int(top, field, expected)
+
+byte_geometry = r.get("bytes")
+require(isinstance(byte_geometry, dict), "exact numerator byte geometry is missing")
+for field, expected in geometry.items(): exact_int(byte_geometry, field, expected)
+require(byte_geometry["validated_canonical_output"] ==
+        byte_geometry["validated_numerator_output"] + byte_geometry["validated_auxiliary_output"],
+        "validated numerator/auxiliary byte split is inconsistent")
+
+memory = r.get("device_memory")
+require(isinstance(memory, dict), "exact numerator device-memory record is missing")
+total = nonnegative_int(memory, "total")
+free_before = nonnegative_int(memory, "free_before_arena")
+free_after = nonnegative_int(memory, "free_after_arena")
+used = nonnegative_int(memory, "isolated_pool_used_after_arena")
+reserved = nonnegative_int(memory, "isolated_pool_reserved_after_arena")
+arena = geometry["shared_data_dual_workspace_arena"]
+require(0 <= free_after <= free_before <= total, "device free-memory ordering is invalid")
+require(arena <= used <= reserved <= total, "isolated-pool memory ordering is invalid")
+require(free_before >= arena, "device lacked the exact arena bytes before allocation")
+
+exact_int(r, "warmups", 3)
+exact_int(r, "iterations", 5)
+exact_int(r, "minimum_iterations", 5)
+identity = r.get("identity")
+require(isinstance(identity, dict), "exact numerator identity is missing")
+exact_int(identity, "timed_sample_index", 0)
+for field in ("timed_sample_causally_validated", "capture_revalidated",
+              "post_timing_revalidated"):
+    require(identity.get(field) is True, f"{field} did not pass")
+
+samples, host_wall, speedup = r.get("samples_ms"), r.get("host_wall_ms"), r.get("speedup")
+require(isinstance(samples, dict) and isinstance(host_wall, dict) and isinstance(speedup, dict),
+        "numerator timing record is incomplete")
+recomputed = {}
+for arm in ("legacy", "hybrid"):
+    raw = samples.get(arm)
+    require(isinstance(raw, list) and len(raw) == 5, f"{arm} sample count drifted")
+    checked = [positive(value, f"{arm} sample {index}") for index, value in enumerate(raw)]
+    reported = host_wall.get(arm)
+    require(isinstance(reported, dict), f"{arm} percentiles are missing")
+    recomputed[arm] = {}
+    for percentile in (50, 95):
+        label = f"p{percentile}"
+        expected = nearest_rank(checked, percentile)
+        actual = positive(reported.get(label), f"{arm} {label}")
+        require(math.isclose(actual, expected, rel_tol=0, abs_tol=5e-10),
+                f"{arm} {label} is not nearest-rank")
+        recomputed[arm][label] = actual
+
+# Samples/percentiles have six decimals; speedups use unrounded values and have nine.
+for label in ("p50", "p95"):
+    legacy, hybrid = recomputed["legacy"][label], recomputed["hybrid"][label]
+    require(hybrid > 0.5e-6, f"hybrid {label} is below timing precision")
+    lower = (legacy - 0.5e-6) / (hybrid + 0.5e-6)
+    upper = (legacy + 0.5e-6) / (hybrid - 0.5e-6)
+    actual = positive(speedup.get(label), f"speedup {label}")
+    require(actual + 0.5e-9 >= lower and actual - 0.5e-9 <= upper,
+            f"speedup {label} is inconsistent")
+
+require(identity.get("topology_fixture_blake3") ==
+        "ea31e3ff054c8d12d32d5b84a3d712987b31bb1fd3fb044fb27758453b49fbda",
+        "topology fixture identity drifted")
+require(identity.get("input_recipe_blake3") ==
+        "e4c2f871c2d05b81588a5407f06cb49c7ed76834d2e363d2214bd34e7defcf31",
+        "input recipe identity drifted")
+digest_fields = ("eager_legacy_blake3", "eager_hybrid_blake3", "captured_legacy_blake3",
+                 "captured_hybrid_blake3", "timed_legacy_blake3", "timed_hybrid_blake3",
+                 "post_timing_legacy_blake3", "post_timing_hybrid_blake3")
+digests = [identity.get(field) for field in digest_fields]
+require(len(set(digests)) == 1 and re.fullmatch(r"[0-9a-f]{64}", str(digests[0])),
+        "legacy/hybrid numerator outputs are not exactly identical")
+artifact = r.get("artifact_identity")
+require(isinstance(artifact, dict) and artifact.get("identity_complete") is True
+        and artifact.get("source_projection_sha256") == os.environ["SOURCE_SHA"]
+        and artifact.get("cuda_module_sha256") == os.environ["MODULE_SHA"]
+        and artifact.get("cuda_build_mode") == "cuda",
+        "exact numerator artifact identity is incomplete")
+print(json.dumps({"exact_numerator_ab": "PASS", "p50_speedup": speedup["p50"],
+                  "p95_speedup": speedup["p95"]}, sort_keys=True))
+PY
+}
+
 checkpoint_exact_numerator_ab() {
   local build_json build_err executable source_sha module_sha log out
   checkpoint_reject_ambient_overrides
@@ -317,61 +447,25 @@ PY
     return 1
   fi
   checkpoint_require_one_test "$log" sn3_hybrid_graph_host_wall_benchmark
-  SOURCE_SHA="$source_sha" MODULE_SHA="$module_sha" python3 - "$log" "$out" <<'PY'
-import json, os, re, sys
+  NUMERATOR_SCHEMA="$CHECKPOINT_NUMERATOR_SCHEMA" python3 - "$log" "$out" <<'PY'
+import json, os, sys
 decoder = json.JSONDecoder()
 records = []
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
-    marker = line.find('{"schema":"stwo.sn3_quotient_numerator_hybrid.host_wall.v5"')
+    marker = line.find(f'{{"schema":"{os.environ["NUMERATOR_SCHEMA"]}"')
     if marker >= 0:
         records.append(decoder.raw_decode(line[marker:])[0])
 if len(records) != 1:
     raise SystemExit(f"expected one exact numerator A/B record, got {len(records)}")
 r = records[0]
-top = r["topology"]
-if (top["groups"], top["eligible_groups"], top["legacy_groups"], top["terms"]) != (19, 18, 1, 6341):
-    raise SystemExit("exact SN3 numerator topology drifted")
-byte_geometry = r["bytes"]
-if (byte_geometry["shared_data_dual_workspace_arena"] != 41889121376
-        or byte_geometry["workspace_span_each"] != 67901168
-        or byte_geometry["second_workspace_arena_delta"] != 67901152
-        or byte_geometry["validated_canonical_output"] != 402645136):
-    raise SystemExit("exact SN3 numerator byte geometry drifted")
-memory = r["device_memory"]
-arena_bytes = byte_geometry["shared_data_dual_workspace_arena"]
-if (memory["total"] < arena_bytes
-        or memory["free_before_arena"] < arena_bytes
-        or memory["free_after_arena"] >= memory["free_before_arena"]
-        or memory["isolated_pool_used_after_arena"] < arena_bytes
-        or memory["isolated_pool_reserved_after_arena"] < memory["isolated_pool_used_after_arena"]):
-    raise SystemExit("exact SN3 numerator device-memory accounting is invalid")
-identity = r["identity"]
-if identity["topology_fixture_blake3"] != "ea31e3ff054c8d12d32d5b84a3d712987b31bb1fd3fb044fb27758453b49fbda":
-    raise SystemExit("exact SN3 topology fixture identity drifted")
-if identity["input_recipe_blake3"] != "e4c2f871c2d05b81588a5407f06cb49c7ed76834d2e363d2214bd34e7defcf31":
-    raise SystemExit("exact SN3 input recipe identity drifted")
-digests = [identity[name] for name in (
-    "eager_legacy_blake3", "eager_hybrid_blake3", "captured_legacy_blake3",
-    "captured_hybrid_blake3", "timed_legacy_blake3", "timed_hybrid_blake3",
-    "post_timing_legacy_blake3", "post_timing_hybrid_blake3")]
-if len(set(digests)) != 1 or not re.fullmatch(r"[0-9a-f]{64}", digests[0]):
-    raise SystemExit("legacy/hybrid numerator outputs are not exactly identical")
-artifact = r["artifact_identity"]
-if (artifact["identity_complete"] is not True
-        or artifact["source_projection_sha256"] != os.environ["SOURCE_SHA"]
-        or artifact["cuda_module_sha256"] != os.environ["MODULE_SHA"]
-        or artifact["cuda_build_mode"] != "cuda"):
-    raise SystemExit("exact numerator artifact identity is incomplete")
-if r["iterations"] != 5 or any(len(r["samples_ms"][arm]) != 5 for arm in ("legacy", "hybrid")):
-    raise SystemExit("exact numerator A/B did not record five samples per arm")
-if any(float(r["speedup"][p]) <= 0 for p in ("p50", "p95")):
-    raise SystemExit("exact numerator A/B timing is invalid")
 with open(sys.argv[2], "w", encoding="utf-8") as stream:
     json.dump(r, stream, sort_keys=True)
     stream.write("\n")
-print(json.dumps({"exact_numerator_ab": "PASS", "p50_speedup": r["speedup"]["p50"],
-                  "p95_speedup": r["speedup"]["p95"]}, sort_keys=True))
 PY
+  if ! checkpoint_validate_numerator_record "$out" "$source_sha" "$module_sha"; then
+    rm -f "$out"
+    return 1
+  fi
   cat "$log"
 }
 
@@ -643,7 +737,7 @@ checkpoint_seal_diagnostic() {
     GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
     AOT_CHECK_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_CHECK")" \
     AOT_MANIFEST_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")" \
-    OUT="$CHECKPOINT_SEAL" python3 - <<'PY'
+    NUMERATOR_SCHEMA="$CHECKPOINT_NUMERATOR_SCHEMA" OUT="$CHECKPOINT_SEAL" python3 - <<'PY'
 import hashlib, json, os, tempfile
 def load(name):
     with open(os.environ[name], encoding="utf-8") as stream: return json.load(stream)
@@ -656,7 +750,7 @@ if (source.get("schema") != "stwo.replacement-v1-sn2.source-input-identity.v1"
         or build.get("schema") != "stwo.replacement-v1-sn2.build-identity.v1"
         or adapted.get("schema") != "stwo.replacement-v1-sn2.adapted-input-identity.v1"
         or carry.get("pass") is not True
-        or numerator.get("schema") != "stwo.sn3_quotient_numerator_hybrid.host_wall.v4"
+        or numerator.get("schema") != os.environ["NUMERATOR_SCHEMA"]
         or record.get("checkpoint_validation", {}).get("verdict") != "PASS"
         or record["checkpoint_validation"].get("mode") != "diagnostic"):
     raise SystemExit("diagnostic receipts are not sealable")
