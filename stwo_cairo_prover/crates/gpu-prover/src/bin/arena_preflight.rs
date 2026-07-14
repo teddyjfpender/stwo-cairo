@@ -33,6 +33,7 @@
 //!   --aot-manifest <path>     required generated/aot_manifest.json whose exact
 //!                             semantic keys must cover this statement
 //!   --vram-budget-gb <f64>   budget in GiB the arena must fit under (default 79)
+//!   --quotient-topology-fixture-output <path>  write the exact versioned numerator topology
 //!   --preprocessed <canonical|canonical-without-pedersen>
 //!                            preprocessed-trace variant override. Default is
 //!                            auto-detected from the adapted input: canonical iff
@@ -44,12 +45,10 @@
 //! The PCS configuration is pinned to the secure benchmark configuration
 //! (pow_bits=26, FriConfig(0, 1, 70, 3)) — the same "do not change" config in
 //! gpu_bench. Exit code 0 iff the verdict is PASS.
-
 #[path = "../arena_preflight_hybrid.rs"]
 mod arena_preflight_hybrid;
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
-
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo_cairo_adapter::ProverInput;
@@ -700,14 +699,12 @@ fn main() -> ExitCode {
         Ok(loaded) => loaded,
         Err(error) => return fail("load_input", error),
     };
-
     // The secure benchmark configuration (gpu_bench `prover_params`; do not change).
     let pcs = PcsConfig {
         pow_bits: 26,
         fri_config: FriConfig::new(0, 1, 70, 3),
         lifting_log_size: None,
     };
-
     let ingest = phases::ingest::run(input, variant, None);
     let compacted_rows = compacted_consumer_rows(&ingest.proof_plan);
     let report = match plan_resident_preflight(
@@ -730,6 +727,9 @@ fn main() -> ExitCode {
         Ok(coverage) => coverage,
         Err(error) => return fail("aot_manifest", error),
     };
+    if let Err(error) = arena_preflight_hybrid::export_requested(report.arena.quotient_numerator()) {
+        return fail("quotient_topology_fixture", error);
+    }
 
     let record = report_json(
         &report,
