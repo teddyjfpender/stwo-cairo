@@ -1,0 +1,28 @@
+# shellcheck shell=bash
+# pod_run: require_clean_sources
+# Seal the diagnostic and admit timing in one detached pod session so the GPU
+# and release binary cannot drift between correctness and measurement.
+# Timing stays fail-closed: no timing phase runs unless the diagnostic seal passes.
+
+REPLACEMENT_SN2_MODE=diagnostic
+source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
+
+phase ambient_override_gate checkpoint_reject_ambient_overrides
+phase source_input_identity checkpoint_source_input_identity
+phase hardware_identity checkpoint_hardware_identity
+phase build checkpoint_build
+phase adapted_input_identity checkpoint_adapted_input_identity
+phase fp256_carry_oracles checkpoint_fp256_carry_oracles
+phase exact_numerator_ab checkpoint_exact_numerator_ab
+phase aot_identity checkpoint_aot_identity
+phase sn2_diagnostic checkpoint_run_sn2 diagnostic 2
+phase sn2_diagnostic_validate checkpoint_validate_sn2 diagnostic 2
+phase seal_passing_diagnostic checkpoint_seal_diagnostic
+
+REPLACEMENT_SN2_MODE=timing
+source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
+
+phase timing_ambient_override_gate checkpoint_reject_ambient_overrides
+phase timing_sealed_diagnostic_identity checkpoint_verify_sealed_diagnostic
+phase timing_sn2 checkpoint_run_sn2 timing 6
+phase timing_sn2_validate checkpoint_validate_sn2 timing 6
