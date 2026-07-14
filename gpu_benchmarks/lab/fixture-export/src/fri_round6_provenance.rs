@@ -147,10 +147,16 @@ pub struct PreflightedProvenanceInputs {
 #[derive(Clone)]
 pub(crate) struct SealedProofInputs {
     pub manifest_sha256: String,
+    #[cfg(test)]
+    pub adapted_prover_input_sha256: String,
+    #[cfg(test)]
+    pub adapted_prover_input_bytes: u64,
     pub proof_bytes: Vec<u8>,
     pub proof_sha256: String,
     pub canonical_transport_bytes: Vec<u8>,
     pub canonical_transport_sha256: String,
+    #[cfg(test)]
+    pub verifier_source_closure_sha256: String,
     pub proof_shape: ProofShapeSeal,
 }
 
@@ -305,10 +311,16 @@ fn preflight_inner(
     };
     let proof_inputs = load_proof_inputs.then(|| SealedProofInputs {
         manifest_sha256,
+        #[cfg(test)]
+        adapted_prover_input_sha256: manifest.adapted_prover_input.sha256,
+        #[cfg(test)]
+        adapted_prover_input_bytes: manifest.adapted_prover_input.byte_length,
         proof_bytes,
         proof_sha256: manifest.extended_cairo_proof_bincode.sha256,
         canonical_transport_bytes,
         canonical_transport_sha256: manifest.canonical_cairo_transport.sha256,
+        #[cfg(test)]
+        verifier_source_closure_sha256: manifest.verifier_source_closure.sha256,
         proof_shape: manifest.proof_shape,
     });
     Ok((verified, proof_inputs))

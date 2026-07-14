@@ -24,7 +24,7 @@ pub struct CaptureSource {
     pub observer_proof_shape_id: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureShape {
     pub circle_log_size: u32,
@@ -38,7 +38,7 @@ pub struct CaptureShape {
     pub fri_tree_count: u32,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PcsShape {
     pub pow_bits: u32,

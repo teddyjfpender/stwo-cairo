@@ -26,7 +26,7 @@ const DATA_LIMIT_BYTES: u64 = 2 * GIB;
 const ADDRESS_SPACE_LIMIT_BYTES: u64 = 4 * GIB;
 const CPU_LIMIT_SECONDS: u64 = 60;
 
-type Blake2sCairoProof = CairoProof<Blake2sMerkleHasher>;
+pub(crate) type Blake2sCairoProof = CairoProof<Blake2sMerkleHasher>;
 
 pub struct VerifiedProofPreflight {
     pub manifest_sha256: String,
@@ -39,9 +39,13 @@ pub fn preflight(
     manifest_path: &Path,
     expected_manifest_sha256: &str,
 ) -> Result<VerifiedProofPreflight, String> {
-    with_resource_limits(install_resource_limits, || {
-        preflight_after_limits(manifest_path, expected_manifest_sha256)
-    })
+    with_proof_resource_limits(|| preflight_after_limits(manifest_path, expected_manifest_sha256))
+}
+
+pub(crate) fn with_proof_resource_limits<T>(
+    load_and_validate: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    with_resource_limits(install_resource_limits, load_and_validate)
 }
 
 fn with_resource_limits<T>(
@@ -140,7 +144,7 @@ fn require_rlimit_call(result: libc::c_int, operation: &str, label: &str) -> Res
     Ok(())
 }
 
-fn decode_exact_bincode<T>(bytes: &[u8], label: &str) -> Result<T, String>
+pub(crate) fn decode_exact_bincode<T>(bytes: &[u8], label: &str) -> Result<T, String>
 where
     T: DeserializeOwned + Serialize,
 {
@@ -215,7 +219,10 @@ impl Write for ExactBytesWriter<'_> {
     }
 }
 
-fn require_canonical_transport(proof: &Blake2sCairoProof, expected: &[u8]) -> Result<(), String> {
+pub(crate) fn require_canonical_transport(
+    proof: &Blake2sCairoProof,
+    expected: &[u8],
+) -> Result<(), String> {
     let mut felts = Vec::new();
     CairoSerialize::serialize(proof, &mut felts);
     require_exact_chunks(
@@ -249,7 +256,7 @@ fn require_exact_chunks<const N: usize>(
     Ok(())
 }
 
-fn derive_shape(proof: &Blake2sCairoProof) -> Result<ProofShape, String> {
+pub(crate) fn derive_shape(proof: &Blake2sCairoProof) -> Result<ProofShape, String> {
     let flat_claim = proof.claim.flatten_claim();
     let enable_bytes = flat_claim
         .component_enable_bits
@@ -341,7 +348,10 @@ fn count(value: usize, label: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("{label} count does not fit in u64"))
 }
 
-fn require_proof_shape(derived: &ProofShape, sealed: &ProofShapeSeal) -> Result<String, String> {
+pub(crate) fn require_proof_shape(
+    derived: &ProofShape,
+    sealed: &ProofShapeSeal,
+) -> Result<String, String> {
     let value =
         serde_json::to_value(derived).map_err(|error| format!("serialize proof shape: {error}"))?;
     let derived_sha256 = canonical_value_hash(&value)?;
@@ -351,10 +361,18 @@ fn require_proof_shape(derived: &ProofShape, sealed: &ProofShapeSeal) -> Result<
     Ok(derived_sha256)
 }
 
-fn panic_safe<T>(validate: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+pub(crate) fn panic_safe<T>(validate: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     catch_unwind(AssertUnwindSafe(validate))
         .map_err(|_| "Cairo proof validation panicked; rejecting the proof".to_string())?
 }
+
+#[cfg(test)]
+#[path = "fri_round6_proof_test_support.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "verifier_capture_recorder.rs"]
+mod verifier_capture_recorder;
 
 #[cfg(test)]
 mod tests {
@@ -387,7 +405,7 @@ mod tests {
 
     #[test]
     fn rejects_self_consistent_but_proof_independent_shape() {
-        let derived = sample_shape();
+        let derived = super::test_support::sample_shape();
         let mut substituted = derived.clone();
         substituted.channel_salt = 1;
         let value = serde_json::to_value(&substituted).unwrap();
@@ -553,10 +571,13 @@ mod tests {
         };
         fri_round6_provenance::SealedProofInputs {
             manifest_sha256: "00".repeat(32),
+            adapted_prover_input_sha256: sha256_hex(b"ephemeral adapted input\n"),
+            adapted_prover_input_bytes: b"ephemeral adapted input\n".len() as u64,
             proof_sha256: sha256_hex(&proof_bytes),
             proof_bytes,
             canonical_transport_sha256: sha256_hex(&canonical_transport_bytes),
             canonical_transport_bytes,
+            verifier_source_closure_sha256: sha256_hex(&source_closure("verifier")),
             proof_shape,
         }
     }
@@ -713,35 +734,5 @@ mod tests {
             "closure_sha256": canonical_value_hash(&core).expect("hash ephemeral source closure"),
         }))
         .expect("serialize ephemeral source closure")
-    }
-
-    fn sample_shape() -> ProofShape {
-        ProofShape {
-            schema_version: PROOF_SHAPE_SCHEMA.into(),
-            pcs: PcsShape {
-                pow_bits: 1,
-                log_blowup_factor: 2,
-                log_last_layer_degree_bound: 3,
-                n_queries: 4,
-                fold_step: 1,
-                lifting_log_size: Some(8),
-            },
-            channel_salt: 0,
-            preprocessed_trace_variant_sha256: "11".repeat(32),
-            component_slots: 1,
-            component_enable_bits_sha256: "22".repeat(32),
-            component_log_sizes: vec![8],
-            trace_column_log_sizes: vec![vec![8]],
-            public_data_word_counts: [1, 2, 3],
-            interaction_claim_felts: 4,
-            commitment_trees: 4,
-            sampled_value_counts: vec![vec![1]],
-            decommitment_trees: 4,
-            queried_value_counts: vec![vec![1]],
-            fri_inner_layers: 2,
-            fri_witness_counts: vec![3, 2, 1],
-            fri_last_layer_coefficients: 8,
-            unsorted_query_locations: 4,
-        }
     }
 }
