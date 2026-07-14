@@ -88,14 +88,16 @@ pub struct CompositionPlan {
 /// remain owned by [`CompositionPlan`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionProofBindings {
-    pub components: Vec<CompositionComponentBindings>,
+    components: Vec<CompositionComponentBinding>,
+    base_param_values: Vec<BaseField>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompositionComponentBindings {
-    pub component: &'static str,
-    pub instance: usize,
-    pub base_param_values: Vec<BaseField>,
+struct CompositionComponentBinding {
+    component: &'static str,
+    instance: usize,
+    base_param_offset: usize,
+    base_param_words: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -373,6 +375,14 @@ pub fn bind_cairo_composition(
     );
     let expected_count = cairo.components().len();
     let mut components = Vec::with_capacity(expected_count);
+    let base_param_words = installed
+        .components
+        .iter()
+        .try_fold(0usize, |total, component| {
+            total.checked_add(component.base_param_values.len())
+        })
+        .ok_or(CompositionPlanError::ConstraintCountOverflow)?;
+    let mut base_param_values = Vec::with_capacity(base_param_words);
 
     macro_rules! bind_component {
         ($name:expr, $instance:expr, $component:expr) => {{
@@ -388,6 +398,7 @@ pub fn bind_cairo_composition(
                 $component,
                 expected,
                 installed.max_kernel_instrs,
+                &mut base_param_values,
             )?);
         }};
     }
@@ -483,7 +494,10 @@ pub fn bind_cairo_composition(
             actual: components.len(),
         });
     }
-    Ok(CompositionProofBindings { components })
+    Ok(CompositionProofBindings {
+        components,
+        base_param_values,
+    })
 }
 
 fn bind_component_values<E: FrameworkEval>(
@@ -492,7 +506,8 @@ fn bind_component_values<E: FrameworkEval>(
     component: &FrameworkComponent<E>,
     installed: &CompositionComponentPlan,
     max_kernel_instrs: usize,
-) -> Result<CompositionComponentBindings, CompositionPlanError> {
+    packed_values: &mut Vec<BaseField>,
+) -> Result<CompositionComponentBinding, CompositionPlanError> {
     let topology_matches = installed.component == name
         && installed.instance == instance
         && installed.trace_locations == component.trace_locations()
@@ -541,25 +556,63 @@ fn bind_component_values<E: FrameworkEval>(
             instance,
         });
     }
-    Ok(CompositionComponentBindings {
+    let base_param_offset = packed_values.len();
+    let base_param_words = binding.base_param_values.len();
+    packed_values.extend(binding.base_param_values);
+    Ok(CompositionComponentBinding {
         component: name,
         instance,
-        base_param_values: binding.base_param_values,
+        base_param_offset,
+        base_param_words,
     })
 }
 
 impl CompositionProofBindings {
+    pub fn component_count(&self) -> usize {
+        self.components.len()
+    }
+
+    pub fn base_param_word_count(&self) -> usize {
+        self.base_param_values.len()
+    }
+
+    pub(crate) fn component(&self, index: usize) -> Option<(&'static str, usize, &[BaseField])> {
+        let binding = self.components.get(index)?;
+        let end = binding
+            .base_param_offset
+            .checked_add(binding.base_param_words)?;
+        Some((
+            binding.component,
+            binding.instance,
+            self.base_param_values.get(binding.base_param_offset..end)?,
+        ))
+    }
+
     pub fn from_plan(plan: &CompositionPlan) -> Self {
-        Self {
-            components: plan
-                .components
+        let mut base_param_values = Vec::with_capacity(
+            plan.components
                 .iter()
-                .map(|component| CompositionComponentBindings {
+                .map(|component| component.base_param_values.len())
+                .sum(),
+        );
+        let components = plan
+            .components
+            .iter()
+            .map(|component| {
+                let base_param_offset = base_param_values.len();
+                let base_param_words = component.base_param_values.len();
+                base_param_values.extend_from_slice(&component.base_param_values);
+                CompositionComponentBinding {
                     component: component.component,
                     instance: component.instance,
-                    base_param_values: component.base_param_values.clone(),
-                })
-                .collect(),
+                    base_param_offset,
+                    base_param_words,
+                }
+            })
+            .collect();
+        Self {
+            components,
+            base_param_values,
         }
     }
 }
@@ -1144,5 +1197,22 @@ mod tests {
             .base_param_values
             .push(BaseField::from_u32_unchecked(13));
         assert_ne!(plan.key(), original, "slot topology changes the graph ABI");
+
+        let bindings = CompositionProofBindings::from_plan(&plan);
+        assert_eq!(bindings.component_count(), 1);
+        assert_eq!(bindings.base_param_word_count(), 2);
+        assert_eq!(
+            bindings.component(0),
+            Some((
+                "test",
+                0,
+                [
+                    BaseField::from_u32_unchecked(11),
+                    BaseField::from_u32_unchecked(13),
+                ]
+                .as_slice(),
+            ))
+        );
+        assert_eq!(bindings.component(1), None);
     }
 }

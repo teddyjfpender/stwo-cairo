@@ -74,6 +74,14 @@ fn same_shape_changed_statement_reuses_one_source_free_executable() {
         cold.shape_executable_topology_digest
     );
     assert_ne!(warm.composition_bindings, cold.composition_bindings);
+    assert_eq!(
+        warm.composition_bindings.component_count(),
+        cold.composition_bindings.component_count()
+    );
+    assert_eq!(
+        warm.composition_bindings.base_param_word_count(),
+        cold.composition_bindings.base_param_word_count()
+    );
     assert_eq!(warm.shape_executable_cache.hits, 1);
     assert_eq!(warm.shape_executable_cache.compilations, 1);
     assert_eq!(warm.shape_executable_cache.source_generation_passes, 1);

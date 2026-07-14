@@ -446,6 +446,10 @@ pub enum PreparedCompositionError {
         expected: usize,
         actual: usize,
     },
+    BaseParamBindingTotalWords {
+        expected: usize,
+        actual: usize,
+    },
     BaseParamBindingIdentity(usize),
     BaseParamBindingWords {
         component: usize,
@@ -1476,10 +1480,23 @@ impl<'a> PreparedCompositionGraph<'a> {
             });
         }
         if let Some(bindings) = proof_bindings {
-            if bindings.components.len() != requirements.components.len() {
+            if bindings.component_count() != requirements.components.len() {
                 return Err(PreparedCompositionError::BaseParamBindingCount {
                     expected: requirements.components.len(),
-                    actual: bindings.components.len(),
+                    actual: bindings.component_count(),
+                });
+            }
+            let expected_words = requirements
+                .components
+                .iter()
+                .try_fold(0usize, |total, component| {
+                    total.checked_add(component.base_param_words)
+                })
+                .ok_or(PreparedCompositionError::SizeOverflow)?;
+            if bindings.base_param_word_count() != expected_words {
+                return Err(PreparedCompositionError::BaseParamBindingTotalWords {
+                    expected: expected_words,
+                    actual: bindings.base_param_word_count(),
                 });
             }
         }
@@ -1740,22 +1757,25 @@ impl<'a> PreparedCompositionGraph<'a> {
         {
             let base_param_values = match proof_bindings {
                 Some(bindings) => {
-                    let binding = &bindings.components[component_index];
-                    if binding.component != component_plan.component
-                        || binding.instance != component_plan.instance
+                    let (binding_component, binding_instance, binding_values) =
+                        bindings.component(component_index).ok_or(
+                            PreparedCompositionError::BaseParamBindingIdentity(component_index),
+                        )?;
+                    if binding_component != component_plan.component
+                        || binding_instance != component_plan.instance
                     {
                         return Err(PreparedCompositionError::BaseParamBindingIdentity(
                             component_index,
                         ));
                     }
-                    if binding.base_param_values.len() != component.base_param_words {
+                    if binding_values.len() != component.base_param_words {
                         return Err(PreparedCompositionError::BaseParamBindingWords {
                             component: component_index,
                             expected: component.base_param_words,
-                            actual: binding.base_param_values.len(),
+                            actual: binding_values.len(),
                         });
                     }
-                    binding.base_param_values.as_slice()
+                    binding_values
                 }
                 None => component_plan.base_param_values.as_slice(),
             };
