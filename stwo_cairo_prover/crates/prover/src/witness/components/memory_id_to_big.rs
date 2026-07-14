@@ -41,26 +41,23 @@ type SmallTrace = Vec<CircleEvaluation<SimdBackend, M31, BitReversedOrder>>;
 /// limb Felt252. The small values are currently 8 limbs, for a maximum of 72 bits.
 /// The separation is done to reduce zeroed out ('unused') trace cells.
 pub struct ClaimGenerator {
-    big_values: Vec<[u32; 8]>,
+    // Resident execution uploads the adapter's canonical tables directly.
+    // Retain that immutable owner and only clone/pad for a consumed legacy
+    // SIMD/device witness writer, never merely to plan a resident proof.
+    memory: Arc<Memory>,
     big_mults: AtomicMultiplicityColumn,
-    small_values: Vec<u128>,
     small_mults: AtomicMultiplicityColumn,
 }
 impl ClaimGenerator {
     pub fn new(mem: Arc<Memory>) -> Self {
-        let mut big_values = mem.f252_values.clone();
-        let simd_padded_big_size = big_values.len().next_multiple_of(N_LANES);
-        big_values.resize(simd_padded_big_size, [0; 8]);
+        let simd_padded_big_size = mem.f252_values.len().next_multiple_of(N_LANES);
         let big_mults = AtomicMultiplicityColumn::new(simd_padded_big_size);
 
-        let mut small_values = mem.small_values.clone();
-        let simd_padded_small_size = small_values.len().next_multiple_of(N_LANES);
-        small_values.resize(simd_padded_small_size, 0);
+        let simd_padded_small_size = mem.small_values.len().next_multiple_of(N_LANES);
         let small_mults = AtomicMultiplicityColumn::new(simd_padded_small_size);
 
         Self {
-            small_values,
-            big_values,
+            memory: mem,
             small_mults,
             big_mults,
         }
@@ -71,12 +68,12 @@ impl ClaimGenerator {
             Simd::from_array(
                 ids.to_array()
                     .map(|M31(i)| match EncodedMemoryValueId(i).decode() {
-                        MemoryValueId::F252(id) => self.big_values[id as usize][j],
+                        MemoryValueId::F252(id) => self.memory.f252_values[id as usize][j],
                         MemoryValueId::Small(id) => {
                             if j >= 4 {
                                 0
                             } else {
-                                let small = self.small_values[id as usize];
+                                let small = self.memory.small_values[id as usize];
                                 u128_to_4_limbs(small)[j]
                             }
                         }
@@ -141,11 +138,20 @@ impl ClaimGenerator {
     /// `MemoryIdToBigWitness` device path, which generates the limb columns from
     /// the raw value tables on device).
     pub(crate) fn into_parts(self) -> (Vec<[u32; 8]>, Vec<PackedM31>, Vec<u128>, Vec<PackedM31>) {
+        let Self {
+            memory,
+            big_mults,
+            small_mults,
+        } = self;
+        let mut big_values = memory.f252_values.clone();
+        big_values.resize(big_mults.padded_len(), [0; 8]);
+        let mut small_values = memory.small_values.clone();
+        small_values.resize(small_mults.padded_len(), 0);
         (
-            self.big_values,
-            self.big_mults.into_simd_vec(),
-            self.small_values,
-            self.small_mults.into_simd_vec(),
+            big_values,
+            big_mults.into_simd_vec(),
+            small_values,
+            small_mults.into_simd_vec(),
         )
     }
 
@@ -160,14 +166,10 @@ impl ClaimGenerator {
         (BigClaim, SmallClaim),
         InteractionClaimGenerator,
     ) {
-        let big_table_traces = gen_big_memory_traces(
-            self.big_values,
-            self.big_mults.into_simd_vec(),
-            log_max_big_size,
-            opt_n_components,
-        );
-        let small_table_trace =
-            gen_small_memory_trace(self.small_values, self.small_mults.into_simd_vec());
+        let (big_values, big_mults, small_values, small_mults) = self.into_parts();
+        let big_table_traces =
+            gen_big_memory_traces(big_values, big_mults, log_max_big_size, opt_n_components);
+        let small_table_trace = gen_small_memory_trace(small_values, small_mults);
 
         // Lookup data.
         let big_components_values: Vec<[_; FELT252_N_WORDS]> = big_table_traces
@@ -703,7 +705,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
     use stwo::core::channel::Blake2sChannel;
     use stwo::core::fields::m31::M31;
-    use stwo::prover::backend::simd::m31::PackedM31;
+    use stwo::prover::backend::simd::m31::{PackedM31, N_LANES};
     use stwo_cairo_adapter::memory::{
         value_from_felt252, MemoryBuilder, MemoryConfig, MemoryValue,
     };
@@ -883,5 +885,24 @@ mod tests {
                 .unwrap();
             assert_eq!(value, expected);
         }
+    }
+
+    #[test]
+    fn planning_keeps_value_tables_shared_until_writer_consumption() {
+        let mut mem = MemoryBuilder::new(MemoryConfig::default());
+        mem.set(1, MemoryValue::F252([7; 8]));
+        mem.set(2, MemoryValue::Small(11));
+        let memory = Arc::new(mem.build().0);
+        let generator = super::ClaimGenerator::new(Arc::clone(&memory));
+
+        assert!(Arc::ptr_eq(&generator.memory, &memory));
+        assert_eq!(generator.big_table_size(), N_LANES);
+        assert_eq!(generator.small_table_size(), N_LANES);
+
+        let (big, _, small, _) = generator.into_parts();
+        assert_eq!(big[0], [7; 8]);
+        assert_eq!(small[0], 11);
+        assert_eq!(big.len(), N_LANES);
+        assert_eq!(small.len(), N_LANES);
     }
 }

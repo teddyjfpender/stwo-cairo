@@ -67,22 +67,21 @@ impl Index<usize> for AddressToId {
 
 /// A struct to generate the memory address to ID trace.
 pub struct ClaimGenerator {
-    address_to_raw_id: AddressToId,
+    // The resident prover already owns and uploads this exact adapter table.
+    // Keep one shared owner during planning; materialize the SIMD trace vector
+    // only if the legacy writer is actually consumed.
+    memory: Arc<Memory>,
     multiplicities: AtomicMultiplicityColumn,
 }
 impl ClaimGenerator {
     pub fn new(memory: Arc<Memory>) -> Self {
         // Note that while `memory.address_to_id` starts from address 0, the memory component can
         // only yield addresses starting from 1.
-        let address_to_raw_id = AddressToId::new(
-            (1..memory.address_to_id.len())
-                .map(|addr| memory.get_raw_id(addr as u32))
-                .collect_vec(),
-        );
-        let multiplicities = AtomicMultiplicityColumn::new(address_to_raw_id.len());
+        let multiplicities =
+            AtomicMultiplicityColumn::new(memory.address_to_id.len().saturating_sub(1));
 
         Self {
-            address_to_raw_id,
+            memory,
             multiplicities,
         }
     }
@@ -94,7 +93,8 @@ impl ClaimGenerator {
     }
 
     pub fn get_id(&self, input: BaseField) -> M31 {
-        M31(self.address_to_raw_id[input.0 as usize])
+        assert_ne!(input.0, 0, "memory address zero is reserved");
+        M31(self.memory.get_raw_id(input.0))
     }
 
     pub fn add_inputs(&self, inputs: &[InputType]) {
@@ -131,18 +131,23 @@ impl ClaimGenerator {
     }
 
     pub fn write_trace(
-        mut self,
+        self,
     ) -> (
         Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
         Claim,
         InteractionClaimGenerator,
     ) {
+        let Self {
+            memory,
+            multiplicities,
+        } = self;
+        let mut address_to_raw_id = AddressToId::new(
+            (1..memory.address_to_id.len())
+                .map(|addr| memory.get_raw_id(addr as u32))
+                .collect_vec(),
+        );
         let size = std::cmp::max(
-            (self
-                .address_to_raw_id
-                .len()
-                .div_ceil(MEMORY_ADDRESS_TO_ID_SPLIT))
-            .next_power_of_two(),
+            (address_to_raw_id.len().div_ceil(MEMORY_ADDRESS_TO_ID_SPLIT)).next_power_of_two(),
             N_LANES,
         );
         let n_packed_rows = size.div_ceil(N_LANES);
@@ -150,14 +155,13 @@ impl ClaimGenerator {
             std::array::from_fn(|_| Col::<SimdBackend, M31>::zeros(size));
 
         // Pad to a multiple of `N_LANES`.
-        let next_multiple_of_16 = self.address_to_raw_id.len().next_multiple_of(16);
-        self.address_to_raw_id.resize(next_multiple_of_16, 0);
+        let next_multiple_of_16 = address_to_raw_id.len().next_multiple_of(16);
+        address_to_raw_id.resize(next_multiple_of_16, 0);
 
-        let id_it = self
-            .address_to_raw_id
+        let id_it = address_to_raw_id
             .array_chunks::<N_LANES>()
             .map(|&chunk| unsafe { PackedM31::from_simd_unchecked(Simd::from_array(chunk)) });
-        let multiplicities = self.multiplicities.into_simd_vec();
+        let multiplicities = multiplicities.into_simd_vec();
 
         for (i, (id, multiplicity)) in zip(id_it, multiplicities).enumerate() {
             let chunk_idx = i / n_packed_rows;
@@ -295,5 +299,25 @@ mod tests {
 
         assert_eq!(actual_mults.len(), 1);
         assert_eq!(actual_mults[0].to_array(), expected_mults);
+    }
+
+    #[test]
+    fn planning_keeps_the_adapter_table_shared() {
+        let (memory, ..) = MemoryBuilder::from_iter(
+            MemoryConfig::default(),
+            (0..4).map(|i| MemoryEntry {
+                address: i,
+                value: [i as u32; 8],
+            }),
+        )
+        .build();
+        let memory = Arc::new(memory);
+        let generator = memory_address_to_id::ClaimGenerator::new(Arc::clone(&memory));
+
+        assert!(Arc::ptr_eq(&generator.memory, &memory));
+        assert_eq!(
+            generator.get_id(BaseField::from(1)),
+            M31(memory.get_raw_id(1))
+        );
     }
 }
