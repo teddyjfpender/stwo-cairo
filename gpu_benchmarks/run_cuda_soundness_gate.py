@@ -156,6 +156,18 @@ GATES = (
         2,
     ),
     (
+        "prepared_numerator_hybrid_eager_capture_reference",
+        (
+            "cargo",
+            "test",
+            "-p",
+            "stwo-backend-cuda",
+            "--test",
+            "prepared_quotient_numerator_hybrid_native",
+        ),
+        1,
+    ),
+    (
         "prepared_quotient_eager_capture_reference",
         (
             "cargo",

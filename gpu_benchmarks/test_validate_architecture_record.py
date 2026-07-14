@@ -1013,8 +1013,8 @@ class ArchitectureRecordTest(unittest.TestCase):
     def test_soundness_manifest_covers_cfg_native_targets_with_exact_counts(self) -> None:
         stwo, stwo_cairo = source_roots()
         arena_gates = gates_for_runtime_mode("arena-graph")
-        self.assertEqual(len(arena_gates), 26)
-        self.assertEqual(sum(required for _name, _command, required in arena_gates), 47)
+        self.assertEqual(len(arena_gates), 27)
+        self.assertEqual(sum(required for _name, _command, required in arena_gates), 48)
         self.assertEqual(
             [name for name, _command, _required in arena_gates[-4:]],
             [
