@@ -49,18 +49,37 @@ impl RangeBinding {
     }
 }
 
-/// A stable slab layout. `raw_peak_words` is the hard live-byte lower bound;
-/// `packing_overhead_words` is only heuristic overhead, not an optimality gap.
+/// A stable slab layout. `raw_peak_words` is a hard arena-word lower bound.
+/// `excess_over_raw_peak_words` is the allocation's exact distance above that
+/// weak bound; it includes required alignment, placement constraints, and any
+/// heuristic fragmentation, so it is neither an optimality gap nor a claim of
+/// reclaimable memory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RangeLayout {
-    pub total_words: usize,
-    pub raw_peak_words: usize,
-    pub packing_overhead_words: usize,
+    total_words: usize,
+    raw_peak_words: usize,
+    excess_over_raw_peak_words: usize,
     /// Canonical `RangeId` order, independent of input order.
-    pub bindings: Vec<RangeBinding>,
+    bindings: Vec<RangeBinding>,
 }
 
 impl RangeLayout {
+    pub const fn total_words(&self) -> usize {
+        self.total_words
+    }
+
+    pub const fn raw_peak_words(&self) -> usize {
+        self.raw_peak_words
+    }
+
+    pub const fn excess_over_raw_peak_words(&self) -> usize {
+        self.excess_over_raw_peak_words
+    }
+
+    pub fn bindings(&self) -> &[RangeBinding] {
+        &self.bindings
+    }
+
     pub fn binding(&self, id: RangeId) -> Option<RangeBinding> {
         self.bindings
             .binary_search_by_key(&id, |binding| binding.id)
@@ -97,6 +116,7 @@ pub enum RangeAllocationError {
     MissingBinding(RangeId),
     UnexpectedBinding(RangeId),
     DuplicateBinding(RangeId),
+    NonCanonicalBindingOrder,
     BindingLengthMismatch {
         id: RangeId,
         expected: usize,
@@ -190,7 +210,7 @@ pub fn allocate_ranges(
     let layout = RangeLayout {
         total_words,
         raw_peak_words,
-        packing_overhead_words: total_words
+        excess_over_raw_peak_words: total_words
             .checked_sub(raw_peak_words)
             .ok_or(RangeAllocationError::SizeOverflow)?,
         bindings,
@@ -256,6 +276,13 @@ pub fn validate_range_layout(
         }
         max_end = max_end.max(end);
     }
+    if layout
+        .bindings
+        .windows(2)
+        .any(|pair| pair[0].id >= pair[1].id)
+    {
+        return Err(RangeAllocationError::NonCanonicalBindingOrder);
+    }
     for request in requests {
         if !bindings_by_id.contains_key(&request.id) {
             return Err(RangeAllocationError::MissingBinding(request.id));
@@ -272,7 +299,7 @@ pub fn validate_range_layout(
     let raw_peak = raw_peak_words(requests)?;
     if layout.raw_peak_words != raw_peak
         || layout.total_words < raw_peak
-        || layout.packing_overhead_words != layout.total_words - raw_peak
+        || layout.excess_over_raw_peak_words != layout.total_words - raw_peak
     {
         return Err(RangeAllocationError::LayoutMetadataMismatch);
     }
