@@ -20,6 +20,7 @@
 //!
 //! Usage: kernel_emit [--stwo-root <path>] [--max-instrs N]
 //!                    [--input-bincode <adapted-input>]... [--check]
+//!        kernel_emit --witness-only --output-dir <witness-lab-path> [--check]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -56,6 +57,69 @@ fn args(name: &str) -> Vec<String> {
         .filter(|pair| pair[0] == name)
         .map(|pair| pair[1].clone())
         .collect()
+}
+
+fn witness_only_incompatibility(cli_args: &[String]) -> Option<&'static str> {
+    [
+        "--input-bincode",
+        "--shape-report-bincode",
+        "--max-instrs",
+        "--max-live-u32-lanes",
+        "--stwo-root",
+    ]
+    .into_iter()
+    .find(|option| cli_args.iter().any(|arg| arg == option))
+}
+
+fn generated_file_counts(files: &BTreeMap<String, String>) -> (usize, usize) {
+    let kernels = files.keys().filter(|file| file.ends_with(".cu")).count();
+    (kernels, files.len() - kernels)
+}
+
+fn admit_witness_output_dir(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if !path.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    let entries = std::fs::read_dir(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let manifest_path = path.join("aot_manifest.json");
+    let manifest = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "non-empty witness output requires {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(&manifest)
+        .map_err(|error| format!("decode {}: {error}", manifest_path.display()))?;
+    if manifest
+        .iter()
+        .any(|entry| entry.get("kind").and_then(|kind| kind.as_str()) != Some("witness"))
+    {
+        return Err(format!(
+            "{} is not a witness-only manifest",
+            manifest_path.display()
+        ));
+    }
+    for entry in entries {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name != "aot_manifest.json" && !(name.starts_with("witness_") && name.ends_with(".cu")) {
+            return Err(format!(
+                "unexpected non-witness artifact {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Per-kernel instruction cap for AOT constraint lowering. MUST MATCH the
@@ -254,12 +318,37 @@ fn run_input(
 }
 
 fn main() -> ExitCode {
-    let stwo_root = PathBuf::from(
-        arg("--stwo-root")
-            .or_else(|| std::env::var("STWO_ROOT").ok())
-            .unwrap_or_else(|| "../stwo".to_string()),
-    );
-    let out_dir = stwo_root.join("crates/backend-cuda-kernels/cuda/generated");
+    let cli_args = std::env::args().collect::<Vec<_>>();
+    let witness_only = cli_args.iter().any(|arg| arg == "--witness-only");
+    if witness_only {
+        if let Some(option) = witness_only_incompatibility(&cli_args) {
+            eprintln!("kernel_emit: --witness-only is incompatible with {option}");
+            return ExitCode::FAILURE;
+        }
+    } else if cli_args.iter().any(|arg| arg == "--output-dir") {
+        eprintln!("kernel_emit: --output-dir requires --witness-only");
+        return ExitCode::FAILURE;
+    }
+    let out_dir = if witness_only {
+        let output_dirs = args("--output-dir");
+        if output_dirs.len() != 1 || output_dirs[0].starts_with("--") {
+            eprintln!("kernel_emit: --witness-only requires exactly one --output-dir <path>");
+            return ExitCode::FAILURE;
+        }
+        let out_dir = PathBuf::from(&output_dirs[0]);
+        if let Err(error) = admit_witness_output_dir(&out_dir) {
+            eprintln!("kernel_emit: refusing witness output: {error}");
+            return ExitCode::FAILURE;
+        }
+        out_dir
+    } else {
+        let stwo_root = PathBuf::from(
+            arg("--stwo-root")
+                .or_else(|| std::env::var("STWO_ROOT").ok())
+                .unwrap_or_else(|| "../stwo".to_string()),
+        );
+        stwo_root.join("crates/backend-cuda-kernels/cuda/generated")
+    };
     let check = std::env::args().any(|a| a == "--check");
     let max_instrs = arg("--max-instrs")
         .map(|v| v.parse::<usize>().expect("--max-instrs <N>"))
@@ -278,73 +367,75 @@ fn main() -> ExitCode {
         });
     }
 
-    // Constraint kernels: fixture matrix for union coverage.
     let mut covered: BTreeMap<String, bool> = BTreeMap::new();
-    run_fixture(
-        "test_prove_verify_all_opcode_components",
-        PreProcessedTraceVariant::Canonical,
-        &mut out,
-        &mut covered,
-        max_instrs,
-    );
-    run_fixture(
-        "test_prove_verify_all_builtins",
-        PreProcessedTraceVariant::Canonical,
-        &mut out,
-        &mut covered,
-        max_instrs,
-    );
-    run_fixture(
-        "test_prove_verify_pedersen_builtin",
-        PreProcessedTraceVariant::CanonicalSmall,
-        &mut out,
-        &mut covered,
-        max_instrs,
-    );
-    // The strict resident parity gate proves this exact fixture x variant
-    // combination; its small shapes produce constraint variants the SN-scale
-    // fixtures above do not (observed as a strict AOT rejection on H100).
-    run_fixture(
-        "test_prove_verify_poseidon_builtin",
-        PreProcessedTraceVariant::CanonicalWithoutPedersen,
-        &mut out,
-        &mut covered,
-        max_instrs,
-    );
-    // The staged Step-1.2 gate fixture (SN2 component profile under the
-    // Canonical variant the SN PIE lane uses).
-    run_fixture(
-        "test_prove_verify_sn2_profile",
-        PreProcessedTraceVariant::Canonical,
-        &mut out,
-        &mut covered,
-        max_instrs,
-    );
-    for input_path in args("--input-bincode") {
-        eprintln!("kernel_emit: adapted input {input_path} (Canonical)");
-        let bytes = std::fs::read(&input_path)
-            .unwrap_or_else(|error| panic!("read adapted input {input_path}: {error}"));
-        let input = bincode::deserialize(&bytes)
-            .unwrap_or_else(|error| panic!("decode adapted input {input_path}: {error}"));
-        run_input(
-            input,
+    if !witness_only {
+        // Constraint kernels: fixture matrix for union coverage.
+        run_fixture(
+            "test_prove_verify_all_opcode_components",
             PreProcessedTraceVariant::Canonical,
             &mut out,
             &mut covered,
             max_instrs,
         );
-    }
-    let missing: Vec<&String> = covered
-        .iter()
-        .filter(|(_, &c)| !c)
-        .map(|(k, _)| k)
-        .collect();
-    if !missing.is_empty() {
-        eprintln!(
-            "kernel_emit: components NOT covered by any fixture (extend the matrix): \
-             {missing:?}"
+        run_fixture(
+            "test_prove_verify_all_builtins",
+            PreProcessedTraceVariant::Canonical,
+            &mut out,
+            &mut covered,
+            max_instrs,
         );
-        return ExitCode::FAILURE;
+        run_fixture(
+            "test_prove_verify_pedersen_builtin",
+            PreProcessedTraceVariant::CanonicalSmall,
+            &mut out,
+            &mut covered,
+            max_instrs,
+        );
+        // The strict resident parity gate proves this exact fixture x variant
+        // combination; its small shapes produce constraint variants the SN-scale
+        // fixtures above do not (observed as a strict AOT rejection on H100).
+        run_fixture(
+            "test_prove_verify_poseidon_builtin",
+            PreProcessedTraceVariant::CanonicalWithoutPedersen,
+            &mut out,
+            &mut covered,
+            max_instrs,
+        );
+        // The staged Step-1.2 gate fixture (SN2 component profile under the
+        // Canonical variant the SN PIE lane uses).
+        run_fixture(
+            "test_prove_verify_sn2_profile",
+            PreProcessedTraceVariant::Canonical,
+            &mut out,
+            &mut covered,
+            max_instrs,
+        );
+        for input_path in args("--input-bincode") {
+            eprintln!("kernel_emit: adapted input {input_path} (Canonical)");
+            let bytes = std::fs::read(&input_path)
+                .unwrap_or_else(|error| panic!("read adapted input {input_path}: {error}"));
+            let input = bincode::deserialize(&bytes)
+                .unwrap_or_else(|error| panic!("decode adapted input {input_path}: {error}"));
+            run_input(
+                input,
+                PreProcessedTraceVariant::Canonical,
+                &mut out,
+                &mut covered,
+                max_instrs,
+            );
+        }
+        let missing: Vec<&String> = covered
+            .iter()
+            .filter(|(_, &c)| !c)
+            .map(|(k, _)| k)
+            .collect();
+        if !missing.is_empty() {
+            eprintln!(
+                "kernel_emit: components NOT covered by any fixture (extend the matrix): \
+                 {missing:?}"
+            );
+            return ExitCode::FAILURE;
+        }
     }
 
     // Dedup by cache key (split parts share keys across statements/components
@@ -378,10 +469,14 @@ fn main() -> ExitCode {
         "aot_manifest.json".to_string(),
         serde_json::to_string_pretty(&manifest).unwrap() + "\n",
     );
-    files.insert(
-        "aot_constraint_max_instrs.txt".to_string(),
-        format!("{max_instrs}\n"),
-    );
+    if !witness_only {
+        files.insert(
+            "aot_constraint_max_instrs.txt".to_string(),
+            format!("{max_instrs}\n"),
+        );
+    }
+
+    let (kernel_count, metadata_count) = generated_file_counts(&files);
 
     if check {
         let mut drift = 0;
@@ -404,8 +499,7 @@ fn main() -> ExitCode {
         }
         if drift == 0 {
             println!(
-                "kernel_emit --check: OK ({} kernels)",
-                files.keys().filter(|file| file.ends_with(".cu")).count()
+                "kernel_emit --check: OK ({kernel_count} kernels + {metadata_count} metadata)"
             );
             ExitCode::SUCCESS
         } else {
@@ -433,8 +527,7 @@ fn main() -> ExitCode {
         }
         println!(
             "kernel_emit: {written} written, {unchanged} unchanged generated files \
-             ({} kernels + metadata) in {}",
-            files.len() - 1,
+             ({kernel_count} kernels + {metadata_count} metadata) in {}",
             out_dir.display()
         );
         ExitCode::SUCCESS
@@ -443,7 +536,59 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::write_if_changed;
+    use std::collections::BTreeMap;
+
+    use super::{
+        admit_witness_output_dir, generated_file_counts, witness_only_incompatibility,
+        write_if_changed,
+    };
+
+    #[test]
+    fn witness_only_rejects_constraint_and_shape_inputs() {
+        for option in [
+            "--input-bincode",
+            "--shape-report-bincode",
+            "--max-instrs",
+            "--max-live-u32-lanes",
+            "--stwo-root",
+        ] {
+            let args = vec!["kernel_emit".to_string(), option.to_string()];
+            assert_eq!(witness_only_incompatibility(&args), Some(option));
+        }
+        let compatible =
+            ["kernel_emit", "--witness-only", "--check", "--output-dir"].map(str::to_string);
+        assert_eq!(witness_only_incompatibility(&compatible), None);
+    }
+
+    #[test]
+    fn witness_output_rejects_a_production_constraint_manifest() {
+        let path = std::env::temp_dir().join(format!(
+            "stwo-kernel-emit-witness-admission-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(
+            path.join("aot_manifest.json"),
+            r#"[{"kind":"constraint","file":"constraint_x.cu"}]"#,
+        )
+        .unwrap();
+        std::fs::write(path.join("constraint_x.cu"), "source").unwrap();
+        let error = admit_witness_output_dir(&path).unwrap_err();
+        assert!(error.contains("not a witness-only manifest"));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn generated_file_counts_distinguish_kernels_from_metadata() {
+        let files = BTreeMap::from([
+            ("a.cu".to_string(), String::new()),
+            ("b.cu".to_string(), String::new()),
+            ("aot_manifest.json".to_string(), String::new()),
+            ("policy.txt".to_string(), String::new()),
+        ]);
+        assert_eq!(generated_file_counts(&files), (2, 2));
+    }
 
     #[test]
     fn write_if_changed_skips_identical_bytes() {
