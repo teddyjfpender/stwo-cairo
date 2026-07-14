@@ -322,7 +322,7 @@ import json, os, re, sys
 decoder = json.JSONDecoder()
 records = []
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
-    marker = line.find('{"schema":"stwo.sn3_quotient_numerator_hybrid.host_wall.v4"')
+    marker = line.find('{"schema":"stwo.sn3_quotient_numerator_hybrid.host_wall.v5"')
     if marker >= 0:
         records.append(decoder.raw_decode(line[marker:])[0])
 if len(records) != 1:
@@ -331,8 +331,20 @@ r = records[0]
 top = r["topology"]
 if (top["groups"], top["eligible_groups"], top["legacy_groups"], top["terms"]) != (19, 18, 1, 6341):
     raise SystemExit("exact SN3 numerator topology drifted")
-if r["bytes"]["shared_arena"] != 41821220224 or r["bytes"]["validated_canonical_output"] != 402645136:
+byte_geometry = r["bytes"]
+if (byte_geometry["shared_data_dual_workspace_arena"] != 41889121376
+        or byte_geometry["workspace_span_each"] != 67901168
+        or byte_geometry["second_workspace_arena_delta"] != 67901152
+        or byte_geometry["validated_canonical_output"] != 402645136):
     raise SystemExit("exact SN3 numerator byte geometry drifted")
+memory = r["device_memory"]
+arena_bytes = byte_geometry["shared_data_dual_workspace_arena"]
+if (memory["total"] < arena_bytes
+        or memory["free_before_arena"] < arena_bytes
+        or memory["free_after_arena"] >= memory["free_before_arena"]
+        or memory["isolated_pool_used_after_arena"] < arena_bytes
+        or memory["isolated_pool_reserved_after_arena"] < memory["isolated_pool_used_after_arena"]):
+    raise SystemExit("exact SN3 numerator device-memory accounting is invalid")
 identity = r["identity"]
 if identity["topology_fixture_blake3"] != "ea31e3ff054c8d12d32d5b84a3d712987b31bb1fd3fb044fb27758453b49fbda":
     raise SystemExit("exact SN3 topology fixture identity drifted")
