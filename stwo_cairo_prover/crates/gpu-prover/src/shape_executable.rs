@@ -115,7 +115,7 @@ impl TopologyKey {
 
     fn compute_digest(&self) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
-        hash.update(b"stwo-cairo-shape-executable-v3\0");
+        hash.update(b"stwo-cairo-shape-executable-v5\0");
         feed_u64(&mut hash, self.relation_graph_hash);
         for component in self.shape.components() {
             feed_bytes(&mut hash, component.id.as_bytes());
@@ -214,6 +214,14 @@ impl TopologyKey {
         hash.update(&[self.policy.commit_mode as u8]);
         hash.update(&[self.policy.direct_composition_retention_mode as u8]);
         hash.update(&[self.policy.quotient_numerator_source_policy as u8]);
+        hash.update(&[self.policy.interpolation_mode as u8]);
+        hash.update(&[u8::from(self.policy.blake2s_interior_fused)]);
+        hash.update(&[self.policy.composition_launch_mode as u8]);
+        hash.update(&[self.policy.relation_tail_mode as u8]);
+        hash.update(&[self.policy.fri_fold_launch_mode as u8]);
+        hash.update(&[self.policy.witness_feed_launch_mode as u8]);
+        hash.update(&[self.policy.resident_backend as u8]);
+        hash.update(&[self.policy.quotient_numerator_schedule as u8]);
         *hash.finalize().as_bytes()
     }
 }
@@ -394,6 +402,10 @@ impl ShapeExecutable {
 
     pub(crate) fn composition(&self) -> &CompositionPlan {
         &self.composition
+    }
+
+    pub(crate) fn protocol_policy(&self) -> ProtocolPlanPolicy {
+        self.admission.topology.policy
     }
 
     fn composition_bindings(&self) -> &CompositionBindingPlan {

@@ -450,13 +450,26 @@ fn last_gpu_native_session_telemetry() -> Option<ResidentSessionTelemetry> {
 
 fn validate_resident_session_architecture(
     required_mode: RequiredCudaPcsRuntimeMode,
+    requested_backend: ResidentBackend,
     telemetry: Option<&ResidentSessionTelemetry>,
 ) -> Result<(), String> {
     if required_mode == RequiredCudaPcsRuntimeMode::DetachedEager {
         return Ok(());
     }
+    let telemetry =
+        telemetry.ok_or_else(|| "resident Graph-A setup telemetry is missing".to_string())?;
+    let actual_backend = telemetry
+        .protocol_policy
+        .ok_or_else(|| "resident protocol policy telemetry is missing".to_string())?
+        .resident_backend;
+    if actual_backend != requested_backend {
+        return Err(format!(
+            "requested resident backend {} but prepared {}",
+            requested_backend.cli_name(),
+            actual_backend.cli_name()
+        ));
+    }
     telemetry
-        .ok_or_else(|| "resident Graph-A setup telemetry is missing".to_string())?
         .require_strict_graph_a()
         .map_err(|error| error.to_string())
 }
@@ -1059,8 +1072,12 @@ fn record_context(backend: &str) -> serde_json::Value {
             .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
         validate_strict_aot_provenance(aot_stats.as_ref())
             .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
-        validate_resident_session_architecture(required_mode, session_telemetry.as_ref())
-            .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
+        validate_resident_session_architecture(
+            required_mode,
+            requested_resident_backend(),
+            session_telemetry.as_ref(),
+        )
+        .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
     }
     let base = json!({
         "security_bits": pcs.security_bits(),
@@ -2681,15 +2698,36 @@ mod tests {
     #[test]
     fn resident_session_gate_is_scoped_to_arena_graph_mode() {
         assert_eq!(
-            validate_resident_session_architecture(RequiredCudaPcsRuntimeMode::DetachedEager, None,),
+            validate_resident_session_architecture(
+                RequiredCudaPcsRuntimeMode::DetachedEager,
+                ResidentBackend::LegacyResident,
+                None,
+            ),
             Ok(())
         );
         assert!(validate_resident_session_architecture(
             RequiredCudaPcsRuntimeMode::ArenaGraph,
+            ResidentBackend::LegacyResident,
             None,
         )
         .unwrap_err()
         .contains("Graph-A setup telemetry is missing"));
+
+        let telemetry = ResidentSessionTelemetry {
+            protocol_policy: Some(
+                stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy::replacement_v1(
+                    0x1234, 2048,
+                ),
+            ),
+            ..ResidentSessionTelemetry::default()
+        };
+        assert!(validate_resident_session_architecture(
+            RequiredCudaPcsRuntimeMode::ArenaGraph,
+            ResidentBackend::LegacyResident,
+            Some(&telemetry),
+        )
+        .unwrap_err()
+        .contains("requested resident backend legacy-resident but prepared replacement-v1"));
     }
 
     #[test]

@@ -19,37 +19,39 @@ use stwo_backend_cuda::{
     decommit_workspace_requirements, ec_op_workspace_requirements,
     execution_tables_workspace_requirements, fri_final_workspace_requirements,
     fri_workspace_requirements, oods_workspace_requirements,
-    progressive_commit_workspace_requirements_for_mode, quotient_numerator_workspace_requirements,
-    quotient_workspace_requirements, witness_input_compact_requirements,
-    witness_input_gather_requirements, witness_workspace_requirements, ArenaError, ArenaLayout,
-    ArenaSlotId, ArenaSlotSpec, Blake2sFriAssemblyShape, Blake2sPowWorkspaceRequirements,
-    Blake2sPowWorkspaceSlots, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,
-    Blake2sTranscriptRequirements, Blake2sTranscriptWorkspaceSlots, CommitBatchRequirements,
-    CommitBatchSlots, CommitGroupSlots, CommitWorkspaceConfig, CommitWorkspaceSlots,
-    CudaExecContext, DecommitColumnGeometry, DecommitSourceMode, DecommitTreeGeometry,
-    DecommitTreeRequirements, DecommitTreeSlots, DecommitWorkspaceConfig,
-    DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena, DeviceTranscriptError,
-    EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
+    progressive_commit_workspace_requirements_for_mode, quotient_numerator_hybrid_plan,
+    quotient_numerator_workspace_requirements, quotient_workspace_requirements,
+    witness_input_compact_requirements, witness_input_gather_requirements,
+    witness_workspace_requirements, ArenaError, ArenaLayout, ArenaSlotId, ArenaSlotSpec,
+    Blake2sFriAssemblyShape, Blake2sPowWorkspaceRequirements, Blake2sPowWorkspaceSlots,
+    Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape, Blake2sTranscriptRequirements,
+    Blake2sTranscriptWorkspaceSlots, CommitBatchRequirements, CommitBatchSlots, CommitGroupSlots,
+    CommitWorkspaceConfig, CommitWorkspaceSlots, CudaExecContext, DecommitColumnGeometry,
+    DecommitSourceMode, DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots,
+    DecommitWorkspaceConfig, DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena,
+    DeviceTranscriptError, EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
     ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
     FixedTableContiguousWorkspaceSlots, FriDecommitGeometry, FriDecommitSlots,
-    FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriMerkleTreeSlots, FriWorkspaceConfig,
-    FriWorkspaceRequirements, FriWorkspaceSlots, InterpolationLaunchMode, MerkleFromLeavesSlots,
-    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, OodsColumnTopology,
-    OodsWorkspaceConfig, OodsWorkspaceRequirements, OodsWorkspaceSlots, PreparedBlake2sPowError,
-    PreparedCommitError, PreparedDecommitError, PreparedExecutionTablesError,
-    PreparedFixedTableError, PreparedFriError, PreparedFriFinalError, PreparedOodsError,
-    PreparedProgressiveCommitError, PreparedQuotientError, PreparedQuotientNumeratorError,
-    PreparedWitnessError, PreparedWitnessFeedError, PreparedWitnessInputGatherError,
-    ProgressiveBatchRequirements, ProgressiveBatchSlots, ProgressiveCommitGeometry,
-    ProgressiveCommitGroupGeometry, ProgressiveCommitMode, ProgressiveCommitWorkspaceSlots,
-    ProgressiveLeafWorkspaceSlots, QuotientNumeratorColumnTopology, QuotientNumeratorSourceKind,
-    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
-    QuotientNumeratorWorkspaceSlots, QuotientOodsSample, QuotientWorkspaceConfig,
-    QuotientWorkspaceRequirements, QuotientWorkspaceSlots, RelationGraphError,
-    RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots, RelationLaunchMode,
-    TraceDecommitGeometry, TraceDecommitSlots, TraceSourceGroupGeometry, TraceSourceGroupSlots,
-    TraceTreeRole, TranscriptInputId, TranscriptOutputId, WitnessFeedClearWorkspaceRequirements,
-    WitnessFeedClearWorkspaceSlots, WitnessFeedWorkspaceSlots, WitnessInputCompactLayout,
+    FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriFoldLaunchMode, FriMerkleTreeSlots,
+    FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots, InterpolationLaunchMode,
+    MerkleFromLeavesSlots, ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
+    OodsColumnTopology, OodsWorkspaceConfig, OodsWorkspaceRequirements, OodsWorkspaceSlots,
+    PreparedBlake2sPowError, PreparedCommitError, PreparedDecommitError,
+    PreparedExecutionTablesError, PreparedFixedTableError, PreparedFriError, PreparedFriFinalError,
+    PreparedOodsError, PreparedProgressiveCommitError, PreparedQuotientError,
+    PreparedQuotientNumeratorError, PreparedWitnessError, PreparedWitnessFeedError,
+    PreparedWitnessInputGatherError, ProgressiveBatchRequirements, ProgressiveBatchSlots,
+    ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry, ProgressiveCommitMode,
+    ProgressiveCommitWorkspaceSlots, ProgressiveLeafWorkspaceSlots,
+    QuotientNumeratorColumnTopology, QuotientNumeratorSingleWriteError,
+    QuotientNumeratorSourceKind, QuotientNumeratorWorkspaceConfig,
+    QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
+    QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
+    RelationGraphError, RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots,
+    RelationLaunchMode, RelationTailMode, TraceDecommitGeometry, TraceDecommitSlots,
+    TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRole, TranscriptInputId,
+    TranscriptOutputId, WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots,
+    WitnessFeedLaunchMode, WitnessFeedWorkspaceSlots, WitnessInputCompactLayout,
     WitnessInputCompactRequirements, WitnessInputCompactSlots, WitnessInputGatherEdge,
     WitnessInputGatherRequirements, WitnessInputGatherSlots, WitnessInputSeedRequirements,
     WitnessInputSeedSlots, WitnessWorkspaceRequirements, WitnessWorkspaceSlots,
@@ -75,8 +77,8 @@ use crate::multiplicity_pipeline::{
 };
 use crate::plan::ProofPlan;
 use crate::prepared_composition::{
-    composition_workspace_requirements_with_retention, default_composition_launch_mode,
-    CompositionCoefficientSource, CompositionExtParamBinding, CompositionTraceTopology,
+    composition_workspace_requirements_with_retention, CompositionCoefficientSource,
+    CompositionExtParamBinding, CompositionLaunchMode, CompositionTraceTopology,
     CompositionWorkspaceRequirements, CompositionWorkspaceSlots, PreparedCompositionError,
 };
 use crate::proof_bundle::{ResidentProofBundleError, ResidentProofBundleLayout};
@@ -597,6 +599,34 @@ pub enum DecommitStrategy {
     HybridByGroup = 2,
 }
 
+/// Resident implementation generation selected before topology planning.
+/// Different generations never share a workspace or captured graph identity.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum ResidentBackend {
+    #[default]
+    LegacyResident = 0,
+    ReplacementV1 = 1,
+}
+
+impl ResidentBackend {
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::LegacyResident => "legacy-resident",
+            Self::ReplacementV1 => "replacement-v1",
+        }
+    }
+}
+
+/// Quotient-numerator launch topology sealed into the graph key.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum QuotientNumeratorSchedule {
+    #[default]
+    LegacyBatches = 0,
+    HybridSingleWrite = 1,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum QuotientNumeratorSourcePolicy {
@@ -638,6 +668,13 @@ pub struct ProtocolIdentity {
     pub kernel_manifest_hash: u64,
     pub decommit_strategy: DecommitStrategy,
     pub interpolation_mode: InterpolationLaunchMode,
+    pub blake2s_interior_fused: bool,
+    pub composition_launch_mode: CompositionLaunchMode,
+    pub relation_tail_mode: RelationTailMode,
+    pub fri_fold_launch_mode: FriFoldLaunchMode,
+    pub witness_feed_launch_mode: WitnessFeedLaunchMode,
+    pub resident_backend: ResidentBackend,
+    pub quotient_numerator_schedule: QuotientNumeratorSchedule,
     pub quotient_numerator_source_policy: QuotientNumeratorSourcePolicy,
     pub commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
     pub direct_composition_retention_mode: DirectCompositionRetentionMode,
@@ -658,6 +695,14 @@ impl ProtocolIdentity {
         composition_plan_hash: u64,
         kernel_manifest_hash: u64,
         decommit_strategy: DecommitStrategy,
+        interpolation_mode: InterpolationLaunchMode,
+        blake2s_interior_fused: bool,
+        composition_launch_mode: CompositionLaunchMode,
+        relation_tail_mode: RelationTailMode,
+        fri_fold_launch_mode: FriFoldLaunchMode,
+        witness_feed_launch_mode: WitnessFeedLaunchMode,
+        resident_backend: ResidentBackend,
+        quotient_numerator_schedule: QuotientNumeratorSchedule,
         commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
         direct_composition_retention_mode: DirectCompositionRetentionMode,
         direct_composition_planner_key: u64,
@@ -679,7 +724,14 @@ impl ProtocolIdentity {
             composition_plan_hash,
             kernel_manifest_hash,
             decommit_strategy,
-            interpolation_mode: InterpolationLaunchMode::from_env(),
+            interpolation_mode,
+            blake2s_interior_fused,
+            composition_launch_mode,
+            relation_tail_mode,
+            fri_fold_launch_mode,
+            witness_feed_launch_mode,
+            resident_backend,
+            quotient_numerator_schedule,
             quotient_numerator_source_policy,
             commit_mode,
             direct_composition_retention_mode,
@@ -1403,6 +1455,19 @@ impl ProtocolGeometry {
             &numerator_topologies,
         )
         .map_err(ArenaPlanError::QuotientNumerator)?;
+        if self.identity.quotient_numerator_schedule == QuotientNumeratorSchedule::HybridSingleWrite
+        {
+            let hybrid = quotient_numerator_hybrid_plan(
+                self.quotient_numerator_workspace_config()?,
+                &numerator_topologies,
+            )
+            .map_err(ArenaPlanError::QuotientNumeratorSchedule)?;
+            if hybrid.requirements() != &numerator_requirements {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "hybrid numerator requirements drifted from the canonical workspace",
+                ));
+            }
+        }
         let numerator_logs = numerator_requirements
             .groups
             .iter()
@@ -1835,7 +1900,7 @@ impl ProtocolGeometry {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
         };
-        feed(b"stwo-cairo-protocol-geometry-v11\0");
+        feed(b"stwo-cairo-protocol-geometry-v13\0");
         feed(&self.identity.pow_bits.to_le_bytes());
         feed(&self.identity.log_blowup_factor.to_le_bytes());
         feed(&self.identity.log_last_layer_degree_bound.to_le_bytes());
@@ -1847,6 +1912,13 @@ impl ProtocolGeometry {
         feed(&self.identity.composition_plan_hash.to_le_bytes());
         feed(&self.identity.kernel_manifest_hash.to_le_bytes());
         feed(&[self.identity.interpolation_mode as u8]);
+        feed(&[u8::from(self.identity.blake2s_interior_fused)]);
+        feed(&[self.identity.composition_launch_mode as u8]);
+        feed(&[self.identity.relation_tail_mode as u8]);
+        feed(&[self.identity.fri_fold_launch_mode as u8]);
+        feed(&[self.identity.witness_feed_launch_mode as u8]);
+        feed(&[self.identity.resident_backend as u8]);
+        feed(&[self.identity.quotient_numerator_schedule as u8]);
         feed(&[self.identity.quotient_numerator_source_policy as u8]);
         feed(&[self.identity.commit_mode as u8]);
         feed(&[self.identity.direct_composition_retention_mode as u8]);
@@ -2192,6 +2264,7 @@ struct LogicalQuotientNumeratorColumn {
 
 #[derive(Clone, Debug)]
 struct LogicalQuotientNumeratorWorkspace {
+    schedule: QuotientNumeratorSchedule,
     config: QuotientNumeratorWorkspaceConfig,
     requirements: QuotientNumeratorWorkspaceRequirements,
     columns: Vec<LogicalQuotientNumeratorColumn>,
@@ -2928,6 +3001,7 @@ pub struct PlannedQuotientNumeratorColumn {
 
 #[derive(Clone, Debug)]
 pub struct PlannedQuotientNumeratorWorkspace {
+    pub schedule: QuotientNumeratorSchedule,
     pub config: QuotientNumeratorWorkspaceConfig,
     pub requirements: QuotientNumeratorWorkspaceRequirements,
     pub columns: Vec<PlannedQuotientNumeratorColumn>,
@@ -3054,6 +3128,7 @@ pub struct PlannedRelationWorkspace {
 pub struct ProofArenaPlan {
     pub shape_key: stwo_cairo_prover::witness::proof_shape::ProofShapeKey,
     pub protocol_key: u64,
+    protocol_identity: ProtocolIdentity,
     logical: Vec<LogicalBuffer>,
     bindings: Vec<ArenaBinding>,
     layout: ArenaLayout,
@@ -3452,6 +3527,7 @@ impl ProofArenaPlan {
         Ok(Self {
             shape_key: plan.shape_key,
             protocol_key,
+            protocol_identity: protocol.identity,
             logical,
             bindings,
             layout,
@@ -3482,6 +3558,10 @@ impl ProofArenaPlan {
 
     pub fn layout(&self) -> &ArenaLayout {
         &self.layout
+    }
+
+    pub const fn protocol_identity(&self) -> ProtocolIdentity {
+        self.protocol_identity
     }
 
     pub fn logical_buffers(&self) -> &[LogicalBuffer] {
@@ -3779,6 +3859,7 @@ pub enum ArenaPlanError {
     Composition(PreparedCompositionError),
     Oods(PreparedOodsError),
     QuotientNumerator(PreparedQuotientNumeratorError),
+    QuotientNumeratorSchedule(QuotientNumeratorSingleWriteError),
     Quotient(PreparedQuotientError),
     Fri(PreparedFriError),
     FriFinal(PreparedFriFinalError),
@@ -6165,7 +6246,7 @@ fn append_protocol_buffers(
     let composition_requirements = composition_workspace_requirements_with_retention(
         composition,
         &composition_trace_shape,
-        default_composition_launch_mode(),
+        protocol.identity.composition_launch_mode,
         protocol.direct_composition_retention.as_ref(),
     )
     .map_err(ArenaPlanError::Composition)?;
@@ -7510,6 +7591,7 @@ fn append_protocol_buffers(
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
     let logical_quotient_numerator = LogicalQuotientNumeratorWorkspace {
+        schedule: protocol.identity.quotient_numerator_schedule,
         config: quotient_numerator_config,
         requirements: quotient_numerator_requirements,
         columns: numerator_columns,
@@ -8148,7 +8230,7 @@ fn resolve_composition_slots(
     let rebound_requirements = composition_workspace_requirements_with_retention(
         &logical.plan,
         &trace_topology,
-        default_composition_launch_mode(),
+        logical.requirements.mode,
         logical.direct_retention.as_ref(),
     )
     .map_err(ArenaPlanError::Composition)?;
@@ -8344,6 +8426,7 @@ fn resolve_quotient_numerator_slots(
         ));
     }
     Ok(PlannedQuotientNumeratorWorkspace {
+        schedule: logical.schedule,
         config: logical.config,
         requirements: logical.requirements,
         columns,
@@ -10155,6 +10238,13 @@ mod tests {
                 kernel_manifest_hash: 4,
                 decommit_strategy: DecommitStrategy::RecomputeQueriedLde,
                 interpolation_mode: InterpolationLaunchMode::StageWiseCopyThenInPlace,
+                blake2s_interior_fused: false,
+                composition_launch_mode: CompositionLaunchMode::Serial,
+                relation_tail_mode: RelationTailMode::Segmented,
+                fri_fold_launch_mode: FriFoldLaunchMode::PerFold,
+                witness_feed_launch_mode: WitnessFeedLaunchMode::GlobalAtomics,
+                resident_backend: ResidentBackend::LegacyResident,
+                quotient_numerator_schedule: QuotientNumeratorSchedule::LegacyBatches,
                 quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::CoefficientsOnly,
                 commit_mode: ProgressiveCommitMode::FullLifting,
                 direct_composition_retention_mode: DirectCompositionRetentionMode::Disabled,
@@ -10261,10 +10351,26 @@ mod tests {
             .partial_numerator_log_sizes
             .push(23);
         assert_ne!(protocol.key(), changed_quotient.key());
-        let mut fused_interpolation = protocol.clone();
-        fused_interpolation.identity.interpolation_mode =
-            InterpolationLaunchMode::StageFusedOutOfPlace;
-        assert_ne!(protocol.key(), fused_interpolation.key());
+        let identity_mutations: [fn(&mut ProtocolGeometry); 8] = [
+            |changed| {
+                changed.identity.interpolation_mode = InterpolationLaunchMode::StageFusedOutOfPlace
+            },
+            |changed| changed.identity.blake2s_interior_fused = true,
+            |changed| changed.identity.composition_launch_mode = CompositionLaunchMode::Wide,
+            |changed| changed.identity.relation_tail_mode = RelationTailMode::Scan,
+            |changed| changed.identity.fri_fold_launch_mode = FriFoldLaunchMode::FusedTriple,
+            |changed| changed.identity.witness_feed_launch_mode = WitnessFeedLaunchMode::Privatized,
+            |changed| changed.identity.resident_backend = ResidentBackend::ReplacementV1,
+            |changed| {
+                changed.identity.quotient_numerator_schedule =
+                    QuotientNumeratorSchedule::HybridSingleWrite
+            },
+        ];
+        for mutate in identity_mutations {
+            let mut changed = protocol.clone();
+            mutate(&mut changed);
+            assert_ne!(protocol.key(), changed.key());
+        }
         let mut retained_numerator = protocol.clone();
         retained_numerator.identity.commit_mode = ProgressiveCommitMode::DomainProgressive;
         retained_numerator.identity.quotient_numerator_source_policy =

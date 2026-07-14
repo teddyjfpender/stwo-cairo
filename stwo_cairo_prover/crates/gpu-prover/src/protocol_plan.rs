@@ -8,7 +8,8 @@ use cairo_air::claims::CairoClaim;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo_backend_cuda::{
-    fri_workspace_requirements, CommitWorkspaceConfig, FriWorkspaceConfig, PreparedFriError,
+    fri_workspace_requirements, CommitWorkspaceConfig, FriFoldLaunchMode, FriWorkspaceConfig,
+    PreparedFriError, RelationTailMode, WitnessFeedLaunchMode,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
     PreProcessedTrace, PreProcessedTraceVariant,
@@ -18,7 +19,8 @@ use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId, TraceP
 use crate::arena_plan::{
     BufferPurpose, CommitmentColumnSource, CommitmentGeometry, CommitmentTreeId, DecommitStrategy,
     OodsColumnGeometry, OodsGeometry, OpenedColumnSource, ProofEpoch, ProtocolGeometry,
-    ProtocolIdentity, QuotientGeometry, QuotientNumeratorSourcePolicy, TranscriptGeometry,
+    ProtocolIdentity, QuotientGeometry, QuotientNumeratorSchedule, QuotientNumeratorSourcePolicy,
+    ResidentBackend, TranscriptGeometry,
 };
 use crate::composition_plan::CompositionPlan;
 use crate::direct_composition_retention::{
@@ -27,6 +29,7 @@ use crate::direct_composition_retention::{
     DirectCompositionRetentionMode, DirectCompositionRetentionPlan,
 };
 use crate::plan::ProofPlan;
+use crate::prepared_composition::{default_composition_launch_mode, CompositionLaunchMode};
 use crate::protocol_discovery::ProtocolTranscriptDiscovery;
 use crate::relation::RelationTracePart;
 use crate::relation_execution::{RelationExecutionError, RelationExecutionPlan};
@@ -44,6 +47,8 @@ pub const BLAKE2S_MERKLE_CHANNEL_TAG: u64 = 0x424c_414b_4532_5331;
 /// Runtime choices that affect graph topology or opening residency.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolPlanPolicy {
+    pub resident_backend: ResidentBackend,
+    pub quotient_numerator_schedule: QuotientNumeratorSchedule,
     pub channel_tag: u64,
     /// Hash of the AOT manifest actually loaded by the runtime.  Zero is never
     /// accepted: graph reuse without a bound kernel library is unsafe.
@@ -57,6 +62,12 @@ pub struct ProtocolPlanPolicy {
     pub commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
     pub direct_composition_retention_mode: DirectCompositionRetentionMode,
     pub quotient_numerator_source_policy: QuotientNumeratorSourcePolicy,
+    pub interpolation_mode: stwo_backend_cuda::InterpolationLaunchMode,
+    pub blake2s_interior_fused: bool,
+    pub composition_launch_mode: CompositionLaunchMode,
+    pub relation_tail_mode: RelationTailMode,
+    pub fri_fold_launch_mode: FriFoldLaunchMode,
+    pub witness_feed_launch_mode: WitnessFeedLaunchMode,
 }
 
 impl ProtocolPlanPolicy {
@@ -65,6 +76,8 @@ impl ProtocolPlanPolicy {
         composition_max_kernel_instrs: usize,
     ) -> Self {
         Self {
+            resident_backend: ResidentBackend::LegacyResident,
+            quotient_numerator_schedule: QuotientNumeratorSchedule::LegacyBatches,
             channel_tag: BLAKE2S_MERKLE_CHANNEL_TAG,
             kernel_manifest_hash,
             composition_max_kernel_instrs,
@@ -75,12 +88,46 @@ impl ProtocolPlanPolicy {
             commit_mode: stwo_backend_cuda::ProgressiveCommitMode::FullLifting,
             direct_composition_retention_mode: DirectCompositionRetentionMode::Disabled,
             quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::CoefficientsOnly,
+            interpolation_mode:
+                stwo_backend_cuda::InterpolationLaunchMode::StageWiseCopyThenInPlace,
+            blake2s_interior_fused: false,
+            composition_launch_mode: CompositionLaunchMode::Serial,
+            relation_tail_mode: RelationTailMode::Segmented,
+            fri_fold_launch_mode: FriFoldLaunchMode::PerFold,
+            witness_feed_launch_mode: WitnessFeedLaunchMode::GlobalAtomics,
         }
+    }
+
+    /// Immutable first replacement generation. These values are one qualified
+    /// topology contract, not independently combinable tuning flags.
+    pub const fn replacement_v1(
+        kernel_manifest_hash: u64,
+        composition_max_kernel_instrs: usize,
+    ) -> Self {
+        let mut policy =
+            Self::starknet_blake2s(kernel_manifest_hash, composition_max_kernel_instrs);
+        policy.resident_backend = ResidentBackend::ReplacementV1;
+        policy.quotient_numerator_schedule = QuotientNumeratorSchedule::HybridSingleWrite;
+        policy.retained_lde_budget_bytes = 64 * 1024 * 1024 * 1024;
+        policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive;
+        policy.direct_composition_retention_mode = DirectCompositionRetentionMode::ExactNative;
+        policy.quotient_numerator_source_policy =
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations;
+        policy.interpolation_mode =
+            stwo_backend_cuda::InterpolationLaunchMode::StageFusedOutOfPlace;
+        policy
     }
 
     /// Bind the plan to the AOT pack embedded in the running binary. Stub builds
     /// and binaries with no generated pack are rejected before CUDA allocation.
     pub fn loaded_starknet_blake2s() -> Result<Self, ProtocolPlanError> {
+        Self::loaded_starknet_blake2s_for(ResidentBackend::LegacyResident)
+    }
+
+    /// Bind one explicit resident generation to the loaded AOT pack.
+    pub fn loaded_starknet_blake2s_for(
+        backend: ResidentBackend,
+    ) -> Result<Self, ProtocolPlanError> {
         let hash = stwo_backend_cuda::aot::loaded_manifest_hash();
         let composition_max_kernel_instrs = stwo_backend_cuda::aot::loaded_constraint_max_instrs();
         if hash == 0 {
@@ -89,7 +136,14 @@ impl ProtocolPlanPolicy {
         if composition_max_kernel_instrs == 0 {
             return Err(ProtocolPlanError::UnboundCompositionKernelCap);
         }
-        Self::starknet_blake2s_from_env(hash, composition_max_kernel_instrs)
+        match backend {
+            ResidentBackend::LegacyResident => {
+                Self::starknet_blake2s_from_env(hash, composition_max_kernel_instrs)
+            }
+            ResidentBackend::ReplacementV1 => {
+                Ok(Self::replacement_v1(hash, composition_max_kernel_instrs))
+            }
+        }
     }
 
     /// Apply runtime topology/residency policy to a caller-supplied manifest
@@ -105,6 +159,24 @@ impl ProtocolPlanPolicy {
         policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::from_env();
         policy.direct_composition_retention_mode = DirectCompositionRetentionMode::from_env();
         policy.quotient_numerator_source_policy = QuotientNumeratorSourcePolicy::from_env();
+        policy.interpolation_mode = stwo_backend_cuda::InterpolationLaunchMode::from_env();
+        policy.blake2s_interior_fused = crate::flags::flag_on("STWO_CUDA_BLAKE2S_INTERIOR_FUSED");
+        policy.composition_launch_mode = default_composition_launch_mode();
+        policy.relation_tail_mode = if crate::flags::flag_on("STWO_CUDA_RELATION_SCAN_TAIL") {
+            RelationTailMode::Scan
+        } else {
+            RelationTailMode::Segmented
+        };
+        policy.fri_fold_launch_mode = if crate::flags::flag_on("STWO_CUDA_FRI_FOLD_FUSED") {
+            FriFoldLaunchMode::FusedTriple
+        } else {
+            FriFoldLaunchMode::PerFold
+        };
+        policy.witness_feed_launch_mode = if crate::flags::flag_on("STWO_CUDA_FEED_PRIVATIZED") {
+            WitnessFeedLaunchMode::Privatized
+        } else {
+            WitnessFeedLaunchMode::GlobalAtomics
+        };
         if policy.direct_composition_retention_mode == DirectCompositionRetentionMode::ExactNative {
             if policy.commit_mode != stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive {
                 return Err(ProtocolPlanError::DirectRetentionRequiresProgressiveCommit);
@@ -131,6 +203,7 @@ pub enum ProtocolPlanError {
     UnboundKernelManifest,
     UnboundCompositionKernelCap,
     InvalidRetainedLdeBudget,
+    ResidentBackendPolicyMismatch,
     UnsupportedRetainAllLde,
     DirectRetentionRequiresProgressiveCommit,
     NumeratorRetentionRequiresProgressiveCommit,
@@ -661,6 +734,21 @@ fn plan_oods_geometry(
     })
 }
 
+fn resident_backend_contract_matches(policy: ProtocolPlanPolicy) -> bool {
+    match policy.resident_backend {
+        ResidentBackend::LegacyResident => {
+            policy.quotient_numerator_schedule == QuotientNumeratorSchedule::LegacyBatches
+        }
+        ResidentBackend::ReplacementV1 => {
+            policy
+                == ProtocolPlanPolicy::replacement_v1(
+                    policy.kernel_manifest_hash,
+                    policy.composition_max_kernel_instrs,
+                )
+        }
+    }
+}
+
 fn plan_protocol_from_logs(
     proof_plan: &ProofPlan,
     claim_log_sizes: &[Vec<u32>],
@@ -673,6 +761,9 @@ fn plan_protocol_from_logs(
     composition_plan_hash: u64,
     composition: Option<&CompositionPlan>,
 ) -> Result<ProtocolGeometry, ProtocolPlanError> {
+    if !resident_backend_contract_matches(policy) {
+        return Err(ProtocolPlanError::ResidentBackendPolicyMismatch);
+    }
     if policy.channel_tag == 0 {
         return Err(ProtocolPlanError::UnboundChannel);
     }
@@ -925,6 +1016,14 @@ fn plan_protocol_from_logs(
             composition_plan_hash,
             policy.kernel_manifest_hash,
             policy.decommit_strategy,
+            policy.interpolation_mode,
+            policy.blake2s_interior_fused,
+            policy.composition_launch_mode,
+            policy.relation_tail_mode,
+            policy.fri_fold_launch_mode,
+            policy.witness_feed_launch_mode,
+            policy.resident_backend,
+            policy.quotient_numerator_schedule,
             policy.commit_mode,
             policy.direct_composition_retention_mode,
             direct_composition_retention
@@ -1409,6 +1508,72 @@ mod tests {
             pow_bits: 26,
             fri_config: FriConfig::new(0, 1, 70, fold_step),
             lifting_log_size: None,
+        }
+    }
+
+    #[test]
+    fn replacement_v1_is_one_immutable_policy_tuple() {
+        let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
+        assert_eq!(policy.resident_backend, ResidentBackend::ReplacementV1);
+        assert_eq!(
+            policy.quotient_numerator_schedule,
+            QuotientNumeratorSchedule::HybridSingleWrite
+        );
+        assert_eq!(policy.retained_lde_budget_bytes, 64 * 1024 * 1024 * 1024);
+        assert_eq!(
+            policy.commit_mode,
+            stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive
+        );
+        assert_eq!(
+            policy.direct_composition_retention_mode,
+            DirectCompositionRetentionMode::ExactNative
+        );
+        assert_eq!(
+            policy.quotient_numerator_source_policy,
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations
+        );
+        assert_eq!(
+            policy.interpolation_mode,
+            stwo_backend_cuda::InterpolationLaunchMode::StageFusedOutOfPlace
+        );
+        assert!(!policy.blake2s_interior_fused);
+        assert_eq!(
+            policy.composition_launch_mode,
+            CompositionLaunchMode::Serial
+        );
+        assert_eq!(policy.relation_tail_mode, RelationTailMode::Segmented);
+        assert_eq!(policy.fri_fold_launch_mode, FriFoldLaunchMode::PerFold);
+        assert_eq!(
+            policy.witness_feed_launch_mode,
+            WitnessFeedLaunchMode::GlobalAtomics
+        );
+        assert!(resident_backend_contract_matches(policy));
+
+        let mutations: [fn(&mut ProtocolPlanPolicy); 11] = [
+            |policy| policy.retained_lde_budget_bytes -= 1,
+            |policy| policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::FullLifting,
+            |policy| {
+                policy.direct_composition_retention_mode = DirectCompositionRetentionMode::Disabled
+            },
+            |policy| {
+                policy.quotient_numerator_source_policy =
+                    QuotientNumeratorSourcePolicy::CoefficientsOnly
+            },
+            |policy| {
+                policy.interpolation_mode =
+                    stwo_backend_cuda::InterpolationLaunchMode::StageWiseCopyThenInPlace
+            },
+            |policy| policy.quotient_numerator_schedule = QuotientNumeratorSchedule::LegacyBatches,
+            |policy| policy.blake2s_interior_fused = true,
+            |policy| policy.composition_launch_mode = CompositionLaunchMode::Wide,
+            |policy| policy.relation_tail_mode = RelationTailMode::Scan,
+            |policy| policy.fri_fold_launch_mode = FriFoldLaunchMode::FusedTriple,
+            |policy| policy.witness_feed_launch_mode = WitnessFeedLaunchMode::Privatized,
+        ];
+        for mutate in mutations {
+            let mut drifted = policy;
+            mutate(&mut drifted);
+            assert!(!resident_backend_contract_matches(drifted));
         }
     }
 

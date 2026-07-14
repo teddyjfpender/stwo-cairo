@@ -59,6 +59,26 @@ pub const FLAGS: &[FlagDef] = &[
         deletion_milestone: "M6 (becomes the unconditional Graph C shape once the H100 A/B shows the width win)",
     },
     FlagDef {
+        name: "STWO_CUDA_BLAKE2S_INTERIOR_FUSED",
+        purpose: "legacy resident commitment: fuse eligible Blake2s interior Merkle levels",
+        deletion_milestone: "M6 (replacement generations select the launch topology explicitly)",
+    },
+    FlagDef {
+        name: "STWO_CUDA_RELATION_SCAN_TAIL",
+        purpose: "legacy resident relation: use the scan-based tail instead of segmented reduction",
+        deletion_milestone: "M6 (replacement generations select the launch topology explicitly)",
+    },
+    FlagDef {
+        name: "STWO_CUDA_FRI_FOLD_FUSED",
+        purpose: "legacy resident FRI: fuse a three-fold round where the shape permits it",
+        deletion_milestone: "M6 (replacement generations select the launch topology explicitly)",
+    },
+    FlagDef {
+        name: "STWO_CUDA_FEED_PRIVATIZED",
+        purpose: "legacy resident witness feeds: use privatized accumulation instead of global atomics",
+        deletion_milestone: "M6 (replacement generations select the launch topology explicitly)",
+    },
+    FlagDef {
         name: "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES",
         purpose: "resident hybrid opener: override the default 8 GiB retained-LDE budget in bytes",
         deletion_milestone: "never (hardware-capacity policy)",
@@ -180,6 +200,11 @@ mod tests {
             "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES",
             "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
             "STWO_CUDA_B2N_STAGE_FUSED",
+            "STWO_CUDA_BLAKE2S_INTERIOR_FUSED",
+            "STWO_CUDA_COMPOSITION_WIDE",
+            "STWO_CUDA_RELATION_SCAN_TAIL",
+            "STWO_CUDA_FRI_FOLD_FUSED",
+            "STWO_CUDA_FEED_PRIVATIZED",
         ] {
             assert!(FLAGS.iter().any(|flag| flag.name == name));
         }

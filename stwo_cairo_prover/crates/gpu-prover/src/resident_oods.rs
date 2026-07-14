@@ -6,13 +6,14 @@
 //! dependency order. No caller may recreate quotient constants on the host.
 
 use stwo_backend_cuda::{
-    ArenaError, ArenaSlice, OodsCoefficientColumn, PreparedOodsError, PreparedOodsGraph,
-    PreparedQuotientError, PreparedQuotientGraph, PreparedQuotientNumeratorError,
-    PreparedQuotientNumeratorGraph, QuotientNumeratorColumn, QuotientNumeratorColumnSource,
-    QuotientNumeratorDestination, QuotientNumeratorSourceKind,
+    ArenaError, ArenaSlice, OodsCoefficientColumn, PreparedNumeratorSchedule, PreparedOodsError,
+    PreparedOodsGraph, PreparedQuotientError, PreparedQuotientGraph,
+    PreparedQuotientNumeratorError, PreparedQuotientNumeratorGraph, QuotientNumeratorColumn,
+    QuotientNumeratorColumnSource, QuotientNumeratorDestination, QuotientNumeratorSingleWriteError,
+    QuotientNumeratorSourceKind,
 };
 
-use crate::arena_plan::{ArenaBinding, OpenedColumnSource};
+use crate::arena_plan::{ArenaBinding, OpenedColumnSource, QuotientNumeratorSchedule};
 use crate::graphs::GraphWorkspace;
 
 #[derive(Debug)]
@@ -35,10 +36,15 @@ pub enum ResidentOodsError {
         actual_words: usize,
     },
     DestinationMismatch(&'static str),
+    NumeratorScheduleMismatch {
+        planned: QuotientNumeratorSchedule,
+        actual: PreparedNumeratorSchedule,
+    },
     SizeOverflow,
     Arena(ArenaError),
     Oods(PreparedOodsError),
     Numerator(PreparedQuotientNumeratorError),
+    NumeratorSchedule(QuotientNumeratorSingleWriteError),
     Quotient(PreparedQuotientError),
 }
 
@@ -65,6 +71,12 @@ impl From<PreparedOodsError> for ResidentOodsError {
 impl From<PreparedQuotientNumeratorError> for ResidentOodsError {
     fn from(value: PreparedQuotientNumeratorError) -> Self {
         Self::Numerator(value)
+    }
+}
+
+impl From<QuotientNumeratorSingleWriteError> for ResidentOodsError {
+    fn from(value: QuotientNumeratorSingleWriteError) -> Self {
+        Self::NumeratorSchedule(value)
     }
 }
 
@@ -199,24 +211,65 @@ impl<'a> ResidentOodsPipeline<'a> {
                 })
             })
             .collect::<Result<Vec<_>, ResidentOodsError>>()?;
-        let numerator = PreparedQuotientNumeratorGraph::prepare(
-            arena,
-            numerator_plan.config,
-            &numerator_columns,
-            bind_logical(workspace, numerator_plan.oods_sample_points)?,
-            bind_logical(workspace, numerator_plan.oods_sampled_values)?,
-            bind_exact(
-                workspace,
-                numerator_plan.random_coefficient,
-                4,
-                "quotient random coefficient",
-            )?,
-            bind_logical(workspace, numerator_plan.sample_points_destination)?,
-            bind_logical(workspace, numerator_plan.first_linear_terms_destination)?,
-            &destinations,
-            bind_logical(workspace, numerator_plan.forward_twiddles)?,
-            &numerator_plan.slots,
+        let oods_sample_points = bind_logical(workspace, numerator_plan.oods_sample_points)?;
+        let oods_sampled_values = bind_logical(workspace, numerator_plan.oods_sampled_values)?;
+        let random_coefficient = bind_exact(
+            workspace,
+            numerator_plan.random_coefficient,
+            4,
+            "quotient random coefficient",
         )?;
+        let sample_points_destination =
+            bind_logical(workspace, numerator_plan.sample_points_destination)?;
+        let first_linear_terms_destination =
+            bind_logical(workspace, numerator_plan.first_linear_terms_destination)?;
+        let forward_twiddles = bind_logical(workspace, numerator_plan.forward_twiddles)?;
+        let numerator = match numerator_plan.schedule {
+            QuotientNumeratorSchedule::LegacyBatches => PreparedQuotientNumeratorGraph::prepare(
+                arena,
+                numerator_plan.config,
+                &numerator_columns,
+                oods_sample_points,
+                oods_sampled_values,
+                random_coefficient,
+                sample_points_destination,
+                first_linear_terms_destination,
+                &destinations,
+                forward_twiddles,
+                &numerator_plan.slots,
+            )?,
+            QuotientNumeratorSchedule::HybridSingleWrite => {
+                PreparedQuotientNumeratorGraph::prepare_hybrid_candidate(
+                    arena,
+                    numerator_plan.config,
+                    &numerator_columns,
+                    oods_sample_points,
+                    oods_sampled_values,
+                    random_coefficient,
+                    sample_points_destination,
+                    first_linear_terms_destination,
+                    &destinations,
+                    forward_twiddles,
+                    &numerator_plan.slots,
+                )?
+            }
+        };
+        let schedule_matches = matches!(
+            (numerator_plan.schedule, numerator.schedule()),
+            (
+                QuotientNumeratorSchedule::LegacyBatches,
+                PreparedNumeratorSchedule::LegacyBatches
+            ) | (
+                QuotientNumeratorSchedule::HybridSingleWrite,
+                PreparedNumeratorSchedule::HybridCandidate { .. }
+            )
+        );
+        if !schedule_matches {
+            return Err(ResidentOodsError::NumeratorScheduleMismatch {
+                planned: numerator_plan.schedule,
+                actual: numerator.schedule(),
+            });
+        }
 
         let quotient_plan = workspace.plan().quotient();
         let quotient_sources = numerator.quotient_sources();
@@ -264,6 +317,10 @@ impl<'a> ResidentOodsPipeline<'a> {
 
     pub(crate) const fn quotient(&self) -> &PreparedQuotientGraph<'a> {
         &self.quotient
+    }
+
+    pub(crate) fn numerator_schedule(&self) -> PreparedNumeratorSchedule {
+        self.numerator.schedule()
     }
 }
 

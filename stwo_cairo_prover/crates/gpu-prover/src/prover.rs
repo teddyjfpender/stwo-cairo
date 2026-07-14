@@ -51,8 +51,10 @@ use stwo_cairo_prover::witness::utils::witness_trace_cells;
 use stwo_constraint_framework::{FrameworkBackend, LogupFinalizeBackend};
 use tracing::{span, Level};
 
+use crate::arena_plan::ResidentBackend;
 use crate::graphs::{GraphError, GraphWorkspace};
 use crate::protocol_discovery::interaction_claim_from_flattened;
+use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::resident_runtime::{ResidentGraphRuntime, ResidentHotPathBudget, ResidentRuntimeError};
 use crate::resident_session::{
     with_resident_session, with_resident_session_from_generator, ResidentExecutionReadiness,
@@ -434,6 +436,9 @@ pub struct GpuProverConfig {
     /// explicit non-zero policy rather than infer one from remaining VRAM.
     pub operational_safety_reserve_bytes: Option<core::num::NonZeroUsize>,
     pub channel: ChannelMode,
+    /// Immutable resident implementation generation. The replacement is
+    /// admitted only through strict, no-fallback execution.
+    pub resident_backend: ResidentBackend,
     /// Post-M6: no fallbacks, any device failure aborts the prove (U3).
     pub strict: bool,
     /// Explicit benchmark-diagnostic escape hatch for host graph-submit timing.
@@ -451,6 +456,7 @@ impl Default for GpuProverConfig {
             workspace_cache_capacity: 1,
             operational_safety_reserve_bytes: None,
             channel: ChannelMode::Host,
+            resident_backend: ResidentBackend::LegacyResident,
             strict: false,
             allow_slow_graph_submit_diagnostic: false,
         }
@@ -484,6 +490,9 @@ where
     /// separate from replay-only CUDA counters so architecture admission
     /// cannot hide a legacy writer before telemetry reset.
     last_resident_session_telemetry: Option<ResidentSessionTelemetry>,
+    /// Exact topology contract resolved once, before any shape is compiled.
+    /// Non-strict execution does not enter the resident selector.
+    resident_protocol_policy: Option<ProtocolPlanPolicy>,
     /// Provenance of every generated CUDA kernel lookup during the last proof.
     /// Strict mode accepts only embedded-AOT loads/hits.
     last_aot_stats: Option<aot::RuntimeStats>,
@@ -503,6 +512,31 @@ where
                 "pipeline_depth {} unsupported until M6 (two-proof pipelining)",
                 config.pipeline_depth
             )));
+        }
+        if config.resident_backend == ResidentBackend::ReplacementV1 && !config.strict {
+            return Err(GpuError::Config(
+                "replacement-v1 requires strict GPU-native resident execution".to_string(),
+            ));
+        }
+        if config.resident_backend == ResidentBackend::ReplacementV1 {
+            for name in [
+                "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES",
+                "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
+                "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE",
+                "STWO_CUDA_COMPOSITION_DIRECT_RETENTION",
+                "STWO_CUDA_B2N_STAGE_FUSED",
+                "STWO_CUDA_BLAKE2S_INTERIOR_FUSED",
+                "STWO_CUDA_COMPOSITION_WIDE",
+                "STWO_CUDA_RELATION_SCAN_TAIL",
+                "STWO_CUDA_FRI_FOLD_FUSED",
+                "STWO_CUDA_FEED_PRIVATIZED",
+            ] {
+                if std::env::var_os(name).is_some() {
+                    return Err(GpuError::Config(format!(
+                        "replacement-v1 rejects legacy topology override {name}; unset it and use the immutable backend selector"
+                    )));
+                }
+            }
         }
         if config.strict {
             if std::env::var("STWO_CUDA_PCS_REFERENCE").as_deref() == Ok("1") {
@@ -530,6 +564,11 @@ where
         // The gpu-native engine defaults to the composed device configuration
         // (explicit env, including =0 kill switches, always wins) — design §3.
         crate::flags::apply_gpu_native_defaults();
+        let resident_protocol_policy = config
+            .strict
+            .then(|| ProtocolPlanPolicy::loaded_starknet_blake2s_for(config.resident_backend))
+            .transpose()
+            .map_err(ResidentSessionError::from)?;
         let workspace_cache = WorkspaceCache::new(config.workspace_cache_capacity)?;
         let shape_executable_cache = ShapeExecutableCache::new(config.workspace_cache_capacity)
             .map_err(ResidentSessionError::from)?;
@@ -539,6 +578,7 @@ where
             shape_executable_cache,
             last_pcs_telemetry: None,
             last_resident_session_telemetry: None,
+            resident_protocol_policy,
             last_aot_stats: None,
             witness_artifact_plan,
             twiddles: HashMap::new(),
@@ -655,6 +695,9 @@ where
             params.preprocessed_trace,
             params.opt_n_id_to_big_components,
         );
+        let protocol_policy = self.resident_protocol_policy.ok_or_else(|| {
+            GpuError::Config("strict resident protocol policy was not resolved".to_string())
+        })?;
         Ok(with_resident_session_from_generator(
             &mut self.shape_executable_cache,
             &mut self.workspace_cache,
@@ -666,6 +709,7 @@ where
                 pcs: params.pcs_config,
                 include_all_preprocessed_columns: params.include_all_preprocessed_columns,
                 operational_safety_reserve_bytes: self.config.operational_safety_reserve_bytes,
+                protocol_policy,
             },
             run,
         )?)
@@ -693,6 +737,9 @@ where
                 "resident session entrypoint requires strict GPU-native mode".to_string(),
             ));
         }
+        let protocol_policy = self.resident_protocol_policy.ok_or_else(|| {
+            GpuError::Config("strict resident protocol policy was not resolved".to_string())
+        })?;
         Ok(with_resident_session(
             &mut self.shape_executable_cache,
             &mut self.workspace_cache,
@@ -703,6 +750,7 @@ where
                 pcs,
                 include_all_preprocessed_columns,
                 operational_safety_reserve_bytes: self.config.operational_safety_reserve_bytes,
+                protocol_policy,
             },
             run,
         )?)

@@ -97,6 +97,23 @@ pub fn runtime_policy_json(
             policy.quotient_numerator_source_policy
         ),
         "interpolation_mode": interpolation_mode_name(policy.interpolation_mode),
+        "blake2s_interior_fused": policy.blake2s_interior_fused,
+        "composition_launch_mode": match policy.composition_launch_mode {
+            stwo_cairo_gpu_prover::CompositionLaunchMode::Serial => "serial",
+            stwo_cairo_gpu_prover::CompositionLaunchMode::Wide => "wide",
+        },
+        "relation_tail_mode": match policy.relation_tail_mode {
+            stwo_backend_cuda::RelationTailMode::Segmented => "segmented",
+            stwo_backend_cuda::RelationTailMode::Scan => "scan",
+        },
+        "fri_fold_launch_mode": match policy.fri_fold_launch_mode {
+            stwo_backend_cuda::FriFoldLaunchMode::PerFold => "per-fold",
+            stwo_backend_cuda::FriFoldLaunchMode::FusedTriple => "fused-triple",
+        },
+        "witness_feed_launch_mode": match policy.witness_feed_launch_mode {
+            stwo_backend_cuda::WitnessFeedLaunchMode::GlobalAtomics => "global-atomics",
+            stwo_backend_cuda::WitnessFeedLaunchMode::Privatized => "privatized",
+        },
         "relation_launch_mode": relation_launch_mode_name(relation_launch_mode),
     })
 }

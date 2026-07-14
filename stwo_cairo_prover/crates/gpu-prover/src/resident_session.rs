@@ -17,7 +17,8 @@ use stwo::core::poly::circle::CanonicCoset;
 use stwo::prover::poly::circle::PolyOps;
 use stwo_backend_cuda::{
     CudaBackend, ExecutionTablesHostData, PreparedEcOpIngestTelemetry,
-    PreparedExecutionTablesIngestTelemetry, RelationChallenges, WitnessInputGatherRequirements,
+    PreparedExecutionTablesIngestTelemetry, PreparedNumeratorSchedule, RelationChallenges,
+    WitnessInputGatherRequirements,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::cairo_claim_generator::CairoClaimGenerator;
@@ -76,6 +77,7 @@ pub struct ResidentSessionRequest {
     pub pcs: PcsConfig,
     pub include_all_preprocessed_columns: bool,
     pub operational_safety_reserve_bytes: Option<NonZeroUsize>,
+    pub protocol_policy: ProtocolPlanPolicy,
 }
 
 /// Strict device-born entry: claim/shape/protocol planning happens before the
@@ -89,6 +91,7 @@ pub struct ResidentPreWitnessSessionRequest {
     pub pcs: PcsConfig,
     pub include_all_preprocessed_columns: bool,
     pub operational_safety_reserve_bytes: Option<NonZeroUsize>,
+    pub protocol_policy: ProtocolPlanPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,11 +112,14 @@ pub struct ResidentPreparationState {
 pub struct ResidentSessionTelemetry {
     pub shape_executable_materialization: Option<ShapeExecutableMaterialization>,
     pub shape_executable_cache: ShapeExecutableCacheTelemetry,
+    pub shape_executable_topology_digest: Option<[u8; 32]>,
     pub workspace_key: Option<WorkspaceKey>,
     pub workspace_materialization: Option<WorkspaceMaterialization>,
     pub cache: WorkspaceCacheTelemetry,
     pub arena_words: usize,
     pub transcript_segments: usize,
+    pub protocol_policy: Option<ProtocolPlanPolicy>,
+    pub prepared_numerator_schedule: Option<PreparedNumeratorSchedule>,
     pub base: ResidentSourceStageReport,
     pub twiddles: ResidentTwiddleStageReport,
     pub preprocessed: ResidentPreprocessedStageReport,
@@ -198,6 +204,50 @@ impl ResidentSessionTelemetry {
     /// preprocessed setup plus compact recorded-input ingest are allowed;
     /// executing/staging any legacy base or interaction writer is not.
     pub fn require_strict_graph_a(&self) -> Result<(), ResidentSessionError> {
+        let policy =
+            self.protocol_policy
+                .ok_or(ResidentSessionError::StrictArchitectureTelemetry(
+                    "resident protocol policy was not reported",
+                ))?;
+        if self.workspace_key.is_none() || self.shape_executable_topology_digest.is_none() {
+            return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                "resident topology identity was not reported",
+            ));
+        }
+        if policy.resident_backend == crate::arena_plan::ResidentBackend::ReplacementV1
+            && policy
+                != ProtocolPlanPolicy::replacement_v1(
+                    policy.kernel_manifest_hash,
+                    policy.composition_max_kernel_instrs,
+                )
+        {
+            return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                "replacement-v1 policy tuple drifted",
+            ));
+        }
+        let prepared = self.prepared_numerator_schedule.ok_or(
+            ResidentSessionError::StrictArchitectureTelemetry(
+                "prepared quotient-numerator schedule was not reported",
+            ),
+        )?;
+        let schedule_matches = match (policy.quotient_numerator_schedule, prepared) {
+            (
+                crate::arena_plan::QuotientNumeratorSchedule::LegacyBatches,
+                PreparedNumeratorSchedule::LegacyBatches,
+            ) => true,
+            (
+                crate::arena_plan::QuotientNumeratorSchedule::HybridSingleWrite,
+                PreparedNumeratorSchedule::HybridCandidate {
+                    eligible_groups, ..
+                },
+            ) => eligible_groups != 0,
+            _ => false,
+        };
+        if !schedule_matches {
+            return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                "planned and prepared quotient-numerator schedules differ",
+            ));
+        }
         if self.base != ResidentSourceStageReport::default() {
             return Err(ResidentSessionError::StrictArchitectureTelemetry(
                 "legacy base trace staging executed",
@@ -392,6 +442,7 @@ fn select_resident_executable(
     pcs: PcsConfig,
     include_all_preprocessed_columns: bool,
     execution_tables: Option<ExecutionTableGeometry>,
+    policy: ProtocolPlanPolicy,
 ) -> Result<ShapeExecutableSelection, ResidentSessionError> {
     Ok(cache.compile_or_bind(ShapeCompileRequest {
         claim,
@@ -400,7 +451,7 @@ fn select_resident_executable(
         pcs,
         include_all_preprocessed_columns,
         execution_tables,
-        policy: ProtocolPlanPolicy::loaded_starknet_blake2s()?,
+        policy,
     })?)
 }
 
@@ -493,11 +544,14 @@ fn run_materialized_session<R>(
     let mut telemetry = ResidentSessionTelemetry {
         shape_executable_materialization: Some(shape_executable_materialization),
         shape_executable_cache,
+        shape_executable_topology_digest: Some(executable.topology().digest()),
         workspace_key: Some(executable.workspace_key()),
         workspace_materialization: Some(workspace_materialization),
         cache: WorkspaceCacheTelemetry::default(),
         arena_words: workspace.plan().total_words(),
         transcript_segments: executable.transcript().segments().len(),
+        protocol_policy: Some(executable.protocol_policy()),
+        prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
         base,
         twiddles: ResidentTwiddleStageReport::default(),
         preprocessed,
@@ -662,6 +716,7 @@ pub fn with_resident_session<R>(
         pcs,
         include_all_preprocessed_columns,
         operational_safety_reserve_bytes,
+        protocol_policy,
     } = request;
     let selection = select_resident_executable(
         executable_cache,
@@ -671,6 +726,7 @@ pub fn with_resident_session<R>(
         pcs,
         include_all_preprocessed_columns,
         None,
+        protocol_policy,
     )?;
     let shape_executable_cache = executable_cache.telemetry();
     let ShapeExecutableSelection {
@@ -1007,6 +1063,7 @@ pub fn with_resident_session_from_generator<R>(
         pcs,
         include_all_preprocessed_columns,
         operational_safety_reserve_bytes,
+        protocol_policy,
     } = request;
     let exact_plan = Arc::new(capacity_plan.strict_resident_exact(
         &crate::schedule_table::CAIRO_SCHEDULE,
@@ -1038,6 +1095,7 @@ pub fn with_resident_session_from_generator<R>(
             )
             .with_public_memory_entries(public_memory_entries),
         ),
+        protocol_policy,
     )?;
     let shape_executable_cache = executable_cache.telemetry();
     let ShapeExecutableSelection {
@@ -1127,11 +1185,14 @@ pub fn with_resident_session_from_generator<R>(
         let mut telemetry = ResidentSessionTelemetry {
             shape_executable_materialization: Some(executable_materialization),
             shape_executable_cache,
+            shape_executable_topology_digest: Some(executable.topology().digest()),
             workspace_key: Some(executable.workspace_key()),
             workspace_materialization: Some(materialization),
             cache: WorkspaceCacheTelemetry::default(),
             arena_words: workspace.plan().total_words(),
             transcript_segments: executable.transcript().segments().len(),
+            protocol_policy: Some(executable.protocol_policy()),
+            prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
             base: ResidentSourceStageReport::default(),
             twiddles: twiddle_report,
             preprocessed,
@@ -1229,8 +1290,7 @@ pub struct ResidentPreflightReport {
     /// Proof-varying values rebound without regenerating CUDA source.
     pub composition_bindings: CompositionProofBindings,
     pub manifest_policy: PreflightManifestPolicy,
-    /// Exact environment-derived topology/residency policy modeled by this
-    /// host plan, retained so preflight artifacts prove which lane they sized.
+    /// Exact selected topology/residency policy modeled by this host plan.
     pub protocol_policy: ProtocolPlanPolicy,
     pub interpolation_mode: stwo_backend_cuda::InterpolationLaunchMode,
 }
@@ -1249,14 +1309,35 @@ pub fn plan_resident_preflight(
     pcs: PcsConfig,
     include_all_preprocessed_columns: bool,
 ) -> Result<ResidentPreflightReport, ResidentPreflightError> {
+    plan_resident_preflight_for(
+        generator,
+        capacity_plan,
+        preprocessed_trace,
+        pcs,
+        include_all_preprocessed_columns,
+        crate::arena_plan::ResidentBackend::LegacyResident,
+    )
+}
+
+/// Explicit resident-generation preflight. Replacement generations never read
+/// legacy topology flags, even when a loaded AOT pack is unavailable locally.
+pub fn plan_resident_preflight_for(
+    generator: &CairoClaimGenerator,
+    capacity_plan: &ProofPlan,
+    preprocessed_trace: &PreProcessedTrace,
+    pcs: PcsConfig,
+    include_all_preprocessed_columns: bool,
+    resident_backend: crate::arena_plan::ResidentBackend,
+) -> Result<ResidentPreflightReport, ResidentPreflightError> {
     let mut executable_cache = ShapeExecutableCache::new(1).map_err(ResidentSessionError::from)?;
-    plan_resident_preflight_with_cache(
+    plan_resident_preflight_with_cache_for(
         &mut executable_cache,
         generator,
         capacity_plan,
         preprocessed_trace,
         pcs,
         include_all_preprocessed_columns,
+        resident_backend,
     )
 }
 
@@ -1269,6 +1350,26 @@ pub fn plan_resident_preflight_with_cache(
     preprocessed_trace: &PreProcessedTrace,
     pcs: PcsConfig,
     include_all_preprocessed_columns: bool,
+) -> Result<ResidentPreflightReport, ResidentPreflightError> {
+    plan_resident_preflight_with_cache_for(
+        executable_cache,
+        generator,
+        capacity_plan,
+        preprocessed_trace,
+        pcs,
+        include_all_preprocessed_columns,
+        crate::arena_plan::ResidentBackend::LegacyResident,
+    )
+}
+
+pub fn plan_resident_preflight_with_cache_for(
+    executable_cache: &mut ShapeExecutableCache,
+    generator: &CairoClaimGenerator,
+    capacity_plan: &ProofPlan,
+    preprocessed_trace: &PreProcessedTrace,
+    pcs: PcsConfig,
+    include_all_preprocessed_columns: bool,
+    resident_backend: crate::arena_plan::ResidentBackend,
 ) -> Result<ResidentPreflightReport, ResidentPreflightError> {
     let exact_plan = capacity_plan
         .strict_resident_exact(
@@ -1291,30 +1392,38 @@ pub fn plan_resident_preflight_with_cache(
             / 2;
     let multiplicities = crate::multiplicity_pipeline::plan_graph_a_multiplicities(&exact_plan)?;
 
-    let (protocol_policy, manifest_policy) = match ProtocolPlanPolicy::loaded_starknet_blake2s() {
-        Ok(policy) => (
-            policy,
-            PreflightManifestPolicy::Loaded {
-                kernel_manifest_hash: policy.kernel_manifest_hash,
-                composition_max_kernel_instrs: policy.composition_max_kernel_instrs,
-            },
-        ),
-        Err(ProtocolPlanError::UnboundKernelManifest)
-        | Err(ProtocolPlanError::UnboundCompositionKernelCap) => {
-            // Off-CUDA probe trick (see the fixture parity test above): geometry
-            // never reads the manifest hash, only the composition kernel cap.
-            let policy = ProtocolPlanPolicy::starknet_blake2s_from_env(0x1234, 2048)
-                .map_err(ResidentSessionError::from)?;
-            (
+    let (protocol_policy, manifest_policy) =
+        match ProtocolPlanPolicy::loaded_starknet_blake2s_for(resident_backend) {
+            Ok(policy) => (
                 policy,
-                PreflightManifestPolicy::Fake {
+                PreflightManifestPolicy::Loaded {
                     kernel_manifest_hash: policy.kernel_manifest_hash,
                     composition_max_kernel_instrs: policy.composition_max_kernel_instrs,
                 },
-            )
-        }
-        Err(other) => return Err(ResidentSessionError::from(other).into()),
-    };
+            ),
+            Err(ProtocolPlanError::UnboundKernelManifest)
+            | Err(ProtocolPlanError::UnboundCompositionKernelCap) => {
+                // Off-CUDA probe trick (see the fixture parity test above): geometry
+                // never reads the manifest hash, only the composition kernel cap.
+                let policy = match resident_backend {
+                    crate::arena_plan::ResidentBackend::LegacyResident => {
+                        ProtocolPlanPolicy::starknet_blake2s_from_env(0x1234, 2048)
+                            .map_err(ResidentSessionError::from)?
+                    }
+                    crate::arena_plan::ResidentBackend::ReplacementV1 => {
+                        ProtocolPlanPolicy::replacement_v1(0x1234, 2048)
+                    }
+                };
+                (
+                    policy,
+                    PreflightManifestPolicy::Fake {
+                        kernel_manifest_hash: policy.kernel_manifest_hash,
+                        composition_max_kernel_instrs: policy.composition_max_kernel_instrs,
+                    },
+                )
+            }
+            Err(other) => return Err(ResidentSessionError::from(other).into()),
+        };
     let memory = &recorded.execution_memory;
     let control_plane_start = Instant::now();
     let selection = executable_cache
@@ -1366,7 +1475,7 @@ pub fn plan_resident_preflight_with_cache(
         composition_bindings: selection.bindings,
         manifest_policy,
         protocol_policy,
-        interpolation_mode: stwo_backend_cuda::InterpolationLaunchMode::from_env(),
+        interpolation_mode: protocol_policy.interpolation_mode,
     })
 }
 
@@ -2310,6 +2419,44 @@ mod tests {
         assert!(telemetry.cache_hit());
         assert_eq!(telemetry.staged_bytes().unwrap(), 64);
         assert_eq!(telemetry.staged_copies().unwrap(), 10);
+    }
+
+    #[test]
+    fn strict_telemetry_admits_only_the_prepared_replacement_schedule() {
+        let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
+        let valid = ResidentSessionTelemetry {
+            shape_executable_topology_digest: Some([7; 32]),
+            workspace_key: Some(WorkspaceKey::new(
+                stwo_cairo_prover::witness::proof_shape::ProofShapeKey(9),
+                11,
+            )),
+            protocol_policy: Some(policy),
+            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::HybridCandidate {
+                eligible_groups: 18,
+                legacy_groups: 1,
+            }),
+            execution_tables_ingest: Some(PreparedExecutionTablesIngestTelemetry {
+                compact_h2d_bytes: 0,
+                compact_h2d_copies: 0,
+                descriptor_h2d_bytes: 0,
+                descriptor_h2d_copies: 0,
+                sync_calls: 1,
+            }),
+            ..ResidentSessionTelemetry::default()
+        };
+        assert!(valid.require_strict_graph_a().is_ok());
+
+        let mut wrong_schedule = valid.clone();
+        wrong_schedule.prepared_numerator_schedule = Some(PreparedNumeratorSchedule::LegacyBatches);
+        assert!(wrong_schedule.require_strict_graph_a().is_err());
+
+        let mut drifted_policy = valid;
+        drifted_policy
+            .protocol_policy
+            .as_mut()
+            .unwrap()
+            .retained_lde_budget_bytes -= 1;
+        assert!(drifted_policy.require_strict_graph_a().is_err());
     }
 
     #[test]

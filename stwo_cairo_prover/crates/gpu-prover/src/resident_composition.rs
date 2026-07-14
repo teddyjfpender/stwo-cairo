@@ -9,8 +9,8 @@ use crate::composition_plan::{
 use crate::direct_composition_retention::DirectCompositionRetentionPlan;
 use crate::graphs::{bind_arena_binding, GraphWorkspace};
 use crate::prepared_composition::{
-    default_composition_launch_mode, CompositionDeviceInputs, CompositionDirectEvaluationBinding,
-    PreparedCompositionError, PreparedCompositionGraph,
+    CompositionDeviceInputs, CompositionDirectEvaluationBinding, PreparedCompositionError,
+    PreparedCompositionGraph,
 };
 use crate::relation::RelationTracePart;
 
@@ -154,7 +154,7 @@ pub(crate) fn prepare_resident_composition<'a>(
         &cached.trace_topology(),
         &inputs,
         &cached.slots,
-        default_composition_launch_mode(),
+        cached.requirements.mode,
         cached.direct_retention.as_ref(),
         &direct_evaluations,
     )?)

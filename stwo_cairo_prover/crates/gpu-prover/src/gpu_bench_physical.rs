@@ -1,5 +1,10 @@
 use serde_json::json;
+use stwo_backend_cuda::PreparedNumeratorSchedule;
+use stwo_cairo_gpu_prover::arena_plan::{QuotientNumeratorSchedule, QuotientNumeratorSourcePolicy};
+use stwo_cairo_gpu_prover::direct_composition_retention::DirectCompositionRetentionMode;
+use stwo_cairo_gpu_prover::shape_executable::ShapeExecutableMaterialization;
 use stwo_cairo_gpu_prover::ResidentSessionTelemetry;
+use stwo_cairo_gpu_prover::WorkspaceMaterialization;
 
 pub(crate) fn operational_safety_reserve_bytes(
     cli_value: Option<String>,
@@ -31,6 +36,33 @@ pub(crate) fn gpu_native_session_context(
     let Some(telemetry) = telemetry.filter(|_| gpu_native) else {
         return json!({
             "gpu_graph_a_setup_gate_passed": null,
+            "gpu_resident_backend": null,
+            "gpu_protocol_key": null,
+            "gpu_arena_words": null,
+            "gpu_shape_executable_topology_digest": null,
+            "gpu_shape_executable_materialization": null,
+            "gpu_shape_executable_cache_hits": null,
+            "gpu_shape_executable_cache_misses": null,
+            "gpu_shape_executable_cache_compilations": null,
+            "gpu_shape_executable_cache_source_generation_passes": null,
+            "gpu_shape_executable_cache_binding_recipe_compilations": null,
+            "gpu_shape_executable_cache_capacity_rejections": null,
+            "gpu_workspace_materialization": null,
+            "gpu_planned_numerator_schedule": null,
+            "gpu_prepared_numerator_schedule": null,
+            "gpu_prepared_numerator_eligible_groups": null,
+            "gpu_prepared_numerator_legacy_groups": null,
+            "gpu_policy_kernel_manifest_hash": null,
+            "gpu_policy_retained_lde_budget_bytes": null,
+            "gpu_policy_commit_mode": null,
+            "gpu_policy_direct_composition_retention": null,
+            "gpu_policy_numerator_source": null,
+            "gpu_policy_interpolation_mode": null,
+            "gpu_policy_blake2s_interior_fused": null,
+            "gpu_policy_composition_launch_mode": null,
+            "gpu_policy_relation_tail_mode": null,
+            "gpu_policy_fri_fold_launch_mode": null,
+            "gpu_policy_witness_feed_launch_mode": null,
             "gpu_setup_base_migration_copies": null,
             "gpu_setup_lookup_host_copies": null,
             "gpu_setup_legacy_witness_fallbacks": null,
@@ -70,8 +102,82 @@ pub(crate) fn resident_session_telemetry_json(
         })
     });
     let missing_physical_ids = telemetry.physical_memory_inputs.missing_allocation_ids();
+    let policy = telemetry.protocol_policy;
+    let topology_digest = telemetry.shape_executable_topology_digest.map(|digest| {
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    let (prepared_schedule, eligible_groups, legacy_groups) =
+        match telemetry.prepared_numerator_schedule {
+            Some(PreparedNumeratorSchedule::LegacyBatches) => (Some("legacy-batches"), None, None),
+            Some(PreparedNumeratorSchedule::SingleWriteCandidate) => {
+                (Some("single-write"), None, Some(0))
+            }
+            Some(PreparedNumeratorSchedule::HybridCandidate {
+                eligible_groups,
+                legacy_groups,
+            }) => (
+                Some("hybrid-single-write"),
+                Some(eligible_groups),
+                Some(legacy_groups),
+            ),
+            None => (None, None, None),
+        };
     json!({
         "gpu_graph_a_setup_gate_passed": telemetry.require_strict_graph_a().is_ok(),
+        "gpu_resident_backend": policy.map(|value| value.resident_backend.cli_name()),
+        "gpu_protocol_key": telemetry.workspace_key.map(|value| value.protocol_key),
+        "gpu_arena_words": telemetry.arena_words,
+        "gpu_shape_executable_topology_digest": topology_digest,
+        "gpu_shape_executable_materialization": telemetry.shape_executable_materialization.map(shape_materialization_name),
+        "gpu_shape_executable_cache_hits": telemetry.shape_executable_cache.hits,
+        "gpu_shape_executable_cache_misses": telemetry.shape_executable_cache.misses,
+        "gpu_shape_executable_cache_compilations": telemetry.shape_executable_cache.compilations,
+        "gpu_shape_executable_cache_source_generation_passes": telemetry.shape_executable_cache.source_generation_passes,
+        "gpu_shape_executable_cache_binding_recipe_compilations": telemetry.shape_executable_cache.binding_recipe_compilations,
+        "gpu_shape_executable_cache_capacity_rejections": telemetry.shape_executable_cache.capacity_rejections,
+        "gpu_workspace_materialization": telemetry.workspace_materialization.map(workspace_materialization_name),
+        "gpu_planned_numerator_schedule": policy.map(|value| numerator_schedule_name(value.quotient_numerator_schedule)),
+        "gpu_prepared_numerator_schedule": prepared_schedule,
+        "gpu_prepared_numerator_eligible_groups": eligible_groups,
+        "gpu_prepared_numerator_legacy_groups": legacy_groups,
+        "gpu_policy_kernel_manifest_hash": policy.map(|value| value.kernel_manifest_hash),
+        "gpu_policy_retained_lde_budget_bytes": policy.map(|value| value.retained_lde_budget_bytes),
+        "gpu_policy_commit_mode": policy.map(|value| match value.commit_mode {
+            stwo_backend_cuda::ProgressiveCommitMode::FullLifting => "full-lifting",
+            stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive => "domain-progressive",
+        }),
+        "gpu_policy_direct_composition_retention": policy.map(|value| match value.direct_composition_retention_mode {
+            DirectCompositionRetentionMode::Disabled => "disabled",
+            DirectCompositionRetentionMode::ExactNative => "exact-native",
+        }),
+        "gpu_policy_numerator_source": policy.map(|value| match value.quotient_numerator_source_policy {
+            QuotientNumeratorSourcePolicy::CoefficientsOnly => "coefficients-only",
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations => "reuse-retained-evaluations",
+        }),
+        "gpu_policy_interpolation_mode": policy.map(|value| match value.interpolation_mode {
+            stwo_backend_cuda::InterpolationLaunchMode::StageWiseCopyThenInPlace => "stage-wise-copy-then-in-place",
+            stwo_backend_cuda::InterpolationLaunchMode::StageFusedOutOfPlace => "stage-fused-out-of-place",
+        }),
+        "gpu_policy_blake2s_interior_fused": policy.map(|value| value.blake2s_interior_fused),
+        "gpu_policy_composition_launch_mode": policy.map(|value| match value.composition_launch_mode {
+            stwo_cairo_gpu_prover::CompositionLaunchMode::Serial => "serial",
+            stwo_cairo_gpu_prover::CompositionLaunchMode::Wide => "wide",
+        }),
+        "gpu_policy_relation_tail_mode": policy.map(|value| match value.relation_tail_mode {
+            stwo_backend_cuda::RelationTailMode::Segmented => "segmented",
+            stwo_backend_cuda::RelationTailMode::Scan => "scan",
+        }),
+        "gpu_policy_fri_fold_launch_mode": policy.map(|value| match value.fri_fold_launch_mode {
+            stwo_backend_cuda::FriFoldLaunchMode::PerFold => "per-fold",
+            stwo_backend_cuda::FriFoldLaunchMode::FusedTriple => "fused-triple",
+        }),
+        "gpu_policy_witness_feed_launch_mode": policy.map(|value| match value.witness_feed_launch_mode {
+            stwo_backend_cuda::WitnessFeedLaunchMode::GlobalAtomics => "global-atomics",
+            stwo_backend_cuda::WitnessFeedLaunchMode::Privatized => "privatized",
+        }),
         "gpu_setup_base_migration_copies": telemetry.base.migrated_base_columns,
         "gpu_setup_lookup_host_copies": telemetry.lookups.host_copies,
         "gpu_setup_legacy_witness_fallbacks": telemetry.witness.host_fallbacks.len(),
@@ -93,9 +199,34 @@ pub(crate) fn resident_session_telemetry_json(
     })
 }
 
+fn numerator_schedule_name(schedule: QuotientNumeratorSchedule) -> &'static str {
+    match schedule {
+        QuotientNumeratorSchedule::LegacyBatches => "legacy-batches",
+        QuotientNumeratorSchedule::HybridSingleWrite => "hybrid-single-write",
+    }
+}
+
+fn shape_materialization_name(value: ShapeExecutableMaterialization) -> &'static str {
+    match value {
+        ShapeExecutableMaterialization::Compiled => "compiled",
+        ShapeExecutableMaterialization::Reused => "reused",
+    }
+}
+
+fn workspace_materialization_name(value: WorkspaceMaterialization) -> &'static str {
+    match value {
+        WorkspaceMaterialization::Materialized => "materialized",
+        WorkspaceMaterialization::Reused => "reused",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use stwo_cairo_gpu_prover::memory_ledger::{AllocatorPoolCheckpoint, PhysicalMemoryInputs};
+    use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
+    use stwo_cairo_gpu_prover::shape_executable::ShapeExecutableMaterialization;
+    use stwo_cairo_gpu_prover::workspace_cache::WorkspaceKey;
+    use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
 
     use super::*;
 
@@ -141,6 +272,52 @@ mod tests {
         assert_eq!(
             value["gpu_physical_memory_rows"].as_array().unwrap().len(),
             6
+        );
+    }
+
+    #[test]
+    fn replacement_policy_and_actual_schedule_are_machine_readable() {
+        let telemetry = ResidentSessionTelemetry {
+            protocol_policy: Some(ProtocolPlanPolicy::replacement_v1(0x1234, 2048)),
+            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::HybridCandidate {
+                eligible_groups: 18,
+                legacy_groups: 1,
+            }),
+            workspace_key: Some(WorkspaceKey::new(ProofShapeKey(0), 0x5678)),
+            arena_words: 123,
+            shape_executable_topology_digest: Some([0xab; 32]),
+            shape_executable_materialization: Some(ShapeExecutableMaterialization::Compiled),
+            ..ResidentSessionTelemetry::default()
+        };
+        let value = resident_session_telemetry_json(&telemetry);
+        assert_eq!(value["gpu_resident_backend"], "replacement-v1");
+        assert_eq!(value["gpu_protocol_key"], 0x5678);
+        assert_eq!(
+            value["gpu_planned_numerator_schedule"],
+            "hybrid-single-write"
+        );
+        assert_eq!(
+            value["gpu_prepared_numerator_schedule"],
+            "hybrid-single-write"
+        );
+        assert_eq!(value["gpu_prepared_numerator_eligible_groups"], 18);
+        assert_eq!(value["gpu_prepared_numerator_legacy_groups"], 1);
+        assert_eq!(value["gpu_policy_commit_mode"], "domain-progressive");
+        assert_eq!(
+            value["gpu_policy_interpolation_mode"],
+            "stage-fused-out-of-place"
+        );
+        assert_eq!(value["gpu_policy_blake2s_interior_fused"], false);
+        assert_eq!(value["gpu_policy_composition_launch_mode"], "serial");
+        assert_eq!(value["gpu_policy_relation_tail_mode"], "segmented");
+        assert_eq!(value["gpu_policy_fri_fold_launch_mode"], "per-fold");
+        assert_eq!(
+            value["gpu_policy_witness_feed_launch_mode"],
+            "global-atomics"
+        );
+        assert_eq!(
+            value["gpu_shape_executable_topology_digest"],
+            "abababababababababababababababababababababababababababababababab"
         );
     }
 }

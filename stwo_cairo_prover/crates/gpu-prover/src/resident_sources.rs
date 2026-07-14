@@ -695,6 +695,7 @@ pub fn stage_preprocessed_commitment(
     workspace: &mut GraphWorkspace,
     trace: Arc<PreProcessedTrace>,
 ) -> Result<ResidentPreprocessedStageReport, ResidentSourceStageError> {
+    let protocol_identity = workspace.plan().protocol_identity();
     let planned = workspace.plan().preprocessed().clone();
     let commitment = workspace
         .plan()
@@ -1033,7 +1034,7 @@ pub fn stage_preprocessed_commitment(
                     None => vec![None; group.columns.len()],
                 })
                 .collect::<Vec<_>>();
-            let commit = PreparedProgressiveCommitGraph::prepare(
+            let commit = PreparedProgressiveCommitGraph::prepare_with_modes(
                 workspace.arena(),
                 commitment.config,
                 requirements,
@@ -1041,6 +1042,8 @@ pub fn stage_preprocessed_commitment(
                 &coefficients,
                 &retained_outputs,
                 twiddles,
+                protocol_identity.commit_mode,
+                protocol_identity.blake2s_interior_fused,
             )?;
             commit.launch()?;
             (

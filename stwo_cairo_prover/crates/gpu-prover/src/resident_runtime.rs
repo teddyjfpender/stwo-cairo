@@ -17,18 +17,17 @@ use stwo_backend_cuda::{
     CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
     DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError, ExecutionTablesHostData,
     FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
-    ModeAwareCommitWorkspaceRequirements,
-    ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError, PreparedBlake2sPowGraph,
-    PreparedBlake2sTranscript, PreparedCommitError, PreparedCommitGraph, PreparedDecommitError,
-    PreparedDecommitGraph, PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
-    PreparedExecutionTablesError, PreparedExecutionTablesGraph,
+    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError,
+    PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedCommitError, PreparedCommitGraph,
+    PreparedDecommitError, PreparedDecommitGraph, PreparedEcOpError, PreparedEcOpGraph,
+    PreparedEcOpIngestTelemetry, PreparedExecutionTablesError, PreparedExecutionTablesGraph,
     PreparedExecutionTablesIngestTelemetry, PreparedFixedTableError, PreparedFixedTableGraph,
     PreparedFriError, PreparedFriFinalError, PreparedFriFinalGraph, PreparedFriGraph,
     PreparedInterpolationError, PreparedInterpolationGraph, PreparedMemoryBaseTraceError,
-    PreparedMemoryBaseTraceGraph, PreparedProgressiveCommitError, PreparedProgressiveCommitGraph,
-    PreparedRelationGraph, PreparedWitnessError, PreparedWitnessFeedClearGraph,
-    PreparedWitnessFeedError, PreparedWitnessFeedGraph, PreparedWitnessGraph,
-    PreparedWitnessInputCompactGraph, PreparedWitnessInputGatherError,
+    PreparedMemoryBaseTraceGraph, PreparedNumeratorSchedule, PreparedProgressiveCommitError,
+    PreparedProgressiveCommitGraph, PreparedRelationGraph, PreparedWitnessError,
+    PreparedWitnessFeedClearGraph, PreparedWitnessFeedError, PreparedWitnessFeedGraph,
+    PreparedWitnessGraph, PreparedWitnessInputCompactGraph, PreparedWitnessInputGatherError,
     PreparedWitnessInputGatherGraph, PreparedWitnessInputSeedGraph, PreparedWitnessMode,
     RelationChallenges, RelationGraphError, RelationInstanceSources, TraceDecommitSources,
     TraceSourceGroup, TranscriptInputBinding, TranscriptInputId, TranscriptMirrorReport,
@@ -42,10 +41,10 @@ use crate::arena_plan::{
     BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedFixedTableSource,
 };
 use crate::composition_plan::CompositionProofBindings;
+use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
 use crate::graphs::{
     bind_arena_binding, GraphCaptureStatus, GraphError, GraphSegment, GraphWorkspace,
 };
-use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
 use crate::multiplicity_pipeline::{FixedMultiplicityCoverageGap, MultiplicityFeedBlocker};
 use crate::proof_bundle::{
     ResidentProofBundle, ResidentProofBundleError, ResidentProofBundleLayout,
@@ -971,6 +970,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                 actual: actual_identity,
             });
         }
+        let protocol_identity = workspace.plan().protocol_identity();
         if !workspace.preprocessed_commitment_ready() {
             return Err(ResidentRuntimeError::FixedPreprocessedCommitmentNotReady);
         }
@@ -1143,7 +1143,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                                     })
                             })
                             .collect::<Result<Vec<_>, _>>()?;
-                        let graph = PreparedWitnessFeedGraph::prepare(
+                        let graph = PreparedWitnessFeedGraph::prepare_with_mode(
                             arena,
                             bind_arena_binding(arena, feed.source)?,
                             feed.plan.row_count,
@@ -1152,6 +1152,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             &luts,
                             &feed.plan.requirements.multiplicity_words,
                             &feed.slots,
+                            protocol_identity.witness_feed_launch_mode,
                         )?;
                         Ok::<_, ResidentRuntimeError>((feed.plan.producer, graph))
                     })
@@ -1160,7 +1161,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                     .public_memory_seed
                     .as_ref()
                     .map(|feed| {
-                        let graph = PreparedWitnessFeedGraph::prepare(
+                        let graph = PreparedWitnessFeedGraph::prepare_with_mode(
                             arena,
                             bind_arena_binding(arena, feed.source)?,
                             feed.plan.row_count,
@@ -1169,6 +1170,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             &[],
                             &feed.plan.requirements.multiplicity_words,
                             &feed.slots,
+                            protocol_identity.witness_feed_launch_mode,
                         )?;
                         let words = public_memory_seed_host.ok_or(
                             ResidentRuntimeError::PublicMemoryMultiplicitySeed(
@@ -1477,7 +1479,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .map(|group| group.as_ref().map(|group| group.columns.clone()))
                         .collect();
                     PreparedResidentCommitment::Progressive {
-                        graph: PreparedProgressiveCommitGraph::prepare(
+                        graph: PreparedProgressiveCommitGraph::prepare_with_modes(
                             arena,
                             planned.config,
                             requirements,
@@ -1485,6 +1487,8 @@ impl<'a> ResidentGraphRuntime<'a> {
                             &coefficients,
                             &flat_retained,
                             twiddles,
+                            protocol_identity.commit_mode,
+                            protocol_identity.blake2s_interior_fused,
                         )?,
                         retained_evaluations: grouped_retained,
                     }
@@ -1648,6 +1652,10 @@ impl<'a> ResidentGraphRuntime<'a> {
 
     pub const fn ec_op_ingest_telemetry(&self) -> Option<PreparedEcOpIngestTelemetry> {
         self.ec_op_ingest
+    }
+
+    pub fn prepared_numerator_schedule(&self) -> PreparedNumeratorSchedule {
+        self.oods.numerator_schedule()
     }
 
     /// Upload the complete compact input set before capture/replay. Every copy
@@ -2170,11 +2178,15 @@ impl<'a> ResidentGraphRuntime<'a> {
         let root_source = commitment.root_slice();
         let transcript = &self.transcript;
         let workspace = self.workspace;
+        let relation_launch_mode = workspace.plan().relation().launch_mode;
+        let relation_tail_mode = workspace.plan().protocol_identity().relation_tail_mode;
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
         let capture = capture_with_cursor_rollback(cursor, |cursor| {
             workspace.capture_segment(GraphSegment::InteractionCommit, |arena| {
-                relation.launch().map_err(ResidentLaunchError::Relation)?;
+                relation
+                    .launch_with_modes(relation_launch_mode, relation_tail_mode)
+                    .map_err(ResidentLaunchError::Relation)?;
                 interpolation
                     .launch()
                     .map_err(ResidentLaunchError::Interpolation)?;
@@ -2318,12 +2330,13 @@ impl<'a> ResidentGraphRuntime<'a> {
         let fri = &self.fri;
         let transcript = &self.transcript;
         let workspace = self.workspace;
+        let fri_fold_launch_mode = workspace.plan().protocol_identity().fri_fold_launch_mode;
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
         let reused_transcript_segment = transcript_tail.as_ref().map(|tail| tail.0);
         let capture = capture_with_cursor_rollback(cursor, |cursor| {
             workspace.capture_segment(segment, |arena| {
-                fri.launch_round(round_index)
+                fri.launch_round_with_mode(round_index, fri_fold_launch_mode)
                     .map(|_| ())
                     .map_err(ResidentLaunchError::Fri)?;
                 if let Some((
@@ -3025,7 +3038,11 @@ impl<'a> ResidentGraphRuntime<'a> {
         if self.relation_challenge_generation <= self.launched_relation_challenge_generation {
             return Err(ResidentRuntimeError::StaleRelationChallenges);
         }
-        self.relation.launch()?;
+        let identity = self.workspace.plan().protocol_identity();
+        self.relation.launch_with_modes(
+            self.workspace.plan().relation().launch_mode,
+            identity.relation_tail_mode,
+        )?;
         self.interaction_interpolation.launch()?;
         self.commitment(CommitmentTreeId::Interaction)?.launch()?;
         self.stage_interaction_claim_for_transcript()?;
@@ -3078,6 +3095,11 @@ impl<'a> ResidentGraphRuntime<'a> {
         round_index: usize,
     ) -> Result<Option<usize>, ResidentRuntimeError> {
         self.require_next_fri_round(round_index)?;
+        let fri_fold_launch_mode = self
+            .workspace
+            .plan()
+            .protocol_identity()
+            .fri_fold_launch_mode;
         let generation = *self
             .fri_challenge_generations
             .get(round_index)
@@ -3086,7 +3108,9 @@ impl<'a> ResidentGraphRuntime<'a> {
         if generation <= *launched {
             return Err(ResidentRuntimeError::StaleFriChallenge(round_index));
         }
-        let tree = self.fri.launch_round(round_index)?;
+        let tree = self
+            .fri
+            .launch_round_with_mode(round_index, fri_fold_launch_mode)?;
         *launched = generation;
         if let Some(tree_index) = tree {
             let layer = u32::try_from(tree_index)
