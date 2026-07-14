@@ -2307,17 +2307,32 @@ use crate::witness::components::{blake_round, pedersen_aggregator_window_bits_18
 
 /// Register the HOST-BUILT `PEDERSEN_TABLE_18` on device (borrowed mode) — the
 /// deduce lane's only permitted table source: the oracle falsified the
-/// GPU-generated table (144/256 rows, run 20260705T113615Z). Idempotent per
-/// process; `false` (stub build / upload failure) → callers fall back to host.
-pub fn ensure_device_pedersen_table() -> bool {
+/// GPU-generated table (144/256 rows, run 20260705T113615Z). The checked result
+/// preserves the first recoverable registration failure exactly. Native CUDA
+/// upload/publication failures still abort because those legacy entry points do
+/// not return status codes.
+pub fn try_ensure_device_pedersen_table() -> Result<
+    stwo_backend_cuda::pedersen_table::RegisteredPedersenTable,
+    stwo_backend_cuda::pedersen_table::PedersenTableRegistrationError,
+> {
     use stwo_cairo_common::preprocessed_columns::pedersen::PedersenPoints;
-    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
-        return false;
-    }
     let n_rows = PedersenPoints::<18>::new(0).get_data().len();
-    stwo_backend_cuda::pedersen_table::register_borrowed_pedersen_table(n_rows, |c, buf| {
-        buf.extend(PedersenPoints::<18>::new(c).get_data().iter().map(|m| m.0));
-    })
+    stwo_backend_cuda::pedersen_table::try_register_borrowed_pedersen_table(
+        n_rows,
+        |column, buf| {
+            buf.extend(
+                PedersenPoints::<18>::new(column)
+                    .get_data()
+                    .iter()
+                    .map(|value| value.0),
+            );
+        },
+    )
+}
+
+/// Compatibility wrapper for recorded lanes that retain host fallback.
+pub fn ensure_device_pedersen_table() -> bool {
+    try_ensure_device_pedersen_table().is_ok()
 }
 
 pub struct PedersenAggregatorW18Lane;
