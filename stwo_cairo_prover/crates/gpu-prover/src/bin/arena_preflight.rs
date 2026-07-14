@@ -1,4 +1,6 @@
 //! SN-scale resident-arena preflight — host-only, no CUDA required.
+//! gpu-lab-cohesion-review: one CLI owns exact admission planning and its single JSON contract;
+//! splitting that contract before Stage 3 stabilizes would obscure field-to-plan reconciliation.
 //!
 //! De-risks the first strict resident attempt on a large PIE by running the
 //! EXACT planning pipeline the resident session runs
@@ -540,6 +542,30 @@ fn report_json(
         .map(|blocker| format!("{blocker:?}"))
         .collect();
 
+    let numerator_groups = &arena.quotient_numerator().requirements.groups;
+    let single_write_groups = numerator_groups
+        .iter()
+        .enumerate()
+        .map(|(group, requirements)| {
+            serde_json::json!({
+                "group": group,
+                "log_size": requirements.log_size,
+                "output_rows": requirements.value_words,
+                "coefficient_source_count": requirements.coefficient_source_count,
+                "eligible": requirements.coefficient_source_count == 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    let single_write_eligible_groups = numerator_groups
+        .iter()
+        .filter(|group| group.coefficient_source_count == 0)
+        .count();
+    let single_write_eligible_rows = numerator_groups
+        .iter()
+        .filter(|group| group.coefficient_source_count == 0)
+        .map(|group| group.value_words)
+        .sum::<usize>();
+
     let budget_bytes = budget_bytes_of(vram_budget_gb);
     let physical_memory = PhysicalMemoryLedger::json(arena, budget_bytes)
         .expect("physical memory ledger must reconcile with the validated arena");
@@ -583,6 +609,12 @@ fn report_json(
             "peak_by_epoch": peak_by_epoch,
         },
         "physical_memory": physical_memory,
+        "quotient_numerator_single_write": {
+            "eligible_groups": single_write_eligible_groups,
+            "ineligible_groups": numerator_groups.len() - single_write_eligible_groups,
+            "eligible_output_rows": single_write_eligible_rows,
+            "groups": single_write_groups,
+        },
         "transcript_segments": report.transcript_segments,
         "manifest_policy": format!("{:?}", report.manifest_policy),
         "runtime_policy": {
