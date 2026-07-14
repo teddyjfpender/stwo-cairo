@@ -13,8 +13,8 @@ use crate::arena_plan::{
 };
 use crate::composition_plan::CompositionPlan;
 use crate::prepared_composition::{
-    composition_workspace_requirements, CompositionCoefficientSource, CompositionTraceTopology,
-    PreparedCompositionError,
+    composition_workspace_requirements_with_mode, CompositionCoefficientSource,
+    CompositionLaunchMode, CompositionTraceTopology, PreparedCompositionError,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -186,11 +186,13 @@ impl From<PreparedCompositionError> for DirectCompositionRetentionError {
     }
 }
 
-/// Derive composition consumers from the same baseline requirements that own
-/// the prepared component/source order. No AIR traversal is duplicated here.
+/// Derive composition consumers from the same mode-explicit requirements that
+/// own the prepared component/source order. No AIR traversal or ambient launch
+/// policy is duplicated here.
 pub fn derive_direct_composition_consumers(
     oods: &OodsGeometry,
     composition: &CompositionPlan,
+    launch_mode: CompositionLaunchMode,
 ) -> Result<Vec<DirectCompositionConsumer>, DirectCompositionRetentionError> {
     let mut proof_sources = [Vec::new(), Vec::new(), Vec::new()];
     let mut trace_trees = vec![Vec::new(), Vec::new(), Vec::new()];
@@ -223,9 +225,10 @@ pub fn derive_direct_composition_consumers(
             log_size: column.coefficient_log_size,
         });
     }
-    let requirements = composition_workspace_requirements(
+    let requirements = composition_workspace_requirements_with_mode(
         composition,
         &CompositionTraceTopology { trees: trace_trees },
+        launch_mode,
     )?;
     let mut consumers = Vec::new();
     for component in &requirements.components {
@@ -1331,7 +1334,9 @@ mod tests {
                 component("b", 6, 1, vec![1], 0..2, 1..3),
             ],
         };
-        let consumers = derive_direct_composition_consumers(&oods, &composition).unwrap();
+        let consumers =
+            derive_direct_composition_consumers(&oods, &composition, CompositionLaunchMode::Serial)
+                .unwrap();
         let expected = [
             sources[0][2],
             sources[0][0],

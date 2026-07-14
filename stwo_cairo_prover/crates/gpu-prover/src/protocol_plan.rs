@@ -962,8 +962,12 @@ fn plan_protocol_from_logs(
         DirectCompositionRetentionMode::ExactNative => {
             let composition =
                 composition.ok_or(ProtocolPlanError::DirectRetentionCompositionMissing)?;
-            let consumers = derive_direct_composition_consumers(&oods, composition)
-                .map_err(ProtocolPlanError::DirectRetention)?;
+            let consumers = derive_direct_composition_consumers(
+                &oods,
+                composition,
+                policy.composition_launch_mode,
+            )
+            .map_err(ProtocolPlanError::DirectRetention)?;
             Some(
                 plan_direct_composition_retention_from_parts(
                     &commitments,
