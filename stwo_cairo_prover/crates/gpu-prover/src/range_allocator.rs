@@ -2,8 +2,9 @@
 //!
 //! Unlike `arena_plan`'s whole-slot colorer, this planner binds every logical
 //! value to an offset and permits spatial overlap only when the values' live
-//! epoch masks are disjoint. It is planner-only: the CUDA arena gains offset
-//! binding in the later runtime vertical slice.
+//! epoch masks are disjoint. [`crate::range_arena`] converts the checked
+//! placement into stable runtime views, and the CUDA backend independently
+//! validates the declared lifetime-reuse contract before allocation.
 
 use std::collections::{BTreeMap, BTreeSet};
 

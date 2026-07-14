@@ -77,6 +77,8 @@ use crate::prepared_composition::{
     CompositionWorkspaceRequirements, CompositionWorkspaceSlots, PreparedCompositionError,
 };
 use crate::proof_bundle::{ResidentProofBundleError, ResidentProofBundleLayout};
+use crate::range_allocator::RangeAllocationError;
+use crate::range_arena::{plan_range_arena, validate_transition_aliases};
 use crate::relation::RelationTracePart;
 use crate::relation_execution::{
     RelationExecutionError, RelationExecutionPlan, RelationInstanceSourcePlan, RelationSourcePlane,
@@ -3031,6 +3033,11 @@ pub struct ProofArenaPlan {
     bindings: Vec<ArenaBinding>,
     layout: ArenaLayout,
     high_water_words: Vec<(ProofEpoch, usize)>,
+    whole_slot_total_words: usize,
+    raw_peak_words: usize,
+    excess_over_raw_peak_words: usize,
+    range_view_count: usize,
+    range_view_words: usize,
     late_coefficient_ownership: LateCoefficientOwnershipPlan,
     preprocessed: PlannedPreprocessedWorkspace,
     commitments: Vec<PlannedCommitment>,
@@ -3299,13 +3306,25 @@ impl ProofArenaPlan {
         )?;
         validate_commitment_sources(&logical, &logical_commitments)?;
 
-        let (bindings, specs, total_words) = color_logical_buffers(&logical, &transition_aliases)?;
-        let layout = ArenaLayout::new(total_words, &specs).map_err(ArenaPlanError::Arena)?;
+        // Retain the old whole-slot result as an exact same-shape comparator,
+        // but bind production execution to the checked range-packed layout.
+        let (_, whole_slot_specs, whole_slot_total_words) =
+            color_logical_buffers(&logical, &transition_aliases)?;
+        ArenaLayout::new(whole_slot_total_words, &whole_slot_specs)
+            .map_err(ArenaPlanError::Arena)?;
+        let range_arena = plan_range_arena(&logical, &transition_aliases)?;
+        let bindings = range_arena.bindings;
+        let layout = range_arena.layout;
         validate_aliases(&logical, &bindings)?;
-        let high_water_words = ProofEpoch::ALL
-            .into_iter()
-            .map(|epoch| (epoch, high_water_at(epoch, &logical, &bindings)))
-            .collect();
+        let high_water_words = range_arena.high_water_words;
+        if high_water_words
+            .iter()
+            .any(|&(epoch, words)| words != high_water_at(epoch, &logical, &bindings))
+        {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "range-address and slot-identity high-water disagree",
+            ));
+        }
         let commitments: Vec<PlannedCommitment> = logical_commitments
             .into_iter()
             .map(|commitment| resolve_commitment_slots(commitment, &bindings))
@@ -3411,6 +3430,11 @@ impl ProofArenaPlan {
             bindings,
             layout,
             high_water_words,
+            whole_slot_total_words,
+            raw_peak_words: range_arena.raw_peak_words,
+            excess_over_raw_peak_words: range_arena.excess_over_raw_peak_words,
+            range_view_count: range_arena.range_view_count,
+            range_view_words: range_arena.range_view_words,
             late_coefficient_ownership,
             preprocessed,
             commitments,
@@ -3455,6 +3479,34 @@ impl ProofArenaPlan {
 
     pub fn total_words(&self) -> usize {
         self.layout.total_words()
+    }
+
+    /// Exact allocation produced by the superseded whole-slot colorer for the
+    /// same logical shape and transition aliases.
+    pub fn whole_slot_total_words(&self) -> usize {
+        self.whole_slot_total_words
+    }
+
+    /// Hard lower bound from the largest sum of simultaneously-live logical
+    /// ranges. This is not an allocator optimality claim.
+    pub fn raw_peak_words(&self) -> usize {
+        self.raw_peak_words
+    }
+
+    /// Exact distance between this range-packed slab and `raw_peak_words`.
+    pub fn excess_over_raw_peak_words(&self) -> usize {
+        self.excess_over_raw_peak_words
+    }
+
+    /// Stable runtime range views. This is not a device-allocation count: all
+    /// views belong to the one shape arena allocation.
+    pub fn range_view_count(&self) -> usize {
+        self.range_view_count
+    }
+
+    /// Sum of view lengths before spatial reuse; may exceed `total_words`.
+    pub fn range_view_words(&self) -> usize {
+        self.range_view_words
     }
 
     pub fn late_coefficient_ownership(&self) -> &LateCoefficientOwnershipPlan {
@@ -3688,6 +3740,7 @@ pub enum ArenaPlanError {
     Decommit(PreparedDecommitError),
     ProofBundle(ResidentProofBundleError),
     Transcript(DeviceTranscriptError),
+    Range(RangeAllocationError),
     Arena(ArenaError),
 }
 
@@ -9120,57 +9173,16 @@ fn color_logical_buffers(
     logical: &[LogicalBuffer],
     transition_aliases: &[(LogicalBufferId, LogicalBufferId)],
 ) -> Result<(Vec<ArenaBinding>, Vec<ArenaSlotSpec>, usize), ArenaPlanError> {
-    let mut indices = BTreeMap::new();
-    for (index, buffer) in logical.iter().enumerate() {
-        if indices.insert(buffer.id, index).is_some() {
-            return Err(ArenaPlanError::InvalidProtocolGeometry(
-                "duplicate logical buffer id",
-            ));
-        }
-    }
-    let mut paired = BTreeMap::new();
-    for &(evaluations, coefficients) in transition_aliases {
-        let evaluation_index = *indices
-            .get(&evaluations)
-            .ok_or(ArenaPlanError::MissingBinding(evaluations))?;
-        let coefficient_index = *indices
-            .get(&coefficients)
-            .ok_or(ArenaPlanError::MissingBinding(coefficients))?;
-        let evaluation = &logical[evaluation_index];
-        let coefficient = &logical[coefficient_index];
-        let valid_purpose = matches!(
-            (evaluation.purpose, coefficient.purpose),
-            (BufferPurpose::BaseTrace, BufferPurpose::BaseCoefficients)
-                | (
-                    BufferPurpose::InteractionTrace,
-                    BufferPurpose::InteractionCoefficients
-                )
-        );
-        if !valid_purpose
-            || evaluation.component != coefficient.component
-            || evaluation.part != coefficient.part
-            || evaluation.ordinal != coefficient.ordinal
-            || evaluation.len_words != coefficient.len_words
-            || evaluation.lifetime.overlaps(coefficient.lifetime)
-            || (evaluation.lifetime.last as u8).checked_add(1)
-                != Some(coefficient.lifetime.first as u8)
-            || paired.insert(evaluation_index, coefficient_index).is_some()
-            || paired.insert(coefficient_index, evaluation_index).is_some()
-        {
-            return Err(ArenaPlanError::InvalidProtocolGeometry(
-                "invalid interpolation transition alias",
-            ));
-        }
-    }
+    let aliases = validate_transition_aliases(logical, transition_aliases)?;
 
-    let mut units = Vec::with_capacity(logical.len() - transition_aliases.len());
+    let mut units = Vec::with_capacity(logical.len() - aliases.pair_count());
     let mut visited = BTreeSet::new();
     for index in 0..logical.len() {
         if !visited.insert(index) {
             continue;
         }
         let mut members = vec![index];
-        if let Some(&other) = paired.get(&index) {
+        if let Some(other) = aliases.partner_index(index) {
             if !visited.insert(other) {
                 return Err(ArenaPlanError::InvalidProtocolGeometry(
                     "logical buffer appears in multiple transition aliases",
@@ -9708,19 +9720,53 @@ mod tests {
                 .collect();
             (logs, sources)
         };
+        let dynamic_geometry = |id| {
+            let component = proof
+                .components
+                .iter()
+                .find(|component| component.node.id == id)
+                .unwrap();
+            let parts = capacity_parts(&component.runtime.rows).unwrap();
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].part, TracePartId::Main);
+            (
+                parts[0].padded_rows.ilog2(),
+                trace_width(component.node.facts.trace_columns, TracePartId::Main).unwrap(),
+                component.node.facts.logup_columns.unwrap() as usize * SECURE_FIELD_WORDS,
+            )
+        };
+        let (address_log_size, address_base_columns, address_interaction_columns) =
+            dynamic_geometry("memory_address_to_id");
+        let (rc99_log_size, rc99_base_columns, rc99_interaction_columns) =
+            dynamic_geometry("range_check_9_9");
         let (base_logs, base_sources) = group_columns(
-            (0..cairo_air::components::memory_id_to_big::BIG_N_COLUMNS as u32)
+            (0..address_base_columns)
                 .map(|ordinal| {
                     (
-                        6,
+                        address_log_size,
                         CommitmentColumnSource::Trace {
-                            component: "memory_id_to_big",
-                            part: TracePartId::MemoryBig(0),
+                            component: "memory_address_to_id",
+                            part: TracePartId::Main,
                             purpose: BufferPurpose::BaseCoefficients,
                             ordinal,
                         },
                     )
                 })
+                .chain(
+                    (0..cairo_air::components::memory_id_to_big::BIG_N_COLUMNS as u32).map(
+                        |ordinal| {
+                            (
+                                6,
+                                CommitmentColumnSource::Trace {
+                                    component: "memory_id_to_big",
+                                    part: TracePartId::MemoryBig(0),
+                                    purpose: BufferPurpose::BaseCoefficients,
+                                    ordinal,
+                                },
+                            )
+                        },
+                    ),
+                )
                 .chain(
                     (0..cairo_air::components::memory_id_to_small::N_TRACE_COLUMNS as u32).map(
                         |ordinal| {
@@ -9736,11 +9782,33 @@ mod tests {
                         },
                     ),
                 )
+                .chain((0..rc99_base_columns).map(|ordinal| {
+                    (
+                        rc99_log_size,
+                        CommitmentColumnSource::Trace {
+                            component: "range_check_9_9",
+                            part: TracePartId::Main,
+                            purpose: BufferPurpose::BaseCoefficients,
+                            ordinal,
+                        },
+                    )
+                }))
                 .collect(),
         );
         let (interaction_logs, interaction_sources) = group_columns(
-            (0..32)
+            (0..u32::try_from(address_interaction_columns).unwrap())
                 .map(|ordinal| {
+                    (
+                        address_log_size,
+                        CommitmentColumnSource::Trace {
+                            component: "memory_address_to_id",
+                            part: TracePartId::Main,
+                            purpose: BufferPurpose::InteractionCoefficients,
+                            ordinal,
+                        },
+                    )
+                })
+                .chain((0..32).map(|ordinal| {
                     (
                         6,
                         CommitmentColumnSource::Trace {
@@ -9750,7 +9818,7 @@ mod tests {
                             ordinal,
                         },
                     )
-                })
+                }))
                 .chain((0..12).map(|ordinal| {
                     (
                         5,
@@ -9762,6 +9830,19 @@ mod tests {
                         },
                     )
                 }))
+                .chain(
+                    (0..u32::try_from(rc99_interaction_columns).unwrap()).map(|ordinal| {
+                        (
+                            rc99_log_size,
+                            CommitmentColumnSource::Trace {
+                                component: "range_check_9_9",
+                                part: TracePartId::Main,
+                                purpose: BufferPurpose::InteractionCoefficients,
+                                ordinal,
+                            },
+                        )
+                    }),
+                )
                 .collect(),
         );
         let mut oods_columns = vec![
@@ -10126,9 +10207,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            coefficient_requirements.groups,
-            retained_requirements.groups
+            coefficient_requirements
+                .groups
+                .iter()
+                .map(|group| (group.shape_point, group.log_size, group.value_words))
+                .collect::<Vec<_>>(),
+            retained_requirements
+                .groups
+                .iter()
+                .map(|group| (group.shape_point, group.log_size, group.value_words))
+                .collect::<Vec<_>>()
         );
+        assert!(coefficient_requirements
+            .groups
+            .iter()
+            .all(|group| group.coefficient_source_count == 1));
+        assert!(retained_requirements
+            .groups
+            .iter()
+            .all(|group| group.coefficient_source_count == 0));
         assert_eq!(
             coefficient_requirements.term_count,
             retained_requirements.term_count
@@ -10223,34 +10320,6 @@ mod tests {
             arena.total_words() * core::mem::size_of::<u32>()
         );
         assert_eq!(memory_ledger.epochs.len(), ProofEpoch::ALL.len());
-        let compact_scratch_purposes = [
-            BufferPurpose::WitnessInputCompactTupleScratch,
-            BufferPurpose::WitnessInputCompactSortKey,
-            BufferPurpose::WitnessInputCompactSortIndex,
-            BufferPurpose::WitnessInputCompactRunHeads,
-            BufferPurpose::WitnessInputCompactRunPositions,
-            BufferPurpose::WitnessInputCompactUniqueCount,
-            BufferPurpose::WitnessInputCompactSortTemp,
-            BufferPurpose::WitnessInputCompactScanTemp,
-        ];
-        let compact_scratch = arena
-            .logical_buffers()
-            .iter()
-            .filter(|buffer| compact_scratch_purposes.contains(&buffer.purpose))
-            .collect::<Vec<_>>();
-        assert!(!compact_scratch.is_empty());
-        assert!(compact_scratch
-            .iter()
-            .all(|buffer| { buffer.lifetime == BufferLifetime::at(ProofEpoch::Witness) }));
-        assert!(arena.logical_buffers().iter().any(|buffer| {
-            matches!(
-                buffer.purpose,
-                BufferPurpose::WitnessInputCompactSourcePointers
-                    | BufferPurpose::WitnessInputCompactDescriptors
-                    | BufferPurpose::WitnessInputCompactOutputPointers
-            ) && buffer.lifetime
-                == BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble).unwrap()
-        }));
         arena.validate_aliases().unwrap();
         assert_eq!(
             arena.protocol_key,
@@ -11146,15 +11215,24 @@ mod tests {
             arena.quotient_numerator().destinations,
             arena.quotient().partial_numerators
         );
-        let physical_for = |purposes: &[BufferPurpose]| {
+        let address_ranges_for = |purposes: &[BufferPurpose]| {
             arena
                 .logical_buffers()
                 .iter()
                 .filter(|buffer| purposes.contains(&buffer.purpose))
-                .map(|buffer| arena.binding(buffer.id).unwrap().physical)
-                .collect::<std::collections::BTreeSet<_>>()
+                .map(|buffer| {
+                    let binding = arena.binding(buffer.id).unwrap();
+                    let slot = arena.layout().slot(binding.physical).unwrap();
+                    (
+                        binding.physical,
+                        buffer.lifetime,
+                        slot.offset_words,
+                        slot.offset_words + binding.len_words,
+                    )
+                })
+                .collect::<Vec<_>>()
         };
-        let oods_ephemeral = physical_for(&[
+        let oods_ephemeral = address_ranges_for(&[
             BufferPurpose::OodsFoldingFactors,
             BufferPurpose::OodsScratchA,
             BufferPurpose::OodsScratchB,
@@ -11164,12 +11242,12 @@ mod tests {
             BufferPurpose::OodsBarycentricScales,
             BufferPurpose::OodsBarycentricPartials,
         ]);
-        let numerator_ephemeral = physical_for(&[
+        let numerator_ephemeral = address_ranges_for(&[
             BufferPurpose::QuotientNumeratorLineCoefficients,
             BufferPurpose::QuotientNumeratorTermPoints,
             BufferPurpose::QuotientNumeratorLdeTile,
         ]);
-        let quotient_stage_ephemeral = physical_for(&[
+        let quotient_stage_ephemeral = address_ranges_for(&[
             BufferPurpose::QuotientNumeratorLineCoefficients,
             BufferPurpose::QuotientNumeratorTermPoints,
             BufferPurpose::QuotientNumeratorLdeTile,
@@ -11177,14 +11255,19 @@ mod tests {
             BufferPurpose::QuotientTile,
             BufferPurpose::QuotientSamplePoints,
         ]);
-        // The colorer chooses slots by best fit, so the OODS scratch is not
-        // guaranteed to land on the three numerator purposes specifically —
-        // the residency property is that OODS-epoch scratch physically aliases
-        // Quotient-epoch scratch (disjoint lifetimes, shared slots).
-        assert!(
-            !oods_ephemeral.is_disjoint(&quotient_stage_ephemeral),
-            "sequential OODS and quotient-stage scratch should reuse arena slots"
-        );
+        // Stable range IDs remain unique even when disjoint lifetimes reuse
+        // the same arena addresses. Pin the physical address reuse itself.
+        let (oods_reused, quotient_reused) = oods_ephemeral
+            .iter()
+            .find_map(|oods| {
+                quotient_stage_ephemeral
+                    .iter()
+                    .find(|quotient| oods.2 < quotient.3 && quotient.2 < oods.3)
+                    .map(|quotient| (oods, quotient))
+            })
+            .expect("sequential OODS and quotient-stage scratch should reuse arena addresses");
+        assert_ne!(oods_reused.0, quotient_reused.0);
+        assert!(!oods_reused.1.overlaps(quotient_reused.1));
         assert!(
             !numerator_ephemeral.is_empty(),
             "numerator scratch must be planned"

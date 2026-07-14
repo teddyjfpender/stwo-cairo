@@ -1556,6 +1556,7 @@ mod tests {
         )
         .unwrap();
         assert_witness_input_slots_satisfy_prepare(&arena);
+        assert_witness_input_compact_lifetimes(&arena);
 
         // Parity with the packaged preflight: `plan_resident_preflight` (the
         // pipeline the `arena_preflight` binary runs) must reproduce this
@@ -1599,6 +1600,114 @@ mod tests {
             preflight.arena.logical_buffers().len(),
             arena.logical_buffers().len()
         );
+    }
+
+    fn assert_witness_input_compact_lifetimes(arena: &ProofArenaPlan) {
+        use crate::arena_plan::{BufferLifetime, BufferPurpose, ProofEpoch};
+
+        let persistent = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble).unwrap();
+        let scratch = BufferLifetime::at(ProofEpoch::Witness);
+        let mut compact_components = 0;
+        for component in &arena.witness().components {
+            let Some(compact) = &component.input_compact else {
+                continue;
+            };
+            compact_components += 1;
+            let persistent_slots = [
+                (
+                    BufferPurpose::WitnessInputCompactSourcePointers,
+                    0,
+                    compact.slots.source_pointers,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactDescriptors,
+                    0,
+                    compact.slots.descriptors,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactOutputPointers,
+                    0,
+                    compact.slots.output_pointers,
+                ),
+            ];
+            let scratch_slots = [
+                (
+                    BufferPurpose::WitnessInputCompactTupleScratch,
+                    0,
+                    compact.slots.tuple_scratch,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactSortKey,
+                    0,
+                    compact.slots.sort_keys_a,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactSortKey,
+                    1,
+                    compact.slots.sort_keys_b,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactSortIndex,
+                    0,
+                    compact.slots.sort_indices_a,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactSortIndex,
+                    1,
+                    compact.slots.sort_indices_b,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactRunHeads,
+                    0,
+                    compact.slots.run_heads,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactRunPositions,
+                    0,
+                    compact.slots.run_positions,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactUniqueCount,
+                    0,
+                    compact.slots.n_unique,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactSortTemp,
+                    0,
+                    compact.slots.sort_temp,
+                ),
+                (
+                    BufferPurpose::WitnessInputCompactScanTemp,
+                    0,
+                    compact.slots.scan_temp,
+                ),
+            ];
+            for (purpose, ordinal, physical) in persistent_slots {
+                let (logical, binding) = arena
+                    .find(
+                        Some(component.component),
+                        Some(component.part),
+                        purpose,
+                        ordinal,
+                    )
+                    .unwrap();
+                assert_eq!(binding.physical, physical);
+                assert_eq!(logical.lifetime, persistent);
+            }
+            for (purpose, ordinal, physical) in scratch_slots {
+                let (logical, binding) = arena
+                    .find(
+                        Some(component.component),
+                        Some(component.part),
+                        purpose,
+                        ordinal,
+                    )
+                    .unwrap();
+                assert_eq!(binding.physical, physical);
+                assert_eq!(logical.lifetime, scratch);
+            }
+        }
+        assert!(compact_components > 0, "fixture must exercise compaction");
     }
 
     #[test]
