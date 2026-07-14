@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use super::{
     admission_verdict, arena_compatibility_aliases_match, budget_bytes_of, missing_aot_kernels,
-    parse_vram_budget_gb, preflight_fit_alias_matches, verdict, AotKernelOccurrence,
-    AotManifestKernel, GIB, WORD_BYTES,
+    parse_resident_backend, parse_vram_budget_gb, preflight_fit_alias_matches, runtime_policy_json,
+    verdict, AotKernelOccurrence, AotManifestKernel, GIB, WORD_BYTES,
 };
 
 #[test]
@@ -24,6 +24,68 @@ fn vram_budget_requires_a_positive_finite_number() {
             "accepted invalid budget {invalid}"
         );
     }
+}
+
+#[test]
+fn resident_backend_selector_is_explicit_and_fail_closed() {
+    use stwo_cairo_gpu_prover::arena_plan::ResidentBackend;
+
+    assert_eq!(
+        parse_resident_backend(["arena_preflight"]),
+        Ok(ResidentBackend::LegacyResident)
+    );
+    assert_eq!(
+        parse_resident_backend(["arena_preflight", "--resident-backend", "replacement-v1"]),
+        Ok(ResidentBackend::ReplacementV1)
+    );
+    assert_eq!(
+        parse_resident_backend(["--resident-backend", "legacy-resident"]),
+        Ok(ResidentBackend::LegacyResident)
+    );
+    for invalid in [
+        vec!["--resident-backend"],
+        vec!["--resident-backend", "--fixture", "test"],
+        vec!["--resident-backend", "unknown"],
+        vec!["--resident-backend=replacement-v1"],
+        vec![
+            "--resident-backend",
+            "legacy-resident",
+            "--resident-backend",
+            "replacement-v1",
+        ],
+    ] {
+        assert!(
+            parse_resident_backend(invalid).is_err(),
+            "accepted invalid resident backend form"
+        );
+    }
+}
+
+#[test]
+fn replacement_policy_json_reports_the_exact_planned_tuple() {
+    use stwo_backend_cuda::RelationLaunchMode;
+    use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
+
+    let value = runtime_policy_json(
+        ProtocolPlanPolicy::replacement_v1(0x1234, 2048),
+        RelationLaunchMode::Fused,
+    );
+    assert_eq!(value["resident_backend"], "replacement-v1");
+    assert_eq!(value["quotient_numerator_schedule"], "hybrid-single-write");
+    assert_eq!(value["kernel_manifest_hash"], "0000000000001234");
+    assert_eq!(value["composition_max_kernel_instrs"], 2048);
+    assert_eq!(
+        value["retained_lde_budget_bytes"],
+        64 * 1024 * 1024 * 1024_u64
+    );
+    assert_eq!(value["commit_mode"], "domain-progressive");
+    assert_eq!(value["direct_composition_retention_mode"], "exact-native");
+    assert_eq!(
+        value["quotient_numerator_source_policy"],
+        "reuse-retained-evaluations"
+    );
+    assert_eq!(value["interpolation_mode"], "stage-fused-out-of-place");
+    assert_eq!(value["relation_launch_mode"], "fused");
 }
 
 #[test]

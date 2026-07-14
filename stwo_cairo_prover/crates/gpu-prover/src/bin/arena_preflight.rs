@@ -33,6 +33,8 @@
 //!   --aot-manifest <path>     required generated/aot_manifest.json whose exact
 //!                             semantic keys must cover this statement
 //!   --vram-budget-gb <f64>   budget in GiB the arena must fit under (default 79)
+//!   --resident-backend <legacy-resident|replacement-v1>
+//!                            immutable resident generation (default legacy-resident)
 //!   --quotient-topology-fixture-output <path>  write the exact versioned numerator topology
 //!   --preprocessed <canonical|canonical-without-pedersen>
 //!                            preprocessed-trace variant override. Default is
@@ -45,6 +47,8 @@
 //! The PCS configuration is pinned to the secure benchmark configuration
 //! (pow_bits=26, FriConfig(0, 1, 70, 3)) — the same "do not change" config in
 //! gpu_bench. Exit code 0 iff the verdict is PASS.
+#[path = "../arena_preflight_cli.rs"]
+mod arena_preflight_cli;
 #[path = "../arena_preflight_hybrid.rs"]
 mod arena_preflight_hybrid;
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,11 +57,15 @@ use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
-use stwo_cairo_gpu_prover::arena_plan::ProofEpoch;
+use stwo_cairo_gpu_prover::arena_plan::{ProofEpoch, ResidentBackend};
 use stwo_cairo_gpu_prover::memory_ledger::{PhysicalMemoryLedger, ARENA_IDLE_DEFINITION};
 use stwo_cairo_gpu_prover::phases;
 use stwo_cairo_gpu_prover::resident_session::{
-    plan_resident_preflight, ResidentPreflightError, ResidentPreflightReport,
+    plan_resident_preflight_for, ResidentPreflightError, ResidentPreflightReport,
+};
+
+use arena_preflight_cli::{
+    arg, budget_bytes_of, parse_resident_backend, parse_vram_budget_gb, runtime_policy_json,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -149,22 +157,6 @@ fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-/// Budget in bytes for a GiB budget flag value.
-fn budget_bytes_of(vram_budget_gb: f64) -> usize {
-    (vram_budget_gb * GIB) as usize
-}
-
-fn parse_vram_budget_gb(value: Option<&str>) -> Result<f64, String> {
-    let value = value.unwrap_or("79");
-    let budget = value
-        .parse::<f64>()
-        .map_err(|error| format!("--vram-budget-gb must be an f64: {error}"))?;
-    if !budget.is_finite() || budget <= 0.0 {
-        return Err("--vram-budget-gb must be finite and greater than zero".to_owned());
-    }
-    Ok(budget)
-}
-
 /// The arena-planning verdict: full capture-safe coverage, no multiplicity
 /// coverage gaps or feed blockers, exact AOT coverage, and arena-allocation fit.
 /// Full process admission additionally requires a complete physical ledger.
@@ -205,16 +197,6 @@ fn arena_compatibility_aliases_match(arena: &serde_json::Value) -> bool {
 fn preflight_fit_alias_matches(record: &serde_json::Value) -> bool {
     record.get("arena_vram_fit").is_some()
         && record.get("arena_vram_fit") == record.get("arena_allocation_vram_fit")
-}
-
-fn arg(name: &str) -> Option<String> {
-    let mut args = std::env::args();
-    while let Some(current) = args.next() {
-        if current == name {
-            return args.next();
-        }
-    }
-    None
 }
 
 fn fail(stage: &str, error: String) -> ExitCode {
@@ -469,12 +451,26 @@ fn compacted_consumer_rows(
 
 fn report_json(
     report: &ResidentPreflightReport,
+    selected_backend: ResidentBackend,
     aot_coverage: &AotCoverage,
     compacted_rows: Vec<serde_json::Value>,
     source: &str,
     vram_budget_gb: f64,
 ) -> serde_json::Value {
     let arena = &report.arena;
+    assert_eq!(report.protocol_policy.resident_backend, selected_backend);
+    assert_eq!(
+        report.protocol_policy.quotient_numerator_schedule,
+        arena.quotient_numerator().schedule
+    );
+    assert_eq!(
+        report.protocol_policy.interpolation_mode,
+        report.interpolation_mode
+    );
+    assert!(arena
+        .commitments()
+        .iter()
+        .all(|commitment| commitment.interpolation_mode == report.interpolation_mode));
     let bytes_of_words = |words: usize| {
         words
             .checked_mul(WORD_BYTES)
@@ -598,6 +594,7 @@ fn report_json(
         "pass": pass,
         "planning_pass": planning_pass,
         "source": source,
+        "selected_resident_backend": selected_backend.cli_name(),
         "present_components": report.present_components.len(),
         "capture_safe_components": report.capture_safe_components.len(),
         "capture_safe_coverage_ok": capture_safe_ok,
@@ -648,18 +645,10 @@ fn report_json(
         },
         "transcript_segments": report.transcript_segments,
         "manifest_policy": format!("{:?}", report.manifest_policy),
-        "runtime_policy": {
-            "commit_mode": format!("{:?}", report.protocol_policy.commit_mode),
-            "direct_composition_retention_mode": format!(
-                "{:?}", report.protocol_policy.direct_composition_retention_mode
-            ),
-            "quotient_numerator_source_policy": format!(
-                "{:?}", report.protocol_policy.quotient_numerator_source_policy
-            ),
-            "retained_lde_budget_bytes": report.protocol_policy.retained_lde_budget_bytes,
-            "interpolation_mode": format!("{:?}", report.interpolation_mode),
-            "relation_launch_mode": format!("{:?}", report.arena.relation().launch_mode),
-        },
+        "runtime_policy": runtime_policy_json(
+            report.protocol_policy,
+            report.arena.relation().launch_mode,
+        ),
         "vram_budget_gib": vram_budget_gb,
         "vram_budget_bytes": budget_bytes,
         "arena_allocation_vram_fit": allocation_bytes <= budget_bytes,
@@ -685,6 +674,10 @@ fn report_json(
 }
 
 fn main() -> ExitCode {
+    let resident_backend = match parse_resident_backend(std::env::args()) {
+        Ok(value) => value,
+        Err(error) => return fail("args", error),
+    };
     let budget_arg = arg("--vram-budget-gb");
     let vram_budget_gb = match parse_vram_budget_gb(budget_arg.as_deref()) {
         Ok(value) => value,
@@ -707,12 +700,13 @@ fn main() -> ExitCode {
     };
     let ingest = phases::ingest::run(input, variant, None);
     let compacted_rows = compacted_consumer_rows(&ingest.proof_plan);
-    let report = match plan_resident_preflight(
+    let report = match plan_resident_preflight_for(
         &ingest.generator,
         &ingest.proof_plan,
         &ingest.preprocessed_trace,
         pcs,
         false,
+        resident_backend,
     ) {
         Ok(report) => report,
         Err(ResidentPreflightError::Session(error)) => {
@@ -727,12 +721,14 @@ fn main() -> ExitCode {
         Ok(coverage) => coverage,
         Err(error) => return fail("aot_manifest", error),
     };
-    if let Err(error) = arena_preflight_hybrid::export_requested(report.arena.quotient_numerator()) {
+    if let Err(error) = arena_preflight_hybrid::export_requested(report.arena.quotient_numerator())
+    {
         return fail("quotient_topology_fixture", error);
     }
 
     let record = report_json(
         &report,
+        resident_backend,
         &aot_coverage,
         compacted_rows,
         &source,
