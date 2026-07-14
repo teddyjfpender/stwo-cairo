@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Cairo e2e proving benchmark in the stwo-book / zkvm-benchmarks format.
 //!
 //! Methodology mirrors zksecurity/zkvm-benchmarks' stwo runner: the program is run in
