@@ -754,6 +754,10 @@ pub fn stage_preprocessed_commitment(
         .any(|column| pedersen_points_18_column_index(&column.identity).is_some());
     let registered_pedersen = uses_registered_pedersen
         .then(|| {
+            // The session admits this immutable process table only through
+            // `try_ensure_device_pedersen_table`, whose request comparison and exact
+            // registration validation bind its canonical digest, source and padded
+            // geometry. This local lookup revalidates reborrow geometry, not content.
             let table = registered_borrowed_pedersen_table()
                 .ok_or(ResidentSourceStageError::RegisteredPedersenTableUnavailable)?;
             let actual_columns = table.columns().len();
@@ -961,168 +965,180 @@ pub fn stage_preprocessed_commitment(
     });
     source_stage_result?;
 
-    let inverse_twiddles = workspace.bind(planned.inverse_twiddles.logical)?.0;
-    let inverse_words = u32::try_from(inverse_twiddles.len_words())
-        .map_err(|_| ResidentSourceStageError::SizeOverflow)?;
-    let stream = workspace.arena().context().stream_raw().as_ptr();
-    let mut descriptor_h2d_bytes = 0usize;
-    for batch in &planned.interpolation_batches {
-        let pointers = batch
-            .column_ordinals
+    let post_handoff_result = (|| {
+        let inverse_twiddles = workspace.bind(planned.inverse_twiddles.logical)?.0;
+        let inverse_words = u32::try_from(inverse_twiddles.len_words())
+            .map_err(|_| ResidentSourceStageError::SizeOverflow)?;
+        let stream = workspace.arena().context().stream_raw().as_ptr();
+        let mut descriptor_h2d_bytes = 0usize;
+        for batch in &planned.interpolation_batches {
+            let pointers = batch
+                .column_ordinals
+                .iter()
+                .map(|&ordinal| {
+                    planned
+                        .columns
+                        .iter()
+                        .position(|column| column.ordinal == ordinal)
+                        .map(|index| destinations[index].as_u32_ptr() as usize)
+                        .ok_or(ResidentSourceStageError::MissingPreprocessedColumn(ordinal))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let pointer_table = workspace.bind(batch.coefficient_pointers.logical)?.0;
+            let bytes = pointers
+                .len()
+                .checked_mul(core::mem::size_of::<usize>())
+                .ok_or(ResidentSourceStageError::SizeOverflow)?;
+            descriptor_h2d_bytes = descriptor_h2d_bytes
+                .checked_add(bytes)
+                .ok_or(ResidentSourceStageError::SizeOverflow)?;
+            unsafe {
+                workspace.arena().context().memcpy_h2d_async(
+                    pointer_table.as_void_ptr(),
+                    pointers.as_ptr().cast(),
+                    bytes,
+                )?;
+            }
+            // `pointers` is ordinary host memory. Fence its async upload before
+            // any later fallible prepare/launch can drop the backing Vec.
+            workspace.arena().context().sync()?;
+            let count = u32::try_from(batch.column_ordinals.len())
+                .map_err(|_| ResidentSourceStageError::SizeOverflow)?;
+            let code = unsafe {
+                stwo_backend_cuda_kernels::raw::stwo_ntt_b2n_columns_on(
+                    pointer_table.as_u32_ptr().cast::<*mut u32>(),
+                    batch.log_size,
+                    count,
+                    inverse_twiddles.as_u32_ptr(),
+                    inverse_words,
+                    1u32 << (batch.log_size - 1),
+                    stream,
+                )
+            };
+            if code != 0 {
+                return Err(ResidentSourceStageError::Runtime(CudaRuntimeError::Cuda {
+                    operation: "preprocessed_interpolation",
+                    code,
+                }));
+            }
+        }
+        let groups = commitment_groups(workspace, &commitment)?;
+        let twiddles = workspace.bind(commitment.twiddles.logical)?.0;
+        let evaluation_outputs = commitment
+            .evaluation_output_groups
             .iter()
-            .map(|&ordinal| {
-                planned
-                    .columns
-                    .iter()
-                    .position(|column| column.ordinal == ordinal)
-                    .map(|index| destinations[index].as_u32_ptr() as usize)
-                    .ok_or(ResidentSourceStageError::MissingPreprocessedColumn(ordinal))
+            .map(|group| {
+                group
+                    .as_ref()
+                    .map(|columns| {
+                        columns
+                            .iter()
+                            .map(|binding| workspace.bind(binding.logical).map(|bound| bound.0))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let pointer_table = workspace.bind(batch.coefficient_pointers.logical)?.0;
-        let bytes = pointers
-            .len()
-            .checked_mul(core::mem::size_of::<usize>())
-            .ok_or(ResidentSourceStageError::SizeOverflow)?;
-        descriptor_h2d_bytes = descriptor_h2d_bytes
-            .checked_add(bytes)
-            .ok_or(ResidentSourceStageError::SizeOverflow)?;
-        unsafe {
-            workspace.arena().context().memcpy_h2d_async(
-                pointer_table.as_void_ptr(),
-                pointers.as_ptr().cast(),
-                bytes,
-            )?;
-        }
-        // `pointers` is ordinary host memory. Fence its async upload before
-        // any later fallible prepare/launch can drop the backing Vec.
-        workspace.arena().context().sync()?;
-        let count = u32::try_from(batch.column_ordinals.len())
-            .map_err(|_| ResidentSourceStageError::SizeOverflow)?;
-        let code = unsafe {
-            stwo_backend_cuda_kernels::raw::stwo_ntt_b2n_columns_on(
-                pointer_table.as_u32_ptr().cast::<*mut u32>(),
-                batch.log_size,
-                count,
-                inverse_twiddles.as_u32_ptr(),
-                inverse_words,
-                1u32 << (batch.log_size - 1),
-                stream,
-            )
+        let (root, retained) = match (&commitment.requirements, &commitment.slots) {
+            (
+                ModeAwareCommitWorkspaceRequirements::FullLifting(_),
+                ModeAwareCommitWorkspaceSlots::FullLifting(slots),
+            ) => {
+                let commit = PreparedCommitGraph::prepare(
+                    workspace.arena(),
+                    commitment.config,
+                    &groups,
+                    twiddles,
+                    slots,
+                )?;
+                commit.launch()?;
+                (
+                    commit.root_slice(),
+                    commit.retained_layers_bottom_up().to_vec(),
+                )
+            }
+            (
+                ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+                ModeAwareCommitWorkspaceSlots::DomainProgressive(slots),
+            ) => {
+                let coefficients = groups
+                    .iter()
+                    .flat_map(|group| group.columns.iter().copied())
+                    .collect::<Vec<_>>();
+                let retained_outputs = groups
+                    .iter()
+                    .zip(&evaluation_outputs)
+                    .flat_map(|(group, retained)| match retained {
+                        Some(retained) => retained.iter().copied().map(Some).collect::<Vec<_>>(),
+                        None => vec![None; group.columns.len()],
+                    })
+                    .collect::<Vec<_>>();
+                let commit = PreparedProgressiveCommitGraph::prepare_with_modes(
+                    workspace.arena(),
+                    commitment.config,
+                    requirements,
+                    slots,
+                    &coefficients,
+                    &retained_outputs,
+                    twiddles,
+                    protocol_identity.commit_mode,
+                    protocol_identity.blake2s_interior_fused,
+                )?;
+                commit.launch()?;
+                (
+                    commit.root_slice(),
+                    commit.retained_layers_bottom_up().to_vec(),
+                )
+            }
+            _ => return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch),
         };
-        if code != 0 {
-            return Err(ResidentSourceStageError::Runtime(CudaRuntimeError::Cuda {
-                operation: "preprocessed_interpolation",
-                code,
-            }));
-        }
-    }
-    let groups = commitment_groups(workspace, &commitment)?;
-    let twiddles = workspace.bind(commitment.twiddles.logical)?.0;
-    let evaluation_outputs = commitment
-        .evaluation_output_groups
-        .iter()
-        .map(|group| {
-            group
-                .as_ref()
-                .map(|columns| {
-                    columns
-                        .iter()
-                        .map(|binding| workspace.bind(binding.logical).map(|bound| bound.0))
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .transpose()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let (root, retained) = match (&commitment.requirements, &commitment.slots) {
-        (
-            ModeAwareCommitWorkspaceRequirements::FullLifting(_),
-            ModeAwareCommitWorkspaceSlots::FullLifting(slots),
-        ) => {
-            let commit = PreparedCommitGraph::prepare(
-                workspace.arena(),
-                commitment.config,
-                &groups,
-                twiddles,
-                slots,
-            )?;
-            commit.launch()?;
-            (
-                commit.root_slice(),
-                commit.retained_layers_bottom_up().to_vec(),
-            )
-        }
-        (
-            ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
-            ModeAwareCommitWorkspaceSlots::DomainProgressive(slots),
-        ) => {
-            let coefficients = groups
+        if root.id() != commitment.root.physical
+            || retained.len() != commitment.retained_layers_bottom_up.len()
+            || retained
                 .iter()
-                .flat_map(|group| group.columns.iter().copied())
-                .collect::<Vec<_>>();
-            let retained_outputs = groups
-                .iter()
-                .zip(&evaluation_outputs)
-                .flat_map(|(group, retained)| match retained {
-                    Some(retained) => retained.iter().copied().map(Some).collect::<Vec<_>>(),
-                    None => vec![None; group.columns.len()],
+                .zip(&commitment.retained_layers_bottom_up)
+                .any(|(actual, expected)| {
+                    actual.id() != expected.physical || actual.len_words() < expected.len_words
                 })
-                .collect::<Vec<_>>();
-            let commit = PreparedProgressiveCommitGraph::prepare_with_modes(
-                workspace.arena(),
-                commitment.config,
-                requirements,
-                slots,
-                &coefficients,
-                &retained_outputs,
-                twiddles,
-                protocol_identity.commit_mode,
-                protocol_identity.blake2s_interior_fused,
-            )?;
-            commit.launch()?;
-            (
-                commit.root_slice(),
-                commit.retained_layers_bottom_up().to_vec(),
-            )
+        {
+            return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch);
         }
-        _ => return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch),
-    };
-    if root.id() != commitment.root.physical
-        || retained.len() != commitment.retained_layers_bottom_up.len()
-        || retained
+        let root_input = CairoTranscriptInput::PreprocessedRoot
+            .id()
+            .map_err(|_| ResidentSourceStageError::MissingPreprocessedRootInput)?;
+        let root_binding = workspace
+            .plan()
+            .transcript()
+            .inputs
             .iter()
-            .zip(&commitment.retained_layers_bottom_up)
-            .any(|(actual, expected)| {
-                actual.id() != expected.physical || actual.len_words() < expected.len_words
-            })
-    {
-        return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch);
-    }
-    let root_input = CairoTranscriptInput::PreprocessedRoot
-        .id()
-        .map_err(|_| ResidentSourceStageError::MissingPreprocessedRootInput)?;
-    let root_binding = workspace
-        .plan()
-        .transcript()
-        .inputs
-        .iter()
-        .find_map(|(id, binding)| (*id == root_input).then_some(*binding))
-        .ok_or(ResidentSourceStageError::MissingPreprocessedRootInput)?;
-    if root_binding.len_words != 8 {
-        return Err(ResidentSourceStageError::PreprocessedRootBindingMismatch {
-            expected_words: 8,
-            actual_words: root_binding.len_words,
-        });
-    }
-    let root_destination = workspace.bind(root_binding.logical)?.0;
-    unsafe {
-        workspace.arena().context().memcpy_d2d_async(
-            root_destination.as_void_ptr(),
-            root.as_void_ptr().cast_const(),
-            8 * core::mem::size_of::<u32>(),
-        )?;
-    }
-    workspace.arena().context().sync()?;
+            .find_map(|(id, binding)| (*id == root_input).then_some(*binding))
+            .ok_or(ResidentSourceStageError::MissingPreprocessedRootInput)?;
+        if root_binding.len_words != 8 {
+            return Err(ResidentSourceStageError::PreprocessedRootBindingMismatch {
+                expected_words: 8,
+                actual_words: root_binding.len_words,
+            });
+        }
+        let root_destination = workspace.bind(root_binding.logical)?.0;
+        unsafe {
+            workspace.arena().context().memcpy_d2d_async(
+                root_destination.as_void_ptr(),
+                root.as_void_ptr().cast_const(),
+                8 * core::mem::size_of::<u32>(),
+            )?;
+        }
+        Ok(descriptor_h2d_bytes)
+    })();
+    // Interpolation and commitment launches share the arena stream. Drain their
+    // successful prefix even when a later binding/shape check fails, preserving the
+    // operation error when synchronization reports a secondary failure.
+    let descriptor_h2d_bytes = fence_after(post_handoff_result, || {
+        workspace
+            .arena()
+            .context()
+            .sync()
+            .map_err(ResidentSourceStageError::from)
+    })?;
     // Detached cold sources have now dropped and their legacy-stream frees
     // were fenced during staging. Return only allocator reserve that is
     // already unused; this cannot and does not reduce the cold setup peak.
@@ -1819,6 +1835,23 @@ mod tests {
         });
         assert_eq!(calls.get(), 2);
         assert_eq!(result, Err("sync"));
+    }
+
+    #[test]
+    fn post_handoff_early_return_still_runs_fence_and_keeps_first_error() {
+        let operations = Cell::new(0);
+        let fences = Cell::new(0);
+        let operation = (|| {
+            operations.set(operations.get() + 1);
+            Err::<(), _>("late_binding")
+        })();
+        let result = fence_after(operation, || {
+            fences.set(fences.get() + 1);
+            Err("arena_sync")
+        });
+        assert_eq!(operations.get(), 1);
+        assert_eq!(fences.get(), 1);
+        assert_eq!(result, Err("late_binding"));
     }
 
     #[test]
