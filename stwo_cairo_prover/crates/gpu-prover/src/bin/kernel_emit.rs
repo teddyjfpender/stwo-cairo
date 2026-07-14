@@ -19,8 +19,12 @@
 //! FAILS the run (loud gap).
 //!
 //! Usage: kernel_emit [--stwo-root <path>] [--max-instrs N]
+//!                    [--max-live-u32-lanes N]
 //!                    [--input-bincode <adapted-input>]... [--check]
 //!        kernel_emit --witness-only --output-dir <witness-lab-path> [--check]
+//! Set `STWO_KERNEL_EMIT_COMPONENT_STATS=1` to print one JSON record per
+//! concrete constraint component. This is intentionally diagnostic-only: it
+//! exposes the exact row geometry and split count without changing the pack.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -122,14 +126,10 @@ fn admit_witness_output_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Per-kernel instruction cap for AOT constraint lowering. MUST MATCH the
-/// runtime lowering cap (`DEFAULT_MAX_KERNEL_INSTRS` in stwo's jit/mod.rs =
-/// 2048): the semantic hash depends on the split, so a mismatched cap means the
-/// runtime's keys never hit the pack (silent NVRTC fallback — the drift check
-/// firing on everything). Manifest steps that override
-/// STWO_JIT_MAX_KERNEL_INSTRS must use this value too; on AOT builds the 512
-/// sm_90 override is obsolete (no load-time ptxas). Raising both caps together
-/// (bigger fused kernels, fewer launches) is a measured follow-up.
+/// Per-kernel instruction cap for AOT constraint lowering. MUST MATCH the runtime
+/// lowering cap (`DEFAULT_MAX_KERNEL_INSTRS` in stwo's jit/mod.rs = 2048). The
+/// lowerer also applies its compiled live-u32-lane cap; both values are sealed into
+/// AOT metadata and the pack hash so a stale policy fails runtime admission.
 const DEFAULT_AOT_MAX_INSTRS: usize = 2048;
 
 struct Emitted {
@@ -138,12 +138,60 @@ struct Emitted {
     kernel: aot::EmittedKernel,
 }
 
+fn print_shape_report(input_path: &str) -> ExitCode {
+    use stwo_cairo_gpu_prover::relation_table::CAIRO_RELATION_GRAPH;
+    use stwo_cairo_prover::witness::proof_shape::RowResolution;
+
+    let bytes = std::fs::read(input_path)
+        .unwrap_or_else(|error| panic!("read adapted input {input_path}: {error}"));
+    let input = bincode::deserialize(&bytes)
+        .unwrap_or_else(|error| panic!("decode adapted input {input_path}: {error}"));
+    let state::IngestOutput { proof_plan, .. } =
+        phases::ingest::run(input, PreProcessedTraceVariant::Canonical, None);
+    let exact = proof_plan
+        .strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)
+        .expect("shape report requires an exact strict-resident proof plan");
+    let components = exact
+        .proof_shape()
+        .components()
+        .iter()
+        .filter_map(|component| match &component.rows {
+            RowResolution::Absent => None,
+            RowResolution::Resolved(parts) => Some(serde_json::json!({
+                "component": component.id,
+                "parts": parts.iter().map(|part| serde_json::json!({
+                    "part": format!("{:?}", part.part),
+                    "n_real_rows": part.n_real_rows,
+                    "padded_rows": part.padded_rows,
+                    "trace_log_size": part.padded_rows.ilog2(),
+                })).collect::<Vec<_>>(),
+                "total_padded_rows": parts.iter().map(|part| part.padded_rows).sum::<u64>(),
+            })),
+            unresolved => panic!(
+                "strict-resident component {} remained unresolved: {unresolved:?}",
+                component.id
+            ),
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": "stwo.kernel-emit.shape-report.v1",
+            "input": input_path,
+            "components": components,
+        }))
+        .expect("serialize shape report")
+    );
+    ExitCode::SUCCESS
+}
+
 fn run_fixture(
     program: &str,
     variant: PreProcessedTraceVariant,
     out: &mut Vec<Emitted>,
     covered: &mut BTreeMap<String, bool>,
     max_instrs: usize,
+    max_live_u32_lanes: usize,
 ) {
     use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
     use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
@@ -158,7 +206,7 @@ fn run_fixture(
     )
     .expect("run_and_adapt fixture");
 
-    run_input(input, variant, out, covered, max_instrs);
+    run_input(input, variant, out, covered, max_instrs, max_live_u32_lanes);
 }
 
 fn run_input(
@@ -167,6 +215,7 @@ fn run_input(
     out: &mut Vec<Emitted>,
     covered: &mut BTreeMap<String, bool>,
     max_instrs: usize,
+    max_live_u32_lanes: usize,
 ) {
     let state::IngestOutput {
         preprocessed_trace,
@@ -206,7 +255,13 @@ fn run_input(
             $(
                 if let Some(c) = &components.$field {
                     covered.insert(stringify!($field).to_string(), true);
-                    emit_component(stringify!($field), c, out, max_instrs);
+                    emit_component(
+                        stringify!($field),
+                        c,
+                        out,
+                        max_instrs,
+                        max_live_u32_lanes,
+                    );
                 } else {
                     covered.entry(stringify!($field).to_string()).or_insert(false);
                 }
@@ -218,15 +273,32 @@ fn run_input(
         component: &stwo_constraint_framework::FrameworkComponent<E>,
         out: &mut Vec<Emitted>,
         max_instrs: usize,
+        max_live_u32_lanes: usize,
     ) {
-        let kernels = aot::constraint_kernel_sources(
+        let kernels = aot::constraint_kernel_sources_with_live_cap(
             component.evaluator(),
             3,
             component.claimed_sum(),
             component.evaluator().log_size(),
             max_instrs,
+            max_live_u32_lanes,
         )
         .unwrap_or_else(|| panic!("constraint lowering failed for {field}"));
+        if std::env::var_os("STWO_KERNEL_EMIT_COMPONENT_STATS").is_some() {
+            eprintln!(
+                "kernel_emit-component: {}",
+                serde_json::json!({
+                    "component": field,
+                    "trace_log_size": component.evaluator().log_size(),
+                    "evaluation_log_size": component.evaluator().max_constraint_log_degree_bound(),
+                    "parts": kernels.len(),
+                    "cache_keys": kernels
+                        .iter()
+                        .map(|kernel| format!("{:016x}", kernel.cache_key))
+                        .collect::<Vec<_>>(),
+                })
+            );
+        }
         for k in kernels {
             out.push(Emitted {
                 kind: "constraint",
@@ -309,7 +381,7 @@ fn run_input(
     // hash — emit from the first (deduped by cache key on write anyway).
     if let Some(c) = components.memory_id_to_big.first() {
         covered.insert("memory_id_to_big".to_string(), true);
-        emit_component("memory_id_to_big", c, out, max_instrs);
+        emit_component("memory_id_to_big", c, out, max_instrs, max_live_u32_lanes);
     } else {
         covered
             .entry("memory_id_to_big".to_string())
@@ -328,6 +400,9 @@ fn main() -> ExitCode {
     } else if cli_args.iter().any(|arg| arg == "--output-dir") {
         eprintln!("kernel_emit: --output-dir requires --witness-only");
         return ExitCode::FAILURE;
+    }
+    if let Some(input_path) = arg("--shape-report-bincode") {
+        return print_shape_report(&input_path);
     }
     let out_dir = if witness_only {
         let output_dirs = args("--output-dir");
@@ -353,6 +428,9 @@ fn main() -> ExitCode {
     let max_instrs = arg("--max-instrs")
         .map(|v| v.parse::<usize>().expect("--max-instrs <N>"))
         .unwrap_or(DEFAULT_AOT_MAX_INSTRS);
+    let max_live_u32_lanes = arg("--max-live-u32-lanes")
+        .map(|v| v.parse::<usize>().expect("--max-live-u32-lanes <N>"))
+        .unwrap_or_else(aot::constraint_split_max_live_u32_lanes);
 
     let mut out: Vec<Emitted> = Vec::new();
 
@@ -376,6 +454,7 @@ fn main() -> ExitCode {
             &mut out,
             &mut covered,
             max_instrs,
+            max_live_u32_lanes,
         );
         run_fixture(
             "test_prove_verify_all_builtins",
@@ -383,6 +462,7 @@ fn main() -> ExitCode {
             &mut out,
             &mut covered,
             max_instrs,
+            max_live_u32_lanes,
         );
         run_fixture(
             "test_prove_verify_pedersen_builtin",
@@ -390,6 +470,7 @@ fn main() -> ExitCode {
             &mut out,
             &mut covered,
             max_instrs,
+            max_live_u32_lanes,
         );
         // The strict resident parity gate proves this exact fixture x variant
         // combination; its small shapes produce constraint variants the SN-scale
@@ -400,6 +481,7 @@ fn main() -> ExitCode {
             &mut out,
             &mut covered,
             max_instrs,
+            max_live_u32_lanes,
         );
         // The staged Step-1.2 gate fixture (SN2 component profile under the
         // Canonical variant the SN PIE lane uses).
@@ -409,6 +491,7 @@ fn main() -> ExitCode {
             &mut out,
             &mut covered,
             max_instrs,
+            max_live_u32_lanes,
         );
         for input_path in args("--input-bincode") {
             eprintln!("kernel_emit: adapted input {input_path} (Canonical)");
@@ -422,6 +505,7 @@ fn main() -> ExitCode {
                 &mut out,
                 &mut covered,
                 max_instrs,
+                max_live_u32_lanes,
             );
         }
         let missing: Vec<&String> = covered
@@ -473,6 +557,10 @@ fn main() -> ExitCode {
         files.insert(
             "aot_constraint_max_instrs.txt".to_string(),
             format!("{max_instrs}\n"),
+        );
+        files.insert(
+            "aot_constraint_max_live_u32_lanes.txt".to_string(),
+            format!("{max_live_u32_lanes}\n"),
         );
     }
 
