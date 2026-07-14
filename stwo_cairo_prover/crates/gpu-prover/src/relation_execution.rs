@@ -491,6 +491,7 @@ impl std::error::Error for RelationExecutionError {}
 
 #[cfg(test)]
 mod tests {
+    use stwo_backend_cuda::relation_batch_fused_eligible;
     use stwo_cairo_prover::witness::cairo_claim_generator::CairoClaimGenerator;
     use stwo_cairo_prover::witness::proof_shape::{
         ProofShape, RuntimeComponentShape, TracePartShape,
@@ -528,6 +529,69 @@ mod tests {
             assert_eq!(source.batch, execution.batches[requirement.batch_index]);
             assert_eq!(source.instance_index, requirement.instance_index);
         }
+    }
+
+    #[test]
+    fn generated_production_graph_proves_exact_sn3_denominator_retirement() {
+        // Eligibility is a property of each generated batch's columns and
+        // tuple widths, not its runtime row count. Lowering the complete
+        // machine-written graph therefore proves every instance in SN1-SN4,
+        // including batches absent from any one proof shape.
+        let shape = CairoClaimGenerator::default().proof_shape(None).unwrap();
+        let proof =
+            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
+        let execution =
+            RelationExecutionPlan::from_proof_plan(&proof, &CAIRO_RELATION_GRAPH).unwrap();
+        let ineligible = execution
+            .kernel_program
+            .batches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, batch)| {
+                (!relation_batch_fused_eligible(batch)).then_some(execution.batches[index])
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            ineligible.is_empty(),
+            "generated production relation batches escaped fused coverage: {ineligible:?}"
+        );
+
+        let full = execution
+            .requirements_for_mode(RelationLaunchMode::ThreeStage)
+            .unwrap();
+        let compact = execution
+            .requirements_for_mode(RelationLaunchMode::Fused)
+            .unwrap();
+        assert_eq!(full.instances.len(), compact.instances.len());
+        assert!(compact
+            .instances
+            .iter()
+            .all(|instance| instance.denominator_words == 1));
+
+        // Sealed SN3 arena facts independently identify 58 instances (928 B
+        // claimed sums / 16 B each, and 2,552 B geometry / 44 B each). Since
+        // every production batch above is eligible, no SN3 instance can retain
+        // a slab: only one 4-byte sentinel per instance remains.
+        const SN3_RELATION_INSTANCES: usize = 58;
+        const SN3_LEGACY_DENOMINATOR_BYTES: usize = 4_226_842_816;
+        const QM31_BYTES: usize = 16;
+        const RETIRED_HBM_BYTES_PER_FRACTION: usize = 96;
+        assert_eq!(928 / 16, SN3_RELATION_INSTANCES);
+        assert_eq!(2_552 / 44, SN3_RELATION_INSTANCES);
+        let compact_bytes = SN3_RELATION_INSTANCES * core::mem::size_of::<u32>();
+        assert_eq!(compact_bytes, 232);
+        assert_eq!(SN3_LEGACY_DENOMINATOR_BYTES - compact_bytes, 4_226_842_584);
+
+        // Each old fallback fraction moved 112 logical HBM bytes after source
+        // evaluation (pair writes 32, inverse read/write 32, chain reads 32 +
+        // final write 16); the wide lane writes only the final 16. This is a
+        // pass-byte lower bound, independent of cache transaction effects.
+        let fallback_fractions = SN3_LEGACY_DENOMINATOR_BYTES / QM31_BYTES;
+        assert_eq!(fallback_fractions, 264_177_676);
+        assert_eq!(
+            fallback_fractions * RETIRED_HBM_BYTES_PER_FRACTION,
+            25_361_056_896
+        );
     }
 
     #[test]
