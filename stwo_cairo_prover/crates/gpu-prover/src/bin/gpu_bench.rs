@@ -13,6 +13,7 @@
 //! Usage:
 //!   gpu_bench --program path/to/compiled.json --iterations N --backend cuda|simd \
 //!             [--engine legacy|gpu-native] \
+//!             [--resident-backend legacy-resident|replacement-v1] \
 //!             [--reps 3] [--pipeline <depth>] [--reuse-input] [--adapt-only] \
 //!             [--require-proof-byte-equal] [--require-gpu-native-architecture] \
 //!             [--diagnostic-allow-slow-graph-submit] \
@@ -90,6 +91,7 @@
 //!   simd_reference_fresh, simd_reference_s,
 //!   proof_mutation_required, proof_mutation_kind,
 //!   proof_mutation_rejected, proof_mutation_error_class,
+//!   gpu_resident_backend_requested,
 //!   gpu_pcs_driver_architecture, gpu_pcs_runtime_mode,
 //!   gpu_pcs_stage_started, gpu_pcs_stage_finished,
 //!   gpu_pcs_batched_tree_decommit, gpu_pcs_driver_complete,
@@ -132,6 +134,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo_cairo_adapter::adapter::adapt;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+use stwo_cairo_gpu_prover::arena_plan::ResidentBackend;
 use stwo_cairo_gpu_prover::{
     CudaPcsDriverTelemetry, CudaPcsRuntimeMode, GpuCairoProver, GpuProverConfig,
     ResidentSessionTelemetry,
@@ -180,6 +183,55 @@ impl RequiredCudaPcsRuntimeMode {
             Self::ArenaGraph => "arena-graph",
         }
     }
+}
+
+fn parse_resident_backend(value: Option<&str>) -> Result<ResidentBackend, String> {
+    match value {
+        Some("legacy-resident") => Ok(ResidentBackend::LegacyResident),
+        Some("replacement-v1") => Ok(ResidentBackend::ReplacementV1),
+        Some(other) => Err(format!(
+            "--resident-backend must be legacy-resident or replacement-v1, got {other}"
+        )),
+        None => Err("--resident-backend requires a value".to_string()),
+    }
+}
+
+fn select_resident_backend(
+    flag_present: bool,
+    value: Option<&str>,
+) -> Result<ResidentBackend, String> {
+    if flag_present {
+        parse_resident_backend(value)
+    } else {
+        Ok(ResidentBackend::LegacyResident)
+    }
+}
+
+fn resident_backend_gate(
+    selected: ResidentBackend,
+    architecture_required: bool,
+    runtime_mode: RequiredCudaPcsRuntimeMode,
+) -> Result<(), &'static str> {
+    if selected == ResidentBackend::ReplacementV1
+        && (!architecture_required || runtime_mode != RequiredCudaPcsRuntimeMode::ArenaGraph)
+    {
+        return Err(
+            "replacement-v1 requires --require-gpu-native-architecture and --require-gpu-pcs-runtime-mode arena-graph",
+        );
+    }
+    Ok(())
+}
+
+fn configure_resident_backend(
+    config: &mut GpuProverConfig,
+    selected: ResidentBackend,
+    architecture_required: bool,
+    runtime_mode: RequiredCudaPcsRuntimeMode,
+) -> Result<(), &'static str> {
+    resident_backend_gate(selected, architecture_required, runtime_mode)?;
+    config.resident_backend = selected;
+    config.strict = architecture_required && runtime_mode == RequiredCudaPcsRuntimeMode::ArenaGraph;
+    Ok(())
 }
 
 /// Prover engine: `legacy` (`prove_cairo` — the parity oracle) or `gpu-native`
@@ -258,8 +310,16 @@ fn prove_gpu_native(
 
 fn gpu_native_prover_config() -> GpuProverConfig {
     let mut config = GpuProverConfig::default();
-    config.strict = gpu_native_architecture_required()
-        && required_gpu_pcs_runtime_mode() == RequiredCudaPcsRuntimeMode::ArenaGraph;
+    let architecture_required = gpu_native_architecture_required();
+    let runtime_mode = required_gpu_pcs_runtime_mode();
+    let resident_backend = requested_resident_backend();
+    configure_resident_backend(
+        &mut config,
+        resident_backend,
+        architecture_required,
+        runtime_mode,
+    )
+    .unwrap_or_else(|error| panic!("GPU resident backend gate failed: {error}"));
     config.allow_slow_graph_submit_diagnostic = graph_submit_gap_diagnostic();
     config.operational_safety_reserve_bytes = gpu_bench_physical::operational_safety_reserve_bytes(
         arg("--operational-safety-reserve-bytes"),
@@ -281,6 +341,24 @@ fn arg(name: &str) -> Option<String> {
 /// Presence check for value-less boolean flags (`arg` would look at the next token).
 fn flag(name: &str) -> bool {
     std::env::args().any(|a| a == name)
+}
+
+fn requested_resident_backend() -> ResidentBackend {
+    let value = arg("--resident-backend");
+    let value = value
+        .as_deref()
+        .filter(|candidate| !candidate.starts_with("--"));
+    select_resident_backend(flag("--resident-backend"), value)
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn enforce_resident_backend_invocation() {
+    resident_backend_gate(
+        requested_resident_backend(),
+        gpu_native_architecture_required(),
+        required_gpu_pcs_runtime_mode(),
+    )
+    .unwrap_or_else(|error| panic!("GPU resident backend gate failed: {error}"));
 }
 
 fn gpu_native_architecture_required() -> bool {
@@ -979,6 +1057,7 @@ fn record_context(backend: &str) -> serde_json::Value {
         "gpu": gpu_name(backend),
         "nproc": nproc(),
         "host_mem_gb": round3(host_mem_gb()),
+        "gpu_resident_backend_requested": requested_resident_backend().cli_name(),
         "gpu_native_architecture_required": architecture_required,
         "gpu_pcs_required_runtime_mode": required_mode.map(RequiredCudaPcsRuntimeMode::cli_name),
         "gpu_native_architecture_gate_passed": architecture_required.then_some(true),
@@ -2065,6 +2144,7 @@ fn main() {
         _ => {}
     }
     let backend = arg("--backend").unwrap_or_else(|| "cuda".to_string());
+    enforce_resident_backend_invocation();
     enforce_gpu_native_architecture_invocation(&backend);
     let reuse_input = flag("--reuse-input");
     if simd_reference_required() {
@@ -2306,14 +2386,15 @@ mod tests {
     use stwo_backend_cuda::CudaExecTelemetry;
 
     use super::{
-        cairo_verification_error_class, initial_proof_byte_equal, mutate_claimed_sum,
-        pcs_telemetry_json, performance_claim_admissible_for, proof_byte_equal_gate_passes,
-        proof_mutation_gate_passes, quantile, resident_session_telemetry_json,
+        cairo_verification_error_class, configure_resident_backend, initial_proof_byte_equal,
+        mutate_claimed_sum, parse_resident_backend, pcs_telemetry_json,
+        performance_claim_admissible_for, proof_byte_equal_gate_passes, proof_mutation_gate_passes,
+        quantile, resident_session_telemetry_json, select_resident_backend,
         simd_reference_gate_passes, simd_reference_reuse_input_gate_passes, throughput_mhz,
         validate_gpu_native_architecture, validate_resident_session_architecture,
         validate_strict_aot_provenance, AotRuntimeStats, CairoVerificationError,
-        CudaPcsDriverTelemetry, CudaPcsRuntimeMode, RequiredCudaPcsRuntimeMode,
-        ResidentSessionTelemetry, SecureField, REQUIRED_CUDA_PCS_ARCHITECTURE,
+        CudaPcsDriverTelemetry, CudaPcsRuntimeMode, GpuProverConfig, RequiredCudaPcsRuntimeMode,
+        ResidentBackend, ResidentSessionTelemetry, SecureField, REQUIRED_CUDA_PCS_ARCHITECTURE,
     };
 
     fn complete_telemetry(runtime_mode: CudaPcsRuntimeMode) -> CudaPcsDriverTelemetry {
@@ -2349,6 +2430,65 @@ mod tests {
     fn mixed_statement_throughput_distribution_is_not_applicable() {
         assert_eq!(throughput_mhz(Some(10_000_000), Some(2.0), false), None);
         assert_eq!(throughput_mhz(Some(10_000_000), Some(2.0), true), Some(5.0));
+    }
+
+    #[test]
+    fn resident_backend_parser_is_exact_and_fail_closed() {
+        assert_eq!(
+            parse_resident_backend(Some("legacy-resident")).unwrap(),
+            ResidentBackend::LegacyResident
+        );
+        assert_eq!(
+            parse_resident_backend(Some("replacement-v1")).unwrap(),
+            ResidentBackend::ReplacementV1
+        );
+        assert!(parse_resident_backend(Some("replacement")).is_err());
+        assert!(parse_resident_backend(None).is_err());
+        assert_eq!(
+            select_resident_backend(false, None).unwrap(),
+            ResidentBackend::LegacyResident
+        );
+        assert!(select_resident_backend(true, None).is_err());
+    }
+
+    #[test]
+    fn resident_backend_config_requires_strict_arena_graph_for_replacement() {
+        let mut legacy = GpuProverConfig::default();
+        configure_resident_backend(
+            &mut legacy,
+            ResidentBackend::LegacyResident,
+            false,
+            RequiredCudaPcsRuntimeMode::DetachedEager,
+        )
+        .unwrap();
+        assert_eq!(legacy.resident_backend, ResidentBackend::LegacyResident);
+        assert!(!legacy.strict);
+
+        let mut replacement = GpuProverConfig::default();
+        configure_resident_backend(
+            &mut replacement,
+            ResidentBackend::ReplacementV1,
+            true,
+            RequiredCudaPcsRuntimeMode::ArenaGraph,
+        )
+        .unwrap();
+        assert_eq!(replacement.resident_backend, ResidentBackend::ReplacementV1);
+        assert!(replacement.strict);
+
+        assert!(configure_resident_backend(
+            &mut GpuProverConfig::default(),
+            ResidentBackend::ReplacementV1,
+            false,
+            RequiredCudaPcsRuntimeMode::ArenaGraph,
+        )
+        .is_err());
+        assert!(configure_resident_backend(
+            &mut GpuProverConfig::default(),
+            ResidentBackend::ReplacementV1,
+            true,
+            RequiredCudaPcsRuntimeMode::DetachedEager,
+        )
+        .is_err());
     }
 
     #[test]
