@@ -51,7 +51,6 @@ use stwo_cairo_prover::witness::utils::witness_trace_cells;
 use stwo_constraint_framework::{FrameworkBackend, LogupFinalizeBackend};
 use tracing::{span, Level};
 
-use crate::arena_plan::ProofArenaPlan;
 use crate::graphs::{GraphError, GraphWorkspace};
 use crate::protocol_discovery::interaction_claim_from_flattened;
 use crate::relation_table::CAIRO_RELATION_GRAPH;
@@ -65,6 +64,7 @@ use crate::resident_session::{
 use crate::resident_witness::{planned_cairo_claim, require_strict_resident_witness_coverage};
 use crate::schedule::ScheduleError;
 use crate::schedule_table::CAIRO_SCHEDULE;
+use crate::shape_executable::{ShapeExecutable, ShapeExecutableCache};
 use crate::state::{IngestOutput, WitnessOutput};
 use crate::workspace_cache::{
     WorkspaceCache, WorkspaceCacheError, WorkspaceKey, WorkspaceMaterialization,
@@ -472,6 +472,9 @@ where
     /// context inside its arena; merely caching one does not activate resident
     /// execution for a proof.
     workspace_cache: WorkspaceCache,
+    /// Persistent typed host executable cache. Workspace reuse is admitted
+    /// only when this cache supplies the exact topology and arena identity.
+    shape_executable_cache: ShapeExecutableCache,
     /// Architecture proof that the last successful gpu-native call used the
     /// concrete CUDA PCS state machine and completed every stage exactly once.
     last_pcs_telemetry: Option<CudaPcsDriverTelemetry>,
@@ -526,9 +529,12 @@ where
         // (explicit env, including =0 kill switches, always wins) — design §3.
         crate::flags::apply_gpu_native_defaults();
         let workspace_cache = WorkspaceCache::new(config.workspace_cache_capacity)?;
+        let shape_executable_cache = ShapeExecutableCache::new(config.workspace_cache_capacity)
+            .map_err(ResidentSessionError::from)?;
         Ok(Self {
             config,
             workspace_cache,
+            shape_executable_cache,
             last_pcs_telemetry: None,
             last_resident_session_telemetry: None,
             last_aot_stats: None,
@@ -560,6 +566,10 @@ where
 
     pub fn workspace_cache_mut(&mut self) -> &mut WorkspaceCache {
         &mut self.workspace_cache
+    }
+
+    pub fn shape_executable_cache(&self) -> &ShapeExecutableCache {
+        &self.shape_executable_cache
     }
 
     /// Compatibility view for the former single-workspace API. Multi-key
@@ -597,17 +607,17 @@ where
     /// arena-bound PCS configuration is passed to the prove path.
     pub fn materialize_graph_workspace(
         &mut self,
-        plan: Arc<ProofArenaPlan>,
+        executable: &ShapeExecutable,
     ) -> Result<(), GpuError> {
-        self.materialize_or_reuse_graph_workspace(plan)?;
+        self.materialize_or_reuse_graph_workspace(executable)?;
         Ok(())
     }
 
     pub fn materialize_or_reuse_graph_workspace(
         &mut self,
-        plan: Arc<ProofArenaPlan>,
+        executable: &ShapeExecutable,
     ) -> Result<WorkspaceMaterialization, GpuError> {
-        let (_, materialization) = self.workspace_cache.materialize_or_reuse(plan)?;
+        let (_, materialization) = self.workspace_cache.materialize_or_reuse(executable)?;
         Ok(materialization)
     }
 
@@ -654,6 +664,7 @@ where
             resident_max_domain_log_size(&planned_claim, &preprocessed_trace, params.pcs_config)?;
         let twiddles = self.twiddle_tree(max_domain);
         Ok(with_resident_session_from_generator(
+            &mut self.shape_executable_cache,
             &mut self.workspace_cache,
             ResidentPreWitnessSessionRequest {
                 preprocessed_trace,
@@ -693,6 +704,7 @@ where
         let max_domain = resident_max_domain_log_size(&witness.claim, &preprocessed_trace, pcs)?;
         let twiddles = self.twiddle_tree(max_domain);
         Ok(with_resident_session(
+            &mut self.shape_executable_cache,
             &mut self.workspace_cache,
             ResidentSessionRequest {
                 preprocessed_trace,

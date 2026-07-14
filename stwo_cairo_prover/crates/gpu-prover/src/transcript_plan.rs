@@ -305,7 +305,6 @@ struct ClaimMixShape {
 impl ClaimMixShape {
     fn from_claim(claim: &CairoClaim) -> Result<Self, TranscriptPlanError> {
         let flat = claim.flatten_claim();
-        let (public_data, ..) = claim.public_data.pack_into_u32s();
         Ok(Self {
             enable_felts: packed_felt_count(
                 flat.component_enable_bits.len(),
@@ -315,9 +314,17 @@ impl ClaimMixShape {
                 flat.component_log_sizes.len(),
                 ClaimMixSegment::ComponentLogSizes,
             )?,
-            public_data_felts: packed_felt_count(public_data.len(), ClaimMixSegment::PublicData)?,
+            public_data_felts: claim_public_data_felt_count(claim)?,
         })
     }
+}
+
+/// Exact topology-bearing length of the packed public-data claim segment.
+/// Public-data values vary per proof, but changing this felt count changes the
+/// transcript schedule and therefore cannot reuse a shape executable.
+pub(crate) fn claim_public_data_felt_count(claim: &CairoClaim) -> Result<u32, TranscriptPlanError> {
+    let (public_data, ..) = claim.public_data.pack_into_u32s();
+    packed_felt_count(public_data.len(), ClaimMixSegment::PublicData)
 }
 
 /// Complete protocol schedule plus graph-safe transcript dependency segments.

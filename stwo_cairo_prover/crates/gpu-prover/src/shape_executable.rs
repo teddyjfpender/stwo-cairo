@@ -5,15 +5,21 @@
 //! rule. A hit re-records only proof-varying composition parameters and proves
 //! that they still lower to the installed AOT kernel identities.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, OnceLock};
 
 use cairo_air::claims::CairoClaim;
 use cairo_air::relations::CommonLookupElements;
 use stwo::core::pcs::PcsConfig;
-use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
+use stwo_backend_cuda::ArenaSlotSpec;
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
+    PreProcessedTrace, PreProcessedTraceVariant,
+};
 use stwo_cairo_prover::witness::proof_shape::{ProofShape, RowResolution, TracePartId};
 
-use crate::arena_plan::{ArenaPlanError, ExecutionTableGeometry, ProofArenaPlan};
+use crate::arena_plan::{
+    ArenaBinding, ArenaPlanError, ExecutionTableGeometry, LogicalBuffer, ProofArenaPlan,
+};
 use crate::composition_plan::{
     bind_cairo_composition, plan_cairo_composition, CompositionPlan, CompositionPlanError,
     CompositionProofBindings,
@@ -21,11 +27,12 @@ use crate::composition_plan::{
 use crate::plan::ProofPlan;
 use crate::protocol_discovery::{
     discover_protocol_transcript_shape, schema_zero_interaction_claim_for_composition,
-    ProtocolDiscoveryError,
+    ProtocolDiscoveryError, ProtocolTranscriptDiscovery,
 };
 use crate::protocol_plan::{plan_protocol_geometry, ProtocolPlanError, ProtocolPlanPolicy};
 use crate::transcript_plan::{
-    plan_cairo_blake2s_transcript, CairoBlake2sTranscriptPlan, TranscriptPlanError,
+    claim_public_data_felt_count, plan_cairo_blake2s_transcript, CairoBlake2sTranscriptPlan,
+    TranscriptPlanError,
 };
 use crate::workspace_cache::WorkspaceKey;
 
@@ -59,6 +66,8 @@ pub struct TopologyKey {
     shape: ProofShape,
     relation_graph_hash: u64,
     claim_log_sizes: Vec<Vec<u32>>,
+    claim_public_data_felts: u32,
+    preprocessed_trace_variant: PreProcessedTraceVariant,
     preprocessed_columns: Vec<(String, u32)>,
     pcs: PcsTopology,
     include_all_preprocessed_columns: bool,
@@ -76,17 +85,15 @@ impl TopologyKey {
         include_all_preprocessed_columns: bool,
         execution_tables: Option<ExecutionTableGeometry>,
         policy: ProtocolPlanPolicy,
-    ) -> Self {
+    ) -> Result<Self, ShapeExecutableError> {
+        let preprocessed_columns = canonical_preprocessed_columns(preprocessed_trace)?;
         let mut key = Self {
             shape: proof_plan.proof_shape().clone(),
             relation_graph_hash: proof_plan.relation_graph_hash,
             claim_log_sizes: claim.log_sizes().0,
-            preprocessed_columns: preprocessed_trace
-                .ids()
-                .into_iter()
-                .zip(preprocessed_trace.log_sizes())
-                .map(|(id, log_size)| (id.id, log_size))
-                .collect(),
+            claim_public_data_felts: claim_public_data_felt_count(claim)?,
+            preprocessed_trace_variant: preprocessed_trace.variant,
+            preprocessed_columns,
             pcs: pcs.into(),
             include_all_preprocessed_columns,
             execution_tables,
@@ -94,7 +101,7 @@ impl TopologyKey {
             digest: [0; 32],
         };
         key.digest = key.compute_digest();
-        key
+        Ok(key)
     }
 
     pub const fn digest(&self) -> [u8; 32] {
@@ -103,7 +110,7 @@ impl TopologyKey {
 
     fn compute_digest(&self) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
-        hash.update(b"stwo-cairo-shape-executable-v1\0");
+        hash.update(b"stwo-cairo-shape-executable-v2\0");
         feed_u64(&mut hash, self.relation_graph_hash);
         for component in self.shape.components() {
             feed_bytes(&mut hash, component.id.as_bytes());
@@ -155,6 +162,8 @@ impl TopologyKey {
                 hash.update(&log_size.to_le_bytes());
             }
         }
+        hash.update(&self.claim_public_data_felts.to_le_bytes());
+        hash.update(&[preprocessed_variant_tag(self.preprocessed_trace_variant)]);
         for (id, log_size) in &self.preprocessed_columns {
             feed_bytes(&mut hash, id.as_bytes());
             hash.update(&log_size.to_le_bytes());
@@ -196,6 +205,131 @@ impl TopologyKey {
     }
 }
 
+fn preprocessed_variant_tag(variant: PreProcessedTraceVariant) -> u8 {
+    match variant {
+        PreProcessedTraceVariant::Canonical => 0,
+        PreProcessedTraceVariant::CanonicalWithoutPedersen => 1,
+        PreProcessedTraceVariant::CanonicalSmall => 2,
+    }
+}
+
+fn ordered_preprocessed_columns(trace: &PreProcessedTrace) -> Vec<(String, u32)> {
+    trace
+        .ids()
+        .into_iter()
+        .zip(trace.log_sizes())
+        .map(|(id, log_size)| (id.id, log_size))
+        .collect()
+}
+
+fn canonical_preprocessed_columns(
+    supplied: &PreProcessedTrace,
+) -> Result<Vec<(String, u32)>, ShapeExecutableError> {
+    let supplied_columns = ordered_preprocessed_columns(supplied);
+    static CANONICAL_COLUMNS: OnceLock<[Vec<(String, u32)>; 3]> = OnceLock::new();
+    let expected_columns = &CANONICAL_COLUMNS.get_or_init(|| {
+        PreProcessedTraceVariant::ALL_VARIANTS
+            .map(|variant| ordered_preprocessed_columns(&variant.to_preprocessed_trace()))
+    })[usize::from(preprocessed_variant_tag(supplied.variant))];
+    if &supplied_columns != expected_columns {
+        let first_mismatch = supplied_columns
+            .iter()
+            .zip(expected_columns)
+            .position(|(supplied, expected)| supplied != expected)
+            .unwrap_or_else(|| supplied_columns.len().min(expected_columns.len()));
+        return Err(ShapeExecutableError::NonCanonicalPreprocessedGeometry {
+            variant: supplied.variant,
+            supplied_columns: supplied_columns.len(),
+            expected_columns: expected_columns.len(),
+            first_mismatch,
+        });
+    }
+    Ok(supplied_columns)
+}
+
+/// Exact structural identity of the stable device allocation compiled for one
+/// topology. The short workspace key remains useful for telemetry, but never
+/// participates in cache admission by itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceLayoutIdentity {
+    total_words: usize,
+    logical: Vec<LogicalBuffer>,
+    bindings: Vec<ArenaBinding>,
+    slots: Vec<ArenaSlotSpec>,
+}
+
+impl WorkspaceLayoutIdentity {
+    fn from_plan(plan: &ProofArenaPlan) -> Result<Self, ShapeExecutableError> {
+        let physical = plan
+            .bindings()
+            .iter()
+            .map(|binding| binding.physical)
+            .collect::<BTreeSet<_>>();
+        let slots = physical
+            .into_iter()
+            .map(|id| {
+                plan.layout()
+                    .slot(id)
+                    .ok_or(ShapeExecutableError::MissingArenaSlot(id))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if slots.len() != plan.range_view_count() {
+            return Err(ShapeExecutableError::ArenaViewCountMismatch {
+                bound: slots.len(),
+                planned: plan.range_view_count(),
+            });
+        }
+        Ok(Self {
+            total_words: plan.total_words(),
+            logical: plan.logical_buffers().to_vec(),
+            bindings: plan.bindings().to_vec(),
+            slots,
+        })
+    }
+
+    fn matches_plan(&self, plan: &ProofArenaPlan) -> bool {
+        self.total_words == plan.total_words()
+            && self.logical == plan.logical_buffers()
+            && self.bindings == plan.bindings()
+            && self.slots.len() == plan.range_view_count()
+            && self
+                .slots
+                .iter()
+                .all(|slot| plan.layout().slot(slot.id) == Some(*slot))
+    }
+}
+
+/// Full typed admission proof carried from host compilation into the CUDA
+/// workspace cache. Equality compares canonical topology and physical layout;
+/// the two-u64 [`WorkspaceKey`] is diagnostic metadata only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceAdmission {
+    key: WorkspaceKey,
+    topology: Arc<TopologyKey>,
+    layout: Arc<WorkspaceLayoutIdentity>,
+}
+
+impl WorkspaceAdmission {
+    fn compile(
+        topology: Arc<TopologyKey>,
+        plan: &ProofArenaPlan,
+    ) -> Result<Self, ShapeExecutableError> {
+        Ok(Self {
+            key: WorkspaceKey::from_plan(plan),
+            topology,
+            layout: Arc::new(WorkspaceLayoutIdentity::from_plan(plan)?),
+        })
+    }
+
+    pub const fn workspace_key(&self) -> WorkspaceKey {
+        self.key
+    }
+
+    pub(crate) fn matches_plan(&self, plan: &ProofArenaPlan) -> bool {
+        self.key == WorkspaceKey::from_plan(plan) && self.layout.matches_plan(plan)
+    }
+}
+
 fn feed_bytes(hash: &mut blake3::Hasher, bytes: &[u8]) {
     feed_usize(hash, bytes.len());
     hash.update(bytes);
@@ -212,16 +346,16 @@ fn feed_u64(hash: &mut blake3::Hasher, value: u64) {
 /// Host half of the durable shape executable. CUDA workspace ownership remains
 /// in `WorkspaceCache`; both use the same exact topology and arena plan.
 pub struct ShapeExecutable {
-    topology: TopologyKey,
+    admission: WorkspaceAdmission,
+    discovery: ProtocolTranscriptDiscovery,
     transcript: CairoBlake2sTranscriptPlan,
     composition: CompositionPlan,
     arena: Arc<ProofArenaPlan>,
-    workspace_key: WorkspaceKey,
 }
 
 impl ShapeExecutable {
     pub fn topology(&self) -> &TopologyKey {
-        &self.topology
+        &self.admission.topology
     }
 
     pub fn arena(&self) -> &Arc<ProofArenaPlan> {
@@ -229,7 +363,15 @@ impl ShapeExecutable {
     }
 
     pub fn workspace_key(&self) -> WorkspaceKey {
-        self.workspace_key
+        self.admission.workspace_key()
+    }
+
+    pub fn workspace_admission(&self) -> &WorkspaceAdmission {
+        &self.admission
+    }
+
+    pub(crate) fn discovery(&self) -> &ProtocolTranscriptDiscovery {
+        &self.discovery
     }
 
     pub(crate) fn transcript(&self) -> &CairoBlake2sTranscriptPlan {
@@ -308,11 +450,11 @@ impl ShapeExecutableCache {
             request.include_all_preprocessed_columns,
             request.execution_tables,
             request.policy,
-        );
+        )?;
         if let Some(executable) = self
             .entries
             .iter()
-            .find(|executable| executable.topology == topology)
+            .find(|executable| executable.topology() == &topology)
             .cloned()
         {
             let interaction = schema_zero_interaction_claim_for_composition(request.claim)?;
@@ -415,13 +557,13 @@ fn compile_shape_executable(
         )?,
         None => ProofArenaPlan::build(request.proof_plan, &protocol, &composition)?,
     });
-    let workspace_key = WorkspaceKey::from_plan(&arena);
+    let admission = WorkspaceAdmission::compile(Arc::new(topology), &arena)?;
     Ok(ShapeExecutable {
-        topology,
+        admission,
+        discovery,
         transcript,
         composition,
         arena,
-        workspace_key,
     })
 }
 
@@ -438,11 +580,22 @@ pub enum ShapeExecutableError {
         lifting: u32,
         required: u32,
     },
+    NonCanonicalPreprocessedGeometry {
+        variant: PreProcessedTraceVariant,
+        supplied_columns: usize,
+        expected_columns: usize,
+        first_mismatch: usize,
+    },
     Discovery(ProtocolDiscoveryError),
     Transcript(TranscriptPlanError),
     Composition(CompositionPlanError),
     Protocol(ProtocolPlanError),
     Arena(ArenaPlanError),
+    MissingArenaSlot(stwo_backend_cuda::ArenaSlotId),
+    ArenaViewCountMismatch {
+        bound: usize,
+        planned: usize,
+    },
 }
 
 impl core::fmt::Display for ShapeExecutableError {
@@ -468,3 +621,7 @@ convert_error!(TranscriptPlanError, Transcript);
 convert_error!(CompositionPlanError, Composition);
 convert_error!(ProtocolPlanError, Protocol);
 convert_error!(ArenaPlanError, Arena);
+
+#[cfg(test)]
+#[path = "shape_executable_tests.rs"]
+mod tests;

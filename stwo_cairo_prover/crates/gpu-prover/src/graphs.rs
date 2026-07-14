@@ -16,14 +16,13 @@ use stwo_backend_cuda::{
 use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
 
 use crate::arena_plan::{ArenaBinding, ArenaPlanError, LogicalBufferId, ProofArenaPlan};
+use crate::shape_executable::WorkspaceAdmission;
 
-/// Bind a plan binding against its stable arena, truncated to the binding's
-/// logical length. The colorer pools epoch-disjoint logical buffers into one
-/// physical slot sized to the LARGEST sharer, so `DeviceArena::bind` alone
-/// returns whole-slot slices whose `len_words()` is the pooled maximum. Every
-/// resident bind of an [`ArenaBinding`] must go through here (or
-/// [`GraphWorkspace::bind`]) so kernel extents, memsets, and END-relative
-/// indexing only ever observe the logical requirement.
+/// Bind one exact stable range view, truncated defensively to its logical
+/// length. Distinct epoch-disjoint identities may reuse the same address while
+/// retaining distinct slot ids; every resident [`ArenaBinding`] still passes
+/// through here (or [`GraphWorkspace::bind`]) so kernel extents, memsets and
+/// END-relative indexing observe only the declared logical requirement.
 pub(crate) fn bind_arena_binding(
     arena: &DeviceArena,
     binding: ArenaBinding,
@@ -291,6 +290,7 @@ impl<T> PersistentGraphCache<T> {
 /// before freeing the slab or its stream/pool context.
 pub struct GraphWorkspace {
     graphs: PersistentGraphCache<PhaseGraph>,
+    admission: WorkspaceAdmission,
     plan: Arc<ProofArenaPlan>,
     arena: DeviceArena,
     /// Fixed preprocessed coefficients, Merkle tree and transcript root are
@@ -303,13 +303,15 @@ pub struct GraphWorkspace {
 }
 
 impl GraphWorkspace {
-    pub fn from_plan(
+    pub(crate) fn from_plan(
         context: CudaExecContext,
         plan: Arc<ProofArenaPlan>,
+        admission: WorkspaceAdmission,
     ) -> Result<Self, GraphError> {
         let arena = plan.allocate(context)?;
         Ok(Self {
             graphs: PersistentGraphCache::default(),
+            admission,
             plan,
             arena,
             preprocessed_commitment_ready: false,
@@ -323,6 +325,10 @@ impl GraphWorkspace {
 
     pub fn plan(&self) -> &ProofArenaPlan {
         &self.plan
+    }
+
+    pub fn admission(&self) -> &WorkspaceAdmission {
+        &self.admission
     }
 
     pub const fn preprocessed_commitment_ready(&self) -> bool {
@@ -351,11 +357,10 @@ impl GraphWorkspace {
         }
     }
 
-    /// Bind a logical identity to its stable physical slot. The returned slice
-    /// is truncated to the logical capacity: a disjoint-lifetime buffer may
-    /// share (and enlarge) the physical range, but that pooled surplus must
-    /// never leak into kernel extents, so `slice.len_words()` always equals
-    /// the returned logical length.
+    /// Bind a logical identity to its exact stable range view. Epoch-disjoint
+    /// identities may reuse an address without sharing slot identity; the
+    /// defensive truncation keeps `slice.len_words()` equal to the declared
+    /// logical length.
     pub fn bind(&self, logical: LogicalBufferId) -> Result<(ArenaSlice, usize), GraphError> {
         let binding = self
             .plan

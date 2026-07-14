@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cairo_air::claims::CairoClaim;
-use cairo_air::relations::CommonLookupElements;
 use num_traits::Zero;
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
 use stwo::core::pcs::PcsConfig;
@@ -24,16 +23,11 @@ use stwo_cairo_prover::witness::exec_context::WitnessResidencyReport;
 use stwo_cairo_prover::witness::relation_sources::RelationSourceError;
 
 use crate::arena_plan::{ArenaPlanError, ExecutionTableGeometry, ProofArenaPlan};
-use crate::composition_plan::{
-    plan_cairo_composition, CompositionPlan, CompositionPlanError, CompositionProofBindings,
-};
+use crate::composition_plan::{CompositionPlan, CompositionPlanError, CompositionProofBindings};
 use crate::graphs::GraphWorkspace;
 use crate::plan::{ProofPlan, ProofPlanError};
-use crate::protocol_discovery::{
-    discover_protocol_transcript_shape, schema_zero_interaction_claim_for_composition,
-    ProtocolDiscoveryError, ProtocolTranscriptDiscovery,
-};
-use crate::protocol_plan::{plan_protocol_geometry, ProtocolPlanError, ProtocolPlanPolicy};
+use crate::protocol_discovery::{ProtocolDiscoveryError, ProtocolTranscriptDiscovery};
+use crate::protocol_plan::{ProtocolPlanError, ProtocolPlanPolicy};
 use crate::recorded_witness_inputs::{
     recorded_witness_inputs_for_plan, DeviceCompactColumn, DeviceEdgeColumn, DeviceEdgeSourceKind,
     DeviceGatherColumn, DeviceNativeColumn, DeviceSeedColumn, PlannedRecordedWitnessInputs,
@@ -53,13 +47,12 @@ use crate::resident_witness::{
     planned_cairo_claim, require_strict_resident_witness_coverage, ResidentWitnessPlanError,
 };
 use crate::shape_executable::{
-    ShapeCompileRequest, ShapeExecutableCache, ShapeExecutableCacheTelemetry, ShapeExecutableError,
-    ShapeExecutableMaterialization,
+    ShapeCompileRequest, ShapeExecutable, ShapeExecutableCache, ShapeExecutableCacheTelemetry,
+    ShapeExecutableError, ShapeExecutableMaterialization, ShapeExecutableSelection,
 };
 use crate::state::{DeviceProofState, WitnessOutput};
 use crate::transcript_plan::{
-    encode_static_transcript_inputs, plan_cairo_blake2s_transcript, CairoBlake2sTranscriptPlan,
-    TranscriptPlanError,
+    encode_static_transcript_inputs, CairoBlake2sTranscriptPlan, TranscriptPlanError,
 };
 use crate::workspace_cache::{
     WorkspaceCache, WorkspaceCacheError, WorkspaceCacheTelemetry, WorkspaceKey,
@@ -376,94 +369,24 @@ fn lifting_log_size_from_max(
     Ok(lifting)
 }
 
-struct PlannedResidentProtocol {
-    discovery: ProtocolTranscriptDiscovery,
-    transcript: CairoBlake2sTranscriptPlan,
-    composition: CompositionPlan,
-    arena: Arc<ProofArenaPlan>,
-    workspace_key: WorkspaceKey,
-}
-
-fn plan_resident_protocol(
+fn select_resident_executable(
+    cache: &mut ShapeExecutableCache,
     claim: &CairoClaim,
     proof_plan: &ProofPlan,
     preprocessed_trace: &PreProcessedTrace,
     pcs: PcsConfig,
     include_all_preprocessed_columns: bool,
-    execution_table_geometry: Option<ExecutionTableGeometry>,
-) -> Result<PlannedResidentProtocol, ResidentSessionError> {
-    let protocol_policy = ProtocolPlanPolicy::loaded_starknet_blake2s()?;
-    plan_resident_protocol_with_policy(
+    execution_tables: Option<ExecutionTableGeometry>,
+) -> Result<ShapeExecutableSelection, ResidentSessionError> {
+    Ok(cache.compile_or_bind(ShapeCompileRequest {
         claim,
         proof_plan,
         preprocessed_trace,
         pcs,
         include_all_preprocessed_columns,
-        execution_table_geometry,
-        protocol_policy,
-    )
-}
-
-fn plan_resident_protocol_with_policy(
-    claim: &CairoClaim,
-    proof_plan: &ProofPlan,
-    preprocessed_trace: &PreProcessedTrace,
-    pcs: PcsConfig,
-    include_all_preprocessed_columns: bool,
-    execution_table_geometry: Option<ExecutionTableGeometry>,
-    protocol_policy: ProtocolPlanPolicy,
-) -> Result<PlannedResidentProtocol, ResidentSessionError> {
-    let lifting_log_size = resident_lifting_log_size(claim, pcs)?;
-    let discovery = discover_protocol_transcript_shape(
-        claim,
-        proof_plan,
-        preprocessed_trace,
-        &pcs,
-        lifting_log_size,
-        include_all_preprocessed_columns,
-    )?;
-    let transcript = plan_cairo_blake2s_transcript(
-        claim,
-        pcs,
-        discovery.lifting_log_size,
-        discovery.dynamic_transcript_shape(),
-    )?;
-    let zero_interaction_claim = schema_zero_interaction_claim_for_composition(claim)?;
-    let composition = plan_cairo_composition(
-        claim,
-        &CommonLookupElements::dummy(),
-        &zero_interaction_claim,
-        &preprocessed_trace.ids(),
-        protocol_policy.composition_max_kernel_instrs,
-    )?;
-    let protocol = plan_protocol_geometry(
-        proof_plan,
-        claim,
-        preprocessed_trace,
-        &pcs,
-        include_all_preprocessed_columns,
-        protocol_policy,
-        &transcript,
-        &discovery,
-        &composition,
-    )?;
-    let arena = Arc::new(match execution_table_geometry {
-        Some(geometry) => ProofArenaPlan::build_with_execution_tables(
-            proof_plan,
-            &protocol,
-            &composition,
-            geometry,
-        )?,
-        None => ProofArenaPlan::build(proof_plan, &protocol, &composition)?,
-    });
-    let workspace_key = WorkspaceKey::from_plan(&arena);
-    Ok(PlannedResidentProtocol {
-        discovery,
-        transcript,
-        composition,
-        arena,
-        workspace_key,
-    })
+        execution_tables,
+        policy: ProtocolPlanPolicy::loaded_starknet_blake2s()?,
+    })?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -475,7 +398,10 @@ fn run_materialized_session<R>(
     channel_salt: u32,
     pcs: PcsConfig,
     twiddles: &'static TwiddleTree<CudaBackend>,
-    planned: &PlannedResidentProtocol,
+    executable: &ShapeExecutable,
+    composition_bindings: &CompositionProofBindings,
+    shape_executable_materialization: ShapeExecutableMaterialization,
+    shape_executable_cache: ShapeExecutableCacheTelemetry,
     require_device_born: bool,
     run: impl FnOnce(
         &mut ResidentGraphRuntime<'_>,
@@ -512,7 +438,6 @@ fn run_materialized_session<R>(
         return Err(ResidentSessionError::InvalidRelationAlphaWords(alpha_words));
     }
     let setup_alphas = vec![SecureField::zero(); alpha_words / SECURE_EXTENSION_DEGREE];
-    let composition_bindings = CompositionProofBindings::from_plan(&planned.composition);
     let mut runtime = ResidentGraphRuntime::prepare(
         workspace,
         ResidentWorkspaceIdentity::of(workspace),
@@ -520,9 +445,9 @@ fn run_materialized_session<R>(
             alpha_powers: &setup_alphas,
             z: SecureField::zero(),
         },
-        &planned.transcript,
-        &planned.composition,
-        &composition_bindings,
+        executable.transcript(),
+        executable.composition(),
+        composition_bindings,
         None,
         None,
         None,
@@ -541,13 +466,13 @@ fn run_materialized_session<R>(
                     .ok_or(ResidentSessionError::SizeOverflow)
             })?;
     let telemetry = ResidentSessionTelemetry {
-        shape_executable_materialization: None,
-        shape_executable_cache: ShapeExecutableCacheTelemetry::default(),
-        workspace_key: Some(planned.workspace_key),
+        shape_executable_materialization: Some(shape_executable_materialization),
+        shape_executable_cache,
+        workspace_key: Some(executable.workspace_key()),
         workspace_materialization: Some(workspace_materialization),
         cache: WorkspaceCacheTelemetry::default(),
         arena_words: workspace.plan().total_words(),
-        transcript_segments: planned.transcript.segments().len(),
+        transcript_segments: executable.transcript().segments().len(),
         base,
         twiddles: ResidentTwiddleStageReport::default(),
         preprocessed,
@@ -564,9 +489,9 @@ fn run_materialized_session<R>(
         ResidentSessionArtifacts {
             claim: &claim,
             proof_plan: &proof_plan,
-            discovery: &planned.discovery,
-            transcript_plan: &planned.transcript,
-            composition_plan: &planned.composition,
+            discovery: executable.discovery(),
+            transcript_plan: executable.transcript(),
+            composition_plan: executable.composition(),
             telemetry: &telemetry,
         },
     )?;
@@ -642,6 +567,7 @@ fn public_memory_id_is_valid(id: u32, n_f252: usize, n_small: usize) -> bool {
 /// still enforces arena-born base columns; a detached legacy witness is rejected
 /// before staging. New callers use [`with_resident_session_from_generator`].
 pub fn with_resident_session<R>(
+    executable_cache: &mut ShapeExecutableCache,
     cache: &mut WorkspaceCache,
     request: ResidentSessionRequest,
     run: impl FnOnce(
@@ -657,7 +583,8 @@ pub fn with_resident_session<R>(
         include_all_preprocessed_columns,
         twiddles,
     } = request;
-    let planned = plan_resident_protocol(
+    let selection = select_resident_executable(
+        executable_cache,
         &witness.claim,
         &witness.device.proof_plan,
         &preprocessed_trace,
@@ -665,9 +592,14 @@ pub fn with_resident_session<R>(
         include_all_preprocessed_columns,
         None,
     )?;
+    let shape_executable_cache = executable_cache.telemetry();
+    let ShapeExecutableSelection {
+        executable,
+        bindings,
+        materialization: executable_materialization,
+    } = selection;
     let (result, mut telemetry) = {
-        let (workspace, materialization) =
-            cache.materialize_or_reuse(Arc::clone(&planned.arena))?;
+        let (workspace, materialization) = cache.materialize_or_reuse(&executable)?;
         run_materialized_session(
             workspace,
             materialization,
@@ -676,7 +608,10 @@ pub fn with_resident_session<R>(
             channel_salt,
             pcs,
             twiddles,
-            &planned,
+            &executable,
+            &bindings,
+            executable_materialization,
+            shape_executable_cache,
             true,
             run,
         )?
@@ -975,6 +910,7 @@ fn resident_host_witness_inputs<'a>(
 /// workspace materialization; the legacy witness writer and host interaction
 /// generator are never executed on this path.
 pub fn with_resident_session_from_generator<R>(
+    executable_cache: &mut ShapeExecutableCache,
     cache: &mut WorkspaceCache,
     request: ResidentPreWitnessSessionRequest,
     run: impl FnOnce(
@@ -1006,7 +942,8 @@ pub fn with_resident_session_from_generator<R>(
     let memory = &recorded.execution_memory;
     let public_memory_seed = public_memory_multiplicity_seed_words(&planned_claim, memory)?;
     let public_memory_entries = public_memory_seed.len() / 2;
-    let planned = plan_resident_protocol(
+    let selection = select_resident_executable(
+        executable_cache,
         &planned_claim,
         &exact_plan,
         &preprocessed_trace,
@@ -1021,6 +958,12 @@ pub fn with_resident_session_from_generator<R>(
             .with_public_memory_entries(public_memory_entries),
         ),
     )?;
+    let shape_executable_cache = executable_cache.telemetry();
+    let ShapeExecutableSelection {
+        executable,
+        bindings: composition_bindings,
+        materialization: executable_materialization,
+    } = selection;
 
     if recorded
         .lanes
@@ -1035,7 +978,7 @@ pub fn with_resident_session_from_generator<R>(
         .iter()
         .map(|encoded| encoded.0)
         .collect::<Vec<_>>();
-    let host_columns = resident_host_witness_inputs(&recorded, &planned.arena)?;
+    let host_columns = resident_host_witness_inputs(&recorded, executable.arena())?;
     let witness_inputs = recorded
         .lanes
         .iter()
@@ -1048,8 +991,7 @@ pub fn with_resident_session_from_generator<R>(
         .collect::<Vec<_>>();
 
     let (result, mut telemetry) = {
-        let (workspace, materialization) =
-            cache.materialize_or_reuse(Arc::clone(&planned.arena))?;
+        let (workspace, materialization) = cache.materialize_or_reuse(&executable)?;
         let twiddle_report = stage_protocol_twiddles(workspace, twiddles)?;
         let preprocessed =
             stage_preprocessed_commitment(workspace, Arc::clone(&preprocessed_trace))?;
@@ -1059,7 +1001,6 @@ pub fn with_resident_session_from_generator<R>(
             return Err(ResidentSessionError::InvalidRelationAlphaWords(alpha_words));
         }
         let setup_alphas = vec![SecureField::zero(); alpha_words / SECURE_EXTENSION_DEGREE];
-        let composition_bindings = CompositionProofBindings::from_plan(&planned.composition);
         let mut runtime = ResidentGraphRuntime::prepare(
             workspace,
             ResidentWorkspaceIdentity::of(workspace),
@@ -1067,8 +1008,8 @@ pub fn with_resident_session_from_generator<R>(
                 alpha_powers: &setup_alphas,
                 z: SecureField::zero(),
             },
-            &planned.transcript,
-            &planned.composition,
+            executable.transcript(),
+            executable.composition(),
             &composition_bindings,
             Some(ExecutionTablesHostData {
                 addr_to_id: &raw_address_to_id,
@@ -1095,13 +1036,13 @@ pub fn with_resident_session_from_generator<R>(
                         .ok_or(ResidentSessionError::SizeOverflow)
                 })?;
         let telemetry = ResidentSessionTelemetry {
-            shape_executable_materialization: None,
-            shape_executable_cache: ShapeExecutableCacheTelemetry::default(),
-            workspace_key: Some(planned.workspace_key),
+            shape_executable_materialization: Some(executable_materialization),
+            shape_executable_cache,
+            workspace_key: Some(executable.workspace_key()),
             workspace_materialization: Some(materialization),
             cache: WorkspaceCacheTelemetry::default(),
             arena_words: workspace.plan().total_words(),
-            transcript_segments: planned.transcript.segments().len(),
+            transcript_segments: executable.transcript().segments().len(),
             base: ResidentSourceStageReport::default(),
             twiddles: twiddle_report,
             preprocessed,
@@ -1118,9 +1059,9 @@ pub fn with_resident_session_from_generator<R>(
             ResidentSessionArtifacts {
                 claim: &planned_claim,
                 proof_plan: &exact_plan,
-                discovery: &planned.discovery,
-                transcript_plan: &planned.transcript,
-                composition_plan: &planned.composition,
+                discovery: executable.discovery(),
+                transcript_plan: executable.transcript(),
+                composition_plan: executable.composition(),
                 telemetry: &telemetry,
             },
         )?;
@@ -1336,10 +1277,17 @@ pub fn plan_resident_preflight_with_cache(
 
 #[cfg(test)]
 mod tests {
+    use cairo_air::relations::CommonLookupElements;
     use stwo::core::fri::FriConfig;
     use stwo_backend_cuda::{witness_input_gather_requirements, WitnessInputGatherEdge};
 
     use super::*;
+    use crate::composition_plan::plan_cairo_composition;
+    use crate::protocol_discovery::{
+        discover_protocol_transcript_shape, schema_zero_interaction_claim_for_composition,
+    };
+    use crate::protocol_plan::plan_protocol_geometry;
+    use crate::transcript_plan::plan_cairo_blake2s_transcript;
 
     #[test]
     fn public_memory_seed_rejects_invalid_tags_and_out_of_bounds_ids() {
@@ -1489,7 +1437,7 @@ mod tests {
             multiplicities.blockers
         );
 
-        // `plan_resident_protocol` itself is manifest-blocked off-CUDA (the
+        // Production policy loading is manifest-blocked off-CUDA (the
         // embedded AOT pack hashes to zero), but arena geometry never depends
         // on that hash: rebuild the identical protocol/arena plan with a fake
         // nonzero policy and replicate the physical slot-length validation that
@@ -1747,24 +1695,26 @@ mod tests {
         let mut policy = ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048);
         policy.commit_mode = ProgressiveCommitMode::DomainProgressive;
         policy.direct_composition_retention_mode = DirectCompositionRetentionMode::ExactNative;
-        let planned = plan_resident_protocol_with_policy(
-            &planned_claim,
-            &exact_plan,
-            &ingest.preprocessed_trace,
-            PcsConfig::default(),
-            false,
-            Some(
-                ExecutionTableGeometry::new(
-                    memory.address_to_id.len(),
-                    memory.f252_values.len(),
-                    memory.small_values.len(),
-                )
-                .with_public_memory_entries(public_memory_entries),
-            ),
-            policy,
-        )
-        .unwrap();
-        let arena = planned.arena.as_ref();
+        let mut executable_cache = ShapeExecutableCache::new(1).unwrap();
+        let selection = executable_cache
+            .compile_or_bind(ShapeCompileRequest {
+                claim: &planned_claim,
+                proof_plan: &exact_plan,
+                preprocessed_trace: &ingest.preprocessed_trace,
+                pcs: PcsConfig::default(),
+                include_all_preprocessed_columns: false,
+                execution_tables: Some(
+                    ExecutionTableGeometry::new(
+                        memory.address_to_id.len(),
+                        memory.f252_values.len(),
+                        memory.small_values.len(),
+                    )
+                    .with_public_memory_entries(public_memory_entries),
+                ),
+                policy,
+            })
+            .unwrap();
+        let arena = selection.executable.arena().as_ref();
         let retention = arena
             .composition()
             .direct_retention

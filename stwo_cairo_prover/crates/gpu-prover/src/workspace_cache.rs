@@ -4,7 +4,6 @@
 //! their arena, so dropping an entry is always an explicit caller decision.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use stwo_backend_cuda::{CudaExecContext, CudaRuntimeError};
@@ -12,6 +11,7 @@ use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
 
 use crate::arena_plan::ProofArenaPlan;
 use crate::graphs::{GraphError, GraphWorkspace};
+use crate::shape_executable::{ShapeExecutable, WorkspaceAdmission};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WorkspaceKey {
@@ -32,7 +32,7 @@ impl WorkspaceKey {
     }
 
     pub fn from_workspace(workspace: &GraphWorkspace) -> Self {
-        Self::from_plan(workspace.plan())
+        workspace.admission().workspace_key()
     }
 }
 
@@ -54,6 +54,10 @@ pub enum WorkspaceMaterialization {
 pub enum WorkspaceCacheError {
     ZeroCapacity,
     Occupied(WorkspaceKey),
+    AdmissionPlanMismatch {
+        admission: WorkspaceKey,
+        plan: WorkspaceKey,
+    },
     AtCapacity {
         capacity: usize,
         requested: WorkspaceKey,
@@ -67,6 +71,10 @@ impl std::fmt::Display for WorkspaceCacheError {
         match self {
             Self::ZeroCapacity => write!(f, "workspace cache capacity must be non-zero"),
             Self::Occupied(key) => write!(f, "workspace cache key is already occupied: {key:?}"),
+            Self::AdmissionPlanMismatch { admission, plan } => write!(
+                f,
+                "workspace admission does not match the requested arena plan: admission={admission:?} plan={plan:?}"
+            ),
             Self::AtCapacity {
                 capacity,
                 requested,
@@ -95,47 +103,78 @@ impl From<GraphError> for WorkspaceCacheError {
     }
 }
 
-/// Generic core keeps key/capacity behavior testable without constructing CUDA
-/// resources. Production stores boxed workspaces so HashMap growth never moves
-/// the host-side workspace object.
-struct BoundedCache<V> {
+struct CacheEntry<K, V> {
+    admission: K,
+    key: WorkspaceKey,
+    value: V,
+}
+
+/// Generic exact-equality core keeps admission behavior testable without CUDA.
+/// Production stores boxed workspaces so vector growth never moves the
+/// host-side workspace object.
+struct BoundedCache<K, V> {
     capacity: usize,
-    entries: HashMap<WorkspaceKey, V>,
+    entries: Vec<CacheEntry<K, V>>,
     telemetry: Cell<WorkspaceCacheTelemetry>,
 }
 
-impl<V> BoundedCache<V> {
+impl<K: Eq, V> BoundedCache<K, V> {
     fn new(capacity: usize) -> Result<Self, WorkspaceCacheError> {
         if capacity == 0 {
             return Err(WorkspaceCacheError::ZeroCapacity);
         }
         Ok(Self {
             capacity,
-            entries: HashMap::with_capacity(capacity),
+            entries: Vec::with_capacity(capacity),
             telemetry: Cell::new(WorkspaceCacheTelemetry::default()),
         })
     }
 
-    fn get(&self, key: WorkspaceKey) -> Option<&V> {
-        let result = self.entries.get(&key);
-        self.record_lookup(result.is_some());
-        result
+    fn exact_index(&self, admission: &K) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| &entry.admission == admission)
     }
 
-    fn get_mut(&mut self, key: WorkspaceKey) -> Option<&mut V> {
-        let hit = self.entries.contains_key(&key);
-        self.record_lookup(hit);
-        self.entries.get_mut(&key)
+    fn unique_key_index(&self, key: WorkspaceKey) -> Option<usize> {
+        let mut indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| (entry.key == key).then_some(index));
+        let index = indices.next()?;
+        indices.next().is_none().then_some(index)
     }
 
-    fn insert(&mut self, key: WorkspaceKey, value: V) -> Result<(), WorkspaceCacheError> {
-        self.admit(key)?;
-        self.entries.insert(key, value);
+    fn get_by_key(&self, key: WorkspaceKey) -> Option<&V> {
+        let index = self.unique_key_index(key);
+        self.record_lookup(index.is_some());
+        index.map(|index| &self.entries[index].value)
+    }
+
+    fn get_by_key_mut(&mut self, key: WorkspaceKey) -> Option<&mut V> {
+        let index = self.unique_key_index(key);
+        self.record_lookup(index.is_some());
+        index.map(|index| &mut self.entries[index].value)
+    }
+
+    fn insert(
+        &mut self,
+        admission: K,
+        key: WorkspaceKey,
+        value: V,
+    ) -> Result<(), WorkspaceCacheError> {
+        self.admit(&admission, key)?;
+        self.entries.push(CacheEntry {
+            admission,
+            key,
+            value,
+        });
         Ok(())
     }
 
-    fn admit(&self, key: WorkspaceKey) -> Result<(), WorkspaceCacheError> {
-        if self.entries.contains_key(&key) {
+    fn admit(&self, admission: &K, key: WorkspaceKey) -> Result<(), WorkspaceCacheError> {
+        if self.exact_index(admission).is_some() {
             return Err(WorkspaceCacheError::Occupied(key));
         }
         if self.entries.len() >= self.capacity {
@@ -148,13 +187,14 @@ impl<V> BoundedCache<V> {
         Ok(())
     }
 
-    fn take(&mut self, key: WorkspaceKey) -> Option<V> {
-        self.entries.remove(&key)
+    fn take_by_key(&mut self, key: WorkspaceKey) -> Option<V> {
+        let index = self.unique_key_index(key)?;
+        Some(self.entries.remove(index).value)
     }
 
     fn only(&self) -> Option<&V> {
         if self.entries.len() == 1 {
-            self.entries.values().next()
+            Some(&self.entries[0].value)
         } else {
             None
         }
@@ -164,8 +204,7 @@ impl<V> BoundedCache<V> {
         if self.entries.len() != 1 {
             return None;
         }
-        let key = self.entries.keys().next().copied()?;
-        self.take(key)
+        Some(self.entries.remove(0).value)
     }
 
     fn record_lookup(&self, hit: bool) {
@@ -192,7 +231,7 @@ impl<V> BoundedCache<V> {
 /// One cache per prover/device. Each miss creates a fresh CUDA execution context
 /// and transfers it into exactly one stable graph workspace.
 pub struct WorkspaceCache {
-    inner: BoundedCache<Box<GraphWorkspace>>,
+    inner: BoundedCache<WorkspaceAdmission, Box<GraphWorkspace>>,
 }
 
 impl WorkspaceCache {
@@ -218,44 +257,52 @@ impl WorkspaceCache {
         self.inner.telemetry.get()
     }
 
+    /// Diagnostic short-key lookup. Returns `None` when distinct exact
+    /// admissions intentionally collide on the same short key.
     pub fn get(&self, key: WorkspaceKey) -> Option<&GraphWorkspace> {
-        self.inner.get(key).map(Box::as_ref)
+        self.inner.get_by_key(key).map(Box::as_ref)
     }
 
+    /// Mutable diagnostic short-key lookup with the same ambiguity rule as
+    /// [`Self::get`]. Production session admission never uses this path.
     pub fn get_mut(&mut self, key: WorkspaceKey) -> Option<&mut GraphWorkspace> {
-        self.inner.get_mut(key).map(Box::as_mut)
+        self.inner.get_by_key_mut(key).map(Box::as_mut)
     }
 
     pub fn materialize_or_reuse(
         &mut self,
-        plan: Arc<ProofArenaPlan>,
+        executable: &ShapeExecutable,
     ) -> Result<(&mut GraphWorkspace, WorkspaceMaterialization), WorkspaceCacheError> {
+        let admission = executable.workspace_admission();
+        let plan = Arc::clone(executable.arena());
         let key = WorkspaceKey::from_plan(&plan);
-        if self.inner.entries.contains_key(&key) {
+        if !admission.matches_plan(&plan) {
+            return Err(WorkspaceCacheError::AdmissionPlanMismatch {
+                admission: admission.workspace_key(),
+                plan: key,
+            });
+        }
+        if let Some(index) = self.inner.exact_index(admission) {
             self.inner.record_lookup(true);
             return Ok((
-                self.inner
-                    .entries
-                    .get_mut(&key)
-                    .expect("workspace key checked")
-                    .as_mut(),
+                self.inner.entries[index].value.as_mut(),
                 WorkspaceMaterialization::Reused,
             ));
         }
 
         self.inner.record_lookup(false);
-        self.inner.admit(key)?;
+        self.inner.admit(admission, key)?;
 
         let context = CudaExecContext::new()?;
-        let workspace = Box::new(GraphWorkspace::from_plan(context, plan)?);
-        self.inner.entries.insert(key, workspace);
+        let workspace = Box::new(GraphWorkspace::from_plan(context, plan, admission.clone())?);
+        self.inner.insert(admission.clone(), key, workspace)?;
         self.inner.record_materialization();
+        let index = self
+            .inner
+            .exact_index(admission)
+            .expect("materialized exact admission inserted");
         Ok((
-            self.inner
-                .entries
-                .get_mut(&key)
-                .expect("materialized workspace inserted")
-                .as_mut(),
+            self.inner.entries[index].value.as_mut(),
             WorkspaceMaterialization::Materialized,
         ))
     }
@@ -267,12 +314,13 @@ impl WorkspaceCache {
         workspace: GraphWorkspace,
     ) -> Result<WorkspaceKey, WorkspaceCacheError> {
         let key = WorkspaceKey::from_workspace(&workspace);
-        self.inner.insert(key, Box::new(workspace))?;
+        let admission = workspace.admission().clone();
+        self.inner.insert(admission, key, Box::new(workspace))?;
         Ok(key)
     }
 
     pub fn take(&mut self, key: WorkspaceKey) -> Option<GraphWorkspace> {
-        self.inner.take(key).map(|workspace| *workspace)
+        self.inner.take_by_key(key).map(|workspace| *workspace)
     }
 
     pub(crate) fn only(&self) -> Option<&GraphWorkspace> {
@@ -288,8 +336,23 @@ impl WorkspaceCache {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TestAdmission {
+        short: WorkspaceKey,
+        topology: u64,
+        layout: u64,
+    }
+
     fn key(shape: u64, protocol: u64) -> WorkspaceKey {
         WorkspaceKey::new(ProofShapeKey(shape), protocol)
+    }
+
+    fn admission(shape: u64, protocol: u64, topology: u64, layout: u64) -> TestAdmission {
+        TestAdmission {
+            short: key(shape, protocol),
+            topology,
+            layout,
+        }
     }
 
     #[test]
@@ -301,20 +364,22 @@ mod tests {
 
     #[test]
     fn bounded_cache_records_lookups_and_never_evicts() {
+        let exact = admission(7, 11, 13, 17);
         let mut cache = BoundedCache::new(1).unwrap();
-        cache.insert(key(7, 11), 41u8).unwrap();
+        cache.insert(exact.clone(), exact.short, 41u8).unwrap();
 
-        assert_eq!(cache.get(key(7, 11)), Some(&41));
-        assert_eq!(cache.get(key(8, 11)), None);
+        assert_eq!(cache.get_by_key(key(7, 11)), Some(&41));
+        assert_eq!(cache.get_by_key(key(8, 11)), None);
         assert!(matches!(
-            cache.insert(key(7, 11), 99),
+            cache.insert(exact.clone(), exact.short, 99),
             Err(WorkspaceCacheError::Occupied(_))
         ));
+        let distinct = admission(8, 11, 19, 23);
         assert!(matches!(
-            cache.insert(key(8, 11), 42),
+            cache.insert(distinct.clone(), distinct.short, 42),
             Err(WorkspaceCacheError::AtCapacity { capacity: 1, .. })
         ));
-        assert_eq!(cache.entries.get(&key(7, 11)), Some(&41));
+        assert_eq!(cache.entries[0].value, 41);
         assert_eq!(
             cache.telemetry.get(),
             WorkspaceCacheTelemetry {
@@ -327,15 +392,41 @@ mod tests {
     }
 
     #[test]
+    fn forced_short_key_collisions_require_exact_topology_and_layout() {
+        let exact = admission(7, 11, 13, 17);
+        let topology_collision = admission(7, 11, 19, 17);
+        let layout_collision = admission(7, 11, 13, 23);
+        let mut cache = BoundedCache::new(3).unwrap();
+        cache.insert(exact.clone(), exact.short, 1u8).unwrap();
+
+        assert_eq!(cache.exact_index(&exact), Some(0));
+        assert_eq!(cache.exact_index(&topology_collision), None);
+        assert_eq!(cache.exact_index(&layout_collision), None);
+
+        cache
+            .insert(topology_collision.clone(), topology_collision.short, 2)
+            .unwrap();
+        cache
+            .insert(layout_collision.clone(), layout_collision.short, 3)
+            .unwrap();
+        assert_eq!(cache.exact_index(&topology_collision), Some(1));
+        assert_eq!(cache.exact_index(&layout_collision), Some(2));
+        assert_eq!(cache.get_by_key(exact.short), None);
+        assert_eq!(cache.take_by_key(exact.short), None);
+    }
+
+    #[test]
     fn explicit_take_frees_capacity_and_get_mut_is_counted() {
+        let first = admission(7, 11, 13, 17);
+        let second = admission(8, 12, 19, 23);
         let mut cache = BoundedCache::new(1).unwrap();
-        cache.insert(key(7, 11), 41u8).unwrap();
+        cache.insert(first.clone(), first.short, 41u8).unwrap();
         assert_eq!(cache.only(), Some(&41));
         assert_eq!(cache.take_only(), Some(41));
-        cache.insert(key(8, 12), 42).unwrap();
-        *cache.get_mut(key(8, 12)).unwrap() = 43;
+        cache.insert(second.clone(), second.short, 42).unwrap();
+        *cache.get_by_key_mut(second.short).unwrap() = 43;
         cache.record_materialization();
-        assert_eq!(cache.entries.get(&key(8, 12)), Some(&43));
+        assert_eq!(cache.entries[0].value, 43);
         assert_eq!(cache.telemetry.get().hits, 1);
         assert_eq!(cache.telemetry.get().materializations, 1);
     }
@@ -343,7 +434,7 @@ mod tests {
     #[test]
     fn zero_capacity_is_rejected() {
         assert!(matches!(
-            BoundedCache::<u8>::new(0),
+            BoundedCache::<TestAdmission, u8>::new(0),
             Err(WorkspaceCacheError::ZeroCapacity)
         ));
     }
