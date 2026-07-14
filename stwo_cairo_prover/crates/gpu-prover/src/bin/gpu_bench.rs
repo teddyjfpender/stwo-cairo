@@ -185,26 +185,45 @@ impl RequiredCudaPcsRuntimeMode {
     }
 }
 
-fn parse_resident_backend(value: Option<&str>) -> Result<ResidentBackend, String> {
-    match value {
-        Some("legacy-resident") => Ok(ResidentBackend::LegacyResident),
-        Some("replacement-v1") => Ok(ResidentBackend::ReplacementV1),
-        Some(other) => Err(format!(
-            "--resident-backend must be legacy-resident or replacement-v1, got {other}"
-        )),
-        None => Err("--resident-backend requires a value".to_string()),
+fn parse_resident_backend_args<I, S>(args: I) -> Result<ResidentBackend, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
+    let mut selected = None;
+    while let Some(argument) = args.next() {
+        let argument = argument.as_ref();
+        if argument.starts_with("--resident-backend=") {
+            return Err(
+                "--resident-backend requires a separate value: legacy-resident or replacement-v1"
+                    .to_owned(),
+            );
+        }
+        if argument != "--resident-backend" {
+            continue;
+        }
+        if selected.is_some() {
+            return Err("--resident-backend may be passed only once".to_owned());
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| "--resident-backend requires a value".to_owned())?;
+        let value = value.as_ref();
+        if value.starts_with("--") {
+            return Err("--resident-backend requires a value".to_owned());
+        }
+        selected = Some(match value {
+            "legacy-resident" => ResidentBackend::LegacyResident,
+            "replacement-v1" => ResidentBackend::ReplacementV1,
+            other => {
+                return Err(format!(
+                    "--resident-backend must be legacy-resident or replacement-v1, got {other}"
+                ))
+            }
+        });
     }
-}
-
-fn select_resident_backend(
-    flag_present: bool,
-    value: Option<&str>,
-) -> Result<ResidentBackend, String> {
-    if flag_present {
-        parse_resident_backend(value)
-    } else {
-        Ok(ResidentBackend::LegacyResident)
-    }
+    Ok(selected.unwrap_or_default())
 }
 
 fn resident_backend_gate(
@@ -344,12 +363,7 @@ fn flag(name: &str) -> bool {
 }
 
 fn requested_resident_backend() -> ResidentBackend {
-    let value = arg("--resident-backend");
-    let value = value
-        .as_deref()
-        .filter(|candidate| !candidate.starts_with("--"));
-    select_resident_backend(flag("--resident-backend"), value)
-        .unwrap_or_else(|error| panic!("{error}"))
+    parse_resident_backend_args(std::env::args()).unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn enforce_resident_backend_invocation() {
@@ -2387,14 +2401,14 @@ mod tests {
 
     use super::{
         cairo_verification_error_class, configure_resident_backend, initial_proof_byte_equal,
-        mutate_claimed_sum, parse_resident_backend, pcs_telemetry_json,
+        mutate_claimed_sum, parse_resident_backend_args, pcs_telemetry_json,
         performance_claim_admissible_for, proof_byte_equal_gate_passes, proof_mutation_gate_passes,
-        quantile, resident_session_telemetry_json, select_resident_backend,
-        simd_reference_gate_passes, simd_reference_reuse_input_gate_passes, throughput_mhz,
-        validate_gpu_native_architecture, validate_resident_session_architecture,
-        validate_strict_aot_provenance, AotRuntimeStats, CairoVerificationError,
-        CudaPcsDriverTelemetry, CudaPcsRuntimeMode, GpuProverConfig, RequiredCudaPcsRuntimeMode,
-        ResidentBackend, ResidentSessionTelemetry, SecureField, REQUIRED_CUDA_PCS_ARCHITECTURE,
+        quantile, resident_session_telemetry_json, simd_reference_gate_passes,
+        simd_reference_reuse_input_gate_passes, throughput_mhz, validate_gpu_native_architecture,
+        validate_resident_session_architecture, validate_strict_aot_provenance, AotRuntimeStats,
+        CairoVerificationError, CudaPcsDriverTelemetry, CudaPcsRuntimeMode, GpuProverConfig,
+        RequiredCudaPcsRuntimeMode, ResidentBackend, ResidentSessionTelemetry, SecureField,
+        REQUIRED_CUDA_PCS_ARCHITECTURE,
     };
 
     fn complete_telemetry(runtime_mode: CudaPcsRuntimeMode) -> CudaPcsDriverTelemetry {
@@ -2435,20 +2449,52 @@ mod tests {
     #[test]
     fn resident_backend_parser_is_exact_and_fail_closed() {
         assert_eq!(
-            parse_resident_backend(Some("legacy-resident")).unwrap(),
+            parse_resident_backend_args(["gpu_bench", "--resident-backend", "legacy-resident"])
+                .unwrap(),
             ResidentBackend::LegacyResident
         );
         assert_eq!(
-            parse_resident_backend(Some("replacement-v1")).unwrap(),
+            parse_resident_backend_args(["gpu_bench", "--resident-backend", "replacement-v1"])
+                .unwrap(),
             ResidentBackend::ReplacementV1
         );
-        assert!(parse_resident_backend(Some("replacement")).is_err());
-        assert!(parse_resident_backend(None).is_err());
         assert_eq!(
-            select_resident_backend(false, None).unwrap(),
+            parse_resident_backend_args(["gpu_bench"]).unwrap(),
             ResidentBackend::LegacyResident
         );
-        assert!(select_resident_backend(true, None).is_err());
+        assert!(
+            parse_resident_backend_args(["gpu_bench", "--resident-backend", "replacement"])
+                .is_err()
+        );
+        assert!(parse_resident_backend_args(["gpu_bench", "--resident-backend"]).is_err());
+    }
+
+    #[test]
+    fn resident_backend_parser_rejects_ambiguous_cli_forms() {
+        for args in [
+            vec!["gpu_bench", "--resident-backend=replacement-v1"],
+            vec![
+                "gpu_bench",
+                "--resident-backend",
+                "legacy-resident",
+                "--resident-backend",
+                "legacy-resident",
+            ],
+            vec![
+                "gpu_bench",
+                "--resident-backend",
+                "legacy-resident",
+                "--resident-backend",
+                "replacement-v1",
+            ],
+            vec![
+                "gpu_bench",
+                "--resident-backend",
+                "--require-gpu-native-architecture",
+            ],
+        ] {
+            assert!(parse_resident_backend_args(args).is_err());
+        }
     }
 
     #[test]
