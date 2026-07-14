@@ -18,6 +18,7 @@
 //!             [--diagnostic-allow-slow-graph-submit] \
 //!             [--operational-safety-reserve-bytes N] \
 //!             [--require-simd-reference-byte-equal] \
+//!             [--require-proof-mutation-rejected] \
 //!             [--require-gpu-pcs-runtime-mode detached-eager|arena-graph]
 //!   gpu_bench --pie a.zip[,b.zip,...] [--pie-copies N] [--pie-mode aggregate|rotate] \
 //!             [--producers N] --backend cuda|simd ...
@@ -42,6 +43,10 @@
 //! proof for the same adapted input and parameters, then exact-compares every
 //! serialized GPU proof to it. The record reports this separately from same-backend
 //! repetition determinism.
+//! `--require-proof-mutation-rejected` retains a verifier-form clone of repetition 0,
+//! waits for the original to verify, adds one to the always-present memory-id
+//! interaction claimed sum, and requires rejection. This is a verifier-integrity
+//! gate, not arbitrary corruption of serialized transport bytes.
 //! `--require-gpu-native-architecture` (or
 //! STWO_BENCH_REQUIRE_GPU_NATIVE_ARCHITECTURE=1) is a fail-closed benchmark gate:
 //! CUDA + gpu-native, the typed CUDA PCS driver, one start and finish for every
@@ -83,6 +88,8 @@
 //!   simd_reference_required, simd_reference_comparison_applicable,
 //!   simd_reference_byte_equal, simd_reference_blake3,
 //!   simd_reference_fresh, simd_reference_s,
+//!   proof_mutation_required, proof_mutation_kind,
+//!   proof_mutation_rejected, proof_mutation_error_class,
 //!   gpu_pcs_driver_architecture, gpu_pcs_runtime_mode,
 //!   gpu_pcs_stage_started, gpu_pcs_stage_finished,
 //!   gpu_pcs_batched_tree_decommit, gpu_pcs_driver_complete,
@@ -105,8 +112,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use cairo_air::verifier::verify_cairo;
-use cairo_air::CairoProof;
+use cairo_air::verifier::{verify_cairo, CairoVerificationError};
+use cairo_air::{CairoProof, CairoProofForRustVerifier};
 use cairo_vm::cairo_run::{cairo_run_program, CairoRunConfig};
 use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::{
     BuiltinHintProcessor, HintFunc,
@@ -117,6 +124,7 @@ use cairo_vm::types::program::Program;
 use cairo_vm::Felt252;
 use serde_json::json;
 use stwo::core::channel::MerkleChannel;
+use stwo::core::fields::qm31::SecureField;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
@@ -136,9 +144,11 @@ mod gpu_bench_physical;
 use gpu_bench_physical::{gpu_native_session_context, resident_session_telemetry_json};
 
 type BenchProof = CairoProof<<Blake2sMerkleChannel as MerkleChannel>::H>;
+type BenchVerifierProof = CairoProofForRustVerifier<<Blake2sMerkleChannel as MerkleChannel>::H>;
 type AotRuntimeStats = stwo_backend_cuda::aot::RuntimeStats;
 
 const REQUIRED_CUDA_PCS_ARCHITECTURE: &str = "cuda-typed-pcs-driver-v1";
+const PROOF_MUTATION_KIND: &str = "interaction_claim.memory_id_to_big.claimed_sum_plus_one";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RequiredCudaPcsRuntimeMode {
@@ -1101,6 +1111,7 @@ struct RepOutcome {
     proof_byte_equal: Option<bool>,
     simd_reference_byte_equal: Option<bool>,
     simd_reference: Option<SimdReferenceRecord>,
+    proof_mutation: Option<ProofMutationRecord>,
     vram_peak_gb: f64,
 }
 
@@ -1133,6 +1144,14 @@ struct ProofValidation {
     proof_byte_equal: Option<bool>,
     simd_reference_byte_equal: Option<bool>,
     simd_reference: Option<SimdReferenceRecord>,
+    proof_mutation: Option<ProofMutationRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProofMutationRecord {
+    kind: &'static str,
+    rejected: bool,
+    error_class: Option<&'static str>,
 }
 
 fn initial_proof_byte_equal(compare_to_rep0: bool, proof_count: usize) -> Option<bool> {
@@ -1154,6 +1173,52 @@ fn simd_reference_gate_passes(required: bool, byte_equal: Option<bool>) -> bool 
 
 fn simd_reference_reuse_input_gate_passes(required: bool, reuse_input: bool) -> bool {
     !required || reuse_input
+}
+
+fn proof_mutation_required() -> bool {
+    flag("--require-proof-mutation-rejected")
+        || std::env::var("STWO_BENCH_REQUIRE_PROOF_MUTATION_REJECTED").as_deref() == Ok("1")
+}
+
+fn proof_mutation_gate_passes(required: bool, rejected: Option<bool>) -> bool {
+    !required || rejected == Some(true)
+}
+
+fn cairo_verification_error_class(error: &CairoVerificationError) -> &'static str {
+    match error {
+        CairoVerificationError::InvalidLogupSum => "invalid_logup_sum",
+        CairoVerificationError::Stark(_) => "stark",
+        CairoVerificationError::ProofOfWork => "proof_of_work",
+    }
+}
+
+fn mutate_claimed_sum(claimed_sum: &mut SecureField) {
+    *claimed_sum += SecureField::from(1_u32);
+}
+
+/// Mutate a verifier-semantic field of an already verified proof. The selected
+/// interaction claim is mandatory for valid Cairo proofs and contributes linearly
+/// to the verifier's lookup sum, so adding one deterministically violates LogUp.
+fn verify_structured_proof_mutation(mut proof: BenchVerifierProof) -> ProofMutationRecord {
+    let memory_id_claim = proof
+        .interaction_claim
+        .memory_id_to_big
+        .as_mut()
+        .expect("verified Cairo proof must contain memory_id_to_big interaction claim");
+    mutate_claimed_sum(&mut memory_id_claim.claimed_sum);
+
+    match verify_cairo::<Blake2sMerkleChannel>(proof) {
+        Ok(()) => ProofMutationRecord {
+            kind: PROOF_MUTATION_KIND,
+            rejected: false,
+            error_class: None,
+        },
+        Err(error) => ProofMutationRecord {
+            kind: PROOF_MUTATION_KIND,
+            rejected: true,
+            error_class: Some(cairo_verification_error_class(&error)),
+        },
+    }
 }
 
 /// Compute and verify one fresh SIMD reference after the timed CUDA repetitions.
@@ -1195,6 +1260,7 @@ fn validate_proofs(
     let mut verify_ms = 0.0;
     let mut proof_byte_equal = initial_proof_byte_equal(compare_to_rep0, verified_reps);
     let mut simd_reference_byte_equal = simd_reference.map(|_| true);
+    let mut proof_mutation = None;
     for (rep, proof) in proofs.into_iter().enumerate() {
         let bytes = bincode::serialize(&proof).expect("serialize proof");
         if let (Some(equal), Some(reference)) = (&mut simd_reference_byte_equal, simd_reference) {
@@ -1217,11 +1283,25 @@ fn validate_proofs(
         }
 
         let verify_start = Instant::now();
-        verify_cairo::<Blake2sMerkleChannel>(proof.into()).unwrap_or_else(|error| {
-            panic!("proof repetition {rep} failed verification: {error:?}")
-        });
-        if rep == 0 {
+        let verifier_proof: BenchVerifierProof = proof.into();
+        if rep == 0 && proof_mutation_required() {
+            // Clone only the verifier representation (not canonical-proof aux
+            // data), then leave it untouched until the original has verified.
+            // This work is outside the timed proving window and occurs only when
+            // explicitly requested.
+            let mutation_candidate = verifier_proof.clone();
+            verify_cairo::<Blake2sMerkleChannel>(verifier_proof).unwrap_or_else(|error| {
+                panic!("proof repetition {rep} failed verification: {error:?}")
+            });
             verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
+            proof_mutation = Some(verify_structured_proof_mutation(mutation_candidate));
+        } else {
+            verify_cairo::<Blake2sMerkleChannel>(verifier_proof).unwrap_or_else(|error| {
+                panic!("proof repetition {rep} failed verification: {error:?}")
+            });
+            if rep == 0 {
+                verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
+            }
         }
     }
 
@@ -1233,6 +1313,7 @@ fn validate_proofs(
         proof_byte_equal,
         simd_reference_byte_equal,
         simd_reference: simd_reference.map(|reference| reference.record.clone()),
+        proof_mutation,
     }
 }
 
@@ -1252,6 +1333,23 @@ fn enforce_simd_reference_byte_equal(byte_equal: Option<bool>) {
     assert!(
         simd_reference_gate_passes(simd_reference_required(), byte_equal),
         "SIMD reference byte equality gate failed: a fresh verified SIMD reference was unavailable or GPU proof bytes differed"
+    );
+}
+
+fn enforce_proof_mutation_rejected(proof_mutation: Option<&ProofMutationRecord>) {
+    assert!(
+        proof_mutation_gate_passes(
+            proof_mutation_required(),
+            proof_mutation.map(|record| record.rejected),
+        ),
+        "proof mutation rejection gate failed: the structured verifier-relevant mutation was unavailable or was accepted"
+    );
+}
+
+fn reject_proof_mutation_gate_without_proof(mode: &str) {
+    assert!(
+        !proof_mutation_required(),
+        "--require-proof-mutation-rejected requires a proof run; unavailable in {mode}"
     );
 }
 
@@ -1322,6 +1420,7 @@ fn print_main_record(
         0.0
     };
     let simd_reference = outcome.simd_reference.as_ref();
+    let proof_mutation = outcome.proof_mutation.as_ref();
 
     let record = json!({
         "program": program,
@@ -1349,6 +1448,10 @@ fn print_main_record(
         "proof_byte_equal": outcome.proof_byte_equal,
         "proof_byte_equal_required": proof_byte_equal_required(),
         "gpu_proof_blake3": &outcome.gpu_proof_blake3,
+        "proof_mutation_required": proof_mutation_required(),
+        "proof_mutation_kind": proof_mutation.map(|record| record.kind),
+        "proof_mutation_rejected": proof_mutation.map(|record| record.rejected),
+        "proof_mutation_error_class": proof_mutation.and_then(|record| record.error_class),
         "proof_kb": round3(outcome.proof_size as f64 / 1024.0),
         "peak_rss_gb": round3(peak_rss_gb()),
         "vram_end_gb": round3(vram_end_gb),
@@ -1442,6 +1545,7 @@ fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
     let per_proof_s = times.iter().sum::<f64>() / n as f64;
     let total_steps = pie_n_steps.map(|s| s * n);
     let performance_claim_admissible = performance_claim_admissible();
+    let proof_mutation = validation.proof_mutation.as_ref();
     println!(
         "{}",
         merge_json(
@@ -1467,12 +1571,17 @@ fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
                 "deterministic": validation.proof_byte_equal,
                 "proof_byte_equal": validation.proof_byte_equal,
                 "proof_byte_equal_required": proof_byte_equal_required(),
+                "proof_mutation_required": proof_mutation_required(),
+                "proof_mutation_kind": proof_mutation.map(|record| record.kind),
+                "proof_mutation_rejected": proof_mutation.map(|record| record.rejected),
+                "proof_mutation_error_class": proof_mutation.and_then(|record| record.error_class),
                 "pie_n_steps": pie_n_steps,
             }),
             record_context(backend)
         )
     );
     enforce_proof_byte_equal(validation.proof_byte_equal);
+    enforce_proof_mutation_rejected(validation.proof_mutation.as_ref());
 }
 
 /// M6-a increment 2: TRUE two-proof concurrency — `N` host threads, each driving a
@@ -1598,6 +1707,7 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
     );
     let total_steps = pie_n_steps.map(|s| s * n);
     let performance_claim_admissible = performance_claim_admissible();
+    let proof_mutation = validation.proof_mutation.as_ref();
     println!(
         "{}",
         merge_json(
@@ -1625,12 +1735,17 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
                 "deterministic": validation.proof_byte_equal,
                 "proof_byte_equal": validation.proof_byte_equal,
                 "proof_byte_equal_required": proof_byte_equal_required(),
+                "proof_mutation_required": proof_mutation_required(),
+                "proof_mutation_kind": proof_mutation.map(|record| record.kind),
+                "proof_mutation_rejected": proof_mutation.map(|record| record.rejected),
+                "proof_mutation_error_class": proof_mutation.and_then(|record| record.error_class),
                 "pie_n_steps": pie_n_steps,
             }),
             record_context(backend)
         )
     );
     enforce_proof_byte_equal(validation.proof_byte_equal);
+    enforce_proof_mutation_rejected(validation.proof_mutation.as_ref());
 }
 
 fn run_pipelined(
@@ -1751,6 +1866,7 @@ fn run_pipelined(
         proof_byte_equal: validation.proof_byte_equal,
         simd_reference_byte_equal: validation.simd_reference_byte_equal,
         simd_reference: validation.simd_reference,
+        proof_mutation: validation.proof_mutation,
         vram_peak_gb,
     };
     print_main_record(
@@ -1784,6 +1900,7 @@ fn run_pipelined(
         })
     );
     enforce_proof_byte_equal(outcome.proof_byte_equal);
+    enforce_proof_mutation_rejected(outcome.proof_mutation.as_ref());
 }
 
 /// Resolve the input source from CLI flags. `--program`/`--iterations` selects the
@@ -1980,6 +2097,7 @@ fn main() {
             "--require-simd-reference-byte-equal requires a standard proof run"
         );
         reject_gpu_native_architecture_gate_without_proof("adapt-only mode");
+        reject_proof_mutation_gate_without_proof("adapt-only mode");
         let loaded = source.load();
         let cycle_count = cycle_count_of(&loaded.input);
         println!(
@@ -2072,6 +2190,7 @@ fn main() {
             "--require-simd-reference-byte-equal requires a standard proof run"
         );
         reject_gpu_native_architecture_gate_without_proof("witness JIT self-test mode");
+        reject_proof_mutation_gate_without_proof("witness JIT self-test mode");
         // STWO_WITNESS_JIT_SOURCE=emitted: register the transformer-EMITTED full-width
         // writer recordings (strictly wider than the built-in hand decode-subsets:
         // e.g. add_opcode 103 columns vs 14) so the device selftest runs
@@ -2094,6 +2213,7 @@ fn main() {
             "--require-simd-reference-byte-equal requires a standard proof run"
         );
         reject_gpu_native_architecture_gate_without_proof("device interaction self-test mode");
+        reject_proof_mutation_gate_without_proof("device interaction self-test mode");
         let ok = stwo_cairo_prover::witness::jit_witness_hook::run_device_interaction_selftest(
             &loaded.input,
         );
@@ -2160,6 +2280,7 @@ fn main() {
         proof_byte_equal: validation.proof_byte_equal,
         simd_reference_byte_equal: validation.simd_reference_byte_equal,
         simd_reference: validation.simd_reference,
+        proof_mutation: validation.proof_mutation,
         vram_peak_gb,
     };
     print_main_record(
@@ -2175,6 +2296,7 @@ fn main() {
     );
     enforce_proof_byte_equal(outcome.proof_byte_equal);
     enforce_simd_reference_byte_equal(outcome.simd_reference_byte_equal);
+    enforce_proof_mutation_rejected(outcome.proof_mutation.as_ref());
     // Silence unused-import warnings when only one backend path is exercised.
     let _ = CairoSerialize::serialize as fn(&u64, &mut Vec<starknet_ff::FieldElement>);
 }
@@ -2184,13 +2306,14 @@ mod tests {
     use stwo_backend_cuda::CudaExecTelemetry;
 
     use super::{
-        initial_proof_byte_equal, pcs_telemetry_json, performance_claim_admissible_for,
-        proof_byte_equal_gate_passes, quantile, resident_session_telemetry_json,
+        cairo_verification_error_class, initial_proof_byte_equal, mutate_claimed_sum,
+        pcs_telemetry_json, performance_claim_admissible_for, proof_byte_equal_gate_passes,
+        proof_mutation_gate_passes, quantile, resident_session_telemetry_json,
         simd_reference_gate_passes, simd_reference_reuse_input_gate_passes, throughput_mhz,
         validate_gpu_native_architecture, validate_resident_session_architecture,
-        validate_strict_aot_provenance, AotRuntimeStats, CudaPcsDriverTelemetry,
-        CudaPcsRuntimeMode, RequiredCudaPcsRuntimeMode, ResidentSessionTelemetry,
-        REQUIRED_CUDA_PCS_ARCHITECTURE,
+        validate_strict_aot_provenance, AotRuntimeStats, CairoVerificationError,
+        CudaPcsDriverTelemetry, CudaPcsRuntimeMode, RequiredCudaPcsRuntimeMode,
+        ResidentSessionTelemetry, SecureField, REQUIRED_CUDA_PCS_ARCHITECTURE,
     };
 
     fn complete_telemetry(runtime_mode: CudaPcsRuntimeMode) -> CudaPcsDriverTelemetry {
@@ -2288,6 +2411,33 @@ mod tests {
         assert!(simd_reference_reuse_input_gate_passes(false, true));
         assert!(simd_reference_reuse_input_gate_passes(true, true));
         assert!(!simd_reference_reuse_input_gate_passes(true, false));
+    }
+
+    #[test]
+    fn proof_mutation_gate_fails_closed() {
+        assert!(proof_mutation_gate_passes(false, None));
+        assert!(proof_mutation_gate_passes(true, Some(true)));
+        assert!(!proof_mutation_gate_passes(true, None));
+        assert!(!proof_mutation_gate_passes(true, Some(false)));
+    }
+
+    #[test]
+    fn structured_mutation_changes_claimed_sum_by_one() {
+        let mut claimed_sum = SecureField::from(7_u32);
+        mutate_claimed_sum(&mut claimed_sum);
+        assert_eq!(claimed_sum, SecureField::from(8_u32));
+    }
+
+    #[test]
+    fn mutation_error_class_is_machine_readable() {
+        assert_eq!(
+            cairo_verification_error_class(&CairoVerificationError::InvalidLogupSum),
+            "invalid_logup_sum"
+        );
+        assert_eq!(
+            cairo_verification_error_class(&CairoVerificationError::ProofOfWork),
+            "proof_of_work"
+        );
     }
 
     #[test]
