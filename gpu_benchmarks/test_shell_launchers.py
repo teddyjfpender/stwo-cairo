@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -16,6 +18,74 @@ ROOT = Path(__file__).resolve().parent
 
 
 class ShellLauncherTests(unittest.TestCase):
+    def test_replacement_sn2_ecc_policy_is_explicit_and_sealed(self) -> None:
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        source = common.read_text(encoding="utf-8")
+        fields = [
+            "NVIDIA H100 80GB HBM3",
+            "GPU-00000000-0000-0000-0000-000000000001",
+            "00000000:01:00.0",
+            "81559",
+            "550.54.15",
+            "9.0",
+            "Enabled",
+            "Disabled",
+            "{ecc}",
+            "Default",
+            "700.00",
+            "1980",
+            "1593",
+        ]
+        records = {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            nvidia_smi = fake_bin / "nvidia-smi"
+            nvidia_smi.write_text(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$TEST_GPU_ROW\"\n",
+                encoding="utf-8",
+            )
+            nvidia_smi.chmod(0o755)
+            for index, ecc in enumerate(("Enabled", "Disabled", "N/A", "", "Unknown")):
+                out = root / f"hardware-{index}.json"
+                env = {
+                    **os.environ,
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                    "REPLACEMENT_SN2_MODE": "diagnostic",
+                    "CAIRO": "/workspace/stwo-cairo/stwo_cairo_prover",
+                    "STWO": "/workspace/stwo",
+                    "RUN": str(root),
+                    "COMMON": str(common),
+                    "OUT": str(out),
+                    "TEST_GPU_ROW": ",".join(fields).format(ecc=ecc),
+                }
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'source "$COMMON"; checkpoint_capture_hardware_identity "$OUT"',
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                if ecc in {"Enabled", "Disabled"}:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    records[ecc] = json.loads(out.read_text(encoding="utf-8"))
+                    self.assertEqual(records[ecc]["ecc_mode"], ecc)
+                else:
+                    self.assertNotEqual(result.returncode, 0, ecc)
+                    self.assertIn("unstable GPU policy", result.stderr)
+
+        self.assertNotEqual(records["Enabled"], records["Disabled"])
+        self.assertIn(
+            'if hardware != seal.get("hardware"):\n'
+            '    raise SystemExit("timing GPU identity/policy differs from the diagnostic")',
+            source,
+        )
+
     def test_replacement_sn2_reuse_gate_rejects_each_mutation(self) -> None:
         source = (
             ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"

@@ -125,7 +125,7 @@ except ValueError as error:
     raise SystemExit(f"invalid numeric GPU identity: {error}")
 if "H100" not in name or memory_mib < 79000 or compute != "9.0":
     raise SystemExit(f"replacement-v1 checkpoint requires H100 sm_90 >=79,000 MiB; got {name}, {compute}, {memory_mib}")
-if persistence not in {"Enabled", "Disabled"} or mig != "Disabled" or ecc != "Enabled" or compute_mode != "Default":
+if persistence not in {"Enabled", "Disabled"} or mig != "Disabled" or ecc not in {"Enabled", "Disabled"} or compute_mode != "Default":
     raise SystemExit(f"unstable GPU policy: persistence={persistence}, MIG={mig}, ECC={ecc}, compute={compute_mode}")
 if not all((uuid, pci_bus_id, driver)) or not math.isfinite(power_limit) or power_limit <= 0 or max_sm <= 0 or max_memory <= 0:
     raise SystemExit("GPU power/clock policy is unavailable")
