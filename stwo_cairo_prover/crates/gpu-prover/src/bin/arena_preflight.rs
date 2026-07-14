@@ -660,6 +660,7 @@ fn report_json(
         .map(|group| group.value_words)
         .sum::<usize>();
     let hybrid_traffic = arena_preflight_hybrid::json(arena.quotient_numerator());
+    let quotient_combine = arena.quotient().requirements.combine_pass_bytes;
 
     let budget_bytes = budget_bytes_of(vram_budget_gb);
     let physical_memory =
@@ -740,6 +741,16 @@ fn report_json(
             "eligible_output_rows": single_write_eligible_rows,
             "groups": single_write_groups,
             "hybrid_traffic_model": hybrid_traffic,
+        },
+        "quotient_combine_pass_byte_model": {
+            "rows": quotient_combine.rows,
+            "samples": quotient_combine.samples,
+            "denominator_inversions": quotient_combine.denominator_inversions,
+            "denominator_global_passes": quotient_combine.denominator_global_passes,
+            "eliminated_scratch_bytes": quotient_combine.eliminated_scratch_bytes,
+            "eliminated_logical_traffic_bytes": quotient_combine.eliminated_logical_traffic_bytes,
+            "output_write_bytes": quotient_combine.output_write_bytes,
+            "scope": "compiler-derived logical requests; not measured HBM traffic",
         },
         "transcript_segments": report.transcript_segments,
         "manifest_policy": format!("{:?}", report.manifest_policy),

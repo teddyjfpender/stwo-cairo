@@ -342,7 +342,6 @@ pub enum BufferPurpose {
     QuotientCoefficientSizes,
     QuotientSubdomainValues,
     QuotientTile,
-    QuotientDenominatorScratch,
     FriPing,
     FriPong,
     FriRetainedEvaluation,
@@ -2526,7 +2525,6 @@ struct LogicalQuotientWorkspace {
     coefficient_sizes: LogicalBufferId,
     subdomain_values: LogicalBufferId,
     output_values: LogicalBufferId,
-    denominator_scratch: LogicalBufferId,
 }
 
 #[derive(Clone, Debug)]
@@ -6876,15 +6874,6 @@ fn append_protocol_buffers(
         quotient_requirements.subdomain_value_words,
         quotient_live,
     )?;
-    let denominator_scratch = push_buffer_id(
-        logical,
-        None,
-        None,
-        BufferPurpose::QuotientDenominatorScratch,
-        0,
-        quotient_requirements.denominator_words,
-        quotient_live,
-    )?;
     let logical_quotient = LogicalQuotientWorkspace {
         config: quotient_config,
         requirements: quotient_requirements,
@@ -6900,7 +6889,6 @@ fn append_protocol_buffers(
         coefficient_sizes,
         subdomain_values,
         output_values,
-        denominator_scratch,
     };
     let fri_scratch = BufferLifetime::at(ProofEpoch::Fri);
     let fri_live = BufferLifetime::new(ProofEpoch::Fri, ProofEpoch::Decommit)?;
@@ -8494,7 +8482,6 @@ fn resolve_quotient_slots(
         coefficient_sizes: physical(logical.coefficient_sizes)?,
         subdomain_values: physical(logical.subdomain_values)?,
         output_values: physical(logical.output_values)?,
-        denominator_scratch: physical(logical.denominator_scratch)?,
     };
     let slot_requirements = logical
         .requirements
@@ -11386,6 +11373,17 @@ mod tests {
         permutation.sort_unstable();
         assert_eq!(permutation, (0..base_columns).collect::<Vec<_>>());
         assert_eq!(arena.quotient().requirements.sample_count, 3);
+        let quotient_pass_bytes = arena.quotient().requirements.combine_pass_bytes;
+        assert_eq!(quotient_pass_bytes.rows, 1 << 25);
+        assert_eq!(quotient_pass_bytes.samples, 3);
+        assert_eq!(quotient_pass_bytes.denominator_inversions, 100_663_296);
+        assert_eq!(quotient_pass_bytes.eliminated_scratch_bytes, 805_306_368);
+        assert_eq!(
+            quotient_pass_bytes.eliminated_logical_traffic_bytes,
+            1_610_612_736
+        );
+        assert_eq!(quotient_pass_bytes.denominator_global_passes, 0);
+        assert_eq!(quotient_pass_bytes.output_write_bytes, 536_870_912);
         assert_eq!(arena.quotient().partial_numerators.len(), 3);
         assert_eq!(arena.preprocessed_coefficients().len(), 3);
         assert_eq!(arena.preprocessed().interpolation_batches.len(), 2);
@@ -11478,27 +11476,13 @@ mod tests {
             BufferPurpose::QuotientNumeratorTermPoints,
             BufferPurpose::QuotientNumeratorLdeTile,
         ]);
-        let quotient_stage_ephemeral = address_ranges_for(&[
-            BufferPurpose::QuotientNumeratorLineCoefficients,
-            BufferPurpose::QuotientNumeratorTermPoints,
-            BufferPurpose::QuotientNumeratorLdeTile,
-            BufferPurpose::QuotientDenominatorScratch,
-            BufferPurpose::QuotientTile,
-            BufferPurpose::QuotientSamplePoints,
-        ]);
-        // Stable range IDs remain unique even when disjoint lifetimes reuse
-        // the same arena addresses. Pin the physical address reuse itself.
-        let (oods_reused, quotient_reused) = oods_ephemeral
+        // OODS and numerator preparation are sequential. Keep the semantic
+        // liveness fact explicit, but do not pin a particular physical alias:
+        // retiring a large scratch slab can legitimately change the optimal
+        // range packing chosen for every smaller buffer around it.
+        assert!(oods_ephemeral.iter().all(|oods| numerator_ephemeral
             .iter()
-            .find_map(|oods| {
-                quotient_stage_ephemeral
-                    .iter()
-                    .find(|quotient| oods.2 < quotient.3 && quotient.2 < oods.3)
-                    .map(|quotient| (oods, quotient))
-            })
-            .expect("sequential OODS and quotient-stage scratch should reuse arena addresses");
-        assert_ne!(oods_reused.0, quotient_reused.0);
-        assert!(!oods_reused.1.overlaps(quotient_reused.1));
+            .all(|numerator| !oods.1.overlaps(numerator.1))));
         assert!(
             !numerator_ephemeral.is_empty(),
             "numerator scratch must be planned"
@@ -11542,11 +11526,10 @@ mod tests {
             quotient_slots.coefficient_sizes,
             quotient_slots.subdomain_values,
             quotient_slots.output_values,
-            quotient_slots.denominator_scratch,
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(quotient_workspace_ids.len(), 10);
+        assert_eq!(quotient_workspace_ids.len(), 9);
         let source_ids = arena
             .quotient()
             .partial_numerators
