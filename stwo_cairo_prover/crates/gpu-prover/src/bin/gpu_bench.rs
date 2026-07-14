@@ -16,6 +16,7 @@
 //!             [--reps 3] [--pipeline <depth>] [--reuse-input] [--adapt-only] \
 //!             [--require-proof-byte-equal] [--require-gpu-native-architecture] \
 //!             [--diagnostic-allow-slow-graph-submit] \
+//!             [--operational-safety-reserve-bytes N] \
 //!             [--require-simd-reference-byte-equal] \
 //!             [--require-gpu-pcs-runtime-mode detached-eager|arena-graph]
 //!   gpu_bench --pie a.zip[,b.zip,...] [--pie-copies N] [--pie-mode aggregate|rotate] \
@@ -129,6 +130,10 @@ use stwo_cairo_gpu_prover::{
 };
 use stwo_cairo_prover::prover::{prove_cairo, ChannelHash, ProverParameters};
 use stwo_cairo_serialize::CairoSerialize;
+
+#[path = "../gpu_bench_physical.rs"]
+mod gpu_bench_physical;
+use gpu_bench_physical::{gpu_native_session_context, resident_session_telemetry_json};
 
 type BenchProof = CairoProof<<Blake2sMerkleChannel as MerkleChannel>::H>;
 type AotRuntimeStats = stwo_backend_cuda::aot::RuntimeStats;
@@ -246,6 +251,9 @@ fn gpu_native_prover_config() -> GpuProverConfig {
     config.strict = gpu_native_architecture_required()
         && required_gpu_pcs_runtime_mode() == RequiredCudaPcsRuntimeMode::ArenaGraph;
     config.allow_slow_graph_submit_diagnostic = graph_submit_gap_diagnostic();
+    config.operational_safety_reserve_bytes = gpu_bench_physical::operational_safety_reserve_bytes(
+        arg("--operational-safety-reserve-bytes"),
+    );
     assert!(
         !config.allow_slow_graph_submit_diagnostic || config.strict,
         "--diagnostic-allow-slow-graph-submit requires the strict ArenaGraph architecture gate"
@@ -975,50 +983,8 @@ fn record_context(backend: &str) -> serde_json::Value {
             merge_json(base, gpu_native_pcs_context(telemetry.as_ref())),
             gpu_native_aot_context(aot_stats.as_ref(), architecture_required),
         ),
-        gpu_native_session_context(session_telemetry.as_ref()),
+        gpu_native_session_context(session_telemetry.as_ref(), engine() == "gpu-native"),
     )
-}
-
-fn gpu_native_session_context(telemetry: Option<&ResidentSessionTelemetry>) -> serde_json::Value {
-    let Some(telemetry) = telemetry.filter(|_| engine() == "gpu-native") else {
-        return json!({
-            "gpu_graph_a_setup_gate_passed": null,
-            "gpu_setup_base_migration_copies": null,
-            "gpu_setup_lookup_host_copies": null,
-            "gpu_setup_legacy_witness_fallbacks": null,
-            "gpu_execution_tables_ingest_compact_h2d_bytes": null,
-            "gpu_execution_tables_ingest_compact_h2d_copies": null,
-            "gpu_execution_tables_ingest_descriptor_h2d_bytes": null,
-            "gpu_execution_tables_ingest_descriptor_h2d_copies": null,
-            "gpu_execution_tables_ingest_syncs": null,
-            "gpu_witness_ingest_components": null,
-            "gpu_witness_ingest_h2d_bytes": null,
-            "gpu_witness_ingest_h2d_copies": null,
-            "gpu_witness_ingest_syncs": null,
-            "gpu_transcript_segments": null,
-        });
-    };
-    resident_session_telemetry_json(telemetry)
-}
-
-fn resident_session_telemetry_json(telemetry: &ResidentSessionTelemetry) -> serde_json::Value {
-    let execution_tables = telemetry.execution_tables_ingest;
-    json!({
-        "gpu_graph_a_setup_gate_passed": telemetry.require_strict_graph_a().is_ok(),
-        "gpu_setup_base_migration_copies": telemetry.base.migrated_base_columns,
-        "gpu_setup_lookup_host_copies": telemetry.lookups.host_copies,
-        "gpu_setup_legacy_witness_fallbacks": telemetry.witness.host_fallbacks.len(),
-        "gpu_execution_tables_ingest_compact_h2d_bytes": execution_tables.map(|value| value.compact_h2d_bytes),
-        "gpu_execution_tables_ingest_compact_h2d_copies": execution_tables.map(|value| value.compact_h2d_copies),
-        "gpu_execution_tables_ingest_descriptor_h2d_bytes": execution_tables.map(|value| value.descriptor_h2d_bytes),
-        "gpu_execution_tables_ingest_descriptor_h2d_copies": execution_tables.map(|value| value.descriptor_h2d_copies),
-        "gpu_execution_tables_ingest_syncs": execution_tables.map(|value| value.sync_calls),
-        "gpu_witness_ingest_components": telemetry.recorded_witness_ingest.components,
-        "gpu_witness_ingest_h2d_bytes": telemetry.recorded_witness_ingest.h2d_bytes,
-        "gpu_witness_ingest_h2d_copies": telemetry.recorded_witness_ingest.h2d_copies,
-        "gpu_witness_ingest_syncs": telemetry.recorded_witness_ingest.sync_calls,
-        "gpu_transcript_segments": telemetry.transcript_segments,
-    })
 }
 
 /// Architecture evidence from the concrete CUDA PCS driver. These fields land
@@ -2215,12 +2181,14 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use stwo_backend_cuda::CudaExecTelemetry;
+
     use super::{
         initial_proof_byte_equal, pcs_telemetry_json, performance_claim_admissible_for,
         proof_byte_equal_gate_passes, quantile, resident_session_telemetry_json,
         simd_reference_gate_passes, simd_reference_reuse_input_gate_passes, throughput_mhz,
         validate_gpu_native_architecture, validate_resident_session_architecture,
-        validate_strict_aot_provenance, AotRuntimeStats, CudaExecTelemetry, CudaPcsDriverTelemetry,
+        validate_strict_aot_provenance, AotRuntimeStats, CudaPcsDriverTelemetry,
         CudaPcsRuntimeMode, RequiredCudaPcsRuntimeMode, ResidentSessionTelemetry,
         REQUIRED_CUDA_PCS_ARCHITECTURE,
     };

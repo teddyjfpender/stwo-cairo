@@ -5,6 +5,7 @@
 //! self-referential session object and makes every failure leave the cache in a
 //! valid, reusable state.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -29,6 +30,7 @@ use crate::fixed_table_materializer::{
     PEDERSEN_POINTS_18_COLUMN_COUNT, PEDERSEN_POINTS_18_ROW_COUNT,
 };
 use crate::graphs::GraphWorkspace;
+use crate::memory_ledger::{AllocatorPoolCheckpoint, PhysicalMemoryInputs};
 use crate::plan::{ProofPlan, ProofPlanError};
 use crate::protocol_discovery::{ProtocolDiscoveryError, ProtocolTranscriptDiscovery};
 use crate::protocol_plan::{ProtocolPlanError, ProtocolPlanPolicy};
@@ -63,6 +65,9 @@ use crate::workspace_cache::{
     WorkspaceMaterialization,
 };
 
+mod physical_memory;
+use physical_memory::{capture_pool_checkpoint, policy_inputs};
+
 /// Everything whose value changes the resident graph or its stable pointers.
 pub struct ResidentSessionRequest {
     pub preprocessed_trace: Arc<PreProcessedTrace>,
@@ -70,6 +75,7 @@ pub struct ResidentSessionRequest {
     pub channel_salt: u32,
     pub pcs: PcsConfig,
     pub include_all_preprocessed_columns: bool,
+    pub operational_safety_reserve_bytes: Option<NonZeroUsize>,
 }
 
 /// Strict device-born entry: claim/shape/protocol planning happens before the
@@ -82,6 +88,7 @@ pub struct ResidentPreWitnessSessionRequest {
     pub channel_salt: u32,
     pub pcs: PcsConfig,
     pub include_all_preprocessed_columns: bool,
+    pub operational_safety_reserve_bytes: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +124,11 @@ pub struct ResidentSessionTelemetry {
     pub execution_tables_ingest: Option<PreparedExecutionTablesIngestTelemetry>,
     pub ec_op_ingest: Option<PreparedEcOpIngestTelemetry>,
     pub recorded_witness_ingest: ResidentWitnessIngestReport,
+    pub allocator_pool_checkpoint: Option<AllocatorPoolCheckpoint>,
+    pub physical_memory_inputs: PhysicalMemoryInputs,
+    /// A failed native checkpoint leaves its rows absent so admission remains
+    /// false without discarding an otherwise valid proof.
+    pub physical_memory_checkpoint_error: Option<String>,
 }
 
 impl ResidentSessionTelemetry {
@@ -273,6 +285,7 @@ pub enum ResidentSessionError {
         component: &'static str,
         ordinal: usize,
     },
+    PhysicalMemory(&'static str),
     StrictArchitectureTelemetry(&'static str),
     PlannedClaimMismatch,
     PublicMemoryMultiplicitySeed(&'static str),
@@ -404,6 +417,7 @@ fn run_materialized_session<R>(
     shape_executable_materialization: ShapeExecutableMaterialization,
     shape_executable_cache: ShapeExecutableCacheTelemetry,
     require_device_born: bool,
+    operational_safety_reserve_bytes: Option<NonZeroUsize>,
     run: impl FnOnce(
         &mut ResidentGraphRuntime<'_>,
         ResidentSessionArtifacts<'_>,
@@ -476,7 +490,7 @@ fn run_materialized_session<R>(
                     .and_then(|next| bytes.checked_add(next))
                     .ok_or(ResidentSessionError::SizeOverflow)
             })?;
-    let telemetry = ResidentSessionTelemetry {
+    let mut telemetry = ResidentSessionTelemetry {
         shape_executable_materialization: Some(shape_executable_materialization),
         shape_executable_cache,
         workspace_key: Some(executable.workspace_key()),
@@ -494,6 +508,9 @@ fn run_materialized_session<R>(
         execution_tables_ingest: None,
         ec_op_ingest: None,
         recorded_witness_ingest: ResidentWitnessIngestReport::default(),
+        allocator_pool_checkpoint: None,
+        physical_memory_inputs: policy_inputs(operational_safety_reserve_bytes)?,
+        physical_memory_checkpoint_error: None,
     };
     let result = run(
         &mut runtime,
@@ -506,6 +523,9 @@ fn run_materialized_session<R>(
             telemetry: &telemetry,
         },
     )?;
+    if let Err(error) = capture_pool_checkpoint(workspace, &mut telemetry) {
+        telemetry.physical_memory_checkpoint_error = Some(error.to_string());
+    }
     Ok((result, telemetry))
 }
 
@@ -641,6 +661,7 @@ pub fn with_resident_session<R>(
         channel_salt,
         pcs,
         include_all_preprocessed_columns,
+        operational_safety_reserve_bytes,
     } = request;
     let selection = select_resident_executable(
         executable_cache,
@@ -672,6 +693,7 @@ pub fn with_resident_session<R>(
             executable_materialization,
             shape_executable_cache,
             true,
+            operational_safety_reserve_bytes,
             run,
         )?
     };
@@ -984,6 +1006,7 @@ pub fn with_resident_session_from_generator<R>(
         channel_salt,
         pcs,
         include_all_preprocessed_columns,
+        operational_safety_reserve_bytes,
     } = request;
     let exact_plan = Arc::new(capacity_plan.strict_resident_exact(
         &crate::schedule_table::CAIRO_SCHEDULE,
@@ -1101,7 +1124,7 @@ pub fn with_resident_session_from_generator<R>(
                         .and_then(|next| bytes.checked_add(next))
                         .ok_or(ResidentSessionError::SizeOverflow)
                 })?;
-        let telemetry = ResidentSessionTelemetry {
+        let mut telemetry = ResidentSessionTelemetry {
             shape_executable_materialization: Some(executable_materialization),
             shape_executable_cache,
             workspace_key: Some(executable.workspace_key()),
@@ -1119,6 +1142,9 @@ pub fn with_resident_session_from_generator<R>(
             execution_tables_ingest,
             ec_op_ingest,
             recorded_witness_ingest: witness_ingest,
+            allocator_pool_checkpoint: None,
+            physical_memory_inputs: policy_inputs(operational_safety_reserve_bytes)?,
+            physical_memory_checkpoint_error: None,
         };
         let result = run(
             &mut runtime,
@@ -1131,6 +1157,9 @@ pub fn with_resident_session_from_generator<R>(
                 telemetry: &telemetry,
             },
         )?;
+        if let Err(error) = capture_pool_checkpoint(workspace, &mut telemetry) {
+            telemetry.physical_memory_checkpoint_error = Some(error.to_string());
+        }
         (result, telemetry)
     };
     telemetry.cache = cache.telemetry();

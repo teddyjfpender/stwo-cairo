@@ -429,6 +429,10 @@ pub struct GpuProverConfig {
     /// Maximum exact shape/protocol workspaces retained. Capacity exhaustion
     /// fails closed; captured graphs are never evicted implicitly.
     pub workspace_cache_capacity: usize,
+    /// Deployment-owned headroom reserved in addition to measured allocations.
+    /// `None` keeps physical admission incomplete; callers must opt into an
+    /// explicit non-zero policy rather than infer one from remaining VRAM.
+    pub operational_safety_reserve_bytes: Option<core::num::NonZeroUsize>,
     pub channel: ChannelMode,
     /// Post-M6: no fallbacks, any device failure aborts the prove (U3).
     pub strict: bool,
@@ -445,6 +449,7 @@ impl Default for GpuProverConfig {
             vram_budget: None,
             pipeline_depth: 1,
             workspace_cache_capacity: 1,
+            operational_safety_reserve_bytes: None,
             channel: ChannelMode::Host,
             strict: false,
             allow_slow_graph_submit_diagnostic: false,
@@ -660,6 +665,7 @@ where
                 channel_salt: params.channel_salt,
                 pcs: params.pcs_config,
                 include_all_preprocessed_columns: params.include_all_preprocessed_columns,
+                operational_safety_reserve_bytes: self.config.operational_safety_reserve_bytes,
             },
             run,
         )?)
@@ -696,6 +702,7 @@ where
                 channel_salt,
                 pcs,
                 include_all_preprocessed_columns,
+                operational_safety_reserve_bytes: self.config.operational_safety_reserve_bytes,
             },
             run,
         )?)

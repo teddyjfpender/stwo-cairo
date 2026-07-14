@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 
 /// One disjoint non-arena physical accounting row.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -59,6 +60,105 @@ impl PhysicalAllocationId {
     }
 }
 
+/// One synchronized native checkpoint over the two allocator pools that can
+/// retain resident-prover allocations.
+///
+/// `attributed_bytes` are allocations already counted by another physical
+/// ledger row. Net slack is therefore `reserved - attributed`, not
+/// `reserved - used`: the latter would silently omit any live pool allocation
+/// whose owner has not yet been classified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocatorPoolCheckpoint {
+    isolated_used_bytes: usize,
+    isolated_reserved_bytes: usize,
+    isolated_attributed_bytes: usize,
+    default_used_bytes: usize,
+    default_reserved_bytes: usize,
+    default_attributed_bytes: usize,
+    net_slack_bytes: usize,
+}
+
+impl AllocatorPoolCheckpoint {
+    pub fn try_new(
+        isolated_used_bytes: usize,
+        isolated_reserved_bytes: usize,
+        isolated_attributed_bytes: usize,
+        default_used_bytes: usize,
+        default_reserved_bytes: usize,
+        default_attributed_bytes: usize,
+    ) -> Result<Self, &'static str> {
+        validate_pool(
+            isolated_used_bytes,
+            isolated_reserved_bytes,
+            isolated_attributed_bytes,
+        )?;
+        validate_pool(
+            default_used_bytes,
+            default_reserved_bytes,
+            default_attributed_bytes,
+        )?;
+        let net_slack_bytes = isolated_reserved_bytes
+            .checked_sub(isolated_attributed_bytes)
+            .and_then(|bytes| {
+                default_reserved_bytes
+                    .checked_sub(default_attributed_bytes)
+                    .and_then(|default| bytes.checked_add(default))
+            })
+            .ok_or("allocator pool net slack overflow")?;
+        Ok(Self {
+            isolated_used_bytes,
+            isolated_reserved_bytes,
+            isolated_attributed_bytes,
+            default_used_bytes,
+            default_reserved_bytes,
+            default_attributed_bytes,
+            net_slack_bytes,
+        })
+    }
+
+    pub const fn isolated_used_bytes(self) -> usize {
+        self.isolated_used_bytes
+    }
+
+    pub const fn isolated_reserved_bytes(self) -> usize {
+        self.isolated_reserved_bytes
+    }
+
+    pub const fn isolated_attributed_bytes(self) -> usize {
+        self.isolated_attributed_bytes
+    }
+
+    pub const fn default_used_bytes(self) -> usize {
+        self.default_used_bytes
+    }
+
+    pub const fn default_reserved_bytes(self) -> usize {
+        self.default_reserved_bytes
+    }
+
+    pub const fn default_attributed_bytes(self) -> usize {
+        self.default_attributed_bytes
+    }
+
+    pub const fn net_slack_bytes(self) -> usize {
+        self.net_slack_bytes
+    }
+}
+
+fn validate_pool(
+    used_bytes: usize,
+    reserved_bytes: usize,
+    attributed_bytes: usize,
+) -> Result<(), &'static str> {
+    if used_bytes > reserved_bytes {
+        return Err("allocator pool used bytes exceed reserved bytes");
+    }
+    if attributed_bytes > used_bytes {
+        return Err("allocator pool attributed bytes exceed used bytes");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PhysicalAllocationOwnerId {
     CudaPrimaryContext,
@@ -101,27 +201,43 @@ impl PhysicalMemoryInputs {
     pub fn try_from_rows(
         rows: impl IntoIterator<Item = (PhysicalAllocationId, PhysicalAllocationOwnerId, usize)>,
     ) -> Result<Self, &'static str> {
-        let mut validated = BTreeMap::new();
+        let mut validated = Self::default();
         for (allocation, owner, bytes) in rows {
-            if owner != allocation.owner() {
-                return Err("physical allocation row has the wrong owner identity");
-            }
-            if bytes == 0 && !allocation.permits_zero() {
-                return Err("physical allocation row requires a non-zero byte count");
-            }
-            if validated.insert(allocation, bytes).is_some() {
-                return Err("physical allocation input contains a duplicate allocation ID");
-            }
+            validated.insert(allocation, owner, bytes)?;
         }
-        Ok(Self { rows: validated })
+        Ok(validated)
     }
 
-    pub(super) fn admission(
-        &self,
-        known_peak_bytes: usize,
-        ceiling_bytes: usize,
-    ) -> Result<PhysicalAdmission, &'static str> {
-        let rows = PhysicalAllocationId::ALL
+    pub fn with_allocator_pool_checkpoint(
+        mut self,
+        checkpoint: AllocatorPoolCheckpoint,
+    ) -> Result<Self, &'static str> {
+        self.insert(
+            PhysicalAllocationId::AllocatorPoolNetSlack,
+            PhysicalAllocationOwnerId::CudaMemoryPools,
+            checkpoint.net_slack_bytes(),
+        )?;
+        Ok(self)
+    }
+
+    pub fn with_operational_safety_reserve(
+        mut self,
+        bytes: NonZeroUsize,
+    ) -> Result<Self, &'static str> {
+        self.insert(
+            PhysicalAllocationId::OperationalSafetyReserve,
+            PhysicalAllocationOwnerId::AdmissionPolicy,
+            bytes.get(),
+        )?;
+        Ok(self)
+    }
+
+    pub fn get(&self, id: PhysicalAllocationId) -> Option<usize> {
+        self.rows.get(&id).copied()
+    }
+
+    pub fn rows_json(&self) -> Vec<serde_json::Value> {
+        PhysicalAllocationId::ALL
             .into_iter()
             .map(|id| {
                 let bytes = self.rows.get(&id).copied();
@@ -144,7 +260,41 @@ impl PhysicalMemoryInputs {
                     },
                 })
             })
-            .collect();
+            .collect()
+    }
+
+    pub fn missing_allocation_ids(&self) -> Vec<&'static str> {
+        PhysicalAllocationId::ALL
+            .into_iter()
+            .filter(|id| !self.rows.contains_key(id))
+            .map(PhysicalAllocationId::id)
+            .collect()
+    }
+
+    fn insert(
+        &mut self,
+        allocation: PhysicalAllocationId,
+        owner: PhysicalAllocationOwnerId,
+        bytes: usize,
+    ) -> Result<(), &'static str> {
+        if owner != allocation.owner() {
+            return Err("physical allocation row has the wrong owner identity");
+        }
+        if bytes == 0 && !allocation.permits_zero() {
+            return Err("physical allocation row requires a non-zero byte count");
+        }
+        if self.rows.insert(allocation, bytes).is_some() {
+            return Err("physical allocation input contains a duplicate allocation ID");
+        }
+        Ok(())
+    }
+
+    pub(super) fn admission(
+        &self,
+        known_peak_bytes: usize,
+        ceiling_bytes: usize,
+    ) -> Result<PhysicalAdmission, &'static str> {
+        let rows = self.rows_json();
         let missing = PhysicalAllocationId::ALL
             .into_iter()
             .filter(|id| !self.rows.contains_key(id))
@@ -167,7 +317,7 @@ impl PhysicalMemoryInputs {
             peak_bytes,
             complete: missing.is_empty(),
             pass: peak_bytes.is_some_and(|bytes| bytes <= ceiling_bytes),
-            missing_ids: missing.iter().map(|id| id.id()).collect(),
+            missing_ids: self.missing_allocation_ids(),
             missing_rows: missing.iter().map(|id| id.label()).collect(),
         })
     }
@@ -221,5 +371,59 @@ mod tests {
             (AllocatorPoolNetSlack, CudaMemoryPools, 0,)
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn native_pool_checkpoint_charges_every_unattributed_reserved_byte() {
+        let checkpoint = AllocatorPoolCheckpoint::try_new(100, 128, 96, 20, 32, 16).unwrap();
+        assert_eq!(checkpoint.net_slack_bytes(), 48);
+        let inputs = PhysicalMemoryInputs::default()
+            .with_allocator_pool_checkpoint(checkpoint)
+            .unwrap()
+            .with_operational_safety_reserve(NonZeroUsize::new(64).unwrap())
+            .unwrap();
+        assert_eq!(
+            inputs.get(PhysicalAllocationId::AllocatorPoolNetSlack),
+            Some(48)
+        );
+        assert_eq!(
+            inputs.get(PhysicalAllocationId::OperationalSafetyReserve),
+            Some(64)
+        );
+        assert_eq!(inputs.missing_allocation_ids().len(), 4);
+        assert!(inputs
+            .missing_allocation_ids()
+            .contains(&"primary_context_driver_baseline"));
+    }
+
+    #[test]
+    fn native_pool_checkpoint_rejects_impossible_or_overflowing_snapshots() {
+        assert_eq!(
+            AllocatorPoolCheckpoint::try_new(2, 1, 1, 0, 0, 0),
+            Err("allocator pool used bytes exceed reserved bytes")
+        );
+        assert_eq!(
+            AllocatorPoolCheckpoint::try_new(1, 1, 2, 0, 0, 0),
+            Err("allocator pool attributed bytes exceed used bytes")
+        );
+        assert_eq!(
+            AllocatorPoolCheckpoint::try_new(0, usize::MAX, 0, 0, 1, 0),
+            Err("allocator pool net slack overflow")
+        );
+    }
+
+    #[test]
+    fn native_rows_cannot_overwrite_a_supplied_owner() {
+        let inputs = PhysicalMemoryInputs::try_from_rows([(
+            PhysicalAllocationId::AllocatorPoolNetSlack,
+            PhysicalAllocationOwnerId::CudaMemoryPools,
+            1,
+        )])
+        .unwrap();
+        let checkpoint = AllocatorPoolCheckpoint::try_new(0, 0, 0, 0, 0, 0).unwrap();
+        assert_eq!(
+            inputs.with_allocator_pool_checkpoint(checkpoint),
+            Err("physical allocation input contains a duplicate allocation ID")
+        );
     }
 }

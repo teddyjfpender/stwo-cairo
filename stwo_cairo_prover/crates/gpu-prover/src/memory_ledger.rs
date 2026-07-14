@@ -9,7 +9,9 @@ use crate::fixed_table_materializer::PEDERSEN_POINTS_18_EVALUATION_BYTES;
 use crate::resident_sources::MAX_PREPROCESSED_DETACHED_STAGING_BYTES;
 
 mod physical_rows;
-pub use physical_rows::{PhysicalAllocationId, PhysicalAllocationOwnerId, PhysicalMemoryInputs};
+pub use physical_rows::{
+    AllocatorPoolCheckpoint, PhysicalAllocationId, PhysicalAllocationOwnerId, PhysicalMemoryInputs,
+};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 
