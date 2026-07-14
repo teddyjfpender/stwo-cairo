@@ -284,6 +284,19 @@ fn fence_after<T, E>(
     }
 }
 
+/// Run ownership cleanup unconditionally. A cleanup failure takes precedence because
+/// the allocator's live-set accounting is no longer trustworthy; otherwise preserve
+/// the original operation result.
+fn cleanup_after<T, E>(
+    operation: Result<T, E>,
+    cleanup: impl FnOnce() -> Result<(), E>,
+) -> Result<T, E> {
+    match cleanup() {
+        Err(error) => Err(error),
+        Ok(()) => operation,
+    }
+}
+
 /// Consume canonical base evaluations and populate both resident trace forms.
 ///
 /// `BaseTrace::Polys` is rejected: already-interpolated coefficients cannot
@@ -878,21 +891,21 @@ pub fn stage_preprocessed_commitment(
                 continue;
             }
             let evaluation = streamer.generate(source.as_ref())?;
-            if evaluation.domain.log_size() != column.log_size {
-                return Err(ResidentSourceStageError::PreprocessedColumnLogMismatch {
-                    column: index,
-                    expected: column.log_size,
-                    actual: evaluation.domain.log_size(),
-                });
-            }
-            if evaluation.values.size != expected_words {
-                return Err(ResidentSourceStageError::ColumnValueSizeMismatch {
-                    column: index,
-                    expected_words,
-                    actual_words: evaluation.values.size,
-                });
-            }
             let stage_result = (|| {
+                if evaluation.domain.log_size() != column.log_size {
+                    return Err(ResidentSourceStageError::PreprocessedColumnLogMismatch {
+                        column: index,
+                        expected: column.log_size,
+                        actual: evaluation.domain.log_size(),
+                    });
+                }
+                if evaluation.values.size != expected_words {
+                    return Err(ResidentSourceStageError::ColumnValueSizeMismatch {
+                        column: index,
+                        expected_words,
+                        actual_words: evaluation.values.size,
+                    });
+                }
                 unsafe {
                     workspace.arena().context().memcpy_d2d_async(
                         destinations[index].as_void_ptr(),
@@ -913,11 +926,19 @@ pub fn stage_preprocessed_commitment(
             // consumes it. Fence even when a later enqueue fails; otherwise the
             // successful prefix could still read the stack-owned evaluation after
             // this iteration unwinds.
-            fence_after(stage_result, || {
+            let stage_result = fence_after(stage_result, || {
                 workspace
                     .arena()
                     .context()
                     .sync()
+                    .map_err(ResidentSourceStageError::from)
+            });
+            // Checked release is mandatory on every path. If it fails, report that
+            // allocator-state failure instead of silently falling through the legacy
+            // BaseFieldVec destructor.
+            cleanup_after(stage_result, || {
+                streamer
+                    .release(evaluation.values)
                     .map_err(ResidentSourceStageError::from)
             })?;
             source_sync_calls = source_sync_calls
@@ -938,16 +959,7 @@ pub fn stage_preprocessed_commitment(
             .sync()
             .map_err(ResidentSourceStageError::from)
     });
-    // A selected detached source drops after its isolated-stream copy is
-    // fenced, which enqueues a legacy-stream free. Drain that free on both
-    // success and every early-error path. Nesting `fence_after` makes both
-    // fences unconditional while retaining the first operation/fence error.
-    fence_after(source_stage_result, || {
-        streamer
-            .synchronize()
-            .map_err(ResidentSourceStageError::from)
-    })?;
-    drop(streamer);
+    source_stage_result?;
 
     let inverse_twiddles = workspace.bind(planned.inverse_twiddles.logical)?.0;
     let inverse_words = u32::try_from(inverse_twiddles.len_words())
@@ -1823,6 +1835,24 @@ mod tests {
         });
         assert_eq!(calls.get(), 2);
         assert_eq!(fully_fenced, Err("source"));
+    }
+
+    #[test]
+    fn ownership_cleanup_is_unconditional_and_its_failure_is_observable() {
+        let calls = Cell::new(0);
+        let result = cleanup_after::<(), _>(Err("stage"), || {
+            calls.set(calls.get() + 1);
+            Err("free")
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result, Err("free"));
+
+        let result = cleanup_after(Err::<(), _>("stage"), || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(calls.get(), 2);
+        assert_eq!(result, Err("stage"));
     }
 
     #[test]

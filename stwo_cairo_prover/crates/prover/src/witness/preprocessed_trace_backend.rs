@@ -133,52 +133,65 @@ fn checked_cuda(operation: &'static str, code: i32) -> Result<(), CudaRuntimeErr
     }
 }
 
-fn generate_family<T, U>(
+fn release_family<T>(
+    outputs: impl IntoIterator<Item = T>,
+    release: &mut impl FnMut(T) -> Result<(), CudaRuntimeError>,
+    fence: &mut impl FnMut() -> Result<(), CudaRuntimeError>,
+) -> Result<(), CudaRuntimeError> {
+    let mut first_error = None;
+    for output in outputs {
+        if let Err(error) = release(output) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    if let Err(error) = fence() {
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn generate_family<T>(
     count: usize,
     mut allocate: impl FnMut() -> Result<T, CudaRuntimeError>,
     launch: impl FnOnce(&[T]) -> Result<(), CudaRuntimeError>,
-    select: impl FnOnce(Vec<T>) -> U,
+    selected_index: usize,
+    mut release: impl FnMut(T) -> Result<(), CudaRuntimeError>,
     mut fence: impl FnMut() -> Result<(), CudaRuntimeError>,
-) -> Result<U, CudaRuntimeError> {
+) -> Result<Option<T>, CudaRuntimeError> {
     let mut outputs = Vec::with_capacity(count);
     for _ in 0..count {
         match allocate() {
             Ok(output) => outputs.push(output),
             Err(error) => {
-                drop(outputs);
-                // Preserve the allocation error even if cleanup fencing also
-                // fails: it is the first failed operation and therefore the
-                // actionable primary diagnosis.
-                let _ = fence();
-                return Err(error);
+                // Pool-accounting uncertainty is more severe than the triggering
+                // operation: surface the first cleanup failure after attempting
+                // every release, otherwise retain the allocation failure.
+                return match release_family(outputs, &mut release, &mut fence) {
+                    Err(cleanup) => Err(cleanup),
+                    Ok(()) => Err(error),
+                };
             }
         }
     }
     if let Err(error) = launch(&outputs) {
-        drop(outputs);
-        // As above, rollback is mandatory but cannot replace the primary
-        // launch status when the CUDA context reports multiple failures.
-        let _ = fence();
-        return Err(error);
+        return match release_family(outputs, &mut release, &mut fence) {
+            Err(cleanup) => Err(cleanup),
+            Ok(()) => Err(error),
+        };
     }
 
-    // Selection drops every unselected family output, enqueueing its legacy-
-    // stream free after the generation kernel. Fence only after that rollback
-    // so success cannot leave hidden detached allocations in flight.
-    let selected = select(outputs);
-    if let Err(error) = fence() {
-        drop(selected);
-        let _ = fence();
+    let selected = (selected_index < outputs.len()).then(|| outputs.swap_remove(selected_index));
+    if let Err(error) = release_family(outputs, &mut release, &mut fence) {
+        // The selected output cannot escape after rollback fails. Release it too;
+        // preserve the first cleanup failure while still attempting every cleanup.
+        let _ = release_family(selected, &mut release, &mut fence);
         return Err(error);
     }
     Ok(selected)
-}
-
-fn select_family_output<T>(outputs: Vec<T>, index: usize) -> Option<T> {
-    outputs
-        .into_iter()
-        .enumerate()
-        .find_map(|(candidate, output)| (candidate == index).then_some(output))
 }
 
 impl CudaPreprocessedColumnStreamer {
@@ -235,9 +248,11 @@ impl CudaPreprocessedColumnStreamer {
                     };
                     checked_cuda("preprocessed_gen_seq", code)
                 },
-                |mut outputs| outputs.pop().expect("one allocated sequence output"),
+                0,
+                BaseFieldVec::release_checked,
                 Self::sync,
-            )?;
+            )?
+            .expect("one allocated sequence output");
             return Ok(CircleEvaluation::new(domain, values));
         }
 
@@ -268,7 +283,8 @@ impl CudaPreprocessedColumnStreamer {
                     };
                     checked_cuda("preprocessed_gen_range", code)
                 },
-                |outputs| select_family_output(outputs, idx),
+                idx,
+                BaseFieldVec::release_checked,
                 Self::sync,
             )?;
             if let Some(values) = values {
@@ -299,7 +315,8 @@ impl CudaPreprocessedColumnStreamer {
                     };
                     checked_cuda("preprocessed_gen_xor", code)
                 },
-                |outputs| select_family_output(outputs, idx),
+                idx,
+                BaseFieldVec::release_checked,
                 Self::sync,
             )?;
             if let Some(values) = values {
@@ -323,14 +340,28 @@ impl CudaPreprocessedColumnStreamer {
                 };
                 checked_cuda("preprocessed_copy_h2d", code)
             },
-            |mut outputs| outputs.pop().expect("one allocated fallback output"),
+            0,
+            BaseFieldVec::release_checked,
             Self::sync,
-        )?;
+        )?
+        .expect("one allocated fallback output");
         Ok(CircleEvaluation::new(host_evaluation.domain, values))
     }
 
     pub fn synchronize(&self) -> Result<(), CudaRuntimeError> {
         Self::sync()
+    }
+
+    /// Release one detached default-pool source and drain its free. The checked
+    /// release consumes ownership even on failure, so the legacy void-returning
+    /// BaseFieldVec destructor can never run for this formal staging allocation.
+    pub fn release(&self, values: BaseFieldVec) -> Result<(), CudaRuntimeError> {
+        let release_result = values.release_checked();
+        let fence_result = Self::sync();
+        match release_result {
+            Err(error) => Err(error),
+            Ok(()) => fence_result,
+        }
     }
 
     fn allocate(words: usize) -> Result<BaseFieldVec, CudaRuntimeError> {
@@ -391,33 +422,23 @@ fn parse_bitwise_xor_id(id: &str) -> Option<(u32, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
+    use std::cell::{Cell, RefCell};
 
     use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
     use super::*;
-
-    #[derive(Debug)]
-    struct DropProbe(Rc<Cell<usize>>);
-
-    impl Drop for DropProbe {
-        fn drop(&mut self) {
-            self.0.set(self.0.get() + 1);
-        }
-    }
 
     fn injected(operation: &'static str, code: i32) -> CudaRuntimeError {
         CudaRuntimeError::Cuda { operation, code }
     }
 
     #[test]
-    fn family_allocation_failure_drops_prefix_and_preserves_primary_error() {
-        let drops = Rc::new(Cell::new(0));
+    fn family_allocation_failure_releases_prefix_once() {
         let attempts = Cell::new(0);
         let fences = Cell::new(0);
+        let released = RefCell::new(Vec::new());
         let primary = injected("injected_allocate", 2);
-        let result: Result<DropProbe, _> = generate_family(
+        let result = generate_family(
             3,
             || {
                 let attempt = attempts.get();
@@ -425,57 +446,86 @@ mod tests {
                 if attempt == 2 {
                     Err(primary.clone())
                 } else {
-                    Ok(DropProbe(Rc::clone(&drops)))
+                    Ok(attempt)
                 }
             },
             |_| unreachable!("launch must not run after allocation failure"),
-            |mut outputs| outputs.pop().expect("test allocation prefix is non-empty"),
-            || {
-                fences.set(fences.get() + 1);
-                Err(injected("injected_cleanup_fence", 700))
+            0,
+            |output| {
+                released.borrow_mut().push(output);
+                Ok(())
             },
-        );
-        assert_eq!(result.unwrap_err(), primary);
-        assert_eq!(attempts.get(), 3);
-        assert_eq!(drops.get(), 2);
-        assert_eq!(fences.get(), 1);
-    }
-
-    #[test]
-    fn family_launch_failure_drops_every_output_before_cleanup_fence() {
-        let drops = Rc::new(Cell::new(0));
-        let fences = Cell::new(0);
-        let primary = injected("injected_launch", 719);
-        let result: Result<DropProbe, _> = generate_family(
-            3,
-            || Ok(DropProbe(Rc::clone(&drops))),
-            |_| Err(primary.clone()),
-            |_| unreachable!("selection must not run after launch failure"),
             || {
-                assert_eq!(drops.get(), 3);
                 fences.set(fences.get() + 1);
                 Ok(())
             },
         );
         assert_eq!(result.unwrap_err(), primary);
-        assert_eq!(drops.get(), 3);
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(*released.borrow(), [0, 1]);
         assert_eq!(fences.get(), 1);
     }
 
     #[test]
-    fn family_fence_failure_drops_selection_then_refences_cleanup() {
-        let drops = Rc::new(Cell::new(0));
+    fn family_launch_failure_releases_every_output_before_cleanup_fence() {
+        let next = Cell::new(0);
         let fences = Cell::new(0);
+        let released = RefCell::new(Vec::new());
+        let primary = injected("injected_launch", 719);
+        let result = generate_family(
+            3,
+            || {
+                let output = next.get();
+                next.set(output + 1);
+                Ok(output)
+            },
+            |_| Err(primary.clone()),
+            1,
+            |output| {
+                released.borrow_mut().push(output);
+                Ok(())
+            },
+            || {
+                assert_eq!(*released.borrow(), [0, 1, 2]);
+                fences.set(fences.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), primary);
+        assert_eq!(*released.borrow(), [0, 1, 2]);
+        assert_eq!(fences.get(), 1);
+    }
+
+    #[test]
+    fn family_fence_failure_releases_selected_output_once() {
+        let next = Cell::new(0);
+        let fences = Cell::new(0);
+        let released = RefCell::new(Vec::new());
         let primary = injected("injected_fence", 700);
         let result = generate_family(
             3,
-            || Ok(DropProbe(Rc::clone(&drops))),
+            || {
+                let output = next.get();
+                next.set(output + 1);
+                Ok(output)
+            },
             |_| Ok(()),
-            |outputs| select_family_output(outputs, 1).expect("valid test selection"),
+            1,
+            |output| {
+                released.borrow_mut().push(output);
+                Ok(())
+            },
             || {
                 let call = fences.get();
                 fences.set(call + 1);
-                assert_eq!(drops.get(), if call == 0 { 2 } else { 3 });
+                assert_eq!(
+                    *released.borrow(),
+                    if call == 0 {
+                        &[0, 2][..]
+                    } else {
+                        &[0, 2, 1][..]
+                    }
+                );
                 if call == 0 {
                     Err(primary.clone())
                 } else {
@@ -484,48 +534,99 @@ mod tests {
             },
         );
         assert_eq!(result.unwrap_err(), primary);
-        assert_eq!(drops.get(), 3);
+        assert_eq!(*released.borrow(), [0, 2, 1]);
         assert_eq!(fences.get(), 2);
     }
 
     #[test]
-    fn family_success_drops_unselected_outputs_before_fence() {
-        let drops = Rc::new(Cell::new(0));
+    fn family_success_releases_only_unselected_outputs_before_fence() {
+        let next = Cell::new(0);
         let fences = Cell::new(0);
+        let released = RefCell::new(Vec::new());
         let selected = generate_family(
             3,
-            || Ok(DropProbe(Rc::clone(&drops))),
-            |_| Ok(()),
-            |outputs| select_family_output(outputs, 1).expect("valid test selection"),
             || {
-                assert_eq!(drops.get(), 2);
+                let output = next.get();
+                next.set(output + 1);
+                Ok(output)
+            },
+            |_| Ok(()),
+            1,
+            |output| {
+                released.borrow_mut().push(output);
+                Ok(())
+            },
+            || {
+                assert_eq!(*released.borrow(), [0, 2]);
                 fences.set(fences.get() + 1);
                 Ok(())
             },
         )
         .unwrap();
-        assert_eq!(drops.get(), 2);
+        assert_eq!(selected, Some(1));
+        assert_eq!(*released.borrow(), [0, 2]);
         assert_eq!(fences.get(), 1);
-        drop(selected);
-        assert_eq!(drops.get(), 3);
     }
 
     #[test]
-    fn family_missing_selection_drops_all_outputs_without_panicking() {
-        let drops = Rc::new(Cell::new(0));
+    fn family_missing_selection_releases_all_outputs() {
+        let next = Cell::new(0);
+        let released = RefCell::new(Vec::new());
         let selected = generate_family(
             3,
-            || Ok(DropProbe(Rc::clone(&drops))),
-            |_| Ok(()),
-            |outputs| select_family_output(outputs, 3),
             || {
-                assert_eq!(drops.get(), 3);
+                let output = next.get();
+                next.set(output + 1);
+                Ok(output)
+            },
+            |_| Ok(()),
+            3,
+            |output| {
+                released.borrow_mut().push(output);
+                Ok(())
+            },
+            || {
+                assert_eq!(*released.borrow(), [0, 1, 2]);
                 Ok(())
             },
         )
         .unwrap();
         assert!(selected.is_none());
-        assert_eq!(drops.get(), 3);
+        assert_eq!(*released.borrow(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn family_cleanup_attempts_every_release_and_preserves_first_error() {
+        let next = Cell::new(0);
+        let fences = Cell::new(0);
+        let released = RefCell::new(Vec::new());
+        let first = injected("injected_free_0", 700);
+        let result = generate_family(
+            3,
+            || {
+                let output = next.get();
+                next.set(output + 1);
+                Ok(output)
+            },
+            |_| Ok(()),
+            1,
+            |output| {
+                released.borrow_mut().push(output);
+                match output {
+                    0 => Err(first.clone()),
+                    2 => Err(injected("injected_free_2", 719)),
+                    1 => Err(injected("injected_free_1", 801)),
+                    _ => unreachable!(),
+                }
+            },
+            || {
+                fences.set(fences.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), first);
+        assert_eq!(*released.borrow(), [0, 2, 1]);
+        assert_eq!(fences.get(), 2);
     }
 
     #[test]
