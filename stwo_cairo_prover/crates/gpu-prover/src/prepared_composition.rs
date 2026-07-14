@@ -19,6 +19,7 @@ use stwo_backend_cuda_kernels::raw::{self, CudaSecureField};
 use crate::arena_plan::{CommitmentTreeId, OpenedColumnSource};
 use crate::composition_plan::{
     CompositionComponentPlan, CompositionExtParamSource, CompositionKernelPart, CompositionPlan,
+    CompositionProofBindings,
 };
 use crate::direct_composition_retention::{
     direct_composition_plan_key, DirectCompositionRetentionPlan,
@@ -440,6 +441,16 @@ pub enum PreparedCompositionError {
     ConstantExtParamMismatch {
         component: usize,
         slot: usize,
+    },
+    BaseParamBindingCount {
+        expected: usize,
+        actual: usize,
+    },
+    BaseParamBindingIdentity(usize),
+    BaseParamBindingWords {
+        component: usize,
+        expected: usize,
+        actual: usize,
     },
     ExtParamBindingCount {
         expected: usize,
@@ -1383,6 +1394,56 @@ impl<'a> PreparedCompositionGraph<'a> {
         direct_retention: Option<&DirectCompositionRetentionPlan>,
         direct_evaluations: &[CompositionDirectEvaluationBinding],
     ) -> Result<Self, PreparedCompositionError> {
+        Self::prepare_impl(
+            arena,
+            plan,
+            None,
+            trace,
+            inputs,
+            slots,
+            mode,
+            direct_retention,
+            direct_evaluations,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_with_proof_bindings(
+        arena: &'a DeviceArena,
+        plan: &CompositionPlan,
+        proof_bindings: &CompositionProofBindings,
+        trace: &CompositionTraceTopology,
+        inputs: &CompositionDeviceInputs,
+        slots: &CompositionWorkspaceSlots,
+        mode: CompositionLaunchMode,
+        direct_retention: Option<&DirectCompositionRetentionPlan>,
+        direct_evaluations: &[CompositionDirectEvaluationBinding],
+    ) -> Result<Self, PreparedCompositionError> {
+        Self::prepare_impl(
+            arena,
+            plan,
+            Some(proof_bindings),
+            trace,
+            inputs,
+            slots,
+            mode,
+            direct_retention,
+            direct_evaluations,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_impl(
+        arena: &'a DeviceArena,
+        plan: &CompositionPlan,
+        proof_bindings: Option<&CompositionProofBindings>,
+        trace: &CompositionTraceTopology,
+        inputs: &CompositionDeviceInputs,
+        slots: &CompositionWorkspaceSlots,
+        mode: CompositionLaunchMode,
+        direct_retention: Option<&DirectCompositionRetentionPlan>,
+        direct_evaluations: &[CompositionDirectEvaluationBinding],
+    ) -> Result<Self, PreparedCompositionError> {
         let requirements =
             composition_workspace_requirements_with_retention(plan, trace, mode, direct_retention)?;
         let lane_components = if requirements.wide_groups.is_empty() {
@@ -1413,6 +1474,14 @@ impl<'a> PreparedCompositionGraph<'a> {
                 expected: requirements.components.len(),
                 actual: inputs.claimed_sums.len(),
             });
+        }
+        if let Some(bindings) = proof_bindings {
+            if bindings.components.len() != requirements.components.len() {
+                return Err(PreparedCompositionError::BaseParamBindingCount {
+                    expected: requirements.components.len(),
+                    actual: bindings.components.len(),
+                });
+            }
         }
         let slot_requirements = requirements.arena_slot_requirements(slots)?;
         let descriptor_requirement = slot_requirements[0];
@@ -1669,6 +1738,27 @@ impl<'a> PreparedCompositionGraph<'a> {
             .zip(&inputs.claimed_sums)
             .enumerate()
         {
+            let base_param_values = match proof_bindings {
+                Some(bindings) => {
+                    let binding = &bindings.components[component_index];
+                    if binding.component != component_plan.component
+                        || binding.instance != component_plan.instance
+                    {
+                        return Err(PreparedCompositionError::BaseParamBindingIdentity(
+                            component_index,
+                        ));
+                    }
+                    if binding.base_param_values.len() != component.base_param_words {
+                        return Err(PreparedCompositionError::BaseParamBindingWords {
+                            component: component_index,
+                            expected: component.base_param_words,
+                            actual: binding.base_param_values.len(),
+                        });
+                    }
+                    binding.base_param_values.as_slice()
+                }
+                None => component_plan.base_param_values.as_slice(),
+            };
             let row_count = component.row_count;
             for (source_index, source_ref) in component.sources.iter().enumerate() {
                 let source = bind_minimum(
@@ -1757,7 +1847,7 @@ impl<'a> PreparedCompositionGraph<'a> {
                 for (word, value) in descriptor_words
                     [descriptor.base_params..descriptor.base_params + component.base_param_words]
                     .iter_mut()
-                    .zip(&component_plan.base_param_values)
+                    .zip(base_param_values)
                 {
                     *word = value.0;
                 }

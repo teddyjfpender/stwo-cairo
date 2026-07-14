@@ -38,7 +38,7 @@ use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
 use stwo_cairo_prover::witness::proof_shape::{ProofShapeKey, TracePartId};
 
 use crate::arena_plan::{BufferPurpose, CommitmentColumnSource, CommitmentTreeId};
-use crate::composition_plan::CompositionPlan;
+use crate::composition_plan::CompositionProofBindings;
 use crate::graphs::{
     bind_arena_binding, GraphCaptureStatus, GraphError, GraphSegment, GraphWorkspace,
 };
@@ -947,7 +947,8 @@ impl<'a> ResidentGraphRuntime<'a> {
         expected_identity: ResidentWorkspaceIdentity,
         setup_relation_challenges: RelationChallenges<'_>,
         transcript_plan: &CairoBlake2sTranscriptPlan,
-        current_composition: &CompositionPlan,
+        current_composition: &crate::composition_plan::CompositionPlan,
+        composition_bindings: &CompositionProofBindings,
         execution_tables_host: Option<ExecutionTablesHostData<'_>>,
         ec_op_segment_start: Option<usize>,
         preprocessed_trace: Option<Arc<PreProcessedTrace>>,
@@ -1341,7 +1342,12 @@ impl<'a> ResidentGraphRuntime<'a> {
             setup_relation_challenges,
         )?;
         let interaction_claim_sources = interaction_outputs_in_cairo_order(workspace, &relation)?;
-        let composition = prepare_resident_composition(workspace, &relation, current_composition)?;
+        let composition = prepare_resident_composition(
+            workspace,
+            &relation,
+            current_composition,
+            composition_bindings,
+        )?;
 
         let fixed_preprocessed = workspace
             .plan()

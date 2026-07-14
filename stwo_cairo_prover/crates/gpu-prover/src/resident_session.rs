@@ -6,6 +6,7 @@
 //! valid, reusable state.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use cairo_air::claims::CairoClaim;
 use cairo_air::relations::CommonLookupElements;
@@ -23,7 +24,9 @@ use stwo_cairo_prover::witness::exec_context::WitnessResidencyReport;
 use stwo_cairo_prover::witness::relation_sources::RelationSourceError;
 
 use crate::arena_plan::{ArenaPlanError, ExecutionTableGeometry, ProofArenaPlan};
-use crate::composition_plan::{plan_cairo_composition, CompositionPlan, CompositionPlanError};
+use crate::composition_plan::{
+    plan_cairo_composition, CompositionPlan, CompositionPlanError, CompositionProofBindings,
+};
 use crate::graphs::GraphWorkspace;
 use crate::plan::{ProofPlan, ProofPlanError};
 use crate::protocol_discovery::{
@@ -48,6 +51,10 @@ use crate::resident_sources::{
 };
 use crate::resident_witness::{
     planned_cairo_claim, require_strict_resident_witness_coverage, ResidentWitnessPlanError,
+};
+use crate::shape_executable::{
+    ShapeCompileRequest, ShapeExecutableCache, ShapeExecutableCacheTelemetry, ShapeExecutableError,
+    ShapeExecutableMaterialization,
 };
 use crate::state::{DeviceProofState, WitnessOutput};
 use crate::transcript_plan::{
@@ -98,6 +105,8 @@ pub struct ResidentPreparationState {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResidentSessionTelemetry {
+    pub shape_executable_materialization: Option<ShapeExecutableMaterialization>,
+    pub shape_executable_cache: ShapeExecutableCacheTelemetry,
     pub workspace_key: Option<WorkspaceKey>,
     pub workspace_materialization: Option<WorkspaceMaterialization>,
     pub cache: WorkspaceCacheTelemetry,
@@ -263,6 +272,7 @@ pub enum ResidentSessionError {
     ProofPlan(ProofPlanError),
     ResidentWitness(ResidentWitnessPlanError),
     RecordedWitness(RecordedWitnessPlanError),
+    ShapeExecutable(ShapeExecutableError),
     RecordedPedersenTableUnavailable,
     RecordedWitnessInputRoute {
         component: &'static str,
@@ -312,6 +322,7 @@ convert_error!(ResidentRuntimeError, Runtime);
 convert_error!(ProofPlanError, ProofPlan);
 convert_error!(ResidentWitnessPlanError, ResidentWitness);
 convert_error!(RecordedWitnessPlanError, RecordedWitness);
+convert_error!(ShapeExecutableError, ShapeExecutable);
 
 /// The exact dynamic composition/FRI log size used by STWO's lifting decision.
 /// The reference prover derives this from the split composition commitment,
@@ -393,13 +404,6 @@ fn plan_resident_protocol(
     )
 }
 
-/// [`plan_resident_protocol`] with the protocol-plan policy supplied by the
-/// caller instead of resolved from the embedded AOT pack. The proving sessions
-/// always go through [`plan_resident_protocol`] (loaded manifest, fail-closed);
-/// this seam exists for the host-only preflight planner, which reuses the exact
-/// planning path on machines whose binary carries no AOT pack (the manifest
-/// hash never feeds arena geometry — see
-/// `poseidon_fixture_recorded_lanes_match_arena_witness_plan`).
 fn plan_resident_protocol_with_policy(
     claim: &CairoClaim,
     proof_plan: &ProofPlan,
@@ -508,6 +512,7 @@ fn run_materialized_session<R>(
         return Err(ResidentSessionError::InvalidRelationAlphaWords(alpha_words));
     }
     let setup_alphas = vec![SecureField::zero(); alpha_words / SECURE_EXTENSION_DEGREE];
+    let composition_bindings = CompositionProofBindings::from_plan(&planned.composition);
     let mut runtime = ResidentGraphRuntime::prepare(
         workspace,
         ResidentWorkspaceIdentity::of(workspace),
@@ -517,6 +522,7 @@ fn run_materialized_session<R>(
         },
         &planned.transcript,
         &planned.composition,
+        &composition_bindings,
         None,
         None,
         None,
@@ -535,6 +541,8 @@ fn run_materialized_session<R>(
                     .ok_or(ResidentSessionError::SizeOverflow)
             })?;
     let telemetry = ResidentSessionTelemetry {
+        shape_executable_materialization: None,
+        shape_executable_cache: ShapeExecutableCacheTelemetry::default(),
         workspace_key: Some(planned.workspace_key),
         workspace_materialization: Some(workspace_materialization),
         cache: WorkspaceCacheTelemetry::default(),
@@ -1051,6 +1059,7 @@ pub fn with_resident_session_from_generator<R>(
             return Err(ResidentSessionError::InvalidRelationAlphaWords(alpha_words));
         }
         let setup_alphas = vec![SecureField::zero(); alpha_words / SECURE_EXTENSION_DEGREE];
+        let composition_bindings = CompositionProofBindings::from_plan(&planned.composition);
         let mut runtime = ResidentGraphRuntime::prepare(
             workspace,
             ResidentWorkspaceIdentity::of(workspace),
@@ -1060,6 +1069,7 @@ pub fn with_resident_session_from_generator<R>(
             },
             &planned.transcript,
             &planned.composition,
+            &composition_bindings,
             Some(ExecutionTablesHostData {
                 addr_to_id: &raw_address_to_id,
                 f252_values: &memory.f252_values,
@@ -1085,6 +1095,8 @@ pub fn with_resident_session_from_generator<R>(
                         .ok_or(ResidentSessionError::SizeOverflow)
                 })?;
         let telemetry = ResidentSessionTelemetry {
+            shape_executable_materialization: None,
+            shape_executable_cache: ShapeExecutableCacheTelemetry::default(),
             workspace_key: Some(planned.workspace_key),
             workspace_materialization: Some(materialization),
             cache: WorkspaceCacheTelemetry::default(),
@@ -1173,6 +1185,13 @@ pub struct ResidentPreflightReport {
     /// The full arena plan the workspace cache would materialize.
     pub arena: Arc<ProofArenaPlan>,
     pub transcript_segments: usize,
+    /// Persistent host-control-plane result used by the real preflight path.
+    pub shape_executable_materialization: ShapeExecutableMaterialization,
+    pub shape_executable_cache: ShapeExecutableCacheTelemetry,
+    pub shape_executable_topology_digest: [u8; 32],
+    pub shape_executable_control_plane_ns: u128,
+    /// Proof-varying values rebound without regenerating CUDA source.
+    pub composition_bindings: CompositionProofBindings,
     pub manifest_policy: PreflightManifestPolicy,
     /// Exact environment-derived topology/residency policy modeled by this
     /// host plan, retained so preflight artifacts prove which lane they sized.
@@ -1184,10 +1203,31 @@ pub struct ResidentPreflightReport {
 /// fail-closed pipeline as [`with_resident_session_from_generator`] up to (and
 /// including) the full arena plan — ingest artifacts in, exact plan, strict
 /// witness coverage, planned claim, recorded witness inputs (`require_resolved`),
-/// Graph-A multiplicity plan, protocol/arena plan. Any `Err` is byte-for-byte
-/// the error the session would fail closed with on hardware. Dev tooling only
-/// (`arena_preflight`); proving sessions never call this.
+/// Graph-A multiplicity plan, protocol/arena plan. Every failure is fail-closed;
+/// cached planning wraps its underlying planner error in `ShapeExecutable`.
+/// Dev tooling only (`arena_preflight`); proving sessions never call this.
 pub fn plan_resident_preflight(
+    generator: &CairoClaimGenerator,
+    capacity_plan: &ProofPlan,
+    preprocessed_trace: &PreProcessedTrace,
+    pcs: PcsConfig,
+    include_all_preprocessed_columns: bool,
+) -> Result<ResidentPreflightReport, ResidentPreflightError> {
+    let mut executable_cache = ShapeExecutableCache::new(1).map_err(ResidentSessionError::from)?;
+    plan_resident_preflight_with_cache(
+        &mut executable_cache,
+        generator,
+        capacity_plan,
+        preprocessed_trace,
+        pcs,
+        include_all_preprocessed_columns,
+    )
+}
+
+/// The reusable host-only preflight seam. Repeated exact-topology calls use
+/// the same shape executable and rebind only statement-dependent parameters.
+pub fn plan_resident_preflight_with_cache(
+    executable_cache: &mut ShapeExecutableCache,
     generator: &CairoClaimGenerator,
     capacity_plan: &ProofPlan,
     preprocessed_trace: &PreProcessedTrace,
@@ -1240,22 +1280,26 @@ pub fn plan_resident_preflight(
         Err(other) => return Err(ResidentSessionError::from(other).into()),
     };
     let memory = &recorded.execution_memory;
-    let planned = plan_resident_protocol_with_policy(
-        &planned_claim,
-        &exact_plan,
-        preprocessed_trace,
-        pcs,
-        include_all_preprocessed_columns,
-        Some(
-            ExecutionTableGeometry::new(
-                memory.address_to_id.len(),
-                memory.f252_values.len(),
-                memory.small_values.len(),
-            )
-            .with_public_memory_entries(public_memory_entries),
-        ),
-        protocol_policy,
-    )?;
+    let control_plane_start = Instant::now();
+    let selection = executable_cache
+        .compile_or_bind(ShapeCompileRequest {
+            claim: &planned_claim,
+            proof_plan: &exact_plan,
+            preprocessed_trace,
+            pcs,
+            include_all_preprocessed_columns,
+            execution_tables: Some(
+                ExecutionTableGeometry::new(
+                    memory.address_to_id.len(),
+                    memory.f252_values.len(),
+                    memory.small_values.len(),
+                )
+                .with_public_memory_entries(public_memory_entries),
+            ),
+            policy: protocol_policy,
+        })
+        .map_err(ResidentSessionError::from)?;
+    let shape_executable_control_plane_ns = control_plane_start.elapsed().as_nanos();
 
     let present_components: Vec<&'static str> = exact_plan
         .components
@@ -1277,8 +1321,13 @@ pub fn plan_resident_preflight(
         capture_safe_components,
         recorded_lanes,
         multiplicities,
-        arena: planned.arena,
-        transcript_segments: planned.transcript.segments().len(),
+        arena: Arc::clone(selection.executable.arena()),
+        transcript_segments: selection.executable.transcript().segments().len(),
+        shape_executable_materialization: selection.materialization,
+        shape_executable_cache: executable_cache.telemetry(),
+        shape_executable_topology_digest: selection.executable.topology().digest(),
+        shape_executable_control_plane_ns,
+        composition_bindings: selection.bindings,
         manifest_policy,
         protocol_policy,
         interpolation_mode: stwo_backend_cuda::InterpolationLaunchMode::from_env(),

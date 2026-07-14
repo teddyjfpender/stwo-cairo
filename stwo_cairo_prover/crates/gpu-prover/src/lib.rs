@@ -43,6 +43,7 @@ pub mod resident_sources;
 pub mod resident_witness;
 pub mod schedule;
 pub mod schedule_table;
+pub mod shape_executable;
 pub mod state;
 pub mod transcript_plan;
 pub mod workspace_cache;

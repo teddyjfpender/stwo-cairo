@@ -3,7 +3,9 @@
 use stwo_backend_cuda::{ArenaSlotId, PreparedRelationGraph};
 
 use crate::arena_plan::ArenaBinding;
-use crate::composition_plan::{CompositionExtParamSource, CompositionPlan};
+use crate::composition_plan::{
+    CompositionExtParamSource, CompositionPlan, CompositionProofBindings,
+};
 use crate::direct_composition_retention::DirectCompositionRetentionPlan;
 use crate::graphs::{bind_arena_binding, GraphWorkspace};
 use crate::prepared_composition::{
@@ -64,6 +66,7 @@ pub(crate) fn prepare_resident_composition<'a>(
     workspace: &'a GraphWorkspace,
     relation: &PreparedRelationGraph<'a>,
     current_plan: &CompositionPlan,
+    proof_bindings: &CompositionProofBindings,
 ) -> Result<PreparedCompositionGraph<'a>, ResidentCompositionError> {
     let cached = workspace.plan().composition();
     let current_plan = require_current_composition_plan(&cached.plan, current_plan)?;
@@ -144,9 +147,10 @@ pub(crate) fn prepare_resident_composition<'a>(
                 })
             })
             .collect::<Result<Vec<_>, ResidentCompositionError>>()?;
-    Ok(PreparedCompositionGraph::prepare_with_mode_and_retention(
+    Ok(PreparedCompositionGraph::prepare_with_proof_bindings(
         workspace.arena(),
-        current_plan,
+        &cached.plan,
+        proof_bindings,
         &cached.trace_topology(),
         &inputs,
         &cached.slots,

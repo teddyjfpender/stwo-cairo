@@ -16,7 +16,9 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::TreeSubspan;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::bit_reverse;
-use stwo_backend_cuda::aot::{constraint_program, EmittedConstraintKernel};
+use stwo_backend_cuda::aot::{
+    constraint_program, constraint_program_bindings, EmittedConstraintKernel,
+};
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{FrameworkComponent, FrameworkEval};
 
@@ -81,6 +83,21 @@ pub struct CompositionPlan {
     pub components: Vec<CompositionComponentPlan>,
 }
 
+/// The only proof-varying host values in an installed composition program.
+/// Kernel source, split layout, denominator tables and parameter slot geometry
+/// remain owned by [`CompositionPlan`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionProofBindings {
+    pub components: Vec<CompositionComponentBindings>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionComponentBindings {
+    pub component: &'static str,
+    pub instance: usize,
+    pub base_param_values: Vec<BaseField>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompositionPlanError {
     Empty,
@@ -126,6 +143,14 @@ pub enum CompositionPlanError {
         slot: usize,
         value: SecureField,
         probe_value: SecureField,
+    },
+    BindingTopologyDrift {
+        component: &'static str,
+        instance: usize,
+    },
+    BindingKernelMismatch {
+        component: &'static str,
+        instance: usize,
     },
 }
 
@@ -327,6 +352,216 @@ pub fn plan_cairo_composition(
         max_evaluation_log_size,
         components,
     })
+}
+
+/// Bind a statement to an already compiled composition program without
+/// regenerating CUDA source. The source-free lowering must reproduce every
+/// installed kernel identity and every non-varying extension parameter before
+/// the base-field values are admitted as proof bindings.
+pub fn bind_cairo_composition(
+    claim: &CairoClaim,
+    lookup_elements: &CommonLookupElements,
+    interaction_claim: &CairoInteractionClaim,
+    preprocessed_columns: &[PreProcessedColumnId],
+    installed: &CompositionPlan,
+) -> Result<CompositionProofBindings, CompositionPlanError> {
+    let cairo = CairoComponents::new(
+        claim,
+        lookup_elements,
+        interaction_claim,
+        preprocessed_columns,
+    );
+    let expected_count = cairo.components().len();
+    let mut components = Vec::with_capacity(expected_count);
+
+    macro_rules! bind_component {
+        ($name:expr, $instance:expr, $component:expr) => {{
+            let expected = installed.components.get(components.len()).ok_or(
+                CompositionPlanError::BindingTopologyDrift {
+                    component: $name,
+                    instance: $instance,
+                },
+            )?;
+            components.push(bind_component_values(
+                $name,
+                $instance,
+                $component,
+                expected,
+                installed.max_kernel_instrs,
+            )?);
+        }};
+    }
+    macro_rules! bind_optional {
+        ($( $field:ident ),+ $(,)?) => {
+            $(
+                if let Some(component) = &cairo.$field {
+                    bind_component!(stringify!($field), 0, component);
+                }
+            )+
+        };
+    }
+
+    // Keep the exact canonical order used by `plan_cairo_composition` and
+    // `CairoComponents::components`.
+    bind_optional!(
+        add_opcode,
+        add_opcode_small,
+        add_ap_opcode,
+        assert_eq_opcode,
+        assert_eq_opcode_imm,
+        assert_eq_opcode_double_deref,
+        blake_compress_opcode,
+        call_opcode_abs,
+        call_opcode_rel_imm,
+        generic_opcode,
+        jnz_opcode_non_taken,
+        jnz_opcode_taken,
+        jump_opcode_abs,
+        jump_opcode_double_deref,
+        jump_opcode_rel,
+        jump_opcode_rel_imm,
+        mul_opcode,
+        mul_opcode_small,
+        qm_31_add_mul_opcode,
+        ret_opcode,
+        verify_instruction,
+        blake_round,
+        blake_g,
+        blake_round_sigma,
+        triple_xor_32,
+        verify_bitwise_xor_12,
+        add_mod_builtin,
+        bitwise_builtin,
+        mul_mod_builtin,
+        pedersen_builtin,
+        pedersen_builtin_narrow_windows,
+        poseidon_builtin,
+        range_check96_builtin,
+        range_check_builtin,
+        ec_op_builtin,
+        partial_ec_mul_generic,
+        pedersen_aggregator_window_bits_18,
+        partial_ec_mul_window_bits_18,
+        pedersen_points_table_window_bits_18,
+        pedersen_aggregator_window_bits_9,
+        partial_ec_mul_window_bits_9,
+        pedersen_points_table_window_bits_9,
+        poseidon_aggregator,
+        poseidon_3_partial_rounds_chain,
+        poseidon_full_round_chain,
+        cube_252,
+        poseidon_round_keys,
+        range_check_252_width_27,
+        memory_address_to_id,
+    );
+    for (instance, component) in cairo.memory_id_to_big.iter().enumerate() {
+        bind_component!("memory_id_to_big", instance, component);
+    }
+    bind_optional!(
+        memory_id_to_small,
+        range_check_6,
+        range_check_8,
+        range_check_11,
+        range_check_12,
+        range_check_18,
+        range_check_20,
+        range_check_4_3,
+        range_check_4_4,
+        range_check_9_9,
+        range_check_7_2_5,
+        range_check_3_6_6_3,
+        range_check_4_4_4_4,
+        range_check_3_3_3_3_3,
+        verify_bitwise_xor_4,
+        verify_bitwise_xor_7,
+        verify_bitwise_xor_8,
+        verify_bitwise_xor_9,
+    );
+    if components.len() != expected_count || components.len() != installed.components.len() {
+        return Err(CompositionPlanError::ComponentOrderMismatch {
+            expected: installed.components.len(),
+            actual: components.len(),
+        });
+    }
+    Ok(CompositionProofBindings { components })
+}
+
+fn bind_component_values<E: FrameworkEval>(
+    name: &'static str,
+    instance: usize,
+    component: &FrameworkComponent<E>,
+    installed: &CompositionComponentPlan,
+    max_kernel_instrs: usize,
+) -> Result<CompositionComponentBindings, CompositionPlanError> {
+    let topology_matches = installed.component == name
+        && installed.instance == instance
+        && installed.trace_locations == component.trace_locations()
+        && installed.preprocessed_column_indices == component.preprocessed_column_indices()
+        && installed.trace_log_size == component.evaluator().log_size()
+        && installed.evaluation_log_size == component.max_constraint_log_degree_bound()
+        && installed.n_constraints == component.n_constraints();
+    if !topology_matches {
+        return Err(CompositionPlanError::BindingTopologyDrift {
+            component: name,
+            instance,
+        });
+    }
+    let binding = constraint_program_bindings(
+        component.evaluator(),
+        3,
+        component.claimed_sum(),
+        component.evaluator().log_size(),
+        max_kernel_instrs,
+    )
+    .ok_or(CompositionPlanError::KernelLowering {
+        component: name,
+        instance,
+    })?;
+    let kernels_match = binding.kernels.len() == installed.kernels.len()
+        && binding
+            .kernels
+            .iter()
+            .zip(&installed.kernels)
+            .all(|(current, expected)| {
+                current.cache_key == expected.cache_key
+                    && current.semantic_hash == expected.semantic_hash
+                    && current.rc_base == expected.rc_base
+            });
+    if !kernels_match {
+        return Err(CompositionPlanError::BindingKernelMismatch {
+            component: name,
+            instance,
+        });
+    }
+    if binding.base_param_values.len() != installed.base_param_values.len()
+        || binding.ext_param_values != installed.ext_param_values
+    {
+        return Err(CompositionPlanError::BindingTopologyDrift {
+            component: name,
+            instance,
+        });
+    }
+    Ok(CompositionComponentBindings {
+        component: name,
+        instance,
+        base_param_values: binding.base_param_values,
+    })
+}
+
+impl CompositionProofBindings {
+    pub fn from_plan(plan: &CompositionPlan) -> Self {
+        Self {
+            components: plan
+                .components
+                .iter()
+                .map(|component| CompositionComponentBindings {
+                    component: component.component,
+                    instance: component.instance,
+                    base_param_values: component.base_param_values.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl CompositionPlan {
