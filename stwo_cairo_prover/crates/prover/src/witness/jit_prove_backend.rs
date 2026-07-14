@@ -30,7 +30,7 @@
 //! `add_inputs` entry points, in the same per-relation order, over the same FULL
 //! padded extent (padding rows feed too — `mults_0 = 1` on every row).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::poly::circle::CanonicCoset;
@@ -2305,29 +2305,65 @@ pub(crate) fn builtin_cuda_write_trace_from<C: BuiltinLaneSpec>(
 
 use crate::witness::components::{blake_round, pedersen_aggregator_window_bits_18};
 
+fn fill_canonical_pedersen_column(column: usize, buf: &mut Vec<u32>) {
+    use stwo_cairo_common::preprocessed_columns::pedersen::PedersenPoints;
+
+    buf.extend(
+        PedersenPoints::<18>::new(column)
+            .get_data()
+            .iter()
+            .map(|value| value.0),
+    );
+}
+
 /// Register the HOST-BUILT `PEDERSEN_TABLE_18` on device (borrowed mode) — the
 /// deduce lane's only permitted table source: the oracle falsified the
-/// GPU-generated table (144/256 rows, run 20260705T113615Z). The checked result
-/// preserves the first recoverable registration failure exactly. Native CUDA
-/// upload/publication failures still abort because those legacy entry points do
-/// not return status codes.
+/// GPU-generated table (144/256 rows, run 20260705T113615Z). Its canonical
+/// digest is computed once from the host table. The upload pass independently
+/// rehashes every padded byte before checked publication, so matching geometry
+/// cannot disguise foreign contents and every CUDA failure remains recoverable.
 pub fn try_ensure_device_pedersen_table() -> Result<
     stwo_backend_cuda::pedersen_table::RegisteredPedersenTable,
     stwo_backend_cuda::pedersen_table::PedersenTableRegistrationError,
 > {
     use stwo_cairo_common::preprocessed_columns::pedersen::PedersenPoints;
+
+    static CANONICAL_DIGEST: OnceLock<
+        Result<
+            stwo_backend_cuda::pedersen_table::PedersenTableContentDigest,
+            stwo_backend_cuda::pedersen_table::PedersenTableRegistrationError,
+        >,
+    > = OnceLock::new();
+
+    // Stub builds must fail before touching PEDERSEN_TABLE_18: materializing and
+    // hashing that lazy host table is roughly 1.9 GB of pointless work there.
+    if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        return Err(
+            stwo_backend_cuda::pedersen_table::PedersenTableRegistrationError::CudaUnavailable,
+        );
+    }
     let n_rows = PedersenPoints::<18>::new(0).get_data().len();
-    stwo_backend_cuda::pedersen_table::try_register_borrowed_pedersen_table(
-        n_rows,
-        |column, buf| {
-            buf.extend(
-                PedersenPoints::<18>::new(column)
-                    .get_data()
-                    .iter()
-                    .map(|value| value.0),
-            );
-        },
-    )
+    let padded_rows = n_rows.next_power_of_two();
+    let content_digest = CANONICAL_DIGEST
+        .get_or_init(|| {
+            stwo_backend_cuda::pedersen_table::compute_borrowed_pedersen_table_digest(
+                n_rows,
+                fill_canonical_pedersen_column,
+            )
+        })
+        .clone()?;
+    let table =
+        stwo_backend_cuda::pedersen_table::try_register_borrowed_pedersen_table_with_content_digest(
+            n_rows,
+            content_digest,
+            fill_canonical_pedersen_column,
+        )?;
+    table
+        .validate_exact_registration_geometry(content_digest, n_rows, padded_rows)
+        .map_err(
+            stwo_backend_cuda::pedersen_table::PedersenTableRegistrationError::InvalidReadyGeometry,
+        )?;
+    Ok(table)
 }
 
 /// Compatibility wrapper for recorded lanes that retain host fallback.

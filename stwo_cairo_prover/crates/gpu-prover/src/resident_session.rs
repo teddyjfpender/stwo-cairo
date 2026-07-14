@@ -695,6 +695,8 @@ fn ensure_process_owned_pedersen_table(
     if !executable.arena().requires_registered_pedersen_table() {
         return Ok(());
     }
+    // This is the content-admission boundary: the canonical caller checks its
+    // digest, source rows, and padded rows before returning the immutable table.
     let table = stwo_cairo_prover::witness::jit_prove_backend::try_ensure_device_pedersen_table()?;
     let actual_columns = table.columns().len();
     if actual_columns != PEDERSEN_POINTS_18_COLUMN_COUNT {

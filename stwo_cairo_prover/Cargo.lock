@@ -3628,6 +3628,7 @@ dependencies = [
 name = "stwo-backend-cuda"
 version = "2.2.0"
 dependencies = [
+ "blake3",
  "itertools 0.12.1",
  "num-traits",
  "rayon",

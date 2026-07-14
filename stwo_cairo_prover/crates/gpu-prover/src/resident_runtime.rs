@@ -1318,6 +1318,9 @@ impl<'a> ResidentGraphRuntime<'a> {
                                         .map_err(ResidentRuntimeError::from)
                                 }
                                 PlannedFixedTableSource::RegisteredPedersen18 { column } => {
+                                    // ResidentSession admitted this immutable process table through
+                                    // the canonical digest + source/padded-geometry boundary. This
+                                    // lookup only rebinds one already-admitted device column.
                                     let table = stwo_backend_cuda::pedersen_table::registered_borrowed_pedersen_table()
                                         .ok_or(ResidentRuntimeError::RegisteredPedersenTableUnavailable)?;
                                     if !table.has_exact_rows(PEDERSEN_POINTS_18_ROW_COUNT) {
