@@ -149,7 +149,7 @@ impl MerkleChannel for RecordingBlake2sMerkleChannel {
 pub(crate) fn record_verifier_events<T>(
     run: impl FnOnce() -> T,
 ) -> Result<(T, Vec<VerifierEvent>), String> {
-    EVENT_SINK.with(|sink| {
+    EVENT_SINK.with(|sink| -> Result<(), String> {
         let mut sink = sink.borrow_mut();
         if sink.is_some() {
             return Err("nested verifier event capture is not supported".into());
