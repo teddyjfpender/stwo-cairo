@@ -10351,10 +10351,11 @@ mod tests {
             .partial_numerator_log_sizes
             .push(23);
         assert_ne!(protocol.key(), changed_quotient.key());
-        let identity_mutations: [fn(&mut ProtocolGeometry); 8] = [
-            |changed| {
-                changed.identity.interpolation_mode = InterpolationLaunchMode::StageFusedOutOfPlace
-            },
+        let mut fused_interpolation = protocol.clone();
+        fused_interpolation.identity.interpolation_mode =
+            InterpolationLaunchMode::StageFusedOutOfPlace;
+        assert_ne!(protocol.key(), fused_interpolation.key());
+        let identity_mutations: [fn(&mut ProtocolGeometry); 7] = [
             |changed| changed.identity.blake2s_interior_fused = true,
             |changed| changed.identity.composition_launch_mode = CompositionLaunchMode::Wide,
             |changed| changed.identity.relation_tail_mode = RelationTailMode::Scan,
