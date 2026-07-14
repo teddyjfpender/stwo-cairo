@@ -1,12 +1,13 @@
-//! Exact late consumers for dynamic commitment coefficients.
+//! Exact consumers for dynamic commitment coefficients.
 //!
-//! This is deliberately narrower than the eventual unified commitment compiler:
-//! the current OODS implementation still reads coefficients. The plan records
-//! only the late stages whose source mode is already sealed by
-//! [`ProtocolGeometry`], so the arena may release a coefficient after its real
-//! final reader without assuming a future evaluation-source OODS path.
+//! Every downstream source choice is sealed by [`ProtocolGeometry`]. A
+//! RetainEvaluation group therefore stops extending coefficient lifetime once
+//! composition, OODS, numerator, and decommit have each selected the retained
+//! evaluation representation.
 
 use std::collections::HashMap;
+
+use stwo_backend_cuda::{OodsSourceKind, QuotientNumeratorSourceKind};
 
 use crate::arena_plan::{
     BufferPurpose, CommitmentTreeId, OpenedColumnSource, ProofEpoch, ProtocolGeometry,
@@ -15,6 +16,7 @@ use crate::arena_plan::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LateCoefficientOwnership {
     pub source: OpenedColumnSource,
+    pub composition_reads_coefficients: bool,
     pub oods_reads_coefficients: bool,
     pub quotient_reads_coefficients: bool,
     pub decommit_reads_coefficients: bool,
@@ -29,6 +31,12 @@ pub struct LateCoefficientOwnershipPlan {
 
 impl LateCoefficientOwnershipPlan {
     pub fn compile(protocol: &ProtocolGeometry) -> Result<Self, &'static str> {
+        let oods_source_kinds = protocol
+            .oods_source_kinds()
+            .map_err(|_| "late coefficient ownership OODS source policy is invalid")?;
+        let numerator_source_kinds = protocol
+            .quotient_numerator_source_kinds()
+            .map_err(|_| "late coefficient ownership numerator source policy is invalid")?;
         let mut entries = Vec::new();
         let mut by_source = HashMap::new();
         for commitment in &protocol.commitments {
@@ -63,25 +71,44 @@ impl LateCoefficientOwnershipPlan {
                         .oods
                         .columns
                         .iter()
-                        .filter(|column| column.source == source);
-                    let oods = matching_oods
+                        .zip(&oods_source_kinds)
+                        .zip(&numerator_source_kinds)
+                        .filter(|((column, _), _)| column.source == source);
+                    let ((oods, &oods_source_kind), &numerator_source_kind) = matching_oods
                         .next()
                         .ok_or("dynamic commitment source has no OODS column")?;
                     if matching_oods.next().is_some() {
                         return Err("dynamic commitment source has duplicate OODS columns");
                     }
                     let quotient_reads_coefficients = !oods.shape_points.is_empty()
-                        && !commitment.numerator_evaluation_groups[group];
+                        && numerator_source_kind == QuotientNumeratorSourceKind::Coefficients;
                     let decommit_reads_coefficients = !commitment.retained_evaluation_groups[group];
-                    let final_consumer =
-                        final_consumer(quotient_reads_coefficients, decommit_reads_coefficients);
+                    let composition_reads_coefficients = matches!(
+                        source,
+                        OpenedColumnSource::Trace {
+                            purpose: BufferPurpose::BaseCoefficients
+                                | BufferPurpose::InteractionCoefficients,
+                            ..
+                        }
+                    ) && !commitment
+                        .direct_composition_evaluation_groups[group];
+                    let oods_reads_coefficients = !oods.shape_points.is_empty()
+                        && oods_source_kind == OodsSourceKind::Coefficients;
+                    let final_consumer = final_consumer(
+                        commitment.created,
+                        composition_reads_coefficients,
+                        oods_reads_coefficients,
+                        quotient_reads_coefficients,
+                        decommit_reads_coefficients,
+                    );
                     let index = entries.len();
                     if by_source.insert(source, index).is_some() {
                         return Err("dynamic commitment source appears in multiple groups");
                     }
                     entries.push(LateCoefficientOwnership {
                         source,
-                        oods_reads_coefficients: true,
+                        composition_reads_coefficients,
+                        oods_reads_coefficients,
                         quotient_reads_coefficients,
                         decommit_reads_coefficients,
                         final_consumer,
@@ -110,6 +137,9 @@ impl LateCoefficientOwnershipPlan {
 }
 
 const fn final_consumer(
+    commitment: ProofEpoch,
+    composition_reads_coefficients: bool,
+    oods_reads_coefficients: bool,
     quotient_reads_coefficients: bool,
     decommit_reads_coefficients: bool,
 ) -> ProofEpoch {
@@ -117,9 +147,12 @@ const fn final_consumer(
         ProofEpoch::Decommit
     } else if quotient_reads_coefficients {
         ProofEpoch::Quotient
-    } else {
-        // OODS remains coefficient-sourced in the current backend.
+    } else if oods_reads_coefficients {
         ProofEpoch::Oods
+    } else if composition_reads_coefficients {
+        ProofEpoch::Composition
+    } else {
+        commitment
     }
 }
 
@@ -129,9 +162,26 @@ mod tests {
 
     #[test]
     fn final_consumer_is_the_latest_real_coefficient_reader() {
-        assert_eq!(final_consumer(false, false), ProofEpoch::Oods);
-        assert_eq!(final_consumer(true, false), ProofEpoch::Quotient);
-        assert_eq!(final_consumer(false, true), ProofEpoch::Decommit);
-        assert_eq!(final_consumer(true, true), ProofEpoch::Decommit);
+        let committed = ProofEpoch::BaseCommit;
+        assert_eq!(
+            final_consumer(committed, false, false, false, false),
+            committed
+        );
+        assert_eq!(
+            final_consumer(committed, true, false, false, false),
+            ProofEpoch::Composition
+        );
+        assert_eq!(
+            final_consumer(committed, true, true, false, false),
+            ProofEpoch::Oods
+        );
+        assert_eq!(
+            final_consumer(committed, true, true, true, false),
+            ProofEpoch::Quotient
+        );
+        assert_eq!(
+            final_consumer(committed, true, true, true, true),
+            ProofEpoch::Decommit
+        );
     }
 }

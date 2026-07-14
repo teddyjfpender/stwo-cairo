@@ -1812,12 +1812,14 @@ mod tests {
                     .map(|&log| (log, log + blowup))
                     .collect::<Vec<_>>()
             );
+            let coefficient_sources =
+                vec![stwo_backend_cuda::OodsSourceKind::Coefficients; oods.columns.len()];
             let requirements = stwo_backend_cuda::oods_workspace_requirements(
                 stwo_backend_cuda::OodsWorkspaceConfig {
                     lifting_log_size: 5 + blowup,
                     mask_log_size: 5,
                 },
-                &oods.column_topologies(),
+                &oods.column_topologies(&coefficient_sources).unwrap(),
             )
             .unwrap();
             assert_eq!(requirements.sample_count, oods.sample_count());

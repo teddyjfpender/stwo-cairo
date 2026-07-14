@@ -6,11 +6,11 @@
 //! dependency order. No caller may recreate quotient constants on the host.
 
 use stwo_backend_cuda::{
-    ArenaError, ArenaSlice, OodsCoefficientColumn, PreparedNumeratorSchedule, PreparedOodsError,
-    PreparedOodsGraph, PreparedQuotientError, PreparedQuotientGraph,
-    PreparedQuotientNumeratorError, PreparedQuotientNumeratorGraph, QuotientNumeratorColumn,
-    QuotientNumeratorColumnSource, QuotientNumeratorDestination, QuotientNumeratorSingleWriteError,
-    QuotientNumeratorSourceKind,
+    ArenaError, ArenaSlice, OodsColumnSource, OodsPolynomialColumn, OodsSourceKind,
+    PreparedNumeratorSchedule, PreparedOodsError, PreparedOodsGraph, PreparedQuotientError,
+    PreparedQuotientGraph, PreparedQuotientNumeratorError, PreparedQuotientNumeratorGraph,
+    QuotientNumeratorColumn, QuotientNumeratorColumnSource, QuotientNumeratorDestination,
+    QuotientNumeratorSingleWriteError, QuotientNumeratorSourceKind,
 };
 
 use crate::arena_plan::{ArenaBinding, OpenedColumnSource, QuotientNumeratorSchedule};
@@ -28,6 +28,9 @@ pub enum ResidentOodsError {
         numerator: OpenedColumnSource,
     },
     ColumnBindingMismatch {
+        index: usize,
+    },
+    ColumnGeometryMismatch {
         index: usize,
     },
     LogicalSizeMismatch {
@@ -109,18 +112,20 @@ impl<'a> ResidentOodsPipeline<'a> {
 
         let mut oods_columns = Vec::with_capacity(oods_plan.columns.len());
         for column in &oods_plan.columns {
-            let coefficients = bind_exact(
+            let topology = column.topology();
+            let source = bind_exact(
                 workspace,
-                column.coefficients,
-                words_for_log(column.coefficient_log_size)?,
-                "OODS coefficient column",
+                column.source_binding,
+                words_for_log(topology.log_size)?,
+                "OODS polynomial source",
             )?;
-            oods_columns.push(OodsCoefficientColumn {
-                coefficients,
-                topology: column.topology(),
-            });
+            let source = match column.source_kind {
+                OodsSourceKind::Coefficients => OodsColumnSource::Coefficients(source),
+                OodsSourceKind::Evaluations => OodsColumnSource::Evaluations(source),
+            };
+            oods_columns.push(OodsPolynomialColumn { source, topology });
         }
-        let oods = PreparedOodsGraph::prepare(
+        let oods = PreparedOodsGraph::prepare_mixed(
             arena,
             oods_plan.config,
             &oods_columns,
@@ -152,32 +157,41 @@ impl<'a> ResidentOodsPipeline<'a> {
                     numerator: column.source,
                 });
             }
-            if oods_column.coefficients != column.coefficients {
+            let expected_evaluation_log = column
+                .topology
+                .coefficient_log_size
+                .checked_add(numerator_plan.config.log_blowup_factor)
+                .ok_or(ResidentOodsError::SizeOverflow)?;
+            if oods_column.coefficient_log_size != column.topology.coefficient_log_size
+                || oods_column.evaluation_log_size != expected_evaluation_log
+            {
+                return Err(ResidentOodsError::ColumnGeometryMismatch { index });
+            }
+            if (oods_column.source_kind == OodsSourceKind::Coefficients
+                && oods_column.source_binding != column.coefficients)
+                || (oods_column.source_kind == OodsSourceKind::Evaluations
+                    && column.topology.source_kind == QuotientNumeratorSourceKind::Evaluation
+                    && oods_column.source_binding != column.numerator_source)
+            {
                 return Err(ResidentOodsError::ColumnBindingMismatch { index });
             }
-            let coefficients = bind_exact(
-                workspace,
-                column.coefficients,
-                words_for_log(column.topology.coefficient_log_size)?,
-                "quotient numerator coefficient column",
-            )?;
             let source = match column.topology.source_kind {
                 QuotientNumeratorSourceKind::Coefficients => {
                     if column.numerator_source != column.coefficients {
                         return Err(ResidentOodsError::ColumnBindingMismatch { index });
                     }
-                    QuotientNumeratorColumnSource::Coefficients(coefficients)
+                    QuotientNumeratorColumnSource::Coefficients(bind_exact(
+                        workspace,
+                        column.coefficients,
+                        words_for_log(column.topology.coefficient_log_size)?,
+                        "quotient numerator coefficient column",
+                    )?)
                 }
                 QuotientNumeratorSourceKind::Evaluation => {
-                    let evaluation_log_size = column
-                        .topology
-                        .coefficient_log_size
-                        .checked_add(numerator_plan.config.log_blowup_factor)
-                        .ok_or(ResidentOodsError::SizeOverflow)?;
                     QuotientNumeratorColumnSource::Evaluation(bind_exact(
                         workspace,
                         column.numerator_source,
-                        words_for_log(evaluation_log_size)?,
+                        words_for_log(expected_evaluation_log)?,
                         "quotient numerator retained evaluation column",
                     )?)
                 }

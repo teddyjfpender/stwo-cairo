@@ -35,8 +35,8 @@ use stwo_backend_cuda::{
     FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriFoldLaunchMode, FriMerkleTreeSlots,
     FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots, InterpolationLaunchMode,
     MerkleFromLeavesSlots, ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
-    OodsColumnTopology, OodsWorkspaceConfig, OodsWorkspaceRequirements, OodsWorkspaceSlots,
-    PreparedBlake2sPowError, PreparedCommitError, PreparedDecommitError,
+    OodsColumnTopology, OodsSourceKind, OodsWorkspaceConfig, OodsWorkspaceRequirements,
+    OodsWorkspaceSlots, PreparedBlake2sPowError, PreparedCommitError, PreparedDecommitError,
     PreparedExecutionTablesError, PreparedFixedTableError, PreparedFriError, PreparedFriFinalError,
     PreparedOodsError, PreparedProgressiveCommitError, PreparedQuotientError,
     PreparedQuotientNumeratorError, PreparedWitnessError, PreparedWitnessFeedError,
@@ -823,9 +823,9 @@ pub struct OodsColumnGeometry {
     pub offset_points: Vec<CirclePoint<BaseField>>,
 }
 
-/// Address-free OODS and quotient-numerator topology. OODS always samples the
-/// canonical coefficients; the numerator may independently reuse a planned
-/// retained evaluation when the sealed policy marks that exact column eligible.
+/// Address-free OODS and quotient-numerator topology. Source representation is
+/// compiled from the exact commitment-group ownership policy; proof order and
+/// opening geometry remain independent of that physical choice.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OodsGeometry {
     pub mask_log_size: u32,
@@ -843,17 +843,31 @@ impl OodsGeometry {
             .sum()
     }
 
-    pub fn column_topologies(&self) -> Vec<OodsColumnTopology<'_>> {
-        self.columns
+    pub fn column_topologies(
+        &self,
+        source_kinds: &[OodsSourceKind],
+    ) -> Result<Vec<OodsColumnTopology<'_>>, ArenaPlanError> {
+        if source_kinds.len() != self.columns.len() {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "OODS source policy width mismatch",
+            ));
+        }
+        Ok(self
+            .columns
             .iter()
-            .map(|column| {
-                OodsColumnTopology::coefficient_offset_points(
+            .zip(source_kinds)
+            .map(|(column, source_kind)| match source_kind {
+                OodsSourceKind::Coefficients => OodsColumnTopology::coefficient_offset_points(
                     column.coefficient_log_size,
                     column.evaluation_log_size,
                     &column.offset_points,
-                )
+                ),
+                OodsSourceKind::Evaluations => OodsColumnTopology::evaluation_offset_points(
+                    column.evaluation_log_size,
+                    &column.offset_points,
+                ),
             })
-            .collect()
+            .collect())
     }
 
     pub fn quotient_numerator_topologies(
@@ -959,6 +973,81 @@ pub struct ProtocolGeometry {
 }
 
 impl ProtocolGeometry {
+    pub fn oods_source_kinds(&self) -> Result<Vec<OodsSourceKind>, ArenaPlanError> {
+        self.oods
+            .columns
+            .iter()
+            .map(|column| {
+                let tree = match column.source {
+                    OpenedColumnSource::Preprocessed { .. } => {
+                        return Ok(OodsSourceKind::Coefficients);
+                    }
+                    OpenedColumnSource::Trace {
+                        purpose: BufferPurpose::BaseCoefficients,
+                        ..
+                    } => CommitmentTreeId::Base,
+                    OpenedColumnSource::Trace {
+                        purpose: BufferPurpose::InteractionCoefficients,
+                        ..
+                    } => CommitmentTreeId::Interaction,
+                    OpenedColumnSource::Composition { .. } => CommitmentTreeId::Composition,
+                    OpenedColumnSource::Trace { .. } => {
+                        return Err(ArenaPlanError::InvalidProtocolGeometry(
+                            "OODS source is not a committed coefficient column",
+                        ));
+                    }
+                };
+                let commitment = self
+                    .commitments
+                    .iter()
+                    .find(|commitment| commitment.id == tree)
+                    .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                        "OODS source tree is missing",
+                    ))?;
+                let mut available_at_oods = None;
+                for (group, (sources, logs)) in commitment
+                    .grouped_column_sources
+                    .iter()
+                    .zip(&commitment.grouped_column_log_sizes)
+                    .enumerate()
+                {
+                    for (&source, &log_size) in sources.iter().zip(logs) {
+                        if OpenedColumnSource::from(source) != column.source {
+                            continue;
+                        }
+                        if available_at_oods.is_some() || log_size != column.coefficient_log_size {
+                            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                                "OODS retained source mapping is ambiguous or has the wrong log",
+                            ));
+                        }
+                        let retained_for_decommit = commitment
+                            .retained_evaluation_groups
+                            .get(group)
+                            .copied()
+                            .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                                "OODS retained source group is missing",
+                            ))?;
+                        let retained_for_numerator = commitment
+                            .numerator_evaluation_groups
+                            .get(group)
+                            .copied()
+                            .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                                "OODS numerator source group is missing",
+                            ))?;
+                        available_at_oods = Some(retained_for_decommit || retained_for_numerator);
+                    }
+                }
+                match available_at_oods {
+                    Some(true) => Ok(OodsSourceKind::Evaluations),
+                    Some(false) => Ok(OodsSourceKind::Coefficients),
+                    None => Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "OODS source is absent from its commitment",
+                    )),
+                }
+            })
+            .collect()
+    }
+
     pub fn quotient_numerator_source_kinds(
         &self,
     ) -> Result<Vec<QuotientNumeratorSourceKind>, ArenaPlanError> {
@@ -1406,7 +1495,8 @@ impl ProtocolGeometry {
                 "OODS topology is missing preprocessed or composition columns",
             ));
         }
-        let oods_topologies = self.oods.column_topologies();
+        let oods_source_kinds = self.oods_source_kinds()?;
+        let oods_topologies = self.oods.column_topologies(&oods_source_kinds)?;
         let oods_requirements =
             oods_workspace_requirements(self.oods_workspace_config(), &oods_topologies)
                 .map_err(ArenaPlanError::Oods)?;
@@ -2179,6 +2269,8 @@ struct LogicalPreprocessedWorkspace {
 struct LogicalOodsColumn {
     geometry: OodsColumnGeometry,
     coefficients: LogicalBufferId,
+    source_kind: OodsSourceKind,
+    source_binding: LogicalBufferId,
 }
 
 #[derive(Clone, Debug)]
@@ -2886,7 +2978,8 @@ pub struct PlannedOodsColumn {
     pub evaluation_log_size: u32,
     pub shape_points: Vec<CirclePoint<SecureField>>,
     pub offset_points: Vec<CirclePoint<BaseField>>,
-    pub coefficients: ArenaBinding,
+    pub source_kind: OodsSourceKind,
+    pub source_binding: ArenaBinding,
 }
 
 #[derive(Clone, Debug)]
@@ -2966,11 +3059,17 @@ impl PlannedCompositionWorkspace {
 
 impl PlannedOodsColumn {
     pub fn topology(&self) -> OodsColumnTopology<'_> {
-        OodsColumnTopology::coefficient_offset_points(
-            self.coefficient_log_size,
-            self.evaluation_log_size,
-            &self.offset_points,
-        )
+        match self.source_kind {
+            OodsSourceKind::Coefficients => OodsColumnTopology::coefficient_offset_points(
+                self.coefficient_log_size,
+                self.evaluation_log_size,
+                &self.offset_points,
+            ),
+            OodsSourceKind::Evaluations => OodsColumnTopology::evaluation_offset_points(
+                self.evaluation_log_size,
+                &self.offset_points,
+            ),
+        }
     }
 }
 
@@ -6087,6 +6186,86 @@ fn interpolation_batch_geometry(
     }
 }
 
+fn retained_oods_source(
+    commitments: &[LogicalCommitWorkspace],
+    source: OpenedColumnSource,
+    coefficient_log_size: u32,
+) -> Result<LogicalBufferId, ArenaPlanError> {
+    let tree = match source {
+        OpenedColumnSource::Trace {
+            purpose: BufferPurpose::BaseCoefficients,
+            ..
+        } => CommitmentTreeId::Base,
+        OpenedColumnSource::Trace {
+            purpose: BufferPurpose::InteractionCoefficients,
+            ..
+        } => CommitmentTreeId::Interaction,
+        OpenedColumnSource::Composition { .. } => CommitmentTreeId::Composition,
+        _ => {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "evaluation-backed OODS source is not dynamic",
+            ));
+        }
+    };
+    let commitment = commitments
+        .iter()
+        .find(|commitment| commitment.id == tree)
+        .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+            "evaluation-backed OODS commitment is missing",
+        ))?;
+    let mut selected = None;
+    for (group, (sources, logs)) in commitment
+        .grouped_column_sources
+        .iter()
+        .zip(&commitment.grouped_column_log_sizes)
+        .enumerate()
+    {
+        for (column, (&candidate, &log_size)) in sources.iter().zip(logs).enumerate() {
+            if OpenedColumnSource::from(candidate) != source {
+                continue;
+            }
+            if selected.is_some() || log_size != coefficient_log_size {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "evaluation-backed OODS source mapping drifted",
+                ));
+            }
+            let retained_for_decommit = commitment
+                .decommit_evaluation_groups
+                .get(group)
+                .copied()
+                .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                "OODS retained-evaluation group closure is missing",
+            ))?;
+            let retained_for_numerator = commitment
+                .numerator_evaluation_groups
+                .get(group)
+                .copied()
+                .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                    "OODS retained-evaluation group closure is missing",
+                ))?;
+            if !retained_for_decommit && !retained_for_numerator {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "OODS retained-evaluation group closure is missing",
+                ));
+            }
+            selected = Some(
+                commitment
+                    .retained_evaluations
+                    .get(group)
+                    .and_then(Option::as_ref)
+                    .and_then(|columns| columns.get(column))
+                    .copied()
+                    .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                        "planned retained OODS evaluation is missing",
+                    ))?,
+            );
+        }
+    }
+    selected.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+        "planned retained OODS source is absent",
+    ))
+}
+
 fn retained_quotient_numerator_source(
     commitments: &[LogicalCommitWorkspace],
     source: OpenedColumnSource,
@@ -6229,7 +6408,8 @@ fn append_protocol_buffers(
     )
     .map_err(ArenaPlanError::Quotient)?;
     let oods_config = protocol.oods_workspace_config();
-    let oods_topologies = protocol.oods.column_topologies();
+    let oods_source_kinds = protocol.oods_source_kinds()?;
+    let oods_topologies = protocol.oods.column_topologies(&oods_source_kinds)?;
     let oods_requirements =
         oods_workspace_requirements(oods_config, &oods_topologies).map_err(ArenaPlanError::Oods)?;
     let quotient_numerator_config = protocol.quotient_numerator_workspace_config()?;
@@ -7324,22 +7504,44 @@ fn append_protocol_buffers(
         .oods
         .columns
         .iter()
-        .map(|geometry| {
+        .zip(&oods_source_kinds)
+        .map(|(geometry, &source_kind)| {
             let coefficients = opened_source_logical_id(logical, geometry.source).ok_or(
                 ArenaPlanError::InvalidProtocolGeometry(
-                    "OODS column source is absent from the arena",
+                    "OODS column coefficient identity is absent from the arena",
                 ),
             )?;
-            let expected_words = checked_pow2(geometry.coefficient_log_size)?;
-            let actual_words = logical[coefficients.0 as usize].len_words;
+            if logical[coefficients.0 as usize].len_words
+                != checked_pow2(geometry.coefficient_log_size)?
+            {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "OODS coefficient identity size disagrees with topology",
+                ));
+            }
+            let source_binding = match source_kind {
+                OodsSourceKind::Coefficients => coefficients,
+                OodsSourceKind::Evaluations => retained_oods_source(
+                    &logical_commitments,
+                    geometry.source,
+                    geometry.coefficient_log_size,
+                )?,
+            };
+            let source_log_size = match source_kind {
+                OodsSourceKind::Coefficients => geometry.coefficient_log_size,
+                OodsSourceKind::Evaluations => geometry.evaluation_log_size,
+            };
+            let expected_words = checked_pow2(source_log_size)?;
+            let actual_words = logical[source_binding.0 as usize].len_words;
             if actual_words != expected_words {
                 return Err(ArenaPlanError::InvalidProtocolGeometry(
-                    "OODS coefficient source size disagrees with topology",
+                    "OODS source size disagrees with its representation topology",
                 ));
             }
             Ok(LogicalOodsColumn {
                 geometry: geometry.clone(),
                 coefficients,
+                source_kind,
+                source_binding,
             })
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
@@ -8278,14 +8480,29 @@ fn resolve_oods_slots(
                 evaluation_log_size: column.geometry.evaluation_log_size,
                 shape_points: column.geometry.shape_points,
                 offset_points: column.geometry.offset_points,
-                coefficients: binding(column.coefficients)?,
+                source_kind: column.source_kind,
+                source_binding: binding(column.source_binding)?,
             })
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+    for column in &columns {
+        validate_oods_source_binding(column)?;
+    }
+    let rebound_topologies = columns
+        .iter()
+        .map(PlannedOodsColumn::topology)
+        .collect::<Vec<_>>();
+    let rebound_requirements = oods_workspace_requirements(logical.config, &rebound_topologies)
+        .map_err(ArenaPlanError::Oods)?;
+    if rebound_requirements != logical.requirements {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "OODS workspace changed while binding physical polynomial sources",
+        ));
+    }
     let oods_point_parameter = binding(logical.oods_point_parameter)?;
     if columns
         .iter()
-        .map(|column| column.coefficients)
+        .map(|column| column.source_binding)
         .chain([oods_point_parameter])
         .any(|external| workspace_ids.contains(&external.physical))
     {
@@ -8302,6 +8519,19 @@ fn resolve_oods_slots(
         sampled_values: binding(logical.sampled_values)?,
         slots,
     })
+}
+
+fn validate_oods_source_binding(column: &PlannedOodsColumn) -> Result<(), ArenaPlanError> {
+    let source_log_size = match column.source_kind {
+        OodsSourceKind::Coefficients => column.coefficient_log_size,
+        OodsSourceKind::Evaluations => column.evaluation_log_size,
+    };
+    if column.source_binding.len_words != checked_pow2(source_log_size)? {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "OODS source binding has the wrong representation extent",
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_quotient_numerator_slots(
@@ -10975,6 +11205,48 @@ mod tests {
 
         let retained_numerator_arena =
             ProofArenaPlan::build(&proof, &retained_numerator, &composition).unwrap();
+        let numerator_only_commitment = retained_numerator_arena
+            .commitment(CommitmentTreeId::Composition)
+            .unwrap();
+        assert!(numerator_only_commitment.retained_evaluation_groups[0].is_none());
+        let numerator_only_group = numerator_only_commitment.numerator_evaluation_groups[0]
+            .as_ref()
+            .unwrap();
+        let numerator_only_oods_columns = retained_numerator_arena
+            .oods()
+            .columns
+            .iter()
+            .filter_map(|column| match column.source {
+                OpenedColumnSource::Composition { ordinal } => Some((ordinal, column)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(numerator_only_oods_columns.len(), 8);
+        for (ordinal, column) in numerator_only_oods_columns {
+            assert_eq!(column.source_kind, OodsSourceKind::Evaluations);
+            assert_eq!(
+                column.source_binding,
+                numerator_only_group[usize::try_from(ordinal).unwrap()],
+                "numerator-retained evaluations already alive at OODS must be reused exactly"
+            );
+        }
+        assert!(retained_numerator_arena
+            .logical_buffers()
+            .iter()
+            .filter(|buffer| buffer.purpose == BufferPurpose::CompositionCoefficients)
+            .all(|buffer| buffer.lifetime.last == ProofEpoch::Decommit));
+        assert!(retained_numerator_arena
+            .late_coefficient_ownership()
+            .entries()
+            .iter()
+            .filter(|ownership| matches!(ownership.source, OpenedColumnSource::Composition { .. }))
+            .all(|ownership| {
+                !ownership.composition_reads_coefficients
+                    && !ownership.oods_reads_coefficients
+                    && !ownership.quotient_reads_coefficients
+                    && ownership.decommit_reads_coefficients
+                    && ownership.final_consumer == ProofEpoch::Decommit
+            }));
         let numerator_columns = &retained_numerator_arena.quotient_numerator().columns;
         let evaluation_column = numerator_columns
             .iter()
@@ -11017,7 +11289,74 @@ mod tests {
             .logical_buffers()
             .iter()
             .filter(|buffer| buffer.purpose == BufferPurpose::CompositionCoefficients)
-            .all(|buffer| buffer.lifetime.last == ProofEpoch::Oods));
+            .all(|buffer| buffer.lifetime.last == ProofEpoch::CompositionCommit));
+        let exclusive_commitment = exclusive_late_arena
+            .commitment(CommitmentTreeId::Composition)
+            .unwrap();
+        let retained_composition = exclusive_commitment.retained_evaluation_groups[0]
+            .as_ref()
+            .unwrap();
+        let evaluation_oods_columns = exclusive_late_arena
+            .oods()
+            .columns
+            .iter()
+            .filter_map(|column| match column.source {
+                OpenedColumnSource::Composition { ordinal } => Some((ordinal, column)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(evaluation_oods_columns.len(), 8);
+        for (ordinal, column) in evaluation_oods_columns {
+            assert_eq!(column.source_kind, OodsSourceKind::Evaluations);
+            assert_eq!(column.coefficient_log_size, 25);
+            assert_eq!(column.topology().log_size, 26);
+            assert_eq!(
+                column.source_binding,
+                retained_composition[usize::try_from(ordinal).unwrap()]
+            );
+        }
+        assert!(exclusive_late_arena
+            .late_coefficient_ownership()
+            .entries()
+            .iter()
+            .filter(|ownership| matches!(ownership.source, OpenedColumnSource::Composition { .. }))
+            .all(|ownership| {
+                !ownership.composition_reads_coefficients
+                    && !ownership.oods_reads_coefficients
+                    && !ownership.quotient_reads_coefficients
+                    && !ownership.decommit_reads_coefficients
+                    && ownership.final_consumer == ProofEpoch::CompositionCommit
+            }));
+        assert!(retained_composition.iter().all(|binding| {
+            exclusive_late_arena.logical_buffers()[binding.logical.0 as usize]
+                .lifetime
+                .last
+                == ProofEpoch::Decommit
+        }));
+        let sampled_composition = exclusive_late_arena
+            .oods()
+            .columns
+            .iter()
+            .find(|column| column.source == OpenedColumnSource::Composition { ordinal: 0 })
+            .unwrap();
+        assert_eq!(
+            sampled_composition.source_binding,
+            exclusive_late_arena
+                .quotient_numerator()
+                .columns
+                .iter()
+                .find(|column| column.source == sampled_composition.source)
+                .unwrap()
+                .numerator_source
+        );
+        let mut short_oods_source = sampled_composition.clone();
+        short_oods_source.source_binding.len_words -= 1;
+        assert_eq!(
+            validate_oods_source_binding(&short_oods_source),
+            Err(ArenaPlanError::InvalidProtocolGeometry(
+                "OODS source binding has the wrong representation extent"
+            ))
+        );
         let mut short_source = evaluation_column.numerator_source;
         short_source.len_words -= 1;
         assert_eq!(
@@ -11062,6 +11401,24 @@ mod tests {
             &retired_coefficient_reuse
         ));
 
+        let mut direct_only_source_policy = protocol.clone();
+        direct_only_source_policy.commitments[1].direct_composition_evaluation_groups[0] = true;
+        let direct_only_source_kinds = direct_only_source_policy.oods_source_kinds().unwrap();
+        for &source in &direct_only_source_policy.commitments[1].grouped_column_sources[0] {
+            let source = OpenedColumnSource::from(source);
+            let proof_column = direct_only_source_policy
+                .oods
+                .columns
+                .iter()
+                .position(|column| column.source == source)
+                .unwrap();
+            assert_eq!(
+                direct_only_source_kinds[proof_column],
+                OodsSourceKind::Coefficients,
+                "a direct-only evaluation expires before OODS and is not a valid source"
+            );
+        }
+
         let mut hybrid = protocol.clone();
         hybrid.identity.decommit_strategy = DecommitStrategy::HybridByGroup;
         hybrid.commitments[1].retained_evaluation_groups[0] = true;
@@ -11081,6 +11438,110 @@ mod tests {
         let hybrid_base = hybrid_arena.commitment(CommitmentTreeId::Base).unwrap();
         assert!(hybrid_base.retained_evaluation_groups[0].is_some());
         assert!(hybrid_base.retained_evaluation_groups[1].is_none());
+        assert_eq!(
+            hybrid_arena
+                .oods()
+                .columns
+                .iter()
+                .map(|column| column.source)
+                .collect::<Vec<_>>(),
+            hybrid
+                .oods
+                .columns
+                .iter()
+                .map(|column| column.source)
+                .collect::<Vec<_>>(),
+            "source grouping must not perturb canonical proof order"
+        );
+        let hybrid_base_geometry = hybrid
+            .commitments
+            .iter()
+            .find(|commitment| commitment.id == CommitmentTreeId::Base)
+            .unwrap();
+        let retained_base_group = hybrid_base.retained_evaluation_groups[0].as_ref().unwrap();
+        for (column_in_group, &source) in hybrid_base_geometry.grouped_column_sources[0]
+            .iter()
+            .enumerate()
+        {
+            let source = OpenedColumnSource::from(source);
+            let planned = hybrid_arena
+                .oods()
+                .columns
+                .iter()
+                .find(|column| column.source == source)
+                .unwrap();
+            assert_eq!(planned.source_kind, OodsSourceKind::Evaluations);
+            assert_eq!(
+                planned.source_binding, retained_base_group[column_in_group],
+                "a retained group must bind the exact commitment output column"
+            );
+            let ownership = hybrid_arena
+                .late_coefficient_ownership()
+                .get(source)
+                .unwrap();
+            assert!(ownership.composition_reads_coefficients);
+            assert!(!ownership.oods_reads_coefficients);
+            assert!(!ownership.quotient_reads_coefficients);
+            assert!(!ownership.decommit_reads_coefficients);
+            assert_eq!(ownership.final_consumer, ProofEpoch::Composition);
+            let OpenedColumnSource::Trace {
+                component,
+                part,
+                purpose,
+                ordinal,
+            } = source
+            else {
+                panic!("base commitment contains a non-trace source")
+            };
+            assert_eq!(
+                hybrid_arena
+                    .find(Some(component), Some(part), purpose, ordinal)
+                    .unwrap()
+                    .0
+                    .lifetime
+                    .last,
+                ProofEpoch::Composition,
+                "retained evaluation must let the coefficient die after its last real reader"
+            );
+        }
+        for &source in hybrid_base_geometry
+            .grouped_column_sources
+            .iter()
+            .skip(1)
+            .flatten()
+        {
+            let source = OpenedColumnSource::from(source);
+            let planned = hybrid_arena
+                .oods()
+                .columns
+                .iter()
+                .find(|column| column.source == source)
+                .unwrap();
+            assert_eq!(planned.source_kind, OodsSourceKind::Coefficients);
+            let OpenedColumnSource::Trace {
+                component,
+                part,
+                purpose,
+                ordinal,
+            } = source
+            else {
+                panic!("base commitment contains a non-trace source")
+            };
+            let (coefficient, coefficient_binding) = hybrid_arena
+                .find(Some(component), Some(part), purpose, ordinal)
+                .unwrap();
+            assert_eq!(planned.source_binding, coefficient_binding);
+            assert_eq!(coefficient.lifetime.last, ProofEpoch::Decommit);
+            let ownership = hybrid_arena
+                .late_coefficient_ownership()
+                .get(source)
+                .unwrap();
+            assert!(ownership.composition_reads_coefficients);
+            assert!(!ownership.oods_reads_coefficients);
+            assert!(!ownership.quotient_reads_coefficients);
+            assert!(ownership.decommit_reads_coefficients);
+            assert_eq!(ownership.final_consumer, ProofEpoch::Decommit);
+        }
         validate_decommit_group_bindings(&hybrid_config, &hybrid_arena.commitments).unwrap();
 
         let mut missing_retained_binding = hybrid_arena.commitments.clone();
