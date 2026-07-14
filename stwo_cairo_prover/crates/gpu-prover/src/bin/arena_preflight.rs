@@ -8,9 +8,11 @@
 //! -> recorded witness inputs (require_resolved) -> Graph-A multiplicity plan
 //! -> protocol/arena plan. It then prints one JSON record with the component
 //! coverage, multiplicity gaps/blockers, arena words/bytes, per-epoch high
-//! water, slot counts, transcript segments, and a PASS/FAIL verdict against a
-//! VRAM budget. Every failure is the exact fail-closed error the H100 session
-//! would raise.
+//! water, slot counts, transcript segments, and a fail-closed physical-memory
+//! admission verdict against a VRAM budget. Arena-only fit remains diagnostic:
+//! the process cannot PASS until every non-arena allocation is in the physical
+//! ledger. Every planning failure is the exact fail-closed error the H100
+//! session would raise.
 //!
 //! Usage (exactly one input source; the binary is registered under the
 //! `emit-tools` feature, same as kernel_emit):
@@ -49,6 +51,7 @@ use stwo::core::pcs::PcsConfig;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_gpu_prover::arena_plan::ProofEpoch;
+use stwo_cairo_gpu_prover::memory_ledger::PhysicalMemoryLedger;
 use stwo_cairo_gpu_prover::phases;
 use stwo_cairo_gpu_prover::resident_session::{
     plan_resident_preflight, ResidentPreflightError, ResidentPreflightReport,
@@ -159,8 +162,9 @@ fn parse_vram_budget_gb(value: Option<&str>) -> Result<f64, String> {
     Ok(budget)
 }
 
-/// The PASS verdict: full capture-safe coverage, no multiplicity coverage gaps
-/// or feed blockers, and the arena fits the VRAM budget.
+/// The arena-planning verdict: full capture-safe coverage, no multiplicity
+/// coverage gaps or feed blockers, exact AOT coverage, and arena-only fit.
+/// Full process admission additionally requires a complete physical ledger.
 fn verdict(
     capture_safe_ok: bool,
     coverage_gaps: usize,
@@ -174,6 +178,14 @@ fn verdict(
         && blockers == 0
         && arena_bytes <= budget_bytes
         && aot_coverage_ok
+}
+
+fn admission_verdict(
+    planning_pass: bool,
+    physical_admission_complete: bool,
+    physical_admission_pass: bool,
+) -> bool {
+    planning_pass && physical_admission_complete && physical_admission_pass
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -529,8 +541,14 @@ fn report_json(
         .collect();
 
     let budget_bytes = budget_bytes_of(vram_budget_gb);
+    let physical_memory = PhysicalMemoryLedger::json(arena, budget_bytes)
+        .expect("physical memory ledger must reconcile with the validated arena");
+    let physical_admission_complete = physical_memory["admission_complete"]
+        .as_bool()
+        .unwrap_or(false);
+    let physical_admission_pass = physical_memory["admission_pass"].as_bool().unwrap_or(false);
     let capture_safe_ok = report.capture_safe_components.len() == report.present_components.len();
-    let pass = verdict(
+    let planning_pass = verdict(
         capture_safe_ok,
         coverage_gaps.len(),
         blockers.len(),
@@ -538,9 +556,15 @@ fn report_json(
         budget_bytes,
         aot_coverage.passed(),
     );
+    let pass = admission_verdict(
+        planning_pass,
+        physical_admission_complete,
+        physical_admission_pass,
+    );
 
     serde_json::json!({
         "pass": pass,
+        "planning_pass": planning_pass,
         "source": source,
         "present_components": report.present_components.len(),
         "capture_safe_components": report.capture_safe_components.len(),
@@ -558,6 +582,7 @@ fn report_json(
             "logical_buffers": arena.logical_buffers().len(),
             "peak_by_epoch": peak_by_epoch,
         },
+        "physical_memory": physical_memory,
         "transcript_segments": report.transcript_segments,
         "manifest_policy": format!("{:?}", report.manifest_policy),
         "runtime_policy": {
@@ -574,9 +599,10 @@ fn report_json(
         },
         "vram_budget_gib": vram_budget_gb,
         "vram_budget_bytes": budget_bytes,
-        "vram_fit": total_bytes <= budget_bytes,
-        "caveat": "arena bytes only; excludes the shared twiddle tree, CUDA context, \
-                   and allocator overhead",
+        "arena_vram_fit": total_bytes <= budget_bytes,
+        "vram_fit": physical_admission_complete && physical_admission_pass,
+        "caveat": "vram_fit fails closed until the physical ledger includes the CUDA context, \
+                   modules, graph metadata, allocator slack, profiling overhead, and safety reserve",
     })
 }
 
@@ -642,81 +668,5 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::{
-        budget_bytes_of, missing_aot_kernels, parse_vram_budget_gb, verdict, AotKernelOccurrence,
-        AotManifestKernel, GIB, WORD_BYTES,
-    };
-
-    #[test]
-    fn budget_bytes_is_gib_scaled() {
-        assert_eq!(budget_bytes_of(1.0), 1024 * 1024 * 1024);
-        assert_eq!(budget_bytes_of(79.0), 79 * 1024 * 1024 * 1024);
-        assert_eq!(budget_bytes_of(0.5), 512 * 1024 * 1024);
-    }
-
-    #[test]
-    fn vram_budget_requires_a_positive_finite_number() {
-        assert_eq!(parse_vram_budget_gb(None), Ok(79.0));
-        assert_eq!(parse_vram_budget_gb(Some("76")), Ok(76.0));
-        assert_eq!(budget_bytes_of(76.0), 76 * 1024 * 1024 * 1024);
-        for invalid in ["0", "-1", "NaN", "inf"] {
-            assert!(
-                parse_vram_budget_gb(Some(invalid)).is_err(),
-                "accepted invalid budget {invalid}"
-            );
-        }
-    }
-
-    #[test]
-    fn word_bytes_and_gib_are_the_arena_units() {
-        assert_eq!(WORD_BYTES, 4);
-        assert_eq!(GIB, (1u64 << 30) as f64);
-    }
-
-    #[test]
-    fn verdict_requires_every_gate() {
-        // All green, at the budget boundary (inclusive).
-        assert!(verdict(true, 0, 0, 100, 100, true));
-        // Each individual failure flips the verdict.
-        assert!(!verdict(false, 0, 0, 100, 100, true));
-        assert!(!verdict(true, 1, 0, 100, 100, true));
-        assert!(!verdict(true, 0, 1, 100, 100, true));
-        assert!(!verdict(true, 0, 0, 101, 100, true));
-        assert!(!verdict(true, 0, 0, 100, 100, false));
-    }
-
-    #[test]
-    fn aot_coverage_requires_exact_launch_identity() {
-        let kernel = AotKernelOccurrence {
-            kind: "constraint",
-            component: "component".to_owned(),
-            instance: 0,
-            kernel: 0,
-            kernel_name: "kernel".to_owned(),
-            semantic_hash: 7,
-            cache_key: 11,
-        };
-        let mut manifest = BTreeMap::from([(
-            11,
-            AotManifestKernel {
-                kind: "constraint".to_owned(),
-                kernel_name: "kernel".to_owned(),
-                semantic_hash: 7,
-            },
-        )]);
-        assert!(missing_aot_kernels(&[kernel.clone()], &manifest).is_empty());
-        manifest.get_mut(&11).unwrap().semantic_hash ^= 1;
-        assert_eq!(
-            missing_aot_kernels(&[kernel.clone()], &manifest)[0].1,
-            "identity_mismatch"
-        );
-        manifest.clear();
-        assert_eq!(
-            missing_aot_kernels(&[kernel], &manifest)[0].1,
-            "missing_key"
-        );
-    }
-}
+#[path = "arena_preflight_tests.rs"]
+mod tests;

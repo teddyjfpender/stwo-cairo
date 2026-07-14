@@ -83,6 +83,7 @@ use crate::relation_execution::{
 };
 use crate::relation_table::CAIRO_RELATION_GRAPH;
 use crate::schedule::{InputEdge, TraceColumnCount, WitnessWriterKind};
+use crate::source_ownership::LateCoefficientOwnershipPlan;
 use crate::transcript_plan::{CairoTranscriptInput, CairoTranscriptOutput};
 
 /// Every arena range is at least 128-byte aligned. Kernel code may rely on this.
@@ -337,6 +338,7 @@ pub enum BufferPurpose {
     FriFinalDegreeError,
     PowBestNonce,
     PowCompletedBlocks,
+    PowPrefixDigest,
     /// Eight split M31 coefficient columns committed as the composition tree.
     CompositionCoefficients,
     RelationDescriptors,
@@ -2356,9 +2358,11 @@ struct LogicalFinalFriPowWorkspace {
     interaction_pow_bits: u32,
     interaction_pow_best_nonce: LogicalBufferId,
     interaction_pow_completed_blocks: LogicalBufferId,
+    interaction_pow_prefix_digest: LogicalBufferId,
     query_pow_bits: u32,
     query_pow_best_nonce: LogicalBufferId,
     query_pow_completed_blocks: LogicalBufferId,
+    query_pow_prefix_digest: LogicalBufferId,
 }
 
 #[derive(Clone, Debug)]
@@ -3027,6 +3031,7 @@ pub struct ProofArenaPlan {
     bindings: Vec<ArenaBinding>,
     layout: ArenaLayout,
     high_water_words: Vec<(ProofEpoch, usize)>,
+    late_coefficient_ownership: LateCoefficientOwnershipPlan,
     preprocessed: PlannedPreprocessedWorkspace,
     commitments: Vec<PlannedCommitment>,
     composition: PlannedCompositionWorkspace,
@@ -3113,6 +3118,8 @@ impl ProofArenaPlan {
                     .map(move |ordinal| (source.batch.component, source.part, ordinal))
             })
             .collect::<HashSet<_>>();
+        let late_coefficient_ownership = LateCoefficientOwnershipPlan::compile(protocol)
+            .map_err(ArenaPlanError::InvalidProtocolGeometry)?;
         let mut logical = Vec::new();
         let mut transition_aliases = Vec::new();
         for component in &plan.components {
@@ -3145,6 +3152,12 @@ impl ProofArenaPlan {
                             BufferLifetime::at(ProofEpoch::Witness)
                         },
                     )?;
+                    let coefficient_source = OpenedColumnSource::Trace {
+                        component: component.node.id,
+                        part: part.part,
+                        purpose: BufferPurpose::BaseCoefficients,
+                        ordinal,
+                    };
                     let coefficients = push_buffer_id(
                         &mut logical,
                         Some(component.node.id),
@@ -3152,7 +3165,12 @@ impl ProofArenaPlan {
                         BufferPurpose::BaseCoefficients,
                         ordinal,
                         trace_words,
-                        BufferLifetime::new(ProofEpoch::BaseCommit, ProofEpoch::Decommit)?,
+                        BufferLifetime::new(
+                            ProofEpoch::BaseCommit,
+                            late_coefficient_ownership
+                                .final_consumer(coefficient_source)
+                                .map_err(ArenaPlanError::InvalidProtocolGeometry)?,
+                        )?,
                     )?;
                     if !retained {
                         transition_aliases.push((evaluations, coefficients));
@@ -3193,6 +3211,12 @@ impl ProofArenaPlan {
                             trace_words,
                             BufferLifetime::at(ProofEpoch::Interaction),
                         )?;
+                        let coefficient_source = OpenedColumnSource::Trace {
+                            component: component.node.id,
+                            part: part.part,
+                            purpose: BufferPurpose::InteractionCoefficients,
+                            ordinal,
+                        };
                         let coefficients = push_buffer_id(
                             &mut logical,
                             Some(component.node.id),
@@ -3202,7 +3226,9 @@ impl ProofArenaPlan {
                             trace_words,
                             BufferLifetime::new(
                                 ProofEpoch::InteractionCommit,
-                                ProofEpoch::Decommit,
+                                late_coefficient_ownership
+                                    .final_consumer(coefficient_source)
+                                    .map_err(ArenaPlanError::InvalidProtocolGeometry)?,
                             )?,
                         )?;
                         transition_aliases.push((evaluations, coefficients));
@@ -3215,8 +3241,12 @@ impl ProofArenaPlan {
             .transpose()?;
         let logical_witness =
             append_witness_buffers(&mut logical, plan, logical_execution_tables.is_some())?;
-        let logical_relation =
-            append_relation_buffers(&mut logical, relation_execution, &mut transition_aliases)?;
+        let logical_relation = append_relation_buffers(
+            &mut logical,
+            relation_execution,
+            &late_coefficient_ownership,
+            &mut transition_aliases,
+        )?;
         let multiplicity_plan = logical_execution_tables
             .is_some()
             .then(|| plan_graph_a_multiplicities(plan).map_err(ArenaPlanError::MultiplicityPlan))
@@ -3244,6 +3274,7 @@ impl ProofArenaPlan {
             protocol,
             composition,
             retained_preprocessed_evaluations.as_ref(),
+            &late_coefficient_ownership,
         )?;
         let logical_multiplicity = if let Some(multiplicity_plan) = multiplicity_plan {
             if multiplicity_plan.fixed.is_empty() && multiplicity_plan.runtime.is_empty() {
@@ -3380,6 +3411,7 @@ impl ProofArenaPlan {
             bindings,
             layout,
             high_water_words,
+            late_coefficient_ownership,
             preprocessed,
             commitments,
             composition,
@@ -3423,6 +3455,10 @@ impl ProofArenaPlan {
 
     pub fn total_words(&self) -> usize {
         self.layout.total_words()
+    }
+
+    pub fn late_coefficient_ownership(&self) -> &LateCoefficientOwnershipPlan {
+        &self.late_coefficient_ownership
     }
 
     pub fn commitments(&self) -> &[PlannedCommitment] {
@@ -4931,7 +4967,7 @@ fn append_witness_input_compact(
         }
     }
 
-    macro_rules! push {
+    macro_rules! push_persistent {
         ($purpose:expr, $ordinal:expr, $words:expr) => {
             push_buffer_id(
                 logical,
@@ -4944,63 +4980,76 @@ fn append_witness_input_compact(
             )?
         };
     }
-    let source_pointers = push!(
+    macro_rules! push_scratch {
+        ($purpose:expr, $ordinal:expr, $words:expr) => {
+            push_buffer_id(
+                logical,
+                Some(node.id),
+                Some(part.part),
+                $purpose,
+                $ordinal,
+                $words,
+                BufferLifetime::at(ProofEpoch::Witness),
+            )?
+        };
+    }
+    let source_pointers = push_persistent!(
         BufferPurpose::WitnessInputCompactSourcePointers,
         0,
         requirements.source_pointer_words
     );
-    let descriptors = push!(
+    let descriptors = push_persistent!(
         BufferPurpose::WitnessInputCompactDescriptors,
         0,
         requirements.descriptor_words
     );
-    let output_pointers = push!(
+    let output_pointers = push_persistent!(
         BufferPurpose::WitnessInputCompactOutputPointers,
         0,
         requirements.output_pointer_words
     );
-    let tuple_scratch = push!(
+    let tuple_scratch = push_scratch!(
         BufferPurpose::WitnessInputCompactTupleScratch,
         0,
         requirements.tuple_scratch_words
     );
-    let sort_keys_a = push!(
+    let sort_keys_a = push_scratch!(
         BufferPurpose::WitnessInputCompactSortKey,
         0,
         requirements.sort_key_words
     );
-    let sort_keys_b = push!(
+    let sort_keys_b = push_scratch!(
         BufferPurpose::WitnessInputCompactSortKey,
         1,
         requirements.sort_key_words
     );
-    let sort_indices_a = push!(
+    let sort_indices_a = push_scratch!(
         BufferPurpose::WitnessInputCompactSortIndex,
         0,
         requirements.sort_index_words
     );
-    let sort_indices_b = push!(
+    let sort_indices_b = push_scratch!(
         BufferPurpose::WitnessInputCompactSortIndex,
         1,
         requirements.sort_index_words
     );
-    let run_heads = push!(
+    let run_heads = push_scratch!(
         BufferPurpose::WitnessInputCompactRunHeads,
         0,
         requirements.run_words
     );
-    let run_positions = push!(
+    let run_positions = push_scratch!(
         BufferPurpose::WitnessInputCompactRunPositions,
         0,
         requirements.run_words
     );
-    let n_unique = push!(BufferPurpose::WitnessInputCompactUniqueCount, 0, 1);
-    let sort_temp = push!(
+    let n_unique = push_scratch!(BufferPurpose::WitnessInputCompactUniqueCount, 0, 1);
+    let sort_temp = push_scratch!(
         BufferPurpose::WitnessInputCompactSortTemp,
         0,
         requirements.sort_temp_words
     );
-    let scan_temp = push!(
+    let scan_temp = push_scratch!(
         BufferPurpose::WitnessInputCompactScanTemp,
         0,
         requirements.scan_temp_words
@@ -5190,6 +5239,7 @@ fn append_witness_input_gather(
 fn append_relation_buffers(
     logical: &mut Vec<LogicalBuffer>,
     execution: RelationExecutionPlan,
+    late_coefficient_ownership: &LateCoefficientOwnershipPlan,
     transition_aliases: &mut Vec<(LogicalBufferId, LogicalBufferId)>,
 ) -> Result<LogicalRelationWorkspace, ArenaPlanError> {
     let launch_mode = CAIRO_RELATION_LAUNCH_MODE;
@@ -5421,14 +5471,26 @@ fn append_relation_buffers(
             ) {
             (0..requirement.output_coordinate_count)
                 .map(|coordinate| {
+                    let ordinal =
+                        u32::try_from(coordinate).map_err(|_| ArenaPlanError::SizeOverflow)?;
                     push_buffer_id(
                         logical,
                         Some(batch.component),
                         Some(part),
                         BufferPurpose::InteractionCoefficients,
-                        u32::try_from(coordinate).map_err(|_| ArenaPlanError::SizeOverflow)?,
+                        ordinal,
                         requirement.output_coordinate_words,
-                        BufferLifetime::new(ProofEpoch::InteractionCommit, ProofEpoch::Decommit)?,
+                        BufferLifetime::new(
+                            ProofEpoch::InteractionCommit,
+                            late_coefficient_ownership
+                                .final_consumer(OpenedColumnSource::Trace {
+                                    component: batch.component,
+                                    part,
+                                    purpose: BufferPurpose::InteractionCoefficients,
+                                    ordinal,
+                                })
+                                .map_err(ArenaPlanError::InvalidProtocolGeometry)?,
+                        )?,
                     )
                 })
                 .collect::<Result<Vec<_>, ArenaPlanError>>()?
@@ -5943,6 +6005,7 @@ fn append_protocol_buffers(
     protocol: &ProtocolGeometry,
     composition: &CompositionPlan,
     retained_preprocessed_evaluations: Option<&BTreeSet<&'static str>>,
+    late_coefficient_ownership: &LateCoefficientOwnershipPlan,
 ) -> Result<
     (
         LogicalPreprocessedWorkspace,
@@ -6820,6 +6883,15 @@ fn append_protocol_buffers(
         pow_requirements.completed_blocks_words,
         BufferLifetime::at(ProofEpoch::BaseCommit),
     )?;
+    let interaction_pow_prefix_digest = push_buffer_id(
+        logical,
+        None,
+        None,
+        BufferPurpose::PowPrefixDigest,
+        0,
+        pow_requirements.prefix_digest_words,
+        BufferLifetime::at(ProofEpoch::BaseCommit),
+    )?;
     let query_pow_best_nonce = push_buffer_id(
         logical,
         None,
@@ -6838,6 +6910,15 @@ fn append_protocol_buffers(
         pow_requirements.completed_blocks_words,
         BufferLifetime::at(ProofEpoch::Fri),
     )?;
+    let query_pow_prefix_digest = push_buffer_id(
+        logical,
+        None,
+        None,
+        BufferPurpose::PowPrefixDigest,
+        1,
+        pow_requirements.prefix_digest_words,
+        BufferLifetime::at(ProofEpoch::Fri),
+    )?;
     let logical_final_fri_pow = LogicalFinalFriPowWorkspace {
         final_requirements: final_fri_requirements,
         final_coefficients: final_fri_coefficients,
@@ -6846,9 +6927,11 @@ fn append_protocol_buffers(
         interaction_pow_bits: cairo_air::verifier::INTERACTION_POW_BITS,
         interaction_pow_best_nonce,
         interaction_pow_completed_blocks,
+        interaction_pow_prefix_digest,
         query_pow_bits: protocol.identity.pow_bits,
         query_pow_best_nonce,
         query_pow_completed_blocks,
+        query_pow_prefix_digest,
     };
     let composition_commitment = protocol
         .commitments
@@ -6873,7 +6956,12 @@ fn append_protocol_buffers(
             BufferPurpose::CompositionCoefficients,
             ordinal,
             checked_pow2(log_size)?,
-            BufferLifetime::new(ProofEpoch::Composition, ProofEpoch::Decommit)?,
+            BufferLifetime::new(
+                ProofEpoch::Composition,
+                late_coefficient_ownership
+                    .final_consumer(OpenedColumnSource::Composition { ordinal })
+                    .map_err(ArenaPlanError::InvalidProtocolGeometry)?,
+            )?,
         )?);
     }
     let composition_coefficients: [LogicalBufferId; 8] =
@@ -8375,6 +8463,7 @@ fn resolve_final_fri_pow_slots(
     let interaction_pow_slots = Blake2sPowWorkspaceSlots {
         best_nonce: physical(logical.interaction_pow_best_nonce)?,
         completed_blocks: physical(logical.interaction_pow_completed_blocks)?,
+        prefix_digest: physical(logical.interaction_pow_prefix_digest)?,
     };
     logical
         .pow_requirements
@@ -8383,6 +8472,7 @@ fn resolve_final_fri_pow_slots(
     let query_pow_slots = Blake2sPowWorkspaceSlots {
         best_nonce: physical(logical.query_pow_best_nonce)?,
         completed_blocks: physical(logical.query_pow_completed_blocks)?,
+        prefix_digest: physical(logical.query_pow_prefix_digest)?,
     };
     logical
         .pow_requirements
@@ -10130,6 +10220,40 @@ mod tests {
             "unexpected missing-tree result: {missing_fixed_tree_result:?}"
         );
         let arena = ProofArenaPlan::build(&proof, &protocol, &composition).unwrap();
+        let memory_ledger = crate::memory_ledger::PhysicalMemoryLedger::from_plan(&arena).unwrap();
+        assert_eq!(
+            memory_ledger.arena_allocation_bytes,
+            arena.total_words() * core::mem::size_of::<u32>()
+        );
+        assert_eq!(memory_ledger.epochs.len(), ProofEpoch::ALL.len());
+        let compact_scratch_purposes = [
+            BufferPurpose::WitnessInputCompactTupleScratch,
+            BufferPurpose::WitnessInputCompactSortKey,
+            BufferPurpose::WitnessInputCompactSortIndex,
+            BufferPurpose::WitnessInputCompactRunHeads,
+            BufferPurpose::WitnessInputCompactRunPositions,
+            BufferPurpose::WitnessInputCompactUniqueCount,
+            BufferPurpose::WitnessInputCompactSortTemp,
+            BufferPurpose::WitnessInputCompactScanTemp,
+        ];
+        let compact_scratch = arena
+            .logical_buffers()
+            .iter()
+            .filter(|buffer| compact_scratch_purposes.contains(&buffer.purpose))
+            .collect::<Vec<_>>();
+        assert!(!compact_scratch.is_empty());
+        assert!(compact_scratch
+            .iter()
+            .all(|buffer| { buffer.lifetime == BufferLifetime::at(ProofEpoch::Witness) }));
+        assert!(arena.logical_buffers().iter().any(|buffer| {
+            matches!(
+                buffer.purpose,
+                BufferPurpose::WitnessInputCompactSourcePointers
+                    | BufferPurpose::WitnessInputCompactDescriptors
+                    | BufferPurpose::WitnessInputCompactOutputPointers
+            ) && buffer.lifetime
+                == BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble).unwrap()
+        }));
         arena.validate_aliases().unwrap();
         assert_eq!(
             arena.protocol_key,
@@ -10611,6 +10735,21 @@ mod tests {
             BufferPurpose::CommitRetainedEvaluation
         );
         assert_eq!(retained_source_buffer.lifetime.last, ProofEpoch::Quotient);
+        let mut exclusive_late = retained_numerator.clone();
+        exclusive_late.identity.decommit_strategy = DecommitStrategy::HybridByGroup;
+        exclusive_late
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == CommitmentTreeId::Composition)
+            .unwrap()
+            .retained_evaluation_groups[0] = true;
+        let exclusive_late_arena =
+            ProofArenaPlan::build(&proof, &exclusive_late, &composition).unwrap();
+        assert!(exclusive_late_arena
+            .logical_buffers()
+            .iter()
+            .filter(|buffer| buffer.purpose == BufferPurpose::CompositionCoefficients)
+            .all(|buffer| buffer.lifetime.last == ProofEpoch::Oods));
         let mut short_source = evaluation_column.numerator_source;
         short_source.len_words -= 1;
         assert_eq!(
