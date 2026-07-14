@@ -28,9 +28,10 @@ use stwo::prover::{
     CommitmentSchemeProver, CommitmentTreeProver, ProveExWithPcsDriverError, ProvingError,
 };
 use stwo_backend_cuda::{
-    aot, assemble_blake2s_stark_proof, Blake2sProofAssemblyError, Blake2sProofAssemblyInput,
-    CudaBackend, CudaExecTelemetry, CudaPcsDriverConfig, CudaPcsDriverError,
-    CudaPcsDriverTelemetry, CudaPcsRuntimeMode, CudaRuntimeError, TranscriptMirrorReport,
+    aot, assemble_blake2s_stark_proof, cuda_device_snapshot, Blake2sProofAssemblyError,
+    Blake2sProofAssemblyInput, CudaBackend, CudaDeviceSnapshot, CudaExecTelemetry,
+    CudaPcsDriverConfig, CudaPcsDriverError, CudaPcsDriverTelemetry, CudaPcsRuntimeMode,
+    CudaRuntimeError, TranscriptMirrorReport,
 };
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_prover::prover::{ChannelHash, ProverParameters};
@@ -421,8 +422,8 @@ pub enum ChannelMode {
 
 #[derive(Clone, Copy, Debug)]
 pub struct GpuProverConfig {
-    /// CUDA device ordinal. Reserved: the backend currently binds the default
-    /// device; multi-device selection lands with the fleet work.
+    /// Logical CUDA device ordinal. Replacement-v1 currently requires one
+    /// visible device and therefore enforces ordinal zero.
     pub device: u32,
     /// VRAM ceiling driving diet mode (M4). `None` = card total.
     pub vram_budget: Option<usize>,
@@ -461,6 +462,96 @@ impl Default for GpuProverConfig {
             allow_slow_graph_submit_diagnostic: false,
         }
     }
+}
+
+const REPLACEMENT_V1_REQUIRED_ENV: &[(&str, &str)] = &[
+    ("STWO_CUDA_WITNESS_JIT_PROVE", "1"),
+    ("STWO_CUDA_WITNESS_JIT_MAX_INSTRS", "20000"),
+    ("STWO_CUDA_DEVICE_INTERACTION", "1"),
+    ("STWO_CUDA_WITNESS_EDGES", "1"),
+    ("STWO_CUDA_MEM_COUNT_FEEDS", "1"),
+    ("STWO_CUDA_STREAM_FANOUT", "1"),
+];
+
+const REPLACEMENT_V1_DEFAULT_OFF_ENV: &[&str] = &[
+    "STWO_CAIRO_LOW_MEMORY",
+    "STWO_CAIRO_STREAM_LDE",
+    "STWO_CUDA_STREAM_LEAF_COMMIT",
+    "STWO_CUDA_PIPELINED_COMMIT",
+    "STWO_DIET_REBUILD_PREPROCESSED",
+    "STWO_FORCE_EXTEND_EVAL_MODE",
+    "STWO_STORE_COEFFS",
+];
+
+fn validate_replacement_fixed_env_value(
+    name: &str,
+    observed: Option<&str>,
+    expected: &str,
+) -> Result<(), GpuError> {
+    if let Some(observed) = observed {
+        if observed != expected {
+            return Err(GpuError::Config(format!(
+                "replacement-v1 requires {name} to be unset or exactly {expected}, got {observed:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_replacement_fixed_environment() -> Result<(), GpuError> {
+    if flags::GPU_NATIVE_DEFAULTS != REPLACEMENT_V1_REQUIRED_ENV {
+        return Err(GpuError::Config(
+            "replacement-v1 required environment no longer matches GPU_NATIVE_DEFAULTS".to_string(),
+        ));
+    }
+    for &(name, expected) in REPLACEMENT_V1_REQUIRED_ENV {
+        validate_replacement_fixed_environment_value(name, expected)?;
+    }
+    for &name in REPLACEMENT_V1_DEFAULT_OFF_ENV {
+        validate_replacement_fixed_environment_value(name, "0")?;
+    }
+    Ok(())
+}
+
+fn validate_replacement_fixed_environment_value(
+    name: &str,
+    expected: &str,
+) -> Result<(), GpuError> {
+    match std::env::var(name) {
+        Ok(observed) => validate_replacement_fixed_env_value(name, Some(&observed), expected),
+        Err(std::env::VarError::NotPresent) => {
+            validate_replacement_fixed_env_value(name, None, expected)
+        }
+        Err(std::env::VarError::NotUnicode(_)) => Err(GpuError::Config(format!(
+            "replacement-v1 requires {name} to be unset or valid UTF-8 equal to {expected}"
+        ))),
+    }
+}
+
+fn validate_replacement_device_admission(
+    configured: u32,
+    snapshot: CudaDeviceSnapshot,
+    aot_arch_supported: bool,
+) -> Result<(), GpuError> {
+    if snapshot.count != 1 {
+        return Err(GpuError::Config(format!(
+            "replacement-v1 requires exactly one CUDA-visible device, found {}",
+            snapshot.count
+        )));
+    }
+    if configured != 0 || snapshot.current != 0 {
+        return Err(GpuError::Config(format!(
+            "replacement-v1 requires configured and current CUDA ordinals to both be 0, got configured={configured} current={}",
+            snapshot.current
+        )));
+    }
+    if !aot_arch_supported {
+        return Err(GpuError::Config(format!(
+            "replacement-v1 AOT pack does not support sm_{}{}",
+            snapshot.sm_major, snapshot.sm_minor
+        )));
+    }
+    Ok(())
 }
 
 /// Persistent per-device prover context (design §3.2): caches that outlive a proof
@@ -519,7 +610,9 @@ where
             ));
         }
         if config.resident_backend == ResidentBackend::ReplacementV1 {
+            validate_replacement_fixed_environment()?;
             for name in [
+                "PREPROCESSED_TRACE_GPU_GENERATE",
                 "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES",
                 "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
                 "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE",
@@ -537,6 +630,16 @@ where
                     )));
                 }
             }
+            crate::flags::apply_gpu_native_defaults();
+            // The second check is the construction postcondition and makes a
+            // later construction accept precisely the state installed above.
+            validate_replacement_fixed_environment()?;
+            let device = cuda_device_snapshot()?;
+            validate_replacement_device_admission(
+                config.device,
+                device,
+                aot::supports_arch(device.sm_major, device.sm_minor),
+            )?;
         }
         if config.strict {
             if std::env::var("STWO_CUDA_PCS_REFERENCE").as_deref() == Ok("1") {
@@ -563,7 +666,9 @@ where
         let witness_artifact_plan = Arc::new(CAIRO_SCHEDULE.artifact_plan()?);
         // The gpu-native engine defaults to the composed device configuration
         // (explicit env, including =0 kill switches, always wins) — design §3.
-        crate::flags::apply_gpu_native_defaults();
+        if config.resident_backend != ResidentBackend::ReplacementV1 {
+            crate::flags::apply_gpu_native_defaults();
+        }
         let resident_protocol_policy = config
             .strict
             .then(|| ProtocolPlanPolicy::loaded_starknet_blake2s_for(config.resident_backend))
@@ -588,6 +693,13 @@ where
 
     pub fn config(&self) -> &GpuProverConfig {
         &self.config
+    }
+
+    fn require_replacement_runtime_environment(&self) -> Result<(), GpuError> {
+        if self.config.resident_backend == ResidentBackend::ReplacementV1 {
+            validate_replacement_fixed_environment()?;
+        }
+        Ok(())
     }
 
     pub fn last_pcs_telemetry(&self) -> Option<&CudaPcsDriverTelemetry> {
@@ -675,6 +787,7 @@ where
             ResidentSessionArtifacts<'_>,
         ) -> Result<R, ResidentRuntimeError>,
     ) -> Result<(R, ResidentSessionTelemetry), GpuError> {
+        self.require_replacement_runtime_environment()?;
         if !self.config.strict {
             return Err(GpuError::Config(
                 "resident session entrypoint requires strict GPU-native mode".to_string(),
@@ -732,6 +845,7 @@ where
             ResidentSessionArtifacts<'_>,
         ) -> Result<R, ResidentRuntimeError>,
     ) -> Result<(R, ResidentSessionTelemetry), GpuError> {
+        self.require_replacement_runtime_environment()?;
         if !self.config.strict {
             return Err(GpuError::Config(
                 "resident session entrypoint requires strict GPU-native mode".to_string(),
@@ -807,6 +921,7 @@ where
         params: ProverParameters,
         pcs_driver_config: &mut CudaPcsDriverConfig<'_>,
     ) -> Result<CairoProof<MC::H>, GpuError> {
+        self.require_replacement_runtime_environment()?;
         if self.config.strict && pcs_driver_config.runtime_mode() != CudaPcsRuntimeMode::ArenaGraph
         {
             return Err(GpuError::Config(
@@ -1323,6 +1438,60 @@ mod resident_transcript_mirror_tests {
             output_words_verified: 41,
             final_digest: Blake2sHash::default(),
             final_n_draws: 9,
+        }
+    }
+
+    fn device(count: u32, current: u32) -> CudaDeviceSnapshot {
+        CudaDeviceSnapshot {
+            count,
+            current,
+            sm_major: 9,
+            sm_minor: 0,
+        }
+    }
+
+    #[test]
+    fn replacement_device_admission_accepts_one_visible_supported_device() {
+        validate_replacement_device_admission(0, device(1, 0), true).unwrap();
+    }
+
+    #[test]
+    fn replacement_device_admission_rejects_ambient_device_or_arch_drift() {
+        for (configured, snapshot, arch_supported) in [
+            (0, device(0, 0), true),
+            (0, device(2, 0), true),
+            (1, device(1, 0), true),
+            (0, device(1, 1), true),
+            (0, device(1, 0), false),
+        ] {
+            assert!(
+                validate_replacement_device_admission(configured, snapshot, arch_supported)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_fixed_ambient_accepts_first_and_repeated_construction_states() {
+        assert_eq!(flags::GPU_NATIVE_DEFAULTS, REPLACEMENT_V1_REQUIRED_ENV);
+        for &(name, expected) in REPLACEMENT_V1_REQUIRED_ENV {
+            validate_replacement_fixed_env_value(name, None, expected).unwrap();
+            validate_replacement_fixed_env_value(name, Some(expected), expected).unwrap();
+        }
+        for &name in REPLACEMENT_V1_DEFAULT_OFF_ENV {
+            validate_replacement_fixed_env_value(name, None, "0").unwrap();
+            validate_replacement_fixed_env_value(name, Some("0"), "0").unwrap();
+        }
+    }
+
+    #[test]
+    fn replacement_fixed_ambient_rejects_required_on_and_default_off_drift() {
+        for &(name, expected) in REPLACEMENT_V1_REQUIRED_ENV {
+            let drift = if expected == "1" { "0" } else { "19999" };
+            assert!(validate_replacement_fixed_env_value(name, Some(drift), expected).is_err());
+        }
+        for &name in REPLACEMENT_V1_DEFAULT_OFF_ENV {
+            assert!(validate_replacement_fixed_env_value(name, Some("1"), "0").is_err());
         }
     }
 

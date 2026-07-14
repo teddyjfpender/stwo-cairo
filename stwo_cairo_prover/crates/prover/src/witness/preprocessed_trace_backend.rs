@@ -128,10 +128,11 @@ pub struct CudaPreprocessedColumnStreamer {
 }
 
 impl CudaPreprocessedColumnStreamer {
-    pub fn new() -> Self {
+    /// Fixed resident source lane. Legacy whole-trace generation keeps its env
+    /// switch above; immutable resident backends never consult it after sealing.
+    pub fn gpu_preferred() -> Self {
         Self {
-            gpu_generate: stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT
-                && std::env::var("PREPROCESSED_TRACE_GPU_GENERATE").as_deref() != Ok("0"),
+            gpu_generate: stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT,
         }
     }
 

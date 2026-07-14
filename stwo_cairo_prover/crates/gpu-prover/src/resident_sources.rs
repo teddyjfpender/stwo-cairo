@@ -854,7 +854,7 @@ pub fn stage_preprocessed_commitment(
         stage_sources.push(stage_source);
     }
 
-    let mut streamer = CudaPreprocessedColumnStreamer::new();
+    let mut streamer = CudaPreprocessedColumnStreamer::gpu_preferred();
     let mut source_sync_calls = 0usize;
     for (index, source) in trace.columns.iter().enumerate() {
         let column = &planned.columns[index];
