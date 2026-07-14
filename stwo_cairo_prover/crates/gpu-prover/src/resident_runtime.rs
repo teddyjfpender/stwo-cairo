@@ -201,7 +201,6 @@ struct ResidentProofBundleSources {
     fri_commitments: Vec<ArenaSlice>,
     final_line_poly: ArenaSlice,
     query_pow: ArenaSlice,
-    decommitment: ArenaSlice,
 }
 
 pub struct ResidentWitnessInput<'a> {
@@ -1692,29 +1691,40 @@ impl<'a> ResidentGraphRuntime<'a> {
             &fixed_preprocessed_retained_layers,
             &fri,
         )?;
-        let decommit = PreparedDecommitGraph::prepare(
+        let proof_bundle = bind_arena_binding(arena, decommit_plan.proof_bundle)?;
+        let direct_decommitment = decommit_plan
+            .proof_bundle_layout
+            .direct_decommitment_destination();
+        if decommit_plan.proof_bundle.len_words != decommit_plan.proof_bundle_layout.total_words
+            || proof_bundle.len_words() != decommit_plan.proof_bundle_layout.total_words
+            || direct_decommitment.len_words != decommit_plan.requirements.assembly_words
+            || direct_decommitment
+                .offset_words
+                .checked_add(direct_decommitment.len_words)
+                != Some(decommit_plan.proof_bundle_layout.total_words)
+        {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "proof bundle does not own the exact canonical decommit tail",
+            ));
+        }
+        let decommitment_destination = proof_bundle.checked_subslice(
+            direct_decommitment.offset_words,
+            direct_decommitment.len_words,
+        )?;
+        let decommit = PreparedDecommitGraph::prepare_into(
             arena,
             decommit_plan.config.clone(),
             raw_queries,
             Some(bind_arena_binding(arena, decommit_plan.lde_twiddles)?),
             &decommit_sources,
             &decommit_plan.slots,
+            decommitment_destination,
         )?;
         require_same_slice(
-            "decommit assembly does not match the planned final ABI",
+            "decommit assembly does not target the planned proof-bundle tail",
             decommit.assembly_slice(),
-            bind_arena_binding(arena, decommit_plan.assembly)?,
+            decommitment_destination,
         )?;
-        let proof_bundle = bind_arena_binding(arena, decommit_plan.proof_bundle)?;
-        if decommit_plan.proof_bundle.len_words != decommit_plan.proof_bundle_layout.total_words
-            || proof_bundle.len_words() < decommit_plan.proof_bundle_layout.total_words
-        {
-            return Err(ResidentRuntimeError::TranscriptBindingTooSmall {
-                role: "resident proof bundle",
-                required_words: decommit_plan.proof_bundle_layout.total_words,
-                actual_words: proof_bundle.len_words(),
-            });
-        }
         let fri_rounds = fri.round_count();
 
         let runtime = Self {
@@ -3381,7 +3391,6 @@ impl<'a> ResidentGraphRuntime<'a> {
             fri_commitments,
             final_line_poly: self.fri_final.transcript_destination(),
             query_pow: self.query_pow.nonce_destination(),
-            decommitment: self.decommit.assembly_slice(),
         })
     }
 
@@ -3412,9 +3421,8 @@ impl<'a> ResidentGraphRuntime<'a> {
         )?)
     }
 
-    /// Resident compact decommit ABI. The production final-bundle copier must
-    /// include this slice in its one D2H transfer instead of calling the
-    /// standalone read helper below.
+    /// Resident compact decommit ABI. This is the final typed range of the
+    /// proof bundle itself; no assembly-to-bundle copy exists.
     pub fn decommit_assembly_slice(&self) -> ArenaSlice {
         self.decommit.assembly_slice()
     }
@@ -3424,7 +3432,7 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     /// Migration/test boundary. Production proof assembly uses the single
-    /// proof-bundle D2H and then calls `DecommitAssembly::decode` on its prefix.
+    /// proof-bundle D2H and decodes this canonical tail in place.
     pub fn read_decommit_assembly_once(&self) -> Result<DecommitAssembly, ResidentRuntimeError> {
         Ok(self.decommit.read_assembly_once()?)
     }
@@ -3715,9 +3723,10 @@ fn enqueue_proof_bundle(
     destination: ArenaSlice,
     layout: &ResidentProofBundleLayout,
 ) -> Result<(), ResidentLaunchError> {
-    if destination.len_words() < layout.total_words
+    if destination.len_words() != layout.total_words
         || layout.commitments.len() != sources.commitments.len() * 8
         || layout.fri_commitments.len() != sources.fri_commitments.len() * 8
+        || !proof_bundle_layout_is_canonical(layout)
     {
         return Err(ResidentLaunchError::Binding("resident proof bundle layout"));
     }
@@ -3763,14 +3772,28 @@ fn enqueue_proof_bundle(
         destination,
         layout.query_pow.start,
         layout.query_pow.len(),
-    )?;
-    enqueue_bundle_range(
-        arena,
-        sources.decommitment,
-        destination,
-        layout.decommitment.start,
-        layout.decommitment.len(),
     )
+}
+
+fn proof_bundle_layout_is_canonical(layout: &ResidentProofBundleLayout) -> bool {
+    let ranges = [
+        &layout.commitments,
+        &layout.interaction_claim,
+        &layout.interaction_pow,
+        &layout.sampled_values,
+        &layout.fri_commitments,
+        &layout.final_line_poly,
+        &layout.query_pow,
+        &layout.decommitment,
+    ];
+    let mut cursor = 0;
+    for range in ranges {
+        if range.start != cursor || range.end < range.start {
+            return false;
+        }
+        cursor = range.end;
+    }
+    cursor == layout.total_words && !layout.decommitment.is_empty()
 }
 
 fn enqueue_bundle_range(
@@ -4319,6 +4342,156 @@ mod tests {
         assert_eq!(budget.expected_graph_launches, 29);
         assert_eq!(budget.expected_kernel_launches, Some(123));
         assert_eq!(budget.expected_d2h_bytes, 371_604);
+    }
+
+    #[test]
+    fn proof_bundle_copy_rejects_noncanonical_ranges_before_launch() {
+        let mut layout = ResidentProofBundleLayout::new(4, 4, 1, 4, 32).unwrap();
+        assert!(proof_bundle_layout_is_canonical(&layout));
+        layout.sampled_values.start -= 1;
+        assert!(!proof_bundle_layout_is_canonical(&layout));
+    }
+
+    /// Native contract for the production tail topology. The decommit producer
+    /// writes the exact final bundle range on the proof stream; the gather then
+    /// copies only the prefix. Eager and captured execution must return the
+    /// same whole device bundle and the eager telemetry must contain no tail
+    /// D2D copy.
+    #[cfg(stwo_cuda_link)]
+    #[test]
+    fn direct_decommit_tail_matches_eager_and_graph_whole_bundle() {
+        use stwo_backend_cuda::{ArenaLayout, ArenaSlotSpec, CudaExecContext, DeviceArena};
+
+        const SOURCE: ArenaSlotId = ArenaSlotId(1);
+        const DESTINATION: ArenaSlotId = ArenaSlotId(2);
+        const TAIL_BYTE: u8 = 0xa5;
+
+        let layout = ResidentProofBundleLayout::new(4, 4, 1, 4, 32).unwrap();
+        let bundle_words = layout.total_words;
+        let arena_layout = ArenaLayout::new(
+            bundle_words * 2,
+            &[
+                ArenaSlotSpec {
+                    id: SOURCE,
+                    offset_words: 0,
+                    len_words: bundle_words,
+                    alignment_words: 1,
+                },
+                ArenaSlotSpec {
+                    id: DESTINATION,
+                    offset_words: bundle_words,
+                    len_words: bundle_words,
+                    alignment_words: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let arena = DeviceArena::new(CudaExecContext::new().unwrap(), arena_layout).unwrap();
+        let source = arena.bind(SOURCE).unwrap();
+        let destination = arena.bind(DESTINATION).unwrap();
+        let decommitment = layout.direct_decommitment_destination();
+        let direct_tail = destination
+            .checked_subslice(decommitment.offset_words, decommitment.len_words)
+            .unwrap();
+
+        let mut source_words = (0..bundle_words)
+            .map(|index| 0x1000_0000_u32.wrapping_add(index as u32))
+            .collect::<Vec<_>>();
+        source_words[layout.decommitment.clone()].fill(0xdead_beef);
+        let mut expected = source_words.clone();
+        expected[layout.decommitment.clone()].fill(u32::from_ne_bytes([TAIL_BYTE; 4]));
+        unsafe {
+            arena
+                .context()
+                .memcpy_h2d_async(
+                    source.as_void_ptr(),
+                    source_words.as_ptr().cast(),
+                    source.len_bytes(),
+                )
+                .unwrap();
+            arena
+                .context()
+                .memset_async(destination.as_void_ptr(), 0, destination.len_bytes())
+                .unwrap();
+        }
+        arena.context().sync().unwrap();
+
+        let section = |range: &core::ops::Range<usize>| {
+            source.checked_subslice(range.start, range.len()).unwrap()
+        };
+        let sources = ResidentProofBundleSources {
+            commitments: std::array::from_fn(|index| {
+                source
+                    .checked_subslice(layout.commitments.start + index * 8, 8)
+                    .unwrap()
+            }),
+            interaction_claim: section(&layout.interaction_claim),
+            interaction_pow: section(&layout.interaction_pow),
+            sampled_values: section(&layout.sampled_values),
+            fri_commitments: vec![section(&layout.fri_commitments)],
+            final_line_poly: section(&layout.final_line_poly),
+            query_pow: section(&layout.query_pow),
+        };
+        let enqueue = || -> Result<(), ResidentLaunchError> {
+            unsafe {
+                arena
+                    .context()
+                    .memset_async(
+                        direct_tail.as_void_ptr(),
+                        TAIL_BYTE,
+                        direct_tail.len_bytes(),
+                    )
+                    .map_err(ResidentLaunchError::Cuda)?;
+            }
+            enqueue_proof_bundle(&arena, &sources, destination, &layout)
+        };
+
+        arena.context().reset_telemetry();
+        enqueue().unwrap();
+        let mut eager = vec![0_u32; bundle_words];
+        unsafe {
+            arena
+                .context()
+                .memcpy_d2h_async(
+                    eager.as_mut_ptr().cast(),
+                    destination.as_void_ptr().cast_const(),
+                    destination.len_bytes(),
+                )
+                .unwrap();
+        }
+        arena.context().sync().unwrap();
+        assert_eq!(eager, expected);
+        assert_eq!(
+            arena.context().telemetry().d2d_bytes,
+            ((bundle_words - decommitment.len_words) * core::mem::size_of::<u32>()) as u64,
+            "the bundle gather must copy the prefix only"
+        );
+
+        unsafe {
+            arena
+                .context()
+                .memset_async(destination.as_void_ptr(), 0, destination.len_bytes())
+                .unwrap();
+        }
+        arena.context().sync().unwrap();
+        let capture = arena.context().capture().unwrap();
+        enqueue().unwrap();
+        let graph = capture.finish().unwrap();
+        graph.launch(arena.context()).unwrap();
+        let mut captured = vec![0_u32; bundle_words];
+        unsafe {
+            arena
+                .context()
+                .memcpy_d2h_async(
+                    captured.as_mut_ptr().cast(),
+                    destination.as_void_ptr().cast_const(),
+                    destination.len_bytes(),
+                )
+                .unwrap();
+        }
+        arena.context().sync().unwrap();
+        assert_eq!(captured, expected);
+        assert_eq!(captured, eager);
     }
 
     #[test]

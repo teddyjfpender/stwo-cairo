@@ -383,7 +383,6 @@ pub enum BufferPurpose {
     DecommitSparseIndices,
     DecommitSparseHashes,
     DecommitCounts,
-    DecommitAssembly,
     DecommitTraceRetainedPointers,
     DecommitTraceSparseOffsets,
     DecommitTraceEvaluationPointers,
@@ -2497,7 +2496,6 @@ struct LogicalDecommitWorkspace {
     sparse_hashes: LogicalBufferId,
     counts: LogicalBufferId,
     values: LogicalBufferId,
-    assembly: LogicalBufferId,
     proof_bundle_layout: ResidentProofBundleLayout,
     proof_bundle: LogicalBufferId,
     trees: Vec<LogicalDecommitTreeSlots>,
@@ -3078,7 +3076,6 @@ pub struct PlannedDecommitWorkspace {
     pub raw_queries: ArenaBinding,
     pub lde_twiddles: ArenaBinding,
     pub slots: DecommitWorkspaceSlots,
-    pub assembly: ArenaBinding,
     pub proof_bundle_layout: ResidentProofBundleLayout,
     pub proof_bundle: ArenaBinding,
 }
@@ -7673,7 +7670,10 @@ fn append_decommit_buffers(
     .map_err(ArenaPlanError::ProofBundle)?;
     let scratch = BufferLifetime::at(ProofEpoch::Decommit);
     let descriptor = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble)?;
-    let assembly_live = BufferLifetime::new(ProofEpoch::Decommit, ProofEpoch::Assemble)?;
+    // The proof bundle itself owns the decommit assembly tail. It becomes live
+    // before the first decommit write and stays live through final assembly;
+    // no second logical buffer or cross-buffer alias is admitted.
+    let bundle_live = BufferLifetime::new(ProofEpoch::Decommit, ProofEpoch::Assemble)?;
     let mut allocate = |purpose, ordinal, words, lifetime| {
         push_buffer_id(logical, None, None, purpose, ordinal, words, lifetime)
     };
@@ -7731,17 +7731,11 @@ fn append_decommit_buffers(
         requirements.value_words,
         scratch,
     )?;
-    let assembly = allocate(
-        BufferPurpose::DecommitAssembly,
-        0,
-        requirements.assembly_words,
-        assembly_live,
-    )?;
     let proof_bundle = allocate(
         BufferPurpose::ProofBytes,
         0,
         proof_bundle_layout.total_words,
-        assembly_live,
+        bundle_live,
     )?;
     let shared_lde_tile = requirements
         .trees
@@ -7883,7 +7877,6 @@ fn append_decommit_buffers(
         sparse_hashes,
         counts,
         values,
-        assembly,
         proof_bundle_layout,
         proof_bundle,
         trees,
@@ -8676,6 +8669,21 @@ fn resolve_decommit_slots(
 ) -> Result<PlannedDecommitWorkspace, ArenaPlanError> {
     let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
+    let proof_bundle = binding(logical.proof_bundle)?;
+    let decommitment = logical
+        .proof_bundle_layout
+        .direct_decommitment_destination();
+    if proof_bundle.len_words != logical.proof_bundle_layout.total_words
+        || decommitment.len_words != logical.requirements.assembly_words
+        || decommitment
+            .offset_words
+            .checked_add(decommitment.len_words)
+            != Some(logical.proof_bundle_layout.total_words)
+    {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "proof bundle direct decommit range is not the exact canonical tail",
+        ));
+    }
     let trees = logical
         .trees
         .into_iter()
@@ -8722,7 +8730,10 @@ fn resolve_decommit_slots(
         sparse_hashes: physical(logical.sparse_hashes)?,
         counts: physical(logical.counts)?,
         values: physical(logical.values)?,
-        assembly: physical(logical.assembly)?,
+        // The proof bundle owns the exact final decommit range. Giving the
+        // prepared tail this physical identity makes aliasing explicit while
+        // the typed subrange below preserves its canonical byte offset.
+        assembly: proof_bundle.physical,
         trees,
     };
     let slot_requirements = logical
@@ -8747,22 +8758,6 @@ fn resolve_decommit_slots(
             ));
         }
     }
-    let assembly = binding(logical.assembly)?;
-    if assembly.physical != slots.assembly
-        || assembly.len_words < logical.requirements.assembly_words
-    {
-        return Err(ArenaPlanError::InvalidProtocolGeometry(
-            "decommit assembly binding disagrees with its exact workspace",
-        ));
-    }
-    let proof_bundle = binding(logical.proof_bundle)?;
-    if proof_bundle.len_words != logical.proof_bundle_layout.total_words
-        || proof_bundle.physical == assembly.physical
-    {
-        return Err(ArenaPlanError::InvalidProtocolGeometry(
-            "proof bundle binding is not exact or aliases decommit assembly",
-        ));
-    }
     Ok(PlannedDecommitWorkspace {
         config: logical.config,
         requirements: logical.requirements,
@@ -8770,7 +8765,6 @@ fn resolve_decommit_slots(
         raw_queries,
         lde_twiddles,
         slots,
-        assembly,
         proof_bundle_layout: logical.proof_bundle_layout,
         proof_bundle,
     })
@@ -11326,6 +11320,48 @@ mod tests {
         assert_eq!(arena.decommit().requirements.trees.len(), 29);
         assert_eq!(arena.decommit().proof_shape.trace_trees.len(), 4);
         assert_eq!(arena.decommit().proof_shape.fri_trees.len(), 25);
+        let decommitment = arena
+            .decommit()
+            .proof_bundle_layout
+            .direct_decommitment_destination();
+        assert_eq!(
+            arena.decommit().slots.assembly,
+            arena.decommit().proof_bundle.physical,
+            "the decommit producer must own the proof bundle's physical identity"
+        );
+        assert_eq!(
+            decommitment.len_words,
+            arena.decommit().requirements.assembly_words
+        );
+        assert_eq!(
+            decommitment
+                .offset_words
+                .checked_add(decommitment.len_words),
+            Some(arena.decommit().proof_bundle_layout.total_words),
+            "decommitment must remain the canonical final proof-bundle range"
+        );
+        let proof_bundle = arena
+            .logical_buffers()
+            .iter()
+            .find(|buffer| buffer.purpose == BufferPurpose::ProofBytes)
+            .unwrap();
+        assert_eq!(
+            arena
+                .logical_buffers()
+                .iter()
+                .filter(|buffer| buffer.purpose == BufferPurpose::ProofBytes)
+                .count(),
+            1,
+            "one proof bundle must be the sole final assembly owner"
+        );
+        assert_eq!(
+            proof_bundle.lifetime,
+            BufferLifetime::new(ProofEpoch::Decommit, ProofEpoch::Assemble).unwrap()
+        );
+        assert_eq!(
+            proof_bundle.len_words,
+            arena.decommit().proof_bundle_layout.total_words
+        );
         assert_eq!(
             arena
                 .logical_buffers()
