@@ -227,17 +227,19 @@ fn validate_protocol_identity(
 }
 
 fn validate_preflight_identity(
-    report: &ResidentPreflightReport,
     selected_backend: ResidentBackend,
+    policy: ProtocolPlanPolicy,
+    identity: ProtocolIdentity,
+    commitment_memory_policies: impl IntoIterator<Item = (u32, u32)>,
 ) -> Result<(), String> {
-    let policy = report.protocol_policy;
     validate_selected_policy(selected_backend, policy)?;
-    let identity = report.arena.protocol_identity();
     validate_protocol_identity(policy, identity)?;
-    if report.arena.commitments().iter().any(|commitment| {
-        commitment.config.unretained_bottom_layers != policy.unretained_bottom_layers
-            || commitment.config.max_fused_tail_levels != policy.max_fused_tail_levels
-    }) {
+    if commitment_memory_policies
+        .into_iter()
+        .any(|(bottom, tail)| {
+            bottom != policy.unretained_bottom_layers || tail != policy.max_fused_tail_levels
+        })
+    {
         return Err("arena commitment memory policy drifted from the selected policy".to_owned());
     }
     if identity.retained_evaluation_union_bytes > policy.retained_lde_budget_bytes {
@@ -813,7 +815,17 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Err(error) = validate_preflight_identity(&report, resident_backend) {
+    if let Err(error) = validate_preflight_identity(
+        resident_backend,
+        report.protocol_policy,
+        report.arena.protocol_identity(),
+        report.arena.commitments().iter().map(|commitment| {
+            (
+                commitment.config.unretained_bottom_layers,
+                commitment.config.max_fused_tail_levels,
+            )
+        }),
+    ) {
         return fail("protocol_identity", error);
     }
 

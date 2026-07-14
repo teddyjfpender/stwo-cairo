@@ -3,9 +3,12 @@ use std::collections::BTreeMap;
 use super::{
     admission_verdict, arena_compatibility_aliases_match, budget_bytes_of, missing_aot_kernels,
     parse_resident_backend, parse_vram_budget_gb, preflight_fit_alias_matches, protocol_key_hex,
-    runtime_policy_json, topology_digest_hex, validate_protocol_identity, validate_selected_policy,
-    verdict, AotKernelOccurrence, AotManifestKernel, GIB, WORD_BYTES,
+    runtime_policy_json, topology_digest_hex, validate_preflight_identity,
+    validate_protocol_identity, validate_selected_policy, verdict, AotKernelOccurrence,
+    AotManifestKernel, GIB, WORD_BYTES,
 };
+use stwo_cairo_gpu_prover::arena_plan::{ProtocolIdentity, ResidentBackend};
+use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
 
 #[test]
 fn budget_bytes_is_gib_scaled() {
@@ -65,7 +68,6 @@ fn resident_backend_selector_is_explicit_and_fail_closed() {
 #[test]
 fn replacement_policy_json_reports_the_exact_planned_tuple() {
     use stwo_backend_cuda::RelationLaunchMode;
-    use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
 
     let value = runtime_policy_json(
         ProtocolPlanPolicy::replacement_v1(0x1234, 2048),
@@ -94,26 +96,8 @@ fn replacement_policy_json_reports_the_exact_planned_tuple() {
     assert_eq!(value["relation_launch_mode"], "fused");
 }
 
-#[test]
-fn replacement_preflight_rejects_policy_or_identity_drift() {
-    use stwo_backend_cuda::{
-        FriFoldLaunchMode, InterpolationLaunchMode, ProgressiveCommitMode, RelationTailMode,
-        WitnessFeedLaunchMode,
-    };
-    use stwo_cairo_gpu_prover::arena_plan::{
-        DecommitStrategy, ProtocolIdentity, QuotientNumeratorSchedule,
-        QuotientNumeratorSourcePolicy, ResidentBackend,
-    };
-    use stwo_cairo_gpu_prover::direct_composition_retention::DirectCompositionRetentionMode;
-    use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
-    use stwo_cairo_gpu_prover::CompositionLaunchMode;
-
-    let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
-    assert_eq!(
-        validate_selected_policy(ResidentBackend::ReplacementV1, policy),
-        Ok(())
-    );
-    let identity = ProtocolIdentity {
+fn protocol_identity_for(policy: ProtocolPlanPolicy) -> ProtocolIdentity {
+    ProtocolIdentity {
         pow_bits: 26,
         log_blowup_factor: 1,
         log_last_layer_degree_bound: 0,
@@ -141,7 +125,34 @@ fn replacement_preflight_rejects_policy_or_identity_drift() {
         direct_composition_group_rounded_bytes: 7,
         numerator_evaluation_group_rounded_bytes: 8,
         retained_evaluation_union_bytes: 9,
+    }
+}
+
+fn commitment_memory_for(policy: ProtocolPlanPolicy) -> [(u32, u32); 1] {
+    [(
+        policy.unretained_bottom_layers,
+        policy.max_fused_tail_levels,
+    )]
+}
+
+#[test]
+fn replacement_preflight_rejects_policy_or_identity_drift() {
+    use stwo_backend_cuda::{
+        FriFoldLaunchMode, InterpolationLaunchMode, ProgressiveCommitMode, RelationTailMode,
+        WitnessFeedLaunchMode,
     };
+    use stwo_cairo_gpu_prover::arena_plan::{
+        DecommitStrategy, QuotientNumeratorSchedule, QuotientNumeratorSourcePolicy,
+    };
+    use stwo_cairo_gpu_prover::direct_composition_retention::DirectCompositionRetentionMode;
+    use stwo_cairo_gpu_prover::CompositionLaunchMode;
+
+    let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
+    assert_eq!(
+        validate_selected_policy(ResidentBackend::ReplacementV1, policy),
+        Ok(())
+    );
+    let identity = protocol_identity_for(policy);
     assert_eq!(validate_protocol_identity(policy, identity), Ok(()));
 
     let mut drifted_policy = policy;
@@ -174,6 +185,77 @@ fn replacement_preflight_rejects_policy_or_identity_drift() {
         mutate(&mut drifted);
         assert!(validate_protocol_identity(policy, drifted).is_err());
     }
+}
+
+#[test]
+fn preflight_identity_accepts_legitimate_legacy_policy() {
+    let policy = ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048);
+    assert_eq!(
+        validate_preflight_identity(
+            ResidentBackend::LegacyResident,
+            policy,
+            protocol_identity_for(policy),
+            commitment_memory_for(policy),
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn preflight_identity_rejects_selected_backend_mismatch() {
+    let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
+    let error = validate_preflight_identity(
+        ResidentBackend::LegacyResident,
+        policy,
+        protocol_identity_for(policy),
+        commitment_memory_for(policy),
+    )
+    .unwrap_err();
+    assert!(error.contains("selected resident backend legacy-resident planned as replacement-v1"));
+}
+
+#[test]
+fn preflight_identity_rejects_each_commitment_memory_drift() {
+    let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
+    for memory in [
+        [(
+            policy.unretained_bottom_layers + 1,
+            policy.max_fused_tail_levels,
+        )],
+        [(
+            policy.unretained_bottom_layers,
+            policy.max_fused_tail_levels + 1,
+        )],
+    ] {
+        assert_eq!(
+            validate_preflight_identity(
+                ResidentBackend::ReplacementV1,
+                policy,
+                protocol_identity_for(policy),
+                memory,
+            ),
+            Err("arena commitment memory policy drifted from the selected policy".to_owned())
+        );
+    }
+}
+
+#[test]
+fn preflight_identity_rejects_retained_union_budget_overflow() {
+    let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
+    let mut identity = protocol_identity_for(policy);
+    identity.retained_evaluation_union_bytes = policy.retained_lde_budget_bytes + 1;
+    assert_eq!(
+        validate_preflight_identity(
+            ResidentBackend::ReplacementV1,
+            policy,
+            identity,
+            commitment_memory_for(policy),
+        ),
+        Err(format!(
+            "arena retained-evaluation union {} exceeds selected policy budget {}",
+            identity.retained_evaluation_union_bytes, policy.retained_lde_budget_bytes
+        ))
+    );
 }
 
 #[test]
