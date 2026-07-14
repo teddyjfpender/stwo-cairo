@@ -1947,12 +1947,11 @@ mod tests {
 
     /// Host mirror of the slot validation in stwo's
     /// `PreparedWitnessInput{Gather,Seed,Compact}::prepare` and the recorded
-    /// host-column ingest: every workspace slot handed to the witness-input
-    /// kernels is `DeviceArena::bind`-ed as a WHOLE physical slot. The arena
-    /// pools disjoint-lifetime buffers into one slot sized to the largest
-    /// sharer, so the contract is CAPACITY — each slot must hold at least the
-    /// kernel-ABI requirement recomputed at runtime (the kernels touch exactly
-    /// the required extent and never the pooled surplus). Any shortfall here
+    /// host-column ingest: every workspace view handed to the witness-input
+    /// kernels is bound to its checked stable range. Disjoint-lifetime views
+    /// retain distinct identities and may reuse overlapping arena addresses,
+    /// so the contract is CAPACITY — each view must hold exactly the kernel-ABI
+    /// requirement recomputed at runtime. Any shortfall here
     /// is exactly the `SlotSizeMismatch`/`SourceRowsMismatch`/`SourceTooSmall`
     /// the H100 raises during `ResidentGraphRuntime::prepare`.
     fn assert_witness_input_slots_satisfy_prepare(arena: &ProofArenaPlan) {
