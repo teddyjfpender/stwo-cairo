@@ -485,10 +485,14 @@ checkpoint_validate_sn2() {
   aot="$(checkpoint_artifact aot_identity.json)"
   proof="$(checkpoint_artifact proof.bin)"
   out="$(checkpoint_artifact record.json)"
-  python3 - "$stdout" "$aot" "$proof" "$CHECKPOINT_SEAL" "$out" "$mode" "$reps" <<'PY'
+  python3 - "$stdout" "$aot" "$proof" "$CHECKPOINT_SEAL" "$out" "$mode" "$reps" \
+    "$CHECKPOINT_ROOT/gpu_benchmarks" <<'PY'
 import hashlib, json, math, re, sys
 
-raw_path, aot_path, proof_path, seal_path, out_path, mode, reps_text = sys.argv[1:]
+raw_path, aot_path, proof_path, seal_path, out_path, mode, reps_text, module_path = sys.argv[1:]
+sys.path.insert(0, module_path)
+from validate_replacement_v1_reuse import require_resident_reuse
+
 reps = int(reps_text)
 objects = []
 for line in open(raw_path, encoding="utf-8", errors="replace"):
@@ -533,6 +537,7 @@ require(isinstance(r.get("gpu_protocol_key"), int) and not isinstance(r["gpu_pro
 topology_digest = r.get("gpu_shape_executable_topology_digest")
 require(hex64(topology_digest) and topology_digest != "0" * 64,
         "topology digest is not a nonzero 256-bit identity")
+require_resident_reuse(r, reps)
 require(r.get("gpu_policy_retained_lde_budget_bytes") == 64 * 1024**3, "replacement-v1 LDE policy drifted")
 require(r.get("gpu_policy_commit_mode") == "domain-progressive", "replacement-v1 commit policy drifted")
 require(r.get("gpu_policy_direct_composition_retention") == "exact-native", "replacement-v1 composition retention drifted")

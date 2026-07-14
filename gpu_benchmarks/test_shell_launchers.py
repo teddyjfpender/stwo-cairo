@@ -9,11 +9,52 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from validate_replacement_v1_reuse import require_resident_reuse
+
 
 ROOT = Path(__file__).resolve().parent
 
 
 class ShellLauncherTests(unittest.TestCase):
+    def test_replacement_sn2_reuse_gate_rejects_each_mutation(self) -> None:
+        source = (
+            ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        ).read_text(encoding="utf-8")
+        validator = source.index("checkpoint_validate_sn2()")
+        valid = {
+            "gpu_shape_executable_materialization": "reused",
+            "gpu_shape_executable_cache_hits": 1,
+            "gpu_shape_executable_cache_misses": 1,
+            "gpu_shape_executable_cache_compilations": 1,
+            "gpu_shape_executable_cache_source_generation_passes": 1,
+            "gpu_shape_executable_cache_binding_recipe_compilations": 1,
+            "gpu_shape_executable_cache_capacity_rejections": 0,
+            "gpu_workspace_materialization": "reused",
+            "gpu_hot_allocations": 0,
+        }
+        require_resident_reuse(valid, 2)
+        require_resident_reuse(
+            {**valid, "gpu_shape_executable_cache_hits": 5}, 6
+        )
+        self.assertIn(
+            "from validate_replacement_v1_reuse import require_resident_reuse",
+            source[validator:],
+        )
+        self.assertIn("require_resident_reuse(r, reps)", source[validator:])
+
+        for field, expected in valid.items():
+            mutations = (
+                ("compiled", None)
+                if field == "gpu_shape_executable_materialization"
+                else ("materialized", None)
+                if field == "gpu_workspace_materialization"
+                else (expected + 1, bool(expected), None)
+            )
+            for mutation in mutations:
+                with self.subTest(field=field, mutation=mutation):
+                    with self.assertRaises(SystemExit):
+                        require_resident_reuse({**valid, field: mutation}, 2)
+
     def test_source_projection_cache_exclusions_only_cover_ignored_files(self) -> None:
         projection_files = []
         for command in (
