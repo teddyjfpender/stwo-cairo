@@ -55,6 +55,7 @@ fn same_shape_changed_statement_reuses_one_source_free_executable() {
     assert_eq!(cold.shape_executable_cache.misses, 1);
     assert_eq!(cold.shape_executable_cache.compilations, 1);
     assert_eq!(cold.shape_executable_cache.source_generation_passes, 1);
+    assert_eq!(cold.shape_executable_cache.binding_recipe_compilations, 1);
 
     let warm = plan_resident_preflight_with_cache(
         &mut cache,
@@ -85,6 +86,7 @@ fn same_shape_changed_statement_reuses_one_source_free_executable() {
     assert_eq!(warm.shape_executable_cache.hits, 1);
     assert_eq!(warm.shape_executable_cache.compilations, 1);
     assert_eq!(warm.shape_executable_cache.source_generation_passes, 1);
+    assert_eq!(warm.shape_executable_cache.binding_recipe_compilations, 1);
     assert_eq!(
         warm.shape_executable_cache.source_generation_passes
             - cold.shape_executable_cache.source_generation_passes,
@@ -165,9 +167,10 @@ fn sn2_resident_planner_profile() {
     )
     .unwrap();
     assert_eq!(cold.shape_executable_cache.source_generation_passes, 1);
+    assert_eq!(cold.shape_executable_cache.binding_recipe_compilations, 1);
 
     let mut warm_total_samples = Vec::new();
-    let mut warm_bind_samples = Vec::new();
+    let mut warm_select_and_bind_samples = Vec::new();
     for _ in 0..7 {
         let warm_start = Instant::now();
         let report = plan_resident_preflight_with_cache(
@@ -184,7 +187,9 @@ fn sn2_resident_planner_profile() {
             ShapeExecutableMaterialization::Reused
         );
         assert_eq!(report.shape_executable_cache.source_generation_passes, 1);
-        warm_bind_samples.push(report.shape_executable_control_plane_ns as f64 / 1_000_000.0);
+        assert_eq!(report.shape_executable_cache.binding_recipe_compilations, 1);
+        warm_select_and_bind_samples
+            .push(report.shape_executable_control_plane_ns as f64 / 1_000_000.0);
         warm_total_samples.push(warm_start.elapsed().as_secs_f64() * 1_000.0);
     }
     let mut uncached_ordered = uncached_samples.clone();
@@ -193,8 +198,8 @@ fn sn2_resident_planner_profile() {
     cold_compile_ordered.sort_by(f64::total_cmp);
     let mut warm_total_ordered = warm_total_samples.clone();
     warm_total_ordered.sort_by(f64::total_cmp);
-    let mut warm_bind_ordered = warm_bind_samples.clone();
-    warm_bind_ordered.sort_by(f64::total_cmp);
+    let mut warm_select_and_bind_ordered = warm_select_and_bind_samples.clone();
+    warm_select_and_bind_ordered.sort_by(f64::total_cmp);
     eprintln!("uncached_planner_ms={uncached_samples:?}");
     eprintln!(
         "uncached_planner_p50_ms={}",
@@ -210,10 +215,10 @@ fn sn2_resident_planner_profile() {
         "warm_total_p50_ms={}",
         warm_total_ordered[warm_total_ordered.len() / 2]
     );
-    eprintln!("warm_source_free_bind_ms={warm_bind_samples:?}");
+    eprintln!("warm_cache_select_and_bind_ms={warm_select_and_bind_samples:?}");
     eprintln!(
-        "warm_source_free_bind_p50_ms={}",
-        warm_bind_ordered[warm_bind_ordered.len() / 2]
+        "warm_cache_select_and_bind_p50_ms={}",
+        warm_select_and_bind_ordered[warm_select_and_bind_ordered.len() / 2]
     );
     eprintln!("shape_cache_telemetry={:?}", cache.telemetry());
 }

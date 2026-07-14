@@ -605,7 +605,13 @@ impl CairoClaim {
         TreeVec::concat_cols(log_sizes_list.into_iter())
     }
 
-    pub fn flatten_claim(&self) -> FlatClaim {
+    /// Returns the exact ordered component topology without cloning public data.
+    ///
+    /// Component identity cannot be recovered from [`Self::log_sizes`]: two
+    /// different components may contribute identical tree geometry. Cache
+    /// admission must therefore retain both the enable bitmap and the ordered
+    /// log sizes mixed into the proof transcript.
+    pub fn component_topology(&self) -> (Vec<bool>, Vec<u32>) {
         let mut component_enable_bits = vec![];
         let mut component_log_sizes = vec![];
 
@@ -1022,6 +1028,11 @@ impl CairoClaim {
             component_enable_bits.push(false);
         }
 
+        (component_enable_bits, component_log_sizes)
+    }
+
+    pub fn flatten_claim(&self) -> FlatClaim {
+        let (component_enable_bits, component_log_sizes) = self.component_topology();
         FlatClaim {
             component_enable_bits,
             component_log_sizes,

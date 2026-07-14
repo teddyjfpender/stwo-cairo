@@ -21,8 +21,8 @@ use crate::arena_plan::{
     ArenaBinding, ArenaPlanError, ExecutionTableGeometry, LogicalBuffer, ProofArenaPlan,
 };
 use crate::composition_plan::{
-    bind_cairo_composition, plan_cairo_composition, CompositionPlan, CompositionPlanError,
-    CompositionProofBindings,
+    bind_cairo_composition, compile_cairo_composition_binding_plan, plan_cairo_composition,
+    CompositionBindingPlan, CompositionPlan, CompositionPlanError, CompositionProofBindings,
 };
 use crate::plan::ProofPlan;
 use crate::protocol_discovery::{
@@ -65,6 +65,8 @@ impl From<PcsConfig> for PcsTopology {
 pub struct TopologyKey {
     shape: ProofShape,
     relation_graph_hash: u64,
+    component_enable_bits: Vec<bool>,
+    component_log_sizes: Vec<u32>,
     claim_log_sizes: Vec<Vec<u32>>,
     claim_public_data_felts: u32,
     preprocessed_trace_variant: PreProcessedTraceVariant,
@@ -87,9 +89,12 @@ impl TopologyKey {
         policy: ProtocolPlanPolicy,
     ) -> Result<Self, ShapeExecutableError> {
         let preprocessed_columns = canonical_preprocessed_columns(preprocessed_trace)?;
+        let (component_enable_bits, component_log_sizes) = claim.component_topology();
         let mut key = Self {
             shape: proof_plan.proof_shape().clone(),
             relation_graph_hash: proof_plan.relation_graph_hash,
+            component_enable_bits,
+            component_log_sizes,
             claim_log_sizes: claim.log_sizes().0,
             claim_public_data_felts: claim_public_data_felt_count(claim)?,
             preprocessed_trace_variant: preprocessed_trace.variant,
@@ -110,7 +115,7 @@ impl TopologyKey {
 
     fn compute_digest(&self) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
-        hash.update(b"stwo-cairo-shape-executable-v2\0");
+        hash.update(b"stwo-cairo-shape-executable-v3\0");
         feed_u64(&mut hash, self.relation_graph_hash);
         for component in self.shape.components() {
             feed_bytes(&mut hash, component.id.as_bytes());
@@ -155,6 +160,14 @@ impl TopologyKey {
                     feed_u64(&mut hash, bound.padded_capacity);
                 }
             }
+        }
+        feed_usize(&mut hash, self.component_enable_bits.len());
+        for &enabled in &self.component_enable_bits {
+            hash.update(&[u8::from(enabled)]);
+        }
+        feed_usize(&mut hash, self.component_log_sizes.len());
+        for &log_size in &self.component_log_sizes {
+            hash.update(&log_size.to_le_bytes());
         }
         for tree in &self.claim_log_sizes {
             feed_usize(&mut hash, tree.len());
@@ -350,6 +363,7 @@ pub struct ShapeExecutable {
     discovery: ProtocolTranscriptDiscovery,
     transcript: CairoBlake2sTranscriptPlan,
     composition: CompositionPlan,
+    composition_bindings: CompositionBindingPlan,
     arena: Arc<ProofArenaPlan>,
 }
 
@@ -381,6 +395,10 @@ impl ShapeExecutable {
     pub(crate) fn composition(&self) -> &CompositionPlan {
         &self.composition
     }
+
+    fn composition_bindings(&self) -> &CompositionBindingPlan {
+        &self.composition_bindings
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -391,6 +409,9 @@ pub struct ShapeExecutableCacheTelemetry {
     /// Cold composition-planning passes that may invoke one or more emitters.
     /// This is deliberately not presented as an emitter-call count.
     pub source_generation_passes: u64,
+    /// Cold compilations of the fail-closed statement binding recipe. A warm
+    /// cache hit must not record or lower a Cairo evaluator.
+    pub binding_recipe_compilations: u64,
     pub capacity_rejections: u64,
 }
 
@@ -457,14 +478,8 @@ impl ShapeExecutableCache {
             .find(|executable| executable.topology() == &topology)
             .cloned()
         {
-            let interaction = schema_zero_interaction_claim_for_composition(request.claim)?;
-            let bindings = bind_cairo_composition(
-                request.claim,
-                &CommonLookupElements::dummy(),
-                &interaction,
-                &request.preprocessed_trace.ids(),
-                executable.composition(),
-            )?;
+            let bindings =
+                bind_cairo_composition(request.claim, executable.composition_bindings())?;
             self.telemetry.hits += 1;
             return Ok(ShapeExecutableSelection {
                 executable,
@@ -481,10 +496,11 @@ impl ShapeExecutableCache {
             });
         }
         let executable = Arc::new(compile_shape_executable(topology, &request)?);
-        let bindings = CompositionProofBindings::from_plan(executable.composition());
+        let bindings = bind_cairo_composition(request.claim, executable.composition_bindings())?;
         self.entries.push(Arc::clone(&executable));
         self.telemetry.compilations += 1;
         self.telemetry.source_generation_passes += 1;
+        self.telemetry.binding_recipe_compilations += 1;
         Ok(ShapeExecutableSelection {
             executable,
             bindings,
@@ -537,6 +553,13 @@ fn compile_shape_executable(
         &request.preprocessed_trace.ids(),
         request.policy.composition_max_kernel_instrs,
     )?;
+    let composition_bindings = compile_cairo_composition_binding_plan(
+        request.claim,
+        &CommonLookupElements::dummy(),
+        &interaction,
+        &request.preprocessed_trace.ids(),
+        &composition,
+    )?;
     let protocol = plan_protocol_geometry(
         request.proof_plan,
         request.claim,
@@ -563,6 +586,7 @@ fn compile_shape_executable(
         discovery,
         transcript,
         composition,
+        composition_bindings,
         arena,
     })
 }

@@ -1,6 +1,8 @@
 use std::sync::OnceLock;
 
 use cairo_vm::types::layout_name::LayoutName;
+use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::qm31::SecureField;
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
 use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 
@@ -180,6 +182,68 @@ fn public_data_felt_count_separates_same_log_after_witness_topology() {
 }
 
 #[test]
+fn component_identity_separates_equal_flattened_tree_geometry() {
+    let fixture = sn2_fixture();
+    let mut base = fixture.claim.clone();
+    base.range_check_8 = None;
+    base.range_check_11 = None;
+    base.range_check_12 = None;
+    base.range_check_18 = None;
+    base.range_check_20 = None;
+    base.range_check_4_3 = None;
+    base.range_check_4_4 = None;
+    base.range_check_9_9 = None;
+    base.range_check_7_2_5 = None;
+    base.range_check_3_6_6_3 = None;
+    base.range_check_4_4_4_4 = None;
+    base.range_check_3_3_3_3_3 = None;
+    base.verify_bitwise_xor_4 = None;
+
+    let mut range_check_8 = base.clone();
+    range_check_8.range_check_8 = Some(cairo_air::components::range_check_8::Claim {});
+    let mut range_check_4_4 = base.clone();
+    range_check_4_4.range_check_4_4 = Some(cairo_air::components::range_check_4_4::Claim {});
+    let mut xor_4 = base;
+    xor_4.verify_bitwise_xor_4 = Some(cairo_air::components::verify_bitwise_xor_4::Claim {});
+
+    // These three components have identical tree geometry. The old admission
+    // identity could not distinguish them when paired with a stale ProofPlan.
+    let flattened_geometry = range_check_8.log_sizes().0;
+    assert_eq!(range_check_4_4.log_sizes().0, flattened_geometry);
+    assert_eq!(xor_4.log_sizes().0, flattened_geometry);
+
+    let (range_8_bits, range_8_logs) = range_check_8.component_topology();
+    let (range_4_4_bits, range_4_4_logs) = range_check_4_4.component_topology();
+    let (xor_4_bits, xor_4_logs) = xor_4.component_topology();
+    assert_eq!(range_8_logs, range_4_4_logs);
+    assert_eq!(range_8_logs, xor_4_logs);
+    assert_ne!(range_8_bits, range_4_4_bits);
+    assert_ne!(range_8_bits, xor_4_bits);
+    assert_ne!(range_4_4_bits, xor_4_bits);
+
+    let key = |claim| {
+        TopologyKey::new(
+            claim,
+            &fixture.proof_plan,
+            &fixture.preprocessed_trace,
+            PcsConfig::default(),
+            false,
+            None,
+            ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048),
+        )
+        .unwrap()
+    };
+    let range_8_key = key(&range_check_8);
+    let range_4_4_key = key(&range_check_4_4);
+    let xor_4_key = key(&xor_4);
+    assert_ne!(range_8_key, range_4_4_key);
+    assert_ne!(range_8_key, xor_4_key);
+    assert_ne!(range_4_4_key, xor_4_key);
+    assert_ne!(range_8_key.digest(), range_4_4_key.digest());
+    assert_ne!(range_8_key.digest(), xor_4_key.digest());
+}
+
+#[test]
 fn admission_rejects_forced_digest_and_layout_collisions() {
     let executable = sn2_executable();
     let exact = executable.workspace_admission().clone();
@@ -216,4 +280,76 @@ fn admission_rejects_forced_digest_and_layout_collisions() {
     };
     assert_ne!(layout_collision, exact);
     assert!(!layout_collision.matches_plan(executable.arena()));
+}
+
+#[test]
+fn binding_recipe_rejects_identity_span_word_and_extension_drift() {
+    let fixture = sn2_fixture();
+    let executable = sn2_executable();
+    let interaction = schema_zero_interaction_claim_for_composition(&fixture.claim).unwrap();
+    let compile = |plan: &CompositionPlan| {
+        compile_cairo_composition_binding_plan(
+            &fixture.claim,
+            &CommonLookupElements::dummy(),
+            &interaction,
+            &fixture.preprocessed_trace.ids(),
+            plan,
+        )
+    };
+
+    let mut identity = executable.composition().clone();
+    identity.components[0].component = "forged_component";
+    assert!(matches!(
+        compile(&identity),
+        Err(CompositionPlanError::BindingTopologyDrift { .. })
+    ));
+
+    let mut span = executable.composition().clone();
+    let component_with_span = span
+        .components
+        .iter()
+        .position(|component| !component.trace_locations.is_empty())
+        .unwrap();
+    span.components[component_with_span].trace_locations[0].col_end += 1;
+    assert!(matches!(
+        compile(&span),
+        Err(CompositionPlanError::BindingTopologyDrift { .. })
+    ));
+
+    let component_with_base = executable
+        .composition()
+        .components
+        .iter()
+        .position(|component| !component.base_param_values.is_empty())
+        .unwrap();
+    for extra in [false, true] {
+        let mut words = executable.composition().clone();
+        if extra {
+            words.components[component_with_base]
+                .base_param_values
+                .push(BaseField::from_u32_unchecked(17));
+        } else {
+            words.components[component_with_base]
+                .base_param_values
+                .pop();
+        }
+        assert!(matches!(
+            compile(&words),
+            Err(CompositionPlanError::BindingTopologyDrift { .. })
+        ));
+    }
+
+    let component_with_ext = executable
+        .composition()
+        .components
+        .iter()
+        .position(|component| !component.ext_param_values.is_empty())
+        .unwrap();
+    let mut extension = executable.composition().clone();
+    extension.components[component_with_ext].ext_param_values[0] +=
+        SecureField::from_u32_unchecked(1, 0, 0, 0);
+    assert!(matches!(
+        compile(&extension),
+        Err(CompositionPlanError::BindingTopologyDrift { .. })
+    ));
 }
