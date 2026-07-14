@@ -3,6 +3,7 @@ mod fri_round6;
 mod fri_round6_capture;
 mod fri_round6_index;
 mod fri_round6_io;
+mod fri_round6_proof;
 mod fri_round6_provenance;
 #[cfg(test)]
 mod fri_round6_provenance_tests;
@@ -38,6 +39,7 @@ struct Args {
     fri_round6_output_dir: Option<PathBuf>,
     fri_round6_synthetic_output_dir: Option<PathBuf>,
     fri_round6_validate_dir: Option<PathBuf>,
+    fri_round6_proof_provenance: Option<PathBuf>,
     fri_round6_provenance: Option<PathBuf>,
     fri_round6_provenance_sha256: Option<String>,
     output: Option<PathBuf>,
@@ -56,6 +58,7 @@ fn parse_args() -> Result<Args, String> {
     let mut fri_round6_output_dir = None;
     let mut fri_round6_synthetic_output_dir = None;
     let mut fri_round6_validate_dir = None;
+    let mut fri_round6_proof_provenance = None;
     let mut fri_round6_provenance = None;
     let mut fri_round6_provenance_sha256 = None;
     let mut output = None;
@@ -100,6 +103,11 @@ fn parse_args() -> Result<Args, String> {
                 args.next(),
                 "--validate-fri-round6-captured-unsealed-dir",
             )?,
+            "--preflight-fri-round6-proof" => set_path(
+                &mut fri_round6_proof_provenance,
+                args.next(),
+                "--preflight-fri-round6-proof",
+            )?,
             "--preflight-fri-round6-provenance" => set_path(
                 &mut fri_round6_provenance,
                 args.next(),
@@ -114,7 +122,7 @@ fn parse_args() -> Result<Args, String> {
             "--check" => check = true,
             "--help" | "-h" => {
                 println!(
-                    "usage:\n  stwo-gpu-lab-fixture-export --fixture PATH [--check] [--output PATH]\n  stwo-gpu-lab-fixture-export --prover-input PATH --prover-input-sha256 SHA256 --expected-exporter-sha256 SHA256 --fixture-class CLASS --fixture-index PATH --output PATH\n  stwo-gpu-lab-fixture-export --fri-round6-capture PATH --fri-round6-capture-sha256 SHA256 --expected-exporter-sha256 SHA256 --fri-round6-captured-unsealed-output-dir PATH\n  stwo-gpu-lab-fixture-export --validate-fri-round6-captured-unsealed-dir PATH --fri-round6-capture PATH --fri-round6-capture-sha256 SHA256 --expected-exporter-sha256 SHA256\n  stwo-gpu-lab-fixture-export --preflight-fri-round6-provenance PATH --fri-round6-provenance-sha256 SHA256\n  stwo-gpu-lab-fixture-export --fri-round6-synthetic-layout-output-dir PATH"
+                    "usage:\n  stwo-gpu-lab-fixture-export --fixture PATH [--check] [--output PATH]\n  stwo-gpu-lab-fixture-export --prover-input PATH --prover-input-sha256 SHA256 --expected-exporter-sha256 SHA256 --fixture-class CLASS --fixture-index PATH --output PATH\n  stwo-gpu-lab-fixture-export --fri-round6-capture PATH --fri-round6-capture-sha256 SHA256 --expected-exporter-sha256 SHA256 --fri-round6-captured-unsealed-output-dir PATH\n  stwo-gpu-lab-fixture-export --validate-fri-round6-captured-unsealed-dir PATH --fri-round6-capture PATH --fri-round6-capture-sha256 SHA256 --expected-exporter-sha256 SHA256\n  stwo-gpu-lab-fixture-export --preflight-fri-round6-provenance PATH --fri-round6-provenance-sha256 SHA256\n  stwo-gpu-lab-fixture-export --preflight-fri-round6-proof PATH --fri-round6-provenance-sha256 SHA256\n  stwo-gpu-lab-fixture-export --fri-round6-synthetic-layout-output-dir PATH"
                 );
                 process::exit(0);
             }
@@ -133,6 +141,7 @@ fn parse_args() -> Result<Args, String> {
         fri_round6_output_dir,
         fri_round6_synthetic_output_dir,
         fri_round6_validate_dir,
+        fri_round6_proof_provenance,
         fri_round6_provenance,
         fri_round6_provenance_sha256,
         output,
@@ -175,6 +184,42 @@ fn schema_version(path: &Path) -> Result<String, String> {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+    if args.fri_round6_proof_provenance.is_some() {
+        if args.fixture.is_some()
+            || args.prover_input.is_some()
+            || args.prover_input_sha256.is_some()
+            || args.expected_exporter_sha256.is_some()
+            || args.fixture_class.is_some()
+            || args.fixture_index.is_some()
+            || args.fri_round6_capture.is_some()
+            || args.fri_round6_capture_sha256.is_some()
+            || args.fri_round6_output_dir.is_some()
+            || args.fri_round6_synthetic_output_dir.is_some()
+            || args.fri_round6_validate_dir.is_some()
+            || args.fri_round6_provenance.is_some()
+            || args.output.is_some()
+            || args.check
+        {
+            return Err("FRI proof preflight is a standalone non-admission mode".into());
+        }
+        let verified = fri_round6_proof::preflight(
+            args.fri_round6_proof_provenance
+                .as_deref()
+                .ok_or("proof preflight requires --preflight-fri-round6-proof")?,
+            args.fri_round6_provenance_sha256
+                .as_deref()
+                .ok_or("proof preflight requires --fri-round6-provenance-sha256")?,
+        )?;
+        println!(
+            "{} manifest_sha256={} proof_sha256={} canonical_transport_sha256={} proof_shape_sha256={}",
+            fri_round6_proof::PROOF_PREFLIGHT_STATUS,
+            verified.manifest_sha256,
+            verified.proof_sha256,
+            verified.canonical_transport_sha256,
+            verified.proof_shape_sha256,
+        );
+        return Ok(());
+    }
     if args.fri_round6_provenance.is_some() || args.fri_round6_provenance_sha256.is_some() {
         if args.fixture.is_some()
             || args.prover_input.is_some()
@@ -187,6 +232,7 @@ fn run() -> Result<(), String> {
             || args.fri_round6_output_dir.is_some()
             || args.fri_round6_synthetic_output_dir.is_some()
             || args.fri_round6_validate_dir.is_some()
+            || args.fri_round6_proof_provenance.is_some()
             || args.output.is_some()
             || args.check
         {

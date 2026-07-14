@@ -18,13 +18,14 @@ pub const SCHEMA: &str = "stwo.gpu-lab.fri-round6-provenance.v1";
 pub const IDENTITY_PREFLIGHT_STATUS: &str = "FRI_ROUND6_PROVENANCE_IDENTITY_PREFLIGHT=PASS production_admissible=false proof_verification=pending adapter_execution_attestation=pending verifier_closure_match=pending";
 const ADAPTER_RUN_SCHEMA: &str = "stwo.gpu-lab.pie-adapter-run.v1";
 const SOURCE_CLOSURE_SCHEMA: &str = "stwo.gpu-lab.source-closure.v1";
-const PROOF_SHAPE_SCHEMA: &str = "stwo.gpu-lab.cairo-proof-shape.v1";
+pub(crate) const PROOF_SHAPE_SCHEMA: &str = "stwo.gpu-lab.cairo-proof-shape.v1";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PIE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PROVER_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PROOF_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_LOADED_PROOF_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SOURCE_FILES: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -143,10 +144,36 @@ pub struct PreflightedProvenanceInputs {
     pub proof_shape_sha256: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct SealedProofInputs {
+    pub manifest_sha256: String,
+    pub proof_bytes: Vec<u8>,
+    pub proof_sha256: String,
+    pub canonical_transport_bytes: Vec<u8>,
+    pub canonical_transport_sha256: String,
+    pub proof_shape: ProofShapeSeal,
+}
+
 pub fn preflight(
     manifest_path: &Path,
     expected_manifest_sha256: &str,
 ) -> Result<PreflightedProvenanceInputs, String> {
+    preflight_inner(manifest_path, expected_manifest_sha256, false).map(|(verified, _)| verified)
+}
+
+pub(crate) fn preflight_with_proof_inputs(
+    manifest_path: &Path,
+    expected_manifest_sha256: &str,
+) -> Result<SealedProofInputs, String> {
+    let (_, proof_inputs) = preflight_inner(manifest_path, expected_manifest_sha256, true)?;
+    proof_inputs.ok_or_else(|| "proof preflight did not load its sealed proof inputs".to_string())
+}
+
+fn preflight_inner(
+    manifest_path: &Path,
+    expected_manifest_sha256: &str,
+    load_proof_inputs: bool,
+) -> Result<(PreflightedProvenanceInputs, Option<SealedProofInputs>), String> {
     validate_sha256(expected_manifest_sha256, "FRI provenance manifest sha256")?;
     reject_symlink(manifest_path, "FRI provenance manifest")?;
     let resolved_manifest = manifest_path
@@ -172,6 +199,18 @@ pub fn preflight(
     let manifest: ProvenanceManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse FRI provenance manifest: {error}"))?;
     validate_header(&manifest)?;
+    if load_proof_inputs {
+        let loaded_bytes = manifest
+            .extended_cairo_proof_bincode
+            .byte_length
+            .checked_add(manifest.canonical_cairo_transport.byte_length)
+            .ok_or("proof and canonical transport byte lengths overflow u64")?;
+        if loaded_bytes > MAX_LOADED_PROOF_INPUT_BYTES {
+            return Err(format!(
+                "proof and canonical transport require {loaded_bytes} loaded bytes; maximum is {MAX_LOADED_PROOF_INPUT_BYTES}"
+            ));
+        }
+    }
     let root = resolved_manifest
         .parent()
         .ok_or("FRI provenance manifest has no parent directory")?
@@ -228,20 +267,20 @@ pub fn preflight(
         true,
         &mut identities,
     )?;
-    verify_artifact(
+    let proof_bytes = verify_artifact(
         &root,
         &manifest.extended_cairo_proof_bincode,
         "extended-cairo-proof-bincode-v1",
         MAX_PROOF_BYTES,
-        false,
+        load_proof_inputs,
         &mut identities,
     )?;
-    verify_artifact(
+    let canonical_transport_bytes = verify_artifact(
         &root,
         &manifest.canonical_cairo_transport,
         "canonical-cairo-proof-felts-be32-v1",
         MAX_PROOF_BYTES,
-        false,
+        load_proof_inputs,
         &mut identities,
     )?;
     let verifier_sources = verify_artifact(
@@ -260,10 +299,19 @@ pub fn preflight(
     validate_source_closure(&verifier_sources, "verifier")?;
     validate_shape(&manifest.proof_shape)?;
 
-    Ok(PreflightedProvenanceInputs {
+    let verified = PreflightedProvenanceInputs {
+        manifest_sha256: manifest_sha256.clone(),
+        proof_shape_sha256: manifest.proof_shape.sha256.clone(),
+    };
+    let proof_inputs = load_proof_inputs.then(|| SealedProofInputs {
         manifest_sha256,
-        proof_shape_sha256: manifest.proof_shape.sha256,
-    })
+        proof_bytes,
+        proof_sha256: manifest.extended_cairo_proof_bincode.sha256,
+        canonical_transport_bytes,
+        canonical_transport_sha256: manifest.canonical_cairo_transport.sha256,
+        proof_shape: manifest.proof_shape,
+    });
+    Ok((verified, proof_inputs))
 }
 
 fn validate_header(manifest: &ProvenanceManifest) -> Result<(), String> {

@@ -207,6 +207,53 @@ record is a reviewed identity claim, not proof that the adapter executable produ
 Only the later proof deserialization, canonical reserialization, verifier, current-source closure,
 proof-shape and transcript-prefix gates may close those pending labels.
 
+The first causal layer is a separate, still non-admitting proof preflight over the same pinned v1
+manifest:
+
+```bash
+"$EXPORTER" \
+  --preflight-fri-round6-proof /absolute/path/to/fri_round6_provenance.v1.json \
+  --fri-round6-provenance-sha256 <64-lowercase-hex-manifest-sha256>
+```
+
+It requires exact bincode decoding and byte-for-byte reserialization, byte identity with the
+canonical Cairo felt transport, successful panic-safe Rust verification, and proof-shape identity
+recomputed from the decoded proof. Its success line still says `production_admissible=false`:
+adapter execution, verifier-source closure, and canonical verifier-to-capture matching remain
+independent pending seals. The identity-only v1 command and schema retain their original meaning.
+Before loading either bulk artifact, this causal mode caps the combined sealed proof-bincode and
+canonical-transport payloads at 256 MiB. It compares bincode output and transport felts directly
+against those loaded bytes instead of materializing duplicate byte buffers; the decoded proof and
+Cairo felt vector are the remaining transient representations. Before the first artifact read, the
+standalone proof process irreversibly caps data memory at 2 GiB, address space at 4 GiB, and CPU
+time at 60 seconds. Only exit zero plus the one exact expected status line is accepted. Any signal,
+timeout, or nonzero exit invalidates all captured text, even if a PASS fragment or full line was
+written before termination. bincode 1.3 slice deserialization discards configured byte limits, so
+the implementation does not claim `.with_limit` as an allocation boundary; the sealed artifact
+caps and OS limits are that boundary. Callers must additionally impose a 90-second wall timeout and
+use bounded or null output capture. Successful proof mode emits exactly one bounded status line.
+For the two shape digests not otherwise encoded by the proof format, canonicalization is explicit:
+the preprocessed variant hash covers its bincode-v1 bytes, and the enable-bit hash covers one byte
+per component slot (`0` or `1`). `trace_column_log_sizes` contains the preprocessed tree first,
+followed by the claim-derived base and interaction trees in verifier order.
+`fri_witness_counts` contains the first layer followed by each inner layer in proof order.
+`sampled_value_counts` and `queried_value_counts` retain the `CommitmentSchemeProof` tree order and
+each tree's column order.
+
+The durable cheap-host procedure builds the exporter, runs only the fully qualified ignored test,
+and refuses to continue unless its summary says exactly one test passed. That test generates four
+disposable, complete, hash-pinned v1 bundles. The procedure then invokes the public proof-preflight
+CLI under a 90-second wall timeout and bounded stdout/stderr for one positive case and independently
+resealed proof, transport, and shape mutations. It accepts exactly one expected non-admitting status
+line from the positive case; every mutation must exit nonzero without an accepted status:
+
+```bash
+./gpu_benchmarks/lab/fixture-export/scripts/cheap_host_proof_boundary.sh
+```
+
+The exact gated test name used by the procedure is
+`fri_round6_proof::tests::real_cairo_proof_crosses_the_full_validation_boundary`.
+
 The headerless payload is fourteen consecutive little-endian-u32 chunks:
 
 | Chunk | Offset | Bytes |
