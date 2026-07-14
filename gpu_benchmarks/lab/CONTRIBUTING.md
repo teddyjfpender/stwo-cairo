@@ -3,6 +3,8 @@
 This is the orchestration/oracle half of the same lab as `stwo/gpu-lab`. Read and follow the
 canonical [`CONTRIBUTING.md`](../../../stwo/gpu-lab/CONTRIBUTING.md), including its independent-
 oracle, evidence, file-size, progressive-disclosure, GPU-measurement, and feedback-SLO rules.
+That document is authoritative: keep orchestration-specific guidance here and change shared policy
+there rather than allowing the two halves of the replacement backend to drift.
 
 `pod/labctl` is the stable, tiny entrypoint; its implementation lives in `pod/labctl_lib/`, split
 by durable responsibility: common policy/state, provider mutations, lease runtime/lifecycle, tree

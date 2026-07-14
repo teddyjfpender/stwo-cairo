@@ -1,0 +1,57 @@
+# Python bytecode and tool caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Rust build output. receipt-targets contains reproducible PIE-adapter build products, not receipts
+# or source; reviewed receipts remain explicit JSON artifacts outside this tree.
+/fixture-export/target/
+/pie-adapter/target/
+/pie-adapter/receipt-targets/
+
+# Local orchestration scratch. Durable sealed records, results, and profiles are persisted by
+# labctl outside the checkout; accepted baselines remain tracked under baselines/.
+/.cache/
+/leases/
+/pod-state/
+/records/*
+/results/*
+/profiles/*
+/persists/*
+/tmp/*
+!/records/.gitkeep
+!/records/.gitignore
+!/results/.gitkeep
+!/results/.gitignore
+!/profiles/.gitkeep
+!/profiles/.gitignore
+!/persists/.gitkeep
+!/persists/.gitignore
+!/tmp/.gitkeep
+!/tmp/.gitignore
+
+# Generated CUDA and profiler products copied into scratch paths during a lab run.
+*.cubin
+*.ptx
+*.fatbin
+*.sass
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+
+# Reviewed fixtures, baseline envelopes, manifests, schemas, and evidence are source artifacts,
+# not scratch output, and must remain visible for explicit review and promotion.
+!/baselines/
+!/baselines/**
+!/fixture-export/fixtures/
+!/fixture-export/fixtures/**
+!/fixture-export/semantics/
+!/fixture-export/semantics/**
+!/manifests/
+!/manifests/**
+!/schemas/
+!/schemas/**
+!/evidence/
+!/evidence/**
