@@ -45,8 +45,8 @@
 //! (pow_bits=26, FriConfig(0, 1, 70, 3)) — the same "do not change" config in
 //! gpu_bench. Exit code 0 iff the verdict is PASS.
 
+#[path = "../arena_preflight_hybrid.rs"]
 mod arena_preflight_hybrid;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
 
@@ -573,8 +573,9 @@ fn report_json(
     let hybrid_traffic = arena_preflight_hybrid::json(arena.quotient_numerator());
 
     let budget_bytes = budget_bytes_of(vram_budget_gb);
-    let physical_memory = PhysicalMemoryLedger::json(arena, budget_bytes)
-        .expect("physical memory ledger must reconcile with the validated arena");
+    let physical_memory =
+        PhysicalMemoryLedger::json_with_inputs(arena, budget_bytes, &Default::default())
+            .expect("physical memory ledger must reconcile with the validated arena");
     let physical_admission_complete = physical_memory["admission_complete"]
         .as_bool()
         .unwrap_or(false);
@@ -744,7 +745,6 @@ fn main() -> ExitCode {
         ExitCode::FAILURE
     }
 }
-
 #[cfg(test)]
-#[path = "arena_preflight_tests.rs"]
+#[path = "../arena_preflight_tests.rs"]
 mod tests;

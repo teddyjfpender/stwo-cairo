@@ -8,6 +8,9 @@ use crate::arena_plan::{
 use crate::fixed_table_materializer::PEDERSEN_POINTS_18_EVALUATION_BYTES;
 use crate::resident_sources::MAX_PREPROCESSED_DETACHED_STAGING_BYTES;
 
+mod physical_rows;
+pub use physical_rows::{PhysicalAllocationId, PhysicalAllocationOwnerId, PhysicalMemoryInputs};
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 
 /// Coarse accounting class inferred from a buffer purpose.
@@ -78,16 +81,6 @@ struct EpochRange {
     offset_words: usize,
 }
 
-const MISSING_ALLOCATION_ROWS: [&str; 6] = [
-    "primary context and driver baseline",
-    "module code and globals",
-    "graph and event metadata",
-    "allocator pool slack",
-    "profiling overhead",
-    "operational safety reserve",
-];
-const ADMISSION_COMPLETE: bool = false;
-const ADMISSION_PASS: bool = false;
 pub const ARENA_IDLE_DEFINITION: &str = concat!(
     "arena allocation bytes minus the exact disjoint live-address union at that epoch; ",
     "includes temporarily dead/reused bytes and alignment gaps; diagnostic only, ",
@@ -170,6 +163,18 @@ impl PhysicalMemoryLedger {
         plan: &ProofArenaPlan,
         operational_ceiling_bytes: usize,
     ) -> Result<serde_json::Value, &'static str> {
+        Self::json_with_inputs(
+            plan,
+            operational_ceiling_bytes,
+            &PhysicalMemoryInputs::default(),
+        )
+    }
+
+    pub fn json_with_inputs(
+        plan: &ProofArenaPlan,
+        operational_ceiling_bytes: usize,
+        physical_inputs: &PhysicalMemoryInputs,
+    ) -> Result<serde_json::Value, &'static str> {
         let ledger = Self::from_plan(plan)?;
         let epochs = ledger
             .epochs
@@ -250,13 +255,18 @@ impl PhysicalMemoryLedger {
             .ok_or("known cold payload subtotal overflow")?;
         let known_cold_payload_subtotal_fit =
             known_cold_payload_subtotal_bytes <= operational_ceiling_bytes;
+        let physical = physical_inputs
+            .admission(known_cold_payload_subtotal_bytes, operational_ceiling_bytes)?;
         let record = serde_json::json!({
             "allocation_model": "one stable shape-arena allocation with lifetime-reused stable range views",
             "purpose_class_caveat": "purpose classes diagnose live logical/range views; the one arena allocation cannot be partitioned by purpose because addresses are reused over time, and shared commitment purposes do not encode exact allocation ownership",
             "arena_idle_definition": ARENA_IDLE_DEFINITION,
             "arena_allocation_id": "shape_arena",
+            "arena_allocation_owner_id": "resident_shape_workspace",
             "arena_allocation_count": 1,
             "arena_allocation_bytes": ledger.arena_allocation_bytes,
+            "process_owned_pedersen_table_allocation_id": "pedersen_points_18_evaluations",
+            "process_owned_pedersen_table_owner_id": "pedersen_points_18_registry",
             "process_owned_pedersen_table_bytes": process_owned_pedersen_table_bytes,
             "omitted_duplicate_pedersen_evaluation_bytes": omitted_pedersen_evaluation_bytes,
             "known_allocation_subtotal_bytes": known_allocation_subtotal_bytes,
@@ -266,6 +276,7 @@ impl PhysicalMemoryLedger {
             "twiddle_detached_staging_payload_bytes": twiddle_detached_staging_payload_bytes,
             "preprocessed_detached_staging_payload_bound_bytes": MAX_PREPROCESSED_DETACHED_STAGING_BYTES,
             "known_cold_source_payload_peak_bytes": known_cold_source_payload_peak_bytes,
+            "known_cold_source_payload_peak_owner_id": "resident_cold_setup",
             "known_cold_payload_subtotal_bytes": known_cold_payload_subtotal_bytes,
             "known_cold_payload_subtotal_fit": known_cold_payload_subtotal_fit,
             "known_cold_payload_subtotal_headroom_bytes": operational_ceiling_bytes
@@ -285,9 +296,13 @@ impl PhysicalMemoryLedger {
                 "reason": "preserve the public preflight JSON contract during range-arena migration",
                 "removal_condition": "remove after all external consumers read arena_allocation_fit",
             },
-            "admission_complete": ADMISSION_COMPLETE,
-            "admission_pass": ADMISSION_PASS,
-            "missing_allocation_rows": MISSING_ALLOCATION_ROWS,
+            "physical_allocation_rows": physical.rows,
+            "measured_non_arena_subtotal_bytes": physical.measured_bytes,
+            "physical_peak_bytes": physical.peak_bytes,
+            "admission_complete": physical.complete,
+            "admission_pass": physical.pass,
+            "missing_allocation_ids": physical.missing_ids,
+            "missing_allocation_rows": physical.missing_rows,
         });
         if !fit_alias_matches(&record) {
             return Err("deprecated arena fit alias drifted from allocation field");
@@ -553,15 +568,6 @@ mod tests {
             .unwrap_err(),
             "ledger live range exceeds the arena allocation"
         );
-    }
-
-    #[test]
-    fn non_arena_rows_keep_process_admission_fail_closed() {
-        assert!(!MISSING_ALLOCATION_ROWS.is_empty());
-        assert!(!ADMISSION_COMPLETE);
-        assert!(!ADMISSION_PASS);
-        assert!(MISSING_ALLOCATION_ROWS.contains(&"primary context and driver baseline"));
-        assert!(MISSING_ALLOCATION_ROWS.contains(&"operational safety reserve"));
     }
 
     #[test]
