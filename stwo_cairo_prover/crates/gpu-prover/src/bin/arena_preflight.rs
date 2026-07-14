@@ -54,6 +54,10 @@ mod arena_preflight_hybrid;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::process::ExitCode;
+
+use arena_preflight_cli::{
+    arg, budget_bytes_of, parse_resident_backend, parse_vram_budget_gb, runtime_policy_json,
+};
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo_cairo_adapter::ProverInput;
@@ -64,10 +68,6 @@ use stwo_cairo_gpu_prover::phases;
 use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
 use stwo_cairo_gpu_prover::resident_session::{
     plan_resident_preflight_for, ResidentPreflightError, ResidentPreflightReport,
-};
-
-use arena_preflight_cli::{
-    arg, budget_bytes_of, parse_resident_backend, parse_vram_budget_gb, runtime_policy_json,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -543,6 +543,49 @@ fn compacted_consumer_rows(
         .collect()
 }
 
+/// Exact producer-to-count-table work retained by the standalone witness-feed
+/// pass.  This is deliberately compiler-derived: benchmark reviewers can rank
+/// fusion candidates without trying to recover descriptor geometry from CUDA
+/// grid sizes in an Nsight trace.
+fn recorded_multiplicity_feeds(report: &ResidentPreflightReport) -> Vec<serde_json::Value> {
+    report
+        .multiplicities
+        .feeds
+        .iter()
+        .map(|feed| {
+            let descriptors = feed
+                .descriptors
+                .chunks_exact(stwo_backend_cuda::WITNESS_FEED_DESCRIPTOR_WORDS)
+                .map(|entry| {
+                    serde_json::json!({
+                        "source_word": entry[0],
+                        "tuple_words": entry[1],
+                        "tuple_bits": &entry[2..7],
+                        "relation_index": entry[7],
+                        "table_words": entry[8],
+                        "lut_index": entry[9],
+                        "destination_index": entry[10],
+                        "kind": entry[11],
+                        "aux_0": entry[12],
+                        "aux_1": entry[13],
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "producer": feed.producer,
+                "row_count": feed.row_count,
+                "sub_words_per_row": feed.sub_words_per_row,
+                "source_words": feed.requirements.source_words,
+                "descriptor_count": feed.requirements.descriptor_count,
+                "descriptors": descriptors,
+                "lut_families": feed.lut_families,
+                "destination_components": feed.destination_components,
+                "multiplicity_words": feed.requirements.multiplicity_words,
+            })
+        })
+        .collect()
+}
+
 fn report_json(
     report: &ResidentPreflightReport,
     selected_backend: ResidentBackend,
@@ -635,6 +678,7 @@ fn report_json(
         .iter()
         .map(|blocker| format!("{blocker:?}"))
         .collect();
+    let recorded_multiplicity_feeds = recorded_multiplicity_feeds(report);
 
     let numerator_groups = &arena.quotient_numerator().requirements.groups;
     let single_write_groups = numerator_groups
@@ -698,6 +742,7 @@ fn report_json(
         "capture_safe_components": report.capture_safe_components.len(),
         "capture_safe_coverage_ok": capture_safe_ok,
         "recorded_witness_lanes": report.recorded_lanes.len(),
+        "recorded_multiplicity_feeds": recorded_multiplicity_feeds,
         "aot_coverage": aot_coverage.json(),
         "compacted_consumer_rows": compacted_rows,
         "multiplicity_coverage_gaps": coverage_gaps,
