@@ -856,76 +856,85 @@ pub fn stage_preprocessed_commitment(
 
     let mut streamer = CudaPreprocessedColumnStreamer::gpu_preferred();
     let mut source_sync_calls = 0usize;
-    for (index, source) in trace.columns.iter().enumerate() {
-        let column = &planned.columns[index];
-        let expected_words = checked_words(column.log_size)?;
-        let bytes = expected_words
-            .checked_mul(core::mem::size_of::<u32>())
-            .ok_or(ResidentSourceStageError::SizeOverflow)?;
-        if let PreprocessedStageSource::RegisteredPedersen(registered) = stage_sources[index] {
-            // Registration uses a synchronous H2D upload and intentionally
-            // retains these allocations for the process lifetime. The arena
-            // stream may therefore consume them directly without a detached
-            // source fence or a second retained evaluation.
-            unsafe {
-                workspace.arena().context().memcpy_d2d_async(
-                    destinations[index].as_void_ptr(),
-                    registered.as_u32_ptr().cast_const().cast(),
-                    bytes,
-                )?;
-            }
-            continue;
-        }
-        let evaluation = streamer.generate(source.as_ref());
-        if evaluation.domain.log_size() != column.log_size {
-            return Err(ResidentSourceStageError::PreprocessedColumnLogMismatch {
-                column: index,
-                expected: column.log_size,
-                actual: evaluation.domain.log_size(),
-            });
-        }
-        if evaluation.values.size != expected_words {
-            return Err(ResidentSourceStageError::ColumnValueSizeMismatch {
-                column: index,
-                expected_words,
-                actual_words: evaluation.values.size,
-            });
-        }
-        synchronize_legacy_stream_for_arena_handoff();
-        let stage_result = (|| {
-            unsafe {
-                workspace.arena().context().memcpy_d2d_async(
-                    destinations[index].as_void_ptr(),
-                    evaluation.values.device_ptr.cast(),
-                    bytes,
-                )?;
-                if let Some(destination) = evaluation_destinations[index] {
+    let source_stage_result = (|| {
+        for (index, source) in trace.columns.iter().enumerate() {
+            let column = &planned.columns[index];
+            let expected_words = checked_words(column.log_size)?;
+            let bytes = expected_words
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(ResidentSourceStageError::SizeOverflow)?;
+            if let PreprocessedStageSource::RegisteredPedersen(registered) = stage_sources[index] {
+                // Registration uses a synchronous H2D upload and intentionally
+                // retains these allocations for the process lifetime. The arena
+                // stream may therefore consume them directly without a detached
+                // source fence or a second retained evaluation.
+                unsafe {
                     workspace.arena().context().memcpy_d2d_async(
-                        destination.as_void_ptr(),
-                        evaluation.values.device_ptr.cast(),
+                        destinations[index].as_void_ptr(),
+                        registered.as_u32_ptr().cast_const().cast(),
                         bytes,
                     )?;
                 }
+                continue;
             }
-            Ok(())
-        })();
-        // The detached source can be freed only after the isolated arena stream
-        // consumes it. Fence even when a later enqueue fails; otherwise the
-        // successful prefix could still read the stack-owned evaluation after
-        // this iteration unwinds.
-        fence_after(stage_result, || {
-            workspace
-                .arena()
-                .context()
-                .sync()
-                .map_err(ResidentSourceStageError::from)
-        })?;
-        source_sync_calls = source_sync_calls
-            .checked_add(1)
-            .ok_or(ResidentSourceStageError::SizeOverflow)?;
-    }
+            let evaluation = streamer.generate(source.as_ref())?;
+            if evaluation.domain.log_size() != column.log_size {
+                return Err(ResidentSourceStageError::PreprocessedColumnLogMismatch {
+                    column: index,
+                    expected: column.log_size,
+                    actual: evaluation.domain.log_size(),
+                });
+            }
+            if evaluation.values.size != expected_words {
+                return Err(ResidentSourceStageError::ColumnValueSizeMismatch {
+                    column: index,
+                    expected_words,
+                    actual_words: evaluation.values.size,
+                });
+            }
+            let stage_result = (|| {
+                unsafe {
+                    workspace.arena().context().memcpy_d2d_async(
+                        destinations[index].as_void_ptr(),
+                        evaluation.values.device_ptr.cast(),
+                        bytes,
+                    )?;
+                    if let Some(destination) = evaluation_destinations[index] {
+                        workspace.arena().context().memcpy_d2d_async(
+                            destination.as_void_ptr(),
+                            evaluation.values.device_ptr.cast(),
+                            bytes,
+                        )?;
+                    }
+                }
+                Ok(())
+            })();
+            // The detached source can be freed only after the isolated arena stream
+            // consumes it. Fence even when a later enqueue fails; otherwise the
+            // successful prefix could still read the stack-owned evaluation after
+            // this iteration unwinds.
+            fence_after(stage_result, || {
+                workspace
+                    .arena()
+                    .context()
+                    .sync()
+                    .map_err(ResidentSourceStageError::from)
+            })?;
+            source_sync_calls = source_sync_calls
+                .checked_add(1)
+                .ok_or(ResidentSourceStageError::SizeOverflow)?;
+        }
+        Ok(())
+    })();
+    // A selected source drops after its isolated-stream copy is fenced, which
+    // enqueues a legacy-stream free. Drain that free on both success and every
+    // early-error path; preserve the source-stage error if cleanup also fails.
+    fence_after(source_stage_result, || {
+        streamer
+            .synchronize()
+            .map_err(ResidentSourceStageError::from)
+    })?;
     drop(streamer);
-    synchronize_legacy_stream_for_arena_handoff();
 
     let inverse_twiddles = workspace.bind(planned.inverse_twiddles.logical)?.0;
     let inverse_words = u32::try_from(inverse_twiddles.len_words())
