@@ -32,6 +32,7 @@ pub mod proof_bundle;
 pub mod protocol_discovery;
 pub mod protocol_plan;
 pub mod prover;
+pub mod range_allocator;
 pub mod recorded_witness_inputs;
 pub mod relation;
 pub mod relation_execution;
