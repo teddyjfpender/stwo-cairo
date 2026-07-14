@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# pod_run: require_clean_sources
 # First replacement-v1 SN2 end-to-end checkpoint. This is the only recipe that
 # may soften graph-submit timing, and its timing is explicitly inadmissible.
 # All source, input, carry, numerator, AOT, architecture, proof-byte, verifier,
@@ -11,6 +12,7 @@
 REPLACEMENT_SN2_MODE=diagnostic
 source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
 
+phase ambient_override_gate checkpoint_reject_ambient_overrides
 phase source_input_identity checkpoint_source_input_identity
 phase hardware_identity checkpoint_hardware_identity
 phase build checkpoint_build

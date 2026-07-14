@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# pod_run: require_clean_sources
 # Follow-on only: no build, no diagnostic exception. This refuses to run unless
 # the exact source, binary, AOT pack, inputs, and GPU match a passing diagnostic
 # seal created by replacement_v1_sn2_checkpoint.phases. Six reps yield five warm
@@ -10,6 +11,7 @@
 REPLACEMENT_SN2_MODE=timing
 source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
 
+phase ambient_override_gate checkpoint_reject_ambient_overrides
 phase sealed_diagnostic_identity checkpoint_verify_sealed_diagnostic
 phase sn2_timing checkpoint_run_sn2 timing 6
 phase sn2_timing_validate checkpoint_validate_sn2 timing 6

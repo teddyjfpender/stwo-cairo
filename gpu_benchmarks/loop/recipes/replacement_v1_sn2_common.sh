@@ -102,26 +102,39 @@ PY
 }
 
 checkpoint_hardware_identity() {
-  local row compute out
-  row="$(nvidia-smi --query-gpu=name,uuid,memory.total,driver_version --format=csv,noheader,nounits)"
-  compute="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits)"
-  out="$(checkpoint_artifact hardware_identity.json)"
-  GPU_ROW="$row" GPU_COMPUTE="$compute" OUT="$out" python3 - <<'PY'
-import csv, io, json, os
+  checkpoint_capture_hardware_identity "$(checkpoint_artifact hardware_identity.json)"
+}
+
+checkpoint_capture_hardware_identity() {
+  local row out="$1"
+  row="$(nvidia-smi \
+    --query-gpu=name,uuid,pci.bus_id,memory.total,driver_version,compute_cap,persistence_mode,mig.mode.current,ecc.mode.current,compute_mode,power.limit,clocks.max.sm,clocks.max.memory \
+    --format=csv,noheader,nounits)"
+  GPU_ROW="$row" OUT="$out" python3 - <<'PY'
+import csv, io, json, math, os
 rows = list(csv.reader(io.StringIO(os.environ["GPU_ROW"])))
-caps = [line.strip() for line in os.environ["GPU_COMPUTE"].splitlines() if line.strip()]
-if len(rows) != 1 or len(caps) != 1 or len(rows[0]) != 4:
+if len(rows) != 1 or len(rows[0]) != 13:
     raise SystemExit("checkpoint requires exactly one queryable GPU")
-name, uuid, memory_mib, driver = [value.strip() for value in rows[0]]
+name, uuid, pci_bus_id, memory_mib, driver, compute, persistence, mig, ecc, compute_mode, power_limit, max_sm, max_memory = [value.strip() for value in rows[0]]
 try:
     memory_mib = int(memory_mib)
+    power_limit = float(power_limit)
+    max_sm = int(max_sm)
+    max_memory = int(max_memory)
 except ValueError as error:
-    raise SystemExit(f"invalid GPU memory identity: {error}")
-if "H100" not in name or memory_mib < 79000 or caps[0] != "9.0":
-    raise SystemExit(f"replacement-v1 checkpoint requires H100 sm_90 >=79,000 MiB; got {name}, {caps[0]}, {memory_mib}")
-record = {"schema": "stwo.replacement-v1-sn2.hardware-identity.v1", "name": name,
-          "uuid": uuid, "memory_mib": memory_mib, "compute_capability": caps[0],
-          "driver_version": driver}
+    raise SystemExit(f"invalid numeric GPU identity: {error}")
+if "H100" not in name or memory_mib < 79000 or compute != "9.0":
+    raise SystemExit(f"replacement-v1 checkpoint requires H100 sm_90 >=79,000 MiB; got {name}, {compute}, {memory_mib}")
+if persistence not in {"Enabled", "Disabled"} or mig != "Disabled" or ecc != "Enabled" or compute_mode != "Default":
+    raise SystemExit(f"unstable GPU policy: persistence={persistence}, MIG={mig}, ECC={ecc}, compute={compute_mode}")
+if not all((uuid, pci_bus_id, driver)) or not math.isfinite(power_limit) or power_limit <= 0 or max_sm <= 0 or max_memory <= 0:
+    raise SystemExit("GPU power/clock policy is unavailable")
+record = {"schema": "stwo.replacement-v1-sn2.hardware-identity.v2", "name": name,
+          "uuid": uuid, "pci_bus_id": pci_bus_id, "memory_mib": memory_mib,
+          "compute_capability": compute, "driver_version": driver,
+          "persistence_mode": persistence, "mig_mode": mig, "ecc_mode": ecc,
+          "compute_mode": compute_mode, "power_limit_w": power_limit,
+          "max_sm_clock_mhz": max_sm, "max_memory_clock_mhz": max_memory}
 with open(os.environ["OUT"], "w", encoding="utf-8") as stream:
     json.dump(record, stream, sort_keys=True)
     stream.write("\n")
@@ -131,6 +144,7 @@ PY
 
 checkpoint_build() {
   local out
+  checkpoint_reject_ambient_overrides
   cd "$CAIRO"
   cargo build --release --locked -p stwo-cairo-gpu-prover \
     --bin gpu_bench --bin aot_index_check --features pie-bench
@@ -157,6 +171,7 @@ PY
 
 checkpoint_adapted_input_identity() {
   local log expected actual bytes out
+  checkpoint_reject_ambient_overrides
   log="$(checkpoint_artifact adapted_input.txt)"
   rm -f "$CHECKPOINT_ADAPTED"
   if ! env STWO_DUMP_INPUT="$CHECKPOINT_ADAPTED" "$CHECKPOINT_GPU_BENCH" \
@@ -199,6 +214,7 @@ PY
 
 checkpoint_fp256_carry_oracles() {
   local oracle captured out
+  checkpoint_reject_ambient_overrides
   oracle="$(checkpoint_artifact fp256_oracle.txt)"
   captured="$(checkpoint_artifact poseidon_captured_aot.txt)"
   cd "$CAIRO"
@@ -256,6 +272,7 @@ checkpoint_numerator_source_sha() {
 
 checkpoint_exact_numerator_ab() {
   local build_json build_err executable source_sha module_sha log out
+  checkpoint_reject_ambient_overrides
   build_json="$(checkpoint_artifact numerator_build.jsonl.txt)"
   build_err="$(checkpoint_artifact numerator_build.stderr.txt)"
   log="$(checkpoint_artifact numerator_ab.txt)"
@@ -349,6 +366,7 @@ PY
 checkpoint_aot_identity() {
   local manifest_sha raw out key
   local -a keys key_args
+  checkpoint_reject_ambient_overrides
   manifest_sha="$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")"
   [[ "$manifest_sha" == "$CHECKPOINT_AOT_MANIFEST_SHA256" ]] \
     || { echo "AOT manifest SHA-256 drifted" >&2; return 1; }
@@ -395,6 +413,11 @@ checkpoint_reject_ambient_overrides() {
     STWO_CUDA_B2N_STAGE_FUSED STWO_CUDA_BLAKE2S_INTERIOR_FUSED
     STWO_CUDA_COMPOSITION_WIDE STWO_CUDA_RELATION_SCAN_TAIL STWO_CUDA_FRI_FOLD_FUSED
     STWO_CUDA_FEED_PRIVATIZED STWO_CUDA_PCS_REFERENCE STWO_CUDA_DECOMMIT_GATHER_REFERENCE
+    STWO_CUDA_DEVICE_INTERACTION STWO_CUDA_WITNESS_EDGES STWO_CUDA_MEM_COUNT_FEEDS
+    STWO_CUDA_STREAM_FANOUT STWO_CUDA_STREAM_LEAF_COMMIT STWO_CUDA_PIPELINED_COMMIT
+    STWO_CAIRO_LOW_MEMORY STWO_CAIRO_STREAM_LDE STWO_DIET_REBUILD_PREPROCESSED
+    STWO_FORCE_EXTEND_EVAL_MODE STWO_STORE_COEFFS PREPROCESSED_TRACE_GPU_GENERATE
+    STWO_GPU_OPERATIONAL_SAFETY_RESERVE_BYTES
     STWO_CUDA_DISABLE_JIT STWO_CUDA_WITNESS_JIT STWO_CUDA_WITNESS_JIT_PROVE
     STWO_CUDA_WITNESS_JIT_MAX_INSTRS STWO_JIT_CACHE_DIR STWO_JIT_CUBIN_CACHE
     STWO_JIT_DISABLE_SPLIT STWO_JIT_FORCE_RELAX STWO_JIT_LOG STWO_JIT_MAX_KERNEL_INSTRS
@@ -457,14 +480,15 @@ PY
 }
 
 checkpoint_validate_sn2() {
-  local mode="$1" reps="$2" stdout aot out
+  local mode="$1" reps="$2" stdout aot proof out
   stdout="$(checkpoint_artifact stdout.txt)"
   aot="$(checkpoint_artifact aot_identity.json)"
+  proof="$(checkpoint_artifact proof.bin)"
   out="$(checkpoint_artifact record.json)"
-  python3 - "$stdout" "$aot" "$out" "$mode" "$reps" <<'PY'
-import json, math, re, sys
+  python3 - "$stdout" "$aot" "$proof" "$CHECKPOINT_SEAL" "$out" "$mode" "$reps" <<'PY'
+import hashlib, json, math, re, sys
 
-raw_path, aot_path, out_path, mode, reps_text = sys.argv[1:]
+raw_path, aot_path, proof_path, seal_path, out_path, mode, reps_text = sys.argv[1:]
 reps = int(reps_text)
 objects = []
 for line in open(raw_path, encoding="utf-8", errors="replace"):
@@ -504,15 +528,28 @@ require(r.get("gpu_planned_numerator_schedule") == "hybrid-single-write", "plann
 require(r.get("gpu_prepared_numerator_schedule") == "hybrid-single-write", "actual numerator schedule fell back")
 require(isinstance(r.get("gpu_prepared_numerator_eligible_groups"), int) and r["gpu_prepared_numerator_eligible_groups"] > 0, "no hybrid numerator group executed")
 require(isinstance(r.get("gpu_prepared_numerator_legacy_groups"), int) and r["gpu_prepared_numerator_legacy_groups"] >= 0, "invalid legacy numerator group count")
+require(isinstance(r.get("gpu_protocol_key"), int) and not isinstance(r["gpu_protocol_key"], bool)
+        and 0 < r["gpu_protocol_key"] < 2**64, "protocol key is not a nonzero u64")
+topology_digest = r.get("gpu_shape_executable_topology_digest")
+require(hex64(topology_digest) and topology_digest != "0" * 64,
+        "topology digest is not a nonzero 256-bit identity")
 require(r.get("gpu_policy_retained_lde_budget_bytes") == 64 * 1024**3, "replacement-v1 LDE policy drifted")
 require(r.get("gpu_policy_commit_mode") == "domain-progressive", "replacement-v1 commit policy drifted")
 require(r.get("gpu_policy_direct_composition_retention") == "exact-native", "replacement-v1 composition retention drifted")
 require(r.get("gpu_policy_numerator_source") == "reuse-retained-evaluations", "replacement-v1 numerator source drifted")
 require(r.get("gpu_policy_interpolation_mode") == "stage-fused-out-of-place", "replacement-v1 interpolation policy drifted")
+require(r.get("gpu_policy_blake2s_interior_fused") is False, "replacement-v1 Blake interior policy drifted")
+require(r.get("gpu_policy_composition_launch_mode") == "serial", "replacement-v1 composition launch policy drifted")
+require(r.get("gpu_policy_relation_tail_mode") == "segmented", "replacement-v1 relation-tail policy drifted")
+require(r.get("gpu_policy_fri_fold_launch_mode") == "per-fold", "replacement-v1 FRI-fold policy drifted")
+require(r.get("gpu_policy_witness_feed_launch_mode") == "global-atomics", "replacement-v1 witness-feed policy drifted")
 for field in ("gpu_setup_base_migration_copies", "gpu_setup_lookup_host_copies", "gpu_setup_legacy_witness_fallbacks"):
     require(r.get(field) == 0, f"legacy setup/fallback executed: {field}={r.get(field)!r}")
 for field in ("gpu_aot_misses", "gpu_aot_runtime_loads", "gpu_aot_runtime_cache_hits", "gpu_aot_strict_rejections"):
     require(r.get(field) == 0, f"JIT/AOT fallback executed: {field}={r.get(field)!r}")
+activity = (r.get("gpu_aot_loads"), r.get("gpu_aot_cache_hits"))
+require(all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in activity)
+        and sum(activity) > 0, "runtime telemetry recorded no positive AOT activity")
 require(r.get("gpu_aot_provenance_gate_passed") is True, "strict AOT provenance gate failed")
 embedded_hash = int(aot["loaded_manifest_hash"], 16)
 require(r.get("gpu_aot_manifest_hash") == embedded_hash and r.get("gpu_policy_kernel_manifest_hash") == embedded_hash, "runtime AOT identity differs from checked embedded pack")
@@ -537,6 +574,19 @@ elif mode == "timing":
     require(r.get("warm_sample_count") == reps - 1, "timing follow-on lacks the expected warm samples")
     for field in ("prove_s_warm_median", "prove_s_warm_p95", "useful_mhz_median", "useful_mhz_at_warm_p95"):
         require(isinstance(r.get(field), (int, float)) and math.isfinite(r[field]) and r[field] > 0, f"invalid timing metric {field}")
+    seal = json.load(open(seal_path, encoding="utf-8"))
+    require(seal.get("schema") == "stwo.replacement-v1-sn2.checkpoint-seal.v2"
+            and seal.get("diagnostic_pass") is True, "timing seal is not a passing diagnostic")
+    require(r["gpu_proof_blake3"] == seal.get("proof_blake3"), "timing proof digest differs from diagnostic")
+    proof_sha256 = hashlib.sha256(open(proof_path, "rb").read()).hexdigest()
+    require(proof_sha256 == seal.get("proof_dump_sha256"), "timing proof bytes differ from diagnostic")
+    shape = seal.get("shape_receipt") or {}
+    require(shape == {
+        "protocol_key": r["gpu_protocol_key"],
+        "topology_digest": r["gpu_shape_executable_topology_digest"],
+        "numerator_eligible_groups": r["gpu_prepared_numerator_eligible_groups"],
+        "numerator_legacy_groups": r["gpu_prepared_numerator_legacy_groups"],
+    }, "timing shape/numerator receipt differs from diagnostic")
 else:
     raise SystemExit(f"unknown validation mode: {mode}")
 r["checkpoint_validation"] = {"schema": "stwo.replacement-v1-sn2.record-validation.v1",
@@ -554,7 +604,8 @@ PY
 }
 
 checkpoint_seal_diagnostic() {
-  local source hardware build adapted carry numerator aot record proof_sha run_seal
+  local source hardware build adapted carry numerator aot record proof proof_sha run_seal
+  checkpoint_reject_ambient_overrides
   source="$(checkpoint_artifact source_input_identity.json)"
   hardware="$(checkpoint_artifact hardware_identity.json)"
   build="$(checkpoint_artifact build_identity.json)"
@@ -563,16 +614,18 @@ checkpoint_seal_diagnostic() {
   numerator="$(checkpoint_artifact numerator_ab.json)"
   aot="$(checkpoint_artifact aot_identity.json)"
   record="$(checkpoint_artifact record.json)"
+  proof="$(checkpoint_artifact proof.bin)"
   proof_sha="$(awk '{print $1}' "$(checkpoint_artifact proof.sha256.txt)")"
   run_seal="$(checkpoint_artifact seal.json)"
-  for path in "$source" "$hardware" "$build" "$adapted" "$carry" "$numerator" "$aot" "$record"; do
+  for path in "$source" "$hardware" "$build" "$adapted" "$carry" "$numerator" "$aot" "$record" "$proof"; do
     [[ -s "$path" ]] || { echo "cannot seal missing checkpoint receipt: $path" >&2; return 1; }
   done
   checkpoint_require_hash "$proof_sha" 256 proof_dump_sha256
   SOURCE="$source" HARDWARE="$hardware" BUILD="$build" ADAPTED="$adapted" CARRY="$carry" \
-    NUMERATOR="$numerator" AOT="$aot" RECORD="$record" PROOF_SHA="$proof_sha" \
+    NUMERATOR="$numerator" AOT="$aot" RECORD="$record" PROOF="$proof" PROOF_SHA="$proof_sha" \
     GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
     AOT_CHECK_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_CHECK")" \
+    AOT_MANIFEST_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")" \
     OUT="$CHECKPOINT_SEAL" python3 - <<'PY'
 import hashlib, json, os, tempfile
 def load(name):
@@ -581,11 +634,26 @@ def sha(name):
     return hashlib.sha256(open(os.environ[name], "rb").read()).hexdigest()
 source, hardware, build, adapted = map(load, ("SOURCE", "HARDWARE", "BUILD", "ADAPTED"))
 carry, numerator, aot, record = map(load, ("CARRY", "NUMERATOR", "AOT", "RECORD"))
-if (carry.get("pass") is not True or numerator.get("schema") != "stwo.sn3_quotient_numerator_hybrid.host_wall.v4"
+if (source.get("schema") != "stwo.replacement-v1-sn2.source-input-identity.v1"
+        or hardware.get("schema") != "stwo.replacement-v1-sn2.hardware-identity.v2"
+        or build.get("schema") != "stwo.replacement-v1-sn2.build-identity.v1"
+        or adapted.get("schema") != "stwo.replacement-v1-sn2.adapted-input-identity.v1"
+        or carry.get("pass") is not True
+        or numerator.get("schema") != "stwo.sn3_quotient_numerator_hybrid.host_wall.v4"
         or record.get("checkpoint_validation", {}).get("verdict") != "PASS"
         or record["checkpoint_validation"].get("mode") != "diagnostic"):
     raise SystemExit("diagnostic receipts are not sealable")
-seal = {"schema": "stwo.replacement-v1-sn2.checkpoint-seal.v1", "diagnostic_pass": True,
+if (build.get("gpu_bench_sha256") != os.environ["GPU_BENCH_SHA"]
+        or build.get("aot_index_check_sha256") != os.environ["AOT_CHECK_SHA"]
+        or build.get("aot_manifest_sha256") != os.environ["AOT_MANIFEST_SHA"]
+        or adapted.get("adapter_binary_sha256") != os.environ["GPU_BENCH_SHA"]
+        or aot.get("gpu_bench_sha256") != os.environ["GPU_BENCH_SHA"]
+        or aot.get("checker_binary_sha256") != os.environ["AOT_CHECK_SHA"]
+        or aot.get("manifest_sha256") != os.environ["AOT_MANIFEST_SHA"]):
+    raise SystemExit("diagnostic receipt/binary identity cross-check failed")
+if sha("PROOF") != os.environ["PROOF_SHA"]:
+    raise SystemExit("diagnostic proof hash receipt differs from proof bytes")
+seal = {"schema": "stwo.replacement-v1-sn2.checkpoint-seal.v2", "diagnostic_pass": True,
         "source": source["source"], "inputs": source["inputs"], "hardware": hardware,
         "adapted_input_sha256": adapted["sha256"],
         "gpu_bench_sha256": os.environ["GPU_BENCH_SHA"],
@@ -594,6 +662,12 @@ seal = {"schema": "stwo.replacement-v1-sn2.checkpoint-seal.v1", "diagnostic_pass
         "aot_loaded_manifest_hash": aot["loaded_manifest_hash"],
         "proof_dump_sha256": os.environ["PROOF_SHA"],
         "proof_blake3": record["gpu_proof_blake3"],
+        "shape_receipt": {
+            "protocol_key": record["gpu_protocol_key"],
+            "topology_digest": record["gpu_shape_executable_topology_digest"],
+            "numerator_eligible_groups": record["gpu_prepared_numerator_eligible_groups"],
+            "numerator_legacy_groups": record["gpu_prepared_numerator_legacy_groups"],
+        },
         "receipts_sha256": {name.lower(): sha(name) for name in
             ("SOURCE", "HARDWARE", "BUILD", "ADAPTED", "CARRY", "NUMERATOR", "AOT", "RECORD")}}
 directory = os.path.dirname(os.environ["OUT"])
@@ -611,14 +685,15 @@ PY
 }
 
 checkpoint_verify_sealed_diagnostic() {
-  local run_seal row compute
+  local current_hardware run_seal
+  checkpoint_reject_ambient_overrides
   checkpoint_require_clean_source_identity
   [[ -s "$CHECKPOINT_SEAL" ]] || { echo "run the passing diagnostic checkpoint before timing" >&2; return 1; }
   # Re-read the embedded index without rebuilding. The timing validator consumes
   # this current-run receipt and the seal comparison prevents pack substitution.
   checkpoint_aot_identity
-  row="$(nvidia-smi --query-gpu=name,uuid,memory.total,driver_version --format=csv,noheader,nounits)"
-  compute="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits)"
+  current_hardware="$(checkpoint_artifact hardware_identity.json)"
+  checkpoint_capture_hardware_identity "$current_hardware"
   run_seal="$(checkpoint_artifact seal.json)"
   GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
   AOT_CHECK_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_CHECK")" \
@@ -627,10 +702,10 @@ checkpoint_verify_sealed_diagnostic() {
   ADAPTED_SHA="$(checkpoint_sha256 "$CHECKPOINT_ADAPTED")" \
   AOT_MANIFEST_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")" \
   CURRENT_AOT="$(checkpoint_artifact aot_identity.json)" \
-  GPU_ROW="$row" GPU_COMPUTE="$compute" python3 - "$CHECKPOINT_SEAL" <<'PY'
-import csv, io, json, os, sys
+  CURRENT_HARDWARE="$current_hardware" python3 - "$CHECKPOINT_SEAL" <<'PY'
+import json, os, sys
 seal = json.load(open(sys.argv[1], encoding="utf-8"))
-if seal.get("schema") != "stwo.replacement-v1-sn2.checkpoint-seal.v1" or seal.get("diagnostic_pass") is not True:
+if seal.get("schema") != "stwo.replacement-v1-sn2.checkpoint-seal.v2" or seal.get("diagnostic_pass") is not True:
     raise SystemExit("checkpoint seal is not a passing diagnostic")
 expected_source = {"stwo": {"head": os.environ["STWO_PARITY_REF_STWO_HEAD"],
                              "worktree_sha256": os.environ["STWO_PARITY_REF_STWO_WORKTREE_HASH"]},
@@ -647,20 +722,16 @@ for field, environment in checks:
     if seal.get(field) != os.environ[environment]:
         raise SystemExit(f"timing artifact differs from diagnostic: {field}")
 current_aot = json.load(open(os.environ["CURRENT_AOT"], encoding="utf-8"))
-if current_aot.get("loaded_manifest_hash") != seal.get("aot_loaded_manifest_hash"):
+if (current_aot.get("loaded_manifest_hash") != seal.get("aot_loaded_manifest_hash")
+        or current_aot.get("manifest_sha256") != seal.get("aot_manifest_sha256")
+        or current_aot.get("checker_binary_sha256") != seal.get("aot_index_check_sha256")
+        or current_aot.get("gpu_bench_sha256") != seal.get("gpu_bench_sha256")):
     raise SystemExit("timing embedded AOT pack differs from the diagnostic")
-rows = list(csv.reader(io.StringIO(os.environ["GPU_ROW"])))
-caps = [line.strip() for line in os.environ["GPU_COMPUTE"].splitlines() if line.strip()]
-if len(rows) != 1 or len(rows[0]) != 4 or len(caps) != 1:
-    raise SystemExit("timing requires exactly one GPU")
-name, uuid, memory, driver = [value.strip() for value in rows[0]]
-hardware = seal["hardware"]
-if (hardware["name"], hardware["uuid"], hardware["memory_mib"],
-        hardware["driver_version"], hardware["compute_capability"]) != (
-        name, uuid, int(memory), driver, caps[0]):
-    raise SystemExit("timing GPU identity differs from the diagnostic")
+hardware = json.load(open(os.environ["CURRENT_HARDWARE"], encoding="utf-8"))
+if hardware != seal.get("hardware"):
+    raise SystemExit("timing GPU identity/policy differs from the diagnostic")
 print(json.dumps({"sealed_diagnostic": "PASS", "proof_blake3": seal["proof_blake3"],
-                  "gpu": name, "uuid": uuid}, sort_keys=True))
+                  "gpu": hardware["name"], "uuid": hardware["uuid"]}, sort_keys=True))
 PY
   cp "$CHECKPOINT_SEAL" "$run_seal"
 }
