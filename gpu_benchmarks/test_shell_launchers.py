@@ -219,6 +219,63 @@ class ShellLauncherTests(unittest.TestCase):
                 file_sha256(root / "fixture.numerator_ab.json"),
             )
 
+    def test_replacement_sn2_aot_identity_derives_exact_key_count(self) -> None:
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "aot_manifest.json"
+            manifest.write_text(
+                json.dumps([{"cache_key": char * 16} for char in "a12"]) + "\n",
+                encoding="utf-8",
+            )
+            checker = root / "aot_index_check"
+            checker.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '{\"pass\":true,\"sm\":90,"
+                "\"loaded_manifest_hash\":\"1234567890abcdef\","
+                "\"required_unique_key_count\":'\"${TEST_COUNT:-3}\"',"
+                "\"missing_keys\":[]}'\n",
+                encoding="utf-8",
+            )
+            checker.chmod(0o755)
+            env = {
+                **os.environ,
+                "REPLACEMENT_SN2_MODE": "diagnostic",
+                "RUN": str(root),
+                "COMMON": str(common),
+                "TEST_MANIFEST": str(manifest),
+                "TEST_MANIFEST_SHA": file_sha256(manifest),
+                "TEST_CHECKER": str(checker),
+            }
+            command = (
+                'source "$COMMON"; CHECKPOINT_PREFIX=fixture; '
+                'CHECKPOINT_AOT_MANIFEST="$TEST_MANIFEST"; '
+                'CHECKPOINT_AOT_MANIFEST_SHA256="$TEST_MANIFEST_SHA"; '
+                'CHECKPOINT_GPU_BENCH="$TEST_CHECKER"; '
+                'CHECKPOINT_AOT_CHECK="$TEST_CHECKER"; checkpoint_aot_identity'
+            )
+
+            accepted = subprocess.run(
+                ["bash", "-c", command],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            identity = json.loads(
+                (root / "fixture.aot_identity.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(identity["schema"], "stwo.replacement-v1-sn2.aot-identity.v1")
+            self.assertEqual(identity["required_unique_key_count"], 3)
+
+            rejected = subprocess.run(
+                ["bash", "-c", command], capture_output=True, text=True,
+                env={**env, "TEST_COUNT": "4"},
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("identity/coverage failed", rejected.stderr)
+
     def test_replacement_sn2_numerator_validator_rejects_mutations(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
         with tempfile.TemporaryDirectory() as directory:

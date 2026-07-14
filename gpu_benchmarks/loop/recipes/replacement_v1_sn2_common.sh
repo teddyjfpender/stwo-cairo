@@ -470,22 +470,31 @@ PY
 }
 
 checkpoint_aot_identity() {
-  local manifest_sha raw out key
+  local manifest_sha key_lines raw out key expected_key_count
   local -a keys key_args
   checkpoint_reject_ambient_overrides
   manifest_sha="$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")"
   [[ "$manifest_sha" == "$CHECKPOINT_AOT_MANIFEST_SHA256" ]] \
     || { echo "AOT manifest SHA-256 drifted" >&2; return 1; }
-  mapfile -t keys < <(python3 - "$CHECKPOINT_AOT_MANIFEST" <<'PY'
+  key_lines="$(python3 - "$CHECKPOINT_AOT_MANIFEST" <<'PY'
 import json, re, sys
 entries = json.load(open(sys.argv[1], encoding="utf-8"))
-keys = sorted({entry.get("cache_key") for entry in entries})
-if len(entries) != 131 or len(keys) != 131 or any(not isinstance(k, str) or not re.fullmatch(r"[0-9a-f]{16}", k) for k in keys):
-    raise SystemExit("pinned AOT manifest does not contain the expected 131 unique keys")
+if not isinstance(entries, list) or not entries or any(not isinstance(entry, dict) for entry in entries):
+    raise SystemExit("pinned AOT manifest is empty or malformed")
+manifest_keys = [entry.get("cache_key") for entry in entries]
+if any(not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{16}", key)
+       for key in manifest_keys):
+    raise SystemExit("pinned AOT manifest contains an invalid cache key")
+keys = sorted(set(manifest_keys))
+if len(keys) != len(manifest_keys):
+    raise SystemExit("pinned AOT manifest contains duplicate cache keys")
 print("\n".join(keys))
 PY
-  )
-  [[ ${#keys[@]} -eq 131 ]] || { echo "AOT key extraction failed" >&2; return 1; }
+  )" || return 1
+  keys=()
+  while IFS= read -r key; do keys+=("$key"); done <<<"$key_lines"
+  [[ ${#keys[@]} -gt 0 ]] || { echo "AOT key extraction failed" >&2; return 1; }
+  expected_key_count="${#keys[@]}"
   key_args=()
   for key in "${keys[@]}"; do key_args+=(--key "$key"); done
   raw="$(checkpoint_artifact aot_index_raw.json)"
@@ -493,11 +502,12 @@ PY
   out="$(checkpoint_artifact aot_identity.json)"
   MANIFEST_SHA="$manifest_sha" CHECKER_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_CHECK")" \
     GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
-    python3 - "$raw" "$out" <<'PY'
+    EXPECTED_KEY_COUNT="$expected_key_count" python3 - "$raw" "$out" <<'PY'
 import json, os, re, sys
 result = json.load(open(sys.argv[1], encoding="utf-8"))
 if (result.get("pass") is not True or result.get("sm") != 90
-        or result.get("required_unique_key_count") != 131 or result.get("missing_keys") != []
+        or result.get("required_unique_key_count") != int(os.environ["EXPECTED_KEY_COUNT"])
+        or result.get("missing_keys") != []
         or not re.fullmatch(r"(?!0{16})[0-9a-f]{16}", result.get("loaded_manifest_hash", ""))):
     raise SystemExit(f"embedded sm_90 AOT pack identity/coverage failed: {result}")
 record = {"schema": "stwo.replacement-v1-sn2.aot-identity.v1", **result,
