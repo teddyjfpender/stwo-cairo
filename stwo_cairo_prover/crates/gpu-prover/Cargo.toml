@@ -57,6 +57,10 @@ serde_json.workspace = true
 name = "kernel_emit"
 required-features = ["emit-tools"]
 
+[[bin]]
+name = "witness_phase_emit"
+required-features = ["emit-tools"]
+
 # Host-only SN-scale resident-arena preflight (no CUDA); emit-tools supplies the
 # dev-utils VM runner for the --fixture arm.
 [[bin]]
