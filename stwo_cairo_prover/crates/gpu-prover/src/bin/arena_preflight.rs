@@ -45,6 +45,8 @@
 //! (pow_bits=26, FriConfig(0, 1, 70, 3)) — the same "do not change" config in
 //! gpu_bench. Exit code 0 iff the verdict is PASS.
 
+mod arena_preflight_hybrid;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
 
@@ -565,6 +567,7 @@ fn report_json(
         .filter(|group| group.coefficient_source_count == 0)
         .map(|group| group.value_words)
         .sum::<usize>();
+    let hybrid_traffic = arena_preflight_hybrid::json(arena.quotient_numerator());
 
     let budget_bytes = budget_bytes_of(vram_budget_gb);
     let physical_memory = PhysicalMemoryLedger::json(arena, budget_bytes)
@@ -614,6 +617,7 @@ fn report_json(
             "ineligible_groups": numerator_groups.len() - single_write_eligible_groups,
             "eligible_output_rows": single_write_eligible_rows,
             "groups": single_write_groups,
+            "hybrid_traffic_model": hybrid_traffic,
         },
         "transcript_segments": report.transcript_segments,
         "manifest_policy": format!("{:?}", report.manifest_policy),
