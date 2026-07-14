@@ -491,7 +491,7 @@ impl std::error::Error for RelationExecutionError {}
 
 #[cfg(test)]
 mod tests {
-    use stwo_backend_cuda::relation_batch_fused_eligible;
+    use stwo_backend_cuda::{relation_batch_fused_eligible, RELATION_FUSED_MAX_COLUMNS};
     use stwo_cairo_prover::witness::cairo_claim_generator::CairoClaimGenerator;
     use stwo_cairo_prover::witness::proof_shape::{
         ProofShape, RuntimeComponentShape, TracePartShape,
@@ -501,6 +501,71 @@ mod tests {
     use crate::plan::ProofPlan;
     use crate::relation_table::CAIRO_RELATION_GRAPH;
     use crate::schedule_table::CAIRO_SCHEDULE;
+
+    const LEGACY_NARROW_MAX_TUPLE_WORDS: u32 = 32;
+    const WORD_BYTES: u64 = core::mem::size_of::<u32>() as u64;
+    const QM31_BYTES: u64 = 16;
+
+    // Derived from the sealed SN3 adapted input (285,299,888 bytes, SHA-256
+    // cd823275e92b4b224251565791ac0aa794a04377f43fd1198798a0d0c1454bed)
+    // by `real_sn3_capacity_fixture_rederives_relation_accounting` below. These are
+    // planned capacity extents, matching resident-arena preflight accounting.
+    const SN3_NARROW_INSTANCES: usize = 48;
+    const SN3_NARROW_FRACTIONS: u64 = 274_250_768;
+    const SN3_NARROW_DENOMINATOR_BYTES: u64 = 4_388_012_288;
+    const SN3_NEWLY_WIDE_INSTANCES: usize = 10;
+    const SN3_NEWLY_WIDE_FRACTIONS: u64 = 264_177_664;
+    const SN3_NEWLY_WIDE_DENOMINATOR_BYTES: u64 = 4_226_842_624;
+
+    fn legacy_narrow_fused_eligible(batch: &RelationBatchProgram) -> bool {
+        batch.columns.len() <= RELATION_FUSED_MAX_COLUMNS
+            && batch.columns.iter().all(|column| {
+                column
+                    .uses
+                    .iter()
+                    .all(|relation_use| relation_use.tuple_words <= LEGACY_NARROW_MAX_TUPLE_WORDS)
+            })
+    }
+
+    #[derive(Debug, Default, Eq, PartialEq)]
+    struct RelationAccounting {
+        narrow_instances: usize,
+        narrow_fractions: u64,
+        narrow_denominator_bytes: u64,
+        newly_wide_instances: usize,
+        newly_wide_fractions: u64,
+        newly_wide_denominator_bytes: u64,
+    }
+
+    fn relation_accounting(
+        execution: &RelationExecutionPlan,
+        full: &RelationGraphRequirements,
+    ) -> RelationAccounting {
+        let mut accounting = RelationAccounting::default();
+        for requirement in &full.instances {
+            assert_eq!(requirement.denominator_words, requirement.output_words);
+            let denominator_bytes =
+                u64::try_from(requirement.denominator_words).unwrap() * WORD_BYTES;
+            assert_eq!(denominator_bytes % QM31_BYTES, 0);
+            let fractions = denominator_bytes / QM31_BYTES;
+            let batch = &execution.kernel_program.batches[requirement.batch_index];
+            if legacy_narrow_fused_eligible(batch) {
+                accounting.narrow_instances += 1;
+                accounting.narrow_fractions += fractions;
+                accounting.narrow_denominator_bytes += denominator_bytes;
+            } else {
+                assert!(
+                    relation_batch_fused_eligible(batch),
+                    "SN3 batch {} is neither legacy-narrow nor newly-wide eligible",
+                    requirement.batch_index
+                );
+                accounting.newly_wide_instances += 1;
+                accounting.newly_wide_fractions += fractions;
+                accounting.newly_wide_denominator_bytes += denominator_bytes;
+            }
+        }
+        accounting
+    }
 
     #[test]
     fn all_generated_uses_lower_once() {
@@ -521,6 +586,21 @@ mod tests {
             807
         );
         assert_eq!(execution.relation_graph_hash, 0x7396_3831_c53d_f4a2);
+        let newly_wide_batches = execution
+            .kernel_program
+            .batches
+            .iter()
+            .filter(|batch| !legacy_narrow_fused_eligible(batch))
+            .count();
+        assert!(
+            newly_wide_batches > 0,
+            "wide production coverage is vacuous"
+        );
+        assert!(execution
+            .kernel_program
+            .batches
+            .iter()
+            .all(relation_batch_fused_eligible));
         execution.requirements().unwrap();
         let sources = execution.source_plan().unwrap();
         let requirements = execution.requirements().unwrap();
@@ -532,14 +612,85 @@ mod tests {
     }
 
     #[test]
-    fn generated_production_graph_proves_exact_sn3_denominator_retirement() {
-        // Eligibility is a property of each generated batch's columns and
-        // tuple widths, not its runtime row count. Lowering the complete
-        // machine-written graph therefore proves every instance in SN1-SN4,
-        // including batches absent from any one proof shape.
-        let shape = CairoClaimGenerator::default().proof_shape(None).unwrap();
-        let proof =
-            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
+    fn real_sn3_relation_accounting_baselines_are_not_conflated() {
+        let total_instances = SN3_NARROW_INSTANCES + SN3_NEWLY_WIDE_INSTANCES;
+        let total_fractions = SN3_NARROW_FRACTIONS + SN3_NEWLY_WIDE_FRACTIONS;
+        let full_legacy_denominator_bytes =
+            SN3_NARROW_DENOMINATOR_BYTES + SN3_NEWLY_WIDE_DENOMINATOR_BYTES;
+        assert_eq!(total_instances, 58);
+        assert_eq!(total_fractions, 538_428_432);
+        assert_eq!(full_legacy_denominator_bytes, 8_614_854_912);
+        assert_eq!(
+            SN3_NARROW_FRACTIONS * QM31_BYTES,
+            SN3_NARROW_DENOMINATOR_BYTES
+        );
+        assert_eq!(
+            SN3_NEWLY_WIDE_FRACTIONS * QM31_BYTES,
+            SN3_NEWLY_WIDE_DENOMINATOR_BYTES
+        );
+
+        // The CURRENT <=32-word fused baseline already holds one four-byte
+        // sentinel for each narrow instance and a full slab only for the ten
+        // wide instances. The new adaptive lane leaves one sentinel for all
+        // 58. This is logical arena accounting, not aligned physical slots.
+        let current_baseline_denominator_bytes =
+            SN3_NARROW_INSTANCES as u64 * WORD_BYTES + SN3_NEWLY_WIDE_DENOMINATOR_BYTES;
+        let new_denominator_bytes = total_instances as u64 * WORD_BYTES;
+        assert_eq!(current_baseline_denominator_bytes, 4_226_842_816);
+        assert_eq!(new_denominator_bytes, 232);
+        assert_eq!(
+            current_baseline_denominator_bytes - new_denominator_bytes,
+            4_226_842_584,
+            "incremental arena retirement versus the current narrow-fused baseline"
+        );
+        assert_eq!(
+            full_legacy_denominator_bytes - new_denominator_bytes,
+            8_614_854_680,
+            "arena retirement versus a full three-stage legacy baseline"
+        );
+
+        // Post-source-evaluation logical pass bytes per fraction: three-stage
+        // writes pairs (32), reads+writes inverse (32), then reads fractions
+        // (32) and writes output (16) = 112. Existing narrow fused stages,
+        // rereads and overwrites output = 48. New one-read wide writes only the
+        // final output = 16. Tuple-source/descriptor reads are deliberately
+        // excluded; this is a pass-byte model, not measured DRAM traffic.
+        const THREE_STAGE_BYTES: u64 = 112;
+        const NARROW_FUSED_BYTES: u64 = 48;
+        const WIDE_FUSED_BYTES: u64 = 16;
+        let current_baseline_body_bytes = SN3_NARROW_FRACTIONS * NARROW_FUSED_BYTES
+            + SN3_NEWLY_WIDE_FRACTIONS * THREE_STAGE_BYTES;
+        let new_body_bytes =
+            SN3_NARROW_FRACTIONS * NARROW_FUSED_BYTES + SN3_NEWLY_WIDE_FRACTIONS * WIDE_FUSED_BYTES;
+        let full_legacy_body_bytes = total_fractions * THREE_STAGE_BYTES;
+        assert_eq!(current_baseline_body_bytes, 42_751_935_232);
+        assert_eq!(new_body_bytes, 17_390_879_488);
+        assert_eq!(
+            current_baseline_body_bytes - new_body_bytes,
+            25_361_055_744,
+            "incremental pass bytes retired by the new wide lane"
+        );
+        assert_eq!(full_legacy_body_bytes, 60_303_984_384);
+        assert_eq!(
+            full_legacy_body_bytes - new_body_bytes,
+            42_913_104_896,
+            "pass bytes retired versus an all-three-stage legacy implementation"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STWO_SN3_INPUT pointing to the sealed 285 MB adapted fixture"]
+    fn real_sn3_capacity_fixture_rederives_relation_accounting() {
+        let input_path = std::env::var("STWO_SN3_INPUT").unwrap();
+        let input_bytes = std::fs::read(input_path).unwrap();
+        assert_eq!(input_bytes.len(), 285_299_888);
+        let input: stwo_cairo_adapter::ProverInput = bincode::deserialize(&input_bytes).unwrap();
+        let ingest = crate::phases::ingest::run(
+            input,
+            stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant::Canonical,
+            None,
+        );
+        let proof = ingest.proof_plan;
         let execution =
             RelationExecutionPlan::from_proof_plan(&proof, &CAIRO_RELATION_GRAPH).unwrap();
         let ineligible = execution
@@ -563,34 +714,23 @@ mod tests {
             .requirements_for_mode(RelationLaunchMode::Fused)
             .unwrap();
         assert_eq!(full.instances.len(), compact.instances.len());
+        assert_eq!(full.instances.len(), 58, "real SN3 coverage is non-vacuous");
         assert!(compact
             .instances
             .iter()
             .all(|instance| instance.denominator_words == 1));
-
-        // Sealed SN3 arena facts independently identify 58 instances (928 B
-        // claimed sums / 16 B each, and 2,552 B geometry / 44 B each). Since
-        // every production batch above is eligible, no SN3 instance can retain
-        // a slab: only one 4-byte sentinel per instance remains.
-        const SN3_RELATION_INSTANCES: usize = 58;
-        const SN3_LEGACY_DENOMINATOR_BYTES: usize = 4_226_842_816;
-        const QM31_BYTES: usize = 16;
-        const RETIRED_HBM_BYTES_PER_FRACTION: usize = 96;
-        assert_eq!(928 / 16, SN3_RELATION_INSTANCES);
-        assert_eq!(2_552 / 44, SN3_RELATION_INSTANCES);
-        let compact_bytes = SN3_RELATION_INSTANCES * core::mem::size_of::<u32>();
-        assert_eq!(compact_bytes, 232);
-        assert_eq!(SN3_LEGACY_DENOMINATOR_BYTES - compact_bytes, 4_226_842_584);
-
-        // Each old fallback fraction moved 112 logical HBM bytes after source
-        // evaluation (pair writes 32, inverse read/write 32, chain reads 32 +
-        // final write 16); the wide lane writes only the final 16. This is a
-        // pass-byte lower bound, independent of cache transaction effects.
-        let fallback_fractions = SN3_LEGACY_DENOMINATOR_BYTES / QM31_BYTES;
-        assert_eq!(fallback_fractions, 264_177_676);
+        assert_eq!(full.instances.len() * 16, 928, "claimed-sum geometry");
+        assert_eq!(full.instances.len() * 44, 2_552, "launch geometry");
         assert_eq!(
-            fallback_fractions * RETIRED_HBM_BYTES_PER_FRACTION,
-            25_361_056_896
+            relation_accounting(&execution, &full),
+            RelationAccounting {
+                narrow_instances: SN3_NARROW_INSTANCES,
+                narrow_fractions: SN3_NARROW_FRACTIONS,
+                narrow_denominator_bytes: SN3_NARROW_DENOMINATOR_BYTES,
+                newly_wide_instances: SN3_NEWLY_WIDE_INSTANCES,
+                newly_wide_fractions: SN3_NEWLY_WIDE_FRACTIONS,
+                newly_wide_denominator_bytes: SN3_NEWLY_WIDE_DENOMINATOR_BYTES,
+            },
         );
     }
 
