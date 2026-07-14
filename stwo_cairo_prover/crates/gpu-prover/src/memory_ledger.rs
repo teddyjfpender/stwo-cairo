@@ -1,4 +1,4 @@
-//! Allocation-deduplicated host ledger for the resident proof arena.
+//! Physical-memory ledger for the one resident proof-arena allocation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,8 +11,8 @@ const WORD_BYTES: usize = core::mem::size_of::<u32>();
 /// Coarse accounting class inferred from a buffer purpose.
 ///
 /// This is not an allocation-owner identity: shared commitment purposes may
-/// contain either fixed or dynamic data. Physical byte totals remain exact;
-/// this split is diagnostic until ownership is carried by each logical value.
+/// contain either fixed or dynamic data. Range-live byte totals remain exact;
+/// the single allocation is not partitioned by this diagnostic classification.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MemoryPurposeClass {
     FixedData,
@@ -50,78 +50,116 @@ impl MemoryPurposeClass {
 pub struct EpochMemoryLedger {
     pub epoch: ProofEpoch,
     pub logical_bytes_by_purpose_class: BTreeMap<MemoryPurposeClass, usize>,
-    pub physical_bytes_by_purpose_class: BTreeMap<MemoryPurposeClass, usize>,
-    pub slot_slack_bytes: usize,
+    pub range_live_bytes_by_purpose_class: BTreeMap<MemoryPurposeClass, usize>,
+    pub logical_live_bytes: usize,
+    pub range_live_bytes: usize,
+    pub arena_idle_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalMemoryLedger {
     pub arena_allocation_bytes: usize,
-    pub physical_slots: usize,
+    pub whole_slot_comparator_bytes: usize,
+    pub raw_peak_bytes: usize,
+    pub excess_over_raw_peak_bytes: usize,
+    pub range_view_count: usize,
+    pub aggregate_range_view_bytes: usize,
     pub epochs: Vec<EpochMemoryLedger>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EpochRange {
+    id: u32,
+    class: MemoryPurposeClass,
+    logical_words: usize,
+    range_words: usize,
+    offset_words: usize,
+}
+
+const MISSING_ALLOCATION_ROWS: [&str; 6] = [
+    "primary context and driver baseline",
+    "module code and globals",
+    "graph and event metadata",
+    "allocator pool slack",
+    "profiling overhead",
+    "operational safety reserve",
+];
+const ADMISSION_COMPLETE: bool = false;
+const ADMISSION_PASS: bool = false;
+pub const ARENA_IDLE_DEFINITION: &str = concat!(
+    "arena allocation bytes minus the exact disjoint live-address union at that epoch; ",
+    "includes temporarily dead/reused bytes and alignment gaps; diagnostic only, ",
+    "not reclaimable or additive memory"
+);
+
 impl PhysicalMemoryLedger {
     pub fn from_plan(plan: &ProofArenaPlan) -> Result<Self, &'static str> {
-        let mut capacities = BTreeMap::new();
+        if plan.bindings().len() != plan.logical_buffers().len() {
+            return Err("ledger binding cardinality does not match logical values");
+        }
+        let arena_words = plan.total_words();
+        let mut range_views = BTreeMap::new();
         for binding in plan.bindings() {
-            capacities
-                .entry(binding.physical)
-                .and_modify(|words: &mut usize| *words = (*words).max(binding.len_words))
-                .or_insert(binding.len_words);
+            let range = plan
+                .layout()
+                .slot(binding.physical)
+                .ok_or("ledger range view is missing")?;
+            range_views.insert(binding.physical.0, range.len_words);
+        }
+        let aggregate_range_view_words = range_views.values().try_fold(0usize, |sum, &words| {
+            sum.checked_add(words)
+                .ok_or("ledger aggregate range-view size overflow")
+        })?;
+        if range_views.len() != plan.range_view_count()
+            || aggregate_range_view_words != plan.range_view_words()
+        {
+            return Err("ledger range-view metrics do not reconcile");
         }
         let epochs = ProofEpoch::ALL
             .into_iter()
             .map(|epoch| {
-                let mut logical_words = BTreeMap::<MemoryPurposeClass, usize>::new();
-                let mut physical_words = BTreeMap::<MemoryPurposeClass, usize>::new();
-                let mut seen = BTreeSet::new();
-                for buffer in plan
+                let ranges = plan
                     .logical_buffers()
                     .iter()
                     .filter(|buffer| buffer.lifetime.contains(epoch))
-                {
-                    let class = MemoryPurposeClass::of(buffer.purpose);
-                    checked_add(&mut logical_words, class, buffer.len_words)?;
-                    let binding = plan.binding(buffer.id).ok_or("ledger binding is missing")?;
-                    if !seen.insert(binding.physical) {
-                        return Err("ledger found two live owners for one physical slot");
-                    }
-                    checked_add(
-                        &mut physical_words,
-                        class,
-                        *capacities
-                            .get(&binding.physical)
-                            .ok_or("ledger slot capacity is missing")?,
-                    )?;
-                }
-                let logical_total = logical_words.values().try_fold(0usize, |sum, &words| {
-                    sum.checked_add(words).ok_or("ledger logical sum overflow")
-                })?;
-                let physical_total = physical_words.values().try_fold(0usize, |sum, &words| {
-                    sum.checked_add(words).ok_or("ledger physical sum overflow")
-                })?;
-                if physical_total != plan.high_water_words(epoch) || logical_total > physical_total
-                {
-                    return Err("ledger does not reconcile with arena high-water");
-                }
-                Ok(EpochMemoryLedger {
-                    epoch,
-                    logical_bytes_by_purpose_class: into_bytes(logical_words)?,
-                    physical_bytes_by_purpose_class: into_bytes(physical_words)?,
-                    slot_slack_bytes: physical_total
-                        .checked_sub(logical_total)
-                        .and_then(|words| words.checked_mul(WORD_BYTES))
-                        .ok_or("ledger slack overflow")?,
-                })
+                    .map(|buffer| {
+                        let binding = plan.binding(buffer.id).ok_or("ledger binding is missing")?;
+                        if binding.len_words != buffer.len_words {
+                            return Err("ledger binding length does not match logical value");
+                        }
+                        let range = plan
+                            .layout()
+                            .slot(binding.physical)
+                            .ok_or("ledger range view is missing")?;
+                        Ok(EpochRange {
+                            id: binding.physical.0,
+                            class: MemoryPurposeClass::of(buffer.purpose),
+                            logical_words: buffer.len_words,
+                            range_words: range.len_words,
+                            offset_words: range.offset_words,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, &'static str>>()?;
+                reconcile_epoch(epoch, arena_words, plan.high_water_words(epoch), ranges)
             })
             .collect::<Result<Vec<_>, &'static str>>()?;
+        let raw_peak_words = ProofEpoch::ALL
+            .into_iter()
+            .map(|epoch| plan.high_water_words(epoch))
+            .max()
+            .unwrap_or(0);
+        if raw_peak_words != plan.raw_peak_words()
+            || arena_words.checked_sub(raw_peak_words) != Some(plan.excess_over_raw_peak_words())
+        {
+            return Err("ledger range-allocation metrics do not reconcile");
+        }
         Ok(Self {
-            arena_allocation_bytes: plan
-                .total_words()
-                .checked_mul(WORD_BYTES)
-                .ok_or("arena byte size overflow")?,
-            physical_slots: capacities.len(),
+            arena_allocation_bytes: words_to_bytes(arena_words)?,
+            whole_slot_comparator_bytes: words_to_bytes(plan.whole_slot_total_words())?,
+            raw_peak_bytes: words_to_bytes(raw_peak_words)?,
+            excess_over_raw_peak_bytes: words_to_bytes(plan.excess_over_raw_peak_words())?,
+            range_view_count: range_views.len(),
+            aggregate_range_view_bytes: words_to_bytes(aggregate_range_view_words)?,
             epochs,
         })
     }
@@ -140,10 +178,13 @@ impl PhysicalMemoryLedger {
                     "logical_by_purpose_class_bytes": purpose_class_json(
                         &epoch.logical_bytes_by_purpose_class
                     ),
-                    "physical_by_purpose_class_bytes": purpose_class_json(
-                        &epoch.physical_bytes_by_purpose_class
+                    "range_live_by_purpose_class_bytes": purpose_class_json(
+                        &epoch.range_live_bytes_by_purpose_class
                     ),
-                    "slot_slack_bytes": epoch.slot_slack_bytes,
+                    "logical_live_bytes": epoch.logical_live_bytes,
+                    "range_live_bytes": epoch.range_live_bytes,
+                    "range_live_reconciles_logical": epoch.range_live_bytes == epoch.logical_live_bytes,
+                    "arena_idle_bytes": epoch.arena_idle_bytes,
                 })
             })
             .collect::<Vec<_>>();
@@ -168,28 +209,98 @@ impl PhysicalMemoryLedger {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, &'static str>>()?;
-        Ok(serde_json::json!({
-            "allocation_model": "one stable shape arena; subslots deduplicated by ArenaSlotId",
-            "purpose_class_caveat": "purpose classes are diagnostic; shared commitment purposes do not encode exact allocation ownership",
+        let arena_allocation_fit = ledger.arena_allocation_bytes <= operational_ceiling_bytes;
+        let record = serde_json::json!({
+            "allocation_model": "one stable shape-arena allocation with lifetime-reused stable range views",
+            "purpose_class_caveat": "purpose classes diagnose live logical/range views; the one arena allocation cannot be partitioned by purpose because addresses are reused over time, and shared commitment purposes do not encode exact allocation ownership",
+            "arena_idle_definition": ARENA_IDLE_DEFINITION,
             "arena_allocation_id": "shape_arena",
+            "arena_allocation_count": 1,
             "arena_allocation_bytes": ledger.arena_allocation_bytes,
-            "physical_slots": ledger.physical_slots,
+            "whole_slot_comparator_bytes": ledger.whole_slot_comparator_bytes,
+            "raw_peak_bytes": ledger.raw_peak_bytes,
+            "excess_over_raw_peak_bytes": ledger.excess_over_raw_peak_bytes,
+            "range_view_count": ledger.range_view_count,
+            "aggregate_range_view_bytes": ledger.aggregate_range_view_bytes,
             "epochs": epochs,
             "late_coefficient_bytes_by_final_consumer": coefficient_bytes,
             "operational_ceiling_bytes": operational_ceiling_bytes,
-            "arena_only_fit": ledger.arena_allocation_bytes <= operational_ceiling_bytes,
-            "admission_complete": false,
-            "admission_pass": false,
-            "missing_allocation_rows": [
-                "primary context and driver baseline",
-                "module code and globals",
-                "graph and event metadata",
-                "allocator pool slack",
-                "profiling overhead",
-                "operational safety reserve"
-            ],
-        }))
+            "arena_allocation_fit": arena_allocation_fit,
+            "arena_only_fit": arena_allocation_fit,
+            "deprecated_compatibility_aliases": {
+                "arena_only_fit": "arena_allocation_fit",
+                "reason": "preserve the public preflight JSON contract during range-arena migration",
+                "removal_condition": "remove after all external consumers read arena_allocation_fit",
+            },
+            "admission_complete": ADMISSION_COMPLETE,
+            "admission_pass": ADMISSION_PASS,
+            "missing_allocation_rows": MISSING_ALLOCATION_ROWS,
+        });
+        if !fit_alias_matches(&record) {
+            return Err("deprecated arena fit alias drifted from allocation field");
+        }
+        Ok(record)
     }
+}
+
+fn fit_alias_matches(record: &serde_json::Value) -> bool {
+    record.get("arena_only_fit").is_some()
+        && record.get("arena_only_fit") == record.get("arena_allocation_fit")
+}
+
+fn reconcile_epoch(
+    epoch: ProofEpoch,
+    arena_words: usize,
+    reported_live_words: usize,
+    ranges: Vec<EpochRange>,
+) -> Result<EpochMemoryLedger, &'static str> {
+    let mut logical_words = BTreeMap::<MemoryPurposeClass, usize>::new();
+    let mut range_words = BTreeMap::<MemoryPurposeClass, usize>::new();
+    let mut identities = BTreeSet::new();
+    let mut occupied = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if range.logical_words == 0 || range.range_words == 0 {
+            return Err("ledger found an empty live range view");
+        }
+        if range.logical_words != range.range_words {
+            return Err("ledger range-view length does not match logical value");
+        }
+        if !identities.insert(range.id) {
+            return Err("ledger found two live owners for one range view");
+        }
+        let end = range
+            .offset_words
+            .checked_add(range.range_words)
+            .ok_or("ledger range end overflow")?;
+        if end > arena_words {
+            return Err("ledger live range exceeds the arena allocation");
+        }
+        checked_add(&mut logical_words, range.class, range.logical_words)?;
+        checked_add(&mut range_words, range.class, range.range_words)?;
+        occupied.push((range.offset_words, end));
+    }
+    occupied.sort_unstable();
+    if occupied.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err("ledger found overlapping live range views");
+    }
+
+    let logical_total = sum_words(&logical_words, "ledger logical sum overflow")?;
+    let range_total = sum_words(&range_words, "ledger range-live sum overflow")?;
+    if logical_total != range_total || range_total != reported_live_words {
+        return Err("ledger range-live bytes do not reconcile with logical live bytes");
+    }
+    Ok(EpochMemoryLedger {
+        epoch,
+        logical_bytes_by_purpose_class: into_bytes(logical_words)?,
+        range_live_bytes_by_purpose_class: into_bytes(range_words)?,
+        logical_live_bytes: words_to_bytes(logical_total)?,
+        range_live_bytes: words_to_bytes(range_total)?,
+        arena_idle_bytes: words_to_bytes(
+            arena_words
+                .checked_sub(range_total)
+                .ok_or("ledger range-live bytes exceed arena allocation")?,
+        )?,
+    })
 }
 
 fn coefficient_buffer(
@@ -226,6 +337,19 @@ fn checked_add<K: Ord + Copy>(
     let total = totals.entry(key).or_default();
     *total = total.checked_add(value).ok_or("memory ledger overflow")?;
     Ok(())
+}
+
+fn sum_words<K: Ord>(
+    totals: &BTreeMap<K, usize>,
+    overflow: &'static str,
+) -> Result<usize, &'static str> {
+    totals
+        .values()
+        .try_fold(0usize, |sum, &words| sum.checked_add(words).ok_or(overflow))
+}
+
+fn words_to_bytes(words: usize) -> Result<usize, &'static str> {
+    words.checked_mul(WORD_BYTES).ok_or("ledger byte overflow")
 }
 
 fn into_bytes<K: Ord>(words: BTreeMap<K, usize>) -> Result<BTreeMap<K, usize>, &'static str> {
@@ -276,5 +400,125 @@ mod tests {
             MemoryPurposeClass::of(BufferPurpose::ProofBytes),
             MemoryPurposeClass::Output
         );
+    }
+
+    fn range(id: u32, class: MemoryPurposeClass, words: usize, offset_words: usize) -> EpochRange {
+        EpochRange {
+            id,
+            class,
+            logical_words: words,
+            range_words: words,
+            offset_words,
+        }
+    }
+
+    #[test]
+    fn epoch_range_live_reconciles_exactly_and_idle_is_all_unused_arena_bytes() {
+        let ledger = reconcile_epoch(
+            ProofEpoch::Witness,
+            128,
+            96,
+            vec![
+                range(1, MemoryPurposeClass::Input, 32, 0),
+                range(2, MemoryPurposeClass::Dynamic, 64, 64),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(ledger.logical_live_bytes, 96 * WORD_BYTES);
+        assert_eq!(ledger.range_live_bytes, ledger.logical_live_bytes);
+        assert_eq!(ledger.arena_idle_bytes, 32 * WORD_BYTES);
+        assert_eq!(
+            ledger.logical_bytes_by_purpose_class,
+            ledger.range_live_bytes_by_purpose_class
+        );
+    }
+
+    #[test]
+    fn epoch_ledger_rejects_overlapping_live_addresses() {
+        assert_eq!(
+            reconcile_epoch(
+                ProofEpoch::Witness,
+                128,
+                96,
+                vec![
+                    range(1, MemoryPurposeClass::Input, 64, 0),
+                    range(2, MemoryPurposeClass::Dynamic, 32, 48),
+                ],
+            )
+            .unwrap_err(),
+            "ledger found overlapping live range views"
+        );
+    }
+
+    #[test]
+    fn epoch_ledger_rejects_duplicate_live_view_identity_even_at_distinct_addresses() {
+        assert_eq!(
+            reconcile_epoch(
+                ProofEpoch::Witness,
+                128,
+                64,
+                vec![
+                    range(7, MemoryPurposeClass::Input, 32, 0),
+                    range(7, MemoryPurposeClass::Dynamic, 32, 64),
+                ],
+            )
+            .unwrap_err(),
+            "ledger found two live owners for one range view"
+        );
+    }
+
+    #[test]
+    fn epoch_ledger_rejects_logical_range_length_or_high_water_drift() {
+        let mut mismatched = range(1, MemoryPurposeClass::Dynamic, 32, 0);
+        mismatched.range_words = 64;
+        assert_eq!(
+            reconcile_epoch(ProofEpoch::Witness, 128, 32, vec![mismatched]).unwrap_err(),
+            "ledger range-view length does not match logical value"
+        );
+        assert_eq!(
+            reconcile_epoch(
+                ProofEpoch::Witness,
+                128,
+                31,
+                vec![range(1, MemoryPurposeClass::Dynamic, 32, 0)],
+            )
+            .unwrap_err(),
+            "ledger range-live bytes do not reconcile with logical live bytes"
+        );
+    }
+
+    #[test]
+    fn epoch_ledger_rejects_ranges_outside_the_single_allocation() {
+        assert_eq!(
+            reconcile_epoch(
+                ProofEpoch::Witness,
+                128,
+                32,
+                vec![range(1, MemoryPurposeClass::Dynamic, 32, 100)],
+            )
+            .unwrap_err(),
+            "ledger live range exceeds the arena allocation"
+        );
+    }
+
+    #[test]
+    fn non_arena_rows_keep_process_admission_fail_closed() {
+        assert!(!MISSING_ALLOCATION_ROWS.is_empty());
+        assert!(!ADMISSION_COMPLETE);
+        assert!(!ADMISSION_PASS);
+        assert!(MISSING_ALLOCATION_ROWS.contains(&"primary context and driver baseline"));
+        assert!(MISSING_ALLOCATION_ROWS.contains(&"operational safety reserve"));
+    }
+
+    #[test]
+    fn deprecated_arena_only_fit_alias_must_equal_allocation_fit() {
+        let mut record = serde_json::json!({
+            "arena_allocation_fit": true,
+            "arena_only_fit": true,
+        });
+        assert!(fit_alias_matches(&record));
+        record["arena_only_fit"] = serde_json::json!(false);
+        assert!(!fit_alias_matches(&record));
     }
 }

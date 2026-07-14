@@ -10,8 +10,8 @@
 //! -> recorded witness inputs (require_resolved) -> Graph-A multiplicity plan
 //! -> protocol/arena plan. It then prints one JSON record with the component
 //! coverage, multiplicity gaps/blockers, arena words/bytes, per-epoch high
-//! water, slot counts, transcript segments, and a fail-closed physical-memory
-//! admission verdict against a VRAM budget. Arena-only fit remains diagnostic:
+//! water, range-view counts, transcript segments, and a fail-closed physical-memory
+//! admission verdict against a VRAM budget. Arena-allocation fit remains diagnostic:
 //! the process cannot PASS until every non-arena allocation is in the physical
 //! ledger. Every planning failure is the exact fail-closed error the H100
 //! session would raise.
@@ -55,7 +55,7 @@ use stwo::core::pcs::PcsConfig;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_gpu_prover::arena_plan::ProofEpoch;
-use stwo_cairo_gpu_prover::memory_ledger::PhysicalMemoryLedger;
+use stwo_cairo_gpu_prover::memory_ledger::{PhysicalMemoryLedger, ARENA_IDLE_DEFINITION};
 use stwo_cairo_gpu_prover::phases;
 use stwo_cairo_gpu_prover::resident_session::{
     plan_resident_preflight, ResidentPreflightError, ResidentPreflightReport,
@@ -167,20 +167,20 @@ fn parse_vram_budget_gb(value: Option<&str>) -> Result<f64, String> {
 }
 
 /// The arena-planning verdict: full capture-safe coverage, no multiplicity
-/// coverage gaps or feed blockers, exact AOT coverage, and arena-only fit.
+/// coverage gaps or feed blockers, exact AOT coverage, and arena-allocation fit.
 /// Full process admission additionally requires a complete physical ledger.
 fn verdict(
     capture_safe_ok: bool,
     coverage_gaps: usize,
     blockers: usize,
-    arena_bytes: usize,
+    arena_allocation_bytes: usize,
     budget_bytes: usize,
     aot_coverage_ok: bool,
 ) -> bool {
     capture_safe_ok
         && coverage_gaps == 0
         && blockers == 0
-        && arena_bytes <= budget_bytes
+        && arena_allocation_bytes <= budget_bytes
         && aot_coverage_ok
 }
 
@@ -190,6 +190,22 @@ fn admission_verdict(
     physical_admission_pass: bool,
 ) -> bool {
     planning_pass && physical_admission_complete && physical_admission_pass
+}
+
+fn arena_compatibility_aliases_match(arena: &serde_json::Value) -> bool {
+    [
+        ("total_words", "allocation_words"),
+        ("total_bytes", "allocation_bytes"),
+        ("total_gib", "allocation_gib"),
+        ("logical_buffers", "logical_buffer_count"),
+    ]
+    .into_iter()
+    .all(|(legacy, current)| arena.get(legacy).is_some() && arena.get(legacy) == arena.get(current))
+}
+
+fn preflight_fit_alias_matches(record: &serde_json::Value) -> bool {
+    record.get("arena_vram_fit").is_some()
+        && record.get("arena_vram_fit") == record.get("arena_allocation_vram_fit")
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -460,76 +476,63 @@ fn report_json(
     vram_budget_gb: f64,
 ) -> serde_json::Value {
     let arena = &report.arena;
-    let total_words = arena.total_words();
-    let total_bytes = total_words * WORD_BYTES;
-    let mut slot_capacity = BTreeMap::new();
-    for binding in arena.bindings() {
-        let capacity = slot_capacity.entry(binding.physical).or_insert(0usize);
-        *capacity = (*capacity).max(binding.len_words);
-    }
-    let peak_by_epoch: Vec<serde_json::Value> = ProofEpoch::ALL
+    let bytes_of_words = |words: usize| {
+        words
+            .checked_mul(WORD_BYTES)
+            .expect("arena report byte size overflow")
+    };
+    let allocation_words = arena.total_words();
+    let allocation_bytes = bytes_of_words(allocation_words);
+    let live_by_epoch: Vec<serde_json::Value> = ProofEpoch::ALL
         .iter()
         .map(|&epoch| {
-            let words = arena.high_water_words(epoch);
+            let range_live_words = arena.high_water_words(epoch);
             let logical_words = arena
                 .logical_buffers()
                 .iter()
                 .filter(|buffer| buffer.lifetime.contains(epoch))
                 .try_fold(0usize, |total, buffer| total.checked_add(buffer.len_words))
                 .expect("logical epoch words overflow");
-            assert!(
-                logical_words <= words,
-                "logical epoch occupancy exceeds physical high-water"
+            assert_eq!(
+                range_live_words, logical_words,
+                "range-live words must reconcile exactly with logical live words"
             );
-            let mut seen = BTreeSet::new();
-            let mut by_purpose_words = BTreeMap::<String, usize>::new();
-            let mut logical_by_purpose_words = BTreeMap::<String, usize>::new();
+            let arena_idle_words = allocation_words
+                .checked_sub(range_live_words)
+                .expect("range-live words exceed the arena allocation");
+            let mut range_live_by_purpose_words = BTreeMap::<String, usize>::new();
             for buffer in arena
                 .logical_buffers()
                 .iter()
                 .filter(|buffer| buffer.lifetime.contains(epoch))
             {
-                *logical_by_purpose_words
+                let words = range_live_by_purpose_words
                     .entry(format!("{:?}", buffer.purpose))
-                    .or_default() += buffer.len_words;
-                let binding = arena.binding(buffer.id).unwrap();
-                if seen.insert(binding.physical) {
-                    *by_purpose_words
-                        .entry(format!("{:?}", buffer.purpose))
-                        .or_default() += slot_capacity[&binding.physical];
-                }
+                    .or_default();
+                *words = words
+                    .checked_add(buffer.len_words)
+                    .expect("per-purpose range-live words overflow");
             }
             assert_eq!(
-                by_purpose_words.values().sum::<usize>(),
-                words,
-                "per-purpose physical-slot attribution must partition the epoch high-water"
+                range_live_by_purpose_words.values().sum::<usize>(),
+                range_live_words,
+                "per-purpose range-live attribution must partition live words"
             );
-            let by_purpose_bytes = by_purpose_words
+            let range_live_by_purpose_bytes = range_live_by_purpose_words
                 .into_iter()
-                .map(|(purpose, words)| (purpose, words * WORD_BYTES))
-                .collect::<BTreeMap<_, _>>();
-            let logical_by_purpose_bytes = logical_by_purpose_words
-                .into_iter()
-                .map(|(purpose, words)| (purpose, words * WORD_BYTES))
+                .map(|(purpose, words)| (purpose, bytes_of_words(words)))
                 .collect::<BTreeMap<_, _>>();
             serde_json::json!({
                 "epoch": format!("{epoch:?}"),
-                "words": words,
-                "bytes": words * WORD_BYTES,
-                "logical_live_bytes": logical_words * WORD_BYTES,
-                "slot_slack_bytes": (words - logical_words) * WORD_BYTES,
-                "by_purpose_bytes": by_purpose_bytes,
-                "logical_by_purpose_bytes": logical_by_purpose_bytes,
+                "logical_live_bytes": bytes_of_words(logical_words),
+                "range_live_words": range_live_words,
+                "range_live_bytes": bytes_of_words(range_live_words),
+                "range_live_reconciles_logical": true,
+                "arena_idle_bytes": bytes_of_words(arena_idle_words),
+                "range_live_by_purpose_bytes": range_live_by_purpose_bytes,
             })
         })
         .collect();
-    let mut physical_slots: Vec<u32> = arena
-        .bindings()
-        .iter()
-        .map(|binding| binding.physical.0)
-        .collect();
-    physical_slots.sort_unstable();
-    physical_slots.dedup();
 
     let coverage_gaps: Vec<String> = report
         .multiplicities
@@ -581,7 +584,7 @@ fn report_json(
         capture_safe_ok,
         coverage_gaps.len(),
         blockers.len(),
-        total_bytes,
+        allocation_bytes,
         budget_bytes,
         aot_coverage.passed(),
     );
@@ -591,7 +594,7 @@ fn report_json(
         physical_admission_pass,
     );
 
-    serde_json::json!({
+    let record = serde_json::json!({
         "pass": pass,
         "planning_pass": planning_pass,
         "source": source,
@@ -604,12 +607,34 @@ fn report_json(
         "multiplicity_coverage_gaps": coverage_gaps,
         "multiplicity_feed_blockers": blockers,
         "arena": {
-            "total_words": total_words,
-            "total_bytes": total_bytes,
-            "total_gib": (total_bytes as f64) / GIB,
-            "physical_slots": physical_slots.len(),
+            "allocation_count": 1,
+            "allocation_words": allocation_words,
+            "allocation_bytes": allocation_bytes,
+            "allocation_gib": (allocation_bytes as f64) / GIB,
+            "total_words": allocation_words,
+            "total_bytes": allocation_bytes,
+            "total_gib": (allocation_bytes as f64) / GIB,
+            "deprecated_compatibility_aliases": {
+                "total_words": "allocation_words",
+                "total_bytes": "allocation_bytes",
+                "total_gib": "allocation_gib",
+                "logical_buffers": "logical_buffer_count",
+                "reason": "preserve public arena size/count fields during range-arena migration",
+                "removal_condition": "remove after all consumers read arena.allocation_* and logical_buffer_count",
+            },
+            "whole_slot_comparator_words": arena.whole_slot_total_words(),
+            "whole_slot_comparator_bytes": bytes_of_words(arena.whole_slot_total_words()),
+            "raw_peak_words": arena.raw_peak_words(),
+            "raw_peak_bytes": bytes_of_words(arena.raw_peak_words()),
+            "excess_over_raw_peak_words": arena.excess_over_raw_peak_words(),
+            "excess_over_raw_peak_bytes": bytes_of_words(arena.excess_over_raw_peak_words()),
+            "range_view_count": arena.range_view_count(),
+            "aggregate_range_view_words": arena.range_view_words(),
+            "aggregate_range_view_bytes": bytes_of_words(arena.range_view_words()),
+            "logical_buffer_count": arena.logical_buffers().len(),
             "logical_buffers": arena.logical_buffers().len(),
-            "peak_by_epoch": peak_by_epoch,
+            "arena_idle_definition": ARENA_IDLE_DEFINITION,
+            "live_by_epoch": live_by_epoch,
         },
         "physical_memory": physical_memory,
         "quotient_numerator_single_write": {
@@ -635,11 +660,26 @@ fn report_json(
         },
         "vram_budget_gib": vram_budget_gb,
         "vram_budget_bytes": budget_bytes,
-        "arena_vram_fit": total_bytes <= budget_bytes,
+        "arena_allocation_vram_fit": allocation_bytes <= budget_bytes,
+        "arena_vram_fit": allocation_bytes <= budget_bytes,
+        "deprecated_compatibility_aliases": {
+            "arena_vram_fit": "arena_allocation_vram_fit",
+            "reason": "preserve the public preflight JSON contract during range-arena migration",
+            "removal_condition": "remove after all external consumers read arena_allocation_vram_fit",
+        },
         "vram_fit": physical_admission_complete && physical_admission_pass,
         "caveat": "vram_fit fails closed until the physical ledger includes the CUDA context, \
                    modules, graph metadata, allocator slack, profiling overhead, and safety reserve",
-    })
+    });
+    assert!(
+        arena_compatibility_aliases_match(&record["arena"]),
+        "deprecated arena aliases drifted from current fields"
+    );
+    assert!(
+        preflight_fit_alias_matches(&record),
+        "deprecated arena VRAM-fit alias drifted from allocation field"
+    );
+    record
 }
 
 fn main() -> ExitCode {

@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use super::{
-    admission_verdict, budget_bytes_of, missing_aot_kernels, parse_vram_budget_gb, verdict,
-    AotKernelOccurrence, AotManifestKernel, GIB, WORD_BYTES,
+    admission_verdict, arena_compatibility_aliases_match, budget_bytes_of, missing_aot_kernels,
+    parse_vram_budget_gb, preflight_fit_alias_matches, verdict, AotKernelOccurrence,
+    AotManifestKernel, GIB, WORD_BYTES,
 };
 
 #[test]
@@ -47,6 +48,37 @@ fn admission_requires_a_complete_passing_physical_ledger() {
     assert!(!admission_verdict(false, true, true));
     assert!(!admission_verdict(true, false, true));
     assert!(!admission_verdict(true, true, false));
+}
+
+#[test]
+fn deprecated_arena_aliases_must_equal_current_fields() {
+    let mut arena = serde_json::json!({
+        "allocation_words": 7,
+        "allocation_bytes": 28,
+        "allocation_gib": 28.0 / GIB,
+        "total_words": 7,
+        "total_bytes": 28,
+        "total_gib": 28.0 / GIB,
+        "logical_buffer_count": 3,
+        "logical_buffers": 3,
+    });
+    assert!(arena_compatibility_aliases_match(&arena));
+    arena["total_bytes"] = serde_json::json!(27);
+    assert!(!arena_compatibility_aliases_match(&arena));
+    arena["total_bytes"] = serde_json::json!(28);
+    arena["logical_buffers"] = serde_json::json!(2);
+    assert!(!arena_compatibility_aliases_match(&arena));
+}
+
+#[test]
+fn deprecated_arena_vram_fit_alias_must_equal_allocation_fit() {
+    let mut record = serde_json::json!({
+        "arena_allocation_vram_fit": true,
+        "arena_vram_fit": true,
+    });
+    assert!(preflight_fit_alias_matches(&record));
+    record["arena_vram_fit"] = serde_json::json!(false);
+    assert!(!preflight_fit_alias_matches(&record));
 }
 
 #[test]
