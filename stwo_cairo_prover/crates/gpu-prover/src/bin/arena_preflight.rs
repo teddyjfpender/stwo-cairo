@@ -52,14 +52,16 @@ mod arena_preflight_cli;
 #[path = "../arena_preflight_hybrid.rs"]
 mod arena_preflight_hybrid;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::process::ExitCode;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
-use stwo_cairo_gpu_prover::arena_plan::{ProofEpoch, ResidentBackend};
+use stwo_cairo_gpu_prover::arena_plan::{ProofEpoch, ProtocolIdentity, ResidentBackend};
 use stwo_cairo_gpu_prover::memory_ledger::{PhysicalMemoryLedger, ARENA_IDLE_DEFINITION};
 use stwo_cairo_gpu_prover::phases;
+use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
 use stwo_cairo_gpu_prover::resident_session::{
     plan_resident_preflight_for, ResidentPreflightError, ResidentPreflightReport,
 };
@@ -155,6 +157,96 @@ impl AotCoverage {
 
 fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+fn topology_digest_hex(digest: &[u8; 32]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
+fn protocol_key_hex(key: u64) -> String {
+    format!("{key:016x}")
+}
+
+fn validate_selected_policy(
+    selected_backend: ResidentBackend,
+    policy: ProtocolPlanPolicy,
+) -> Result<(), String> {
+    if policy.resident_backend != selected_backend {
+        return Err(format!(
+            "selected resident backend {} planned as {}",
+            selected_backend.cli_name(),
+            policy.resident_backend.cli_name()
+        ));
+    }
+    if selected_backend == ResidentBackend::ReplacementV1
+        && policy
+            != ProtocolPlanPolicy::replacement_v1(
+                policy.kernel_manifest_hash,
+                policy.composition_max_kernel_instrs,
+            )
+    {
+        return Err("replacement-v1 policy drifted from its immutable tuple".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_protocol_identity(
+    policy: ProtocolPlanPolicy,
+    identity: ProtocolIdentity,
+) -> Result<(), String> {
+    macro_rules! require_policy_field {
+        ($field:ident) => {
+            if identity.$field != policy.$field {
+                return Err(format!(
+                    "arena protocol identity field {} drifted from the selected policy",
+                    stringify!($field)
+                ));
+            }
+        };
+    }
+
+    require_policy_field!(channel_tag);
+    require_policy_field!(kernel_manifest_hash);
+    require_policy_field!(decommit_strategy);
+    require_policy_field!(interpolation_mode);
+    require_policy_field!(blake2s_interior_fused);
+    require_policy_field!(composition_launch_mode);
+    require_policy_field!(relation_tail_mode);
+    require_policy_field!(fri_fold_launch_mode);
+    require_policy_field!(witness_feed_launch_mode);
+    require_policy_field!(resident_backend);
+    require_policy_field!(quotient_numerator_schedule);
+    require_policy_field!(quotient_numerator_source_policy);
+    require_policy_field!(commit_mode);
+    require_policy_field!(direct_composition_retention_mode);
+    Ok(())
+}
+
+fn validate_preflight_identity(
+    report: &ResidentPreflightReport,
+    selected_backend: ResidentBackend,
+) -> Result<(), String> {
+    let policy = report.protocol_policy;
+    validate_selected_policy(selected_backend, policy)?;
+    let identity = report.arena.protocol_identity();
+    validate_protocol_identity(policy, identity)?;
+    if report.arena.commitments().iter().any(|commitment| {
+        commitment.config.unretained_bottom_layers != policy.unretained_bottom_layers
+            || commitment.config.max_fused_tail_levels != policy.max_fused_tail_levels
+    }) {
+        return Err("arena commitment memory policy drifted from the selected policy".to_owned());
+    }
+    if identity.retained_evaluation_union_bytes > policy.retained_lde_budget_bytes {
+        return Err(format!(
+            "arena retained-evaluation union {} exceeds selected policy budget {}",
+            identity.retained_evaluation_union_bytes, policy.retained_lde_budget_bytes
+        ));
+    }
+    Ok(())
 }
 
 /// The arena-planning verdict: full capture-safe coverage, no multiplicity
@@ -595,6 +687,10 @@ fn report_json(
         "planning_pass": planning_pass,
         "source": source,
         "selected_resident_backend": selected_backend.cli_name(),
+        "shape_executable_topology_digest": topology_digest_hex(
+            &report.shape_executable_topology_digest
+        ),
+        "protocol_key": protocol_key_hex(arena.protocol_key),
         "present_components": report.present_components.len(),
         "capture_safe_components": report.capture_safe_components.len(),
         "capture_safe_coverage_ok": capture_safe_ok,
@@ -716,6 +812,10 @@ fn main() -> ExitCode {
             return fail("graph_a_multiplicity_plan", format!("{error:?}"))
         }
     };
+
+    if let Err(error) = validate_preflight_identity(&report, resident_backend) {
+        return fail("protocol_identity", error);
+    }
 
     let aot_coverage = match aot_coverage(&report, &aot_manifest) {
         Ok(coverage) => coverage,

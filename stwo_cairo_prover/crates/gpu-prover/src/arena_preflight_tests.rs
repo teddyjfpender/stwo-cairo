@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use super::{
     admission_verdict, arena_compatibility_aliases_match, budget_bytes_of, missing_aot_kernels,
-    parse_resident_backend, parse_vram_budget_gb, preflight_fit_alias_matches, runtime_policy_json,
+    parse_resident_backend, parse_vram_budget_gb, preflight_fit_alias_matches, protocol_key_hex,
+    runtime_policy_json, topology_digest_hex, validate_protocol_identity, validate_selected_policy,
     verdict, AotKernelOccurrence, AotManifestKernel, GIB, WORD_BYTES,
 };
 
@@ -85,7 +86,101 @@ fn replacement_policy_json_reports_the_exact_planned_tuple() {
         "reuse-retained-evaluations"
     );
     assert_eq!(value["interpolation_mode"], "stage-fused-out-of-place");
+    assert_eq!(value["blake2s_interior_fused"], false);
+    assert_eq!(value["composition_launch_mode"], "serial");
+    assert_eq!(value["relation_tail_mode"], "segmented");
+    assert_eq!(value["fri_fold_launch_mode"], "per-fold");
+    assert_eq!(value["witness_feed_launch_mode"], "global-atomics");
     assert_eq!(value["relation_launch_mode"], "fused");
+}
+
+#[test]
+fn replacement_preflight_rejects_policy_or_identity_drift() {
+    use stwo_backend_cuda::{
+        FriFoldLaunchMode, InterpolationLaunchMode, ProgressiveCommitMode, RelationTailMode,
+        WitnessFeedLaunchMode,
+    };
+    use stwo_cairo_gpu_prover::arena_plan::{
+        DecommitStrategy, ProtocolIdentity, QuotientNumeratorSchedule,
+        QuotientNumeratorSourcePolicy, ResidentBackend,
+    };
+    use stwo_cairo_gpu_prover::direct_composition_retention::DirectCompositionRetentionMode;
+    use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
+    use stwo_cairo_gpu_prover::CompositionLaunchMode;
+
+    let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
+    assert_eq!(
+        validate_selected_policy(ResidentBackend::ReplacementV1, policy),
+        Ok(())
+    );
+    let identity = ProtocolIdentity {
+        pow_bits: 26,
+        log_blowup_factor: 1,
+        log_last_layer_degree_bound: 0,
+        fri_fold_step: 3,
+        channel_tag: policy.channel_tag,
+        relation_graph_hash: 1,
+        preprocessed_binding_hash: 2,
+        oods_topology_hash: 3,
+        composition_plan_hash: 4,
+        kernel_manifest_hash: policy.kernel_manifest_hash,
+        decommit_strategy: policy.decommit_strategy,
+        interpolation_mode: policy.interpolation_mode,
+        blake2s_interior_fused: policy.blake2s_interior_fused,
+        composition_launch_mode: policy.composition_launch_mode,
+        relation_tail_mode: policy.relation_tail_mode,
+        fri_fold_launch_mode: policy.fri_fold_launch_mode,
+        witness_feed_launch_mode: policy.witness_feed_launch_mode,
+        resident_backend: policy.resident_backend,
+        quotient_numerator_schedule: policy.quotient_numerator_schedule,
+        quotient_numerator_source_policy: policy.quotient_numerator_source_policy,
+        commit_mode: policy.commit_mode,
+        direct_composition_retention_mode: policy.direct_composition_retention_mode,
+        direct_composition_planner_key: 5,
+        direct_composition_occurrence_bitmap_hash: 6,
+        direct_composition_group_rounded_bytes: 7,
+        numerator_evaluation_group_rounded_bytes: 8,
+        retained_evaluation_union_bytes: 9,
+    };
+    assert_eq!(validate_protocol_identity(policy, identity), Ok(()));
+
+    let mut drifted_policy = policy;
+    drifted_policy.retained_lde_budget_bytes -= 1;
+    assert!(validate_selected_policy(ResidentBackend::ReplacementV1, drifted_policy).is_err());
+
+    let mutations: [fn(&mut ProtocolIdentity); 14] = [
+        |identity| identity.channel_tag ^= 1,
+        |identity| identity.kernel_manifest_hash ^= 1,
+        |identity| identity.decommit_strategy = DecommitStrategy::RetainAllLde,
+        |identity| identity.interpolation_mode = InterpolationLaunchMode::StageWiseCopyThenInPlace,
+        |identity| identity.blake2s_interior_fused = true,
+        |identity| identity.composition_launch_mode = CompositionLaunchMode::Wide,
+        |identity| identity.relation_tail_mode = RelationTailMode::Scan,
+        |identity| identity.fri_fold_launch_mode = FriFoldLaunchMode::FusedTriple,
+        |identity| identity.witness_feed_launch_mode = WitnessFeedLaunchMode::Privatized,
+        |identity| identity.resident_backend = ResidentBackend::LegacyResident,
+        |identity| identity.quotient_numerator_schedule = QuotientNumeratorSchedule::LegacyBatches,
+        |identity| {
+            identity.quotient_numerator_source_policy =
+                QuotientNumeratorSourcePolicy::CoefficientsOnly
+        },
+        |identity| identity.commit_mode = ProgressiveCommitMode::FullLifting,
+        |identity| {
+            identity.direct_composition_retention_mode = DirectCompositionRetentionMode::Disabled
+        },
+    ];
+    for mutate in mutations {
+        let mut drifted = identity;
+        mutate(&mut drifted);
+        assert!(validate_protocol_identity(policy, drifted).is_err());
+    }
+}
+
+#[test]
+fn output_identifiers_are_fixed_width_lowercase_hex() {
+    assert_eq!(topology_digest_hex(&[0xab; 32]), "ab".repeat(32));
+    assert_eq!(topology_digest_hex(&[0; 32]).len(), 64);
+    assert_eq!(protocol_key_hex(0xabcdef), "0000000000abcdef");
 }
 
 #[test]
