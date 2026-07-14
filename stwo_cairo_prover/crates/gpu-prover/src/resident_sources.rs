@@ -926,9 +926,22 @@ pub fn stage_preprocessed_commitment(
         }
         Ok(())
     })();
-    // A selected source drops after its isolated-stream copy is fenced, which
-    // enqueues a legacy-stream free. Drain that free on both success and every
-    // early-error path; preserve the source-stage error if cleanup also fails.
+    // Registered sources enqueue arena-stream copies without a per-column
+    // fence because their process-owned storage cannot disappear. A later
+    // detached-source failure must still drain that successful prefix before
+    // the workspace can unwind. Preserve the source-stage error if this fence
+    // also fails.
+    let source_stage_result = fence_after(source_stage_result, || {
+        workspace
+            .arena()
+            .context()
+            .sync()
+            .map_err(ResidentSourceStageError::from)
+    });
+    // A selected detached source drops after its isolated-stream copy is
+    // fenced, which enqueues a legacy-stream free. Drain that free on both
+    // success and every early-error path. Nesting `fence_after` makes both
+    // fences unconditional while retaining the first operation/fence error.
     fence_after(source_stage_result, || {
         streamer
             .synchronize()
@@ -1794,6 +1807,22 @@ mod tests {
         });
         assert_eq!(calls.get(), 2);
         assert_eq!(result, Err("sync"));
+    }
+
+    #[test]
+    fn nested_source_fences_both_run_and_preserve_the_primary_error() {
+        let calls = Cell::new(0);
+        let operation = Err::<(), _>("source");
+        let arena_fenced = fence_after(operation, || {
+            calls.set(calls.get() + 1);
+            Err("arena")
+        });
+        let fully_fenced = fence_after(arena_fenced, || {
+            calls.set(calls.get() + 1);
+            Err("legacy")
+        });
+        assert_eq!(calls.get(), 2);
+        assert_eq!(fully_fenced, Err("source"));
     }
 
     #[test]
