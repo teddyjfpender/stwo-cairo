@@ -1,0 +1,26 @@
+[package]
+name = "stwo-gpu-lab-pie-adapter"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+bincode = "=1.3.3"
+cairo-program-runner-lib = { git = "https://github.com/starkware-libs/proving-utils", rev = "14490bfd" }
+cairo-vm = { version = "=3.2.0", features = ["extensive_hints", "mod_builtin", "clap"], default-features = false }
+serde = { version = "=1.0.228", features = ["derive"] }
+stwo-cairo-adapter = { path = "../../../stwo_cairo_prover/crates/adapter" }
+
+# Keep the adapter on the exact local host implementation under qualification.
+# Neither patch introduces a CUDA crate or a GPU build script.
+[patch."https://github.com/teddyjfpender/stwo"]
+stwo = { path = "../../../../stwo/crates/stwo" }
+stwo-constraint-framework = { path = "../../../../stwo/crates/constraint-framework" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
