@@ -1,0 +1,15 @@
+# shellcheck shell=bash
+# Follow-on only: no build, no diagnostic exception. This refuses to run unless
+# the exact source, binary, AOT pack, inputs, and GPU match a passing diagnostic
+# seal created by replacement_v1_sn2_checkpoint.phases. Six reps yield five warm
+# samples and the strict graph-submit gate is performance-admission critical.
+#
+#   ./pod_run.sh recipes/replacement_v1_sn2_timing.phases \
+#     replacement_v1_sn2_timing_$(date -u +%Y%m%dT%H%M%SZ)
+
+REPLACEMENT_SN2_MODE=timing
+source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
+
+phase sealed_diagnostic_identity checkpoint_verify_sealed_diagnostic
+phase sn2_timing checkpoint_run_sn2 timing 6
+phase sn2_timing_validate checkpoint_validate_sn2 timing 6

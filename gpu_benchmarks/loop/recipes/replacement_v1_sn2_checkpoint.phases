@@ -1,0 +1,23 @@
+# shellcheck shell=bash
+# First replacement-v1 SN2 end-to-end checkpoint. This is the only recipe that
+# may soften graph-submit timing, and its timing is explicitly inadmissible.
+# All source, input, carry, numerator, AOT, architecture, proof-byte, verifier,
+# fallback, JIT, CUDA, and OOM gates remain fail-closed.
+#
+# Run from gpu_benchmarks/loop with a unique result label:
+#   ./pod_run.sh recipes/replacement_v1_sn2_checkpoint.phases \
+#     replacement_v1_sn2_checkpoint_$(date -u +%Y%m%dT%H%M%SZ)
+
+REPLACEMENT_SN2_MODE=diagnostic
+source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
+
+phase source_input_identity checkpoint_source_input_identity
+phase hardware_identity checkpoint_hardware_identity
+phase build checkpoint_build
+phase adapted_input_identity checkpoint_adapted_input_identity
+phase fp256_carry_oracles checkpoint_fp256_carry_oracles
+phase exact_numerator_ab checkpoint_exact_numerator_ab
+phase aot_identity checkpoint_aot_identity
+phase sn2_diagnostic checkpoint_run_sn2 diagnostic 2
+phase sn2_diagnostic_validate checkpoint_validate_sn2 diagnostic 2
+phase seal_passing_diagnostic checkpoint_seal_diagnostic
