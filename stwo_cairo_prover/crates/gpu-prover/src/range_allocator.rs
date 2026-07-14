@@ -165,6 +165,15 @@ pub fn allocate_ranges(
     slab_alignment_words: usize,
     capacity_words: Option<usize>,
 ) -> Result<RangeLayout, RangeAllocationError> {
+    allocate_ranges_impl(requests, slab_alignment_words, capacity_words, true)
+}
+
+fn allocate_ranges_impl(
+    requests: &[RangeRequest],
+    slab_alignment_words: usize,
+    capacity_words: Option<usize>,
+    reuse_search_cursor: bool,
+) -> Result<RangeLayout, RangeAllocationError> {
     validate_requests(requests, slab_alignment_words)?;
     let raw_peak_words = raw_peak_words(requests)?;
     let mut units = collapse_alias_groups(requests)?;
@@ -179,13 +188,28 @@ pub fn allocate_ranges(
 
     let mut occupied: [BTreeMap<usize, (usize, RangeId)>; u16::BITS as usize] =
         std::array::from_fn(|_| BTreeMap::new());
+    let mut next_search_cursor = BTreeMap::<(usize, usize, u16), usize>::new();
     let mut bindings = Vec::with_capacity(requests.len());
     let mut max_end = 0usize;
     for unit in units {
-        let offset_words = lowest_available_offset(&unit, &occupied)?;
+        let search_key = (unit.len_words, unit.alignment_words, unit.live_mask);
+        let cursor = reuse_search_cursor
+            .then(|| next_search_cursor.get(&search_key).copied())
+            .flatten()
+            .unwrap_or(0);
+        let offset_words = lowest_available_offset(&unit, &occupied, cursor)?;
         let end_words = offset_words
             .checked_add(unit.len_words)
             .ok_or(RangeAllocationError::SizeOverflow)?;
+        if reuse_search_cursor {
+            // Exact first-fit lower bound for the next identical placement
+            // key. Before this insertion every candidate below `offset_words`
+            // was already invalid. Afterwards every candidate from there to
+            // `end_words` conflicts with this equal-length, equal-mask range.
+            // Occupancy only grows, so restarting at `end_words` cannot skip a
+            // future valid offset and preserves the uncached layout exactly.
+            next_search_cursor.insert(search_key, end_words);
+        }
         max_end = max_end.max(end_words);
         for bit in live_bits(unit.live_mask) {
             let previous = occupied[bit].insert(offset_words, (end_words, unit.id));
@@ -423,8 +447,8 @@ fn collapse_alias_groups(
 fn lowest_available_offset(
     unit: &PlacementUnit,
     occupied: &[BTreeMap<usize, (usize, RangeId)>; u16::BITS as usize],
+    mut cursor: usize,
 ) -> Result<usize, RangeAllocationError> {
-    let mut cursor = 0usize;
     loop {
         let candidate = align_up(cursor, unit.alignment_words)?;
         let candidate_end = candidate
@@ -443,6 +467,15 @@ fn lowest_available_offset(
             None => return Ok(candidate),
         }
     }
+}
+
+#[cfg(test)]
+fn allocate_ranges_uncached_reference(
+    requests: &[RangeRequest],
+    slab_alignment_words: usize,
+    capacity_words: Option<usize>,
+) -> Result<RangeLayout, RangeAllocationError> {
+    allocate_ranges_impl(requests, slab_alignment_words, capacity_words, false)
 }
 
 fn live_bits(mask: u16) -> impl Iterator<Item = usize> {

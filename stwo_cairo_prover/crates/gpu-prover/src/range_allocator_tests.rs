@@ -246,6 +246,76 @@ fn layout_is_stable_across_input_order() {
 }
 
 #[test]
+fn monotonic_search_is_byte_identical_to_uncached_first_fit() {
+    let masks = [
+        0b0000_0000_0001,
+        0b0000_0000_0011,
+        0b0000_0000_0110,
+        0b0000_0000_1110,
+        0b0000_0001_1100,
+        0b0000_0011_1000,
+        0b0000_0111_0000,
+        0b0000_1110_0000,
+    ];
+    let mut state = 0x243f_6a88_85a3_08d3u64;
+    let mut requests = Vec::new();
+    for id in 0..768u32 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut value = request(
+            id,
+            [32, 64, 96, 128][(state as usize >> 8) & 3],
+            masks[(state as usize >> 16) & 7],
+        );
+        value.alignment_words = [1, 2, 4, 32][(state as usize >> 24) & 3];
+        requests.push(value);
+    }
+    for group in 1..=12u32 {
+        let mut evaluation = request(768 + (group - 1) * 2, 96, 0b0000_0000_0011);
+        evaluation.alignment_words = 32;
+        evaluation.must_alias = Some(AliasGroupId(group));
+        let mut coefficients = request(769 + (group - 1) * 2, 96, 0b0000_0000_1100);
+        coefficients.alignment_words = 32;
+        coefficients.must_alias = Some(AliasGroupId(group));
+        requests.extend([evaluation, coefficients]);
+    }
+
+    let expected = allocate_ranges_uncached_reference(&requests, 32, None).unwrap();
+    let actual = allocate_ranges(&requests, 32, None).unwrap();
+    assert_eq!(actual, expected);
+
+    requests.reverse();
+    assert_eq!(allocate_ranges(&requests, 32, None).unwrap(), expected);
+}
+
+#[test]
+fn repeated_shape_20k_scale_regression() {
+    let mut requests = (0..20_500u32)
+        .map(|id| {
+            let mut value = request(id, 128, 0b0000_0000_1111);
+            value.alignment_words = 32;
+            value
+        })
+        .collect::<Vec<_>>();
+    // Interleave a second repeated shape so the cursor proof is exercised
+    // across intervening placements, not only one contiguous sort run.
+    for request in requests.iter_mut().step_by(11) {
+        request.live_mask = 0b0000_1111_0000;
+    }
+
+    let started = std::time::Instant::now();
+    let layout = allocate_ranges(&requests, 32, None).unwrap();
+    eprintln!(
+        "range_allocator_scale ranges={} elapsed_ms={}",
+        requests.len(),
+        started.elapsed().as_millis()
+    );
+    assert_eq!(layout.bindings().len(), requests.len());
+    validate_range_layout(&requests, 32, None, &layout).unwrap();
+}
+
+#[test]
 fn exhaustive_single_epoch_cases_hit_the_hard_lower_bound() {
     for case in 0..6561u32 {
         let mut digits = case;
