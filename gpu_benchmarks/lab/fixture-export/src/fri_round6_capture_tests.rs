@@ -101,6 +101,41 @@ fn valid_seed_rebuilds_full_schedule_closure() {
 }
 
 #[test]
+fn observer_encoder_roundtrips_through_the_capture_verifier() {
+    let source = CaptureSource {
+        observer: "stwo-cairo.production-simd-fri-observer.v1".into(),
+        prover_input_sha256: "22".repeat(32),
+        prover_input_bytes: 1_024,
+        observer_proof_shape_id: "44".repeat(32),
+    };
+    let channel = |word, n_draws| ObserverChannelState {
+        digest_words: [word; 8],
+        n_draws,
+    };
+    let bytes = encode_observer_seed(
+        source,
+        shape(),
+        (0..256).map(|word| word as u32).collect(),
+        ObserverRound6 {
+            pre_root6: channel(1, 2),
+            root6_words: [2; 8],
+            alpha6_words: [3; 4],
+            cursor34: channel(4, 1),
+            root7_words: [5; 8],
+            cursor35: channel(6, 0),
+            alpha7_words: [7; 4],
+            cursor36: channel(6, 1),
+        },
+    )
+    .unwrap();
+    let seed: CaptureSeed = serde_json::from_slice(&bytes).unwrap();
+    let verified = verify(seed, sha256_hex(&bytes)).unwrap();
+    assert_eq!(verified.source.observer_proof_shape_id, "44".repeat(32));
+    assert_eq!(verified.cursor32[8], 2);
+    assert_eq!(verified.observed.root6_words, [2; 8]);
+}
+
+#[test]
 fn tampered_schedule_prefix_is_rejected() {
     let mut capture = seed();
     capture.schedule.c34 = "0000000000000000".into();

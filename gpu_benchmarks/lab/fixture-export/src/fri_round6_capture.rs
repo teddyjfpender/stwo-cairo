@@ -87,6 +87,26 @@ pub struct Observed {
     pub cursor36_state_words: Vec<u32>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ObserverChannelState {
+    pub(crate) digest_words: [u32; 8],
+    pub(crate) n_draws: u32,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ObserverRound6 {
+    pub(crate) pre_root6: ObserverChannelState,
+    pub(crate) root6_words: [u32; 8],
+    pub(crate) alpha6_words: [u32; 4],
+    pub(crate) cursor34: ObserverChannelState,
+    pub(crate) root7_words: [u32; 8],
+    pub(crate) cursor35: ObserverChannelState,
+    pub(crate) alpha7_words: [u32; 4],
+    pub(crate) cursor36: ObserverChannelState,
+}
+
 pub struct VerifiedCapture {
     pub capture_sha256: String,
     pub source: CaptureSource,
@@ -110,6 +130,83 @@ pub fn load(path: &Path, expected_sha256: &str) -> Result<VerifiedCapture, Strin
     let seed: CaptureSeed = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse FRI capture seed {}: {error}", path.display()))?;
     verify(seed, actual_sha256)
+}
+
+/// Encodes a test-only observer snapshot through the production capture schema.
+///
+/// The result is deliberately only bytes: it cannot admit a fixture, and it is
+/// reloaded by the same fail-closed parser used at the verifier boundary.
+#[cfg(test)]
+pub(crate) fn encode_observer_seed(
+    source: CaptureSource,
+    shape: CaptureShape,
+    entry_pong_words: Vec<u32>,
+    observed: ObserverRound6,
+) -> Result<Vec<u8>, String> {
+    let operations = cairo_operations(&shape)?;
+    let schedule = Blake2sTranscriptSchedule::new(
+        TranscriptStart::Default,
+        operations.clone(),
+        MAX_REJECTION_ROUNDS,
+    )
+    .map_err(|error| error.to_string())?;
+    let prefix = independent_prefix_chains(&operations);
+    let chains: [u64; 5] = prefix
+        .get(32..=36)
+        .ok_or("captured Cairo schedule does not reach C36")?
+        .try_into()
+        .map_err(|_| "captured Cairo schedule has an invalid C32-C36 window")?;
+    let cursor32_state_words = observer_state_words(&observed.pre_root6, 32, chains[0]);
+    let seed = CaptureSeed {
+        schema_version: CAPTURE_SCHEMA.into(),
+        source,
+        shape: shape.clone(),
+        schedule: ScheduleSeal {
+            device_protocol_key: format!("{:016x}", schedule.protocol_key()),
+            cairo_schedule_key: format!(
+                "{:016x}",
+                compute_cairo_schedule_key(schedule.protocol_key(), &shape)
+            ),
+            c32: format!("{:016x}", chains[0]),
+            c33: format!("{:016x}", chains[1]),
+            c34: format!("{:016x}", chains[2]),
+            c35: format!("{:016x}", chains[3]),
+            c36: format!("{:016x}", chains[4]),
+        },
+        cursor32_state_words_sha256: sha256_hex(&word_bytes(&cursor32_state_words)),
+        cursor32_state_words,
+        entry_pong_words_sha256: sha256_hex(&word_bytes(&entry_pong_words)),
+        entry_pong_words,
+        observed: Observed {
+            root6_words: observed.root6_words.to_vec(),
+            alpha6_words: observed.alpha6_words.to_vec(),
+            cursor34_state_words: observer_state_words(&observed.cursor34, 34, chains[2]),
+            root7_words: observed.root7_words.to_vec(),
+            alpha7_words: observed.alpha7_words.to_vec(),
+            cursor35_state_words: observer_state_words(&observed.cursor35, 35, chains[3]),
+            cursor36_state_words: observer_state_words(&observed.cursor36, 36, chains[4]),
+        },
+    };
+    let bytes = serde_json::to_vec_pretty(&seed)
+        .map_err(|error| format!("serialize FRI observer capture: {error}"))?;
+    verify(seed, sha256_hex(&bytes))?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+fn observer_state_words(state: &ObserverChannelState, cursor: u32, chain: u64) -> Vec<u32> {
+    let mut words = state.digest_words.to_vec();
+    words.extend([
+        state.n_draws,
+        cursor,
+        0,
+        0,
+        chain as u32,
+        (chain >> 32) as u32,
+        0,
+        0,
+    ]);
+    words
 }
 
 fn verify(seed: CaptureSeed, capture_sha256: String) -> Result<VerifiedCapture, String> {

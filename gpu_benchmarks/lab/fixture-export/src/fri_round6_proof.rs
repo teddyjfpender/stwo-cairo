@@ -462,6 +462,7 @@ mod tests {
     #[test]
     #[ignore = "set STWO_GPU_LAB_RUN_REAL_PROOF_BOUNDARY=1 on a cheap host"]
     fn real_cairo_proof_crosses_the_full_validation_boundary() {
+        const EPHEMERAL_ADAPTED_INPUT: &[u8] = b"ephemeral adapted input\n";
         assert!(
             matches!(
                 std::env::var("STWO_GPU_LAB_RUN_REAL_PROOF_BOUNDARY").as_deref(),
@@ -470,11 +471,11 @@ mod tests {
             "the real-proof boundary test requires its explicit cheap-host gate"
         );
         let proof = real_cairo_proof();
-        let positive = seal_proof(&proof);
+        let positive = seal_proof(&proof, EPHEMERAL_ADAPTED_INPUT);
         let positive_shape_sha256 = positive.proof_shape.sha256.clone();
         let mut invalid_proof = proof;
         invalid_proof.channel_salt ^= 1;
-        let proof_mutation = seal_proof(&invalid_proof);
+        let proof_mutation = seal_proof(&invalid_proof, EPHEMERAL_ADAPTED_INPUT);
         let mut transport_mutation = positive.clone();
         *transport_mutation
             .canonical_transport_bytes
@@ -490,6 +491,7 @@ mod tests {
         if let Some(root) = std::env::var_os("STWO_GPU_LAB_PROOF_BUNDLE_DIR") {
             write_boundary_bundles(
                 Path::new(&root),
+                EPHEMERAL_ADAPTED_INPUT,
                 [
                     ("positive", &positive),
                     ("proof_mutation", &proof_mutation),
@@ -555,7 +557,10 @@ mod tests {
             .expect("prove real all-opcodes Cairo fixture")
     }
 
-    fn seal_proof(proof: &Blake2sCairoProof) -> fri_round6_provenance::SealedProofInputs {
+    pub(super) fn seal_proof(
+        proof: &Blake2sCairoProof,
+        adapted_input_bytes: &[u8],
+    ) -> fri_round6_provenance::SealedProofInputs {
         let proof_bytes = bincode::serialize(proof).expect("serialize real Cairo proof");
         let mut felts = Vec::new();
         CairoSerialize::serialize(proof, &mut felts);
@@ -571,8 +576,8 @@ mod tests {
         };
         fri_round6_provenance::SealedProofInputs {
             manifest_sha256: "00".repeat(32),
-            adapted_prover_input_sha256: sha256_hex(b"ephemeral adapted input\n"),
-            adapted_prover_input_bytes: b"ephemeral adapted input\n".len() as u64,
+            adapted_prover_input_sha256: sha256_hex(adapted_input_bytes),
+            adapted_prover_input_bytes: adapted_input_bytes.len() as u64,
             proof_sha256: sha256_hex(&proof_bytes),
             proof_bytes,
             canonical_transport_sha256: sha256_hex(&canonical_transport_bytes),
@@ -584,15 +589,20 @@ mod tests {
 
     fn write_boundary_bundles(
         root: &Path,
+        adapted_input_bytes: &[u8],
         cases: [(&str, &fri_round6_provenance::SealedProofInputs); 4],
     ) {
         std::fs::create_dir(root).expect("create fresh public-boundary bundle root");
         for (name, sealed) in cases {
-            write_boundary_bundle(&root.join(name), sealed);
+            write_boundary_bundle(&root.join(name), sealed, adapted_input_bytes);
         }
     }
 
-    fn write_boundary_bundle(root: &Path, sealed: &fri_round6_provenance::SealedProofInputs) {
+    pub(super) fn write_boundary_bundle(
+        root: &Path,
+        sealed: &fri_round6_provenance::SealedProofInputs,
+        adapted_input_bytes: &[u8],
+    ) {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -604,8 +614,10 @@ mod tests {
             root,
             "adapted-input.bin",
             "stwo-prover-input-bincode-v1",
-            b"ephemeral adapted input\n",
+            adapted_input_bytes,
         );
+        assert_eq!(adapted_input.sha256, sealed.adapted_prover_input_sha256);
+        assert_eq!(adapted_input.byte_length, sealed.adapted_prover_input_bytes);
         let invocation = write_artifact(
             root,
             "adapter-invocation.json",

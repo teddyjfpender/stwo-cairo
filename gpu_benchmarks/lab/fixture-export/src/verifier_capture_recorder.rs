@@ -349,6 +349,10 @@ fn require_identity_and_shape(
             &capture.source.prover_input_sha256,
             "capture ProverInput sha256",
         ),
+        (
+            &capture.source.observer_proof_shape_id,
+            "capture observer proof-shape sha256",
+        ),
     ] {
         validate_sha256(value, label)?;
     }
@@ -356,6 +360,9 @@ fn require_identity_and_shape(
         || prepared.adapted_prover_input_bytes != capture.source.prover_input_bytes
     {
         return Err("capture source does not match the manifest's adapted ProverInput".into());
+    }
+    if prepared.proof_shape_sha256 != capture.source.observer_proof_shape_id {
+        return Err("capture observer proof shape does not match the decoded proof".into());
     }
     let proof_capture_shape = derive_capture_shape(&prepared.proof)?;
     if proof_capture_shape != capture.shape {
