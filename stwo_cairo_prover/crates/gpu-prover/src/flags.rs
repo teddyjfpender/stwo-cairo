@@ -110,13 +110,11 @@ pub const FLAGS: &[FlagDef] = &[
     },
 ];
 
-/// The gpu-native engine's DEFAULTS (design §3: the new pipeline IS the composed
-/// fast configuration — device witness lanes, device interaction, device edges,
-/// and a witness governor sized for the biggest recorded program). Applied as
-/// process env at prover construction ONLY where the variable is unset, so a
-/// manifest step's explicit value (including `=0` kill switches) always wins.
-/// Migration scaffolding (R4): deleted at M6 when the lanes become the
-/// unconditional single path.
+/// Legacy gpu-native migration defaults. Replacement-v1 seals the equivalent
+/// witness behavior in a typed resident execution config and never installs or
+/// rereads these variables. The detached legacy path still applies them at
+/// successful prover construction where a manifest's explicit value wins.
+/// Migration scaffolding (R4): deleted with the detached path.
 pub const GPU_NATIVE_DEFAULTS: &[(&str, &str)] = &[
     ("STWO_CUDA_WITNESS_JIT_PROVE", "1"),
     ("STWO_CUDA_WITNESS_JIT_MAX_INSTRS", "20000"),
@@ -137,8 +135,8 @@ pub const GPU_NATIVE_DEFAULTS: &[(&str, &str)] = &[
     // multi-stream async makes it reliably pay.
 ];
 
-/// Apply [`GPU_NATIVE_DEFAULTS`] (unset variables only). Called once at
-/// `GpuCairoProver::new`; benign on SIMD (the flags gate CUDA-only seams).
+/// Apply [`GPU_NATIVE_DEFAULTS`] (unset variables only) for a successfully
+/// admitted legacy gpu-native prover; benign on SIMD.
 pub fn apply_gpu_native_defaults() {
     for (name, value) in GPU_NATIVE_DEFAULTS {
         if std::env::var_os(name).is_none() {

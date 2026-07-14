@@ -42,7 +42,7 @@ use crate::recorded_witness_inputs::{
 };
 use crate::resident_runtime::{
     ResidentGraphRuntime, ResidentRuntimeError, ResidentWitnessIngestReport, ResidentWitnessInput,
-    ResidentWitnessInputColumn, ResidentWorkspaceIdentity,
+    ResidentWitnessInputColumn, ResidentWorkspaceIdentity, SealedResidentExecutionConfig,
 };
 use crate::resident_sources::{
     inspect_base_trace_residency, stage_base_trace_coefficients, stage_preprocessed_commitment,
@@ -78,6 +78,7 @@ pub struct ResidentSessionRequest {
     pub include_all_preprocessed_columns: bool,
     pub operational_safety_reserve_bytes: Option<NonZeroUsize>,
     pub protocol_policy: ProtocolPlanPolicy,
+    pub execution_config: SealedResidentExecutionConfig,
 }
 
 /// Strict device-born entry: claim/shape/protocol planning happens before the
@@ -92,6 +93,7 @@ pub struct ResidentPreWitnessSessionRequest {
     pub include_all_preprocessed_columns: bool,
     pub operational_safety_reserve_bytes: Option<NonZeroUsize>,
     pub protocol_policy: ProtocolPlanPolicy,
+    pub execution_config: SealedResidentExecutionConfig,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -469,6 +471,7 @@ fn run_materialized_session<R>(
     shape_executable_cache: ShapeExecutableCacheTelemetry,
     require_device_born: bool,
     operational_safety_reserve_bytes: Option<NonZeroUsize>,
+    execution_config: SealedResidentExecutionConfig,
     run: impl FnOnce(
         &mut ResidentGraphRuntime<'_>,
         ResidentSessionArtifacts<'_>,
@@ -517,6 +520,7 @@ fn run_materialized_session<R>(
     let mut runtime = ResidentGraphRuntime::prepare(
         workspace,
         ResidentWorkspaceIdentity::of(workspace),
+        execution_config,
         RelationChallenges {
             alpha_powers: &setup_alphas,
             z: SecureField::zero(),
@@ -717,6 +721,7 @@ pub fn with_resident_session<R>(
         include_all_preprocessed_columns,
         operational_safety_reserve_bytes,
         protocol_policy,
+        execution_config,
     } = request;
     let selection = select_resident_executable(
         executable_cache,
@@ -750,6 +755,7 @@ pub fn with_resident_session<R>(
             shape_executable_cache,
             true,
             operational_safety_reserve_bytes,
+            execution_config,
             run,
         )?
     };
@@ -1064,6 +1070,7 @@ pub fn with_resident_session_from_generator<R>(
         include_all_preprocessed_columns,
         operational_safety_reserve_bytes,
         protocol_policy,
+        execution_config,
     } = request;
     let exact_plan = Arc::new(capacity_plan.strict_resident_exact(
         &crate::schedule_table::CAIRO_SCHEDULE,
@@ -1151,6 +1158,7 @@ pub fn with_resident_session_from_generator<R>(
         let mut runtime = ResidentGraphRuntime::prepare(
             workspace,
             ResidentWorkspaceIdentity::of(workspace),
+            execution_config,
             RelationChallenges {
                 alpha_powers: &setup_alphas,
                 z: SecureField::zero(),

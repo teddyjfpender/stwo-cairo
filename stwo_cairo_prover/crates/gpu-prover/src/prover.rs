@@ -56,7 +56,10 @@ use crate::arena_plan::ResidentBackend;
 use crate::graphs::{GraphError, GraphWorkspace};
 use crate::protocol_discovery::interaction_claim_from_flattened;
 use crate::protocol_plan::ProtocolPlanPolicy;
-use crate::resident_runtime::{ResidentGraphRuntime, ResidentHotPathBudget, ResidentRuntimeError};
+use crate::resident_runtime::{
+    ResidentGraphRuntime, ResidentHotPathBudget, ResidentRuntimeError,
+    SealedResidentExecutionConfig,
+};
 use crate::resident_session::{
     with_resident_session, with_resident_session_from_generator, ResidentExecutionReadiness,
     ResidentPreWitnessSessionRequest, ResidentPreparationState, ResidentSessionArtifacts,
@@ -483,6 +486,20 @@ const REPLACEMENT_V1_DEFAULT_OFF_ENV: &[&str] = &[
     "STWO_STORE_COEFFS",
 ];
 
+const REPLACEMENT_V1_FORBIDDEN_ENV: &[&str] = &[
+    "PREPROCESSED_TRACE_GPU_GENERATE",
+    "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES",
+    "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
+    "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE",
+    "STWO_CUDA_COMPOSITION_DIRECT_RETENTION",
+    "STWO_CUDA_B2N_STAGE_FUSED",
+    "STWO_CUDA_BLAKE2S_INTERIOR_FUSED",
+    "STWO_CUDA_COMPOSITION_WIDE",
+    "STWO_CUDA_RELATION_SCAN_TAIL",
+    "STWO_CUDA_FRI_FOLD_FUSED",
+    "STWO_CUDA_FEED_PRIVATIZED",
+];
+
 fn validate_replacement_fixed_env_value(
     name: &str,
     observed: Option<&str>,
@@ -528,6 +545,24 @@ fn validate_replacement_fixed_environment_value(
     }
 }
 
+fn validate_replacement_forbidden_env_value(name: &str, present: bool) -> Result<(), GpuError> {
+    if present {
+        return Err(GpuError::Config(format!(
+            "replacement-v1 rejects legacy topology override {name}; unset it and use the immutable backend selector"
+        )));
+    }
+    Ok(())
+}
+
+fn replacement_execution_config_from_environment(
+) -> Result<SealedResidentExecutionConfig, GpuError> {
+    validate_replacement_fixed_environment()?;
+    for &name in REPLACEMENT_V1_FORBIDDEN_ENV {
+        validate_replacement_forbidden_env_value(name, std::env::var_os(name).is_some())?;
+    }
+    Ok(SealedResidentExecutionConfig::replacement_v1())
+}
+
 fn validate_replacement_device_admission(
     configured: u32,
     snapshot: CudaDeviceSnapshot,
@@ -554,6 +589,28 @@ fn validate_replacement_device_admission(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProverExecutionEntry {
+    PreWitnessResident,
+    AfterWitnessResident,
+    LegacyPcs,
+}
+
+fn validate_execution_entry(
+    backend: ResidentBackend,
+    entry: ProverExecutionEntry,
+) -> Result<(), GpuError> {
+    if backend == ResidentBackend::ReplacementV1
+        && entry != ProverExecutionEntry::PreWitnessResident
+    {
+        return Err(GpuError::Config(
+            "replacement-v1 executes only through the pre-witness strict resident entrypoint"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Persistent per-device prover context (design §3.2): caches that outlive a proof
 /// — twiddle trees and preprocessed commitment trees today; the AOT kernel
 /// registry (M3), graph cache and identity-slot arena (M5) join here.
@@ -567,6 +624,7 @@ where
     CudaBackend: CairoBackend<MC>,
 {
     config: GpuProverConfig,
+    resident_execution_config: SealedResidentExecutionConfig,
     /// Stable, exact-key workspaces. Each materialization owns an isolated CUDA
     /// context inside its arena; merely caching one does not activate resident
     /// execution for a proof.
@@ -592,6 +650,47 @@ where
     preprocessed_trees: HashMap<u64, &'static CommitmentTreeProver<CudaBackend, MC>>,
 }
 
+/// Fully validated constructor state with no semantic mode, environment, or
+/// AOT latch committed. Checked default-pool admission may already have cached
+/// a retryable process resource; `commit` is deliberately infallible and is the
+/// only point that changes proof-selection state.
+struct PendingGpuCairoProver {
+    config: GpuProverConfig,
+    resident_execution_config: SealedResidentExecutionConfig,
+    workspace_cache: WorkspaceCache,
+    shape_executable_cache: ShapeExecutableCache,
+    resident_protocol_policy: Option<ProtocolPlanPolicy>,
+    witness_artifact_plan: Arc<WitnessArtifactPlan>,
+}
+
+impl PendingGpuCairoProver {
+    fn commit<MC>(self) -> GpuCairoProver<MC>
+    where
+        MC: MerkleChannel + 'static,
+        CudaBackend: CairoBackend<MC>,
+    {
+        if self.config.strict {
+            aot::require_loaded_kernels();
+        }
+        if self.config.resident_backend == ResidentBackend::LegacyResident {
+            crate::flags::apply_gpu_native_defaults();
+        }
+        GpuCairoProver {
+            config: self.config,
+            resident_execution_config: self.resident_execution_config,
+            workspace_cache: self.workspace_cache,
+            shape_executable_cache: self.shape_executable_cache,
+            last_pcs_telemetry: None,
+            last_resident_session_telemetry: None,
+            resident_protocol_policy: self.resident_protocol_policy,
+            last_aot_stats: None,
+            witness_artifact_plan: self.witness_artifact_plan,
+            twiddles: HashMap::new(),
+            preprocessed_trees: HashMap::new(),
+        }
+    }
+}
+
 impl<MC> GpuCairoProver<MC>
 where
     MC: MerkleChannel + 'static,
@@ -609,38 +708,10 @@ where
                 "replacement-v1 requires strict GPU-native resident execution".to_string(),
             ));
         }
-        if config.resident_backend == ResidentBackend::ReplacementV1 {
-            validate_replacement_fixed_environment()?;
-            for name in [
-                "PREPROCESSED_TRACE_GPU_GENERATE",
-                "STWO_CUDA_RETAINED_LDE_BUDGET_BYTES",
-                "STWO_CUDA_QUOTIENT_REUSE_RETAINED_EVALUATIONS",
-                "STWO_CUDA_COMMIT_DOMAIN_PROGRESSIVE",
-                "STWO_CUDA_COMPOSITION_DIRECT_RETENTION",
-                "STWO_CUDA_B2N_STAGE_FUSED",
-                "STWO_CUDA_BLAKE2S_INTERIOR_FUSED",
-                "STWO_CUDA_COMPOSITION_WIDE",
-                "STWO_CUDA_RELATION_SCAN_TAIL",
-                "STWO_CUDA_FRI_FOLD_FUSED",
-                "STWO_CUDA_FEED_PRIVATIZED",
-            ] {
-                if std::env::var_os(name).is_some() {
-                    return Err(GpuError::Config(format!(
-                        "replacement-v1 rejects legacy topology override {name}; unset it and use the immutable backend selector"
-                    )));
-                }
-            }
-            crate::flags::apply_gpu_native_defaults();
-            // The second check is the construction postcondition and makes a
-            // later construction accept precisely the state installed above.
-            validate_replacement_fixed_environment()?;
-            let device = cuda_device_snapshot()?;
-            validate_replacement_device_admission(
-                config.device,
-                device,
-                aot::supports_arch(device.sm_major, device.sm_minor),
-            )?;
-        }
+        let resident_execution_config = match config.resident_backend {
+            ResidentBackend::LegacyResident => SealedResidentExecutionConfig::legacy_strict(),
+            ResidentBackend::ReplacementV1 => replacement_execution_config_from_environment()?,
+        };
         if config.strict {
             if std::env::var("STWO_CUDA_PCS_REFERENCE").as_deref() == Ok("1") {
                 return Err(GpuError::Config(
@@ -661,14 +732,17 @@ where
                         .to_string(),
                 ));
             }
-            aot::require_loaded_kernels();
+        }
+        if config.resident_backend == ResidentBackend::ReplacementV1 {
+            let device = cuda_device_snapshot()?;
+            validate_replacement_device_admission(
+                config.device,
+                device,
+                aot::supports_arch(device.sm_major, device.sm_minor),
+            )?;
+            stwo_backend_cuda::ensure_gpu_default_pool()?;
         }
         let witness_artifact_plan = Arc::new(CAIRO_SCHEDULE.artifact_plan()?);
-        // The gpu-native engine defaults to the composed device configuration
-        // (explicit env, including =0 kill switches, always wins) — design §3.
-        if config.resident_backend != ResidentBackend::ReplacementV1 {
-            crate::flags::apply_gpu_native_defaults();
-        }
         let resident_protocol_policy = config
             .strict
             .then(|| ProtocolPlanPolicy::loaded_starknet_blake2s_for(config.resident_backend))
@@ -677,29 +751,19 @@ where
         let workspace_cache = WorkspaceCache::new(config.workspace_cache_capacity)?;
         let shape_executable_cache = ShapeExecutableCache::new(config.workspace_cache_capacity)
             .map_err(ResidentSessionError::from)?;
-        Ok(Self {
+        Ok(PendingGpuCairoProver {
             config,
+            resident_execution_config,
             workspace_cache,
             shape_executable_cache,
-            last_pcs_telemetry: None,
-            last_resident_session_telemetry: None,
             resident_protocol_policy,
-            last_aot_stats: None,
             witness_artifact_plan,
-            twiddles: HashMap::new(),
-            preprocessed_trees: HashMap::new(),
-        })
+        }
+        .commit())
     }
 
     pub fn config(&self) -> &GpuProverConfig {
         &self.config
-    }
-
-    fn require_replacement_runtime_environment(&self) -> Result<(), GpuError> {
-        if self.config.resident_backend == ResidentBackend::ReplacementV1 {
-            validate_replacement_fixed_environment()?;
-        }
-        Ok(())
     }
 
     pub fn last_pcs_telemetry(&self) -> Option<&CudaPcsDriverTelemetry> {
@@ -787,7 +851,10 @@ where
             ResidentSessionArtifacts<'_>,
         ) -> Result<R, ResidentRuntimeError>,
     ) -> Result<(R, ResidentSessionTelemetry), GpuError> {
-        self.require_replacement_runtime_environment()?;
+        validate_execution_entry(
+            self.config.resident_backend,
+            ProverExecutionEntry::PreWitnessResident,
+        )?;
         if !self.config.strict {
             return Err(GpuError::Config(
                 "resident session entrypoint requires strict GPU-native mode".to_string(),
@@ -823,6 +890,7 @@ where
                 include_all_preprocessed_columns: params.include_all_preprocessed_columns,
                 operational_safety_reserve_bytes: self.config.operational_safety_reserve_bytes,
                 protocol_policy,
+                execution_config: self.resident_execution_config,
             },
             run,
         )?)
@@ -845,7 +913,10 @@ where
             ResidentSessionArtifacts<'_>,
         ) -> Result<R, ResidentRuntimeError>,
     ) -> Result<(R, ResidentSessionTelemetry), GpuError> {
-        self.require_replacement_runtime_environment()?;
+        validate_execution_entry(
+            self.config.resident_backend,
+            ProverExecutionEntry::AfterWitnessResident,
+        )?;
         if !self.config.strict {
             return Err(GpuError::Config(
                 "resident session entrypoint requires strict GPU-native mode".to_string(),
@@ -865,6 +936,7 @@ where
                 include_all_preprocessed_columns,
                 operational_safety_reserve_bytes: self.config.operational_safety_reserve_bytes,
                 protocol_policy,
+                execution_config: self.resident_execution_config,
             },
             run,
         )?)
@@ -912,16 +984,19 @@ where
         self.prove_with_pcs_driver_config(input, params, &mut pcs_driver_config)
     }
 
-    /// Explicit PCS-driver entry point. Resident execution constructs
-    /// `CudaPcsDriverConfig::arena_graph` with real captured-segment hooks and
-    /// enters here; the default [`Self::prove`] always uses detached eager mode.
+    /// Legacy migration PCS-driver entry point. Replacement-v1 has a separate
+    /// sealed whole-proof runtime and is rejected here before any env-driven
+    /// witness choice can execute.
     pub fn prove_with_pcs_driver_config(
         &mut self,
         input: ProverInput,
         params: ProverParameters,
         pcs_driver_config: &mut CudaPcsDriverConfig<'_>,
     ) -> Result<CairoProof<MC::H>, GpuError> {
-        self.require_replacement_runtime_environment()?;
+        validate_execution_entry(
+            self.config.resident_backend,
+            ProverExecutionEntry::LegacyPcs,
+        )?;
         if self.config.strict && pcs_driver_config.runtime_mode() != CudaPcsRuntimeMode::ArenaGraph
         {
             return Err(GpuError::Config(
@@ -1472,7 +1547,7 @@ mod resident_transcript_mirror_tests {
     }
 
     #[test]
-    fn replacement_fixed_ambient_accepts_first_and_repeated_construction_states() {
+    fn replacement_fixed_ambient_accepts_unset_or_exact_admission() {
         assert_eq!(flags::GPU_NATIVE_DEFAULTS, REPLACEMENT_V1_REQUIRED_ENV);
         for &(name, expected) in REPLACEMENT_V1_REQUIRED_ENV {
             validate_replacement_fixed_env_value(name, None, expected).unwrap();
@@ -1492,6 +1567,30 @@ mod resident_transcript_mirror_tests {
         }
         for &name in REPLACEMENT_V1_DEFAULT_OFF_ENV {
             assert!(validate_replacement_fixed_env_value(name, Some("1"), "0").is_err());
+        }
+    }
+
+    #[test]
+    fn replacement_ambient_rejects_every_forbidden_override() {
+        for &name in REPLACEMENT_V1_FORBIDDEN_ENV {
+            validate_replacement_forbidden_env_value(name, false).unwrap();
+            assert!(validate_replacement_forbidden_env_value(name, true).is_err());
+        }
+    }
+
+    #[test]
+    fn replacement_admits_only_the_pre_witness_resident_entrypoint() {
+        assert!(validate_execution_entry(
+            ResidentBackend::ReplacementV1,
+            ProverExecutionEntry::PreWitnessResident,
+        )
+        .is_ok());
+        for entry in [
+            ProverExecutionEntry::AfterWitnessResident,
+            ProverExecutionEntry::LegacyPcs,
+        ] {
+            assert!(validate_execution_entry(ResidentBackend::ReplacementV1, entry).is_err());
+            assert!(validate_execution_entry(ResidentBackend::LegacyResident, entry).is_ok());
         }
     }
 

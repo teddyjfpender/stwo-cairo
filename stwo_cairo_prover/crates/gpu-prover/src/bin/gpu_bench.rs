@@ -565,10 +565,9 @@ fn enforce_gpu_native_architecture_invocation(backend: &str) {
         manifest_hash, 0,
         "GPU-native architecture gate failed: embedded CUDA AOT kernel pack is missing"
     );
-    // Select AOT-only lookup before constructing the prover or loading any generated
-    // kernel. Missing entries now fail at their first use; counters below remain the
-    // independent post-proof provenance contract.
-    stwo_backend_cuda::aot::require_loaded_kernels();
+    // GpuCairoProver commits the process-wide AOT-only mode only after its full
+    // fallible admission succeeds. Missing entries still fail at first use and
+    // the post-proof counters remain the independent provenance contract.
 }
 
 fn reject_gpu_native_architecture_gate_without_proof(mode: &str) {
@@ -1714,9 +1713,9 @@ fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
 ///
 /// The per-thread `set_var` races that `GpuCairoProver::{new,prove}` would trigger
 /// are all pre-empted on the main thread before any spawn: the diet vars are set
-/// here, and a throwaway prover is constructed to run `apply_gpu_native_defaults` +
-/// CUDA init once, so per-thread construction finds every env var already set and
-/// writes none.
+/// here, and a fully admitted throwaway prover performs CUDA/AOT initialization.
+/// It also installs migration defaults for the legacy resident generation;
+/// replacement-v1 carries those choices in its sealed execution config.
 fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
     assert!(n >= 1, "--resident-concurrent <N> must be >= 1");
     assert_eq!(backend, "cuda", "resident-concurrent is cuda-only");
@@ -1741,9 +1740,9 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
             std::env::set_var("STWO_FORCE_EXTEND_EVAL_MODE", "1");
         }
     }
-    // Warm-up prover on the main thread: runs apply_gpu_native_defaults (set_var of
-    // any unset GPU_NATIVE_DEFAULTS) and one-time CUDA init BEFORE spawning, so the
-    // per-thread `new` calls find every default set and race no env writes.
+    // Warm-up on the main thread. Legacy admission installs any unset migration
+    // defaults; replacement admission is env-write-free. Both complete one-time
+    // CUDA/AOT setup before per-thread construction.
     drop(
         GpuCairoProver::<Blake2sMerkleChannel>::new(gpu_native_prover_config())
             .expect("warm-up gpu prover"),

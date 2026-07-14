@@ -39,6 +39,7 @@ use stwo_cairo_prover::witness::proof_shape::{ProofShapeKey, TracePartId};
 
 use crate::arena_plan::{
     BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedFixedTableSource,
+    ResidentBackend,
 };
 use crate::composition_plan::CompositionProofBindings;
 use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
@@ -79,6 +80,102 @@ impl ResidentWorkspaceIdentity {
             arena_base: workspace.arena().base_ptr().as_ptr() as usize,
         }
     }
+}
+
+/// Immutable witness-execution choices carried from prover admission into the
+/// prepared resident runtime. Replacement-v1 never consults the migration env
+/// switches after this value is built.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SealedResidentExecutionConfig {
+    resident_backend: ResidentBackend,
+    witness_jit_prove: bool,
+    witness_jit_max_instrs: usize,
+    device_interaction: bool,
+    witness_edges: bool,
+    mem_count_feeds: bool,
+    stream_fanout: bool,
+}
+
+impl SealedResidentExecutionConfig {
+    pub const fn replacement_v1() -> Self {
+        Self {
+            resident_backend: ResidentBackend::ReplacementV1,
+            witness_jit_prove: true,
+            witness_jit_max_instrs: 20_000,
+            device_interaction: true,
+            witness_edges: true,
+            mem_count_feeds: true,
+            stream_fanout: true,
+        }
+    }
+
+    /// Strict legacy resident execution was already an unconditional prepared
+    /// AOT graph. Keep it uncapped and explicit while its detached sibling
+    /// continues to consume the legacy environment switches.
+    pub const fn legacy_strict() -> Self {
+        Self {
+            resident_backend: ResidentBackend::LegacyResident,
+            witness_jit_prove: true,
+            witness_jit_max_instrs: usize::MAX,
+            device_interaction: true,
+            witness_edges: true,
+            mem_count_feeds: true,
+            stream_fanout: true,
+        }
+    }
+
+    pub const fn resident_backend(self) -> ResidentBackend {
+        self.resident_backend
+    }
+
+    pub const fn witness_jit_max_instrs(self) -> usize {
+        self.witness_jit_max_instrs
+    }
+
+    const fn prepared_witness_mode(self) -> PreparedWitnessMode {
+        if self.witness_jit_prove {
+            PreparedWitnessMode::RequireEmbeddedAot
+        } else {
+            PreparedWitnessMode::PreResolved
+        }
+    }
+}
+
+fn validate_execution_backend(
+    config: SealedResidentExecutionConfig,
+    planned: ResidentBackend,
+) -> Result<(), ResidentRuntimeError> {
+    if config.resident_backend != planned {
+        return Err(ResidentRuntimeError::ExecutionConfigBackendMismatch {
+            configured: config.resident_backend,
+            planned,
+        });
+    }
+    Ok(())
+}
+
+fn require_execution_feature(
+    enabled: bool,
+    feature: &'static str,
+) -> Result<(), ResidentRuntimeError> {
+    enabled
+        .then_some(())
+        .ok_or(ResidentRuntimeError::ExecutionFeatureDisabled(feature))
+}
+
+fn validate_witness_program_instruction_limit(
+    config: SealedResidentExecutionConfig,
+    component: &'static str,
+    actual: usize,
+) -> Result<(), ResidentRuntimeError> {
+    if actual > config.witness_jit_max_instrs {
+        return Err(ResidentRuntimeError::WitnessProgramInstructionLimit {
+            component,
+            actual,
+            limit: config.witness_jit_max_instrs,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,6 +303,16 @@ pub enum ResidentRuntimeError {
     WorkspaceIdentityMismatch {
         expected: ResidentWorkspaceIdentity,
         actual: ResidentWorkspaceIdentity,
+    },
+    ExecutionConfigBackendMismatch {
+        configured: ResidentBackend,
+        planned: ResidentBackend,
+    },
+    ExecutionFeatureDisabled(&'static str),
+    WitnessProgramInstructionLimit {
+        component: &'static str,
+        actual: usize,
+        limit: usize,
     },
     SourceOutsideArena {
         slot: stwo_backend_cuda::ArenaSlotId,
@@ -909,6 +1016,7 @@ impl PreparedResidentCommitment<'_> {
 }
 
 pub struct ResidentGraphRuntime<'a> {
+    execution_config: SealedResidentExecutionConfig,
     execution_tables: Option<PreparedExecutionTablesGraph<'a>>,
     execution_tables_ingest: Option<PreparedExecutionTablesIngestTelemetry>,
     ec_op: Option<PreparedEcOpGraph<'a>>,
@@ -954,6 +1062,7 @@ impl<'a> ResidentGraphRuntime<'a> {
     pub fn prepare(
         workspace: &'a GraphWorkspace,
         expected_identity: ResidentWorkspaceIdentity,
+        execution_config: SealedResidentExecutionConfig,
         setup_relation_challenges: RelationChallenges<'_>,
         transcript_plan: &CairoBlake2sTranscriptPlan,
         current_composition: &crate::composition_plan::CompositionPlan,
@@ -971,6 +1080,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             });
         }
         let protocol_identity = workspace.plan().protocol_identity();
+        validate_execution_backend(execution_config, protocol_identity.resident_backend)?;
         if !workspace.preprocessed_commitment_ready() {
             return Err(ResidentRuntimeError::FixedPreprocessedCommitmentNotReady);
         }
@@ -1029,6 +1139,8 @@ impl<'a> ResidentGraphRuntime<'a> {
                 }
                 (None, None) => (None, None, None),
             };
+        require_execution_feature(execution_config.witness_jit_prove, "witness_jit_prove")?;
+        require_execution_feature(execution_config.witness_edges, "witness_edges")?;
         let witness = match execution_tables_view {
             Some(tables) => workspace
                 .plan()
@@ -1036,6 +1148,11 @@ impl<'a> ResidentGraphRuntime<'a> {
                 .components
                 .iter()
                 .map(|component| {
+                    validate_witness_program_instruction_limit(
+                        execution_config,
+                        component.component,
+                        component.program.insts.len(),
+                    )?;
                     let input_gather = component
                         .input_gather
                         .as_ref()
@@ -1099,7 +1216,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                         &component.requirements.multiplicity_column_words,
                         tables,
                         &component.slots,
-                        PreparedWitnessMode::RequireEmbeddedAot,
+                        execution_config.prepared_witness_mode(),
                     )
                     .map_err(ResidentRuntimeError::from)?;
                     Ok::<_, ResidentRuntimeError>(PreparedResidentWitness {
@@ -1114,6 +1231,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                 .collect::<Result<Vec<_>, _>>()?,
             None => Vec::new(),
         };
+        require_execution_feature(execution_config.mem_count_feeds, "mem_count_feeds")?;
         let multiplicity = match workspace.plan().multiplicity() {
             Some(planned) => {
                 let preprocessed_trace = preprocessed_trace
@@ -1346,6 +1464,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             (None, Some(_)) => return Err(ResidentRuntimeError::UnexpectedPreparedEcOpSegment),
             (None, None) => (None, None),
         };
+        require_execution_feature(execution_config.stream_fanout, "stream_fanout")?;
         let witness_lane_levels =
             plan_witness_lane_levels(&witness, ec_op.as_ref(), arena.context().lane_count())?;
         let planned_transcript = workspace.plan().transcript();
@@ -1373,6 +1492,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                 .collect::<Vec<_>>(),
         )?;
         let transcript_cursor = transcript.segment_cursor();
+        require_execution_feature(execution_config.device_interaction, "device_interaction")?;
         let relation_plan = workspace.plan().relation();
         let relation = PreparedRelationGraph::prepare_with_mode(
             arena,
@@ -1595,6 +1715,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         let fri_rounds = fri.round_count();
 
         let runtime = Self {
+            execution_config,
             execution_tables,
             execution_tables_ingest,
             ec_op,
@@ -1642,6 +1763,10 @@ impl<'a> ResidentGraphRuntime<'a> {
 
     pub const fn identity(&self) -> ResidentWorkspaceIdentity {
         self.identity
+    }
+
+    pub const fn execution_config(&self) -> SealedResidentExecutionConfig {
+        self.execution_config
     }
 
     pub const fn execution_tables_ingest_telemetry(
@@ -2591,7 +2716,9 @@ impl<'a> ResidentGraphRuntime<'a> {
             if prepared.native_input_producer != planned.native_input_producer {
                 return Err(reject("native input provenance"));
             }
-            if prepared.writer.kernel_identity().mode != PreparedWitnessMode::RequireEmbeddedAot {
+            if prepared.writer.kernel_identity().mode
+                != self.execution_config.prepared_witness_mode()
+            {
                 return Err(reject("embedded AOT mode"));
             }
             if !slices_match_slots(
@@ -4139,6 +4266,49 @@ fn require_complete_captured_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_execution_config_seals_every_gpu_native_witness_choice() {
+        let config = SealedResidentExecutionConfig::replacement_v1();
+        assert_eq!(config.resident_backend, ResidentBackend::ReplacementV1);
+        assert!(config.witness_jit_prove);
+        assert_eq!(config.witness_jit_max_instrs, 20_000);
+        assert!(config.device_interaction);
+        assert!(config.witness_edges);
+        assert!(config.mem_count_feeds);
+        assert!(config.stream_fanout);
+        assert_eq!(
+            config.prepared_witness_mode(),
+            PreparedWitnessMode::RequireEmbeddedAot
+        );
+    }
+
+    #[test]
+    fn resident_execution_config_rejects_protocol_generation_mismatch() {
+        let config = SealedResidentExecutionConfig::replacement_v1();
+        assert!(validate_execution_backend(config, ResidentBackend::ReplacementV1).is_ok());
+        assert!(matches!(
+            validate_execution_backend(config, ResidentBackend::LegacyResident),
+            Err(ResidentRuntimeError::ExecutionConfigBackendMismatch {
+                configured: ResidentBackend::ReplacementV1,
+                planned: ResidentBackend::LegacyResident,
+            })
+        ));
+    }
+
+    #[test]
+    fn replacement_witness_instruction_cap_is_exact_and_fail_closed() {
+        let config = SealedResidentExecutionConfig::replacement_v1();
+        validate_witness_program_instruction_limit(config, "boundary", 20_000).unwrap();
+        assert!(matches!(
+            validate_witness_program_instruction_limit(config, "too_large", 20_001),
+            Err(ResidentRuntimeError::WitnessProgramInstructionLimit {
+                component: "too_large",
+                actual: 20_001,
+                limit: 20_000,
+            })
+        ));
+    }
 
     #[test]
     fn final_bundle_budget_uses_the_captured_kernel_node_count() {
