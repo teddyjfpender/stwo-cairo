@@ -30,6 +30,15 @@ pub struct ResidentProofBundleLayout {
     pub total_words: usize,
 }
 
+/// Stable device range that the decommit tail may target directly. The range
+/// is deliberately pointer-free: the resident runtime binds it to its exact
+/// arena allocation, while this module owns the canonical proof-byte offsets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentProofBundleDeviceRange {
+    pub offset_words: usize,
+    pub len_words: usize,
+}
+
 impl ResidentProofBundleLayout {
     pub fn new(
         interaction_claim_words: usize,
@@ -93,6 +102,13 @@ impl ResidentProofBundleLayout {
             decommitment,
             total_words: cursor,
         })
+    }
+
+    pub fn direct_decommitment_destination(&self) -> ResidentProofBundleDeviceRange {
+        ResidentProofBundleDeviceRange {
+            offset_words: self.decommitment.start,
+            len_words: self.decommitment.len(),
+        }
     }
 }
 
@@ -270,12 +286,49 @@ mod tests {
         assert_eq!(layout.interaction_claim, 32..44);
         assert_eq!(layout.interaction_pow, 44..46);
         assert_eq!(layout.decommitment.end, layout.total_words);
+        assert_eq!(
+            layout.direct_decommitment_destination(),
+            ResidentProofBundleDeviceRange {
+                offset_words: layout.decommitment.start,
+                len_words: 200,
+            }
+        );
         assert!(matches!(
             ResidentProofBundleLayout::new(3, 24, 3, 16, 200),
             Err(ResidentProofBundleError::InvalidSectionWidth(
                 "interaction claim"
             ))
         ));
+    }
+
+    #[test]
+    fn direct_decommit_writes_are_byte_identical_to_the_legacy_tail_copy() {
+        let layout = ResidentProofBundleLayout::new(12, 24, 3, 16, 200).unwrap();
+        let mut copied = vec![0u32; layout.total_words];
+        let mut direct = vec![0u32; layout.total_words];
+        let sections = [
+            layout.commitments.clone(),
+            layout.interaction_claim.clone(),
+            layout.interaction_pow.clone(),
+            layout.sampled_values.clone(),
+            layout.fri_commitments.clone(),
+            layout.final_line_poly.clone(),
+            layout.query_pow.clone(),
+            layout.decommitment.clone(),
+        ];
+        for (section_index, section) in sections.iter().enumerate() {
+            for (word_index, destination) in copied[section.clone()].iter_mut().enumerate() {
+                *destination = ((section_index as u32 + 1) << 24) | word_index as u32;
+            }
+        }
+
+        let decommit = layout.direct_decommitment_destination();
+        direct[decommit.offset_words..decommit.offset_words + decommit.len_words]
+            .copy_from_slice(&copied[layout.decommitment.clone()]);
+        for section in &sections[..sections.len() - 1] {
+            direct[section.clone()].copy_from_slice(&copied[section.clone()]);
+        }
+        assert_eq!(direct, copied);
     }
 
     #[test]
