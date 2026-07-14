@@ -8206,27 +8206,25 @@ fn resolve_quotient_numerator_slots(
     let sample_points_destination = binding(logical.sample_points_destination)?;
     let first_linear_terms_destination = binding(logical.first_linear_terms_destination)?;
     let forward_twiddles = binding(logical.forward_twiddles)?;
-    if quotient_numerator_columns_alias_workspace(&columns, &workspace_ids) {
+    if quotient_numerator_sources_alias_workspace(&columns, &workspace_ids) {
         return Err(ArenaPlanError::InvalidProtocolGeometry(
             "quotient numerator external binding aliases a live workspace slot",
         ));
     }
-    let external = columns
-        .iter()
-        .map(|column| column.coefficients)
-        .chain([
-            oods_sample_points,
-            oods_sampled_values,
-            random_coefficient,
-            sample_points_destination,
-            first_linear_terms_destination,
-            forward_twiddles,
-        ])
-        .chain(
-            destinations
-                .iter()
-                .flat_map(|destination| destination.coordinates),
-        );
+    let external = [
+        oods_sample_points,
+        oods_sampled_values,
+        random_coefficient,
+        sample_points_destination,
+        first_linear_terms_destination,
+        forward_twiddles,
+    ]
+    .into_iter()
+    .chain(
+        destinations
+            .iter()
+            .flat_map(|destination| destination.coordinates),
+    );
     if external
         .into_iter()
         .any(|binding| workspace_ids.contains(&binding.physical))
@@ -8250,14 +8248,13 @@ fn resolve_quotient_numerator_slots(
     })
 }
 
-fn quotient_numerator_columns_alias_workspace(
+fn quotient_numerator_sources_alias_workspace(
     columns: &[PlannedQuotientNumeratorColumn],
     workspace_ids: &BTreeSet<ArenaSlotId>,
 ) -> bool {
-    columns.iter().any(|column| {
-        workspace_ids.contains(&column.coefficients.physical)
-            || workspace_ids.contains(&column.numerator_source.physical)
-    })
+    columns
+        .iter()
+        .any(|column| workspace_ids.contains(&column.numerator_source.physical))
 }
 
 fn validate_quotient_numerator_source_binding(
@@ -10778,10 +10775,20 @@ mod tests {
                 "quotient numerator source binding has the wrong kind or extent"
             ))
         );
-        let aliased_workspace = BTreeSet::from([evaluation_column.numerator_source.physical]);
-        assert!(quotient_numerator_columns_alias_workspace(
-            numerator_columns,
-            &aliased_workspace
+        let source_alias = BTreeSet::from([evaluation_column.numerator_source.physical]);
+        assert!(quotient_numerator_sources_alias_workspace(
+            std::slice::from_ref(evaluation_column),
+            &source_alias
+        ));
+        let coefficient_source_alias = BTreeSet::from([coefficient_column.coefficients.physical]);
+        assert!(quotient_numerator_sources_alias_workspace(
+            std::slice::from_ref(coefficient_column),
+            &coefficient_source_alias
+        ));
+        let retired_coefficient_reuse = BTreeSet::from([evaluation_column.coefficients.physical]);
+        assert!(!quotient_numerator_sources_alias_workspace(
+            std::slice::from_ref(evaluation_column),
+            &retired_coefficient_reuse
         ));
 
         let mut hybrid = protocol.clone();
