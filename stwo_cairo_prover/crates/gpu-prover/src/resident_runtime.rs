@@ -18,9 +18,10 @@ use stwo_backend_cuda::{
     DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError, ExecutionTablesHostData,
     FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
     ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError,
-    PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedCommitError, PreparedCommitGraph,
-    PreparedDecommitError, PreparedDecommitGraph, PreparedEcOpError, PreparedEcOpGraph,
-    PreparedEcOpIngestTelemetry, PreparedExecutionTablesError, PreparedExecutionTablesGraph,
+    PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedBlakeGFusedFeed,
+    PreparedCommitError, PreparedCommitGraph, PreparedDecommitError, PreparedDecommitGraph,
+    PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
+    PreparedExecutionTablesError, PreparedExecutionTablesGraph,
     PreparedExecutionTablesIngestTelemetry, PreparedFixedTableError, PreparedFixedTableGraph,
     PreparedFriError, PreparedFriFinalError, PreparedFriFinalGraph, PreparedFriGraph,
     PreparedInterpolationError, PreparedInterpolationGraph, PreparedMemoryBaseTraceError,
@@ -39,7 +40,7 @@ use stwo_cairo_prover::witness::proof_shape::{ProofShapeKey, TracePartId};
 
 use crate::arena_plan::{
     BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedFixedTableSource,
-    ResidentBackend,
+    PlannedRecordedMultiplicityFeedGraph, ResidentBackend,
 };
 use crate::composition_plan::CompositionProofBindings;
 use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
@@ -682,6 +683,7 @@ impl From<ResidentLaunchError> for ResidentRuntimeError {
 /// resident across proof sessions.
 struct PreparedResidentWitness<'a> {
     component: &'static str,
+    n_real_rows: usize,
     native_input_producer: Option<&'static str>,
     input_gather: Option<PreparedWitnessInputGatherGraph<'a>>,
     input_seed: Option<PreparedWitnessInputSeedGraph<'a>>,
@@ -899,18 +901,32 @@ fn enqueue_witness_lane_levels(
                                 .launch_on(launch)
                                 .map_err(WitnessLaneLaunchError::Input)?;
                         }
-                        graph
-                            .writer
-                            .launch_on(launch)
-                            .map_err(WitnessLaneLaunchError::Writer)?;
-                        if let Some((_, feed)) = multiplicity.and_then(|multiplicity| {
+                        let feed = multiplicity.and_then(|multiplicity| {
                             multiplicity
                                 .feeds
                                 .iter()
-                                .find(|(producer, _)| *producer == graph.component)
-                        }) {
-                            feed.launch_on(launch)
-                                .map_err(WitnessLaneLaunchError::Feed)?;
+                                .find(|feed| feed.producer() == graph.component)
+                        });
+                        if let Some(PreparedResidentFeed::BlakeGFused { binding, .. }) = feed {
+                            graph
+                                .writer
+                                .launch_blake_g_fused_on(
+                                    launch,
+                                    graph.n_real_rows,
+                                    binding.luts(),
+                                    binding.counts(),
+                                )
+                                .map_err(WitnessLaneLaunchError::Writer)?;
+                        } else {
+                            graph
+                                .writer
+                                .launch_on(launch)
+                                .map_err(WitnessLaneLaunchError::Writer)?;
+                            if let Some(PreparedResidentFeed::Generic { graph, .. }) = feed {
+                                graph
+                                    .launch_on(launch)
+                                    .map_err(WitnessLaneLaunchError::Feed)?;
+                            }
                         }
                         Ok(())
                     })();
@@ -941,9 +957,28 @@ fn enqueue_witness_lane_levels(
 struct PreparedResidentMultiplicity<'a> {
     clear: PreparedWitnessFeedClearGraph<'a>,
     public_memory_seed: Option<PreparedWitnessFeedGraph<'a>>,
-    feeds: Vec<(&'static str, PreparedWitnessFeedGraph<'a>)>,
+    feeds: Vec<PreparedResidentFeed<'a>>,
     fixed_tables: Vec<PreparedFixedTableGraph<'a>>,
     memory_traces: Option<PreparedMemoryBaseTraceGraph<'a>>,
+}
+
+enum PreparedResidentFeed<'a> {
+    Generic {
+        producer: &'static str,
+        graph: PreparedWitnessFeedGraph<'a>,
+    },
+    BlakeGFused {
+        producer: &'static str,
+        binding: PreparedBlakeGFusedFeed<'a>,
+    },
+}
+
+impl PreparedResidentFeed<'_> {
+    fn producer(&self) -> &'static str {
+        match self {
+            Self::Generic { producer, .. } | Self::BlakeGFused { producer, .. } => producer,
+        }
+    }
 }
 
 fn slice_matches_slot(slice: ArenaSlice, slot: ArenaSlotId, required_words: usize) -> bool {
@@ -1208,18 +1243,30 @@ impl<'a> ResidentGraphRuntime<'a> {
                             .map_err(ResidentRuntimeError::from)
                         })
                         .transpose()?;
-                    let writer = PreparedWitnessGraph::prepare_with_execution_tables(
-                        arena,
-                        &component.program,
-                        component.requirements.row_count,
-                        &component.requirements.multiplicity_column_words,
-                        tables,
-                        &component.slots,
-                        execution_config.prepared_witness_mode(),
-                    )
+                    let writer = if component.blake_g_fused {
+                        PreparedWitnessGraph::prepare_blake_g_fused_with_execution_tables(
+                            arena,
+                            &component.program,
+                            component.requirements.row_count,
+                            tables,
+                            &component.slots,
+                            execution_config.prepared_witness_mode(),
+                        )
+                    } else {
+                        PreparedWitnessGraph::prepare_with_execution_tables(
+                            arena,
+                            &component.program,
+                            component.requirements.row_count,
+                            &component.requirements.multiplicity_column_words,
+                            tables,
+                            &component.slots,
+                            execution_config.prepared_witness_mode(),
+                        )
+                    }
                     .map_err(ResidentRuntimeError::from)?;
                     Ok::<_, ResidentRuntimeError>(PreparedResidentWitness {
                         component: component.component,
+                        n_real_rows: component.n_real_rows,
                         native_input_producer: component.native_input_producer,
                         input_gather,
                         input_seed,
@@ -1248,30 +1295,78 @@ impl<'a> ResidentGraphRuntime<'a> {
                 let feeds = planned
                     .feeds
                     .iter()
-                    .map(|feed| {
-                        let luts = feed
-                            .plan
-                            .lut_families
-                            .iter()
-                            .map(|&family| {
-                                canonical_count_lut(family, Arc::clone(&preprocessed_trace))
-                                    .map_err(|_| {
-                                        ResidentRuntimeError::CanonicalMultiplicityLut(family)
-                                    })
+                    .map(|feed| match feed {
+                        PlannedRecordedMultiplicityFeedGraph::Generic(feed) => {
+                            let luts = feed
+                                .plan
+                                .lut_families
+                                .iter()
+                                .map(|&family| {
+                                    canonical_count_lut(family, Arc::clone(&preprocessed_trace))
+                                        .map_err(|_| {
+                                            ResidentRuntimeError::CanonicalMultiplicityLut(family)
+                                        })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let graph = PreparedWitnessFeedGraph::prepare_with_mode(
+                                arena,
+                                bind_arena_binding(arena, feed.source)?,
+                                feed.plan.row_count,
+                                feed.plan.sub_words_per_row,
+                                &feed.plan.descriptors,
+                                &luts,
+                                &feed.plan.requirements.multiplicity_words,
+                                &feed.slots,
+                                protocol_identity.witness_feed_launch_mode,
+                            )?;
+                            Ok::<_, ResidentRuntimeError>(PreparedResidentFeed::Generic {
+                                producer: feed.plan.producer,
+                                graph,
                             })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let graph = PreparedWitnessFeedGraph::prepare_with_mode(
-                            arena,
-                            bind_arena_binding(arena, feed.source)?,
-                            feed.plan.row_count,
-                            feed.plan.sub_words_per_row,
-                            &feed.plan.descriptors,
-                            &luts,
-                            &feed.plan.requirements.multiplicity_words,
-                            &feed.slots,
-                            protocol_identity.witness_feed_launch_mode,
-                        )?;
-                        Ok::<_, ResidentRuntimeError>((feed.plan.producer, graph))
+                        }
+                        PlannedRecordedMultiplicityFeedGraph::BlakeGFused {
+                            plan,
+                            lut_tables,
+                            multiplicity_destinations,
+                        } => {
+                            let luts = plan
+                                .lut_families
+                                .iter()
+                                .map(|&family| {
+                                    canonical_count_lut(family, Arc::clone(&preprocessed_trace))
+                                        .map_err(|_| {
+                                            ResidentRuntimeError::CanonicalMultiplicityLut(family)
+                                        })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let [xor8, xor4, xor7, xor9] = luts.as_slice() else {
+                                return Err(ResidentRuntimeError::PreparedWitnessCaptureContract {
+                                    component: "blake_g",
+                                    role: "fused canonical LUT order",
+                                });
+                            };
+                            let binding = PreparedBlakeGFusedFeed::prepare(
+                                arena,
+                                [
+                                    bind_arena_binding(arena, lut_tables[0])?,
+                                    bind_arena_binding(arena, lut_tables[1])?,
+                                    bind_arena_binding(arena, lut_tables[2])?,
+                                    bind_arena_binding(arena, lut_tables[3])?,
+                                ],
+                                [xor8, xor4, xor7, xor9],
+                                [
+                                    bind_arena_binding(arena, multiplicity_destinations[0])?,
+                                    bind_arena_binding(arena, multiplicity_destinations[1])?,
+                                    bind_arena_binding(arena, multiplicity_destinations[2])?,
+                                    bind_arena_binding(arena, multiplicity_destinations[3])?,
+                                    bind_arena_binding(arena, multiplicity_destinations[4])?,
+                                ],
+                            )?;
+                            Ok(PreparedResidentFeed::BlakeGFused {
+                                producer: plan.producer,
+                                binding,
+                            })
+                        }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let public_memory_seed = planned
@@ -2726,6 +2821,27 @@ impl<'a> ResidentGraphRuntime<'a> {
             if prepared.component != planned.component {
                 return Err(reject("component identity"));
             }
+            if prepared.n_real_rows != planned.n_real_rows
+                || prepared.n_real_rows > prepared.writer.row_count()
+            {
+                return Err(reject("real-row geometry"));
+            }
+            if prepared.writer.is_blake_g_fused() != planned.blake_g_fused {
+                return Err(reject("fused writer ownership"));
+            }
+            let prepared_feed_is_fused = self
+                .multiplicity
+                .as_ref()
+                .and_then(|multiplicity| {
+                    multiplicity
+                        .feeds
+                        .iter()
+                        .find(|feed| feed.producer() == prepared.component)
+                })
+                .is_some_and(|feed| matches!(feed, PreparedResidentFeed::BlakeGFused { .. }));
+            if prepared_feed_is_fused != planned.blake_g_fused {
+                return Err(reject("fused feed ownership"));
+            }
             if prepared.native_input_producer != planned.native_input_producer {
                 return Err(reject("native input provenance"));
             }
@@ -2748,7 +2864,13 @@ impl<'a> ResidentGraphRuntime<'a> {
             ) {
                 return Err(reject("lookup destination"));
             }
-            if !slice_matches_slot(
+            if planned.blake_g_fused {
+                if planned.slots.multiplicity_dummy != Some(planned.slots.sub_words)
+                    || !slice_matches_slot(prepared.writer.sub_words(), planned.slots.sub_words, 1)
+                {
+                    return Err(reject("retired subcomponent destination"));
+                }
+            } else if !slice_matches_slot(
                 prepared.writer.sub_words(),
                 planned.slots.sub_words,
                 planned.requirements.sub_words,

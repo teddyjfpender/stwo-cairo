@@ -56,6 +56,72 @@ pub struct PlannedRecordedMultiplicityFeed {
     pub requirements: WitnessFeedWorkspaceRequirements,
 }
 
+/// Exact pointer order consumed by the native blake_g producer/feed fusion.
+/// Construction fail-closes unless the transformer-emitted 16-descriptor
+/// source topology is still byte-for-byte canonical.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlakeGFusedFeedBinding {
+    /// xor8, xor4, xor7, xor9.
+    pub lut_indices: [usize; 4],
+    /// xor8, xor12, xor4, xor7, xor9.
+    pub destination_indices: [usize; 5],
+}
+
+pub fn blake_g_fused_feed_binding(
+    feed: &PlannedRecordedMultiplicityFeed,
+) -> Option<BlakeGFusedFeedBinding> {
+    let layout = all_lane_sub_feed_layouts()
+        .into_iter()
+        .find(|layout| layout.component == "blake_g")?;
+    let (descriptors, lut_families, destination_states, multiplicity_words) =
+        build_feed_descriptors_sized(layout.entries, COUNT_RELATIONS, &|_| None);
+    let destination_components = destination_states
+        .iter()
+        .map(|state| destination_for_state(state).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if feed.producer != "blake_g"
+        || feed.sub_words_per_row != 48
+        || feed.descriptors != descriptors
+        || feed.lut_families != lut_families
+        || feed.destination_components != destination_components
+        || feed.requirements.row_count != feed.row_count
+        || feed.requirements.sub_words_per_row != feed.sub_words_per_row
+        || feed.requirements.descriptor_words != descriptors.len()
+        || feed.requirements.descriptor_count != 16
+        || feed.requirements.lut_pointer_words != pointer_words(lut_families.len()).ok()?
+        || feed.requirements.multiplicity_pointer_words
+            != pointer_words(destination_components.len()).ok()?
+        || feed.requirements.source_words != feed.row_count.checked_mul(48)?
+        || feed.requirements.lut_words != [1 << 16, 1 << 8, 1 << 14, 1 << 18]
+        || feed.requirements.multiplicity_words != multiplicity_words
+    {
+        return None;
+    }
+    let unique_index = |values: &[&'static str], needle: &'static str| {
+        let mut matches = values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &value)| (value == needle).then_some(index));
+        let index = matches.next()?;
+        matches.next().is_none().then_some(index)
+    };
+    Some(BlakeGFusedFeedBinding {
+        lut_indices: [
+            unique_index(&feed.lut_families, "verify_bitwise_xor_8_state")?,
+            unique_index(&feed.lut_families, "verify_bitwise_xor_4_state")?,
+            unique_index(&feed.lut_families, "verify_bitwise_xor_7_state")?,
+            unique_index(&feed.lut_families, "verify_bitwise_xor_9_state")?,
+        ],
+        destination_indices: [
+            unique_index(&feed.destination_components, "verify_bitwise_xor_8")?,
+            unique_index(&feed.destination_components, "verify_bitwise_xor_12")?,
+            unique_index(&feed.destination_components, "verify_bitwise_xor_4")?,
+            unique_index(&feed.destination_components, "verify_bitwise_xor_7")?,
+            unique_index(&feed.destination_components, "verify_bitwise_xor_9")?,
+        ],
+    })
+}
+
 pub fn plan_public_memory_multiplicity_seed(
     row_count: usize,
     address_words: usize,
@@ -780,14 +846,378 @@ fn topology_hash(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use stwo_cairo_prover::witness::cairo_claim_generator::CairoClaimGenerator;
+    use stwo_cairo_prover::witness::jit_prove_backend::{
+        BlakeGRecordedLane, BuiltinLaneSpec,
+    };
     use stwo_cairo_prover::witness::proof_shape::{
         ProofShape, RuntimeComponentShape, TracePartShape,
     };
 
     use super::*;
+
+    fn canonical_blake_g_feed(rows: usize) -> PlannedRecordedMultiplicityFeed {
+        let layout = all_lane_sub_feed_layouts()
+            .into_iter()
+            .find(|layout| layout.component == "blake_g")
+            .unwrap();
+        let (descriptors, lut_families, destination_states, multiplicity_words) =
+            build_feed_descriptors_sized(layout.entries, COUNT_RELATIONS, &|_| None);
+        let lut_words = lut_families
+            .iter()
+            .map(|family| count_relation(family).unwrap().table_size)
+            .collect::<Vec<_>>();
+        let destination_components = destination_states
+            .iter()
+            .map(|&state| destination_for_state(state).unwrap())
+            .collect::<Vec<_>>();
+        PlannedRecordedMultiplicityFeed {
+            producer: "blake_g",
+            row_count: rows,
+            sub_words_per_row: 48,
+            requirements: WitnessFeedWorkspaceRequirements {
+                row_count: rows,
+                sub_words_per_row: 48,
+                source_words: rows * 48,
+                descriptor_words: descriptors.len(),
+                descriptor_count: descriptors.len() / WITNESS_FEED_DESCRIPTOR_WORDS,
+                lut_pointer_words: pointer_words(lut_families.len()).unwrap(),
+                multiplicity_pointer_words: pointer_words(destination_components.len()).unwrap(),
+                lut_words,
+                multiplicity_words,
+            },
+            descriptors,
+            lut_families,
+            destination_components,
+        }
+    }
+
+    #[test]
+    fn blake_g_fusion_admits_only_the_exact_recorded_feed_topology() {
+        let feed = canonical_blake_g_feed(1 << 24);
+        assert_eq!(
+            blake_g_fused_feed_binding(&feed),
+            Some(BlakeGFusedFeedBinding {
+                lut_indices: [0, 1, 2, 3],
+                destination_indices: [0, 1, 2, 3, 4],
+            })
+        );
+
+        let mut changed = feed.clone();
+        changed.descriptors[0] ^= 1;
+        assert_eq!(blake_g_fused_feed_binding(&changed), None);
+        let mut changed = feed.clone();
+        changed.lut_families.swap(0, 1);
+        assert_eq!(blake_g_fused_feed_binding(&changed), None);
+        let mut changed = feed.clone();
+        changed.destination_components.swap(0, 1);
+        assert_eq!(blake_g_fused_feed_binding(&changed), None);
+        let mut changed = feed.clone();
+        changed.requirements.source_words -= 1;
+        assert_eq!(blake_g_fused_feed_binding(&changed), None);
+        let mut changed = feed.clone();
+        changed.requirements.descriptor_words -= 1;
+        assert_eq!(blake_g_fused_feed_binding(&changed), None);
+        let mut changed = feed.clone();
+        changed.requirements.lut_pointer_words += 1;
+        assert_eq!(blake_g_fused_feed_binding(&changed), None);
+        let mut changed = feed;
+        changed.requirements.row_count -= 1;
+        assert_eq!(blake_g_fused_feed_binding(&changed), None);
+    }
+
+    #[test]
+    fn blake_g_fusion_pins_sn3_sn4_capacity_and_traffic_retirement() {
+        for (rows, expected_capacity_bytes, expected_traffic_bytes) in [
+            (1usize << 23, 1_610_612_736usize, 3_221_225_472usize),
+            (1usize << 24, 3_221_225_472usize, 6_442_450_944usize),
+        ] {
+            let feed = canonical_blake_g_feed(rows);
+            assert!(blake_g_fused_feed_binding(&feed).is_some());
+            let capacity_bytes = feed.requirements.source_words * core::mem::size_of::<u32>();
+            assert_eq!(capacity_bytes, expected_capacity_bytes);
+            assert_eq!(capacity_bytes * 2, expected_traffic_bytes);
+        }
+    }
+
+    #[test]
+    fn blake_g_native_identity_rejects_semantic_drift() {
+        let recording = BlakeGRecordedLane::record();
+        assert!(recording.poisoned_cols.is_empty());
+        assert!(recording.poisoned_lookup_words.is_empty());
+        assert!(recording.poisoned_sub_words.is_empty());
+        assert!(recording.poison_ops.is_empty());
+        assert!(stwo_backend_cuda::blake_g_fusion_program_is_exact(
+            &recording.program
+        ));
+
+        let mut drifted = recording.program;
+        drifted.insts[0].imm ^= 1;
+        assert!(!stwo_backend_cuda::blake_g_fusion_program_is_exact(
+            &drifted
+        ));
+    }
+
+    #[test]
+    fn blake_g_host_abis_prove_lookup_and_sub_require_distinct_permutations() {
+        let layout = all_lane_sub_feed_layouts()
+            .into_iter()
+            .find(|layout| layout.component == "blake_g")
+            .unwrap();
+        let sub_fields = layout
+            .entries
+            .iter()
+            .map(|&(field, instance, ..)| (field, instance))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sub_fields,
+            [
+                ("verify_bitwise_xor_8", 0),
+                ("verify_bitwise_xor_8", 1),
+                ("verify_bitwise_xor_8", 2),
+                ("verify_bitwise_xor_8", 3),
+                ("verify_bitwise_xor_8_b", 0),
+                ("verify_bitwise_xor_8_b", 1),
+                ("verify_bitwise_xor_8_b", 2),
+                ("verify_bitwise_xor_8_b", 3),
+                ("verify_bitwise_xor_12", 0),
+                ("verify_bitwise_xor_12", 1),
+                ("verify_bitwise_xor_4", 0),
+                ("verify_bitwise_xor_4", 1),
+                ("verify_bitwise_xor_7", 0),
+                ("verify_bitwise_xor_7", 1),
+                ("verify_bitwise_xor_9", 0),
+                ("verify_bitwise_xor_9", 1),
+            ]
+        );
+        assert_eq!(
+            &BlakeGRecordedLane::lookup_fields()[..16],
+            &[
+                ("verify_bitwise_xor_8_0", 4),
+                ("verify_bitwise_xor_8_1", 4),
+                ("verify_bitwise_xor_8_b_2", 4),
+                ("verify_bitwise_xor_8_b_3", 4),
+                ("verify_bitwise_xor_12_4", 4),
+                ("verify_bitwise_xor_4_5", 4),
+                ("verify_bitwise_xor_12_6", 4),
+                ("verify_bitwise_xor_4_7", 4),
+                ("verify_bitwise_xor_8_8", 4),
+                ("verify_bitwise_xor_8_9", 4),
+                ("verify_bitwise_xor_8_b_10", 4),
+                ("verify_bitwise_xor_8_b_11", 4),
+                ("verify_bitwise_xor_7_12", 4),
+                ("verify_bitwise_xor_9_13", 4),
+                ("verify_bitwise_xor_7_14", 4),
+                ("verify_bitwise_xor_9_15", 4),
+            ]
+        );
+
+        // These are the two independently generated host ABI projections in
+        // terms of the native writer's live c[] values. The old CUDA writer
+        // used LOOKUP_COLUMNS for both destinations, which permuted eight of
+        // sixteen generic-feed tuples. Lookup order itself remains unchanged.
+        const LOOKUP_COLUMNS: [[u8; 3]; 16] = [
+            [53, 55, 18],
+            [14, 16, 19],
+            [54, 56, 20],
+            [15, 17, 21],
+            [57, 59, 28],
+            [24, 26, 29],
+            [58, 60, 30],
+            [25, 27, 31],
+            [61, 63, 38],
+            [34, 36, 39],
+            [62, 64, 40],
+            [35, 37, 41],
+            [65, 67, 48],
+            [44, 46, 49],
+            [66, 68, 50],
+            [45, 47, 51],
+        ];
+        const SUB_COLUMNS: [[u8; 3]; 16] = [
+            [53, 55, 18],
+            [14, 16, 19],
+            [61, 63, 38],
+            [34, 36, 39],
+            [54, 56, 20],
+            [15, 17, 21],
+            [62, 64, 40],
+            [35, 37, 41],
+            [57, 59, 28],
+            [58, 60, 30],
+            [24, 26, 29],
+            [25, 27, 31],
+            [65, 67, 48],
+            [66, 68, 50],
+            [44, 46, 49],
+            [45, 47, 51],
+        ];
+        const SUB_TO_LOOKUP: [usize; 16] = [
+            0, 1, 8, 9, 2, 3, 10, 11, 4, 6, 5, 7, 12, 14, 13, 15,
+        ];
+        assert_ne!(SUB_COLUMNS, LOOKUP_COLUMNS);
+        for (sub, lookup) in SUB_TO_LOOKUP.into_iter().enumerate() {
+            assert_eq!(SUB_COLUMNS[sub], LOOKUP_COLUMNS[lookup]);
+        }
+    }
+
+    type SparseCounts = BTreeMap<(usize, usize), u32>;
+
+    fn increment(counts: &mut SparseCounts, destination: usize, offset: usize) {
+        let count = counts.entry((destination, offset)).or_default();
+        *count = count.wrapping_add(1);
+    }
+
+    fn generic_blake_g_sparse_counts(
+        sub: &[u32],
+        rows: usize,
+        descriptors: &[u32],
+        luts: &[Vec<u32>],
+    ) -> SparseCounts {
+        let mut counts = SparseCounts::new();
+        for descriptor in descriptors.chunks_exact(WITNESS_FEED_DESCRIPTOR_WORDS) {
+            let word_base = descriptor[0] as usize;
+            let bits = descriptor[2];
+            let relation = descriptor[7] as usize;
+            let table_size = descriptor[8] as usize;
+            let destination = descriptor[10] as usize;
+            for row in 0..rows {
+                let a = sub[word_base * rows + row];
+                let b = sub[(word_base + 1) * rows + row];
+                let xor = sub[(word_base + 2) * rows + row];
+                if xor != a ^ b {
+                    continue;
+                }
+                let offset = match descriptor[11] {
+                    2 if (a | b | xor) < (1 << bits) => {
+                        let key = ((a << bits) | b) as usize;
+                        let index = luts[descriptor[9] as usize][key] as usize;
+                        (index < table_size).then_some(relation * table_size + index)
+                    }
+                    3 if (a | b | xor) < (1 << 12) => {
+                        let column = ((a >> 10) << 2) | (b >> 10);
+                        let table_row = ((a & 0x3ff) << 10) | (b & 0x3ff);
+                        Some(column as usize * table_size + table_row as usize)
+                    }
+                    _ => None,
+                };
+                if let Some(offset) = offset {
+                    increment(&mut counts, destination, offset);
+                }
+            }
+        }
+        counts
+    }
+
+    fn fused_blake_g_sparse_counts(columns: &[[u32; 73]], luts: &[Vec<u32>]) -> SparseCounts {
+        let mut counts = SparseCounts::new();
+        let lut_pairs = [
+            (0, 0, 8, [53, 14, 61, 34], [55, 16, 63, 36]),
+            (0, 1, 8, [54, 15, 62, 35], [56, 17, 64, 37]),
+            (2, 0, 4, [24, 25, 0, 0], [26, 27, 0, 0]),
+            (3, 0, 7, [65, 66, 0, 0], [67, 68, 0, 0]),
+            (4, 0, 9, [44, 45, 0, 0], [46, 47, 0, 0]),
+        ];
+        for column in columns {
+            for (family, &(destination, relation, bits, a_columns, b_columns)) in
+                lut_pairs.iter().enumerate()
+            {
+                let pairs = if destination == 0 { 4 } else { 2 };
+                let lut = &luts[[0, 0, 1, 2, 3][family]];
+                let table_size = 1usize << (2 * bits);
+                for pair in 0..pairs {
+                    let a = column[a_columns[pair]];
+                    let b = column[b_columns[pair]];
+                    let index = lut[((a << bits) | b) as usize] as usize;
+                    increment(&mut counts, destination, relation * table_size + index);
+                }
+            }
+            for (&a_column, &b_column) in [57, 58].iter().zip([59, 60].iter()) {
+                let a = column[a_column];
+                let b = column[b_column];
+                let relation = ((a >> 10) << 2) | (b >> 10);
+                let row = ((a & 0x3ff) << 10) | (b & 0x3ff);
+                increment(&mut counts, 1, ((relation << 20) | row) as usize);
+            }
+        }
+        counts
+    }
+
+    #[test]
+    fn blake_g_fused_count_oracle_matches_generic_words_at_lut_boundaries() {
+        // Reverse LUTs make key zero map to the last row and the maximum key
+        // map to row zero, exercising both destination boundaries.
+        let luts = [8, 4, 7, 9].map(|bits| {
+            (0..1usize << (2 * bits))
+                .rev()
+                .map(|row| row as u32)
+                .collect()
+        });
+        let mut columns = vec![[0u32; 73]; 3];
+        // Exact SubComponentInputs declaration order. LookupData contains the
+        // same tuples in a different interaction-column order.
+        let tuple_columns = [
+            53, 55, 18, 14, 16, 19, 61, 63, 38, 34, 36, 39, 54, 56, 20, 15, 17, 21, 62, 64, 40, 35,
+            37, 41, 57, 59, 28, 58, 60, 30, 24, 26, 29, 25, 27, 31, 65, 67, 48, 66, 68, 50, 44, 46,
+            49, 45, 47, 51,
+        ];
+        for (row, column) in columns.iter_mut().enumerate() {
+            for &(bits, a_columns, b_columns) in &[
+                (
+                    8,
+                    &[53, 14, 61, 34, 54, 15, 62, 35][..],
+                    &[55, 16, 63, 36, 56, 17, 64, 37][..],
+                ),
+                (12, &[57, 58][..], &[59, 60][..]),
+                (4, &[24, 25][..], &[26, 27][..]),
+                (7, &[65, 66][..], &[67, 68][..]),
+                (9, &[44, 45][..], &[46, 47][..]),
+            ] {
+                let mask = (1u32 << bits) - 1;
+                for (pair, (&a_column, &b_column)) in a_columns.iter().zip(b_columns).enumerate() {
+                    let (a, b) = match row {
+                        0 => (0, 0),
+                        1 => (mask, mask),
+                        _ => ((pair as u32 + 1) & mask, mask - pair as u32),
+                    };
+                    column[a_column] = a;
+                    column[b_column] = b;
+                }
+            }
+        }
+        let rows = columns.len();
+        for column in &mut columns {
+            for tuple in tuple_columns.chunks_exact(3) {
+                column[tuple[2]] = column[tuple[0]] ^ column[tuple[1]];
+            }
+        }
+        let mut sub = vec![0u32; tuple_columns.len() * rows];
+        for (word, &column) in tuple_columns.iter().enumerate() {
+            for row in 0..rows {
+                sub[word * rows + row] = columns[row][column];
+            }
+        }
+        let feed = canonical_blake_g_feed(rows);
+        let generic = generic_blake_g_sparse_counts(&sub, rows, &feed.descriptors, &luts);
+        let fused = fused_blake_g_sparse_counts(&columns, &luts);
+        assert_eq!(fused, generic);
+        for &(destination, last) in &[
+            (0, (2 << 16) - 1),
+            (1, (16 << 20) - 1),
+            (2, (1 << 8) - 1),
+            (3, (1 << 14) - 1),
+            (4, (1 << 18) - 1),
+        ] {
+            assert!(generic
+                .keys()
+                .any(|&(slot, offset)| slot == destination && offset == 0));
+            assert!(generic
+                .keys()
+                .any(|&(slot, offset)| slot == destination && offset == last));
+        }
+    }
 
     #[test]
     fn public_memory_seed_preserves_duplicate_address_and_id_multiplicities() {

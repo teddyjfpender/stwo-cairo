@@ -15,7 +15,8 @@ use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo_backend_cuda::jit_witness::isa::WitnessProgram;
 use stwo_backend_cuda::{
-    blake2s_pow_workspace_requirements, commit_workspace_requirements,
+    blake2s_pow_workspace_requirements, blake_g_fusion_program_is_exact,
+    commit_workspace_requirements,
     decommit_workspace_requirements, ec_op_workspace_requirements,
     execution_tables_workspace_requirements, fri_final_workspace_requirements,
     fri_workspace_requirements, oods_workspace_requirements,
@@ -57,6 +58,7 @@ use stwo_backend_cuda::{
     WitnessInputSeedSlots, WitnessWorkspaceRequirements, WitnessWorkspaceSlots,
     EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_SMALL_LIMBS,
 };
+use stwo_cairo_prover::witness::jit_prove_backend::{BlakeGRecordedLane, BuiltinLaneSpec};
 use stwo_cairo_prover::witness::proof_shape::{
     ProofShapeError, RowResolution, TracePartId, TracePartShape,
 };
@@ -71,7 +73,7 @@ use crate::fixed_table_materializer::{
     pedersen_points_18_column_index, PEDERSEN_POINTS_18_LOG_SIZE, PEDERSEN_POINTS_18_ROW_COUNT,
 };
 use crate::multiplicity_pipeline::{
-    plan_graph_a_multiplicities, plan_public_memory_multiplicity_seed,
+    blake_g_fused_feed_binding, plan_graph_a_multiplicities, plan_public_memory_multiplicity_seed,
     FixedMultiplicityCoverageGap, GraphAMultiplicityPlan, GraphAMultiplicityPlanError,
     MultiplicityFeedBlocker, PlannedMemoryBaseTraces,
 };
@@ -2719,6 +2721,8 @@ struct LogicalWitnessInputCompact {
 struct LogicalWitnessComponent {
     component: &'static str,
     part: TracePartId,
+    n_real_rows: usize,
+    blake_g_fused: bool,
     native_input_producer: Option<&'static str>,
     program: WitnessProgram,
     requirements: WitnessWorkspaceRequirements,
@@ -2744,7 +2748,7 @@ struct LogicalWitnessWorkspace {
 }
 
 #[derive(Clone, Debug)]
-struct LogicalRecordedMultiplicityFeed {
+struct LogicalGenericRecordedMultiplicityFeed {
     plan: crate::multiplicity_pipeline::PlannedRecordedMultiplicityFeed,
     source: LogicalBufferId,
     descriptors: LogicalBufferId,
@@ -2752,6 +2756,16 @@ struct LogicalRecordedMultiplicityFeed {
     lut_pointers: LogicalBufferId,
     multiplicity_destinations: Vec<LogicalBufferId>,
     multiplicity_pointers: LogicalBufferId,
+}
+
+#[derive(Clone, Debug)]
+enum LogicalRecordedMultiplicityFeed {
+    Generic(LogicalGenericRecordedMultiplicityFeed),
+    BlakeGFused {
+        plan: crate::multiplicity_pipeline::PlannedRecordedMultiplicityFeed,
+        lut_tables: [LogicalBufferId; 4],
+        multiplicity_destinations: [LogicalBufferId; 5],
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -2785,7 +2799,7 @@ struct LogicalGraphAMultiplicityWorkspace {
     clear_pointers: LogicalBufferId,
     clear_lengths: LogicalBufferId,
     feeds: Vec<LogicalRecordedMultiplicityFeed>,
-    public_memory_seed: Option<LogicalRecordedMultiplicityFeed>,
+    public_memory_seed: Option<LogicalGenericRecordedMultiplicityFeed>,
     fixed_tables: Vec<LogicalFixedTableMaterializer>,
     memory_traces: Option<LogicalMemoryBaseTraces>,
 }
@@ -2874,6 +2888,8 @@ pub struct PlannedEcOpWorkspace {
 pub struct PlannedWitnessComponent {
     pub component: &'static str,
     pub part: TracePartId,
+    pub n_real_rows: usize,
+    pub blake_g_fused: bool,
     pub native_input_producer: Option<&'static str>,
     pub program: WitnessProgram,
     pub requirements: WitnessWorkspaceRequirements,
@@ -2889,10 +2905,20 @@ pub struct PlannedWitnessWorkspace {
 }
 
 #[derive(Clone, Debug)]
-pub struct PlannedRecordedMultiplicityFeedGraph {
+pub struct PlannedGenericRecordedMultiplicityFeedGraph {
     pub plan: crate::multiplicity_pipeline::PlannedRecordedMultiplicityFeed,
     pub source: ArenaBinding,
     pub slots: WitnessFeedWorkspaceSlots,
+}
+
+#[derive(Clone, Debug)]
+pub enum PlannedRecordedMultiplicityFeedGraph {
+    Generic(PlannedGenericRecordedMultiplicityFeedGraph),
+    BlakeGFused {
+        plan: crate::multiplicity_pipeline::PlannedRecordedMultiplicityFeed,
+        lut_tables: [ArenaBinding; 4],
+        multiplicity_destinations: [ArenaBinding; 5],
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -2918,7 +2944,7 @@ pub struct PlannedGraphAMultiplicityWorkspace {
     pub clear_requirements: WitnessFeedClearWorkspaceRequirements,
     pub clear_slots: WitnessFeedClearWorkspaceSlots,
     pub feeds: Vec<PlannedRecordedMultiplicityFeedGraph>,
-    pub public_memory_seed: Option<PlannedRecordedMultiplicityFeedGraph>,
+    pub public_memory_seed: Option<PlannedGenericRecordedMultiplicityFeedGraph>,
     pub fixed_tables: Vec<PlannedFixedTableMaterializer>,
     pub memory_traces: Option<PlannedMemoryBaseTraceWorkspace>,
 }
@@ -3323,6 +3349,27 @@ impl ProofArenaPlan {
             .collect::<HashSet<_>>();
         let late_coefficient_ownership = LateCoefficientOwnershipPlan::compile(protocol)
             .map_err(ArenaPlanError::InvalidProtocolGeometry)?;
+        let multiplicity_plan = execution_table_geometry
+            .is_some()
+            .then(|| plan_graph_a_multiplicities(plan).map_err(ArenaPlanError::MultiplicityPlan))
+            .transpose()?;
+        let blake_g_fused = multiplicity_plan.as_ref().is_some_and(|multiplicity| {
+            let feed_is_exact = multiplicity
+                .feeds
+                .iter()
+                .find(|feed| feed.producer == "blake_g")
+                .and_then(blake_g_fused_feed_binding)
+                .is_some();
+            if !feed_is_exact {
+                return false;
+            }
+            let recording = BlakeGRecordedLane::record();
+            recording.poisoned_cols.is_empty()
+                && recording.poisoned_lookup_words.is_empty()
+                && recording.poisoned_sub_words.is_empty()
+                && recording.poison_ops.is_empty()
+                && blake_g_fusion_program_is_exact(&recording.program)
+        });
         let mut logical = Vec::new();
         let mut transition_aliases = Vec::new();
         for component in &plan.components {
@@ -3390,7 +3437,12 @@ impl ProofArenaPlan {
                         BufferLifetime::new(ProofEpoch::Witness, ProofEpoch::Interaction)?,
                     )?;
                 }
-                if let Some(words) = component.node.facts.sub_words {
+                if let Some(words) = component
+                    .node
+                    .facts
+                    .sub_words
+                    .filter(|_| component.node.id != "blake_g" || !blake_g_fused)
+                {
                     push_component_flat_buffer(
                         &mut logical,
                         component.node.id,
@@ -3442,18 +3494,18 @@ impl ProofArenaPlan {
         let logical_execution_tables = execution_table_geometry
             .map(|geometry| append_execution_table_buffers(&mut logical, geometry))
             .transpose()?;
-        let logical_witness =
-            append_witness_buffers(&mut logical, plan, logical_execution_tables.is_some())?;
+        let logical_witness = append_witness_buffers(
+            &mut logical,
+            plan,
+            logical_execution_tables.is_some(),
+            blake_g_fused,
+        )?;
         let logical_relation = append_relation_buffers(
             &mut logical,
             relation_execution,
             &late_coefficient_ownership,
             &mut transition_aliases,
         )?;
-        let multiplicity_plan = logical_execution_tables
-            .is_some()
-            .then(|| plan_graph_a_multiplicities(plan).map_err(ArenaPlanError::MultiplicityPlan))
-            .transpose()?;
         let retained_preprocessed_evaluations = multiplicity_plan.as_ref().map(|multiplicity| {
             multiplicity
                 .fixed
@@ -3489,6 +3541,7 @@ impl ProofArenaPlan {
                     &logical_preprocessed,
                     multiplicity_plan,
                     execution_table_geometry.map_or(0, |geometry| geometry.public_memory_entries),
+                    blake_g_fused,
                 )?)
             }
         } else {
@@ -4184,6 +4237,7 @@ fn append_witness_buffers(
     logical: &mut Vec<LogicalBuffer>,
     proof: &ProofPlan,
     shared_execution_tables: bool,
+    blake_g_fused: bool,
 ) -> Result<LogicalWitnessWorkspace, ArenaPlanError> {
     let mut recordings = BTreeMap::new();
     for (label, program) in stwo_cairo_prover::witness::jit_prove_backend::all_lane_recordings() {
@@ -4359,15 +4413,21 @@ fn append_witness_buffers(
                 witness_lifetime,
             )?,
         };
-        let sub_words = match component.node.facts.sub_words {
-            Some(_) => logical_buffer_id(
+        let component_blake_g_fused = blake_g_fused && component.node.id == "blake_g";
+        let sub_words = match (component.node.facts.sub_words, component_blake_g_fused) {
+            (Some(_), true) => {
+                multiplicity_dummy.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                    "fused blake_g is missing its shared one-word dummy",
+                ))?
+            }
+            (Some(_), false) => logical_buffer_id(
                 logical,
                 component.node.id,
                 part.part,
                 BufferPurpose::SubcomponentInputs,
                 0,
             )?,
-            None => push_buffer_id(
+            (None, _) => push_buffer_id(
                 logical,
                 Some(component.node.id),
                 Some(part.part),
@@ -4432,6 +4492,9 @@ fn append_witness_buffers(
         components.push(LogicalWitnessComponent {
             component: component.node.id,
             part: part.part,
+            n_real_rows: usize::try_from(part.n_real_rows)
+                .map_err(|_| ArenaPlanError::SizeOverflow)?,
+            blake_g_fused: component_blake_g_fused,
             native_input_producer,
             program,
             requirements,
@@ -4662,6 +4725,7 @@ fn append_graph_a_multiplicity_buffers(
     preprocessed: &LogicalPreprocessedWorkspace,
     plan: GraphAMultiplicityPlan,
     public_memory_entries: usize,
+    blake_g_fused: bool,
 ) -> Result<LogicalGraphAMultiplicityWorkspace, ArenaPlanError> {
     let persistent = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble)?;
     let witness = BufferLifetime::at(ProofEpoch::Witness);
@@ -4750,6 +4814,42 @@ fn append_graph_a_multiplicity_buffers(
     let mut feeds = Vec::with_capacity(feed_count);
     for (ordinal, feed) in plan.feeds.into_iter().enumerate() {
         let ordinal = u32::try_from(ordinal).map_err(|_| ArenaPlanError::SizeOverflow)?;
+        let lut_tables = feed
+            .lut_families
+            .iter()
+            .map(|family| {
+                lut_ids
+                    .get(family)
+                    .copied()
+                    .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                        "missing canonical witness-feed LUT",
+                    ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let multiplicity_destinations = feed
+            .destination_components
+            .iter()
+            .map(|component| {
+                multiplicity_ids.get(component).copied().ok_or(
+                    ArenaPlanError::InvalidProtocolGeometry(
+                        "missing fixed multiplicity destination",
+                    ),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(binding) = blake_g_fused
+            .then(|| blake_g_fused_feed_binding(&feed))
+            .flatten()
+        {
+            feeds.push(LogicalRecordedMultiplicityFeed::BlakeGFused {
+                plan: feed,
+                lut_tables: binding.lut_indices.map(|index| lut_tables[index]),
+                multiplicity_destinations: binding
+                    .destination_indices
+                    .map(|index| multiplicity_destinations[index]),
+            });
+            continue;
+        }
         let source = logical_buffer_id(
             logical,
             feed.producer,
@@ -4766,18 +4866,6 @@ fn append_graph_a_multiplicity_buffers(
             feed.requirements.descriptor_words,
             persistent,
         )?;
-        let lut_tables = feed
-            .lut_families
-            .iter()
-            .map(|family| {
-                lut_ids
-                    .get(family)
-                    .copied()
-                    .ok_or(ArenaPlanError::InvalidProtocolGeometry(
-                        "missing canonical witness-feed LUT",
-                    ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let lut_pointers = push_buffer_id(
             logical,
             Some(feed.producer),
@@ -4787,17 +4875,6 @@ fn append_graph_a_multiplicity_buffers(
             feed.requirements.lut_pointer_words,
             persistent,
         )?;
-        let multiplicity_destinations = feed
-            .destination_components
-            .iter()
-            .map(|component| {
-                multiplicity_ids.get(component).copied().ok_or(
-                    ArenaPlanError::InvalidProtocolGeometry(
-                        "missing fixed multiplicity destination",
-                    ),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let multiplicity_pointers = push_buffer_id(
             logical,
             Some(feed.producer),
@@ -4807,15 +4884,17 @@ fn append_graph_a_multiplicity_buffers(
             feed.requirements.multiplicity_pointer_words,
             persistent,
         )?;
-        feeds.push(LogicalRecordedMultiplicityFeed {
-            plan: feed,
-            source,
-            descriptors,
-            lut_tables,
-            lut_pointers,
-            multiplicity_destinations,
-            multiplicity_pointers,
-        });
+        feeds.push(LogicalRecordedMultiplicityFeed::Generic(
+            LogicalGenericRecordedMultiplicityFeed {
+                plan: feed,
+                source,
+                descriptors,
+                lut_tables,
+                lut_pointers,
+                multiplicity_destinations,
+                multiplicity_pointers,
+            },
+        ));
     }
 
     let public_memory_seed = (public_memory_entries != 0)
@@ -4885,7 +4964,7 @@ fn append_graph_a_multiplicity_buffers(
                 seed.requirements.multiplicity_pointer_words,
                 persistent,
             )?;
-            Ok::<_, ArenaPlanError>(LogicalRecordedMultiplicityFeed {
+            Ok::<_, ArenaPlanError>(LogicalGenericRecordedMultiplicityFeed {
                 plan: seed,
                 source,
                 descriptors,
@@ -9189,7 +9268,19 @@ fn resolve_witness_slots(
                 lookup_words: physical(component.lookup_words)?,
                 sub_words: physical(component.sub_words)?,
             };
-            if execution_tables.is_some() {
+            if component.blake_g_fused {
+                if execution_tables.is_none() {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "fused blake_g requires prepared execution tables",
+                    ));
+                }
+                component
+                    .requirements
+                    .arena_slot_requirements_for_blake_g_fusion_with_prepared_execution_tables(
+                        &slots,
+                    )
+                    .map_err(ArenaPlanError::Witness)?;
+            } else if execution_tables.is_some() {
                 component
                     .requirements
                     .arena_slot_requirements_with_prepared_execution_tables(&slots)
@@ -9279,6 +9370,8 @@ fn resolve_witness_slots(
             Ok(PlannedWitnessComponent {
                 component: component.component,
                 part: component.part,
+                n_real_rows: component.n_real_rows,
+                blake_g_fused: component.blake_g_fused,
                 native_input_producer: component.native_input_producer,
                 program: component.program,
                 requirements: component.requirements,
@@ -9311,7 +9404,7 @@ fn resolve_graph_a_multiplicity_slots(
         .clear_requirements
         .arena_slot_requirements(clear_slots)
         .map_err(ArenaPlanError::WitnessFeed)?;
-    let resolve_feed = |feed: LogicalRecordedMultiplicityFeed| {
+    let resolve_generic_feed = |feed: LogicalGenericRecordedMultiplicityFeed| {
         let slots = WitnessFeedWorkspaceSlots {
             descriptors: physical(feed.descriptors)?,
             lut_tables: feed
@@ -9331,7 +9424,7 @@ fn resolve_graph_a_multiplicity_slots(
             .requirements
             .arena_slot_requirements(&slots)
             .map_err(ArenaPlanError::WitnessFeed)?;
-        Ok::<_, ArenaPlanError>(PlannedRecordedMultiplicityFeedGraph {
+        Ok::<_, ArenaPlanError>(PlannedGenericRecordedMultiplicityFeedGraph {
             plan: feed.plan,
             source: binding(feed.source)?,
             slots,
@@ -9340,9 +9433,36 @@ fn resolve_graph_a_multiplicity_slots(
     let feeds = logical
         .feeds
         .into_iter()
-        .map(&resolve_feed)
+        .map(|feed| match feed {
+            LogicalRecordedMultiplicityFeed::Generic(feed) => {
+                resolve_generic_feed(feed).map(PlannedRecordedMultiplicityFeedGraph::Generic)
+            }
+            LogicalRecordedMultiplicityFeed::BlakeGFused {
+                plan,
+                lut_tables,
+                multiplicity_destinations,
+            } => Ok(PlannedRecordedMultiplicityFeedGraph::BlakeGFused {
+                plan,
+                lut_tables: [
+                    binding(lut_tables[0])?,
+                    binding(lut_tables[1])?,
+                    binding(lut_tables[2])?,
+                    binding(lut_tables[3])?,
+                ],
+                multiplicity_destinations: [
+                    binding(multiplicity_destinations[0])?,
+                    binding(multiplicity_destinations[1])?,
+                    binding(multiplicity_destinations[2])?,
+                    binding(multiplicity_destinations[3])?,
+                    binding(multiplicity_destinations[4])?,
+                ],
+            }),
+        })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
-    let public_memory_seed = logical.public_memory_seed.map(resolve_feed).transpose()?;
+    let public_memory_seed = logical
+        .public_memory_seed
+        .map(resolve_generic_feed)
+        .transpose()?;
     let fixed_tables = logical
         .fixed_tables
         .into_iter()
