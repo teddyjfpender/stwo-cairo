@@ -35,6 +35,8 @@
 # resolved by `runpodctl ssh info`.
 #
 # PHASE CONTRACT — the phases_file runs ON THE POD with these available:
+#   * exact directive `# pod_run: require_clean_sources` rejects either local
+#       repo unless its source hash is SHA-256(empty), before the pod is started.
 #   * function `phase NAME CMD...` : run CMD, record $RUN/NAME.rc and
 #       $RUN/NAME.secs, and abort the session on failure. The driver polls
 #       exactly the NAMEs it finds by scanning your file for lines beginning
@@ -70,6 +72,8 @@ printf -v POD_CARGO_HOME_Q '%q' "$POD_CARGO_HOME"
 PHASES_FILE="${1:?usage: pod_run.sh <phases_file> [label]}"
 [[ -f "$PHASES_FILE" ]] || { echo "phases file not found: $PHASES_FILE" >&2; exit 2; }
 LABEL="${2:-pod_run_$(date -u +%Y%m%dT%H%M%SZ)}"
+REQUIRE_CLEAN_SOURCES=0
+grep -Fqx '# pod_run: require_clean_sources' "$PHASES_FILE" && REQUIRE_CLEAN_SOURCES=1
 
 # --- pod identity ---
 POD_ID="${BENCH_POD_ID:-}"
@@ -148,6 +152,13 @@ valid_source_identity "$STWO_HEAD" "$STWO_WORKTREE_HASH" \
   || { echo "invalid stwo source identity" >&2; exit 2; }
 valid_source_identity "$CAIRO_HEAD" "$CAIRO_WORKTREE_HASH" \
   || { echo "invalid stwo-cairo source identity" >&2; exit 2; }
+EMPTY_SOURCE_HASH=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+if [[ "$REQUIRE_CLEAN_SOURCES" == 1 &&
+      ( "$STWO_WORKTREE_HASH" != "$EMPTY_SOURCE_HASH" ||
+        "$CAIRO_WORKTREE_HASH" != "$EMPTY_SOURCE_HASH" ) ]]; then
+  echo "phase contract requires clean stwo and stwo-cairo sources" >&2
+  exit 2
+fi
 
 PHASE_NAMES="$(awk '$1=="phase"{print $2}' "$PHASES_FILE")"
 [[ -n "$PHASE_NAMES" ]] || { echo "no 'phase NAME ...' lines in $PHASES_FILE" >&2; exit 2; }
@@ -289,7 +300,7 @@ PROLOGUE
   echo 'echo done > "$RUN/session.done"'
 } | pssh "mkdir -p '$RUN' && cat > '$RUN/session.sh'" \
   || { note "UPLOAD FAILED"; exit 1; }
-pssh "cd '$RUN' && rm -rf divergence *.log *.rc *.secs session.done && nohup setsid -f bash '$RUN/session.sh' </dev/null > session.out 2>&1 && echo LAUNCHED" \
+pssh "cd '$RUN' && rm -rf divergence *.bin *.log *.rc *.secs *.csv *.json *.ncu-rep *.nsys-rep *.qdrep *.sqlite *.txt *.xml session.done && nohup setsid -f bash '$RUN/session.sh' </dev/null > session.out 2>&1 && echo LAUNCHED" \
   || { note "LAUNCH FAILED"; exit 1; }
 
 # --- 6. poll phases in order ---
@@ -372,6 +383,16 @@ scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" "root@${HOST}:$RUN/*.log" "root@${HOST
 scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" "root@${HOST}:$RUN/*.rc" \
   "$RESULTS_DIR/$LABEL/" 2>/dev/null \
   || { note "ERROR: phase rc fetch failed"; RUN_RC=1; }
+# Profiling recipes and formal checkpoints keep raw reports/proofs alongside
+# the phase logs. Fetch every present optional artifact before the pod stops;
+# absence is expected for ordinary benchmark recipes.
+for suffix in bin csv json ncu-rep nsys-rep qdrep sqlite txt xml; do
+  if pssh "compgen -G '$RUN/*.$suffix' >/dev/null" 2>/dev/null; then
+    scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" "root@${HOST}:$RUN/*.$suffix" \
+      "$RESULTS_DIR/$LABEL/" 2>/dev/null \
+      || { note "ERROR: optional *.$suffix artifact fetch failed"; RUN_RC=1; }
+  fi
+done
 for p in $OBSERVED_PHASES; do
   for suffix in log secs rc; do
     [[ -f "$RESULTS_DIR/$LABEL/$p.$suffix" ]] \
