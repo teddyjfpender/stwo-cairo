@@ -373,7 +373,6 @@ pub enum BufferPurpose {
     RelationDenominators,
     RelationClaimedSum,
     QueryIndices,
-    DecommitValues,
     DecommitHashes,
     DecommitUniqueQueries,
     DecommitMappedQueries,
@@ -2453,6 +2452,8 @@ struct LogicalFinalFriPowWorkspace {
 
 #[derive(Clone, Debug)]
 struct LogicalTraceDecommitSlots {
+    evaluation_ptrs: LogicalBufferId,
+    evaluation_log_sizes: LogicalBufferId,
     retained_layers_by_log: LogicalBufferId,
     sparse_level_offsets: LogicalBufferId,
     groups: Vec<LogicalTraceDecommitGroupSlots>,
@@ -2460,8 +2461,6 @@ struct LogicalTraceDecommitSlots {
 
 #[derive(Clone, Debug)]
 struct LogicalTraceDecommitGroupSlots {
-    evaluation_ptrs: LogicalBufferId,
-    evaluation_log_sizes: LogicalBufferId,
     coefficient_ptrs: Option<LogicalBufferId>,
     coefficient_sizes: Option<LogicalBufferId>,
     lde_output_ptrs: Option<LogicalBufferId>,
@@ -2495,7 +2494,6 @@ struct LogicalDecommitWorkspace {
     sparse_indices: LogicalBufferId,
     sparse_hashes: LogicalBufferId,
     counts: LogicalBufferId,
-    values: LogicalBufferId,
     proof_bundle_layout: ResidentProofBundleLayout,
     proof_bundle: LogicalBufferId,
     trees: Vec<LogicalDecommitTreeSlots>,
@@ -7725,12 +7723,6 @@ fn append_decommit_buffers(
         requirements.count_words,
         scratch,
     )?;
-    let values = allocate(
-        BufferPurpose::DecommitValues,
-        0,
-        requirements.value_words,
-        scratch,
-    )?;
     let proof_bundle = allocate(
         BufferPurpose::ProofBytes,
         0,
@@ -7774,18 +7766,6 @@ fn append_decommit_buffers(
                                 )
                                 .ok_or(ArenaPlanError::SizeOverflow)?;
                             Ok(LogicalTraceDecommitGroupSlots {
-                                evaluation_ptrs: allocate(
-                                    BufferPurpose::DecommitTraceEvaluationPointers,
-                                    ordinal,
-                                    group.pointer_words,
-                                    descriptor,
-                                )?,
-                                evaluation_log_sizes: allocate(
-                                    BufferPurpose::DecommitTraceEvaluationLogs,
-                                    ordinal,
-                                    group.log_words,
-                                    descriptor,
-                                )?,
                                 coefficient_ptrs: group
                                     .coefficient_pointer_words
                                     .map(|words| {
@@ -7828,6 +7808,18 @@ fn append_decommit_buffers(
                         })
                         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
                     Ok(LogicalDecommitTreeSlots::Trace(LogicalTraceDecommitSlots {
+                        evaluation_ptrs: allocate(
+                            BufferPurpose::DecommitTraceEvaluationPointers,
+                            tree_ordinal,
+                            tree.evaluation_pointer_words,
+                            descriptor,
+                        )?,
+                        evaluation_log_sizes: allocate(
+                            BufferPurpose::DecommitTraceEvaluationLogs,
+                            tree_ordinal,
+                            tree.evaluation_log_words,
+                            descriptor,
+                        )?,
                         retained_layers_by_log: allocate(
                             BufferPurpose::DecommitTraceRetainedPointers,
                             tree_ordinal,
@@ -7876,7 +7868,6 @@ fn append_decommit_buffers(
         sparse_indices,
         sparse_hashes,
         counts,
-        values,
         proof_bundle_layout,
         proof_bundle,
         trees,
@@ -8690,6 +8681,8 @@ fn resolve_decommit_slots(
         .map(|tree| match tree {
             LogicalDecommitTreeSlots::Trace(tree) => {
                 Ok(DecommitTreeSlots::Trace(TraceDecommitSlots {
+                    evaluation_ptrs: physical(tree.evaluation_ptrs)?,
+                    evaluation_log_sizes: physical(tree.evaluation_log_sizes)?,
                     retained_layers_by_log: physical(tree.retained_layers_by_log)?,
                     sparse_level_offsets: physical(tree.sparse_level_offsets)?,
                     groups: tree
@@ -8697,8 +8690,6 @@ fn resolve_decommit_slots(
                         .into_iter()
                         .map(|group| {
                             Ok(TraceSourceGroupSlots {
-                                evaluation_ptrs: physical(group.evaluation_ptrs)?,
-                                evaluation_log_sizes: physical(group.evaluation_log_sizes)?,
                                 coefficient_ptrs: group
                                     .coefficient_ptrs
                                     .map(physical)
@@ -8729,7 +8720,6 @@ fn resolve_decommit_slots(
         sparse_indices: physical(logical.sparse_indices)?,
         sparse_hashes: physical(logical.sparse_hashes)?,
         counts: physical(logical.counts)?,
-        values: physical(logical.values)?,
         // The proof bundle owns the exact final decommit range. Giving the
         // prepared tail this physical identity makes aliasing explicit while
         // the typed subrange below preserves its canonical byte offset.
