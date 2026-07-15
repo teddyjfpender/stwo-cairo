@@ -2,7 +2,9 @@ use serde_json::json;
 use stwo_backend_cuda::PreparedNumeratorSchedule;
 use stwo_cairo_gpu_prover::arena_plan::{QuotientNumeratorSchedule, QuotientNumeratorSourcePolicy};
 use stwo_cairo_gpu_prover::direct_composition_retention::DirectCompositionRetentionMode;
+use stwo_cairo_gpu_prover::graphs::GraphSegment;
 use stwo_cairo_gpu_prover::shape_executable::ShapeExecutableMaterialization;
+use stwo_cairo_gpu_prover::transcript_plan::CairoTranscriptSegment;
 use stwo_cairo_gpu_prover::{
     PreparedRuntimeMaterialization, ResidentSessionTelemetry, WorkspaceMaterialization,
 };
@@ -77,6 +79,8 @@ pub(crate) fn gpu_native_session_context(
             "gpu_composition_coefficient_commit_paths": null,
             "gpu_composition_part_count": null,
             "gpu_composition_wave_count": null,
+            "gpu_composition_replay_launch_mode": null,
+            "gpu_composition_replay_wave_launches": null,
             "gpu_composition_split_source_image_bytes": null,
             "gpu_composition_split_retained_image_bytes": null,
             "gpu_composition_split_launch_mode": null,
@@ -114,6 +118,11 @@ pub(crate) fn gpu_native_session_context(
             "gpu_witness_ingest_h2d_copies": null,
             "gpu_witness_ingest_syncs": null,
             "gpu_transcript_segments": null,
+            "gpu_graph_replay_intervals": null,
+            "gpu_graph_replay_interval_total_ns": null,
+            "gpu_graph_replay_interval_count": null,
+            "gpu_graph_replay_semantic_count": null,
+            "gpu_graph_replay_timing_scope": null,
             "gpu_physical_allocator_pool_checkpoint": null,
             "gpu_physical_memory_checkpoint_error": null,
             "gpu_physical_memory_rows": null,
@@ -147,6 +156,34 @@ pub(crate) fn resident_session_telemetry_json(
     let composition_commit = telemetry.composition_commit;
     let composition_traffic = composition_commit.and_then(|value| value.split_traffic);
     let composition_execution = composition_commit.and_then(|value| value.execution_receipt);
+    let composition_replay = composition_commit.and_then(|value| value.replay_receipt);
+    let graph_timing = telemetry.graph_replay_timing.as_ref();
+    let graph_timing_rows = graph_timing.map(|report| {
+        report
+            .intervals
+            .iter()
+            .map(|timing| {
+                json!({
+                    "graph_segment": graph_segment_name(timing.segment),
+                    "transcript_segments": timing
+                        .transcript_segments
+                        .iter()
+                        .copied()
+                        .map(transcript_segment_name)
+                        .collect::<Vec<_>>(),
+                    "kernel_nodes": timing.kernel_nodes,
+                    "interval_elapsed_ns": timing.elapsed_ns,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let graph_timing_semantic_count = graph_timing.map(|report| {
+        report
+            .intervals
+            .iter()
+            .map(|timing| timing.transcript_segments.len())
+            .sum::<usize>()
+    });
     let host = telemetry.host_preparation;
     let host_cache = host.and_then(|value| value.replacement_host_cache);
     let topology_digest = telemetry.shape_executable_topology_digest.map(|digest| {
@@ -239,6 +276,8 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_composition_coefficient_commit_paths": composition_commit.map(|value| value.coefficient_commit_paths),
         "gpu_composition_part_count": composition_execution.map(|value| value.part_count),
         "gpu_composition_wave_count": composition_execution.map(|value| value.wave_count),
+        "gpu_composition_replay_launch_mode": composition_replay.map(|value| composition_launch_mode_name(value.mode)),
+        "gpu_composition_replay_wave_launches": composition_replay.map(|value| value.wave_launches),
         "gpu_composition_split_source_image_bytes": composition_traffic.map(|value| value.source_image_bytes),
         "gpu_composition_split_retained_image_bytes": composition_traffic.map(|value| value.retained_image_bytes),
         "gpu_composition_split_launch_mode": composition_commit.and_then(|value| value.split_launch_mode).map(composition_split_launch_mode_name),
@@ -301,12 +340,53 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_witness_ingest_h2d_copies": telemetry.recorded_witness_ingest.h2d_copies,
         "gpu_witness_ingest_syncs": telemetry.recorded_witness_ingest.sync_calls,
         "gpu_transcript_segments": telemetry.transcript_segments,
+        "gpu_graph_replay_intervals": graph_timing_rows,
+        "gpu_graph_replay_interval_total_ns": graph_timing.map(|report| report.total_ns),
+        "gpu_graph_replay_interval_count": graph_timing.map(|report| report.intervals.len()),
+        "gpu_graph_replay_semantic_count": graph_timing_semantic_count,
+        "gpu_graph_replay_timing_scope": graph_timing.map(|_| "main-stream-start-through-final-graph-marker; includes-host-submit-gaps; excludes-proof-bundle-readback"),
         "gpu_physical_allocator_pool_checkpoint": allocator_pool_checkpoint,
         "gpu_physical_memory_checkpoint_error": telemetry.physical_memory_checkpoint_error.as_deref(),
         "gpu_physical_memory_rows": telemetry.physical_memory_inputs.rows_json(),
         "gpu_physical_inputs_complete": missing_physical_ids.is_empty(),
         "gpu_physical_missing_allocation_ids": missing_physical_ids,
     })
+}
+
+fn graph_segment_name(segment: GraphSegment) -> String {
+    match segment {
+        GraphSegment::IngestWitnessBaseCommit => "ingest-witness-base-commit".to_owned(),
+        GraphSegment::InteractionCommit => "interaction-commit".to_owned(),
+        GraphSegment::CompositionQuotientCommit => "composition-quotient-commit".to_owned(),
+        GraphSegment::OodsEvaluation => "oods-evaluation".to_owned(),
+        GraphSegment::FriLayer(layer) => format!("fri-layer-{layer}"),
+        GraphSegment::OodsQueriesDecommitAssemble => "oods-queries-decommit-assemble".to_owned(),
+    }
+}
+
+fn transcript_segment_name(segment: CairoTranscriptSegment) -> String {
+    match segment {
+        CairoTranscriptSegment::BootstrapThroughBase => "bootstrap-through-base".to_owned(),
+        CairoTranscriptSegment::InteractionPowAndLookup => "interaction-pow-and-lookup".to_owned(),
+        CairoTranscriptSegment::InteractionAndComposition => {
+            "interaction-and-composition".to_owned()
+        }
+        CairoTranscriptSegment::CompositionAndOods => "composition-and-oods".to_owned(),
+        CairoTranscriptSegment::OodsAndQuotient => "oods-and-quotient".to_owned(),
+        CairoTranscriptSegment::FriLayer(layer) => format!("fri-layer-{layer}"),
+        CairoTranscriptSegment::FriLastLayer => "fri-last-layer".to_owned(),
+        CairoTranscriptSegment::QueryPowAndPositions => "query-pow-and-positions".to_owned(),
+    }
+}
+
+fn composition_launch_mode_name(
+    mode: stwo_cairo_gpu_prover::CompositionLaunchMode,
+) -> &'static str {
+    match mode {
+        stwo_cairo_gpu_prover::CompositionLaunchMode::Serial => "serial",
+        stwo_cairo_gpu_prover::CompositionLaunchMode::Wide => "wide",
+        stwo_cairo_gpu_prover::CompositionLaunchMode::Wave => "wave",
+    }
 }
 
 fn numerator_schedule_name(schedule: QuotientNumeratorSchedule) -> &'static str {
@@ -472,14 +552,41 @@ mod tests {
                             wave_count: 18,
                         },
                     ),
+                    replay_receipt: Some(
+                        stwo_cairo_gpu_prover::prepared_composition::CompositionReplayReceipt {
+                            mode: stwo_cairo_gpu_prover::CompositionLaunchMode::Wave,
+                            wave_launches: 18,
+                        },
+                    ),
+                },
+            ),
+            graph_replay_timing: Some(
+                stwo_cairo_gpu_prover::resident_runtime::ResidentGraphReplayTimingReport {
+                    intervals: vec![
+                        stwo_cairo_gpu_prover::resident_runtime::ResidentGraphReplayIntervalTiming {
+                            segment: GraphSegment::IngestWitnessBaseCommit,
+                            transcript_segments: vec![
+                                CairoTranscriptSegment::BootstrapThroughBase,
+                                CairoTranscriptSegment::InteractionPowAndLookup,
+                            ],
+                            kernel_nodes: 700,
+                            elapsed_ns: 11_000_000,
+                        },
+                        stwo_cairo_gpu_prover::resident_runtime::ResidentGraphReplayIntervalTiming {
+                            segment: GraphSegment::FriLayer(8),
+                            transcript_segments: vec![],
+                            kernel_nodes: 12,
+                            elapsed_ns: 3_000_000,
+                        },
+                    ],
+                    total_ns: 14_000_000,
                 },
             ),
             ..ResidentSessionTelemetry::default()
         };
         let mut cold = telemetry.clone();
         cold.workspace_materialization = Some(WorkspaceMaterialization::Materialized);
-        cold.prepared_runtime_materialization =
-            Some(PreparedRuntimeMaterialization::Materialized);
+        cold.prepared_runtime_materialization = Some(PreparedRuntimeMaterialization::Materialized);
         cold.prepared_runtime_capture_ready_at_entry = Some(false);
         cold.statement_refresh = None;
         let cold_value = resident_session_telemetry_json(&cold);
@@ -507,6 +614,27 @@ mod tests {
         assert_eq!(value["gpu_composition_coefficient_commit_paths"], 0);
         assert_eq!(value["gpu_composition_part_count"], 153);
         assert_eq!(value["gpu_composition_wave_count"], 18);
+        assert_eq!(value["gpu_composition_replay_launch_mode"], "wave");
+        assert_eq!(value["gpu_composition_replay_wave_launches"], 18);
+        assert_eq!(value["gpu_graph_replay_interval_total_ns"], 14_000_000);
+        assert_eq!(value["gpu_graph_replay_interval_count"], 2);
+        assert_eq!(value["gpu_graph_replay_semantic_count"], 2);
+        assert_eq!(
+            value["gpu_graph_replay_timing_scope"],
+            "main-stream-start-through-final-graph-marker; includes-host-submit-gaps; excludes-proof-bundle-readback"
+        );
+        assert_eq!(
+            value["gpu_graph_replay_intervals"][0]["graph_segment"],
+            "ingest-witness-base-commit"
+        );
+        assert_eq!(
+            value["gpu_graph_replay_intervals"][0]["transcript_segments"],
+            json!(["bootstrap-through-base", "interaction-pow-and-lookup"])
+        );
+        assert_eq!(
+            value["gpu_graph_replay_intervals"][1]["graph_segment"],
+            "fri-layer-8"
+        );
         assert_eq!(
             value["gpu_composition_split_launch_mode"],
             "terminal-fallback"

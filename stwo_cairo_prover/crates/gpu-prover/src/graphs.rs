@@ -392,6 +392,11 @@ impl GraphWorkspace {
         self.graph(self.key(segment))
     }
 
+    pub fn graph_segment_kernel_nodes(&self, segment: GraphSegment) -> Option<u64> {
+        self.graph_segment(segment)
+            .map(|graph| graph.kernel_nodes())
+    }
+
     pub fn graph_count(&self) -> usize {
         self.graphs.len()
     }

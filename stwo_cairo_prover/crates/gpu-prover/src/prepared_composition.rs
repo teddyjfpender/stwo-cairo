@@ -319,6 +319,12 @@ pub struct CompositionExecutionReceipt {
     pub wave_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositionReplayReceipt {
+    pub mode: CompositionLaunchMode,
+    pub wave_launches: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ComponentDescriptorLayout {
     coefficient_pointers: usize,

@@ -860,6 +860,8 @@ require(r.get("gpu_prepared_numerator_legacy_groups") == 0, "staged numerator ex
 require(r.get("gpu_prepared_numerator_packed_output_rows") == int(os.environ["PACKED_ROWS"]), "staged numerator packed-row count drifted")
 require(r.get("gpu_composition_part_count") == int(os.environ["COMPOSITION_PARTS"]), "composition part count drifted")
 require(r.get("gpu_composition_wave_count") == int(os.environ["COMPOSITION_WAVES"]), "composition wave count drifted")
+require(r.get("gpu_composition_replay_launch_mode") == "wave", "composition replay did not use the wave launch path")
+require(r.get("gpu_composition_replay_wave_launches") == int(os.environ["COMPOSITION_WAVES"]), "replayed composition wave launches drifted")
 require(isinstance(r.get("gpu_protocol_key"), int) and not isinstance(r["gpu_protocol_key"], bool)
         and 0 < r["gpu_protocol_key"] < 2**64, "protocol key is not a nonzero u64")
 topology_digest = r.get("gpu_shape_executable_topology_digest")
@@ -934,12 +936,65 @@ require(r.get("gpu_graph_submit_gap_strict_gate_passed") is claimed_graph_gate,
 require(r.get("performance_measurement_available") is True, "GPU timing is unavailable")
 if mode == "diagnostic":
     require(reps == 2 and r.get("benchmark_diagnostic_mode") is True, "first checkpoint must be reps=2 diagnostic")
-    require(r.get("benchmark_diagnostic_reason") == "graph-submit-gap-only", "diagnostic softened more than graph-submit")
+    require(r.get("benchmark_diagnostic_reason") == "graph-submit-gap-and-replay-intervals",
+            "diagnostic timing scope drifted")
     require(r.get("benchmark_graph_submit_capture_mode") is False, "diagnostic unexpectedly used timing capture mode")
     require(r.get("performance_claim_admissible") is False, "diagnostic timing must not be admissible")
+    graph_rows = r.get("gpu_graph_replay_intervals")
+    expected_graphs = [
+        "ingest-witness-base-commit",
+        "interaction-commit",
+        "composition-quotient-commit",
+        "oods-evaluation",
+        *[f"fri-layer-{layer}" for layer in range(9)],
+        "oods-queries-decommit-assemble",
+    ]
+    expected_semantics = [
+        "bootstrap-through-base",
+        "interaction-pow-and-lookup",
+        "interaction-and-composition",
+        "composition-and-oods",
+        "oods-and-quotient",
+        *[f"fri-layer-{layer}" for layer in range(8)],
+        "fri-last-layer",
+        "query-pow-and-positions",
+    ]
+    require(isinstance(graph_rows, list) and len(graph_rows) == len(expected_graphs),
+            "diagnostic omitted the 14 topology-preserving graph intervals")
+    require([row.get("graph_segment") for row in graph_rows] == expected_graphs,
+            "diagnostic graph timing order drifted")
+    require(all(isinstance(row.get("interval_elapsed_ns"), int) and row["interval_elapsed_ns"] > 0
+                and isinstance(row.get("kernel_nodes"), int) and row["kernel_nodes"] > 0
+                and isinstance(row.get("transcript_segments"), list)
+                for row in graph_rows),
+            "diagnostic graph timing rows are incomplete")
+    observed_semantics = [semantic for row in graph_rows for semantic in row["transcript_segments"]]
+    require(observed_semantics == expected_semantics,
+            "14 graph intervals do not cover the 15 semantic transcript segments exactly once")
+    require(graph_rows[12]["transcript_segments"] == [],
+            "terminal FRI fold unexpectedly owns a transcript boundary")
+    graph_total = sum(row["interval_elapsed_ns"] for row in graph_rows)
+    require(r.get("gpu_graph_replay_interval_total_ns") == graph_total and graph_total > 0,
+            "diagnostic graph timing total is invalid")
+    require(r.get("gpu_graph_replay_interval_count") == 14
+            and r.get("gpu_graph_replay_semantic_count") == 15,
+            "diagnostic graph/semantic timing counts drifted")
+    require(r.get("gpu_graph_replay_timing_scope") ==
+            "main-stream-start-through-final-graph-marker; includes-host-submit-gaps; excludes-proof-bundle-readback",
+            "diagnostic graph timing scope is ambiguous")
+    require(sum(row["kernel_nodes"] for row in graph_rows) == r.get("gpu_kernel_launches"),
+            "diagnostic timing kernel-node total differs from executed graph telemetry")
+    warm_samples = r.get("prove_s_warm_samples_raw")
+    require(isinstance(warm_samples, list) and len(warm_samples) == 1
+            and isinstance(warm_samples[0], (int, float)) and warm_samples[0] > 0
+            and graph_total <= warm_samples[0] * 1_000_000_000,
+            "diagnostic graph timeline exceeds the measured warm proof wall")
 elif mode in ("timing", "iteration"):
     require(reps >= 6 and r.get("benchmark_diagnostic_mode") is False and r.get("benchmark_diagnostic_reason") is None, f"{mode} run must have diagnostics disabled")
     require(r.get("benchmark_graph_submit_capture_mode") is True, f"{mode} run did not enable soft graph-gap capture")
+    require(r.get("gpu_graph_replay_intervals") is None
+            and r.get("gpu_graph_replay_interval_total_ns") is None,
+            f"{mode} run must remain free of CUDA-event instrumentation")
     require(r.get("performance_claim_admissible") is (r.get("gpu_graph_submit_gap_strict_gate_passed") is True), f"{mode} timing admissibility disagrees with observed graph-submit gate")
     require(r.get("warm_sample_count") == reps - 1, f"{mode} run lacks the expected warm samples")
     for field in ("prove_s_warm_median", "prove_s_warm_p95", "useful_mhz_median", "useful_mhz_at_warm_p95"):

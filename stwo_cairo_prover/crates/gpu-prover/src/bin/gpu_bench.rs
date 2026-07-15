@@ -346,11 +346,11 @@ fn gpu_native_prover_config() -> GpuProverConfig {
         runtime_mode,
     )
     .unwrap_or_else(|error| panic!("GPU resident backend gate failed: {error}"));
-    assert!(
-        !(graph_submit_gap_diagnostic() && graph_submit_gap_capture()),
-        "graph-submit diagnostic and capture modes are mutually exclusive"
+    configure_graph_submit_policy(
+        &mut config,
+        graph_submit_gap_diagnostic(),
+        graph_submit_gap_capture(),
     );
-    config.allow_slow_graph_submit_diagnostic = graph_submit_gap_budget_relaxed();
     config.operational_safety_reserve_bytes = gpu_bench_physical::operational_safety_reserve_bytes(
         arg("--operational-safety-reserve-bytes"),
     );
@@ -399,8 +399,13 @@ fn graph_submit_gap_capture() -> bool {
     flag("--capture-slow-graph-submit")
 }
 
-fn graph_submit_gap_budget_relaxed() -> bool {
-    graph_submit_gap_diagnostic() || graph_submit_gap_capture()
+fn configure_graph_submit_policy(config: &mut GpuProverConfig, diagnostic: bool, capture: bool) {
+    assert!(
+        !(diagnostic && capture),
+        "graph-submit diagnostic and capture modes are mutually exclusive"
+    );
+    config.allow_slow_graph_submit_diagnostic = diagnostic || capture;
+    config.record_graph_replay_intervals_diagnostic = diagnostic;
 }
 
 fn required_gpu_pcs_runtime_mode() -> RequiredCudaPcsRuntimeMode {
@@ -1120,7 +1125,7 @@ fn record_context(backend: &str) -> serde_json::Value {
         "gpu_native_architecture_gate_passed": architecture_required.then_some(true),
         "benchmark_diagnostic_mode": graph_submit_gap_diagnostic(),
         "benchmark_diagnostic_reason": graph_submit_gap_diagnostic()
-            .then_some("graph-submit-gap-only"),
+            .then_some("graph-submit-gap-and-replay-intervals"),
         "benchmark_graph_submit_capture_mode": graph_submit_gap_capture(),
         "performance_measurement_available": performance_measurement_available(),
         "performance_claim_admissible": performance_claim_admissible()
@@ -2571,12 +2576,12 @@ mod tests {
     use crate::gpu_bench_physical::resident_session_telemetry_json;
 
     use super::{
-        cairo_verification_error_class, claimed_graph_submit_gap_ns, configure_resident_backend,
-        graph_capture_claim_admissible, graph_submit_gap_average_ns, initial_proof_byte_equal,
-        mutate_claimed_sum, parse_resident_backend_args, pcs_telemetry_json,
-        performance_claim_admissible_for, proof_byte_equal_gate_passes, proof_mutation_gate_passes,
-        quantile, simd_reference_gate_passes, simd_reference_reuse_input_gate_passes,
-        throughput_mhz, validate_gpu_native_architecture,
+        cairo_verification_error_class, claimed_graph_submit_gap_ns, configure_graph_submit_policy,
+        configure_resident_backend, graph_capture_claim_admissible, graph_submit_gap_average_ns,
+        initial_proof_byte_equal, mutate_claimed_sum, parse_resident_backend_args,
+        pcs_telemetry_json, performance_claim_admissible_for, proof_byte_equal_gate_passes,
+        proof_mutation_gate_passes, quantile, simd_reference_gate_passes,
+        simd_reference_reuse_input_gate_passes, throughput_mhz, validate_gpu_native_architecture,
         validate_resident_session_architecture, validate_strict_aot_provenance, AotRuntimeStats,
         CairoVerificationError, CudaPcsDriverTelemetry, CudaPcsRuntimeMode, GpuProverConfig,
         GraphSubmitSample, RequiredCudaPcsRuntimeMode, ResidentBackend, ResidentSessionTelemetry,
@@ -2750,6 +2755,28 @@ mod tests {
         assert!(!graph_capture_claim_admissible(true, true, Some(false)));
         assert!(!graph_capture_claim_admissible(true, true, None));
         assert!(!graph_capture_claim_admissible(false, false, Some(true)));
+    }
+
+    #[test]
+    #[should_panic(expected = "graph-submit diagnostic and capture modes are mutually exclusive")]
+    fn graph_submit_policy_rejects_mixed_modes() {
+        configure_graph_submit_policy(&mut GpuProverConfig::default(), true, true);
+    }
+
+    #[test]
+    fn graph_submit_policy_instruments_only_diagnostics() {
+        let assert_policy = |diagnostic, capture, allow_slow, record_intervals| {
+            let mut config = GpuProverConfig::default();
+            configure_graph_submit_policy(&mut config, diagnostic, capture);
+            assert_eq!(config.allow_slow_graph_submit_diagnostic, allow_slow);
+            assert_eq!(
+                config.record_graph_replay_intervals_diagnostic,
+                record_intervals
+            );
+        };
+        assert_policy(false, false, false, false);
+        assert_policy(true, false, true, true);
+        assert_policy(false, true, true, false);
     }
 
     #[test]

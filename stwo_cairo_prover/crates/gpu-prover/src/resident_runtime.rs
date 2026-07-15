@@ -56,7 +56,8 @@ use crate::graphs::{
 };
 use crate::multiplicity_pipeline::{FixedMultiplicityCoverageGap, MultiplicityFeedBlocker};
 use crate::prepared_composition::{
-    CompositionBindingRefreshTelemetry, CompositionExecutionReceipt, CompositionOutputMode,
+    CompositionBindingRefreshTelemetry, CompositionExecutionReceipt, CompositionLaunchMode,
+    CompositionOutputMode, CompositionReplayReceipt,
 };
 use crate::proof_bundle::{
     ResidentProofBundle, ResidentProofBundleError, ResidentProofBundleLayout,
@@ -133,6 +134,21 @@ pub struct ResidentCompositionCommitTelemetry {
     pub split_launch_mode: Option<CompositionSplitLaunchMode>,
     pub split_traffic: Option<CompositionSplitTraffic>,
     pub execution_receipt: Option<CompositionExecutionReceipt>,
+    pub replay_receipt: Option<CompositionReplayReceipt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResidentGraphReplayIntervalTiming {
+    pub segment: GraphSegment,
+    pub transcript_segments: Vec<CairoTranscriptSegment>,
+    pub kernel_nodes: u64,
+    pub elapsed_ns: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResidentGraphReplayTimingReport {
+    pub intervals: Vec<ResidentGraphReplayIntervalTiming>,
+    pub total_ns: u64,
 }
 
 impl ResidentCompositionCommitTelemetry {
@@ -434,6 +450,13 @@ pub enum ResidentRuntimeError {
     MissingTranscriptInput(TranscriptInputId),
     MissingTranscriptOutput(TranscriptOutputId),
     InvalidTranscriptSegment(usize),
+    GraphReplayTimingAlreadyActive,
+    GraphReplayTimingNotActive,
+    GraphReplayTimingCapacity {
+        required: usize,
+        available: usize,
+    },
+    InvalidGraphReplayTiming,
     MissingTranscriptSegment(CairoTranscriptSegment),
     TranscriptBindingTooSmall {
         role: &'static str,
@@ -1460,6 +1483,9 @@ pub struct ResidentGraphRuntime<'a> {
     fri_challenge_generations: Vec<u64>,
     launched_fri_challenge_generations: Vec<u64>,
     next_fri_round: Option<usize>,
+    composition_replay_receipt: Option<CompositionReplayReceipt>,
+    graph_replay_timing_active: bool,
+    last_graph_replay_timing: Option<ResidentGraphReplayTimingReport>,
 }
 
 impl<'a> ResidentGraphRuntime<'a> {
@@ -2442,6 +2468,9 @@ impl<'a> ResidentGraphRuntime<'a> {
             fri_challenge_generations: vec![0; fri_rounds],
             launched_fri_challenge_generations: vec![0; fri_rounds],
             next_fri_round: None,
+            composition_replay_receipt: None,
+            graph_replay_timing_active: false,
+            last_graph_replay_timing: None,
         };
         // Preparing every descriptor is not enough: require the fully bound
         // runtime to match the strict schedule one-for-one before it can escape
@@ -2729,12 +2758,87 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// Reset counters after setup/input staging and immediately before a warm
     /// replay. This makes the resident acceptance gate independent of one-time
     /// descriptor uploads and graph instantiation.
-    pub fn begin_hot_path_telemetry(&self) {
+    pub fn begin_hot_path_telemetry(&mut self) {
         self.workspace.arena().context().reset_telemetry();
+        self.composition_replay_receipt = None;
+        self.graph_replay_timing_active = false;
+        self.last_graph_replay_timing = None;
     }
 
     pub fn hot_path_telemetry(&self) -> CudaExecTelemetry {
         self.workspace.arena().context().telemetry()
+    }
+
+    /// Enable diagnostic CUDA-event timing around the existing graph replays.
+    /// Each interval ends after one graph and therefore includes any host-submit
+    /// gap since the prior marker. The final proof-bundle readback is excluded.
+    /// Markers add no fence; durations are read after the existing bundle fence.
+    pub fn begin_graph_replay_timing(&mut self) -> Result<(), ResidentRuntimeError> {
+        if self.graph_replay_timing_active {
+            return Err(ResidentRuntimeError::GraphReplayTimingAlreadyActive);
+        }
+        let required = self.graph_replay_order()?.len();
+        let available = self.workspace.arena().context().begin_timing()?;
+        if required > available {
+            return Err(ResidentRuntimeError::GraphReplayTimingCapacity {
+                required,
+                available,
+            });
+        }
+        self.last_graph_replay_timing = None;
+        self.graph_replay_timing_active = true;
+        Ok(())
+    }
+
+    /// Read the diagnostic timeline after the caller's existing proof-bundle
+    /// synchronization. This method performs no synchronization itself.
+    pub fn finish_graph_replay_timing(&mut self) -> Result<(), ResidentRuntimeError> {
+        if !self.graph_replay_timing_active {
+            return Err(ResidentRuntimeError::GraphReplayTimingNotActive);
+        }
+        self.graph_replay_timing_active = false;
+        let order = self.graph_replay_order()?;
+        let elapsed_ms = self
+            .workspace
+            .arena()
+            .context()
+            .elapsed_timing_ms(order.len())?;
+        let mut total_ns = 0u64;
+        let segments = order
+            .into_iter()
+            .zip(elapsed_ms)
+            .map(|(segment, elapsed_ms)| {
+                if !elapsed_ms.is_finite() || elapsed_ms < 0.0 {
+                    return Err(ResidentRuntimeError::InvalidGraphReplayTiming);
+                }
+                let elapsed_ns = (f64::from(elapsed_ms) * 1_000_000.0).round();
+                if elapsed_ns > u64::MAX as f64 {
+                    return Err(ResidentRuntimeError::InvalidGraphReplayTiming);
+                }
+                let elapsed_ns = elapsed_ns as u64;
+                total_ns = total_ns
+                    .checked_add(elapsed_ns)
+                    .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                let kernel_nodes = self.workspace.graph_segment_kernel_nodes(segment).ok_or(
+                    ResidentRuntimeError::Graph(GraphError::MissingSegment(segment)),
+                )?;
+                Ok(ResidentGraphReplayIntervalTiming {
+                    segment,
+                    transcript_segments: self.graph_transcript_membership(segment)?,
+                    kernel_nodes,
+                    elapsed_ns,
+                })
+            })
+            .collect::<Result<Vec<_>, ResidentRuntimeError>>()?;
+        self.last_graph_replay_timing = Some(ResidentGraphReplayTimingReport {
+            intervals: segments,
+            total_ns,
+        });
+        Ok(())
+    }
+
+    pub fn take_graph_replay_timing_report(&mut self) -> Option<ResidentGraphReplayTimingReport> {
+        self.last_graph_replay_timing.take()
     }
 
     /// Exact semantic launch ownership paired with the graph-derived kernel
@@ -2769,6 +2873,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             split_launch_mode: self.composition.direct_split_launch_mode(),
             split_traffic: self.composition.direct_split_traffic(),
             execution_receipt: self.composition.requirements().execution_receipt,
+            replay_receipt: self.composition_replay_receipt,
         }
     }
 
@@ -3440,7 +3545,20 @@ impl<'a> ResidentGraphRuntime<'a> {
         let transcript_segment =
             self.transcript_segment_index(CairoTranscriptSegment::CompositionAndOods)?;
         self.admit_transcript_segment_replay(transcript_segment)?;
-        self.replay(GraphSegment::CompositionQuotientCommit)
+        self.replay(GraphSegment::CompositionQuotientCommit)?;
+        let requirements = self.composition.requirements();
+        let wave_launches = if requirements.mode == CompositionLaunchMode::Wave {
+            requirements
+                .execution_receipt
+                .map_or(0, |receipt| receipt.wave_count)
+        } else {
+            0
+        };
+        self.composition_replay_receipt = Some(CompositionReplayReceipt {
+            mode: requirements.mode,
+            wave_launches,
+        });
+        Ok(())
     }
 
     pub fn replay_oods_transcript_boundary(&mut self) -> Result<(), ResidentRuntimeError> {
@@ -4542,9 +4660,47 @@ impl<'a> ResidentGraphRuntime<'a> {
         })
     }
 
-    fn replay(&self, segment: GraphSegment) -> Result<(), ResidentRuntimeError> {
+    fn replay(&mut self, segment: GraphSegment) -> Result<(), ResidentRuntimeError> {
         self.workspace.replay_segment(segment)?;
+        if self.graph_replay_timing_active {
+            self.workspace.arena().context().mark_timing()?;
+        }
         Ok(())
+    }
+
+    fn graph_replay_order(&self) -> Result<Vec<GraphSegment>, ResidentRuntimeError> {
+        let mut order = Vec::with_capacity(self.workspace.graph_count());
+        order.extend([
+            GraphSegment::IngestWitnessBaseCommit,
+            GraphSegment::InteractionCommit,
+            GraphSegment::CompositionQuotientCommit,
+            GraphSegment::OodsEvaluation,
+            GraphSegment::FriLayer(0),
+        ]);
+        for round in 0..self.fri.round_count() {
+            order.push(fri_round_segment(round)?);
+        }
+        order.push(GraphSegment::OodsQueriesDecommitAssemble);
+        if order.len() != self.workspace.graph_count() {
+            return Err(ResidentRuntimeError::CapturedGraphTopology {
+                fri_rounds: self.fri.round_count(),
+                transcript_segments: self.transcript_segments.len(),
+                expected: order.len(),
+                actual: self.workspace.graph_count(),
+            });
+        }
+        Ok(order)
+    }
+
+    fn graph_transcript_membership(
+        &self,
+        segment: GraphSegment,
+    ) -> Result<Vec<CairoTranscriptSegment>, ResidentRuntimeError> {
+        let membership = graph_transcript_membership_for(segment, &self.transcript_segments);
+        for semantic in &membership {
+            self.transcript_segment_index(*semantic)?;
+        }
+        Ok(membership)
     }
 
     fn require_next_fri_round(&self, round_index: usize) -> Result<(), ResidentRuntimeError> {
@@ -5196,6 +5352,37 @@ fn fri_round_segment(round_index: usize) -> Result<GraphSegment, ResidentRuntime
     Ok(GraphSegment::FriLayer(layer))
 }
 
+fn graph_transcript_membership_for(
+    segment: GraphSegment,
+    transcript_segments: &[TranscriptSegmentPlan],
+) -> Vec<CairoTranscriptSegment> {
+    match segment {
+        GraphSegment::IngestWitnessBaseCommit => vec![
+            CairoTranscriptSegment::BootstrapThroughBase,
+            CairoTranscriptSegment::InteractionPowAndLookup,
+        ],
+        GraphSegment::InteractionCommit => {
+            vec![CairoTranscriptSegment::InteractionAndComposition]
+        }
+        GraphSegment::CompositionQuotientCommit => {
+            vec![CairoTranscriptSegment::CompositionAndOods]
+        }
+        GraphSegment::OodsEvaluation => vec![CairoTranscriptSegment::OodsAndQuotient],
+        GraphSegment::FriLayer(layer) => {
+            let semantic = CairoTranscriptSegment::FriLayer(u32::from(layer));
+            transcript_segments
+                .iter()
+                .any(|planned| planned.segment == semantic)
+                .then_some(vec![semantic])
+                .unwrap_or_default()
+        }
+        GraphSegment::OodsQueriesDecommitAssemble => vec![
+            CairoTranscriptSegment::FriLastLayer,
+            CairoTranscriptSegment::QueryPowAndPositions,
+        ],
+    }
+}
+
 fn require_complete_captured_topology(
     shape_key: ProofShapeKey,
     protocol_key: u64,
@@ -5749,6 +5936,55 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn sn2_graph_replay_membership_covers_all_semantic_segments_once() {
+        let mut semantics = vec![
+            CairoTranscriptSegment::BootstrapThroughBase,
+            CairoTranscriptSegment::InteractionPowAndLookup,
+            CairoTranscriptSegment::InteractionAndComposition,
+            CairoTranscriptSegment::CompositionAndOods,
+            CairoTranscriptSegment::OodsAndQuotient,
+        ];
+        semantics.extend((0..8).map(CairoTranscriptSegment::FriLayer));
+        semantics.extend([
+            CairoTranscriptSegment::FriLastLayer,
+            CairoTranscriptSegment::QueryPowAndPositions,
+        ]);
+        let plans = semantics
+            .iter()
+            .copied()
+            .map(|segment| TranscriptSegmentPlan {
+                segment,
+                operation_range: 0..0,
+                starts_after: None,
+                ends_at: crate::transcript_plan::CairoTranscriptBoundary::QueryPositions,
+            })
+            .collect::<Vec<_>>();
+        let mut graphs = vec![
+            GraphSegment::IngestWitnessBaseCommit,
+            GraphSegment::InteractionCommit,
+            GraphSegment::CompositionQuotientCommit,
+            GraphSegment::OodsEvaluation,
+            GraphSegment::FriLayer(0),
+        ];
+        graphs.extend((0..8).map(|round| fri_round_segment(round).unwrap()));
+        graphs.push(GraphSegment::OodsQueriesDecommitAssemble);
+
+        let membership = graphs
+            .iter()
+            .copied()
+            .map(|graph| graph_transcript_membership_for(graph, &plans))
+            .collect::<Vec<_>>();
+        assert_eq!(graphs.len(), 14);
+        assert_eq!(membership[0].len(), 2);
+        assert!(membership[12].is_empty());
+        assert_eq!(membership[13].len(), 2);
+        assert_eq!(
+            membership.into_iter().flatten().collect::<Vec<_>>(),
+            semantics
+        );
     }
 
     #[test]

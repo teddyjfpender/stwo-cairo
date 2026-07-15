@@ -469,10 +469,14 @@ pub struct GpuProverConfig {
     pub resident_backend: ResidentBackend,
     /// Post-M6: no fallbacks, any device failure aborts the prove (U3).
     pub strict: bool,
-    /// Explicit benchmark-diagnostic escape hatch for host graph-submit timing.
-    /// Structural/copy/synchronization budgets remain exact and the caller must
-    /// mark the resulting measurement non-formal.
+    /// Temporary relaxation of the host graph-submit gap abort. Diagnostic runs
+    /// are non-formal; capture runs may be re-admitted only after the observed
+    /// strict gap gate passes. Structural/copy/synchronization budgets stay exact.
     pub allow_slow_graph_submit_diagnostic: bool,
+    /// Record per-graph CUDA-event intervals for a diagnostic run. This is
+    /// deliberately separate from the soft graph-gap capture used by formal
+    /// timing runs, which must remain free of event instrumentation.
+    pub record_graph_replay_intervals_diagnostic: bool,
 }
 
 impl Default for GpuProverConfig {
@@ -487,6 +491,7 @@ impl Default for GpuProverConfig {
             resident_backend: ResidentBackend::LegacyResident,
             strict: false,
             allow_slow_graph_submit_diagnostic: false,
+            record_graph_replay_intervals_diagnostic: false,
         }
     }
 }
@@ -806,6 +811,14 @@ where
         if config.resident_backend == ResidentBackend::ReplacementV1 && !config.strict {
             return Err(GpuError::Config(
                 "replacement-v1 requires strict GPU-native resident execution".to_string(),
+            ));
+        }
+        if config.record_graph_replay_intervals_diagnostic
+            && (!config.strict || !config.allow_slow_graph_submit_diagnostic)
+        {
+            return Err(GpuError::Config(
+                "graph replay interval timing requires strict slow-submit diagnostic mode"
+                    .to_string(),
             ));
         }
         let resident_execution_config = match config.resident_backend {
@@ -1509,6 +1522,7 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
         }
         aot::reset_runtime_stats();
         let allow_slow_graph_submit_diagnostic = self.config.allow_slow_graph_submit_diagnostic;
+        let capture_graph_replay_timing = self.config.record_graph_replay_intervals_diagnostic;
 
         let (
             (
@@ -1541,8 +1555,14 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
                 .workspace_proof_bundle_bytes()
                 .ok_or(ResidentRuntimeError::TranscriptRequirementsMismatch)?;
             runtime.begin_hot_path_telemetry();
+            if capture_graph_replay_timing {
+                runtime.begin_graph_replay_timing()?;
+            }
             runtime.replay_all_prepared_subgraphs()?;
             let bundle = runtime.read_proof_bundle_once()?;
+            if capture_graph_replay_timing {
+                runtime.finish_graph_replay_timing()?;
+            }
             let exec = runtime.require_hot_path_budget(resident_hot_path_budget(
                 transcript_mode,
                 allow_slow_graph_submit_diagnostic,

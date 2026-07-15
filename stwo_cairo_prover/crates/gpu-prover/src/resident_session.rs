@@ -54,8 +54,8 @@ use crate::replacement_host_cache::{
 };
 use crate::resident_input::ResidentProverInputOwner;
 use crate::resident_runtime::{
-    ResidentCompositionCommitTelemetry, ResidentGraphRuntime, ResidentRuntimeError,
-    ResidentStatementRefreshTelemetry, ResidentTraceCommitInputTelemetry,
+    ResidentCompositionCommitTelemetry, ResidentGraphReplayTimingReport, ResidentGraphRuntime,
+    ResidentRuntimeError, ResidentStatementRefreshTelemetry, ResidentTraceCommitInputTelemetry,
     ResidentWitnessIngestReport, ResidentWitnessInput, ResidentWitnessInputColumn,
     ResidentWorkspaceIdentity, SealedResidentExecutionConfig,
 };
@@ -275,6 +275,7 @@ pub struct ResidentSessionTelemetry {
     pub prepared_numerator_schedule: Option<PreparedNumeratorSchedule>,
     pub trace_commit_inputs: Option<ResidentTraceCommitInputTelemetry>,
     pub composition_commit: Option<ResidentCompositionCommitTelemetry>,
+    pub graph_replay_timing: Option<ResidentGraphReplayTimingReport>,
     pub base: ResidentSourceStageReport,
     pub twiddles: ResidentTwiddleStageReport,
     pub preprocessed: ResidentPreprocessedStageReport,
@@ -460,6 +461,18 @@ impl ResidentSessionTelemetry {
             {
                 return Err(ResidentSessionError::StrictArchitectureTelemetry(
                     "replacement composition execution receipt was invalid",
+                ));
+            }
+            let replay_receipt = composition_commit.replay_receipt.ok_or(
+                ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement composition replay receipt was not reported",
+                ),
+            )?;
+            if replay_receipt.mode != crate::prepared_composition::CompositionLaunchMode::Wave
+                || replay_receipt.wave_launches != execution_receipt.wave_count
+            {
+                return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement composition replay did not execute the exact wave topology",
                 ));
             }
             if !composition_commit.direct_retained_evaluations
@@ -877,6 +890,7 @@ fn run_materialized_session<R>(
         prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
         trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
         composition_commit: Some(runtime.composition_commit_telemetry()),
+        graph_replay_timing: None,
         base,
         twiddles: ResidentTwiddleStageReport::default(),
         preprocessed,
@@ -902,6 +916,8 @@ fn run_materialized_session<R>(
             telemetry: &telemetry,
         },
     )?;
+    telemetry.composition_commit = Some(runtime.composition_commit_telemetry());
+    telemetry.graph_replay_timing = runtime.take_graph_replay_timing_report();
     if let Err(error) = capture_pool_checkpoint(workspace, &mut telemetry) {
         telemetry.physical_memory_checkpoint_error = Some(error.to_string());
     }
@@ -1655,6 +1671,7 @@ pub fn with_resident_pre_witness_session<R>(
                     prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
                     trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
                     composition_commit: Some(runtime.composition_commit_telemetry()),
+                    graph_replay_timing: None,
                     base: ResidentSourceStageReport::default(),
                     twiddles: twiddle_report,
                     preprocessed,
@@ -1680,6 +1697,8 @@ pub fn with_resident_pre_witness_session<R>(
                         telemetry: &telemetry,
                     },
                 )?;
+                telemetry.composition_commit = Some(runtime.composition_commit_telemetry());
+                telemetry.graph_replay_timing = runtime.take_graph_replay_timing_report();
                 runtime.require_complete_captured_topology()?;
                 telemetry.prepared_runtime_capture_ready_at_exit = Some(true);
                 Ok((result, telemetry))
@@ -3098,6 +3117,10 @@ mod tests {
                     part_count: 2,
                     wave_count: 1,
                 }),
+                replay_receipt: Some(crate::prepared_composition::CompositionReplayReceipt {
+                    mode: crate::prepared_composition::CompositionLaunchMode::Wave,
+                    wave_launches: 1,
+                }),
             }),
             execution_tables_ingest: Some(PreparedExecutionTablesIngestTelemetry {
                 compact_h2d_bytes: 0,
@@ -3117,6 +3140,27 @@ mod tests {
             .unwrap()
             .execution_receipt = None;
         assert!(missing_composition_execution
+            .require_strict_graph_a()
+            .is_err());
+
+        let mut missing_composition_replay = valid.clone();
+        missing_composition_replay
+            .composition_commit
+            .as_mut()
+            .unwrap()
+            .replay_receipt = None;
+        assert!(missing_composition_replay.require_strict_graph_a().is_err());
+
+        let mut incomplete_composition_replay = valid.clone();
+        incomplete_composition_replay
+            .composition_commit
+            .as_mut()
+            .unwrap()
+            .replay_receipt
+            .as_mut()
+            .unwrap()
+            .wave_launches = 0;
+        assert!(incomplete_composition_replay
             .require_strict_graph_a()
             .is_err());
 

@@ -549,7 +549,7 @@ class ArchitectureRecordTest(unittest.TestCase):
         record.update(
             {
                 "benchmark_diagnostic_mode": True,
-                "benchmark_diagnostic_reason": "graph-submit-gap-only",
+                "benchmark_diagnostic_reason": "graph-submit-gap-and-replay-intervals",
                 "performance_measurement_available": True,
                 "performance_claim_admissible": False,
                 "gpu_max_graph_submit_gap_ms": 918.959783,
@@ -558,6 +558,12 @@ class ArchitectureRecordTest(unittest.TestCase):
         )
         self.assertEqual(
             validate_record(record, "arena-graph", graph_gap_diagnostic=True), []
+        )
+        legacy_record = record.copy()
+        legacy_record["benchmark_diagnostic_reason"] = "graph-submit-gap-only"
+        self.assertEqual(
+            validate_record(legacy_record, "arena-graph", graph_gap_diagnostic=True),
+            [],
         )
         self.assertTrue(validate_record(record, "arena-graph"))
 

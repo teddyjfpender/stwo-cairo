@@ -909,9 +909,12 @@ def validate_record(
     if graph_gap_diagnostic:
         if record.get("benchmark_diagnostic_mode") is not True:
             errors.append("benchmark_diagnostic_mode: expected true")
-        if record.get("benchmark_diagnostic_reason") != "graph-submit-gap-only":
+        if record.get("benchmark_diagnostic_reason") not in (
+            "graph-submit-gap-only",
+            "graph-submit-gap-and-replay-intervals",
+        ):
             errors.append(
-                "benchmark_diagnostic_reason: expected 'graph-submit-gap-only'"
+                "benchmark_diagnostic_reason: expected a graph-submit diagnostic"
             )
     elif record.get("benchmark_diagnostic_mode") is True:
         errors.append("benchmark_diagnostic_mode: diagnostic record requires explicit admission")
