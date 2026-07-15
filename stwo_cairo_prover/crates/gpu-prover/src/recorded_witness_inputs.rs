@@ -7,17 +7,24 @@
 
 use std::sync::Arc;
 
+use stwo_cairo_adapter::builtins::MemorySegmentAddresses;
 use stwo_cairo_adapter::memory::Memory;
+use stwo_cairo_common::builtins::{
+    BITWISE_BUILTIN_MEMORY_CELLS, PEDERSEN_BUILTIN_MEMORY_CELLS, POSEIDON_BUILTIN_MEMORY_CELLS,
+    RANGE_CHECK_BUILTIN_MEMORY_CELLS,
+};
 use stwo_cairo_prover::witness::cairo_claim_generator::CairoClaimGenerator;
 use stwo_cairo_prover::witness::jit_prove_backend::{
-    recorded_casm_input_attempt, recorded_input_compaction_geometry, recorded_input_geometry,
-    recorded_witness_input_attempt, ExecutionMemoryIdentity, RecordedCasmInputAttempt,
-    RecordedInputBuildError, RecordedTableIdentity, RecordedWitnessInputAttempt,
-    RecordedWitnessInputSource, RecordedWitnessInputsError,
+    all_lane_recording_metadata, recorded_casm_input_attempt, recorded_device_seed_scalar_count,
+    recorded_input_compaction_geometry, recorded_input_geometry, recorded_witness_input_attempt,
+    ExecutionMemoryIdentity, RecordedCasmInputAttempt, RecordedInputBuildError,
+    RecordedTableIdentity, RecordedWitnessInputAttempt, RecordedWitnessInputSource,
+    RecordedWitnessInputsError,
 };
 use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId};
 
 use crate::plan::ProofPlan;
+use crate::resident_input::ResidentProverInputOwner;
 use crate::schedule::{ComponentId, ComponentNode, InputEdge, WitnessWriterKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,7 +117,7 @@ pub enum DeviceCompactColumn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedRecordedWitnessInput {
     pub component: ComponentId,
-    pub program: stwo_backend_cuda::jit_witness::isa::WitnessProgram,
+    pub program: Arc<stwo_backend_cuda::jit_witness::isa::WitnessProgram>,
     pub row_count: usize,
     pub n_real: usize,
     pub columns: Vec<RecordedInputColumnProvenance>,
@@ -183,6 +190,7 @@ pub enum RecordedWitnessPlanError {
         source: RecordedInputBuildError,
     },
     MissingInputGeometry(ComponentId),
+    MissingDeviceSeed(ComponentId),
     SizeOverflow(ComponentId),
 }
 
@@ -230,16 +238,145 @@ pub fn recorded_witness_inputs_for_replacement_plan(
     recorded_witness_inputs_for_plan_inner(generator, proof_plan, true)
 }
 
-fn recorded_witness_inputs_for_plan_inner(
-    generator: &CairoClaimGenerator,
+/// Generator-free ReplacementV1 binding. The exact plan supplies lane geometry
+/// and dependency topology; immutable recording metadata, raw Casm rows, builtin
+/// segment starts, and execution memory come directly from the ingress owner.
+pub fn recorded_witness_inputs_for_raw_replacement_plan(
+    owner: &ResidentProverInputOwner,
     proof_plan: &ProofPlan,
-    borrow_casm_inputs: bool,
 ) -> Result<PlannedRecordedWitnessInputs, RecordedWitnessPlanError> {
-    // Lanes must be planned in the same topological (producer-before-consumer)
-    // order the arena witness workspace and the Graph A launcher use; the
-    // resident session zips the two lists pairwise and fails closed on any
-    // order drift. Plan order differs whenever a producer sorts after its
-    // consumer (e.g. poseidon_aggregator after poseidon_3_partial_rounds_chain).
+    let expected = expected_recorded_lanes(proof_plan)?;
+    let recordings = all_lane_recording_metadata()?;
+    let memory = Arc::clone(owner.execution_memory());
+    let execution_memory_identity = ExecutionMemoryIdentity::of(&memory);
+    let mut unsupported = Vec::new();
+    let mut lanes = Vec::with_capacity(expected.len());
+
+    for expected in expected {
+        let Some(metadata) = recordings
+            .iter()
+            .find(|metadata| metadata.label == expected.node.id)
+        else {
+            unsupported.push(expected.node.id);
+            continue;
+        };
+        let program = Arc::clone(&metadata.program);
+        let columns = if let Some(casm) = owner.casm_input(expected.node.id) {
+            let actual_real = casm.states.len();
+            let actual_padded = match stwo_backend_cuda::witness_casm_input_requirements(
+                actual_real,
+                casm.descriptor.include_iota,
+            ) {
+                Ok(requirements) => requirements.consumer_rows,
+                Err(stwo_backend_cuda::PreparedWitnessCasmInputError::NoRows) => 0,
+                Err(_) => return Err(RecordedWitnessPlanError::SizeOverflow(expected.node.id)),
+            };
+            require_row_geometry(&expected, actual_real, actual_padded)?;
+            let mut columns = vec![
+                RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Pc),
+                RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Ap),
+                RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Fp),
+                RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Enabler),
+            ];
+            if casm.descriptor.include_iota {
+                columns.push(RecordedInputColumnProvenance::DeviceCasm(
+                    DeviceCasmColumn::Iota,
+                ));
+            }
+            columns
+        } else if let Some(scalar_count) = recorded_device_seed_scalar_count(expected.node.id) {
+            if scalar_count != 1 {
+                return Err(RecordedWitnessPlanError::MissingDeviceSeed(
+                    expected.node.id,
+                ));
+            }
+            let segment = owner
+                .builtin_segments()
+                .get_segment_by_name(expected.node.id)
+                .ok_or(RecordedWitnessPlanError::MissingDeviceSeed(
+                    expected.node.id,
+                ))?;
+            let segment_start = u32::try_from(segment.begin_addr)
+                .map_err(|_| RecordedWitnessPlanError::SizeOverflow(expected.node.id))?;
+            let actual_rows = stored_builtin_rows(expected.node.id, segment)?;
+            require_row_geometry(&expected, actual_rows, actual_rows)?;
+            provenance_for_device_seed(
+                expected.node.id,
+                program.n_inputs as usize,
+                &[segment_start],
+            )?
+        } else {
+            provenance_for_unmaterialized(
+                expected.node,
+                program.n_inputs as usize,
+                expected.n_real,
+                expected.row_count,
+                |producer| {
+                    proof_plan.components.iter().any(|component| {
+                        component.node.id == producer && component.runtime.is_present()
+                    })
+                },
+            )?
+        };
+        if columns.len() != program.n_inputs as usize {
+            return Err(RecordedWitnessPlanError::MissingInputGeometry(
+                expected.node.id,
+            ));
+        }
+        lanes.push(PlannedRecordedWitnessInput {
+            component: expected.node.id,
+            program,
+            row_count: expected.row_count,
+            n_real: expected.n_real,
+            columns,
+            tables: RecordedTableIdentity {
+                execution_memory: execution_memory_identity,
+                host_pedersen_points_18: metadata.host_pedersen_points_18,
+            },
+            host_build_error: None,
+        });
+    }
+    if !unsupported.is_empty() {
+        return Err(RecordedWitnessPlanError::UnsupportedLabels(unsupported));
+    }
+    Ok(PlannedRecordedWitnessInputs {
+        execution_memory: memory,
+        execution_memory_identity,
+        lanes,
+    })
+}
+
+fn stored_builtin_rows(
+    component: ComponentId,
+    segment: MemorySegmentAddresses,
+) -> Result<usize, RecordedWitnessPlanError> {
+    let cells_per_instance = match component {
+        "bitwise_builtin" => BITWISE_BUILTIN_MEMORY_CELLS,
+        "range_check_builtin" => RANGE_CHECK_BUILTIN_MEMORY_CELLS,
+        "pedersen_builtin" => PEDERSEN_BUILTIN_MEMORY_CELLS,
+        "poseidon_builtin" => POSEIDON_BUILTIN_MEMORY_CELLS,
+        _ => return Err(RecordedWitnessPlanError::MissingDeviceSeed(component)),
+    };
+    let cells = segment
+        .stop_ptr
+        .checked_sub(segment.begin_addr)
+        .ok_or(RecordedWitnessPlanError::MissingDeviceSeed(component))?;
+    if cells == 0 || !cells.is_multiple_of(cells_per_instance) {
+        return Err(RecordedWitnessPlanError::MissingDeviceSeed(component));
+    }
+    let rows = cells / cells_per_instance;
+    if !rows.is_power_of_two() {
+        return Err(RecordedWitnessPlanError::MissingDeviceSeed(component));
+    }
+    Ok(rows)
+}
+
+fn expected_recorded_lanes(
+    proof_plan: &ProofPlan,
+) -> Result<Vec<ExpectedLane>, RecordedWitnessPlanError> {
+    // The resident session zips these lanes with topologically ordered arena
+    // destinations. Plan order is not sufficient when a producer sorts after
+    // its consumer.
     let ordered = crate::arena_plan::topological_component_order(proof_plan)
         .map_err(|_| RecordedWitnessPlanError::UnorderableSchedule)?;
     let mut expected = Vec::new();
@@ -265,6 +402,33 @@ fn recorded_witness_inputs_for_plan_inner(
                 .map_err(|_| RecordedWitnessPlanError::SizeOverflow(component.node.id))?,
         });
     }
+    Ok(expected)
+}
+
+fn require_row_geometry(
+    expected: &ExpectedLane,
+    actual_real: usize,
+    actual_padded: usize,
+) -> Result<(), RecordedWitnessPlanError> {
+    if actual_real == expected.n_real && actual_padded == expected.row_count {
+        Ok(())
+    } else {
+        Err(RecordedWitnessPlanError::RowGeometryMismatch {
+            component: expected.node.id,
+            expected_real: expected.n_real,
+            actual_real,
+            expected_padded: expected.row_count,
+            actual_padded,
+        })
+    }
+}
+
+fn recorded_witness_inputs_for_plan_inner(
+    generator: &CairoClaimGenerator,
+    proof_plan: &ProofPlan,
+    borrow_casm_inputs: bool,
+) -> Result<PlannedRecordedWitnessInputs, RecordedWitnessPlanError> {
+    let expected = expected_recorded_lanes(proof_plan)?;
 
     let labels = expected.iter().map(|lane| lane.node.id).collect::<Vec<_>>();
     let memory = generator
@@ -324,10 +488,10 @@ fn recorded_witness_inputs_for_plan_inner(
                         DeviceCasmColumn::Iota,
                     ));
                 }
-                (attempt.program, columns, None, false)
+                (Arc::new(attempt.program), columns, None, false)
             }
             PlannedInputAttempt::Standard(attempt) => {
-                let program = attempt.program;
+                let program = Arc::new(attempt.program);
                 let (columns, host_build_error) = match attempt.input_source {
                     RecordedWitnessInputSource::Host(Ok(inputs)) => {
                         let actual_padded = inputs.row_count();

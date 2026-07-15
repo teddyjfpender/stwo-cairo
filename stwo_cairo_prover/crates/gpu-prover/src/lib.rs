@@ -34,6 +34,8 @@ pub mod protocol_plan;
 pub mod prover;
 pub mod range_allocator;
 mod range_arena;
+#[cfg(test)]
+mod raw_replacement_oracle_tests;
 pub mod recorded_witness_inputs;
 pub mod relation;
 pub mod relation_execution;
@@ -43,6 +45,7 @@ pub mod resident_input;
 mod resident_oods;
 pub mod resident_runtime;
 pub mod resident_session;
+pub mod resident_shape;
 pub mod resident_sources;
 pub mod resident_witness;
 pub mod schedule;

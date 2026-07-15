@@ -15,6 +15,7 @@ use stwo_cairo_adapter::opcodes::{
 use stwo_cairo_adapter::{ProverInput, PublicSegmentContext};
 use stwo_cairo_common::prover_types::cpu::CasmState;
 use stwo_cairo_prover::witness::cairo::public_data_from_prover_input;
+use stwo_cairo_prover::witness::opcodes::get_opcodes;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ResidentCasmInput<'a> {
@@ -34,13 +35,13 @@ impl ResidentCasmInput<'_> {
 /// Diagnostic-only relocated fields from `extract-mem-trace` are intentionally
 /// outside the resident proof contract.
 pub struct ResidentProverInputOwner {
-    pub public_data: PublicData,
-    pub execution_memory: Arc<Memory>,
-    pub pc_count: usize,
-    pub public_memory_addresses: Vec<u32>,
-    pub builtin_segments: BuiltinSegments,
-    pub public_segment_context: PublicSegmentContext,
-    pub casm_states: CasmStatesByOpcode,
+    public_data: PublicData,
+    execution_memory: Arc<Memory>,
+    pc_count: usize,
+    public_memory_addresses: Vec<u32>,
+    builtin_segments: BuiltinSegments,
+    public_segment_context: PublicSegmentContext,
+    casm_states: CasmStatesByOpcode,
 }
 
 impl ResidentProverInputOwner {
@@ -64,6 +65,45 @@ impl ResidentProverInputOwner {
             builtin_segments,
             public_segment_context,
             casm_states: state_transitions.casm_states_by_opcode,
+        }
+    }
+
+    pub fn public_data(&self) -> &PublicData {
+        &self.public_data
+    }
+
+    pub fn execution_memory(&self) -> &Arc<Memory> {
+        &self.execution_memory
+    }
+
+    pub fn pc_count(&self) -> usize {
+        self.pc_count
+    }
+
+    pub fn public_memory_addresses(&self) -> &[u32] {
+        &self.public_memory_addresses
+    }
+
+    pub fn builtin_segments(&self) -> &BuiltinSegments {
+        &self.builtin_segments
+    }
+
+    pub fn public_segment_context(&self) -> &PublicSegmentContext {
+        &self.public_segment_context
+    }
+
+    pub fn opcode_labels(&self) -> Vec<&'static str> {
+        get_opcodes(&self.casm_states)
+    }
+
+    /// Row count only; raw Casm values stay behind descriptor-typed access.
+    /// `generic_opcode` is intentionally not a recorded descriptor and must be
+    /// rejected by ReplacementV1 until it has a resident writer.
+    pub fn direct_input_rows(&self, label: &str) -> Option<usize> {
+        if label == "generic_opcode" {
+            Some(self.casm_states.generic_opcode.len())
+        } else {
+            self.casm_input(label).map(|input| input.states.len())
         }
     }
 
@@ -123,36 +163,36 @@ mod tests {
         );
 
         assert_eq!(
-            bincode::serialize(&owner.public_data).unwrap(),
+            bincode::serialize(owner.public_data()).unwrap(),
             bincode::serialize(&generator.public_data).unwrap()
         );
         let oracle_memory = generator.jit_memory.as_deref().unwrap();
         assert_eq!(
-            owner.execution_memory.address_to_id,
+            owner.execution_memory().address_to_id,
             oracle_memory.address_to_id
         );
         assert_eq!(
-            owner.execution_memory.f252_values,
+            owner.execution_memory().f252_values,
             oracle_memory.f252_values
         );
         assert_eq!(
-            owner.execution_memory.small_values,
+            owner.execution_memory().small_values,
             oracle_memory.small_values
         );
         assert_eq!(
-            owner.execution_memory.config.small_max,
+            owner.execution_memory().config.small_max,
             oracle_memory.config.small_max
         );
         assert_eq!(
-            owner.execution_memory.config.log_small_value_capacity,
+            owner.execution_memory().config.log_small_value_capacity,
             oracle_memory.config.log_small_value_capacity
         );
         assert_eq!(
-            bincode::serialize(&owner.builtin_segments).unwrap(),
+            bincode::serialize(owner.builtin_segments()).unwrap(),
             expected_builtins
         );
-        assert_eq!(owner.public_memory_addresses, expected_addresses);
-        assert_eq!(owner.pc_count, expected_pc_count);
+        assert_eq!(owner.public_memory_addresses(), expected_addresses);
+        assert_eq!(owner.pc_count(), expected_pc_count);
 
         for source in owner.casm_inputs() {
             let oracle = recorded_casm_input_attempt(&generator, source.descriptor.label).unwrap();

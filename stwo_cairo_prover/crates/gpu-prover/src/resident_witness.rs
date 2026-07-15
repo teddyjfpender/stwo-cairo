@@ -5,6 +5,7 @@
 //! BaseTrace/LookupInputs/SubcomponentInputs slots and launch on the owning
 //! workspace stream. No writer may infer column order from vector position.
 
+use cairo_air::air::PublicData;
 use cairo_air::claims::CairoClaim;
 use serde_json::{Map, Value};
 use stwo_backend_cuda::BaseFieldVec;
@@ -92,10 +93,17 @@ pub fn planned_cairo_claim(
     generator: &CairoClaimGenerator,
     proof_plan: &ProofPlan,
 ) -> Result<CairoClaim, ResidentWitnessPlanError> {
+    planned_cairo_claim_from_public_data(&generator.public_data, proof_plan)
+}
+
+pub fn planned_cairo_claim_from_public_data(
+    public_data: &PublicData,
+    proof_plan: &ProofPlan,
+) -> Result<CairoClaim, ResidentWitnessPlanError> {
     let mut claim = Map::new();
     claim.insert(
         "public_data".to_string(),
-        serde_json::to_value(&generator.public_data)?,
+        serde_json::to_value(public_data)?,
     );
     let mut memory_small = Value::Null;
     for component in &proof_plan.components {

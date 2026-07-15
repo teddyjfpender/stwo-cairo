@@ -30,6 +30,7 @@
 //! `add_inputs` entry points, in the same per-relation order, over the same FULL
 //! padded extent (padding rows feed too — `mults_0 = 1` on every row).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use stwo::core::fields::m31::BaseField;
@@ -39,8 +40,10 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::FromSimdColumns;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
+use stwo_cairo_adapter::builtins::{BuiltinSegments, MemorySegmentAddresses};
 use stwo_cairo_adapter::memory::Memory;
 use stwo_cairo_adapter::opcodes::{recorded_casm_descriptor, RecordedCasmKind};
+use stwo_cairo_common::builtins::{PEDERSEN_BUILTIN_MEMORY_CELLS, POSEIDON_BUILTIN_MEMORY_CELLS};
 use stwo_cairo_common::prover_types::cpu::CasmState;
 
 use crate::witness::components::{
@@ -911,64 +914,119 @@ pub trait BuiltinLaneSpec {
     fn igen_from_flats(log_size: u32, n_real: usize, words: &[u32], n_rows: usize) -> Self::IGen;
 }
 
-/// Every lane recording, for the AOT `kernel_emit` tool (design §4/§17, M3):
-/// `(label, recorded witness program)`. Colocated with the spec definitions;
-/// gpu-prover's schedule-table pin asserts each label is a schedule node, so a
-/// lane added without a registry entry (or vice versa) fails a gate, not
-/// silently ships NVRTC-only.
+/// Statement-independent facts needed to bind one recorded AOT program without
+/// constructing its claim generator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedLaneMetadata {
+    pub label: &'static str,
+    pub program: Arc<stwo_backend_cuda::jit_witness::isa::WitnessProgram>,
+    pub host_pedersen_points_18: bool,
+}
+
+/// The authoritative recorded-lane registry. Recording shape and poison checks
+/// are performed here so generator-free consumers retain the legacy fail-closed
+/// contract. Recordings execute once per process; warm statements only clone
+/// the selected immutable program's `Arc`.
+pub fn all_lane_recording_metadata(
+) -> Result<&'static [RecordedLaneMetadata], RecordedWitnessInputsError> {
+    static REGISTRY: OnceLock<Result<Vec<RecordedLaneMetadata>, RecordedWitnessInputsError>> =
+        OnceLock::new();
+    match REGISTRY.get_or_init(build_lane_recording_metadata) {
+        Ok(metadata) => Ok(metadata),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+static LANE_RECORDING_METADATA_INITIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub fn lane_recording_metadata_initialization_count() -> usize {
+    LANE_RECORDING_METADATA_INITIALIZATIONS.load(Ordering::Relaxed)
+}
+
+fn build_lane_recording_metadata() -> Result<Vec<RecordedLaneMetadata>, RecordedWitnessInputsError>
+{
+    LANE_RECORDING_METADATA_INITIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+    fn op<C: OpcodeLaneSpec>() -> Result<RecordedLaneMetadata, RecordedWitnessInputsError> {
+        let recording = C::record();
+        validate_recording(
+            C::LABEL,
+            &recording,
+            C::N_TRACE,
+            C::N_LOOKUP_WORDS,
+            C::N_SUB_WORDS,
+        )?;
+        Ok(RecordedLaneMetadata {
+            label: C::LABEL,
+            program: Arc::new(recording.program),
+            host_pedersen_points_18: false,
+        })
+    }
+    fn bi<C: BuiltinLaneSpec>() -> Result<RecordedLaneMetadata, RecordedWitnessInputsError> {
+        let recording = C::record();
+        validate_recording(
+            C::LABEL,
+            &recording,
+            C::N_TRACE,
+            C::N_LOOKUP_WORDS,
+            C::N_SUB_WORDS,
+        )?;
+        Ok(RecordedLaneMetadata {
+            label: C::LABEL,
+            program: Arc::new(recording.program),
+            host_pedersen_points_18: C::NEEDS_PEDERSEN_TABLE,
+        })
+    }
+    Ok(vec![
+        op::<AddOpcodeLane>()?,
+        op::<AssertEqOpcodeLane>()?,
+        op::<JnzOpcodeTakenLane>()?,
+        op::<AddOpcodeSmallLane>()?,
+        op::<AssertEqOpcodeImmLane>()?,
+        op::<AssertEqOpcodeDoubleDerefLane>()?,
+        op::<CallOpcodeAbsLane>()?,
+        op::<CallOpcodeRelImmLane>()?,
+        op::<JnzOpcodeNonTakenLane>()?,
+        op::<JumpOpcodeAbsLane>()?,
+        op::<JumpOpcodeDoubleDerefLane>()?,
+        op::<JumpOpcodeRelLane>()?,
+        op::<JumpOpcodeRelImmLane>()?,
+        op::<RetOpcodeLane>()?,
+        bi::<AddApOpcodeLane>()?,
+        bi::<MulOpcodeLane>()?,
+        bi::<MulOpcodeSmallLane>()?,
+        bi::<RangeCheck252Width27Lane>()?,
+        bi::<TripleXor32Lane>()?,
+        bi::<VerifyInstructionLane>()?,
+        bi::<BlakeCompressOpcodeLane>()?,
+        bi::<PedersenAggregatorW18Lane>()?,
+        bi::<BlakeRoundLane>()?,
+        bi::<PartialEcMulW18Lane>()?,
+        bi::<PartialEcMulGenericLane>()?,
+        bi::<Cube252Lane>()?,
+        bi::<BlakeGRecordedLane>()?,
+        bi::<Qm31AddMulOpcodeLane>()?,
+        bi::<BitwiseBuiltinLane>()?,
+        bi::<RangeCheckBuiltinLane>()?,
+        bi::<PedersenBuiltinLane>()?,
+        bi::<PoseidonBuiltinLane>()?,
+        bi::<PoseidonAggregatorLane>()?,
+        bi::<PoseidonFullRoundChainLane>()?,
+        bi::<Poseidon3PartialRoundsChainLane>()?,
+    ])
+}
+
+/// Every lane recording, for the AOT `kernel_emit` tool (design §4/§17, M3).
+/// Kept as a compatibility projection of the richer single registry above.
 pub fn all_lane_recordings() -> Vec<(
     &'static str,
     stwo_backend_cuda::jit_witness::isa::WitnessProgram,
 )> {
-    fn op<C: OpcodeLaneSpec>() -> (
-        &'static str,
-        stwo_backend_cuda::jit_witness::isa::WitnessProgram,
-    ) {
-        (C::LABEL, C::record().program)
-    }
-    fn bi<C: BuiltinLaneSpec>() -> (
-        &'static str,
-        stwo_backend_cuda::jit_witness::isa::WitnessProgram,
-    ) {
-        (C::LABEL, C::record().program)
-    }
-    vec![
-        op::<AddOpcodeLane>(),
-        op::<AssertEqOpcodeLane>(),
-        op::<JnzOpcodeTakenLane>(),
-        op::<AddOpcodeSmallLane>(),
-        op::<AssertEqOpcodeImmLane>(),
-        op::<AssertEqOpcodeDoubleDerefLane>(),
-        op::<CallOpcodeAbsLane>(),
-        op::<CallOpcodeRelImmLane>(),
-        op::<JnzOpcodeNonTakenLane>(),
-        op::<JumpOpcodeAbsLane>(),
-        op::<JumpOpcodeDoubleDerefLane>(),
-        op::<JumpOpcodeRelLane>(),
-        op::<JumpOpcodeRelImmLane>(),
-        op::<RetOpcodeLane>(),
-        bi::<AddApOpcodeLane>(),
-        bi::<MulOpcodeLane>(),
-        bi::<MulOpcodeSmallLane>(),
-        bi::<RangeCheck252Width27Lane>(),
-        bi::<TripleXor32Lane>(),
-        bi::<VerifyInstructionLane>(),
-        bi::<BlakeCompressOpcodeLane>(),
-        bi::<PedersenAggregatorW18Lane>(),
-        bi::<BlakeRoundLane>(),
-        bi::<PartialEcMulW18Lane>(),
-        bi::<PartialEcMulGenericLane>(),
-        bi::<Cube252Lane>(),
-        bi::<BlakeGRecordedLane>(),
-        bi::<Qm31AddMulOpcodeLane>(),
-        bi::<BitwiseBuiltinLane>(),
-        bi::<RangeCheckBuiltinLane>(),
-        bi::<PedersenBuiltinLane>(),
-        bi::<PoseidonBuiltinLane>(),
-        bi::<PoseidonAggregatorLane>(),
-        bi::<PoseidonFullRoundChainLane>(),
-        bi::<Poseidon3PartialRoundsChainLane>(),
-    ]
+    all_lane_recording_metadata()
+        .expect("recorded lane registry must pass its static shape checks")
+        .iter()
+        .map(|lane| (lane.label, (*lane.program).clone()))
+        .collect()
 }
 
 pub type RecordedSubFeedLayoutEntry = (&'static str, usize, &'static str, u32, usize, usize);
@@ -1145,7 +1203,7 @@ pub struct RecordedWitnessInputs {
     pub lanes: Vec<RecordedWitnessInputPlan>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RecordedWitnessInputsError {
     UnsupportedLabels(Vec<&'static str>),
     MissingExecutionMemory(Vec<&'static str>),
@@ -1417,6 +1475,19 @@ pub enum PlannedCompactedRowsError {
         consumer: &'static str,
         state: &'static str,
     },
+    InvalidBuiltinSegment {
+        consumer: &'static str,
+        begin_addr: usize,
+        stop_ptr: usize,
+        cells_per_instance: usize,
+    },
+    BuiltinSegmentOutOfMemory {
+        consumer: &'static str,
+        begin_addr: usize,
+        stop_ptr: usize,
+        memory_rows: usize,
+    },
+    AddressOverflow(&'static str),
     Shape(crate::witness::proof_shape::ProofShapeError),
 }
 
@@ -1427,6 +1498,213 @@ impl core::fmt::Display for PlannedCompactedRowsError {
 }
 
 impl std::error::Error for PlannedCompactedRowsError {}
+
+/// Generator-free counterpart of [`planned_compacted_consumer_shape`]. It uses
+/// the same component `AddInputs` dedup probes and final-shape projection; only
+/// the immutable source of memory ids and builtin geometry changes.
+pub fn planned_compacted_consumer_shape_from_raw(
+    label: &str,
+    consumer_present: bool,
+    adapted_pc_count: usize,
+    memory: &Memory,
+    builtin_segments: &BuiltinSegments,
+) -> Result<Option<crate::witness::proof_shape::RuntimeComponentShape>, PlannedCompactedRowsError> {
+    if !consumer_present {
+        return Ok(None);
+    }
+    match label {
+        "verify_instruction" => {
+            let rows = u64::try_from(adapted_pc_count)
+                .map_err(|_| PlannedCompactedRowsError::AddressOverflow("verify_instruction"))?;
+            compacted_uniform_shape("verify_instruction", rows).map(Some)
+        }
+        "pedersen_aggregator_window_bits_18" => {
+            let segment = builtin_segments.pedersen_builtin.ok_or(
+                PlannedCompactedRowsError::MissingFeederState {
+                    consumer: "pedersen_aggregator_window_bits_18",
+                    state: "pedersen_builtin",
+                },
+            )?;
+            let rows = raw_builtin_rows(
+                "pedersen_aggregator_window_bits_18",
+                segment,
+                PEDERSEN_BUILTIN_MEMORY_CELLS,
+            )?;
+            validate_raw_segment_memory(
+                "pedersen_aggregator_window_bits_18",
+                segment,
+                PEDERSEN_BUILTIN_MEMORY_CELLS,
+                rows,
+                memory.address_to_id.len(),
+            )?;
+            planned_pedersen_compacted_shape(rows, segment.begin_addr, |address| {
+                BaseField::from(memory.get_raw_id(address.0))
+            })
+            .map(Some)
+        }
+        "poseidon_aggregator" => {
+            let segment = builtin_segments.poseidon_builtin.ok_or(
+                PlannedCompactedRowsError::MissingFeederState {
+                    consumer: "poseidon_aggregator",
+                    state: "poseidon_builtin",
+                },
+            )?;
+            let rows = raw_builtin_rows(
+                "poseidon_aggregator",
+                segment,
+                POSEIDON_BUILTIN_MEMORY_CELLS,
+            )?;
+            validate_raw_segment_memory(
+                "poseidon_aggregator",
+                segment,
+                POSEIDON_BUILTIN_MEMORY_CELLS,
+                rows,
+                memory.address_to_id.len(),
+            )?;
+            planned_poseidon_compacted_shape(rows, segment.begin_addr, |address| {
+                BaseField::from(memory.get_raw_id(address.0))
+            })
+            .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn raw_builtin_rows(
+    consumer: &'static str,
+    segment: MemorySegmentAddresses,
+    cells_per_instance: usize,
+) -> Result<u64, PlannedCompactedRowsError> {
+    let Some(cells) = segment.stop_ptr.checked_sub(segment.begin_addr) else {
+        return Err(PlannedCompactedRowsError::InvalidBuiltinSegment {
+            consumer,
+            begin_addr: segment.begin_addr,
+            stop_ptr: segment.stop_ptr,
+            cells_per_instance,
+        });
+    };
+    if cells == 0 || !cells.is_multiple_of(cells_per_instance) {
+        return Err(PlannedCompactedRowsError::InvalidBuiltinSegment {
+            consumer,
+            begin_addr: segment.begin_addr,
+            stop_ptr: segment.stop_ptr,
+            cells_per_instance,
+        });
+    }
+    let rows = cells / cells_per_instance;
+    if !rows.is_power_of_two() {
+        return Err(PlannedCompactedRowsError::InvalidBuiltinSegment {
+            consumer,
+            begin_addr: segment.begin_addr,
+            stop_ptr: segment.stop_ptr,
+            cells_per_instance,
+        });
+    }
+    u64::try_from(rows).map_err(|_| PlannedCompactedRowsError::AddressOverflow(consumer))
+}
+
+fn validate_raw_segment_memory(
+    consumer: &'static str,
+    segment: MemorySegmentAddresses,
+    cells_per_instance: usize,
+    rows: u64,
+    memory_rows: usize,
+) -> Result<(), PlannedCompactedRowsError> {
+    const M31_MODULUS: usize = 0x7fff_ffff;
+
+    let covered_cells = usize::try_from(rows)
+        .ok()
+        .and_then(|rows| rows.checked_mul(cells_per_instance));
+    let computed_stop = covered_cells.and_then(|cells| segment.begin_addr.checked_add(cells));
+    if segment.begin_addr == 0
+        || segment.stop_ptr > memory_rows
+        || segment.stop_ptr > M31_MODULUS
+        || computed_stop != Some(segment.stop_ptr)
+        || u32::try_from(segment.begin_addr).is_err()
+        || u32::try_from(segment.stop_ptr.saturating_sub(1)).is_err()
+    {
+        return Err(PlannedCompactedRowsError::BuiltinSegmentOutOfMemory {
+            consumer,
+            begin_addr: segment.begin_addr,
+            stop_ptr: segment.stop_ptr,
+            memory_rows,
+        });
+    }
+    Ok(())
+}
+
+fn compacted_uniform_shape(
+    label: &'static str,
+    n_real: u64,
+) -> Result<crate::witness::proof_shape::RuntimeComponentShape, PlannedCompactedRowsError> {
+    use crate::witness::proof_shape::{padded_rows, RuntimeComponentShape};
+
+    let padded =
+        padded_rows(label, n_real, N_LANES as u64).map_err(PlannedCompactedRowsError::Shape)?;
+    RuntimeComponentShape::uniform(label, n_real, padded).map_err(PlannedCompactedRowsError::Shape)
+}
+
+fn planned_pedersen_compacted_shape(
+    rows: u64,
+    segment_start: usize,
+    mut get_id: impl FnMut(BaseField) -> BaseField,
+) -> Result<crate::witness::proof_shape::RuntimeComponentShape, PlannedCompactedRowsError> {
+    use crate::witness::proof_shape_generated::FinalComponentShape;
+    use crate::witness::utils::AddInputs;
+
+    let segment_start = u32::try_from(segment_start).map_err(|_| {
+        PlannedCompactedRowsError::AddressOverflow("pedersen_aggregator_window_bits_18")
+    })?;
+    let probe = pedersen_aggregator_window_bits_18::ClaimGenerator::new();
+    let segment_start = BaseField::from(segment_start);
+    let three = BaseField::from(3u32);
+    let one = BaseField::from(1u32);
+    let two = BaseField::from(2u32);
+    for row in 0..rows {
+        let row = u32::try_from(row).map_err(|_| {
+            PlannedCompactedRowsError::AddressOverflow("pedersen_aggregator_window_bits_18")
+        })?;
+        let instance_addr = BaseField::from(row) * three + segment_start;
+        probe.add_input(
+            &(
+                [get_id(instance_addr), get_id(instance_addr + one)],
+                get_id(instance_addr + two),
+            ),
+            0,
+        );
+    }
+    probe
+        .final_component_shape(None, 0)
+        .map_err(PlannedCompactedRowsError::Shape)
+}
+
+fn planned_poseidon_compacted_shape(
+    rows: u64,
+    segment_start: usize,
+    mut get_id: impl FnMut(BaseField) -> BaseField,
+) -> Result<crate::witness::proof_shape::RuntimeComponentShape, PlannedCompactedRowsError> {
+    use crate::witness::proof_shape_generated::FinalComponentShape;
+    use crate::witness::utils::AddInputs;
+
+    let segment_start = u32::try_from(segment_start)
+        .map_err(|_| PlannedCompactedRowsError::AddressOverflow("poseidon_aggregator"))?;
+    let probe = poseidon_aggregator::ClaimGenerator::new();
+    let segment_start = BaseField::from(segment_start);
+    let six = BaseField::from(6u32);
+    for row in 0..rows {
+        let row = u32::try_from(row)
+            .map_err(|_| PlannedCompactedRowsError::AddressOverflow("poseidon_aggregator"))?;
+        let instance_addr = BaseField::from(row) * six + segment_start;
+        let mut word = |offset: u32| get_id(instance_addr + BaseField::from(offset));
+        probe.add_input(
+            &([word(0), word(1), word(2)], [word(3), word(4), word(5)]),
+            0,
+        );
+    }
+    probe
+        .final_component_shape(None, 0)
+        .map_err(PlannedCompactedRowsError::Shape)
+}
 
 /// HOST-SIDE EXACT ROW DERIVATION for the device-compacted consumers, at plan
 /// time (pre-witness). Returns `Ok(None)` when `label` is not a compacted
@@ -1455,10 +1733,6 @@ pub fn planned_compacted_consumer_shape(
     generator: &crate::witness::cairo_claim_generator::CairoClaimGenerator,
     label: &str,
 ) -> Result<Option<crate::witness::proof_shape::RuntimeComponentShape>, PlannedCompactedRowsError> {
-    use crate::witness::proof_shape::{padded_rows, RuntimeComponentShape};
-    use crate::witness::proof_shape_generated::FinalComponentShape;
-    use crate::witness::utils::AddInputs;
-
     match label {
         // The host multiset keys on the FULL 7-word tuple
         // `(pc, offsets, flags, opcode_extension)` (see
@@ -1495,11 +1769,7 @@ pub fn planned_compacted_consumer_shape(
                     pcs.len() as u64
                 }
             };
-            let padded = padded_rows("verify_instruction", n_real, N_LANES as u64)
-                .map_err(PlannedCompactedRowsError::Shape)?;
-            RuntimeComponentShape::uniform("verify_instruction", n_real, padded)
-                .map(Some)
-                .map_err(PlannedCompactedRowsError::Shape)
+            compacted_uniform_shape("verify_instruction", n_real).map(Some)
         }
         // Sole feeder: `pedersen_builtin`. Its SIMD writer
         // (`pedersen_builtin::write_trace_simd`) adds one aggregator tuple
@@ -1525,22 +1795,12 @@ pub fn planned_compacted_consumer_shape(
                     state: "memory_address_to_id",
                 },
             )?;
-            let probe = pedersen_aggregator_window_bits_18::ClaimGenerator::new();
-            let segment_start = BaseField::from(builtin.pedersen_builtin_segment_start);
-            let three = BaseField::from(3u32);
-            let one = BaseField::from(1u32);
-            let two = BaseField::from(2u32);
-            for row in 0..(1u64 << builtin.log_size) {
-                let instance_addr = BaseField::from(row as u32) * three + segment_start;
-                let id0 = addr_to_id.get_id(instance_addr);
-                let id1 = addr_to_id.get_id(instance_addr + one);
-                let id2 = addr_to_id.get_id(instance_addr + two);
-                probe.add_input(&([id0, id1], id2), 0);
-            }
-            probe
-                .final_component_shape(None, 0)
-                .map(Some)
-                .map_err(PlannedCompactedRowsError::Shape)
+            planned_pedersen_compacted_shape(
+                1u64 << builtin.log_size,
+                builtin.pedersen_builtin_segment_start as usize,
+                |address| addr_to_id.get_id(address),
+            )
+            .map(Some)
         }
         // Sole feeder: `poseidon_builtin`. Same structure as the pedersen arm
         // (`poseidon_builtin::write_trace_simd`): one tuple
@@ -1562,21 +1822,12 @@ pub fn planned_compacted_consumer_shape(
                     state: "memory_address_to_id",
                 },
             )?;
-            let probe = poseidon_aggregator::ClaimGenerator::new();
-            let segment_start = BaseField::from(builtin.poseidon_builtin_segment_start);
-            let six = BaseField::from(6u32);
-            for row in 0..(1u64 << builtin.log_size) {
-                let instance_addr = BaseField::from(row as u32) * six + segment_start;
-                let word = |offset: u32| addr_to_id.get_id(instance_addr + BaseField::from(offset));
-                probe.add_input(
-                    &([word(0), word(1), word(2)], [word(3), word(4), word(5)]),
-                    0,
-                );
-            }
-            probe
-                .final_component_shape(None, 0)
-                .map(Some)
-                .map_err(PlannedCompactedRowsError::Shape)
+            planned_poseidon_compacted_shape(
+                1u64 << builtin.log_size,
+                builtin.poseidon_builtin_segment_start as usize,
+                |address| addr_to_id.get_id(address),
+            )
+            .map(Some)
         }
         _ => Ok(None),
     }
@@ -4664,6 +4915,53 @@ mod emitted_lane_tests {
             );
             assert!(program.n_sub_words > 0, "{label}: empty sub recording");
         }
+    }
+
+    #[test]
+    fn recorded_lane_metadata_is_validated_once_and_process_owned() {
+        let first = all_lane_recording_metadata().unwrap();
+        let second = all_lane_recording_metadata().unwrap();
+        assert!(core::ptr::eq(first, second));
+        assert_eq!(lane_recording_metadata_initialization_count(), 1);
+        assert_eq!(first.len(), all_lane_recordings().len());
+        for (left, right) in first.iter().zip(second) {
+            assert!(Arc::ptr_eq(&left.program, &right.program), "{}", left.label);
+        }
+    }
+
+    #[test]
+    fn raw_compacted_shape_rejects_builtin_segment_outside_memory() {
+        use stwo_cairo_adapter::builtins::{BuiltinSegments, MemorySegmentAddresses};
+        use stwo_cairo_adapter::memory::{EncodedMemoryValueId, MemoryConfig};
+
+        let memory = Memory {
+            config: MemoryConfig::default(),
+            address_to_id: vec![EncodedMemoryValueId(0); 4],
+            f252_values: vec![],
+            small_values: vec![],
+        };
+        let builtins = BuiltinSegments {
+            poseidon_builtin: Some(MemorySegmentAddresses {
+                begin_addr: 1,
+                stop_ptr: 13,
+            }),
+            ..BuiltinSegments::default()
+        };
+        assert!(matches!(
+            planned_compacted_consumer_shape_from_raw(
+                "poseidon_aggregator",
+                true,
+                1,
+                &memory,
+                &builtins,
+            ),
+            Err(PlannedCompactedRowsError::BuiltinSegmentOutOfMemory {
+                consumer: "poseidon_aggregator",
+                begin_addr: 1,
+                stop_ptr: 13,
+                memory_rows: 4,
+            })
+        ));
     }
 
     #[test]
