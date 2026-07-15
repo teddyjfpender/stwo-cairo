@@ -24,7 +24,9 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
     PreProcessedTrace, PreProcessedTraceVariant,
 };
 
-use crate::arena_plan::{CommitmentTreeId, ExecutionTableGeometry, ResidentBackend};
+use crate::arena_plan::{
+    CommitmentTreeId, ExecutionTableGeometry, ProofArenaPlan, ResidentBackend,
+};
 use crate::plan::ProofPlan;
 use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::prepare_resident_ingest;
@@ -145,6 +147,59 @@ fn execution_geometry(
         owner.execution_memory().small_values.len(),
     )
     .with_public_memory_entries(public_memory_entries)
+}
+
+fn assert_sn_terminal_fusion(profile: &str, arena: &ProofArenaPlan) {
+    let expected = match profile {
+        "SN1" => [
+            (CommitmentTreeId::Base, 7, 12, 16_922_247_168, -7),
+            (CommitmentTreeId::Interaction, 9, 10, 8_269_332_480, 1),
+        ],
+        "SN2" => [
+            (CommitmentTreeId::Base, 7, 11, 6_820_986_880, -5),
+            (CommitmentTreeId::Interaction, 8, 10, 5_606_735_872, -2),
+        ],
+        "SN3" => [
+            (CommitmentTreeId::Base, 8, 10, 9_969_139_712, -6),
+            (CommitmentTreeId::Interaction, 8, 10, 7_235_436_544, -6),
+        ],
+        "SN4" => [
+            (CommitmentTreeId::Base, 9, 11, 10_019_995_648, -3),
+            (CommitmentTreeId::Interaction, 7, 13, 4_521_197_568, -5),
+        ],
+        _ => panic!("unknown sealed SN profile {profile}"),
+    };
+    for (tree, fixed16_batches, materialized_batches, net_device_bytes, net_cuda_launches) in
+        expected
+    {
+        let commitment = arena
+            .commitment(tree)
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: commitment missing"));
+        let selection = commitment
+            .direct_compact_terminal
+            .as_ref()
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: terminal plan missing"));
+        let receipt = selection
+            .receipt()
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: zero terminal-fusion execution"));
+        assert_eq!(
+            receipt.fixed_terminal_launches, fixed16_batches,
+            "{profile}/{tree:?}: exact fixed16 terminal batches"
+        );
+        assert_eq!(
+            selection.materialized_batches(),
+            materialized_batches,
+            "{profile}/{tree:?}: exact explicit materialized batches"
+        );
+        assert_eq!(
+            receipt.net_device_bytes_removed, net_device_bytes,
+            "{profile}/{tree:?}: exact retired device traffic"
+        );
+        assert_eq!(
+            receipt.net_cuda_launches_removed, net_cuda_launches,
+            "{profile}/{tree:?}: exact signed launch delta"
+        );
+    }
 }
 
 fn assert_current_bindings_match_fresh(
@@ -407,6 +462,7 @@ fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
         ShapeExecutableMaterialization::Reused
     );
     assert!(Arc::ptr_eq(&cold_shape.executable, &warm_shape.executable));
+    assert_sn_terminal_fusion(fixture.profile, cold_shape.executable.arena());
     assert_ne!(
         cold_shape.bindings, warm_shape.bindings,
         "{}: warm handle must bind current statement values",
