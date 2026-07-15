@@ -3561,10 +3561,13 @@ fn casm_slot_columns(
         return Err(RecordedInputBuildError::EmptyInputs(label));
     }
     let size = std::cmp::max(n_real.next_power_of_two(), N_LANES);
-    let mut padded = inputs.to_vec();
-    padded.resize(size, padded[0]);
     let mut columns = vec![Vec::with_capacity(size); 4];
-    for row in padded {
+    let first = inputs[0];
+    for row in inputs
+        .iter()
+        .copied()
+        .chain(std::iter::repeat(first).take(size - n_real))
+    {
         columns[0].push(row.pc.0);
         columns[1].push(row.ap.0);
         columns[2].push(row.fp.0);
@@ -4323,6 +4326,27 @@ impl RecordedFlatWitness for stwo_backend_cuda::CudaBackend {
 #[cfg(test)]
 mod emitted_lane_tests {
     use super::*;
+
+    #[test]
+    fn casm_slot_columns_replicate_the_first_real_row() {
+        let first = CasmState {
+            pc: BaseField::from_u32_unchecked(1),
+            ap: BaseField::from_u32_unchecked(2),
+            fp: BaseField::from_u32_unchecked(3),
+        };
+        let second = CasmState {
+            pc: BaseField::from_u32_unchecked(4),
+            ap: BaseField::from_u32_unchecked(5),
+            fp: BaseField::from_u32_unchecked(6),
+        };
+        let columns = casm_slot_columns("test", &[first, second]).unwrap();
+        assert_eq!(columns.n_real, 2);
+        assert_eq!(columns.row_count(), N_LANES);
+        assert_eq!(&columns.columns[0][..3], &[1, 4, 1]);
+        assert_eq!(&columns.columns[1][..3], &[2, 5, 2]);
+        assert_eq!(&columns.columns[2][..3], &[3, 6, 3]);
+        assert_eq!(&columns.columns[3][..3], &[1, 1, 0]);
+    }
 
     #[test]
     fn certified_edge_defaults_to_mirror_and_hostless_requires_opt_in() {
