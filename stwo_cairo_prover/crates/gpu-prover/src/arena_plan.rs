@@ -10976,7 +10976,23 @@ mod tests {
             Some(DirectCompactTerminalPlan::Materialized { batches: 1 })
         );
 
+        // A width-19 singleton is deliberately materialized: its three-column
+        // remainder plus the compact lazy tail consume the apparent reread win.
         let (compact, direct) = direct_terminal_programs(vec![12; 19]);
+        assert_eq!(
+            direct_compact_terminal_plan(
+                ResidentBackend::ReplacementV1,
+                CommitmentTreeId::Base,
+                Some(&compact),
+                Some(&direct),
+            )
+            .unwrap(),
+            Some(DirectCompactTerminalPlan::Materialized { batches: 1 })
+        );
+
+        // The exact fixed-16 shape has no remainder and must select the fused
+        // binder. This is the profitable path the production receipt gates.
+        let (compact, direct) = direct_terminal_programs(vec![12; 16]);
         let selected = direct_compact_terminal_plan(
             ResidentBackend::ReplacementV1,
             CommitmentTreeId::Base,
@@ -10985,7 +11001,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let receipt = selected.receipt().expect("log13 width19 must fuse");
+        let receipt = selected.receipt().expect("log13 width16 must fuse");
         assert_eq!(receipt.fixed_terminal_launches, 1);
         assert_eq!(receipt.batches.len(), 1);
         assert!(receipt.net_device_bytes_removed > 0);
