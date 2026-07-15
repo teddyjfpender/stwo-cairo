@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 //! Cairo e2e proving benchmark in the stwo-book / zkvm-benchmarks format.
 //!
