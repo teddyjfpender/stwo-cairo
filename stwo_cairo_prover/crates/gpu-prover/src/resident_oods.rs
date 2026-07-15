@@ -15,8 +15,9 @@ use stwo_backend_cuda::{
 };
 
 use crate::arena_plan::{
-    validate_quotient_producer_b2n_selection, ArenaBinding, OpenedColumnSource,
-    QuotientNumeratorSchedule, QuotientProducerB2nSelectionError,
+    validate_oods_pass_collapse_selection, validate_quotient_producer_b2n_selection, ArenaBinding,
+    OodsPassCollapseSelectionError, OpenedColumnSource, QuotientNumeratorSchedule,
+    QuotientProducerB2nSelectionError,
 };
 use crate::graphs::GraphWorkspace;
 use crate::prepared_composition::CompositionOutputMode;
@@ -51,6 +52,8 @@ pub enum ResidentOodsError {
     SizeOverflow,
     Arena(ArenaError),
     Oods(PreparedOodsError),
+    OodsPassCollapse(OodsPassCollapseSelectionError),
+    OodsPassCollapseRequirementsMismatch,
     Numerator(PreparedQuotientNumeratorError),
     NumeratorSchedule(QuotientNumeratorSingleWriteError),
     NumeratorStagedSchedule(QuotientNumeratorStagedSingleWriteError),
@@ -80,6 +83,12 @@ impl From<ArenaError> for ResidentOodsError {
 impl From<PreparedOodsError> for ResidentOodsError {
     fn from(value: PreparedOodsError) -> Self {
         Self::Oods(value)
+    }
+}
+
+impl From<OodsPassCollapseSelectionError> for ResidentOodsError {
+    fn from(value: OodsPassCollapseSelectionError) -> Self {
+        Self::OodsPassCollapse(value)
     }
 }
 
@@ -151,13 +160,38 @@ impl<'a> ResidentOodsPipeline<'a> {
             };
             oods_columns.push(OodsPolynomialColumn { source, topology });
         }
-        let oods = PreparedOodsGraph::prepare_mixed(
-            arena,
+        let rebound_topology = oods_columns
+            .iter()
+            .map(|column| column.topology)
+            .collect::<Vec<_>>();
+        validate_oods_pass_collapse_selection(
+            workspace.plan().protocol_identity().resident_backend,
             oods_plan.config,
-            &oods_columns,
-            bind_exact(workspace, oods_plan.oods_point_parameter, 4, "OODS point")?,
-            &oods_plan.slots,
+            &rebound_topology,
+            oods_plan.pass_collapse.as_ref(),
         )?;
+        let oods_point = bind_exact(workspace, oods_plan.oods_point_parameter, 4, "OODS point")?;
+        let oods = if let Some(program) = &oods_plan.pass_collapse {
+            if program.ordinary_requirements() != &oods_plan.requirements {
+                return Err(ResidentOodsError::OodsPassCollapseRequirementsMismatch);
+            }
+            PreparedOodsGraph::prepare_mixed_pass_collapsed(
+                arena,
+                oods_plan.config,
+                &oods_columns,
+                oods_point,
+                &oods_plan.slots,
+                program,
+            )?
+        } else {
+            PreparedOodsGraph::prepare_mixed(
+                arena,
+                oods_plan.config,
+                &oods_columns,
+                oods_point,
+                &oods_plan.slots,
+            )?
+        };
         require_same_slice(
             oods.sample_points_destination(),
             bind_logical(workspace, oods_plan.sample_points)?,

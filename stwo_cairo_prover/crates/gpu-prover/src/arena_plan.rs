@@ -42,15 +42,16 @@ use stwo_backend_cuda::{
     FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriFoldLaunchMode, FriMerkleTreeSlots,
     FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots, InterpolationLaunchMode,
     MerkleFromLeavesSlots, ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
-    OodsColumnTopology, OodsSourceKind, OodsWorkspaceConfig, OodsWorkspaceRequirements,
-    OodsWorkspaceSlots, PreparedBlake2sPowError, PreparedCommitError, PreparedDecommitError,
-    PreparedExecutionTablesError, PreparedFixedTableError, PreparedFriError, PreparedFriFinalError,
-    PreparedOodsError, PreparedProgressiveCommitError, PreparedQuotientError,
-    PreparedQuotientNumeratorError, PreparedWitnessCasmInputError, PreparedWitnessError,
-    PreparedWitnessFeedError, PreparedWitnessInputGatherError, ProgressiveBatchRequirements,
-    ProgressiveBatchSlots, ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
-    ProgressiveCommitMode, ProgressiveCommitStorageMode, ProgressiveCommitWorkspaceSlots,
-    ProgressiveLeafWorkspaceSlots, ProgressiveNttLeafFusionMode, QuotientNumeratorColumnTopology,
+    OodsColumnTopology, OodsPassCollapseError, OodsPassCollapseProgram, OodsSourceKind,
+    OodsWorkspaceConfig, OodsWorkspaceRequirements, OodsWorkspaceSlots, PreparedBlake2sPowError,
+    PreparedCommitError, PreparedDecommitError, PreparedExecutionTablesError,
+    PreparedFixedTableError, PreparedFriError, PreparedFriFinalError, PreparedOodsError,
+    PreparedProgressiveCommitError, PreparedQuotientError, PreparedQuotientNumeratorError,
+    PreparedWitnessCasmInputError, PreparedWitnessError, PreparedWitnessFeedError,
+    PreparedWitnessInputGatherError, ProgressiveBatchRequirements, ProgressiveBatchSlots,
+    ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry, ProgressiveCommitMode,
+    ProgressiveCommitStorageMode, ProgressiveCommitWorkspaceSlots, ProgressiveLeafWorkspaceSlots,
+    ProgressiveNttLeafFusionMode, QuotientNumeratorColumnTopology,
     QuotientNumeratorSingleWriteError, QuotientNumeratorSourceKind,
     QuotientNumeratorStagedSingleWriteError, QuotientNumeratorStagedSingleWritePlan,
     QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
@@ -108,6 +109,9 @@ use crate::transcript_plan::{CairoTranscriptInput, CairoTranscriptOutput};
 
 #[path = "arena_plan/composition_slab_counterfactual.rs"]
 mod composition_slab_counterfactual;
+#[cfg(test)]
+#[path = "arena_plan/oods_pass_collapse_tests.rs"]
+mod oods_pass_collapse_tests;
 pub use composition_slab_counterfactual::{
     CompositionSlabArenaCounterfactual, CompositionSlabArenaFootprint,
 };
@@ -2515,6 +2519,7 @@ struct LogicalDirectCompositionBinding {
 struct LogicalOodsWorkspace {
     config: OodsWorkspaceConfig,
     requirements: OodsWorkspaceRequirements,
+    pass_collapse: Option<OodsPassCollapseProgram>,
     columns: Vec<LogicalOodsColumn>,
     oods_point_parameter: LogicalBufferId,
     source_pointers: LogicalBufferId,
@@ -3323,6 +3328,9 @@ impl PlannedOodsColumn {
 pub struct PlannedOodsWorkspace {
     pub config: OodsWorkspaceConfig,
     pub requirements: OodsWorkspaceRequirements,
+    /// Exact address-free ReplacementV1 program. Absence selects the ordinary
+    /// constructor for Legacy and non-qualifying shapes.
+    pub pass_collapse: Option<OodsPassCollapseProgram>,
     pub columns: Vec<PlannedOodsColumn>,
     pub oods_point_parameter: ArenaBinding,
     pub slots: OodsWorkspaceSlots,
@@ -3520,6 +3528,57 @@ pub enum QuotientProducerB2nSelectionError {
         expected: Option<QuotientProducerB2nProgram>,
         selected: Option<QuotientProducerB2nProgram>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OodsPassCollapseSelectionError {
+    Compile(OodsPassCollapseError),
+    Identity(OodsPassCollapseError),
+    SelectionDrift {
+        resident_backend: ResidentBackend,
+        expected_selected: bool,
+        actual_selected: bool,
+    },
+}
+
+fn select_oods_pass_collapse(
+    resident_backend: ResidentBackend,
+    config: OodsWorkspaceConfig,
+    columns: &[OodsColumnTopology<'_>],
+) -> Result<Option<OodsPassCollapseProgram>, OodsPassCollapseSelectionError> {
+    if resident_backend == ResidentBackend::LegacyResident {
+        return Ok(None);
+    }
+    match OodsPassCollapseProgram::compile(config, columns) {
+        Ok(program) => Ok(Some(program)),
+        Err(
+            OodsPassCollapseError::NoEvaluationGroups
+            | OodsPassCollapseError::InsufficientNonExpandingWorkspace,
+        ) => Ok(None),
+        Err(error) => Err(OodsPassCollapseSelectionError::Compile(error)),
+    }
+}
+
+pub(crate) fn validate_oods_pass_collapse_selection(
+    resident_backend: ResidentBackend,
+    config: OodsWorkspaceConfig,
+    columns: &[OodsColumnTopology<'_>],
+    selected: Option<&OodsPassCollapseProgram>,
+) -> Result<(), OodsPassCollapseSelectionError> {
+    let expected = select_oods_pass_collapse(resident_backend, config, columns)?;
+    if expected.is_some() != selected.is_some() {
+        return Err(OodsPassCollapseSelectionError::SelectionDrift {
+            resident_backend,
+            expected_selected: expected.is_some(),
+            actual_selected: selected.is_some(),
+        });
+    }
+    if let Some(program) = selected {
+        program
+            .validate_against(config, columns)
+            .map_err(OodsPassCollapseSelectionError::Identity)?;
+    }
+    Ok(())
 }
 
 fn select_quotient_producer_b2n(
@@ -3967,7 +4026,7 @@ impl ProofArenaPlan {
             .collect::<Result<Vec<_>, _>>()?;
         let preprocessed = resolve_preprocessed_slots(logical_preprocessed, &bindings)?;
         let composition = resolve_composition_slots(logical_composition, &bindings)?;
-        let oods = resolve_oods_slots(logical_oods, &bindings)?;
+        let oods = resolve_oods_slots(protocol.identity.resident_backend, logical_oods, &bindings)?;
         let quotient_numerator =
             resolve_quotient_numerator_slots(logical_quotient_numerator, &bindings)?;
         let quotient = resolve_quotient_slots(
@@ -4428,6 +4487,7 @@ pub enum ArenaPlanError {
     },
     Composition(PreparedCompositionError),
     Oods(PreparedOodsError),
+    OodsPassCollapse(OodsPassCollapseSelectionError),
     QuotientNumerator(PreparedQuotientNumeratorError),
     QuotientNumeratorSchedule(QuotientNumeratorSingleWriteError),
     QuotientNumeratorStaged(QuotientNumeratorStagedSingleWriteError),
@@ -7359,6 +7419,20 @@ fn append_protocol_buffers(
     let oods_topologies = protocol.oods.column_topologies(&oods_source_kinds)?;
     let oods_requirements =
         oods_workspace_requirements(oods_config, &oods_topologies).map_err(ArenaPlanError::Oods)?;
+    let oods_pass_collapse = select_oods_pass_collapse(
+        protocol.identity.resident_backend,
+        oods_config,
+        &oods_topologies,
+    )
+    .map_err(ArenaPlanError::OodsPassCollapse)?;
+    if oods_pass_collapse
+        .as_ref()
+        .is_some_and(|program| program.ordinary_requirements() != &oods_requirements)
+    {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "selected OODS pass-collapse program changed ordinary requirements",
+        ));
+    }
     let quotient_numerator_config = protocol.quotient_numerator_workspace_config()?;
     let quotient_numerator_topologies = protocol.quotient_numerator_topologies()?;
     let quotient_numerator_requirements = quotient_numerator_workspace_requirements(
@@ -8708,6 +8782,7 @@ fn append_protocol_buffers(
     let logical_oods = LogicalOodsWorkspace {
         config: oods_config,
         requirements: oods_requirements,
+        pass_collapse: oods_pass_collapse,
         columns: opened_columns.clone(),
         oods_point_parameter,
         source_pointers: oods_source_pointers,
@@ -9633,6 +9708,7 @@ fn resolve_composition_slots(
 }
 
 fn resolve_oods_slots(
+    resident_backend: ResidentBackend,
     logical: LogicalOodsWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedOodsWorkspace, ArenaPlanError> {
@@ -9690,6 +9766,13 @@ fn resolve_oods_slots(
             "OODS workspace changed while binding physical polynomial sources",
         ));
     }
+    validate_oods_pass_collapse_selection(
+        resident_backend,
+        logical.config,
+        &rebound_topologies,
+        logical.pass_collapse.as_ref(),
+    )
+    .map_err(ArenaPlanError::OodsPassCollapse)?;
     let oods_point_parameter = binding(logical.oods_point_parameter)?;
     if columns
         .iter()
@@ -9704,6 +9787,7 @@ fn resolve_oods_slots(
     Ok(PlannedOodsWorkspace {
         config: logical.config,
         requirements: logical.requirements,
+        pass_collapse: logical.pass_collapse,
         columns,
         oods_point_parameter,
         sample_points: binding(logical.sample_points)?,
