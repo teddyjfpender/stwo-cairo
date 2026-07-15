@@ -45,6 +45,7 @@ pub mod relation_execution;
 pub mod relation_table;
 pub mod replacement_host_cache;
 mod resident_composition;
+mod resident_direct_commit;
 pub mod resident_input;
 mod resident_oods;
 pub mod resident_runtime;

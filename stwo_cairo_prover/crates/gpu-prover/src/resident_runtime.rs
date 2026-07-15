@@ -13,15 +13,16 @@ use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo_backend_cuda::{
-    ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitEvaluationGroup,
-    CommitProgram, CompactDomainBindingError, CompactDomainProgram, CudaExecTelemetry,
-    CudaRuntimeError, DecommitAssembly, DecommitColumnSource, DecommitTreeGeometry,
-    DecommitTreeSources, DeviceTranscriptError, DomainCooperativeBindingError,
-    DomainCooperativeProgram, ExecutionTablesHostData, FixedTableSourceColumn,
-    FriDecommitOwnedSources, MemoryBaseTracePart, ModeAwareCommitWorkspaceRequirements,
-    ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError, PreparedBlake2sPowGraph,
-    PreparedBlake2sTranscript, PreparedBlakeGFusedFeed, PreparedCommitError, PreparedCommitGraph,
-    PreparedCompactDomainCommitGraph, PreparedDecommitError, PreparedDecommitGraph,
+    ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitCoefficientGroup,
+    CommitEvaluationGroup, CommitProgram, CompactDomainBindingError, CompactDomainProgram,
+    CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
+    DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError,
+    DirectCompactDomainBindingError, DomainCooperativeBindingError, DomainCooperativeProgram,
+    ExecutionTablesHostData, FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
+    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError,
+    PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedBlakeGFusedFeed,
+    PreparedCommitError, PreparedCommitGraph, PreparedCompactDomainCommitGraph,
+    PreparedDecommitError, PreparedDecommitGraph, PreparedDirectCompactDomainCommitGraph,
     PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
     PreparedExecutionTablesError, PreparedExecutionTablesGraph,
     PreparedExecutionTablesIngestTelemetry, PreparedFixedTableError, PreparedFixedTableGraph,
@@ -58,6 +59,9 @@ use crate::proof_bundle::{
 use crate::relation::RelationTracePart;
 use crate::relation_execution::{RelationBatchKey, RelationSourcePlane};
 use crate::resident_composition::{prepare_resident_composition, ResidentCompositionError};
+use crate::resident_direct_commit::{
+    direct_commitment_inputs, trace_commit_input_mode, TraceCommitInputMode,
+};
 use crate::resident_oods::{ResidentOodsError, ResidentOodsPipeline};
 use crate::resident_sources::{
     commitment_groups, prepare_commitment_interpolation, ResidentSourceStageError,
@@ -75,6 +79,13 @@ pub struct ResidentWorkspaceIdentity {
     pub shape_key: ProofShapeKey,
     pub protocol_key: u64,
     pub arena_base: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentTraceCommitInputTelemetry {
+    pub direct_commitments: u32,
+    pub separate_interpolation_graph_invocations: u32,
+    pub separate_interpolation_kernel_launches: usize,
 }
 
 impl ResidentWorkspaceIdentity {
@@ -332,6 +343,7 @@ pub enum ResidentRuntimeError {
         ordinal: u32,
     },
     MissingPreparedCommitment(CommitmentTreeId),
+    DirectRetainedOutputMismatch(CommitmentTreeId),
     FixedPreprocessedCommitmentNotReady,
     TranscriptScheduleMismatch {
         expected: u64,
@@ -431,6 +443,7 @@ pub enum ResidentRuntimeError {
     ProgressiveCommit(PreparedProgressiveCommitError),
     DomainCooperativeBinding(DomainCooperativeBindingError),
     CompactDomainBinding(CompactDomainBindingError),
+    DirectCompactDomainBinding(DirectCompactDomainBindingError),
     CommitModeMismatch,
     Interpolation(PreparedInterpolationError),
     SourceStage(ResidentSourceStageError),
@@ -503,6 +516,12 @@ impl From<DomainCooperativeBindingError> for ResidentRuntimeError {
 impl From<CompactDomainBindingError> for ResidentRuntimeError {
     fn from(value: CompactDomainBindingError) -> Self {
         Self::CompactDomainBinding(value)
+    }
+}
+
+impl From<DirectCompactDomainBindingError> for ResidentRuntimeError {
+    fn from(value: DirectCompactDomainBindingError) -> Self {
+        Self::DirectCompactDomainBinding(value)
     }
 }
 
@@ -682,6 +701,7 @@ enum ResidentLaunchError {
     Commit(PreparedCommitError),
     ProgressiveCommit(PreparedProgressiveCommitError),
     CompactDomainCommit(CompactDomainBindingError),
+    DirectCompactDomainCommit(DirectCompactDomainBindingError),
     Interpolation(PreparedInterpolationError),
     Composition(PreparedCompositionError),
     Oods(ResidentOodsError),
@@ -712,6 +732,12 @@ impl core::fmt::Display for ResidentLaunchError {
             }
             Self::CompactDomainCommit(error) => {
                 write!(f, "resident compact commitment launch rejected: {error}")
+            }
+            Self::DirectCompactDomainCommit(error) => {
+                write!(
+                    f,
+                    "resident direct compact commitment launch rejected: {error}"
+                )
             }
             Self::Interpolation(error) => {
                 write!(f, "resident interpolation launch rejected: {error}")
@@ -1075,6 +1101,59 @@ fn slices_match_slots(
             .all(|((&slice, &slot), &words)| slice_matches_slot(slice, slot, words))
 }
 
+fn flat_retained_outputs(
+    groups: &[CommitCoefficientGroup],
+    outputs: &[Option<Vec<ArenaSlice>>],
+) -> Result<Vec<Option<ArenaSlice>>, ResidentRuntimeError> {
+    if groups.len() != outputs.len() {
+        return Err(ResidentRuntimeError::CommitModeMismatch);
+    }
+    let mut flat = Vec::new();
+    for (group, outputs) in groups.iter().zip(outputs) {
+        match outputs {
+            Some(outputs) if outputs.len() == group.columns.len() => {
+                flat.extend(outputs.iter().copied().map(Some));
+            }
+            Some(_) => return Err(ResidentRuntimeError::CommitModeMismatch),
+            None => flat.extend((0..group.columns.len()).map(|_| None)),
+        }
+    }
+    Ok(flat)
+}
+
+fn direct_retained_outputs_match(
+    actual: &[Option<ArenaSlice>],
+    planned: &[Option<Vec<ArenaSlice>>],
+) -> bool {
+    canonical_output_order_matches(actual, planned, |actual, planned| {
+        actual.id() == planned.id()
+            && actual.as_u32_ptr() == planned.as_u32_ptr()
+            && actual.len_words() == planned.len_words()
+    })
+}
+
+fn canonical_output_order_matches<T, U>(
+    actual: &[Option<T>],
+    planned: &[Option<Vec<U>>],
+    mut matches: impl FnMut(&T, &U) -> bool,
+) -> bool {
+    let mut actual = actual.iter();
+    for planned_group in planned {
+        let Some(planned_group) = planned_group else {
+            return false;
+        };
+        for planned in planned_group {
+            let Some(Some(actual)) = actual.next() else {
+                return false;
+            };
+            if !matches(actual, planned) {
+                return false;
+            }
+        }
+    }
+    actual.next().is_none()
+}
+
 enum PreparedResidentCommitment<'a> {
     Full(PreparedCommitGraph<'a>),
     Progressive {
@@ -1085,9 +1164,17 @@ enum PreparedResidentCommitment<'a> {
         graph: PreparedCompactDomainCommitGraph<'a>,
         retained_evaluations: Vec<Option<Vec<ArenaSlice>>>,
     },
+    DirectCompact {
+        graph: PreparedDirectCompactDomainCommitGraph<'a>,
+        retained_evaluations: Vec<Option<Vec<ArenaSlice>>>,
+    },
 }
 
 impl PreparedResidentCommitment<'_> {
+    fn is_direct(&self) -> bool {
+        matches!(self, Self::DirectCompact { .. })
+    }
+
     fn launch(&self) -> Result<(), ResidentLaunchError> {
         match self {
             Self::Full(graph) => graph.launch().map_err(ResidentLaunchError::Commit),
@@ -1097,6 +1184,9 @@ impl PreparedResidentCommitment<'_> {
             Self::Compact { graph, .. } => graph
                 .launch()
                 .map_err(ResidentLaunchError::CompactDomainCommit),
+            Self::DirectCompact { graph, .. } => graph
+                .launch()
+                .map_err(ResidentLaunchError::DirectCompactDomainCommit),
         }
     }
 
@@ -1105,6 +1195,7 @@ impl PreparedResidentCommitment<'_> {
             Self::Full(graph) => graph.root_slice(),
             Self::Progressive { graph, .. } => graph.root_slice(),
             Self::Compact { graph, .. } => graph.root_slice(),
+            Self::DirectCompact { graph, .. } => graph.root_slice(),
         }
     }
 
@@ -1113,6 +1204,7 @@ impl PreparedResidentCommitment<'_> {
             Self::Full(graph) => graph.retained_layers_bottom_up(),
             Self::Progressive { graph, .. } => graph.retained_layers_bottom_up(),
             Self::Compact { graph, .. } => graph.retained_layers_bottom_up(),
+            Self::DirectCompact { graph, .. } => graph.retained_layers_bottom_up(),
         }
     }
 
@@ -1126,6 +1218,10 @@ impl PreparedResidentCommitment<'_> {
             | Self::Compact {
                 retained_evaluations,
                 ..
+            }
+            | Self::DirectCompact {
+                retained_evaluations,
+                ..
             } => retained_evaluations,
         }
     }
@@ -1135,7 +1231,86 @@ impl PreparedResidentCommitment<'_> {
             Self::Full(graph) => Ok(graph.read_root_at_transcript_boundary()?),
             Self::Progressive { graph, .. } => Ok(graph.read_root_at_transcript_boundary()?),
             Self::Compact { graph, .. } => Ok(graph.read_root_at_transcript_boundary()?),
+            Self::DirectCompact { graph, .. } => Ok(graph.read_root_at_transcript_boundary()?),
         }
+    }
+}
+
+enum PreparedTraceCommitInput<'a> {
+    Interpolate(PreparedInterpolationGraph<'a>),
+    DirectEvaluations,
+}
+
+impl PreparedTraceCommitInput<'_> {
+    fn mode(&self) -> TraceCommitInputMode {
+        match self {
+            Self::Interpolate(_) => TraceCommitInputMode::Interpolate,
+            Self::DirectEvaluations => TraceCommitInputMode::DirectEvaluations,
+        }
+    }
+
+    fn interpolation_kernel_launches(&self) -> usize {
+        match self {
+            Self::Interpolate(graph) => graph.batch_count(),
+            Self::DirectEvaluations => 0,
+        }
+    }
+}
+
+fn trace_commit_input_telemetry(
+    base: &PreparedTraceCommitInput<'_>,
+    interaction: &PreparedTraceCommitInput<'_>,
+) -> ResidentTraceCommitInputTelemetry {
+    trace_commit_input_telemetry_from_modes(
+        base.mode(),
+        interaction.mode(),
+        base.interpolation_kernel_launches(),
+        interaction.interpolation_kernel_launches(),
+    )
+}
+
+fn trace_commit_input_telemetry_from_modes(
+    base: TraceCommitInputMode,
+    interaction: TraceCommitInputMode,
+    base_interpolation_launches: usize,
+    interaction_interpolation_launches: usize,
+) -> ResidentTraceCommitInputTelemetry {
+    let direct_commitments = [base, interaction]
+        .into_iter()
+        .filter(|&mode| mode == TraceCommitInputMode::DirectEvaluations)
+        .count() as u32;
+    ResidentTraceCommitInputTelemetry {
+        direct_commitments,
+        separate_interpolation_graph_invocations: 2 - direct_commitments,
+        separate_interpolation_kernel_launches: base_interpolation_launches
+            + interaction_interpolation_launches,
+    }
+}
+
+fn prepare_trace_commit_input<'a>(
+    workspace: &'a GraphWorkspace,
+    commitments: &[(CommitmentTreeId, PreparedResidentCommitment<'a>)],
+    tree: CommitmentTreeId,
+) -> Result<PreparedTraceCommitInput<'a>, ResidentRuntimeError> {
+    let planned = workspace
+        .plan()
+        .commitment(tree)
+        .ok_or(ResidentRuntimeError::MissingPreparedCommitment(tree))?;
+    let prepared = commitments
+        .iter()
+        .find_map(|(candidate, prepared)| (*candidate == tree).then_some(prepared))
+        .ok_or(ResidentRuntimeError::MissingPreparedCommitment(tree))?;
+    match trace_commit_input_mode(
+        planned.direct_retained_b2n_program.is_some(),
+        prepared.is_direct(),
+    ) {
+        Ok(TraceCommitInputMode::DirectEvaluations) => {
+            Ok(PreparedTraceCommitInput::DirectEvaluations)
+        }
+        Ok(TraceCommitInputMode::Interpolate) => Ok(PreparedTraceCommitInput::Interpolate(
+            prepare_commitment_interpolation(workspace, tree)?,
+        )),
+        Err(()) => Err(ResidentRuntimeError::CommitModeMismatch),
     }
 }
 
@@ -1149,11 +1324,11 @@ pub struct ResidentGraphRuntime<'a> {
     witness_lane_levels: Vec<Vec<Vec<usize>>>,
     multiplicity: Option<PreparedResidentMultiplicity<'a>>,
     commitments: Vec<(CommitmentTreeId, PreparedResidentCommitment<'a>)>,
-    base_interpolation: PreparedInterpolationGraph<'a>,
+    base_commit_input: PreparedTraceCommitInput<'a>,
     fixed_preprocessed_root: ArenaSlice,
     fixed_preprocessed_retained_layers: Vec<ArenaSlice>,
     relation: PreparedRelationGraph<'a>,
-    interaction_interpolation: PreparedInterpolationGraph<'a>,
+    interaction_commit_input: PreparedTraceCommitInput<'a>,
     interaction_claim_sources: Vec<ArenaSlice>,
     composition: PreparedCompositionGraph<'a>,
     oods: ResidentOodsPipeline<'a>,
@@ -1729,8 +1904,19 @@ impl<'a> ResidentGraphRuntime<'a> {
             .iter()
             .filter(|planned| planned.id != CommitmentTreeId::Preprocessed)
         {
-            let groups = commitment_groups(workspace, planned)?;
-            let twiddles = bind_arena_binding(arena, planned.twiddles)?;
+            let direct_inputs = planned
+                .direct_retained_b2n_program
+                .as_ref()
+                .map(|_| direct_commitment_inputs(workspace, planned))
+                .transpose()?;
+            let groups = direct_inputs
+                .is_none()
+                .then(|| commitment_groups(workspace, planned))
+                .transpose()?;
+            let twiddles = direct_inputs
+                .is_none()
+                .then(|| bind_arena_binding(arena, planned.twiddles))
+                .transpose()?;
             let retained_evaluations = planned
                 .retained_evaluation_groups
                 .iter()
@@ -1766,40 +1952,39 @@ impl<'a> ResidentGraphRuntime<'a> {
                 (
                     ModeAwareCommitWorkspaceRequirements::FullLifting(_),
                     ModeAwareCommitWorkspaceSlots::FullLifting(slots),
-                ) => PreparedResidentCommitment::Full(
-                    PreparedCommitGraph::prepare_with_retained_evaluations(
-                        arena,
-                        planned.config,
-                        &groups,
-                        twiddles,
-                        slots,
-                        &retained_evaluations,
-                    )?,
-                ),
+                ) => {
+                    let groups = groups
+                        .as_ref()
+                        .ok_or(ResidentRuntimeError::CommitModeMismatch)?;
+                    PreparedResidentCommitment::Full(
+                        PreparedCommitGraph::prepare_with_retained_evaluations(
+                            arena,
+                            planned.config,
+                            groups,
+                            twiddles.ok_or(ResidentRuntimeError::CommitModeMismatch)?,
+                            slots,
+                            &retained_evaluations,
+                        )?,
+                    )
+                }
                 (
                     ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
                     ModeAwareCommitWorkspaceSlots::DomainProgressive(slots),
                 ) => {
-                    let coefficients = groups
-                        .iter()
-                        .flat_map(|group| group.columns.iter().copied())
-                        .collect::<Vec<_>>();
-                    let flat_retained = groups
-                        .iter()
-                        .zip(&evaluation_outputs)
-                        .flat_map(|(group, retained)| match retained {
-                            Some(retained) => {
-                                retained.iter().copied().map(Some).collect::<Vec<_>>()
-                            }
-                            None => vec![None; group.columns.len()],
-                        })
-                        .collect::<Vec<_>>();
                     let grouped_retained = retained_evaluations
                         .iter()
                         .map(|group| group.as_ref().map(|group| group.columns.clone()))
                         .collect();
                     match planned.storage_mode {
                         ProgressiveCommitStorageMode::Separate => {
+                            let groups = groups
+                                .as_ref()
+                                .ok_or(ResidentRuntimeError::CommitModeMismatch)?;
+                            let coefficients = groups
+                                .iter()
+                                .flat_map(|group| group.columns.iter().copied())
+                                .collect::<Vec<_>>();
+                            let flat_retained = flat_retained_outputs(groups, &evaluation_outputs)?;
                             if !matches!(
                                 (
                                     protocol_identity.resident_backend,
@@ -1820,7 +2005,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                                     slots,
                                     &coefficients,
                                     &flat_retained,
-                                    twiddles,
+                                    twiddles.ok_or(ResidentRuntimeError::CommitModeMismatch)?,
                                     protocol_identity.commit_mode,
                                     protocol_identity.blake2s_interior_fused,
                                     ProgressiveNttLeafFusionMode::Separate,
@@ -1839,13 +2024,22 @@ impl<'a> ResidentGraphRuntime<'a> {
                                 planned.commit_program.as_ref(),
                             )? {
                                 ExactDynamicCommitProgram::Cooperative { domain, base } => {
+                                    let groups = groups
+                                        .as_ref()
+                                        .ok_or(ResidentRuntimeError::CommitModeMismatch)?;
+                                    let coefficients = groups
+                                        .iter()
+                                        .flat_map(|group| group.columns.iter().copied())
+                                        .collect::<Vec<_>>();
+                                    let flat_retained =
+                                        flat_retained_outputs(groups, &evaluation_outputs)?;
                                     let graph = domain.bind(
                                         arena,
                                         base,
                                         slots,
                                         &coefficients,
                                         &flat_retained,
-                                        twiddles,
+                                        twiddles.ok_or(ResidentRuntimeError::CommitModeMismatch)?,
                                     )?;
                                     PreparedResidentCommitment::Progressive {
                                         graph,
@@ -1857,18 +2051,58 @@ impl<'a> ResidentGraphRuntime<'a> {
                                     domain,
                                     base,
                                 } => {
-                                    let graph = compact.bind_prepared(
-                                        arena,
-                                        base,
-                                        domain,
-                                        slots,
-                                        &coefficients,
-                                        &flat_retained,
-                                        twiddles,
-                                    )?;
-                                    PreparedResidentCommitment::Compact {
-                                        graph,
-                                        retained_evaluations: grouped_retained,
+                                    if let (Some(direct_program), Some(direct_inputs)) = (
+                                        planned.direct_retained_b2n_program.as_ref(),
+                                        direct_inputs.as_ref(),
+                                    ) {
+                                        let graph = compact.bind_prepared_direct(
+                                            arena,
+                                            base,
+                                            domain,
+                                            direct_program,
+                                            slots,
+                                            &direct_inputs.columns,
+                                            direct_inputs.inverse_twiddles,
+                                            direct_inputs.forward_twiddles,
+                                        )?;
+                                        if !direct_retained_outputs_match(
+                                            graph.retained_evaluations(),
+                                            &evaluation_outputs,
+                                        ) {
+                                            return Err(
+                                                ResidentRuntimeError::DirectRetainedOutputMismatch(
+                                                    planned.id,
+                                                ),
+                                            );
+                                        }
+                                        PreparedResidentCommitment::DirectCompact {
+                                            graph,
+                                            retained_evaluations: grouped_retained,
+                                        }
+                                    } else {
+                                        let groups = groups
+                                            .as_ref()
+                                            .ok_or(ResidentRuntimeError::CommitModeMismatch)?;
+                                        let coefficients = groups
+                                            .iter()
+                                            .flat_map(|group| group.columns.iter().copied())
+                                            .collect::<Vec<_>>();
+                                        let flat_retained =
+                                            flat_retained_outputs(groups, &evaluation_outputs)?;
+                                        let graph = compact.bind_prepared(
+                                            arena,
+                                            base,
+                                            domain,
+                                            slots,
+                                            &coefficients,
+                                            &flat_retained,
+                                            twiddles
+                                                .ok_or(ResidentRuntimeError::CommitModeMismatch)?,
+                                        )?;
+                                        PreparedResidentCommitment::Compact {
+                                            graph,
+                                            retained_evaluations: grouped_retained,
+                                        }
                                     }
                                 }
                             }
@@ -1879,10 +2113,38 @@ impl<'a> ResidentGraphRuntime<'a> {
             };
             commitments.push((planned.id, prepared));
         }
-        let base_interpolation =
-            prepare_commitment_interpolation(workspace, CommitmentTreeId::Base)?;
-        let interaction_interpolation =
-            prepare_commitment_interpolation(workspace, CommitmentTreeId::Interaction)?;
+        let base_commit_input =
+            prepare_trace_commit_input(workspace, &commitments, CommitmentTreeId::Base)?;
+        let interaction_commit_input =
+            prepare_trace_commit_input(workspace, &commitments, CommitmentTreeId::Interaction)?;
+        let input_telemetry =
+            trace_commit_input_telemetry(&base_commit_input, &interaction_commit_input);
+        let expected_input_telemetry = match protocol_identity.resident_backend {
+            ResidentBackend::ReplacementV1 => ResidentTraceCommitInputTelemetry {
+                direct_commitments: 2,
+                separate_interpolation_graph_invocations: 0,
+                separate_interpolation_kernel_launches: 0,
+            },
+            ResidentBackend::LegacyResident => ResidentTraceCommitInputTelemetry {
+                direct_commitments: 0,
+                separate_interpolation_graph_invocations: 2,
+                separate_interpolation_kernel_launches: workspace
+                    .plan()
+                    .commitments()
+                    .iter()
+                    .filter(|commitment| {
+                        matches!(
+                            commitment.id,
+                            CommitmentTreeId::Base | CommitmentTreeId::Interaction
+                        )
+                    })
+                    .map(|commitment| commitment.interpolation_batches.len())
+                    .sum(),
+            },
+        };
+        if input_telemetry != expected_input_telemetry {
+            return Err(ResidentRuntimeError::CommitModeMismatch);
+        }
 
         let oods = ResidentOodsPipeline::prepare(workspace)?;
 
@@ -1997,11 +2259,11 @@ impl<'a> ResidentGraphRuntime<'a> {
             witness_lane_levels,
             multiplicity,
             commitments,
-            base_interpolation,
+            base_commit_input,
             fixed_preprocessed_root,
             fixed_preprocessed_retained_layers,
             relation,
-            interaction_interpolation,
+            interaction_commit_input,
             interaction_claim_sources,
             composition,
             oods,
@@ -2243,6 +2505,13 @@ impl<'a> ResidentGraphRuntime<'a> {
 
     pub fn hot_path_telemetry(&self) -> CudaExecTelemetry {
         self.workspace.arena().context().telemetry()
+    }
+
+    /// Exact semantic launch ownership paired with the graph-derived kernel
+    /// node count used by the hot-path budget. Replacement-v1 must report zero
+    /// separately launched Base/Interaction interpolation graphs.
+    pub fn trace_commit_input_telemetry(&self) -> ResidentTraceCommitInputTelemetry {
+        trace_commit_input_telemetry(&self.base_commit_input, &self.interaction_commit_input)
     }
 
     pub fn require_hot_path_budget(
@@ -2514,7 +2783,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         let witness = &self.witness;
         let witness_lane_levels = &self.witness_lane_levels;
         let multiplicity = self.multiplicity.as_ref();
-        let interpolation = &self.base_interpolation;
+        let commit_input = &self.base_commit_input;
         let commitment = &self.commitments[commitment_index].1;
         let root_source = commitment.root_slice();
         let transcript = &self.transcript;
@@ -2557,9 +2826,12 @@ impl<'a> ResidentGraphRuntime<'a> {
                         fixed.launch().map_err(ResidentLaunchError::FixedTable)?;
                     }
                 }
-                interpolation
-                    .launch()
-                    .map_err(ResidentLaunchError::Interpolation)?;
+                match commit_input {
+                    PreparedTraceCommitInput::Interpolate(interpolation) => interpolation
+                        .launch()
+                        .map_err(ResidentLaunchError::Interpolation)?,
+                    PreparedTraceCommitInput::DirectEvaluations => {}
+                }
                 commitment.launch()?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
                 transcript
@@ -2606,7 +2878,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         let root_destination = self.transcript_input(CairoTranscriptInput::InteractionRoot)?;
         let claim_sources = &self.interaction_claim_sources;
         let relation = &self.relation;
-        let interpolation = &self.interaction_interpolation;
+        let commit_input = &self.interaction_commit_input;
         let commitment = &self.commitments[commitment_index].1;
         let root_source = commitment.root_slice();
         let transcript = &self.transcript;
@@ -2620,9 +2892,12 @@ impl<'a> ResidentGraphRuntime<'a> {
                 relation
                     .launch_with_modes(relation_launch_mode, relation_tail_mode)
                     .map_err(ResidentLaunchError::Relation)?;
-                interpolation
-                    .launch()
-                    .map_err(ResidentLaunchError::Interpolation)?;
+                match commit_input {
+                    PreparedTraceCommitInput::Interpolate(interpolation) => interpolation
+                        .launch()
+                        .map_err(ResidentLaunchError::Interpolation)?,
+                    PreparedTraceCommitInput::DirectEvaluations => {}
+                }
                 commitment.launch()?;
                 enqueue_claimed_sums(arena, claim_sources, claim_destination)?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
@@ -3500,7 +3775,10 @@ impl<'a> ResidentGraphRuntime<'a> {
                 fixed.launch()?;
             }
         }
-        self.base_interpolation.launch()?;
+        match &self.base_commit_input {
+            PreparedTraceCommitInput::Interpolate(interpolation) => interpolation.launch()?,
+            PreparedTraceCommitInput::DirectEvaluations => {}
+        }
         self.commitment(CommitmentTreeId::Base)?.launch()?;
         self.stage_commitment_root_for_transcript(
             CommitmentTreeId::Base,
@@ -3525,7 +3803,10 @@ impl<'a> ResidentGraphRuntime<'a> {
             self.workspace.plan().relation().launch_mode,
             identity.relation_tail_mode,
         )?;
-        self.interaction_interpolation.launch()?;
+        match &self.interaction_commit_input {
+            PreparedTraceCommitInput::Interpolate(interpolation) => interpolation.launch()?,
+            PreparedTraceCommitInput::DirectEvaluations => {}
+        }
         self.commitment(CommitmentTreeId::Interaction)?.launch()?;
         self.stage_interaction_claim_for_transcript()?;
         self.stage_commitment_root_for_transcript(
@@ -4659,6 +4940,69 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn direct_retained_outputs_require_exact_count_identity_extent_and_order() {
+        let first = (1u32, 0x1000usize, 8usize);
+        let second = (2u32, 0x2000usize, 16usize);
+        let actual = vec![Some(first), Some(second)];
+        let planned = vec![Some(vec![first]), Some(vec![second])];
+        assert!(canonical_output_order_matches(
+            &actual,
+            &planned,
+            |actual, planned| actual == planned
+        ));
+
+        for drifted in [
+            vec![Some(first)],
+            vec![Some(second), Some(first)],
+            vec![Some((9, first.1, first.2)), Some(second)],
+            vec![Some((first.0, 0x3000, first.2)), Some(second)],
+            vec![Some((first.0, first.1, 9)), Some(second)],
+            vec![None, Some(second)],
+        ] {
+            assert!(!canonical_output_order_matches(
+                &drifted,
+                &planned,
+                |actual, planned| actual == planned
+            ));
+        }
+        assert!(!canonical_output_order_matches(
+            &actual,
+            &[Some(vec![first]), None],
+            |actual, planned| actual == planned
+        ));
+    }
+
+    #[test]
+    fn trace_commit_telemetry_makes_interpolation_retirement_explicit() {
+        assert_eq!(
+            trace_commit_input_telemetry_from_modes(
+                TraceCommitInputMode::DirectEvaluations,
+                TraceCommitInputMode::DirectEvaluations,
+                0,
+                0,
+            ),
+            ResidentTraceCommitInputTelemetry {
+                direct_commitments: 2,
+                separate_interpolation_graph_invocations: 0,
+                separate_interpolation_kernel_launches: 0,
+            }
+        );
+        assert_eq!(
+            trace_commit_input_telemetry_from_modes(
+                TraceCommitInputMode::Interpolate,
+                TraceCommitInputMode::Interpolate,
+                18,
+                18,
+            ),
+            ResidentTraceCommitInputTelemetry {
+                direct_commitments: 0,
+                separate_interpolation_graph_invocations: 2,
+                separate_interpolation_kernel_launches: 36,
+            }
+        );
     }
 
     #[test]

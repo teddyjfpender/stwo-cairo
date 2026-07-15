@@ -17,9 +17,9 @@ use stwo_backend_cuda::jit_witness::isa::WitnessProgram;
 use stwo_backend_cuda::{
     blake2s_pow_workspace_requirements, blake_g_fusion_program_is_exact,
     commit_workspace_requirements, compact_domain_arena_slot_requirements,
-    decommit_workspace_requirements, ec_op_workspace_requirements,
-    execution_tables_workspace_requirements, fri_final_workspace_requirements,
-    fri_workspace_requirements, oods_workspace_requirements,
+    decommit_workspace_requirements, direct_compact_domain_arena_slot_requirements,
+    ec_op_workspace_requirements, execution_tables_workspace_requirements,
+    fri_final_workspace_requirements, fri_workspace_requirements, oods_workspace_requirements,
     progressive_commit_workspace_requirements_for_mode, quotient_numerator_hybrid_plan,
     quotient_numerator_staged_single_write_plan_with_overflow_capacities,
     quotient_numerator_workspace_requirements, quotient_workspace_requirements,
@@ -33,6 +33,7 @@ use stwo_backend_cuda::{
     CompactDomainProgramError, CudaExecContext, DecommitColumnGeometry, DecommitSourceMode,
     DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots, DecommitWorkspaceConfig,
     DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena, DeviceTranscriptError,
+    DirectCompactDomainBindingError, DirectRetainedB2nError, DirectRetainedB2nProgram,
     DomainCooperativeProgram, DomainCooperativeProgramError, EcOpMultiplicityGeometry,
     EcOpWorkspaceRequirements, EcOpWorkspaceSlots, ExecutionTablesWorkspaceRequirements,
     ExecutionTablesWorkspaceSlots, FixedTableContiguousWorkspaceSlots, FriDecommitGeometry,
@@ -2497,6 +2498,7 @@ struct LogicalCommitWorkspace {
     commit_program: Option<CommitProgram>,
     domain_cooperative_program: Option<DomainCooperativeProgram>,
     compact_domain_program: Option<CompactDomainProgram>,
+    direct_retained_b2n_program: Option<DirectRetainedB2nProgram>,
     interpolation_mode: InterpolationLaunchMode,
     config: CommitWorkspaceConfig,
     grouped_column_log_sizes: Vec<Vec<u32>>,
@@ -3282,6 +3284,9 @@ pub struct PlannedCommitment {
     pub commit_program: Option<CommitProgram>,
     pub domain_cooperative_program: Option<DomainCooperativeProgram>,
     pub compact_domain_program: Option<CompactDomainProgram>,
+    /// Replacement-v1 Base/Interaction one-owner evaluation-to-LDE program.
+    /// `None` for Preprocessed, Composition, and every legacy commitment.
+    pub direct_retained_b2n_program: Option<DirectRetainedB2nProgram>,
     pub config: CommitWorkspaceConfig,
     pub grouped_column_log_sizes: Vec<Vec<u32>>,
     pub grouped_column_sources: Vec<Vec<CommitmentColumnSource>>,
@@ -4159,6 +4164,19 @@ pub enum ArenaPlanError {
     DomainCooperativeProgram(DomainCooperativeProgramError),
     CompactDomainProgram(CompactDomainProgramError),
     CompactDomainBinding(CompactDomainBindingError),
+    DirectRetainedB2n(DirectRetainedB2nError),
+    DirectCompactDomainBinding(DirectCompactDomainBindingError),
+    DirectCommitCoefficientReaders {
+        tree: CommitmentTreeId,
+        sources: usize,
+        missing_ownership: usize,
+        composition: usize,
+        oods: usize,
+        quotient: usize,
+        decommit: usize,
+        final_consumer_mismatch: usize,
+        first_blocker: OpenedColumnSource,
+    },
     Composition(PreparedCompositionError),
     Oods(PreparedOodsError),
     QuotientNumerator(PreparedQuotientNumeratorError),
@@ -6754,6 +6772,89 @@ fn dynamic_commitment_leaf_program(
     }
 }
 
+fn direct_retained_b2n_program(
+    backend: ResidentBackend,
+    geometry: &CommitmentGeometry,
+    base: Option<&CommitProgram>,
+    compact: Option<&CompactDomainProgram>,
+    ownership: &LateCoefficientOwnershipPlan,
+) -> Result<Option<DirectRetainedB2nProgram>, ArenaPlanError> {
+    if backend != ResidentBackend::ReplacementV1 {
+        return Ok(None);
+    }
+    let (role, commit_epoch) = match geometry.id {
+        CommitmentTreeId::Base => (TraceTreeRole::Base, ProofEpoch::BaseCommit),
+        CommitmentTreeId::Interaction => {
+            (TraceTreeRole::Interaction, ProofEpoch::InteractionCommit)
+        }
+        CommitmentTreeId::Preprocessed | CommitmentTreeId::Composition => return Ok(None),
+        CommitmentTreeId::Fri(_) => {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "dynamic direct commitment cannot target an FRI tree",
+            ))
+        }
+    };
+    if geometry.created != commit_epoch || compact.is_none() {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "replacement direct commitment requires its exact compact commit epoch",
+        ));
+    }
+
+    let sources = geometry
+        .grouped_column_sources
+        .iter()
+        .flatten()
+        .copied()
+        .map(OpenedColumnSource::from)
+        .collect::<Vec<_>>();
+    let mut missing_ownership = 0usize;
+    let mut composition = 0usize;
+    let mut oods = 0usize;
+    let mut quotient = 0usize;
+    let mut decommit = 0usize;
+    let mut final_consumer_mismatch = 0usize;
+    let mut first_blocker = None;
+    for source in sources.iter().copied() {
+        let Some(entry) = ownership.get(source) else {
+            missing_ownership += 1;
+            first_blocker.get_or_insert(source);
+            continue;
+        };
+        composition += usize::from(entry.composition_reads_coefficients);
+        oods += usize::from(entry.oods_reads_coefficients);
+        quotient += usize::from(entry.quotient_reads_coefficients);
+        decommit += usize::from(entry.decommit_reads_coefficients);
+        final_consumer_mismatch += usize::from(entry.final_consumer != commit_epoch);
+        if entry.composition_reads_coefficients
+            || entry.oods_reads_coefficients
+            || entry.quotient_reads_coefficients
+            || entry.decommit_reads_coefficients
+            || entry.final_consumer != commit_epoch
+        {
+            first_blocker.get_or_insert(source);
+        }
+    }
+    if let Some(first_blocker) = first_blocker {
+        return Err(ArenaPlanError::DirectCommitCoefficientReaders {
+            tree: geometry.id,
+            sources: sources.len(),
+            missing_ownership,
+            composition,
+            oods,
+            quotient,
+            decommit,
+            final_consumer_mismatch,
+            first_blocker,
+        });
+    }
+    let base = base.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+        "replacement direct commitment is missing its base program",
+    ))?;
+    DirectRetainedB2nProgram::compile(role, base)
+        .map(Some)
+        .map_err(ArenaPlanError::DirectRetainedB2n)
+}
+
 fn append_protocol_buffers(
     logical: &mut Vec<LogicalBuffer>,
     released_commitment_aliases: &mut Vec<ReleasedCommitmentAlias>,
@@ -7064,6 +7165,13 @@ fn append_protocol_buffers(
             geometry.id,
             commit_program.as_ref(),
         )?;
+        let direct_retained_b2n_program = direct_retained_b2n_program(
+            protocol.identity.resident_backend,
+            geometry,
+            commit_program.as_ref(),
+            compact_domain_program.as_ref(),
+            late_coefficient_ownership,
+        )?;
         let in_place_slab = match (&requirements, storage_mode) {
             (
                 ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
@@ -7345,46 +7453,50 @@ fn append_protocol_buffers(
                 }
             }
         };
-        let interpolation_batches =
-            interpolation_batch_geometry(geometry, protocol.identity.interpolation_mode)?
-                .into_iter()
-                .map(|(log_size, sources)| {
-                    let pointer_words = sources
-                        .len()
-                        .checked_mul(
-                            core::mem::size_of::<usize>().div_ceil(core::mem::size_of::<u32>()),
-                        )
-                        .ok_or(ArenaPlanError::SizeOverflow)?;
-                    Ok(LogicalInterpolationBatch {
-                        log_size,
-                        sources,
-                        input_pointers: push_buffer_id(
-                            logical,
-                            None,
-                            None,
-                            BufferPurpose::InterpolationInputPointers,
-                            ordinal()?,
-                            pointer_words,
-                            descriptor,
-                        )?,
-                        output_pointers: push_buffer_id(
-                            logical,
-                            None,
-                            None,
-                            BufferPurpose::InterpolationOutputPointers,
-                            ordinal()?,
-                            pointer_words,
-                            descriptor,
-                        )?,
-                    })
+        let interpolation_batches = direct_retained_b2n_program
+            .is_none()
+            .then(|| interpolation_batch_geometry(geometry, protocol.identity.interpolation_mode))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(log_size, sources)| {
+                let pointer_words = sources
+                    .len()
+                    .checked_mul(
+                        core::mem::size_of::<usize>().div_ceil(core::mem::size_of::<u32>()),
+                    )
+                    .ok_or(ArenaPlanError::SizeOverflow)?;
+                Ok(LogicalInterpolationBatch {
+                    log_size,
+                    sources,
+                    input_pointers: push_buffer_id(
+                        logical,
+                        None,
+                        None,
+                        BufferPurpose::InterpolationInputPointers,
+                        ordinal()?,
+                        pointer_words,
+                        descriptor,
+                    )?,
+                    output_pointers: push_buffer_id(
+                        logical,
+                        None,
+                        None,
+                        BufferPurpose::InterpolationOutputPointers,
+                        ordinal()?,
+                        pointer_words,
+                        descriptor,
+                    )?,
                 })
-                .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+            })
+            .collect::<Result<Vec<_>, ArenaPlanError>>()?;
         logical_commitments.push(LogicalCommitWorkspace {
             id: geometry.id,
             storage_mode,
             commit_program,
             domain_cooperative_program,
             compact_domain_program,
+            direct_retained_b2n_program,
             interpolation_mode: protocol.identity.interpolation_mode,
             config: geometry.config,
             grouped_column_log_sizes: geometry.grouped_column_log_sizes.clone(),
@@ -8814,8 +8926,15 @@ fn resolve_commitment_slots(
                         "compact commitment is missing its domain program",
                     ),
                 )?;
-                compact_domain_arena_slot_requirements(compact, base, domain, slots)
-                    .map_err(ArenaPlanError::CompactDomainBinding)?;
+                if let Some(direct) = logical.direct_retained_b2n_program.as_ref() {
+                    direct_compact_domain_arena_slot_requirements(
+                        compact, base, domain, direct, slots,
+                    )
+                    .map_err(ArenaPlanError::DirectCompactDomainBinding)?;
+                } else {
+                    compact_domain_arena_slot_requirements(compact, base, domain, slots)
+                        .map_err(ArenaPlanError::CompactDomainBinding)?;
+                }
             } else {
                 requirements
                     .arena_slot_requirements_in_place(slots)
@@ -8834,6 +8953,7 @@ fn resolve_commitment_slots(
         commit_program: logical.commit_program,
         domain_cooperative_program: logical.domain_cooperative_program,
         compact_domain_program: logical.compact_domain_program,
+        direct_retained_b2n_program: logical.direct_retained_b2n_program,
         config: logical.config,
         grouped_column_log_sizes: logical.grouped_column_log_sizes,
         grouped_column_sources: logical.grouped_column_sources,

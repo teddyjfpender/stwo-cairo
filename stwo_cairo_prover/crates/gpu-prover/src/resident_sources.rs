@@ -33,8 +33,8 @@ use stwo_cairo_prover::witness::relation_sources::{
 };
 
 use crate::arena_plan::{
-    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, DynamicCommitmentLeafSchedule,
-    PlannedCommitment, ResidentBackend,
+    BufferLifetime, BufferPurpose, CommitmentColumnSource, CommitmentTreeId,
+    DynamicCommitmentLeafSchedule, PlannedCommitment, ResidentBackend,
 };
 use crate::fixed_table_materializer::{
     pedersen_points_18_column_index, PEDERSEN_POINTS_18_COLUMN_COUNT, PEDERSEN_POINTS_18_LOG_SIZE,
@@ -189,6 +189,22 @@ pub enum ResidentSourceStageError {
         expected_words: usize,
         actual_words: usize,
     },
+    DirectCommitmentShapeMismatch(CommitmentTreeId),
+    DirectCommitmentSourceLifetime {
+        tree: CommitmentTreeId,
+        source: CommitmentColumnSource,
+        evaluations: BufferLifetime,
+        coefficients: BufferLifetime,
+    },
+    DirectCommitmentSourceOutputAlias {
+        tree: CommitmentTreeId,
+        source: CommitmentColumnSource,
+    },
+    DirectTwiddlePurposeMismatch {
+        tree: CommitmentTreeId,
+        purpose: BufferPurpose,
+    },
+    DirectTwiddleAlias(CommitmentTreeId),
     TwiddleSourceSizeMismatch {
         purpose: BufferPurpose,
         expected_words: usize,
