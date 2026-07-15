@@ -39,19 +39,20 @@ use crate::memory_ledger::{AllocatorPoolCheckpoint, PhysicalMemoryInputs};
 use crate::plan::{ProofPlan, ProofPlanError};
 use crate::protocol_discovery::{ProtocolDiscoveryError, ProtocolTranscriptDiscovery};
 use crate::protocol_plan::{ProtocolPlanError, ProtocolPlanPolicy};
-use crate::replacement_host_cache::{
-    ReplacementHostCacheProofAudit, ReplacementHostMaterialization, ReplacementHostTemplate,
-};
 use crate::recorded_witness_inputs::{
     recorded_witness_inputs_for_plan, recorded_witness_inputs_for_raw_replacement_plan,
     DeviceCasmColumn, DeviceCompactColumn, DeviceEdgeColumn, DeviceEdgeSourceKind,
     DeviceGatherColumn, DeviceNativeColumn, DeviceSeedColumn, PlannedRecordedWitnessInputs,
     RecordedInputColumnProvenance, RecordedWitnessPlanError,
 };
+use crate::replacement_host_cache::{
+    ReplacementHostCacheProofAudit, ReplacementHostMaterialization, ReplacementHostTemplate,
+};
 use crate::resident_input::ResidentProverInputOwner;
 use crate::resident_runtime::{
-    ResidentGraphRuntime, ResidentRuntimeError, ResidentWitnessIngestReport, ResidentWitnessInput,
-    ResidentWitnessInputColumn, ResidentWorkspaceIdentity, SealedResidentExecutionConfig,
+    ResidentGraphRuntime, ResidentRuntimeError, ResidentTraceCommitInputTelemetry,
+    ResidentWitnessIngestReport, ResidentWitnessInput, ResidentWitnessInputColumn,
+    ResidentWorkspaceIdentity, SealedResidentExecutionConfig,
 };
 use crate::resident_sources::{
     inspect_base_trace_residency, stage_base_trace_coefficients, stage_preprocessed_commitment,
@@ -129,12 +130,12 @@ impl ResidentPreWitnessInput {
 
     fn exact_plan(&self) -> Result<Arc<ProofPlan>, ResidentSessionError> {
         match self {
-            Self::LegacyResident { capacity_plan, .. } => Ok(Arc::new(
-                capacity_plan.strict_resident_exact(
+            Self::LegacyResident { capacity_plan, .. } => {
+                Ok(Arc::new(capacity_plan.strict_resident_exact(
                     &crate::schedule_table::CAIRO_SCHEDULE,
                     &crate::relation_table::CAIRO_RELATION_GRAPH,
-                )?,
-            )),
+                )?))
+            }
             Self::ReplacementV1 { template, .. } => Ok(Arc::clone(template.exact_plan())),
         }
     }
@@ -263,6 +264,7 @@ pub struct ResidentSessionTelemetry {
     pub transcript_segments: usize,
     pub protocol_policy: Option<ProtocolPlanPolicy>,
     pub prepared_numerator_schedule: Option<PreparedNumeratorSchedule>,
+    pub trace_commit_inputs: Option<ResidentTraceCommitInputTelemetry>,
     pub base: ResidentSourceStageReport,
     pub twiddles: ResidentTwiddleStageReport,
     pub preprocessed: ResidentPreprocessedStageReport,
@@ -369,6 +371,17 @@ impl ResidentSessionTelemetry {
             ));
         }
         if policy.resident_backend == ResidentBackend::ReplacementV1 {
+            if self.trace_commit_inputs
+                != Some(ResidentTraceCommitInputTelemetry {
+                    direct_commitments: 2,
+                    separate_interpolation_graph_invocations: 0,
+                    separate_interpolation_kernel_launches: 0,
+                })
+            {
+                return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement trace commits did not report the exact direct-input contract",
+                ));
+            }
             let audit =
                 self.host_preparation
                     .ok_or(ResidentSessionError::StrictArchitectureTelemetry(
@@ -747,6 +760,7 @@ fn run_materialized_session<R>(
         transcript_segments: executable.transcript().segments().len(),
         protocol_policy: Some(executable.protocol_policy()),
         prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
+        trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
         base,
         twiddles: ResidentTwiddleStageReport::default(),
         preprocessed,
@@ -1492,6 +1506,7 @@ pub fn with_resident_pre_witness_session<R>(
             transcript_segments: executable.transcript().segments().len(),
             protocol_policy: Some(executable.protocol_policy()),
             prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
+            trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
             base: ResidentSourceStageReport::default(),
             twiddles: twiddle_report,
             preprocessed,
@@ -2517,11 +2532,11 @@ mod tests {
 
         let mut failures = Vec::new();
         let check_slot = |failures: &mut Vec<String>,
-                              component: &str,
-                              kind: &str,
-                              label: String,
-                              id: ArenaSlotId,
-                              required: usize| {
+                          component: &str,
+                          kind: &str,
+                          label: String,
+                          id: ArenaSlotId,
+                          required: usize| {
             match arena.layout().slot(id) {
                 None => failures.push(format!(
                     "{component} {kind} {label}: slot {id:?} missing from the arena layout"
@@ -2865,6 +2880,11 @@ mod tests {
             prepared_numerator_schedule: Some(PreparedNumeratorSchedule::StagedPackedSingleWrite {
                 packed_output_rows: 1,
             }),
+            trace_commit_inputs: Some(ResidentTraceCommitInputTelemetry {
+                direct_commitments: 2,
+                separate_interpolation_graph_invocations: 0,
+                separate_interpolation_kernel_launches: 0,
+            }),
             execution_tables_ingest: Some(PreparedExecutionTablesIngestTelemetry {
                 compact_h2d_bytes: 0,
                 compact_h2d_copies: 0,
@@ -2875,6 +2895,29 @@ mod tests {
             ..ResidentSessionTelemetry::default()
         };
         assert!(valid.require_strict_graph_a().is_ok());
+
+        for trace_commit_inputs in [
+            None,
+            Some(ResidentTraceCommitInputTelemetry {
+                direct_commitments: 1,
+                separate_interpolation_graph_invocations: 0,
+                separate_interpolation_kernel_launches: 0,
+            }),
+            Some(ResidentTraceCommitInputTelemetry {
+                direct_commitments: 2,
+                separate_interpolation_graph_invocations: 1,
+                separate_interpolation_kernel_launches: 0,
+            }),
+            Some(ResidentTraceCommitInputTelemetry {
+                direct_commitments: 2,
+                separate_interpolation_graph_invocations: 0,
+                separate_interpolation_kernel_launches: 1,
+            }),
+        ] {
+            let mut drifted = valid.clone();
+            drifted.trace_commit_inputs = trace_commit_inputs;
+            assert!(drifted.require_strict_graph_a().is_err());
+        }
 
         let mut wrong_schedule = valid.clone();
         wrong_schedule.prepared_numerator_schedule = Some(PreparedNumeratorSchedule::LegacyBatches);
