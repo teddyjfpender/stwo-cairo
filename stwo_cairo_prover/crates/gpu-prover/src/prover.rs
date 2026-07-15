@@ -57,6 +57,9 @@ use crate::arena_plan::ResidentBackend;
 use crate::graphs::{GraphError, GraphWorkspace};
 use crate::protocol_discovery::interaction_claim_from_flattened;
 use crate::protocol_plan::ProtocolPlanPolicy;
+use crate::replacement_host_cache::{
+    ReplacementHostCache, ReplacementHostCacheError, ReplacementHostCacheTelemetry,
+};
 use crate::resident_runtime::{
     ResidentGraphRuntime, ResidentHotPathBudget, ResidentRuntimeError,
     SealedResidentExecutionConfig,
@@ -71,7 +74,7 @@ use crate::resident_shape::RawResidentShapeError;
 use crate::schedule::ScheduleError;
 use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::shape_executable::{ShapeExecutable, ShapeExecutableCache};
-use crate::state::{IngestOutput, ReplacementIngestOutput, WitnessOutput};
+use crate::state::{IngestOutput, WitnessOutput};
 use crate::workspace_cache::{
     WorkspaceCache, WorkspaceCacheError, WorkspaceKey, WorkspaceMaterialization,
 };
@@ -159,6 +162,7 @@ pub enum GpuError {
     WorkspaceCache(WorkspaceCacheError),
     ResidentSession(ResidentSessionError),
     RawResidentShape(RawResidentShapeError),
+    ReplacementHostCache(ReplacementHostCacheError),
     ProofAssembly(Blake2sProofAssemblyError),
 }
 
@@ -401,6 +405,12 @@ impl From<RawResidentShapeError> for GpuError {
     }
 }
 
+impl From<ReplacementHostCacheError> for GpuError {
+    fn from(e: ReplacementHostCacheError) -> Self {
+        GpuError::ReplacementHostCache(e)
+    }
+}
+
 impl From<Blake2sProofAssemblyError> for GpuError {
     fn from(e: Blake2sProofAssemblyError) -> Self {
         GpuError::ProofAssembly(e)
@@ -419,6 +429,9 @@ impl std::fmt::Display for GpuError {
             GpuError::WorkspaceCache(e) => write!(f, "gpu-prover workspace cache error: {e}"),
             GpuError::ResidentSession(e) => write!(f, "gpu-prover resident session error: {e}"),
             GpuError::RawResidentShape(e) => write!(f, "gpu-prover raw resident shape error: {e}"),
+            GpuError::ReplacementHostCache(e) => {
+                write!(f, "gpu-prover replacement host cache error: {e}")
+            }
             GpuError::ProofAssembly(e) => write!(f, "gpu-prover proof assembly error: {e}"),
         }
     }
@@ -643,6 +656,9 @@ where
     /// Persistent typed host executable cache. Workspace reuse is admitted
     /// only when this cache supplies the exact topology and arena identity.
     shape_executable_cache: ShapeExecutableCache,
+    /// Replacement-only immutable plan/claim/lane cache. LegacyResident never
+    /// constructs or consults it.
+    replacement_host_cache: Option<ReplacementHostCache>,
     /// Architecture proof that the last successful gpu-native call used the
     /// concrete CUDA PCS state machine and completed every stage exactly once.
     last_pcs_telemetry: Option<CudaPcsDriverTelemetry>,
@@ -670,6 +686,7 @@ struct PendingGpuCairoProver {
     resident_execution_config: SealedResidentExecutionConfig,
     workspace_cache: WorkspaceCache,
     shape_executable_cache: ShapeExecutableCache,
+    replacement_host_cache: Option<ReplacementHostCache>,
     resident_protocol_policy: Option<ProtocolPlanPolicy>,
     witness_artifact_plan: Arc<WitnessArtifactPlan>,
 }
@@ -686,12 +703,14 @@ pub(crate) struct PreparedResidentIngest {
 /// `CairoClaimGenerator`.
 pub(crate) fn prepare_resident_ingest(
     backend: ResidentBackend,
+    replacement_host_cache: Option<&mut ReplacementHostCache>,
     input: ProverInput,
     variant: stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant,
     opt_n_id_to_big_components: Option<usize>,
 ) -> Result<PreparedResidentIngest, GpuError> {
     let start = Instant::now();
     let before = stwo_cairo_prover::witness::cairo::claim_generator_constructions();
+    let mut replacement_host_cache_audit = None;
     let (preprocessed_trace, input) = match backend {
         ResidentBackend::LegacyResident => {
             let IngestOutput {
@@ -708,16 +727,19 @@ pub(crate) fn prepare_resident_ingest(
             )
         }
         ResidentBackend::ReplacementV1 => {
-            let ReplacementIngestOutput {
-                preprocessed_trace,
-                input,
-                proof_plan,
-            } = phases::ingest::run_replacement(input, variant, opt_n_id_to_big_components)?;
+            let cache = replacement_host_cache.ok_or_else(|| {
+                GpuError::Config("ReplacementV1 host cache was not constructed".to_owned())
+            })?;
+            let input = phases::ingest::encode_replacement(input);
+            let selection =
+                cache.compile_or_bind(&input, variant, opt_n_id_to_big_components)?;
+            let preprocessed_trace = Arc::clone(selection.template.preprocessed_trace());
+            replacement_host_cache_audit = Some(selection.audit);
             (
                 preprocessed_trace,
                 ResidentPreWitnessInput::ReplacementV1 {
                     input,
-                    capacity_plan: proof_plan,
+                    template: selection.template,
                 },
             )
         }
@@ -735,6 +757,7 @@ pub(crate) fn prepare_resident_ingest(
         audit: ResidentIngressAudit {
             ingest_ns: start.elapsed().as_nanos(),
             claim_generator_constructions,
+            replacement_host_cache: replacement_host_cache_audit,
         },
     })
 }
@@ -756,6 +779,7 @@ impl PendingGpuCairoProver {
             resident_execution_config: self.resident_execution_config,
             workspace_cache: self.workspace_cache,
             shape_executable_cache: self.shape_executable_cache,
+            replacement_host_cache: self.replacement_host_cache,
             last_pcs_telemetry: None,
             last_resident_session_telemetry: None,
             resident_protocol_policy: self.resident_protocol_policy,
@@ -827,11 +851,15 @@ where
         let workspace_cache = WorkspaceCache::new(config.workspace_cache_capacity)?;
         let shape_executable_cache = ShapeExecutableCache::new(config.workspace_cache_capacity)
             .map_err(ResidentSessionError::from)?;
+        let replacement_host_cache = (config.resident_backend == ResidentBackend::ReplacementV1)
+            .then(|| ReplacementHostCache::new(config.workspace_cache_capacity))
+            .transpose()?;
         Ok(PendingGpuCairoProver {
             config,
             resident_execution_config,
             workspace_cache,
             shape_executable_cache,
+            replacement_host_cache,
             resident_protocol_policy,
             witness_artifact_plan,
         }
@@ -864,6 +892,12 @@ where
 
     pub fn shape_executable_cache(&self) -> &ShapeExecutableCache {
         &self.shape_executable_cache
+    }
+
+    pub fn replacement_host_cache_telemetry(&self) -> Option<ReplacementHostCacheTelemetry> {
+        self.replacement_host_cache
+            .as_ref()
+            .map(ReplacementHostCache::telemetry)
     }
 
     /// Compatibility view for the former single-workspace API. Multi-key
@@ -948,6 +982,7 @@ where
             audit,
         } = prepare_resident_ingest(
             self.config.resident_backend,
+            self.replacement_host_cache.as_mut(),
             input,
             params.preprocessed_trace,
             params.opt_n_id_to_big_components,

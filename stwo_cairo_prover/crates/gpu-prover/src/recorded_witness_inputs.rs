@@ -75,6 +75,10 @@ pub struct UnresolvedInputColumn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecordedInputColumnProvenance {
     Host(Vec<u32>),
+    /// Topology-only `row < n_real` tail. Unlike [`Self::Host`], these words
+    /// are immutable for an exact shape and may be shared by the warm host
+    /// template without retaining proof-varying statement data.
+    StructuralEnabler(Arc<[u32]>),
     DeviceCasm(DeviceCasmColumn),
     DeviceNative(DeviceNativeColumn),
     DeviceSeed(DeviceSeedColumn),
@@ -146,6 +150,156 @@ pub struct PlannedRecordedWitnessInputs {
     pub lanes: Vec<PlannedRecordedWitnessInput>,
 }
 
+/// Immutable ReplacementV1 lane recipe cached across proofs with the same raw
+/// topology. Proof-owned memory identities and builtin segment starts are
+/// deliberately absent and must be rebound for every proof.
+#[derive(Clone, Debug)]
+pub struct RawRecordedWitnessTemplate {
+    lanes: Vec<RawRecordedWitnessLaneTemplate>,
+}
+
+#[derive(Clone, Debug)]
+struct RawRecordedWitnessLaneTemplate {
+    component: ComponentId,
+    program: Arc<stwo_backend_cuda::jit_witness::isa::WitnessProgram>,
+    row_count: usize,
+    n_real: usize,
+    columns: Vec<RawRecordedInputColumnTemplate>,
+    host_pedersen_points_18: bool,
+}
+
+#[derive(Clone, Debug)]
+enum RawRecordedInputColumnTemplate {
+    Static(RecordedInputColumnProvenance),
+    SeedScalar { index: usize },
+}
+
+impl RawRecordedWitnessTemplate {
+    pub fn compile(
+        owner: &ResidentProverInputOwner,
+        proof_plan: &ProofPlan,
+    ) -> Result<Self, RecordedWitnessPlanError> {
+        let planned = recorded_witness_inputs_for_raw_replacement_plan(owner, proof_plan)?;
+        planned.require_resolved()?;
+        let lanes = planned
+            .lanes
+            .into_iter()
+            .map(|lane| {
+                let columns = lane
+                    .columns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ordinal, column)| -> Result<_, RecordedWitnessPlanError> {
+                        match column {
+                            RecordedInputColumnProvenance::Host(words) => {
+                                validate_structural_enabler(
+                                    lane.component,
+                                    ordinal,
+                                    lane.n_real,
+                                    lane.row_count,
+                                    &words,
+                                )?;
+                                Ok(RawRecordedInputColumnTemplate::Static(
+                                    RecordedInputColumnProvenance::StructuralEnabler(Arc::from(
+                                        words,
+                                    )),
+                                ))
+                            }
+                            RecordedInputColumnProvenance::StructuralEnabler(words) => {
+                                validate_structural_enabler(
+                                    lane.component,
+                                    ordinal,
+                                    lane.n_real,
+                                    lane.row_count,
+                                    &words,
+                                )?;
+                                Ok(RawRecordedInputColumnTemplate::Static(
+                                    RecordedInputColumnProvenance::StructuralEnabler(words),
+                                ))
+                            }
+                            RecordedInputColumnProvenance::DeviceSeed(
+                                DeviceSeedColumn::Scalar { index, .. },
+                            ) => Ok(RawRecordedInputColumnTemplate::SeedScalar { index }),
+                            column => Ok(RawRecordedInputColumnTemplate::Static(column)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(RawRecordedWitnessLaneTemplate {
+                    component: lane.component,
+                    program: lane.program,
+                    row_count: lane.row_count,
+                    n_real: lane.n_real,
+                    columns,
+                    host_pedersen_points_18: lane.tables.host_pedersen_points_18,
+                })
+            })
+            .collect::<Result<Vec<_>, RecordedWitnessPlanError>>()?;
+        Ok(Self { lanes })
+    }
+
+    pub fn lane_count(&self) -> usize {
+        self.lanes.len()
+    }
+
+    /// Bind only proof-varying values. This always takes the current owner's
+    /// memory Arc and recomputes its pointer identity; no cached statement data
+    /// can reach execution or transcript staging.
+    pub fn bind(
+        &self,
+        owner: &ResidentProverInputOwner,
+    ) -> Result<PlannedRecordedWitnessInputs, RecordedWitnessPlanError> {
+        let execution_memory = Arc::clone(owner.execution_memory());
+        let execution_memory_identity = ExecutionMemoryIdentity::of(&execution_memory);
+        let lanes = self
+            .lanes
+            .iter()
+            .map(|lane| {
+                validate_cached_lane_geometry(owner, lane)?;
+                let seed = lane
+                    .columns
+                    .iter()
+                    .any(|column| {
+                        matches!(column, RawRecordedInputColumnTemplate::SeedScalar { .. })
+                    })
+                    .then(|| cached_seed_value(owner, lane.component))
+                    .transpose()?;
+                let columns = lane
+                    .columns
+                    .iter()
+                    .map(|column| match column {
+                        RawRecordedInputColumnTemplate::Static(column) => Ok(column.clone()),
+                        RawRecordedInputColumnTemplate::SeedScalar { index } => Ok(
+                            RecordedInputColumnProvenance::DeviceSeed(DeviceSeedColumn::Scalar {
+                                index: *index,
+                                value: seed.ok_or(RecordedWitnessPlanError::MissingDeviceSeed(
+                                    lane.component,
+                                ))?,
+                            }),
+                        ),
+                    })
+                    .collect::<Result<Vec<_>, RecordedWitnessPlanError>>()?;
+                Ok(PlannedRecordedWitnessInput {
+                    component: lane.component,
+                    program: Arc::clone(&lane.program),
+                    row_count: lane.row_count,
+                    n_real: lane.n_real,
+                    columns,
+                    tables: RecordedTableIdentity {
+                        execution_memory: execution_memory_identity,
+                        host_pedersen_points_18: lane.host_pedersen_points_18,
+                    },
+                    host_build_error: None,
+                })
+            })
+            .collect::<Result<Vec<_>, RecordedWitnessPlanError>>()?;
+        Ok(PlannedRecordedWitnessInputs {
+            execution_memory,
+            execution_memory_identity,
+            lanes,
+        })
+    }
+}
+
 impl PlannedRecordedWitnessInputs {
     pub fn unresolved_columns(&self) -> Vec<(ComponentId, usize)> {
         self.lanes
@@ -188,6 +342,10 @@ pub enum RecordedWitnessPlanError {
     InputBuild {
         component: ComponentId,
         source: RecordedInputBuildError,
+    },
+    CachedHostColumn {
+        component: ComponentId,
+        ordinal: usize,
     },
     MissingInputGeometry(ComponentId),
     MissingDeviceSeed(ComponentId),
@@ -369,6 +527,58 @@ fn stored_builtin_rows(
         return Err(RecordedWitnessPlanError::MissingDeviceSeed(component));
     }
     Ok(rows)
+}
+
+fn cached_seed_value(
+    owner: &ResidentProverInputOwner,
+    component: ComponentId,
+) -> Result<u32, RecordedWitnessPlanError> {
+    let segment = owner
+        .builtin_segments()
+        .get_segment_by_name(component)
+        .ok_or(RecordedWitnessPlanError::MissingDeviceSeed(component))?;
+    u32::try_from(segment.begin_addr).map_err(|_| RecordedWitnessPlanError::SizeOverflow(component))
+}
+
+fn validate_cached_lane_geometry(
+    owner: &ResidentProverInputOwner,
+    lane: &RawRecordedWitnessLaneTemplate,
+) -> Result<(), RecordedWitnessPlanError> {
+    let expected = ExpectedLane {
+        node: crate::schedule_table::CAIRO_SCHEDULE
+            .nodes
+            .iter()
+            .find(|node| node.id == lane.component)
+            .ok_or(RecordedWitnessPlanError::MissingInputGeometry(
+                lane.component,
+            ))?,
+        n_real: lane.n_real,
+        row_count: lane.row_count,
+    };
+    if let Some(casm) = owner.casm_input(lane.component) {
+        let actual_padded = match stwo_backend_cuda::witness_casm_input_requirements(
+            casm.states.len(),
+            casm.descriptor.include_iota,
+        ) {
+            Ok(requirements) => requirements.consumer_rows,
+            Err(stwo_backend_cuda::PreparedWitnessCasmInputError::NoRows) => 0,
+            Err(_) => return Err(RecordedWitnessPlanError::SizeOverflow(lane.component)),
+        };
+        return require_row_geometry(&expected, casm.states.len(), actual_padded);
+    }
+    if lane
+        .columns
+        .iter()
+        .any(|column| matches!(column, RawRecordedInputColumnTemplate::SeedScalar { .. }))
+    {
+        let segment = owner
+            .builtin_segments()
+            .get_segment_by_name(lane.component)
+            .ok_or(RecordedWitnessPlanError::MissingDeviceSeed(lane.component))?;
+        let rows = stored_builtin_rows(lane.component, segment)?;
+        require_row_geometry(&expected, rows, rows)?;
+    }
+    Ok(())
 }
 
 fn expected_recorded_lanes(
@@ -794,6 +1004,27 @@ fn provenance_for_unmaterialized(
     Ok(columns)
 }
 
+fn validate_structural_enabler(
+    component: ComponentId,
+    ordinal: usize,
+    n_real: usize,
+    row_count: usize,
+    words: &[u32],
+) -> Result<(), RecordedWitnessPlanError> {
+    let geometry = recorded_input_geometry(component)
+        .ok_or(RecordedWitnessPlanError::MissingInputGeometry(component))?;
+    if geometry.enabler_slot != Some(ordinal)
+        || words.len() != row_count
+        || words
+            .iter()
+            .enumerate()
+            .any(|(row, &value)| value != u32::from(row < n_real))
+    {
+        return Err(RecordedWitnessPlanError::CachedHostColumn { component, ordinal });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use stwo_cairo_adapter::memory::{EncodedMemoryValueId, MemoryConfig};
@@ -921,6 +1152,7 @@ mod tests {
             assert!(columns.iter().all(|source| !matches!(
                 source,
                 RecordedInputColumnProvenance::Host(_)
+                    | RecordedInputColumnProvenance::StructuralEnabler(_)
                     | RecordedInputColumnProvenance::Unresolved(_)
             )));
         }

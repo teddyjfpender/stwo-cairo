@@ -104,6 +104,7 @@ pub(crate) fn resident_session_telemetry_json(
     let missing_physical_ids = telemetry.physical_memory_inputs.missing_allocation_ids();
     let policy = telemetry.protocol_policy;
     let host = telemetry.host_preparation;
+    let host_cache = host.and_then(|value| value.replacement_host_cache);
     let topology_digest = telemetry.shape_executable_topology_digest.map(|digest| {
         digest
             .iter()
@@ -140,6 +141,14 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_host_structural_casm_slab_clones": host.map(|value| value.ownership.casm_slab_clones),
         "gpu_host_structural_execution_memory_arc_clones": host.map(|value| value.ownership.execution_memory_arc_clones),
         "gpu_host_structural_recorded_program_arc_clones": host.map(|value| value.ownership.recorded_program_arc_clones),
+        "gpu_host_plan_cache_materialization": host_cache.map(|value| value.materialization.as_str()),
+        "gpu_host_plan_cache_identity_ns": host_cache.map(|value| value.identity_ns),
+        "gpu_host_plan_cache_select_ns": host_cache.map(|value| value.select_ns),
+        "gpu_host_plan_cache_hits": host_cache.map(|value| value.telemetry.hits),
+        "gpu_host_plan_cache_misses": host_cache.map(|value| value.telemetry.misses),
+        "gpu_host_plan_cache_compilations": host_cache.map(|value| value.telemetry.compilations),
+        "gpu_host_plan_cache_evictions": host_cache.map(|value| value.telemetry.evictions),
+        "gpu_host_plan_cache_collisions": host_cache.map(|value| value.telemetry.collisions),
         "gpu_resident_backend": policy.map(|value| value.resident_backend.cli_name()),
         "gpu_protocol_key": telemetry.workspace_key.map(|value| value.protocol_key),
         "gpu_arena_words": telemetry.arena_words,

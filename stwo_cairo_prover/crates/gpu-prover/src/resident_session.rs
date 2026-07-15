@@ -39,6 +39,9 @@ use crate::memory_ledger::{AllocatorPoolCheckpoint, PhysicalMemoryInputs};
 use crate::plan::{ProofPlan, ProofPlanError};
 use crate::protocol_discovery::{ProtocolDiscoveryError, ProtocolTranscriptDiscovery};
 use crate::protocol_plan::{ProtocolPlanError, ProtocolPlanPolicy};
+use crate::replacement_host_cache::{
+    ReplacementHostCacheProofAudit, ReplacementHostMaterialization, ReplacementHostTemplate,
+};
 use crate::recorded_witness_inputs::{
     recorded_witness_inputs_for_plan, recorded_witness_inputs_for_raw_replacement_plan,
     DeviceCasmColumn, DeviceCompactColumn, DeviceEdgeColumn, DeviceEdgeSourceKind,
@@ -112,7 +115,7 @@ pub enum ResidentPreWitnessInput {
     },
     ReplacementV1 {
         input: ResidentProverInputOwner,
-        capacity_plan: Arc<ProofPlan>,
+        template: Arc<ReplacementHostTemplate>,
     },
 }
 
@@ -124,10 +127,15 @@ impl ResidentPreWitnessInput {
         }
     }
 
-    fn capacity_plan(&self) -> &ProofPlan {
+    fn exact_plan(&self) -> Result<Arc<ProofPlan>, ResidentSessionError> {
         match self {
-            Self::LegacyResident { capacity_plan, .. }
-            | Self::ReplacementV1 { capacity_plan, .. } => capacity_plan,
+            Self::LegacyResident { capacity_plan, .. } => Ok(Arc::new(
+                capacity_plan.strict_resident_exact(
+                    &crate::schedule_table::CAIRO_SCHEDULE,
+                    &crate::relation_table::CAIRO_RELATION_GRAPH,
+                )?,
+            )),
+            Self::ReplacementV1 { template, .. } => Ok(Arc::clone(template.exact_plan())),
         }
     }
 
@@ -147,9 +155,9 @@ impl ResidentPreWitnessInput {
     fn planned_claim(&self, exact_plan: &ProofPlan) -> Result<CairoClaim, ResidentSessionError> {
         Ok(match self {
             Self::LegacyResident { generator, .. } => planned_cairo_claim(generator, exact_plan)?,
-            Self::ReplacementV1 { input, .. } => {
-                planned_cairo_claim_from_public_data(input.public_data(), exact_plan)?
-            }
+            Self::ReplacementV1 {
+                input, template, ..
+            } => template.bind_claim(input.public_data()),
         })
     }
 
@@ -161,9 +169,9 @@ impl ResidentPreWitnessInput {
             Self::LegacyResident { generator, .. } => {
                 recorded_witness_inputs_for_plan(generator, exact_plan)?
             }
-            Self::ReplacementV1 { input, .. } => {
-                recorded_witness_inputs_for_raw_replacement_plan(input, exact_plan)?
-            }
+            Self::ReplacementV1 {
+                input, template, ..
+            } => template.bind_recorded(input)?,
         })
     }
 
@@ -200,6 +208,7 @@ struct ResidentCasmWords<'a> {
 pub struct ResidentIngressAudit {
     pub ingest_ns: u128,
     pub claim_generator_constructions: u64,
+    pub replacement_host_cache: Option<ReplacementHostCacheProofAudit>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,6 +223,7 @@ pub struct ResidentHostPreparationAudit {
     pub ownership: ResidentHostOwnershipContract,
     /// Measured by the thread-local constructor witness around real ingest.
     pub claim_generator_constructions: u64,
+    pub replacement_host_cache: Option<ReplacementHostCacheProofAudit>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -364,6 +374,11 @@ impl ResidentSessionTelemetry {
                     .ok_or(ResidentSessionError::StrictArchitectureTelemetry(
                         "replacement host preparation audit was not reported",
                     ))?;
+            let host_cache = audit.replacement_host_cache.ok_or(
+                ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement host-plan cache audit was not reported",
+                ),
+            )?;
             if audit.backend != ResidentBackend::ReplacementV1
                 || audit.ownership.prover_input_moves != 1
                 || audit.ownership.prover_input_clones != 0
@@ -372,6 +387,14 @@ impl ResidentSessionTelemetry {
                 || audit.claim_generator_constructions != 0
                 || audit.ownership.execution_memory_arc_clones != 1
                 || audit.ownership.recorded_program_arc_clones == 0
+                || host_cache.telemetry.compilations > host_cache.telemetry.misses
+                || host_cache.telemetry.collisions != 0
+                || match host_cache.materialization {
+                    ReplacementHostMaterialization::Compiled => {
+                        host_cache.telemetry.compilations == 0
+                    }
+                    ReplacementHostMaterialization::Reused => host_cache.telemetry.hits == 0,
+                }
             {
                 return Err(ResidentSessionError::StrictArchitectureTelemetry(
                     "replacement host ownership contract drifted",
@@ -985,6 +1008,14 @@ fn recorded_input_matches_gather(
                         .enumerate()
                         .all(|(row, &value)| value == u32::from(row < requirements.total_real_rows))
             }
+            RecordedInputColumnProvenance::StructuralEnabler(words) => {
+                !device_tail
+                    && words.len() == requirements.consumer_rows
+                    && words
+                        .iter()
+                        .enumerate()
+                        .all(|(row, &value)| value == u32::from(row < requirements.total_real_rows))
+            }
             _ => false,
         };
     }
@@ -1239,6 +1270,12 @@ fn resident_host_witness_inputs<'a>(
                     RecordedInputColumnProvenance::Host(words) => {
                         Ok(ResidentWitnessInputColumn { ordinal, words })
                     }
+                    RecordedInputColumnProvenance::StructuralEnabler(words) => {
+                        Ok(ResidentWitnessInputColumn {
+                            ordinal,
+                            words: words.as_ref(),
+                        })
+                    }
                     RecordedInputColumnProvenance::DeviceEdge(_)
                     | RecordedInputColumnProvenance::DeviceCasm(_)
                     | RecordedInputColumnProvenance::DeviceGather(_)
@@ -1303,10 +1340,7 @@ pub fn with_resident_pre_witness_session<R>(
         execution_config.resident_backend(),
         ingress_audit.claim_generator_constructions,
     )?;
-    let exact_plan = Arc::new(input.capacity_plan().strict_resident_exact(
-        &crate::schedule_table::CAIRO_SCHEDULE,
-        &crate::relation_table::CAIRO_RELATION_GRAPH,
-    )?);
+    let exact_plan = input.exact_plan()?;
     let ec_op_segment_start = input.ec_op_segment_start();
     require_strict_resident_witness_coverage(&exact_plan)?;
     let planned_claim = input.planned_claim(&exact_plan)?;
@@ -1433,6 +1467,7 @@ pub fn with_resident_pre_witness_session<R>(
                     ) * recorded.lanes.len(),
                 },
                 claim_generator_constructions: ingress_audit.claim_generator_constructions,
+                replacement_host_cache: ingress_audit.replacement_host_cache,
             }),
             shape_executable_materialization: Some(executable_materialization),
             shape_executable_cache,
@@ -2795,6 +2830,18 @@ mod tests {
                     recorded_program_arc_clones: 35,
                 },
                 claim_generator_constructions: 0,
+                replacement_host_cache: Some(ReplacementHostCacheProofAudit {
+                    materialization: ReplacementHostMaterialization::Reused,
+                    identity_ns: 10,
+                    select_ns: 20,
+                    telemetry: crate::replacement_host_cache::ReplacementHostCacheTelemetry {
+                        hits: 1,
+                        misses: 1,
+                        compilations: 1,
+                        evictions: 0,
+                        collisions: 0,
+                    },
+                }),
             }),
             shape_executable_topology_digest: Some([7; 32]),
             workspace_key: Some(WorkspaceKey::new(
@@ -2819,6 +2866,18 @@ mod tests {
         let mut wrong_schedule = valid.clone();
         wrong_schedule.prepared_numerator_schedule = Some(PreparedNumeratorSchedule::LegacyBatches);
         assert!(wrong_schedule.require_strict_graph_a().is_err());
+
+        let mut collision_tainted = valid.clone();
+        collision_tainted
+            .host_preparation
+            .as_mut()
+            .unwrap()
+            .replacement_host_cache
+            .as_mut()
+            .unwrap()
+            .telemetry
+            .collisions = 1;
+        assert!(collision_tainted.require_strict_graph_a().is_err());
 
         let mut drifted_policy = valid;
         drifted_policy

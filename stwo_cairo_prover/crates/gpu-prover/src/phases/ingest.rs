@@ -73,8 +73,7 @@ pub fn run_replacement(
     let span = span!(Level::INFO, "Write Preprocessed trace").entered();
     let preprocessed_trace = Arc::new(variant.to_preprocessed_trace());
     span.exit();
-
-    let input = ResidentProverInputOwner::encode(input);
+    let input = encode_replacement(input);
     let proof_plan = Arc::new(raw_replacement_proof_plan(
         &input,
         Arc::clone(&preprocessed_trace),
@@ -85,6 +84,12 @@ pub fn run_replacement(
         input,
         proof_plan,
     })
+}
+
+/// Move-only front half shared by cold tooling and the production host cache.
+/// No shape or claim construction occurs here.
+pub fn encode_replacement(input: ProverInput) -> ResidentProverInputOwner {
+    ResidentProverInputOwner::encode(input)
 }
 
 /// Replace every device-compacted consumer's pending rows in the OBSERVED

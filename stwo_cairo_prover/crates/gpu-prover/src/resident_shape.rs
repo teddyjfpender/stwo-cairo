@@ -56,6 +56,18 @@ pub enum RawResidentShapeError {
     Compacted(PlannedCompactedRowsError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawCompactedRows {
+    pub n_real_rows: u64,
+    pub padded_rows: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawCompactedGeometry {
+    pub component: ComponentId,
+    pub rows: Option<RawCompactedRows>,
+}
+
 impl core::fmt::Display for RawResidentShapeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "raw resident shape rejected: {self:?}")
@@ -117,6 +129,53 @@ pub fn raw_replacement_proof_plan(
     let capacity = ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &observed)?;
     let sealed = seal_compacted(owner, &observed, &capacity)?;
     ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &sealed).map_err(Into::into)
+}
+
+/// Canonical small identity for the only data-dependent pre-witness row
+/// projections. Different memory contents with the same derived geometry are
+/// deliberately equivalent cache keys.
+pub fn raw_replacement_compacted_geometry(
+    owner: &ResidentProverInputOwner,
+    preprocessed_trace: Arc<PreProcessedTrace>,
+) -> Result<[RawCompactedGeometry; 3], RawResidentShapeError> {
+    let present = present_components(owner, preprocessed_trace);
+    Ok([
+        compacted_geometry(owner, &present, "verify_instruction")?,
+        compacted_geometry(owner, &present, "pedersen_aggregator_window_bits_18")?,
+        compacted_geometry(owner, &present, "poseidon_aggregator")?,
+    ])
+}
+
+fn compacted_geometry(
+    owner: &ResidentProverInputOwner,
+    present: &BTreeSet<ComponentId>,
+    component: ComponentId,
+) -> Result<RawCompactedGeometry, RawResidentShapeError> {
+    let shape = planned_compacted_consumer_shape_from_raw(
+        component,
+        present.contains(component),
+        owner.pc_count(),
+        owner.execution_memory(),
+        owner.builtin_segments(),
+    )?;
+    let rows = shape
+        .map(|shape| {
+            let RowResolution::Resolved(parts) = shape.rows else {
+                return Err(RawResidentShapeError::MissingDirectRows(component));
+            };
+            let [part] = parts.as_slice() else {
+                return Err(RawResidentShapeError::MissingDirectRows(component));
+            };
+            if part.part != TracePartId::Main {
+                return Err(RawResidentShapeError::MissingDirectRows(component));
+            }
+            Ok(RawCompactedRows {
+                n_real_rows: part.n_real_rows,
+                padded_rows: part.padded_rows,
+            })
+        })
+        .transpose()?;
+    Ok(RawCompactedGeometry { component, rows })
 }
 
 fn present_components(

@@ -40,6 +40,7 @@ pub mod recorded_witness_inputs;
 pub mod relation;
 pub mod relation_execution;
 pub mod relation_table;
+pub mod replacement_host_cache;
 mod resident_composition;
 pub mod resident_input;
 mod resident_oods;

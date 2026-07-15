@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use cairo_vm::types::layout_name::LayoutName;
+use stwo_cairo_adapter::memory::DEFAULT_ID;
 use stwo_cairo_adapter::opcodes::RECORDED_CASM_DESCRIPTORS;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
@@ -16,13 +18,50 @@ use crate::phases;
 use crate::prover::{prepare_resident_ingest, GpuError, PreparedResidentIngest};
 use crate::recorded_witness_inputs::{
     recorded_witness_inputs_for_raw_replacement_plan, recorded_witness_inputs_for_replacement_plan,
+    PlannedRecordedWitnessInputs, RecordedInputColumnProvenance,
 };
 use crate::relation_table::CAIRO_RELATION_GRAPH;
+use crate::replacement_host_cache::{
+    ReplacementHostCache, ReplacementHostCacheError, ReplacementHostMaterialization,
+};
 use crate::resident_input::ResidentProverInputOwner;
 use crate::resident_session::ResidentPreWitnessInput;
-use crate::resident_shape::{raw_replacement_proof_plan, RawResidentShapeError};
+use crate::resident_shape::{
+    raw_replacement_compacted_geometry, raw_replacement_proof_plan, RawResidentShapeError,
+};
 use crate::resident_witness::{planned_cairo_claim, planned_cairo_claim_from_public_data};
 use crate::schedule_table::CAIRO_SCHEDULE;
+
+fn assert_cached_recorded_matches_fresh(
+    cached: &PlannedRecordedWitnessInputs,
+    fresh: &PlannedRecordedWitnessInputs,
+) {
+    assert_eq!(
+        cached.execution_memory_identity,
+        fresh.execution_memory_identity
+    );
+    assert_eq!(cached.lanes.len(), fresh.lanes.len());
+    for (cached, fresh) in cached.lanes.iter().zip(&fresh.lanes) {
+        assert_eq!(cached.component, fresh.component);
+        assert_eq!(cached.program, fresh.program);
+        assert_eq!(
+            (cached.n_real, cached.row_count),
+            (fresh.n_real, fresh.row_count)
+        );
+        assert_eq!(cached.tables, fresh.tables);
+        assert_eq!(cached.host_build_error, fresh.host_build_error);
+        assert_eq!(cached.columns.len(), fresh.columns.len());
+        for (cached, fresh) in cached.columns.iter().zip(&fresh.columns) {
+            match (cached, fresh) {
+                (
+                    RecordedInputColumnProvenance::StructuralEnabler(cached),
+                    RecordedInputColumnProvenance::Host(fresh),
+                ) => assert_eq!(cached.as_ref(), fresh.as_slice()),
+                _ => assert_eq!(cached, fresh),
+            }
+        }
+    }
+}
 
 fn assert_raw_replacement_matches_generator(input: ProverInput, case: &str) {
     let owner = ResidentProverInputOwner::encode(input.clone());
@@ -183,15 +222,19 @@ fn raw_replacement_fails_closed_on_nonempty_generic_opcode() {
         .casm_states_by_opcode
         .generic_opcode
         .push(input.state_transitions.initial_state);
+    let mut cache = ReplacementHostCache::new(1).unwrap();
     assert!(matches!(
         prepare_resident_ingest(
             ResidentBackend::ReplacementV1,
+            Some(&mut cache),
             input,
             PreProcessedTraceVariant::Canonical,
             None,
         ),
-        Err(GpuError::RawResidentShape(
-            RawResidentShapeError::GenericOpcodeUnsupported { rows: 1 }
+        Err(GpuError::ReplacementHostCache(
+            ReplacementHostCacheError::RawShape(RawResidentShapeError::GenericOpcodeUnsupported {
+                rows: 1
+            })
         ))
     ));
 }
@@ -221,6 +264,7 @@ fn raw_replacement_production_ingest_is_move_only_and_generator_free() {
         "fixture must contain recorded Casm lanes"
     );
     let constructions = stwo_cairo_prover::witness::cairo::claim_generator_constructions();
+    let mut cache = ReplacementHostCache::new(2).unwrap();
 
     let PreparedResidentIngest {
         input,
@@ -228,12 +272,17 @@ fn raw_replacement_production_ingest_is_move_only_and_generator_free() {
         preprocessed_trace: _,
     } = prepare_resident_ingest(
         ResidentBackend::ReplacementV1,
+        Some(&mut cache),
         input,
         PreProcessedTraceVariant::Canonical,
         None,
     )
     .unwrap();
     assert_eq!(audit.claim_generator_constructions, 0);
+    assert_eq!(
+        audit.replacement_host_cache.unwrap().materialization,
+        ReplacementHostMaterialization::Compiled
+    );
     assert_eq!(
         stwo_cairo_prover::witness::cairo::claim_generator_constructions(),
         constructions
@@ -270,16 +319,339 @@ fn raw_replacement_dispatch_preserves_legacy_generator_path() {
     .unwrap();
     let PreparedResidentIngest { input, audit, .. } = prepare_resident_ingest(
         ResidentBackend::LegacyResident,
+        None,
         input,
         PreProcessedTraceVariant::Canonical,
         None,
     )
     .unwrap();
     assert_eq!(audit.claim_generator_constructions, 1);
+    assert!(audit.replacement_host_cache.is_none());
     assert!(matches!(
         input,
         ResidentPreWitnessInput::LegacyResident { .. }
     ));
+}
+
+#[test]
+fn raw_replacement_host_cache_reuses_topology_and_rebinds_statement_memory_and_seeds() {
+    let cold_input = run_and_adapt(
+        &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .unwrap();
+    let mut warm_input = cold_input.clone();
+    warm_input.state_transitions.final_state.fp.0 ^= 1;
+    if let Some(segment) = warm_input.builtin_segments.bitwise_builtin.as_mut() {
+        assert!(segment.stop_ptr < warm_input.memory.address_to_id.len());
+        segment.begin_addr += 1;
+        segment.stop_ptr += 1;
+    }
+
+    let mut cache = ReplacementHostCache::new(2).unwrap();
+    let cold_started = Instant::now();
+    let cold = prepare_resident_ingest(
+        ResidentBackend::ReplacementV1,
+        Some(&mut cache),
+        cold_input,
+        PreProcessedTraceVariant::Canonical,
+        None,
+    )
+    .unwrap();
+    let cold_wall_ns = cold_started.elapsed().as_nanos();
+    let cold_preprocessed = Arc::clone(&cold.preprocessed_trace);
+    let ResidentPreWitnessInput::ReplacementV1 {
+        input: cold_owner,
+        template: cold_template,
+    } = cold.input
+    else {
+        panic!("cold replacement dispatch returned legacy input")
+    };
+    assert_eq!(
+        cold.audit.replacement_host_cache.unwrap().materialization,
+        ReplacementHostMaterialization::Compiled
+    );
+    let cold_claim = cold_template.bind_claim(cold_owner.public_data());
+    let cold_recorded = cold_template.bind_recorded(&cold_owner).unwrap();
+    let cold_memory_ptr = cold_owner.execution_memory().address_to_id.as_ptr();
+
+    let warm_started = Instant::now();
+    let warm = prepare_resident_ingest(
+        ResidentBackend::ReplacementV1,
+        Some(&mut cache),
+        warm_input,
+        PreProcessedTraceVariant::Canonical,
+        None,
+    )
+    .unwrap();
+    let warm_wall_ns = warm_started.elapsed().as_nanos();
+    assert!(Arc::ptr_eq(&cold_preprocessed, &warm.preprocessed_trace));
+    let ResidentPreWitnessInput::ReplacementV1 {
+        input: warm_owner,
+        template: warm_template,
+    } = warm.input
+    else {
+        panic!("warm replacement dispatch returned legacy input")
+    };
+    let warm_audit = warm.audit.replacement_host_cache.unwrap();
+    assert_eq!(
+        warm_audit.materialization,
+        ReplacementHostMaterialization::Reused
+    );
+    assert_eq!(
+        (warm_audit.telemetry.hits, warm_audit.telemetry.misses),
+        (1, 1)
+    );
+    assert_eq!(warm_audit.telemetry.compilations, 1);
+    assert!(Arc::ptr_eq(&cold_template, &warm_template));
+    assert!(Arc::ptr_eq(
+        cold_template.capacity_plan(),
+        warm_template.capacity_plan()
+    ));
+    assert!(Arc::ptr_eq(
+        cold_template.exact_plan(),
+        warm_template.exact_plan()
+    ));
+    assert_ne!(
+        warm_owner.execution_memory().address_to_id.as_ptr(),
+        cold_memory_ptr,
+        "the mutation oracle requires a distinct current memory allocation"
+    );
+
+    let warm_claim = warm_template.bind_claim(warm_owner.public_data());
+    let fresh_claim =
+        planned_cairo_claim_from_public_data(warm_owner.public_data(), warm_template.exact_plan())
+            .unwrap();
+    assert_ne!(
+        serde_json::to_value(&cold_claim).unwrap(),
+        serde_json::to_value(&warm_claim).unwrap(),
+        "proof-varying PublicData must not come from the cached skeleton"
+    );
+    assert_eq!(
+        serde_json::to_value(&warm_claim).unwrap(),
+        serde_json::to_value(&fresh_claim).unwrap()
+    );
+
+    let rebound = warm_template.bind_recorded(&warm_owner).unwrap();
+    let fresh =
+        recorded_witness_inputs_for_raw_replacement_plan(&warm_owner, warm_template.exact_plan())
+            .unwrap();
+    assert!(Arc::ptr_eq(
+        &rebound.execution_memory,
+        warm_owner.execution_memory()
+    ));
+    assert_eq!(
+        rebound.execution_memory_identity,
+        fresh.execution_memory_identity
+    );
+    assert_cached_recorded_matches_fresh(&rebound, &fresh);
+    let cold_enabler = cold_recorded
+        .lanes
+        .iter()
+        .flat_map(|lane| &lane.columns)
+        .find_map(|column| match column {
+            RecordedInputColumnProvenance::StructuralEnabler(words) => Some(words),
+            _ => None,
+        })
+        .expect("fixture must exercise a cached structural enabler");
+    let warm_enabler = rebound
+        .lanes
+        .iter()
+        .flat_map(|lane| &lane.columns)
+        .find_map(|column| match column {
+            RecordedInputColumnProvenance::StructuralEnabler(words) => Some(words),
+            _ => None,
+        })
+        .expect("warm binding must retain the structural enabler");
+    assert!(Arc::ptr_eq(cold_enabler, warm_enabler));
+
+    let fresh_capacity = raw_replacement_proof_plan(
+        &warm_owner,
+        Arc::new(PreProcessedTraceVariant::Canonical.to_preprocessed_trace()),
+        None,
+    )
+    .unwrap();
+    let fresh_exact = fresh_capacity
+        .strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)
+        .unwrap();
+    assert_eq!(
+        warm_template.exact_plan().proof_shape(),
+        fresh_exact.proof_shape()
+    );
+    eprintln!(
+        "replacement_host_cache cold_wall_ms={:.3} warm_wall_ms={:.3} warm_identity_ms={:.3} warm_select_ms={:.3}",
+        cold_wall_ns as f64 / 1e6,
+        warm_wall_ns as f64 / 1e6,
+        warm_audit.identity_ns as f64 / 1e6,
+        warm_audit.select_ns as f64 / 1e6,
+    );
+}
+
+#[test]
+fn raw_replacement_host_cache_rejects_digest_collision() {
+    let input = run_and_adapt(
+        &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .unwrap();
+    let mut changed = input.clone();
+    changed.pc_count += 1;
+    let cold_owner = ResidentProverInputOwner::encode(input);
+    let changed_owner = ResidentProverInputOwner::encode(changed);
+    let forced_digest = [0x5a; 32];
+    let mut cache = ReplacementHostCache::new(2).unwrap();
+    cache
+        .compile_or_bind_with_digest_for_test(
+            &cold_owner,
+            PreProcessedTraceVariant::Canonical,
+            None,
+            forced_digest,
+        )
+        .unwrap();
+    assert!(matches!(
+        cache.compile_or_bind_with_digest_for_test(
+            &changed_owner,
+            PreProcessedTraceVariant::Canonical,
+            None,
+            forced_digest,
+        ),
+        Err(ReplacementHostCacheError::DigestCollision { digest }) if digest == forced_digest
+    ));
+    assert_eq!(cache.telemetry().collisions, 1);
+    assert_eq!(cache.telemetry().compilations, 1);
+}
+
+#[test]
+fn raw_replacement_host_cache_keys_compacted_geometry_not_raw_ids() {
+    let input = run_and_adapt(
+        &get_compiled_cairo_program_path("test_prove_verify_poseidon_builtin"),
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .unwrap();
+    let mut equal_geometry = input.clone();
+    let mut changed_geometry = input.clone();
+    let segment = input
+        .builtin_segments
+        .poseidon_builtin
+        .expect("cache oracle requires the poseidon compacted builtin segment");
+    let source = &input.memory.address_to_id[segment.begin_addr..segment.stop_ptr];
+    assert!(
+        source.len() >= 12,
+        "cache oracle requires at least two poseidon rows"
+    );
+    let first = source[0];
+    let second = source
+        .iter()
+        .copied()
+        .find(|value| *value != first)
+        .expect("cache oracle requires two distinct raw ids");
+    for value in &mut equal_geometry.memory.address_to_id[segment.begin_addr..segment.stop_ptr] {
+        if *value == first {
+            *value = second;
+        } else if *value == second {
+            *value = first;
+        }
+    }
+    let trace = || Arc::new(PreProcessedTraceVariant::Canonical.to_preprocessed_trace());
+    let base_geometry_owner = ResidentProverInputOwner::encode(input.clone());
+    let base_geometry = raw_replacement_compacted_geometry(&base_geometry_owner, trace()).unwrap();
+    let base_poseidon_rows = base_geometry[2]
+        .rows
+        .expect("poseidon fixture must contain compacted geometry")
+        .n_real_rows;
+    if base_poseidon_rows == 1 {
+        let novel = input
+            .memory
+            .address_to_id
+            .iter()
+            .copied()
+            .find(|value| value.0 != DEFAULT_ID && !source.contains(value))
+            .expect("cache oracle requires a valid raw id outside the poseidon segment");
+        // One novel cell makes row zero distinct while row one remains the
+        // original tuple, changing the exact compacted unique-row count.
+        changed_geometry.memory.address_to_id[segment.begin_addr] = novel;
+    } else {
+        // Collapse every tuple to one canonical key. This preserves segment
+        // extent while forcing geometry away from any base count above one.
+        for value in
+            &mut changed_geometry.memory.address_to_id[segment.begin_addr..segment.stop_ptr]
+        {
+            *value = first;
+        }
+    }
+    assert_ne!(
+        equal_geometry.memory.address_to_id,
+        input.memory.address_to_id
+    );
+
+    let base_owner = ResidentProverInputOwner::encode(input);
+    let equal_owner = ResidentProverInputOwner::encode(equal_geometry);
+    let changed_owner = ResidentProverInputOwner::encode(changed_geometry);
+    assert_eq!(
+        raw_replacement_compacted_geometry(&base_owner, trace()).unwrap(),
+        raw_replacement_compacted_geometry(&equal_owner, trace()).unwrap(),
+        "a bijective raw-id relabeling must preserve canonical compacted geometry"
+    );
+    assert_ne!(
+        raw_replacement_compacted_geometry(&base_owner, trace()).unwrap(),
+        raw_replacement_compacted_geometry(&changed_owner, trace()).unwrap(),
+        "the deterministic raw-id mutation must change poseidon compacted geometry"
+    );
+    let mut cache = ReplacementHostCache::new(1).unwrap();
+    let cold = cache
+        .compile_or_bind(&base_owner, PreProcessedTraceVariant::Canonical, None)
+        .unwrap();
+    let equal = cache
+        .compile_or_bind(&equal_owner, PreProcessedTraceVariant::Canonical, None)
+        .unwrap();
+    assert_eq!(
+        equal.audit.materialization,
+        ReplacementHostMaterialization::Reused,
+        "a content mutation preserving canonical compacted geometry must hit"
+    );
+    assert!(Arc::ptr_eq(&cold.template, &equal.template));
+
+    let fresh_capacity = raw_replacement_proof_plan(&equal_owner, trace(), None).unwrap();
+    let fresh_exact = fresh_capacity
+        .strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)
+        .unwrap();
+    assert_eq!(
+        equal.template.exact_plan().proof_shape(),
+        fresh_exact.proof_shape()
+    );
+    let cached_claim = equal.template.bind_claim(equal_owner.public_data());
+    let fresh_claim =
+        planned_cairo_claim_from_public_data(equal_owner.public_data(), &fresh_exact).unwrap();
+    assert_eq!(
+        serde_json::to_value(cached_claim).unwrap(),
+        serde_json::to_value(fresh_claim).unwrap()
+    );
+    let cached_lanes = equal.template.bind_recorded(&equal_owner).unwrap();
+    let fresh_lanes =
+        recorded_witness_inputs_for_raw_replacement_plan(&equal_owner, &fresh_exact).unwrap();
+    assert_cached_recorded_matches_fresh(&cached_lanes, &fresh_lanes);
+
+    let changed = cache
+        .compile_or_bind(&changed_owner, PreProcessedTraceVariant::Canonical, None)
+        .unwrap();
+    assert_eq!(
+        changed.audit.materialization,
+        ReplacementHostMaterialization::Compiled,
+        "a changed canonical compacted geometry must miss"
+    );
+    assert_eq!(changed.audit.telemetry.misses, 2);
+    assert_eq!(changed.audit.telemetry.compilations, 2);
+    assert_eq!(changed.audit.telemetry.evictions, 1);
+    assert_ne!(
+        cold.template.exact_plan().proof_shape(),
+        changed.template.exact_plan().proof_shape()
+    );
 }
 
 #[test]
