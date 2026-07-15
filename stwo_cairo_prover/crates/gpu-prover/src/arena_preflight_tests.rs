@@ -75,6 +75,10 @@ fn replacement_policy_json_reports_the_exact_planned_tuple() {
     );
     assert_eq!(value["resident_backend"], "replacement-v1");
     assert_eq!(
+        value["dynamic_commitment_leaf_schedule"],
+        "retained-domain-cooperative"
+    );
+    assert_eq!(
         value["quotient_numerator_schedule"],
         "staged-packed-single-write"
     );
@@ -119,6 +123,7 @@ fn protocol_identity_for(policy: ProtocolPlanPolicy) -> ProtocolIdentity {
         fri_fold_launch_mode: policy.fri_fold_launch_mode,
         witness_feed_launch_mode: policy.witness_feed_launch_mode,
         resident_backend: policy.resident_backend,
+        dynamic_commitment_leaf_schedule: policy.dynamic_commitment_leaf_schedule,
         quotient_numerator_schedule: policy.quotient_numerator_schedule,
         quotient_numerator_source_policy: policy.quotient_numerator_source_policy,
         commit_mode: policy.commit_mode,
@@ -162,7 +167,7 @@ fn replacement_preflight_rejects_policy_or_identity_drift() {
     drifted_policy.retained_lde_budget_bytes -= 1;
     assert!(validate_selected_policy(ResidentBackend::ReplacementV1, drifted_policy).is_err());
 
-    let mutations: [fn(&mut ProtocolIdentity); 14] = [
+    let mutations: [fn(&mut ProtocolIdentity); 15] = [
         |identity| identity.channel_tag ^= 1,
         |identity| identity.kernel_manifest_hash ^= 1,
         |identity| identity.decommit_strategy = DecommitStrategy::RetainAllLde,
@@ -173,6 +178,10 @@ fn replacement_preflight_rejects_policy_or_identity_drift() {
         |identity| identity.fri_fold_launch_mode = FriFoldLaunchMode::FusedTriple,
         |identity| identity.witness_feed_launch_mode = WitnessFeedLaunchMode::Privatized,
         |identity| identity.resident_backend = ResidentBackend::LegacyResident,
+        |identity| {
+            identity.dynamic_commitment_leaf_schedule =
+                stwo_cairo_gpu_prover::arena_plan::DynamicCommitmentLeafSchedule::LegacyPerBatch
+        },
         |identity| identity.quotient_numerator_schedule = QuotientNumeratorSchedule::LegacyBatches,
         |identity| {
             identity.quotient_numerator_source_policy =

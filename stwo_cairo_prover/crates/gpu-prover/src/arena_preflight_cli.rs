@@ -81,6 +81,7 @@ pub fn runtime_policy_json(
 ) -> serde_json::Value {
     serde_json::json!({
         "resident_backend": policy.resident_backend.cli_name(),
+        "dynamic_commitment_leaf_schedule": policy.dynamic_commitment_leaf_schedule.cli_name(),
         "quotient_numerator_schedule": numerator_schedule_name(policy.quotient_numerator_schedule),
         "channel_tag": format!("{:016x}", policy.channel_tag),
         "kernel_manifest_hash": format!("{:016x}", policy.kernel_manifest_hash),

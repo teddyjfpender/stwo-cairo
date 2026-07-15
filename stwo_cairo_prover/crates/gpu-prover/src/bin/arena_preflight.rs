@@ -49,6 +49,8 @@
 //! gpu_bench. Exit code 0 iff the verdict is PASS.
 #[path = "../arena_preflight_cli.rs"]
 mod arena_preflight_cli;
+#[path = "arena_preflight/commitment_receipt.rs"]
+mod arena_preflight_commitment_receipt;
 #[path = "../arena_preflight_hybrid.rs"]
 mod arena_preflight_hybrid;
 #[path = "../arena_preflight_staged.rs"]
@@ -59,6 +61,9 @@ use std::process::ExitCode;
 
 use arena_preflight_cli::{
     arg, budget_bytes_of, parse_resident_backend, parse_vram_budget_gb, runtime_policy_json,
+};
+use arena_preflight_commitment_receipt::{
+    dynamic_commitment_leaf_program_receipts, validate_dynamic_commitment_leaf_programs,
 };
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
@@ -222,6 +227,7 @@ fn validate_protocol_identity(
     require_policy_field!(fri_fold_launch_mode);
     require_policy_field!(witness_feed_launch_mode);
     require_policy_field!(resident_backend);
+    require_policy_field!(dynamic_commitment_leaf_schedule);
     require_policy_field!(quotient_numerator_schedule);
     require_policy_field!(quotient_numerator_source_policy);
     require_policy_field!(commit_mode);
@@ -611,6 +617,8 @@ fn report_json(
         .commitments()
         .iter()
         .all(|commitment| commitment.interpolation_mode == report.interpolation_mode));
+    let dynamic_commitment_leaf_programs =
+        dynamic_commitment_leaf_program_receipts(arena.commitments());
     let bytes_of_words = |words: usize| {
         words
             .checked_mul(WORD_BYTES)
@@ -741,6 +749,7 @@ fn report_json(
             &report.shape_executable_topology_digest
         ),
         "protocol_key": protocol_key_hex(arena.protocol_key),
+        "dynamic_commitment_leaf_programs": dynamic_commitment_leaf_programs,
         "present_components": report.present_components.len(),
         "capture_safe_components": report.capture_safe_components.len(),
         "capture_safe_coverage_ok": capture_safe_ok,
@@ -908,6 +917,11 @@ fn main() -> ExitCode {
         }),
     ) {
         return fail("protocol_identity", error);
+    }
+    if let Err(error) =
+        validate_dynamic_commitment_leaf_programs(resident_backend, report.arena.commitments())
+    {
+        return fail("dynamic_commitment_leaf_programs", error);
     }
 
     let aot_coverage = match aot_coverage(&report, &aot_manifest) {

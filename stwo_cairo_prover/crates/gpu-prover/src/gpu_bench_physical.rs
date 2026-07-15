@@ -37,6 +37,7 @@ pub(crate) fn gpu_native_session_context(
         return json!({
             "gpu_graph_a_setup_gate_passed": null,
             "gpu_resident_backend": null,
+            "gpu_dynamic_commitment_leaf_schedule": null,
             "gpu_protocol_key": null,
             "gpu_arena_words": null,
             "gpu_shape_executable_topology_digest": null,
@@ -153,6 +154,7 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_host_plan_cache_evictions": host_cache.map(|value| value.telemetry.evictions),
         "gpu_host_plan_cache_collisions": host_cache.map(|value| value.telemetry.collisions),
         "gpu_resident_backend": policy.map(|value| value.resident_backend.cli_name()),
+        "gpu_dynamic_commitment_leaf_schedule": policy.map(|value| value.dynamic_commitment_leaf_schedule.cli_name()),
         "gpu_protocol_key": telemetry.workspace_key.map(|value| value.protocol_key),
         "gpu_arena_words": telemetry.arena_words,
         "gpu_shape_executable_topology_digest": topology_digest,
@@ -327,6 +329,10 @@ mod tests {
         };
         let value = resident_session_telemetry_json(&telemetry);
         assert_eq!(value["gpu_resident_backend"], "replacement-v1");
+        assert_eq!(
+            value["gpu_dynamic_commitment_leaf_schedule"],
+            "retained-domain-cooperative"
+        );
         assert_eq!(value["gpu_protocol_key"], 0x5678);
         assert_eq!(
             value["gpu_planned_numerator_schedule"],
@@ -370,6 +376,7 @@ mod tests {
 
         let null_schema = gpu_native_session_context(None, false);
         for key in [
+            "gpu_dynamic_commitment_leaf_schedule",
             "gpu_shape_executable_cache_topology_key_constructions",
             "gpu_shape_executable_cache_replacement_handle_lock_ns",
             "gpu_shape_executable_cache_replacement_handle_lock_ops",
