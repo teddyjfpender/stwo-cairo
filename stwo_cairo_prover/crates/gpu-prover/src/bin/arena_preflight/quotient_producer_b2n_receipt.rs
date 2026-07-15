@@ -5,7 +5,7 @@ use stwo_cairo_gpu_prover::arena_plan::ProofArenaPlan;
 pub(crate) fn json(arena: &ProofArenaPlan) -> Value {
     let selection = arena.quotient_producer_b2n_selection_receipt();
     json!({
-        "schema": "stwo.quotient-producer-b2n-selection.v1",
+        "schema": "stwo.quotient-producer-b2n-selection.v2",
         "resident_backend": selection.resident_backend.cli_name(),
         "production_selected": selection.production_selected,
         "program": selection.program.map(program_json),
@@ -21,19 +21,23 @@ fn program_json(receipt: QuotientProducerB2nReceipt) -> Value {
             "producer_stages": receipt.schedule.producer_stages,
             "continuation_intervals": receipt.schedule.continuation_intervals,
         },
-        "resources": {
-            "sm_arch": receipt.resources.sm_arch,
-            "cuda_toolkit_major": receipt.resources.cuda_toolkit_major,
-            "cuda_toolkit_minor": receipt.resources.cuda_toolkit_minor,
-            "launch_threads": receipt.resources.launch_threads,
-            "min_blocks_per_sm": receipt.resources.min_blocks_per_sm,
-            "ptxas_registers_per_thread": receipt.resources.ptxas_registers_per_thread,
-            "max_registers_per_thread": receipt.resources.max_registers_per_thread,
-            "ptxas_stack_bytes": receipt.resources.ptxas_stack_bytes,
-            "ptxas_spill_store_bytes": receipt.resources.ptxas_spill_store_bytes,
-            "ptxas_spill_load_bytes": receipt.resources.ptxas_spill_load_bytes,
-            "static_shared_bytes": receipt.resources.static_shared_bytes,
-            "zero_spills_required": receipt.resources.zero_spills_required,
+        "resource_policy": {
+            "required_sm_arch": receipt.resources.required_sm_arch,
+            "architecture_registers_per_sm": receipt.resources.registers_per_sm,
+            "producer": {
+                "launch_threads": receipt.resources.producer.launch_threads,
+                "required_blocks_per_sm": receipt.resources.producer.required_blocks_per_sm,
+                "max_registers_per_thread": receipt.resources.producer.max_registers_per_thread,
+                "max_local_bytes": receipt.resources.producer.max_local_bytes,
+                "max_static_shared_bytes": receipt.resources.producer.max_static_shared_bytes,
+            },
+            "continuation": {
+                "launch_threads": receipt.resources.continuation.launch_threads,
+                "required_blocks_per_sm": receipt.resources.continuation.required_blocks_per_sm,
+                "max_registers_per_thread": receipt.resources.continuation.max_registers_per_thread,
+                "max_local_bytes": receipt.resources.continuation.max_local_bytes,
+                "max_static_shared_bytes": receipt.resources.continuation.max_static_shared_bytes,
+            },
         },
         "traffic": {
             "coordinate_image_bytes": receipt.traffic.coordinate_image_bytes,

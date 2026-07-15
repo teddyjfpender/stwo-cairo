@@ -156,19 +156,23 @@ fn quotient_producer_b2n_receipt_json(
                 "producer_stages": receipt.schedule.producer_stages,
                 "continuation_intervals": receipt.schedule.continuation_intervals,
             },
-            "resources": {
-                "sm_arch": receipt.resources.sm_arch,
-                "cuda_toolkit_major": receipt.resources.cuda_toolkit_major,
-                "cuda_toolkit_minor": receipt.resources.cuda_toolkit_minor,
-                "launch_threads": receipt.resources.launch_threads,
-                "min_blocks_per_sm": receipt.resources.min_blocks_per_sm,
-                "ptxas_registers_per_thread": receipt.resources.ptxas_registers_per_thread,
-                "max_registers_per_thread": receipt.resources.max_registers_per_thread,
-                "ptxas_stack_bytes": receipt.resources.ptxas_stack_bytes,
-                "ptxas_spill_store_bytes": receipt.resources.ptxas_spill_store_bytes,
-                "ptxas_spill_load_bytes": receipt.resources.ptxas_spill_load_bytes,
-                "static_shared_bytes": receipt.resources.static_shared_bytes,
-                "zero_spills_required": receipt.resources.zero_spills_required,
+            "resource_policy": {
+                "required_sm_arch": receipt.resources.required_sm_arch,
+                "architecture_registers_per_sm": receipt.resources.registers_per_sm,
+                "producer": {
+                    "launch_threads": receipt.resources.producer.launch_threads,
+                    "required_blocks_per_sm": receipt.resources.producer.required_blocks_per_sm,
+                    "max_registers_per_thread": receipt.resources.producer.max_registers_per_thread,
+                    "max_local_bytes": receipt.resources.producer.max_local_bytes,
+                    "max_static_shared_bytes": receipt.resources.producer.max_static_shared_bytes,
+                },
+                "continuation": {
+                    "launch_threads": receipt.resources.continuation.launch_threads,
+                    "required_blocks_per_sm": receipt.resources.continuation.required_blocks_per_sm,
+                    "max_registers_per_thread": receipt.resources.continuation.max_registers_per_thread,
+                    "max_local_bytes": receipt.resources.continuation.max_local_bytes,
+                    "max_static_shared_bytes": receipt.resources.continuation.max_static_shared_bytes,
+                },
             },
             "traffic": {
                 "coordinate_image_bytes": receipt.traffic.coordinate_image_bytes,
@@ -185,7 +189,7 @@ fn quotient_producer_b2n_receipt_json(
         })
     });
     json!({
-        "schema": "stwo.quotient-producer-b2n-selection.v1",
+        "schema": "stwo.quotient-producer-b2n-selection.v2",
         "resident_backend": selection.resident_backend.cli_name(),
         "production_selected": selection.production_selected,
         "program": program,
@@ -548,7 +552,7 @@ mod tests {
         let value = resident_session_telemetry_json(&telemetry);
         assert_eq!(
             value["gpu_quotient_producer_b2n"]["schema"],
-            "stwo.quotient-producer-b2n-selection.v1"
+            "stwo.quotient-producer-b2n-selection.v2"
         );
         assert_eq!(
             value["gpu_quotient_producer_b2n"]["production_selected"],
@@ -567,10 +571,13 @@ mod tests {
             21
         );
         assert_eq!(
-            value["gpu_quotient_producer_b2n"]["program"]["resources"]
-                ["ptxas_registers_per_thread"],
-            98
+            value["gpu_quotient_producer_b2n"]["program"]["resource_policy"]["producer"]
+                ["max_registers_per_thread"],
+            128
         );
+        assert!(!value["gpu_quotient_producer_b2n"]["program"]
+            .to_string()
+            .contains("ptxas"));
     }
 
     #[test]
