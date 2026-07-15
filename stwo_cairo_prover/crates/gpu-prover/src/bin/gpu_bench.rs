@@ -111,6 +111,7 @@
 //!   pipeline, producers, pie_mode, reps, total_s, feed_starved_s,
 //!   sustained_steps_per_s, sustained_mhz, sustained_useful_mhz (null for --program)
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -147,7 +148,7 @@ use stwo_cairo_serialize::CairoSerialize;
 
 #[path = "../gpu_bench_physical.rs"]
 mod gpu_bench_physical;
-use gpu_bench_physical::{gpu_native_session_context, resident_session_telemetry_json};
+use gpu_bench_physical::gpu_native_session_context;
 
 type BenchProof = CairoProof<<Blake2sMerkleChannel as MerkleChannel>::H>;
 type BenchVerifierProof = CairoProofForRustVerifier<<Blake2sMerkleChannel as MerkleChannel>::H>;
@@ -262,10 +263,15 @@ fn engine() -> String {
     arg("--engine").unwrap_or_else(|| "legacy".to_string())
 }
 
-/// The GPU-native engine is deliberately CUDA-specific. SIMD remains the legacy
-/// reference oracle instead of masquerading as another implementation of the new
-/// orchestration architecture.
-static GPU_NATIVE_CUDA: OnceLock<Mutex<GpuCairoProver<Blake2sMerkleChannel>>> = OnceLock::new();
+// The GPU-native engine is deliberately CUDA-specific. SIMD remains the legacy
+// reference oracle instead of masquerading as another implementation of the new
+// orchestration architecture. Resident CUDA graphs borrow thread-bound execution
+// state, so each proving thread owns and reuses its own prover instead of moving one
+// through a process-global mutex.
+thread_local! {
+    static GPU_NATIVE_CUDA: RefCell<Option<GpuCairoProver<Blake2sMerkleChannel>>> =
+        const { RefCell::new(None) };
+}
 static LAST_GPU_NATIVE_PCS_TELEMETRY: OnceLock<Mutex<Option<CudaPcsDriverTelemetry>>> =
     OnceLock::new();
 static LAST_GPU_NATIVE_AOT_STATS: OnceLock<Mutex<Option<AotRuntimeStats>>> = OnceLock::new();
@@ -293,41 +299,39 @@ fn record_gpu_native_session_telemetry(telemetry: &ResidentSessionTelemetry) {
         .expect("gpu-native session telemetry mutex poisoned") = Some(telemetry.clone());
 }
 
-fn prove_gpu_native(
-    cell: &OnceLock<Mutex<GpuCairoProver<Blake2sMerkleChannel>>>,
-    input: ProverInput,
-    params: ProverParameters,
-) -> BenchProof {
-    let prover = cell.get_or_init(|| {
-        Mutex::new(GpuCairoProver::new(gpu_native_prover_config()).expect("gpu-native config"))
-    });
-    let mut prover = prover.lock().unwrap();
-    let proof = if prover.config().strict {
-        prover.prove_resident_blake2s(input, params)
-    } else {
-        prover.prove(input, params)
-    }
-    .expect("gpu-native prove failed");
-    let telemetry = prover
-        .last_pcs_telemetry()
-        .expect("gpu-native prove returned without CUDA PCS architecture telemetry");
-    assert!(
-        telemetry.is_complete(),
-        "gpu-native CUDA PCS driver did not complete every architecture stage"
-    );
-    record_gpu_native_pcs_telemetry(telemetry);
-    if let Some(session) = prover.last_resident_session_telemetry() {
-        record_gpu_native_session_telemetry(session);
-    }
-    let aot_stats = prover
-        .last_aot_stats()
-        .expect("gpu-native prove returned without CUDA AOT provenance telemetry");
-    if gpu_native_architecture_required() {
-        validate_strict_aot_provenance(Some(&aot_stats))
-            .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
-    }
-    record_gpu_native_aot_stats(aot_stats);
-    proof
+fn prove_gpu_native(input: ProverInput, params: ProverParameters) -> BenchProof {
+    GPU_NATIVE_CUDA.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let prover = slot.get_or_insert_with(|| {
+            GpuCairoProver::new(gpu_native_prover_config()).expect("gpu-native config")
+        });
+        let proof = if prover.config().strict {
+            prover.prove_resident_blake2s(input, params)
+        } else {
+            prover.prove(input, params)
+        }
+        .expect("gpu-native prove failed");
+        let telemetry = prover
+            .last_pcs_telemetry()
+            .expect("gpu-native prove returned without CUDA PCS architecture telemetry");
+        assert!(
+            telemetry.is_complete(),
+            "gpu-native CUDA PCS driver did not complete every architecture stage"
+        );
+        record_gpu_native_pcs_telemetry(telemetry);
+        if let Some(session) = prover.last_resident_session_telemetry() {
+            record_gpu_native_session_telemetry(session);
+        }
+        let aot_stats = prover
+            .last_aot_stats()
+            .expect("gpu-native prove returned without CUDA AOT provenance telemetry");
+        if gpu_native_architecture_required() {
+            validate_strict_aot_provenance(Some(&aot_stats))
+                .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
+        }
+        record_gpu_native_aot_stats(aot_stats);
+        proof
+    })
 }
 
 fn gpu_native_prover_config() -> GpuProverConfig {
@@ -1606,7 +1610,7 @@ macro_rules! prove_sampled {
                     .unwrap()
             }
             ("cuda", "gpu-native") => {
-                prove_gpu_native(&GPU_NATIVE_CUDA, $input, prover_params($variant))
+                prove_gpu_native($input, prover_params($variant))
             }
             ("simd", "gpu-native") => panic!(
                 "gpu-native is a concrete CUDA proof runtime; use --engine legacy --backend simd for the reference oracle"
@@ -2564,13 +2568,15 @@ fn main() {
 mod tests {
     use stwo_backend_cuda::CudaExecTelemetry;
 
+    use crate::gpu_bench_physical::resident_session_telemetry_json;
+
     use super::{
         cairo_verification_error_class, claimed_graph_submit_gap_ns, configure_resident_backend,
         graph_capture_claim_admissible, graph_submit_gap_average_ns, initial_proof_byte_equal,
         mutate_claimed_sum, parse_resident_backend_args, pcs_telemetry_json,
         performance_claim_admissible_for, proof_byte_equal_gate_passes, proof_mutation_gate_passes,
-        quantile, resident_session_telemetry_json, simd_reference_gate_passes,
-        simd_reference_reuse_input_gate_passes, throughput_mhz, validate_gpu_native_architecture,
+        quantile, simd_reference_gate_passes, simd_reference_reuse_input_gate_passes,
+        throughput_mhz, validate_gpu_native_architecture,
         validate_resident_session_architecture, validate_strict_aot_provenance, AotRuntimeStats,
         CairoVerificationError, CudaPcsDriverTelemetry, CudaPcsRuntimeMode, GpuProverConfig,
         GraphSubmitSample, RequiredCudaPcsRuntimeMode, ResidentBackend, ResidentSessionTelemetry,

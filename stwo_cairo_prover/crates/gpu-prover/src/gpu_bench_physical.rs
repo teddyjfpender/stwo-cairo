@@ -517,7 +517,7 @@ mod tests {
         assert_eq!(value["gpu_resident_backend"], "replacement-v1");
         assert_eq!(
             value["gpu_dynamic_commitment_leaf_schedule"],
-            "retained-domain-cooperative"
+            "retained-domain-compact-h8"
         );
         assert_eq!(value["gpu_protocol_key"], 0x5678);
         assert_eq!(
