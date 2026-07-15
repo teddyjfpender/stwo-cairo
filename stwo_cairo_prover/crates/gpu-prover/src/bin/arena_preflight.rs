@@ -53,6 +53,8 @@ mod arena_preflight_cli;
 mod arena_preflight_commitment_receipt;
 #[path = "../arena_preflight_hybrid.rs"]
 mod arena_preflight_hybrid;
+#[path = "arena_preflight/ntt_lde_receipt.rs"]
+mod arena_preflight_ntt_lde_receipt;
 #[path = "../arena_preflight_staged.rs"]
 mod arena_preflight_staged;
 use std::collections::{BTreeMap, BTreeSet};
@@ -599,6 +601,7 @@ fn report_json(
     report: &ResidentPreflightReport,
     selected_backend: ResidentBackend,
     aot_coverage: &AotCoverage,
+    ntt_lde_direct_slab_frontier: serde_json::Value,
     compacted_rows: Vec<serde_json::Value>,
     source: &str,
     vram_budget_gb: f64,
@@ -800,6 +803,7 @@ fn report_json(
             "hybrid_traffic_model": hybrid_traffic,
         },
         "quotient_numerator_staged_single_write": arena_preflight_staged::json(arena),
+        "ntt_lde_direct_slab_frontier": ntt_lde_direct_slab_frontier,
         "quotient_combine_pass_byte_model": {
             "rows": quotient_combine.rows,
             "samples": quotient_combine.samples,
@@ -923,6 +927,18 @@ fn main() -> ExitCode {
     {
         return fail("dynamic_commitment_leaf_programs", error);
     }
+    let ntt_lde_direct_slab_frontier = match resident_backend {
+        ResidentBackend::ReplacementV1 => {
+            match arena_preflight_ntt_lde_receipt::json(&report.arena) {
+                Ok(receipt) => receipt,
+                Err(error) => return fail("ntt_lde_direct_slab_frontier", error),
+            }
+        }
+        ResidentBackend::LegacyResident => serde_json::json!({
+            "status": "not-applicable",
+            "reason": "direct-slab frontier requires the immutable replacement-v1 ownership policy",
+        }),
+    };
 
     let aot_coverage = match aot_coverage(&report, &aot_manifest) {
         Ok(coverage) => coverage,
@@ -937,6 +953,7 @@ fn main() -> ExitCode {
         &report,
         resident_backend,
         &aot_coverage,
+        ntt_lde_direct_slab_frontier,
         compacted_rows,
         &source,
         vram_budget_gb,
