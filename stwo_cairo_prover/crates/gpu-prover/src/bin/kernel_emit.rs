@@ -228,33 +228,46 @@ fn run_input(
     max_instrs: usize,
     max_live_u32_lanes: usize,
 ) -> Result<(), String> {
-    let state::IngestOutput {
-        preprocessed_trace,
-        generator,
-        proof_plan,
-    } = phases::ingest::run(input, variant, None);
-    let state::WitnessOutput {
-        trace: _trace,
-        claim,
-        interaction_generator,
-        device,
-    } = phases::witness::run::<SimdBackend>(
-        generator,
-        Arc::new(
-            CAIRO_SCHEDULE
-                .artifact_plan()
-                .expect("valid Cairo schedule"),
-        ),
-        proof_plan,
-        None,
-        None,
-    );
-    // Any elements work: the lowering hoists them into parameters; hashes are
-    // statement-independent.
-    let elements = CommonLookupElements::draw(&mut Blake2sChannel::default());
-    let (_evals, interaction_claim) =
-        phases::interaction::run(interaction_generator, &device, &elements);
-    let preprocessed_ids = preprocessed_trace.ids();
+    // Kernel emission needs only claims and preprocessed identities. Keep the
+    // multi-GiB witness/interaction owners inside this lexical preparation
+    // scope and release each at its exact last use before any CUDA source is
+    // lowered. Otherwise every source pass overlaps the full SN trace.
+    let (claim, interaction_claim, preprocessed_ids, elements) = {
+        let state::IngestOutput {
+            preprocessed_trace,
+            generator,
+            proof_plan,
+        } = phases::ingest::run(input, variant, None);
+        let state::WitnessOutput {
+            trace,
+            claim,
+            interaction_generator,
+            device,
+        } = phases::witness::run::<SimdBackend>(
+            generator,
+            Arc::new(
+                CAIRO_SCHEDULE
+                    .artifact_plan()
+                    .expect("valid Cairo schedule"),
+            ),
+            proof_plan,
+            None,
+            None,
+        );
+        drop(trace);
+
+        // Any elements work: the lowering hoists them into parameters; hashes
+        // are statement-independent.
+        let elements = CommonLookupElements::draw(&mut Blake2sChannel::default());
+        let (evals, interaction_claim) =
+            phases::interaction::run(interaction_generator, &device, &elements);
+        drop(evals);
+        drop(device);
+
+        let preprocessed_ids = preprocessed_trace.ids();
+        drop(preprocessed_trace);
+        (claim, interaction_claim, preprocessed_ids, elements)
+    };
     let components = CairoComponents::new(&claim, &elements, &interaction_claim, &preprocessed_ids);
 
     macro_rules! emit_fields {
