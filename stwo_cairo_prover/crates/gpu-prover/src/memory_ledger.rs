@@ -3,10 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::arena_plan::{
-    BufferPurpose, LogicalBuffer, OpenedColumnSource, ProofArenaPlan, ProofEpoch,
+    ArenaBinding, BufferPurpose, CommitmentTreeId, LogicalBuffer, OpenedColumnSource,
+    ProofArenaPlan, ProofEpoch,
 };
 use crate::fixed_table_materializer::PEDERSEN_POINTS_18_EVALUATION_BYTES;
+use crate::prepared_composition::CompositionOutputMode;
 use crate::resident_sources::MAX_PREPROCESSED_DETACHED_STAGING_BYTES;
+use crate::source_ownership::LateCoefficientOwnership;
 
 mod physical_rows;
 pub use physical_rows::{
@@ -198,26 +201,35 @@ impl PhysicalMemoryLedger {
             })
             .collect::<Vec<_>>();
         let mut coefficient_bytes = BTreeMap::<ProofEpoch, usize>::new();
+        let mut retained_evaluation_bytes = BTreeMap::<ProofEpoch, usize>::new();
         for ownership in plan.late_coefficient_ownership().entries() {
-            let buffer = coefficient_buffer(plan.logical_buffers(), ownership.source)
-                .ok_or("late ownership source has no logical coefficient buffer")?;
-            checked_add(
-                &mut coefficient_bytes,
-                ownership.final_consumer,
-                buffer.len_words,
-            )?;
+            match direct_composition_retained_output(plan, ownership)? {
+                Some(output) => {
+                    if coefficient_buffer(plan.logical_buffers(), ownership.source).is_some() {
+                        return Err("direct Composition retained an unexpected coefficient buffer");
+                    }
+                    coefficient_bytes
+                        .entry(ownership.final_consumer)
+                        .or_default();
+                    checked_add(
+                        &mut retained_evaluation_bytes,
+                        ownership.final_consumer,
+                        output.len_words,
+                    )?;
+                }
+                None => {
+                    let buffer = coefficient_buffer(plan.logical_buffers(), ownership.source)
+                        .ok_or("late ownership source has no logical coefficient buffer")?;
+                    checked_add(
+                        &mut coefficient_bytes,
+                        ownership.final_consumer,
+                        buffer.len_words,
+                    )?;
+                }
+            }
         }
-        let coefficient_bytes = coefficient_bytes
-            .into_iter()
-            .map(|(epoch, words)| {
-                Ok((
-                    format!("{epoch:?}"),
-                    words
-                        .checked_mul(WORD_BYTES)
-                        .ok_or("coefficient byte size overflow")?,
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, &'static str>>()?;
+        let coefficient_bytes = epoch_words_to_bytes(coefficient_bytes)?;
+        let retained_evaluation_bytes = epoch_words_to_bytes(retained_evaluation_bytes)?;
         let arena_allocation_fit = ledger.arena_allocation_bytes <= operational_ceiling_bytes;
         let process_owned_pedersen_table_bytes = plan
             .requires_registered_pedersen_table()
@@ -290,6 +302,7 @@ impl PhysicalMemoryLedger {
             "aggregate_range_view_bytes": ledger.aggregate_range_view_bytes,
             "epochs": epochs,
             "late_coefficient_bytes_by_final_consumer": coefficient_bytes,
+            "late_retained_evaluation_bytes_by_owner": retained_evaluation_bytes,
             "operational_ceiling_bytes": operational_ceiling_bytes,
             "arena_allocation_fit": arena_allocation_fit,
             "arena_only_fit": arena_allocation_fit,
@@ -397,6 +410,62 @@ fn coefficient_buffer(
         }
         OpenedColumnSource::Preprocessed { .. } => false,
     })
+}
+
+fn direct_composition_retained_output(
+    plan: &ProofArenaPlan,
+    ownership: &LateCoefficientOwnership,
+) -> Result<Option<ArenaBinding>, &'static str> {
+    let Some(program) = plan.composition().output_plan.direct_program() else {
+        return Ok(None);
+    };
+    if plan.composition().output_plan.mode() != CompositionOutputMode::DirectRetainedEvaluations {
+        return Err("direct Composition program has the wrong output mode");
+    }
+    let OpenedColumnSource::Composition { ordinal } = ownership.source else {
+        return Ok(None);
+    };
+    if ownership.composition_reads_coefficients
+        || ownership.oods_reads_coefficients
+        || ownership.quotient_reads_coefficients
+        || ownership.decommit_reads_coefficients
+        || ownership.final_consumer != ProofEpoch::CompositionCommit
+    {
+        return Err("direct Composition has a live coefficient reader");
+    }
+    let commitment = plan
+        .commitment(CommitmentTreeId::Composition)
+        .ok_or("direct Composition commitment is missing")?;
+    let [Some(outputs)] = commitment.evaluation_output_groups.as_slice() else {
+        return Err("direct Composition retained output group is not unique");
+    };
+    let output = outputs
+        .get(usize::try_from(ordinal).map_err(|_| "Composition ordinal overflow")?)
+        .copied()
+        .ok_or("direct Composition retained output is missing")?;
+    let expected_words = 1usize
+        .checked_shl(program.schedule().evaluation_log_size)
+        .ok_or("direct Composition retained output extent overflow")?;
+    if outputs.len() != 8 || output.len_words != expected_words {
+        return Err("direct Composition retained output extent drifted");
+    }
+    Ok(Some(output))
+}
+
+fn epoch_words_to_bytes(
+    words: BTreeMap<ProofEpoch, usize>,
+) -> Result<BTreeMap<String, usize>, &'static str> {
+    words
+        .into_iter()
+        .map(|(epoch, words)| {
+            Ok((
+                format!("{epoch:?}"),
+                words
+                    .checked_mul(WORD_BYTES)
+                    .ok_or("coefficient byte size overflow")?,
+            ))
+        })
+        .collect()
 }
 
 fn checked_add<K: Ord + Copy>(

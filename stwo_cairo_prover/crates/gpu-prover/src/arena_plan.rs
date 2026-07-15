@@ -30,40 +30,40 @@ use stwo_backend_cuda::{
     Blake2sTranscriptRequirements, Blake2sTranscriptWorkspaceSlots, CommitBatchRequirements,
     CommitBatchSlots, CommitGroupSlots, CommitProgram, CommitProgramError, CommitWorkspaceConfig,
     CommitWorkspaceSlots, CompactDomainBindingError, CompactDomainProgram,
-    CompactDomainProgramError, CudaExecContext, DecommitColumnGeometry, DecommitSourceMode,
-    DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots, DecommitWorkspaceConfig,
-    DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena, DeviceTranscriptError,
-    DirectCompactDomainBindingError, DirectRetainedB2nError, DirectRetainedB2nProgram,
-    DomainCooperativeProgram, DomainCooperativeProgramError, EcOpMultiplicityGeometry,
-    EcOpWorkspaceRequirements, EcOpWorkspaceSlots, ExecutionTablesWorkspaceRequirements,
-    ExecutionTablesWorkspaceSlots, FixedTableContiguousWorkspaceSlots, FriDecommitGeometry,
-    FriDecommitSlots, FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriFoldLaunchMode,
-    FriMerkleTreeSlots, FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots,
-    InterpolationLaunchMode, MerkleFromLeavesSlots, ModeAwareCommitWorkspaceRequirements,
-    ModeAwareCommitWorkspaceSlots, OodsColumnTopology, OodsSourceKind, OodsWorkspaceConfig,
-    OodsWorkspaceRequirements, OodsWorkspaceSlots, PreparedBlake2sPowError, PreparedCommitError,
-    PreparedDecommitError, PreparedExecutionTablesError, PreparedFixedTableError, PreparedFriError,
-    PreparedFriFinalError, PreparedOodsError, PreparedProgressiveCommitError,
-    PreparedQuotientError, PreparedQuotientNumeratorError, PreparedWitnessCasmInputError,
-    PreparedWitnessError, PreparedWitnessFeedError, PreparedWitnessInputGatherError,
-    ProgressiveBatchRequirements, ProgressiveBatchSlots, ProgressiveCommitGeometry,
-    ProgressiveCommitGroupGeometry, ProgressiveCommitMode, ProgressiveCommitStorageMode,
-    ProgressiveCommitWorkspaceSlots, ProgressiveLeafWorkspaceSlots, ProgressiveNttLeafFusionMode,
-    QuotientNumeratorColumnTopology, QuotientNumeratorSingleWriteError,
-    QuotientNumeratorSourceKind, QuotientNumeratorStagedSingleWriteError,
-    QuotientNumeratorStagedSingleWritePlan, QuotientNumeratorWorkspaceConfig,
-    QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
-    QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
-    RelationGraphError, RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots,
-    RelationLaunchMode, RelationTailMode, TraceDecommitGeometry, TraceDecommitSlots,
-    TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRole, TranscriptInputId,
-    TranscriptOutputId, WitnessCasmInputRequirements, WitnessCasmInputSlots,
-    WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode,
-    WitnessFeedWorkspaceSlots, WitnessInputCompactLayout, WitnessInputCompactRequirements,
-    WitnessInputCompactSlots, WitnessInputGatherEdge, WitnessInputGatherRequirements,
-    WitnessInputGatherSlots, WitnessInputSeedRequirements, WitnessInputSeedSlots,
-    WitnessWorkspaceRequirements, WitnessWorkspaceSlots, EXECUTION_TABLE_BIG_LIMBS,
-    EXECUTION_TABLE_SMALL_LIMBS,
+    CompactDomainProgramError, CompositionSplitProgram, CudaExecContext, DecommitColumnGeometry,
+    DecommitSourceMode, DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots,
+    DecommitWorkspaceConfig, DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena,
+    DeviceTranscriptError, DirectCompactDomainBindingError, DirectRetainedB2nError,
+    DirectRetainedB2nProgram, DomainCooperativeProgram, DomainCooperativeProgramError,
+    EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
+    ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
+    FixedTableContiguousWorkspaceSlots, FriDecommitGeometry, FriDecommitSlots,
+    FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriFoldLaunchMode, FriMerkleTreeSlots,
+    FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots, InterpolationLaunchMode,
+    MerkleFromLeavesSlots, ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
+    OodsColumnTopology, OodsSourceKind, OodsWorkspaceConfig, OodsWorkspaceRequirements,
+    OodsWorkspaceSlots, PreparedBlake2sPowError, PreparedCommitError, PreparedDecommitError,
+    PreparedExecutionTablesError, PreparedFixedTableError, PreparedFriError, PreparedFriFinalError,
+    PreparedOodsError, PreparedProgressiveCommitError, PreparedQuotientError,
+    PreparedQuotientNumeratorError, PreparedWitnessCasmInputError, PreparedWitnessError,
+    PreparedWitnessFeedError, PreparedWitnessInputGatherError, ProgressiveBatchRequirements,
+    ProgressiveBatchSlots, ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
+    ProgressiveCommitMode, ProgressiveCommitStorageMode, ProgressiveCommitWorkspaceSlots,
+    ProgressiveLeafWorkspaceSlots, ProgressiveNttLeafFusionMode, QuotientNumeratorColumnTopology,
+    QuotientNumeratorSingleWriteError, QuotientNumeratorSourceKind,
+    QuotientNumeratorStagedSingleWriteError, QuotientNumeratorStagedSingleWritePlan,
+    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
+    QuotientNumeratorWorkspaceSlots, QuotientOodsSample, QuotientWorkspaceConfig,
+    QuotientWorkspaceRequirements, QuotientWorkspaceSlots, RelationGraphError,
+    RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots, RelationLaunchMode,
+    RelationTailMode, TraceDecommitGeometry, TraceDecommitSlots, TraceSourceGroupGeometry,
+    TraceSourceGroupSlots, TraceTreeRole, TranscriptInputId, TranscriptOutputId,
+    WitnessCasmInputRequirements, WitnessCasmInputSlots, WitnessFeedClearWorkspaceRequirements,
+    WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode, WitnessFeedWorkspaceSlots,
+    WitnessInputCompactLayout, WitnessInputCompactRequirements, WitnessInputCompactSlots,
+    WitnessInputGatherEdge, WitnessInputGatherRequirements, WitnessInputGatherSlots,
+    WitnessInputSeedRequirements, WitnessInputSeedSlots, WitnessWorkspaceRequirements,
+    WitnessWorkspaceSlots, EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_SMALL_LIMBS,
 };
 use stwo_cairo_adapter::opcodes::recorded_casm_descriptor;
 use stwo_cairo_prover::witness::jit_prove_backend::{BlakeGRecordedLane, BuiltinLaneSpec};
@@ -88,7 +88,8 @@ use crate::multiplicity_pipeline::{
 use crate::plan::ProofPlan;
 use crate::prepared_composition::{
     composition_workspace_requirements_with_retention, CompositionCoefficientSource,
-    CompositionExtParamBinding, CompositionLaunchMode, CompositionTraceTopology,
+    CompositionExtParamBinding, CompositionLaunchMode, CompositionOutputMode,
+    CompositionOutputPlan, CompositionOutputSlots, CompositionTraceTopology,
     CompositionWorkspaceRequirements, CompositionWorkspaceSlots, PreparedCompositionError,
 };
 use crate::proof_bundle::{ResidentProofBundleError, ResidentProofBundleLayout};
@@ -2369,7 +2370,7 @@ struct LogicalPreprocessedWorkspace {
 #[derive(Clone, Debug)]
 struct LogicalOodsColumn {
     geometry: OodsColumnGeometry,
-    coefficients: LogicalBufferId,
+    coefficients: Option<LogicalBufferId>,
     source_kind: OodsSourceKind,
     source_binding: LogicalBufferId,
 }
@@ -2403,9 +2404,16 @@ struct LogicalCompositionWorkspace {
     lde_tile: LogicalBufferId,
     accumulators: LogicalBufferId,
     random_coefficient_powers: LogicalBufferId,
-    composition_coefficients: [LogicalBufferId; 8],
+    output: LogicalCompositionOutput,
     direct_retention: Option<DirectCompositionRetentionPlan>,
     direct_bindings: Vec<LogicalDirectCompositionBinding>,
+    output_plan: CompositionOutputPlan,
+}
+
+#[derive(Clone, Debug)]
+enum LogicalCompositionOutput {
+    CoefficientSplit([LogicalBufferId; 8]),
+    DirectRetainedEvaluations,
 }
 
 #[derive(Clone, Debug)]
@@ -2448,7 +2456,7 @@ struct LogicalOodsWorkspace {
 struct LogicalQuotientNumeratorColumn {
     source: OpenedColumnSource,
     topology: QuotientNumeratorColumnTopology,
-    coefficients: LogicalBufferId,
+    coefficients: Option<LogicalBufferId>,
     numerator_source: LogicalBufferId,
 }
 
@@ -3178,6 +3186,7 @@ pub struct PlannedCompositionWorkspace {
     pub slots: CompositionWorkspaceSlots,
     pub direct_retention: Option<DirectCompositionRetentionPlan>,
     pub direct_bindings: Vec<PlannedDirectCompositionBinding>,
+    pub output_plan: CompositionOutputPlan,
 }
 
 impl PlannedCompositionWorkspace {
@@ -3242,7 +3251,7 @@ pub struct PlannedOodsWorkspace {
 pub struct PlannedQuotientNumeratorColumn {
     pub source: OpenedColumnSource,
     pub topology: QuotientNumeratorColumnTopology,
-    pub coefficients: ArenaBinding,
+    pub coefficients: Option<ArenaBinding>,
     pub numerator_source: ArenaBinding,
 }
 
@@ -3700,7 +3709,11 @@ impl ProofArenaPlan {
             &logical_witness,
             logical_multiplicity.as_ref(),
         )?;
-        validate_commitment_sources(&logical, &logical_commitments)?;
+        validate_commitment_sources(
+            &logical,
+            &logical_commitments,
+            logical_composition.output_plan,
+        )?;
 
         // Retain the old whole-slot result as an exact same-shape comparator,
         // but bind production execution to the checked range-packed layout.
@@ -6219,8 +6232,21 @@ fn append_relation_buffers(
 fn validate_commitment_sources(
     logical: &[LogicalBuffer],
     commitments: &[LogicalCommitWorkspace],
+    composition_output_plan: CompositionOutputPlan,
 ) -> Result<(), ArenaPlanError> {
     for commitment in commitments {
+        let direct_composition_outputs = if commitment.id == CommitmentTreeId::Composition
+            && composition_output_plan.mode() == CompositionOutputMode::DirectRetainedEvaluations
+        {
+            let [Some(outputs)] = commitment.retained_evaluations.as_slice() else {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "direct Composition output requires one retained evaluation group",
+                ));
+            };
+            Some(outputs)
+        } else {
+            None
+        };
         for (sources, log_sizes) in commitment
             .grouped_column_sources
             .iter()
@@ -6254,6 +6280,36 @@ fn validate_commitment_sources(
                         tree: commitment.id,
                         source,
                     });
+                }
+                if let Some(outputs) = direct_composition_outputs {
+                    let CommitmentColumnSource::Composition { ordinal } = source else {
+                        return Err(ArenaPlanError::CommitmentSourceTreeMismatch {
+                            tree: commitment.id,
+                            source,
+                        });
+                    };
+                    let canonical =
+                        usize::try_from(ordinal).map_err(|_| ArenaPlanError::SizeOverflow)?;
+                    let output = outputs.get(canonical).copied().ok_or(
+                        ArenaPlanError::MissingCommitmentSource {
+                            tree: commitment.id,
+                            source,
+                        },
+                    )?;
+                    let buffer = &logical[output.0 as usize];
+                    let evaluation_log_size = log_size
+                        .checked_add(commitment.config.log_blowup_factor)
+                        .ok_or(ArenaPlanError::SizeOverflow)?;
+                    let expected_words = checked_pow2(evaluation_log_size)?;
+                    if buffer.len_words != expected_words {
+                        return Err(ArenaPlanError::CommitmentSourceSizeMismatch {
+                            tree: commitment.id,
+                            source,
+                            expected_words,
+                            actual_words: buffer.len_words,
+                        });
+                    }
+                    continue;
                 }
                 let buffer = logical
                     .iter()
@@ -6297,6 +6353,15 @@ fn validate_commitment_sources(
                 }
             }
         }
+    }
+    if composition_output_plan.mode() == CompositionOutputMode::DirectRetainedEvaluations
+        && logical
+            .iter()
+            .any(|buffer| buffer.purpose == BufferPurpose::CompositionCoefficients)
+    {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "direct Composition output retained a coefficient allocation",
+        ));
     }
     Ok(())
 }
@@ -6855,6 +6920,116 @@ fn direct_retained_b2n_program(
         .map_err(ArenaPlanError::DirectRetainedB2n)
 }
 
+fn composition_output_plan(
+    protocol: &ProtocolGeometry,
+    requirements: &CompositionWorkspaceRequirements,
+    ownership: &LateCoefficientOwnershipPlan,
+) -> Result<CompositionOutputPlan, ArenaPlanError> {
+    let evaluation_log_size = requirements.max_evaluation_log_size;
+    if protocol.identity.resident_backend != ResidentBackend::ReplacementV1
+        || protocol.identity.dynamic_commitment_leaf_schedule
+            != DynamicCommitmentLeafSchedule::RetainedDomainCompactH8
+        || !matches!(evaluation_log_size, 24 | 25)
+    {
+        return Ok(CompositionOutputPlan::CoefficientSplit);
+    }
+    let coefficient_log_size = evaluation_log_size
+        .checked_sub(protocol.identity.log_blowup_factor)
+        .ok_or(ArenaPlanError::SizeOverflow)?;
+    let Some(geometry) = protocol
+        .commitments
+        .iter()
+        .find(|commitment| commitment.id == CommitmentTreeId::Composition)
+    else {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "missing composition commitment geometry",
+        ));
+    };
+    let [logs] = geometry.grouped_column_log_sizes.as_slice() else {
+        return Ok(CompositionOutputPlan::CoefficientSplit);
+    };
+    let [sources] = geometry.grouped_column_sources.as_slice() else {
+        return Ok(CompositionOutputPlan::CoefficientSplit);
+    };
+    let exact_geometry = geometry.created == ProofEpoch::CompositionCommit
+        && geometry.config.log_blowup_factor == 1
+        && protocol.identity.log_blowup_factor == 1
+        && geometry.retained_evaluation_groups.as_slice() == [true]
+        && logs.len() == 8
+        && logs.iter().all(|&log| log == coefficient_log_size)
+        && sources.len() == 8
+        && sources.iter().enumerate().all(|(ordinal, &source)| {
+            u32::try_from(ordinal)
+                .is_ok_and(|ordinal| source == CommitmentColumnSource::Composition { ordinal })
+        });
+    let exact_ownership = (0..8u32).all(|ordinal| {
+        ownership
+            .get(OpenedColumnSource::Composition { ordinal })
+            .is_some_and(|entry| {
+                !entry.composition_reads_coefficients
+                    && !entry.oods_reads_coefficients
+                    && !entry.quotient_reads_coefficients
+                    && !entry.decommit_reads_coefficients
+                    && entry.final_consumer == ProofEpoch::CompositionCommit
+            })
+    });
+    if !exact_geometry || !exact_ownership {
+        return Ok(CompositionOutputPlan::CoefficientSplit);
+    }
+    CompositionSplitProgram::compile(evaluation_log_size)
+        .map(CompositionOutputPlan::DirectRetainedEvaluations)
+        .map_err(|error| ArenaPlanError::Composition(PreparedCompositionError::DirectSplit(error)))
+}
+
+fn append_composition_output_buffers(
+    logical: &mut Vec<LogicalBuffer>,
+    composition_commitment: &CommitmentGeometry,
+    composition_requirements: &CompositionWorkspaceRequirements,
+    output_plan: CompositionOutputPlan,
+    ownership: &LateCoefficientOwnershipPlan,
+) -> Result<LogicalCompositionOutput, ArenaPlanError> {
+    let CompositionOutputPlan::CoefficientSplit = output_plan else {
+        return Ok(LogicalCompositionOutput::DirectRetainedEvaluations);
+    };
+    let mut coefficients = Vec::with_capacity(8);
+    for (composition_column, &log_size) in composition_commitment
+        .grouped_column_log_sizes
+        .iter()
+        .flatten()
+        .enumerate()
+    {
+        let ordinal =
+            u32::try_from(composition_column).map_err(|_| ArenaPlanError::SizeOverflow)?;
+        coefficients.push(push_buffer_id(
+            logical,
+            None,
+            None,
+            BufferPurpose::CompositionCoefficients,
+            ordinal,
+            checked_pow2(log_size)?,
+            BufferLifetime::new(
+                ProofEpoch::Composition,
+                ownership
+                    .final_consumer(OpenedColumnSource::Composition { ordinal })
+                    .map_err(ArenaPlanError::InvalidProtocolGeometry)?,
+            )?,
+        )?);
+    }
+    let coefficients: [LogicalBufferId; 8] = coefficients.try_into().map_err(|_| {
+        ArenaPlanError::InvalidProtocolGeometry(
+            "composition commitment must contain eight M31 coordinate polynomials",
+        )
+    })?;
+    if coefficients.iter().any(|id| {
+        logical[id.0 as usize].len_words < composition_requirements.output_coefficient_words
+    }) {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "composition coefficient output is smaller than the prepared composition result",
+        ));
+    }
+    Ok(LogicalCompositionOutput::CoefficientSplit(coefficients))
+}
+
 fn append_protocol_buffers(
     logical: &mut Vec<LogicalBuffer>,
     released_commitment_aliases: &mut Vec<ReleasedCommitmentAlias>,
@@ -6916,6 +7091,11 @@ fn append_protocol_buffers(
         protocol.direct_composition_retention.as_ref(),
     )
     .map_err(ArenaPlanError::Composition)?;
+    let composition_output_plan = composition_output_plan(
+        protocol,
+        &composition_requirements,
+        late_coefficient_ownership,
+    )?;
     let max_commitment_twiddle_words = commit_requirements
         .iter()
         .map(|requirements| match requirements {
@@ -7892,43 +8072,13 @@ fn append_protocol_buffers(
         .ok_or(ArenaPlanError::InvalidProtocolGeometry(
             "missing composition commitment geometry",
         ))?;
-    let mut composition_coefficients = Vec::with_capacity(8);
-    for (composition_column, &log_size) in composition_commitment
-        .grouped_column_log_sizes
-        .iter()
-        .flatten()
-        .enumerate()
-    {
-        let ordinal =
-            u32::try_from(composition_column).map_err(|_| ArenaPlanError::SizeOverflow)?;
-        composition_coefficients.push(push_buffer_id(
-            logical,
-            None,
-            None,
-            BufferPurpose::CompositionCoefficients,
-            ordinal,
-            checked_pow2(log_size)?,
-            BufferLifetime::new(
-                ProofEpoch::Composition,
-                late_coefficient_ownership
-                    .final_consumer(OpenedColumnSource::Composition { ordinal })
-                    .map_err(ArenaPlanError::InvalidProtocolGeometry)?,
-            )?,
-        )?);
-    }
-    let composition_coefficients: [LogicalBufferId; 8] =
-        composition_coefficients.try_into().map_err(|_| {
-            ArenaPlanError::InvalidProtocolGeometry(
-                "composition commitment must contain eight M31 coordinate polynomials",
-            )
-        })?;
-    if composition_coefficients.iter().any(|id| {
-        logical[id.0 as usize].len_words < composition_requirements.output_coefficient_words
-    }) {
-        return Err(ArenaPlanError::InvalidProtocolGeometry(
-            "composition coefficient output is smaller than the prepared composition result",
-        ));
-    }
+    let composition_output = append_composition_output_buffers(
+        logical,
+        composition_commitment,
+        &composition_requirements,
+        composition_output_plan,
+        late_coefficient_ownership,
+    )?;
     let mut composition_trace_trees = vec![Vec::new(), Vec::new(), Vec::new()];
     for column in &protocol.oods.columns {
         let tree = match column.source {
@@ -8090,9 +8240,10 @@ fn append_protocol_buffers(
         lde_tile: composition_lde_tile,
         accumulators: composition_accumulators,
         random_coefficient_powers: composition_random_powers,
-        composition_coefficients,
+        output: composition_output,
         direct_retention: protocol.direct_composition_retention.clone(),
         direct_bindings,
+        output_plan: composition_output_plan,
     };
     let opened_columns = protocol
         .oods
@@ -8100,20 +8251,22 @@ fn append_protocol_buffers(
         .iter()
         .zip(&oods_source_kinds)
         .map(|(geometry, &source_kind)| {
-            let coefficients = opened_source_logical_id(logical, geometry.source).ok_or(
-                ArenaPlanError::InvalidProtocolGeometry(
-                    "OODS column coefficient identity is absent from the arena",
-                ),
-            )?;
-            if logical[coefficients.0 as usize].len_words
-                != checked_pow2(geometry.coefficient_log_size)?
-            {
-                return Err(ArenaPlanError::InvalidProtocolGeometry(
-                    "OODS coefficient identity size disagrees with topology",
-                ));
+            let coefficients = opened_source_logical_id(logical, geometry.source);
+            if let Some(coefficients) = coefficients {
+                if logical[coefficients.0 as usize].len_words
+                    != checked_pow2(geometry.coefficient_log_size)?
+                {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "OODS coefficient identity size disagrees with topology",
+                    ));
+                }
             }
             let source_binding = match source_kind {
-                OodsSourceKind::Coefficients => coefficients,
+                OodsSourceKind::Coefficients => {
+                    coefficients.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                        "coefficient-backed OODS source is absent from the arena",
+                    ))?
+                }
                 OodsSourceKind::Evaluations => retained_oods_source(
                     &logical_commitments,
                     geometry.source,
@@ -8427,7 +8580,13 @@ fn append_protocol_buffers(
         .zip(quotient_numerator_topologies)
         .map(|(column, topology)| {
             let numerator_source = match topology.source_kind {
-                QuotientNumeratorSourceKind::Coefficients => column.coefficients,
+                QuotientNumeratorSourceKind::Coefficients => {
+                    column
+                        .coefficients
+                        .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                            "coefficient-backed quotient numerator source is absent from the arena",
+                        ))?
+                }
                 QuotientNumeratorSourceKind::Evaluation => retained_quotient_numerator_source(
                     &logical_commitments,
                     column.geometry.source,
@@ -9013,18 +9172,32 @@ fn resolve_composition_slots(
 ) -> Result<PlannedCompositionWorkspace, ArenaPlanError> {
     let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
+    let output = match logical.output {
+        LogicalCompositionOutput::CoefficientSplit(coefficients) => {
+            CompositionOutputSlots::CoefficientSplit(
+                coefficients
+                    .map(physical)
+                    .into_iter()
+                    .collect::<Result<Vec<_>, ArenaPlanError>>()?
+                    .try_into()
+                    .expect("exactly eight composition coefficient slots"),
+            )
+        }
+        LogicalCompositionOutput::DirectRetainedEvaluations => {
+            CompositionOutputSlots::DirectRetainedEvaluations
+        }
+    };
+    if output.mode() != logical.output_plan.mode() {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "Composition output plan changed while resolving physical slots",
+        ));
+    }
     let slots = CompositionWorkspaceSlots {
         descriptors: physical(logical.descriptors)?,
         lde_tile: physical(logical.lde_tile)?,
         accumulators: physical(logical.accumulators)?,
         random_coefficient_powers: physical(logical.random_coefficient_powers)?,
-        composition_coefficients: logical
-            .composition_coefficients
-            .map(physical)
-            .into_iter()
-            .collect::<Result<Vec<_>, ArenaPlanError>>()?
-            .try_into()
-            .expect("exactly eight composition coefficient slots"),
+        output,
     };
     let workspace_ids = logical
         .requirements
@@ -9147,6 +9320,7 @@ fn resolve_composition_slots(
         slots,
         direct_retention: logical.direct_retention,
         direct_bindings,
+        output_plan: logical.output_plan,
     })
 }
 
@@ -9315,7 +9489,7 @@ fn resolve_quotient_numerator_slots(
         .columns
         .into_iter()
         .map(|column| {
-            let coefficients = binding(column.coefficients)?;
+            let coefficients = column.coefficients.map(binding).transpose()?;
             let numerator_source = binding(column.numerator_source)?;
             validate_quotient_numerator_source_binding(
                 logical.config,
@@ -9409,7 +9583,7 @@ fn quotient_numerator_sources_alias_workspace(
 fn validate_quotient_numerator_source_binding(
     config: QuotientNumeratorWorkspaceConfig,
     topology: &QuotientNumeratorColumnTopology,
-    coefficients: ArenaBinding,
+    coefficients: Option<ArenaBinding>,
     numerator_source: ArenaBinding,
 ) -> Result<(), ArenaPlanError> {
     let source_log_size = match topology.source_kind {
@@ -9419,10 +9593,11 @@ fn validate_quotient_numerator_source_binding(
             .checked_add(config.log_blowup_factor)
             .ok_or(ArenaPlanError::SizeOverflow)?,
     };
-    if numerator_source.len_words != checked_pow2(source_log_size)?
-        || (topology.source_kind == QuotientNumeratorSourceKind::Coefficients
-            && numerator_source != coefficients)
-    {
+    let exact_kind = match topology.source_kind {
+        QuotientNumeratorSourceKind::Coefficients => coefficients == Some(numerator_source),
+        QuotientNumeratorSourceKind::Evaluation => true,
+    };
+    if numerator_source.len_words != checked_pow2(source_log_size)? || !exact_kind {
         return Err(ArenaPlanError::InvalidProtocolGeometry(
             "quotient numerator source binding has the wrong kind or extent",
         ));
@@ -12338,12 +12513,12 @@ mod tests {
         );
         assert_eq!(evaluation_column.numerator_source.len_words, 1 << 26);
         assert_ne!(
-            evaluation_column.numerator_source,
+            Some(evaluation_column.numerator_source),
             evaluation_column.coefficients
         );
         assert!(numerator_columns.iter().all(|column| {
             column.topology.source_kind == QuotientNumeratorSourceKind::Evaluation
-                || column.numerator_source == column.coefficients
+                || Some(column.numerator_source) == column.coefficients
         }));
         let retained_source_buffer = retained_numerator_arena
             .logical_buffers()
@@ -12407,6 +12582,68 @@ mod tests {
                     && !ownership.decommit_reads_coefficients
                     && ownership.final_consumer == ProofEpoch::CompositionCommit
             }));
+        for (evaluation_log_size, expected_removed_bytes) in
+            [(24u32, 256usize << 20), (25u32, 512usize << 20)]
+        {
+            let mut geometry = exclusive_late
+                .commitments
+                .iter()
+                .find(|commitment| commitment.id == CommitmentTreeId::Composition)
+                .unwrap()
+                .clone();
+            geometry.grouped_column_log_sizes =
+                vec![vec![evaluation_log_size.checked_sub(1).unwrap(); 8]];
+            let mut requirements = exclusive_late_arena.composition().requirements.clone();
+            requirements.max_evaluation_log_size = evaluation_log_size;
+            requirements.output_coefficient_words =
+                checked_pow2(evaluation_log_size.checked_sub(1).unwrap()).unwrap();
+
+            let mut direct_logical = Vec::new();
+            let direct = append_composition_output_buffers(
+                &mut direct_logical,
+                &geometry,
+                &requirements,
+                CompositionOutputPlan::DirectRetainedEvaluations(
+                    CompositionSplitProgram::compile(evaluation_log_size).unwrap(),
+                ),
+                exclusive_late_arena.late_coefficient_ownership(),
+            )
+            .unwrap();
+            assert!(matches!(
+                direct,
+                LogicalCompositionOutput::DirectRetainedEvaluations
+            ));
+            assert!(direct_logical.is_empty());
+
+            let mut fallback_logical = Vec::new();
+            let fallback = append_composition_output_buffers(
+                &mut fallback_logical,
+                &geometry,
+                &requirements,
+                CompositionOutputPlan::CoefficientSplit,
+                exclusive_late_arena.late_coefficient_ownership(),
+            )
+            .unwrap();
+            let LogicalCompositionOutput::CoefficientSplit(ids) = fallback else {
+                unreachable!();
+            };
+            assert_eq!(ids.len(), 8);
+            assert_eq!(
+                fallback_logical
+                    .iter()
+                    .map(|buffer| buffer.len_words)
+                    .sum::<usize>()
+                    .checked_mul(core::mem::size_of::<u32>())
+                    .unwrap(),
+                expected_removed_bytes,
+                "direct L{evaluation_log_size} must remove the exact eight-slab arena image",
+            );
+            assert!(fallback_logical.iter().all(|buffer| {
+                buffer.purpose == BufferPurpose::CompositionCoefficients
+                    && buffer.lifetime.first == ProofEpoch::Composition
+                    && buffer.lifetime.last == ProofEpoch::CompositionCommit
+            }));
+        }
         assert!(retained_composition.iter().all(|binding| {
             exclusive_late_arena.logical_buffers()[binding.logical.0 as usize]
                 .lifetime
@@ -12470,12 +12707,18 @@ mod tests {
             std::slice::from_ref(evaluation_column),
             &source_alias
         ));
-        let coefficient_source_alias = BTreeSet::from([coefficient_column.coefficients.physical]);
+        let coefficient_source_alias = BTreeSet::from([coefficient_column
+            .coefficients
+            .expect("coefficient source kind owns a coefficient binding")
+            .physical]);
         assert!(quotient_numerator_sources_alias_workspace(
             std::slice::from_ref(coefficient_column),
             &coefficient_source_alias
         ));
-        let retired_coefficient_reuse = BTreeSet::from([evaluation_column.coefficients.physical]);
+        let retired_coefficient_reuse = BTreeSet::from([evaluation_column
+            .coefficients
+            .expect("decommit-backed fixture retains coefficients")
+            .physical]);
         assert!(!quotient_numerator_sources_alias_workspace(
             std::slice::from_ref(evaluation_column),
             &retired_coefficient_reuse

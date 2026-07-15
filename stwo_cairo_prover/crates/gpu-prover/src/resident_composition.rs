@@ -1,16 +1,19 @@
 //! Exact resident bindings for the prepared Cairo composition graph.
 
-use stwo_backend_cuda::{ArenaSlotId, PreparedRelationGraph};
+use stwo_backend_cuda::{
+    ArenaSlotId, CompositionSplitPointerSlots, ModeAwareCommitWorkspaceRequirements,
+    ModeAwareCommitWorkspaceSlots, PreparedRelationGraph, COMPOSITION_RETAINED_COLUMNS,
+};
 
-use crate::arena_plan::ArenaBinding;
+use crate::arena_plan::{ArenaBinding, CommitmentTreeId};
 use crate::composition_plan::{
     CompositionExtParamSource, CompositionPlan, CompositionProofBindings,
 };
 use crate::direct_composition_retention::DirectCompositionRetentionPlan;
 use crate::graphs::{bind_arena_binding, GraphWorkspace};
 use crate::prepared_composition::{
-    CompositionDeviceInputs, CompositionDirectEvaluationBinding, PreparedCompositionError,
-    PreparedCompositionGraph,
+    CompositionDeviceInputs, CompositionDirectEvaluationBinding, CompositionDirectSplitBinding,
+    PreparedCompositionError, PreparedCompositionGraph,
 };
 use crate::relation::RelationTracePart;
 
@@ -42,6 +45,7 @@ pub enum ResidentCompositionError {
     DuplicateDirectRetentionConsumer(usize),
     MissingDirectEvaluation(usize),
     ConflictingDirectEvaluation(usize),
+    DirectSplitTopology(&'static str),
     Prepared(PreparedCompositionError),
 }
 
@@ -147,17 +151,106 @@ pub(crate) fn prepare_resident_composition<'a>(
                 })
             })
             .collect::<Result<Vec<_>, ResidentCompositionError>>()?;
-    Ok(PreparedCompositionGraph::prepare_with_proof_bindings(
-        workspace.arena(),
-        &cached.plan,
-        proof_bindings,
-        &cached.trace_topology(),
-        &inputs,
-        &cached.slots,
-        cached.requirements.mode,
-        cached.direct_retention.as_ref(),
-        &direct_evaluations,
-    )?)
+    let direct_split = composition_direct_split_binding(workspace, cached)?;
+    Ok(
+        PreparedCompositionGraph::prepare_with_proof_bindings_and_direct_split(
+            workspace.arena(),
+            &cached.plan,
+            proof_bindings,
+            &cached.trace_topology(),
+            &inputs,
+            &cached.slots,
+            cached.requirements.mode,
+            cached.direct_retention.as_ref(),
+            &direct_evaluations,
+            direct_split,
+        )?,
+    )
+}
+
+fn composition_direct_split_binding(
+    workspace: &GraphWorkspace,
+    composition: &crate::arena_plan::PlannedCompositionWorkspace,
+) -> Result<Option<CompositionDirectSplitBinding>, ResidentCompositionError> {
+    let Some(program) = composition.output_plan.direct_program() else {
+        return Ok(None);
+    };
+    let commitment = workspace
+        .plan()
+        .commitment(CommitmentTreeId::Composition)
+        .ok_or(ResidentCompositionError::DirectSplitTopology(
+            "composition commitment is missing",
+        ))?;
+    let (requirements, slots) = match (&commitment.requirements, &commitment.slots) {
+        (
+            ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+            ModeAwareCommitWorkspaceSlots::DomainProgressive(slots),
+        ) => (requirements, slots),
+        _ => {
+            return Err(ResidentCompositionError::DirectSplitTopology(
+                "composition commitment is not domain-progressive",
+            ));
+        }
+    };
+    let [batch] = requirements.leaves.plan.lde_batches.as_slice() else {
+        return Err(ResidentCompositionError::DirectSplitTopology(
+            "composition commitment must have one canonical batch",
+        ));
+    };
+    let [batch_slots] = slots.leaves.batches.as_slice() else {
+        return Err(ResidentCompositionError::DirectSplitTopology(
+            "composition commitment must have one batch slot set",
+        ));
+    };
+    if requirements.leaves.plan.columns.len() != COMPOSITION_RETAINED_COLUMNS
+        || batch.columns != (0..COMPOSITION_RETAINED_COLUMNS).collect::<Vec<_>>()
+        || batch.evaluation_log_size != program.schedule().evaluation_log_size
+    {
+        return Err(ResidentCompositionError::DirectSplitTopology(
+            "composition commitment batch geometry drifted",
+        ));
+    }
+    let [Some(outputs)] = commitment.evaluation_output_groups.as_slice() else {
+        return Err(ResidentCompositionError::DirectSplitTopology(
+            "composition retained output group is not unique",
+        ));
+    };
+    let retained_evaluations: [stwo_backend_cuda::ArenaSlice; COMPOSITION_RETAINED_COLUMNS] =
+        outputs
+            .iter()
+            .copied()
+            .map(|binding| {
+                bind_arena_binding(workspace.arena(), binding)
+                    .map_err(PreparedCompositionError::Arena)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| {
+                ResidentCompositionError::DirectSplitTopology(
+                    "composition retained output count is not eight",
+                )
+            })?;
+    let expected_words = 1usize
+        .checked_shl(program.schedule().evaluation_log_size)
+        .ok_or(ResidentCompositionError::DirectSplitTopology(
+            "composition retained output log overflows",
+        ))?;
+    if retained_evaluations
+        .iter()
+        .any(|output| output.len_words() != expected_words)
+    {
+        return Err(ResidentCompositionError::DirectSplitTopology(
+            "composition retained output extent drifted",
+        ));
+    }
+    Ok(Some(CompositionDirectSplitBinding {
+        program,
+        pointer_slots: CompositionSplitPointerSlots {
+            source_pointers: batch_slots.coefficient_ptrs,
+            retained_pointers: batch_slots.output_ptrs,
+        },
+        retained_evaluations,
+    }))
 }
 
 /// Prove that the current statement has exactly the cached workspace topology,

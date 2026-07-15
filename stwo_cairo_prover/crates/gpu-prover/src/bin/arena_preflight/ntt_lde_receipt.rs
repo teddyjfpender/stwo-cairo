@@ -12,6 +12,7 @@ use stwo_cairo_gpu_prover::arena_plan::{
     BufferPurpose, CommitmentColumnSource, CommitmentTreeId, OpenedColumnSource, PlannedCommitment,
     ProofArenaPlan, ProofEpoch,
 };
+use stwo_cairo_gpu_prover::prepared_composition::CompositionOutputMode;
 
 #[path = "ntt_lde_intervals.rs"]
 mod intervals;
@@ -26,6 +27,7 @@ const REQUIRED_H100_CUT_NS: u64 = 113_742_773;
 struct Totals {
     columns: u64,
     coefficient_words: u64,
+    resident_coefficient_words: u64,
     evaluation_words: u64,
     current_words: u64,
     direct_tail_words: u64,
@@ -48,6 +50,7 @@ impl Totals {
         }
         add!(columns);
         add!(coefficient_words);
+        add!(resident_coefficient_words);
         add!(evaluation_words);
         add!(current_words);
         add!(direct_tail_words);
@@ -89,14 +92,16 @@ pub(crate) fn json(arena: &ProofArenaPlan) -> Result<Value, String> {
 
     Ok(json!({
         "schema": "stwo-ntt-lde-direct-slab-frontier-v1",
-        "status": "address-free-model-only-native-not-implemented",
-        "native_implementation_present": false,
-        "missing_native_primitives": [
-            "B2N terminal duplicate write into canonical retained output",
-            "Composition producer duplicate write into canonical retained output",
-            "N2B entry at stage 2",
+        "status": "dynamic-retirement-implemented-awaiting-native-qualification",
+        "native_implementation_present": true,
+        "remaining_native_work": [
             "five-stage non-final N2B kernel for evaluation logs 13 and 14",
-            "dynamic coefficient logical-range retirement and arena recoloring",
+            "phantom Base/Interaction coefficient Value deletion after byte qualification",
+        ],
+        "unqualified_gates": [
+            "Composition L24/L25 native output, leaf, retained-layer, and root byte identity",
+            "sealed adapted-SN direct-vs-forced-fallback ProofArenaPlan total_words receipt",
+            "counter-enabled replay timing after byte qualification",
         ],
         "h100_timing_credit_ns": 0,
         "required_h100_cut_ns": REQUIRED_H100_CUT_NS,
@@ -116,6 +121,8 @@ pub(crate) fn json(arena: &ProofArenaPlan) -> Result<Value, String> {
             "columns": totals.columns,
             "coefficient_words": totals.coefficient_words,
             "coefficient_bytes": bytes(totals.coefficient_words)?,
+            "resident_coefficient_words": totals.resident_coefficient_words,
+            "resident_coefficient_bytes": bytes(totals.resident_coefficient_words)?,
             "evaluation_words": totals.evaluation_words,
             "evaluation_bytes": bytes(totals.evaluation_words)?,
             "current_pipeline_logical_bytes": current_bytes,
@@ -162,7 +169,8 @@ fn tree_receipt(
     validate_retained_outputs(commitment, &flattened)?;
     validate_commit_program(commitment, &flattened)?;
     validate_interpolation(commitment, &flattened)?;
-    validate_coefficient_logical_words(arena, commitment.id, &flattened)?;
+    let resident_coefficient_words =
+        validate_coefficient_logical_words(arena, commitment.id, &flattened)?;
 
     let program = commitment
         .commit_program
@@ -250,6 +258,7 @@ fn tree_receipt(
         let batch_totals = Totals {
             columns,
             coefficient_words,
+            resident_coefficient_words: 0,
             evaluation_words,
             current_words,
             direct_tail_words: tail_words,
@@ -278,14 +287,28 @@ fn tree_receipt(
             "duplicate_first_stage_kernel_launches": duplicate_launches,
         }));
     }
+    totals.resident_coefficient_words = resident_coefficient_words;
 
     Ok((
         json!({
             "tree": tree_name(commitment.id),
             "canonical_columns": flattened.len(),
             "interpolation_batches": commitment.interpolation_batches.len(),
-            "logical_coefficient_bytes": bytes(totals.coefficient_words)?,
+            "direct_retained_b2n_batches": commitment
+                .direct_retained_b2n_program
+                .as_ref()
+                .map_or(0, |program| program.batches().len()),
+            "transform_coefficient_image_bytes": bytes(totals.coefficient_words)?,
+            "logical_coefficient_bytes": bytes(totals.resident_coefficient_words)?,
             "retained_evaluation_bytes": bytes(totals.evaluation_words)?,
+            "ownership_representation": if commitment.id == CommitmentTreeId::Composition
+                && arena.composition().output_plan.mode()
+                    == CompositionOutputMode::DirectRetainedEvaluations
+            {
+                "direct-retained-evaluations"
+            } else {
+                "coefficients-plus-retained-evaluations"
+            },
             "batches": batches,
         }),
         totals,
@@ -309,6 +332,27 @@ fn interpolation_traffic(
             launches: 0,
             intervals: Vec::new(),
         });
+    }
+    if let Some(program) = &commitment.direct_retained_b2n_program {
+        let matching = program
+            .batches()
+            .iter()
+            .filter(|batch| {
+                batch.source_log_size == coefficient_log
+                    && batch.canonical_columns == canonical_columns
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(format!(
+                "{} direct B2N has {} exact matches for canonical batch {:?}",
+                tree_name(commitment.id),
+                matching.len(),
+                canonical_columns
+            ));
+        }
+        let columns = u64::try_from(canonical_columns.len())
+            .map_err(|_| "direct B2N column count does not fit u64".to_owned())?;
+        return b2n_traffic(coefficient_log, columns);
     }
     let wanted = canonical_columns
         .iter()
@@ -351,6 +395,16 @@ fn interpolation_traffic(
             wanted.len()
         ));
     }
+    let mut traffic = b2n_traffic(coefficient_log, count)?;
+    let passes = u64::try_from(traffic.intervals.len())
+        .map_err(|_| "B2N pass count does not fit u64".to_owned())?;
+    traffic.launches = launch_chunks
+        .checked_mul(passes)
+        .ok_or_else(|| "B2N launch count overflow".to_owned())?;
+    Ok(traffic)
+}
+
+fn b2n_traffic(coefficient_log: u32, columns: u64) -> Result<InterpolationTraffic, String> {
     let intervals = b2n_stage_intervals(coefficient_log)
         .ok_or_else(|| format!("unsupported B2N log {coefficient_log}"))?;
     let passes =
@@ -358,10 +412,10 @@ fn interpolation_traffic(
     let words_per_column = pow2(coefficient_log)?;
     Ok(InterpolationTraffic {
         words: words_per_column
-            .checked_mul(count)
+            .checked_mul(columns)
             .and_then(|words| words.checked_mul(2 * passes))
             .ok_or_else(|| "B2N traffic overflow".to_owned())?,
-        launches: launch_chunks
+        launches: chunks(columns)?
             .checked_mul(passes)
             .ok_or_else(|| "B2N launch count overflow".to_owned())?,
         intervals,
@@ -511,6 +565,9 @@ fn validate_interpolation(
     commitment: &PlannedCommitment,
     flattened: &[(u32, CommitmentColumnSource)],
 ) -> Result<(), String> {
+    if commitment.direct_retained_b2n_program.is_some() {
+        return validate_direct_interpolation(commitment, flattened);
+    }
     let expected = if commitment.id == CommitmentTreeId::Composition {
         0
     } else {
@@ -548,11 +605,122 @@ fn validate_interpolation(
     Ok(())
 }
 
+fn validate_direct_interpolation(
+    commitment: &PlannedCommitment,
+    flattened: &[(u32, CommitmentColumnSource)],
+) -> Result<(), String> {
+    let direct = commitment
+        .direct_retained_b2n_program
+        .as_ref()
+        .ok_or_else(|| "missing direct B2N program".to_owned())?;
+    let expected_role = match commitment.id {
+        CommitmentTreeId::Base => TraceTreeRole::Base,
+        CommitmentTreeId::Interaction => TraceTreeRole::Interaction,
+        _ => {
+            return Err(format!(
+                "{} cannot own a direct B2N program",
+                tree_name(commitment.id)
+            ))
+        }
+    };
+    if direct.role() != expected_role || !commitment.interpolation_batches.is_empty() {
+        return Err(format!(
+            "{} direct B2N mode drifted",
+            tree_name(commitment.id)
+        ));
+    }
+    let commit = commitment
+        .commit_program
+        .as_ref()
+        .ok_or_else(|| format!("{} has no commit program", tree_name(commitment.id)))?;
+    if direct.commit_cache_key() != commit.identity().cache_key {
+        return Err(format!(
+            "{} direct B2N commit identity drifted",
+            tree_name(commitment.id)
+        ));
+    }
+    let lde_batches = &commit.requirements().leaves.plan.lde_batches;
+    if direct.batches().len() != lde_batches.len() {
+        return Err(format!(
+            "{} direct B2N batch count drifted",
+            tree_name(commitment.id)
+        ));
+    }
+    validate_exact_canonical_coverage(
+        flattened.len(),
+        direct
+            .batches()
+            .iter()
+            .map(|batch| batch.canonical_columns.as_slice()),
+    )?;
+    for (index, (batch, lde)) in direct.batches().iter().zip(lde_batches).enumerate() {
+        let expected_index = u32::try_from(index)
+            .map_err(|_| "direct B2N batch index does not fit u32".to_owned())?;
+        let expected_retained_log = batch
+            .source_log_size
+            .checked_add(1)
+            .ok_or_else(|| "direct B2N retained log overflow".to_owned())?;
+        if batch.batch_index != expected_index
+            || batch.canonical_columns != lde.columns
+            || batch.retained_log_size != lde.evaluation_log_size
+            || batch.retained_log_size != expected_retained_log
+            || batch.canonical_columns.iter().any(|&canonical| {
+                !matches!(
+                    flattened.get(canonical),
+                    Some(&(log, _)) if log == batch.source_log_size
+                )
+            })
+        {
+            return Err(format!(
+                "{} direct B2N batch {index} drifted",
+                tree_name(commitment.id)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_canonical_coverage<'a>(
+    columns: usize,
+    batches: impl IntoIterator<Item = &'a [usize]>,
+) -> Result<(), String> {
+    let mut seen = vec![false; columns];
+    let mut next = 0usize;
+    for batch in batches {
+        if batch.is_empty() {
+            return Err("direct B2N contains an empty batch".to_owned());
+        }
+        for &canonical in batch {
+            let covered = seen
+                .get_mut(canonical)
+                .ok_or_else(|| "direct B2N canonical index is out of range".to_owned())?;
+            if *covered {
+                return Err(format!(
+                    "direct B2N canonical column {canonical} is duplicated"
+                ));
+            }
+            if canonical != next {
+                return Err(format!(
+                    "direct B2N canonical order drifted at {next}: found {canonical}"
+                ));
+            }
+            *covered = true;
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| "direct B2N coverage overflow".to_owned())?;
+        }
+    }
+    if next != columns || seen.iter().any(|covered| !covered) {
+        return Err(format!("direct B2N covers {next}/{columns} columns"));
+    }
+    Ok(())
+}
+
 fn validate_coefficient_logical_words(
     arena: &ProofArenaPlan,
     tree: CommitmentTreeId,
     flattened: &[(u32, CommitmentColumnSource)],
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let purpose = match tree {
         CommitmentTreeId::Base => BufferPurpose::BaseCoefficients,
         CommitmentTreeId::Interaction => BufferPurpose::InteractionCoefficients,
@@ -573,13 +741,34 @@ fn validate_coefficient_logical_words(
             .checked_add(pow2(*log)?)
             .ok_or_else(|| "expected coefficient words overflow".to_owned())
     })?;
+    let direct_composition = tree == CommitmentTreeId::Composition
+        && arena.composition().output_plan.mode()
+            == CompositionOutputMode::DirectRetainedEvaluations;
+    if direct_composition {
+        let program = arena
+            .composition()
+            .output_plan
+            .direct_program()
+            .ok_or_else(|| "direct Composition output has no split program".to_owned())?;
+        if planned != 0
+            || flattened.len() != 8
+            || flattened
+                .iter()
+                .any(|&(log, _)| log.checked_add(1) != Some(program.schedule().evaluation_log_size))
+        {
+            return Err(format!(
+                "Composition direct ownership has {planned} coefficient words or drifted geometry"
+            ));
+        }
+        return Ok(0);
+    }
     if planned != expected {
         return Err(format!(
             "{} logical coefficient words {planned} != canonical {expected}",
             tree_name(tree)
         ));
     }
-    Ok(())
+    Ok(planned)
 }
 
 fn validate_late_consumers(arena: &ProofArenaPlan) -> Result<(), String> {
@@ -672,6 +861,18 @@ fn validate_oods_and_numerator_sources(
     {
         return Err("dynamic numerator sources are not exactly retained evaluations".to_owned());
     }
+    let direct_composition =
+        arena.composition().output_plan.mode() == CompositionOutputMode::DirectRetainedEvaluations;
+    if numerator.iter().any(|column| {
+        let direct =
+            direct_composition && matches!(column.source, OpenedColumnSource::Composition { .. });
+        direct != column.coefficients.is_none()
+    }) {
+        return Err(
+            "dynamic numerator coefficient presence disagrees with direct Composition ownership"
+                .to_owned(),
+        );
+    }
 
     let preprocessed_oods = arena
         .oods()
@@ -690,9 +891,10 @@ fn validate_oods_and_numerator_sources(
         || preprocessed_oods
             .iter()
             .any(|column| column.source_kind != OodsSourceKind::Coefficients)
-        || preprocessed_numerator
-            .iter()
-            .any(|column| column.topology.source_kind != QuotientNumeratorSourceKind::Coefficients)
+        || preprocessed_numerator.iter().any(|column| {
+            column.topology.source_kind != QuotientNumeratorSourceKind::Coefficients
+                || column.coefficients.is_none()
+        })
     {
         return Err("preprocessed OODS/numerator ownership is not coefficient-backed".to_owned());
     }

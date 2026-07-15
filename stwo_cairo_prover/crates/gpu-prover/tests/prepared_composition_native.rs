@@ -38,8 +38,9 @@ use stwo_cairo_gpu_prover::prepared_composition::{
 use stwo_cairo_gpu_prover::{
     composition_workspace_requirements, composition_workspace_requirements_with_mode,
     CompositionCoefficientSource, CompositionDeviceInputs, CompositionExtParamBinding,
-    CompositionLaunchMode, CompositionTraceTopology, CompositionWorkspaceRequirements,
-    CompositionWorkspaceSlots, PreparedCompositionError, PreparedCompositionGraph,
+    CompositionLaunchMode, CompositionOutputSlots, CompositionTraceTopology,
+    CompositionWorkspaceRequirements, CompositionWorkspaceSlots, PreparedCompositionError,
+    PreparedCompositionGraph,
 };
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{
@@ -196,7 +197,9 @@ fn workspace_slots() -> CompositionWorkspaceSlots {
         lde_tile: ArenaSlotId(2),
         accumulators: ArenaSlotId(3),
         random_coefficient_powers: ArenaSlotId(4),
-        composition_coefficients: std::array::from_fn(|index| ArenaSlotId(5 + index as u32)),
+        output: CompositionOutputSlots::CoefficientSplit(std::array::from_fn(|index| {
+            ArenaSlotId(5 + index as u32)
+        })),
     }
 }
 
@@ -459,20 +462,23 @@ fn interpolate_and_split(
 }
 
 fn read_outputs(arena: &DeviceArena, prepared: &PreparedCompositionGraph<'_>) -> [Vec<u32>; 8] {
-    prepared.composition_coefficients().map(|source| {
-        let mut words = vec![0u32; source.len_words()];
-        unsafe {
-            arena
-                .context()
-                .memcpy_d2h_async(
-                    words.as_mut_ptr().cast::<c_void>(),
-                    source.as_void_ptr(),
-                    core::mem::size_of_val(words.as_slice()),
-                )
-                .unwrap();
-        }
-        words
-    })
+    prepared
+        .composition_coefficients()
+        .expect("native fallback fixture owns coefficient outputs")
+        .map(|source| {
+            let mut words = vec![0u32; source.len_words()];
+            unsafe {
+                arena
+                    .context()
+                    .memcpy_d2h_async(
+                        words.as_mut_ptr().cast::<c_void>(),
+                        source.as_void_ptr(),
+                        core::mem::size_of_val(words.as_slice()),
+                    )
+                    .unwrap();
+            }
+            words
+        })
 }
 
 #[test]
@@ -1111,13 +1117,14 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
     .unwrap();
     assert!(all_direct_prepared
         .composition_coefficients()
+        .unwrap()
         .iter()
         .all(|output| output.len_words() == all_direct_requirements.output_coefficient_words));
+    let CompositionOutputSlots::CoefficientSplit(coefficient_slots) = slots.output else {
+        unreachable!();
+    };
     assert!(
-        arena
-            .bind(slots.composition_coefficients[0])
-            .unwrap()
-            .len_words()
+        arena.bind(coefficient_slots[0]).unwrap().len_words()
             > all_direct_requirements.output_coefficient_words
     );
     let all_direct_coefficients_0 = coefficients(2000);

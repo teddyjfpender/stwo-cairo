@@ -16,6 +16,7 @@ use stwo_backend_cuda::{
 
 use crate::arena_plan::{ArenaBinding, OpenedColumnSource, QuotientNumeratorSchedule};
 use crate::graphs::GraphWorkspace;
+use crate::prepared_composition::CompositionOutputMode;
 
 #[derive(Debug)]
 pub enum ResidentOodsError {
@@ -112,6 +113,8 @@ impl<'a> ResidentOodsPipeline<'a> {
         let arena = workspace.arena();
         let oods_plan = workspace.plan().oods();
         let numerator_plan = workspace.plan().quotient_numerator();
+        let direct_composition_outputs = workspace.plan().composition().output_plan.mode()
+            == CompositionOutputMode::DirectRetainedEvaluations;
         if oods_plan.columns.len() != numerator_plan.columns.len() {
             return Err(ResidentOodsError::ColumnCountMismatch {
                 oods: oods_plan.columns.len(),
@@ -176,8 +179,20 @@ impl<'a> ResidentOodsPipeline<'a> {
             {
                 return Err(ResidentOodsError::ColumnGeometryMismatch { index });
             }
+            let direct_composition_column = direct_composition_outputs
+                && matches!(column.source, OpenedColumnSource::Composition { .. });
+            if direct_composition_column {
+                if column.coefficients.is_some()
+                    || oods_column.source_kind != OodsSourceKind::Evaluations
+                    || column.topology.source_kind != QuotientNumeratorSourceKind::Evaluation
+                {
+                    return Err(ResidentOodsError::ColumnBindingMismatch { index });
+                }
+            } else if column.coefficients.is_none() {
+                return Err(ResidentOodsError::ColumnBindingMismatch { index });
+            }
             if (oods_column.source_kind == OodsSourceKind::Coefficients
-                && oods_column.source_binding != column.coefficients)
+                && Some(oods_column.source_binding) != column.coefficients)
                 || (oods_column.source_kind == OodsSourceKind::Evaluations
                     && column.topology.source_kind == QuotientNumeratorSourceKind::Evaluation
                     && oods_column.source_binding != column.numerator_source)
@@ -186,12 +201,15 @@ impl<'a> ResidentOodsPipeline<'a> {
             }
             let source = match column.topology.source_kind {
                 QuotientNumeratorSourceKind::Coefficients => {
-                    if column.numerator_source != column.coefficients {
+                    let coefficients = column
+                        .coefficients
+                        .ok_or(ResidentOodsError::ColumnBindingMismatch { index })?;
+                    if column.numerator_source != coefficients {
                         return Err(ResidentOodsError::ColumnBindingMismatch { index });
                     }
                     QuotientNumeratorColumnSource::Coefficients(bind_exact(
                         workspace,
-                        column.coefficients,
+                        coefficients,
                         words_for_log(column.topology.coefficient_log_size)?,
                         "quotient numerator coefficient column",
                     )?)

@@ -26,7 +26,11 @@ use crate::direct_composition_retention::{
 };
 
 mod binding_refresh;
+mod direct_split;
 pub use binding_refresh::CompositionBindingRefreshTelemetry;
+pub use direct_split::{
+    CompositionDirectSplitBinding, CompositionOutputMode, CompositionOutputPlan,
+};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const SECURE_WORDS: usize = 4;
@@ -206,7 +210,24 @@ pub struct CompositionWorkspaceSlots {
     pub lde_tile: ArenaSlotId,
     pub accumulators: ArenaSlotId,
     pub random_coefficient_powers: ArenaSlotId,
-    pub composition_coefficients: [ArenaSlotId; SPLIT_COORDINATES],
+    pub output: CompositionOutputSlots,
+}
+
+/// Physical ownership of the final Composition representation. The direct
+/// replacement path has no coefficient slots to bind or accidentally retain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompositionOutputSlots {
+    CoefficientSplit([ArenaSlotId; SPLIT_COORDINATES]),
+    DirectRetainedEvaluations,
+}
+
+impl CompositionOutputSlots {
+    pub const fn mode(self) -> CompositionOutputMode {
+        match self {
+            Self::CoefficientSplit(_) => CompositionOutputMode::CoefficientSplit,
+            Self::DirectRetainedEvaluations => CompositionOutputMode::DirectRetainedEvaluations,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -362,11 +383,10 @@ impl CompositionWorkspaceRequirements {
                 SECURE_WORDS,
             ),
         ];
-        requirements.extend(
-            slots
-                .composition_coefficients
-                .map(|id| slot_requirement(id, self.output_coefficient_words, 1)),
-        );
+        if let CompositionOutputSlots::CoefficientSplit(outputs) = slots.output {
+            requirements
+                .extend(outputs.map(|id| slot_requirement(id, self.output_coefficient_words, 1)));
+        }
         let mut ids = BTreeSet::new();
         for requirement in &requirements {
             if !ids.insert(requirement.id) {
@@ -387,6 +407,19 @@ fn slot_requirement(
         len_words,
         alignment_words,
     }
+}
+
+fn validate_output_mode(
+    slots: CompositionOutputSlots,
+    binding: CompositionOutputMode,
+) -> Result<(), PreparedCompositionError> {
+    if slots.mode() != binding {
+        return Err(PreparedCompositionError::OutputModeMismatch {
+            slots: slots.mode(),
+            binding,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -577,6 +610,11 @@ pub enum PreparedCompositionError {
     /// Wide mode requires at least one component lane on the execution
     /// context; fail closed rather than silently degrading the topology.
     NoComponentLanes,
+    OutputModeMismatch {
+        slots: CompositionOutputMode,
+        binding: CompositionOutputMode,
+    },
+    DirectSplit(stwo_backend_cuda::CompositionSplitError),
     CudaStatus {
         operation: &'static str,
         status: i32,
@@ -603,6 +641,12 @@ impl From<ArenaError> for PreparedCompositionError {
 impl From<CudaRuntimeError> for PreparedCompositionError {
     fn from(value: CudaRuntimeError) -> Self {
         Self::Cuda(value)
+    }
+}
+
+impl From<stwo_backend_cuda::CompositionSplitError> for PreparedCompositionError {
+    fn from(value: stwo_backend_cuda::CompositionSplitError) -> Self {
+        Self::DirectSplit(value)
     }
 }
 
@@ -1498,13 +1542,18 @@ pub struct PreparedCompositionGraph<'a> {
     relation_alpha_powers: ArenaSlice,
     _claimed_sums: Vec<ArenaSlice>,
     _direct_evaluations: Vec<ArenaSlice>,
-    composition_coefficients: [ArenaSlice; SPLIT_COORDINATES],
+    output: PreparedCompositionOutput<'a>,
     components: Vec<PreparedComponent>,
     waves: Vec<PreparedWave>,
     /// Wide-mode fanout: `lane_components[lane]` holds component indices in
     /// enqueue order (group-contiguous, members in plan order). Empty in
     /// serial mode, so the serial launch path performs no fork/join at all.
     lane_components: Vec<Vec<usize>>,
+}
+
+enum PreparedCompositionOutput<'a> {
+    CoefficientSplit([ArenaSlice; SPLIT_COORDINATES]),
+    DirectRetainedEvaluations(stwo_backend_cuda::PreparedCompositionSplitGraph<'a>),
 }
 
 impl<'a> PreparedCompositionGraph<'a> {
@@ -1587,11 +1636,12 @@ impl<'a> PreparedCompositionGraph<'a> {
             mode,
             direct_retention,
             direct_evaluations,
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare_with_proof_bindings(
+    pub(crate) fn prepare_with_proof_bindings_and_direct_split(
         arena: &'a DeviceArena,
         plan: &CompositionPlan,
         proof_bindings: &CompositionProofBindings,
@@ -1601,6 +1651,7 @@ impl<'a> PreparedCompositionGraph<'a> {
         mode: CompositionLaunchMode,
         direct_retention: Option<&DirectCompositionRetentionPlan>,
         direct_evaluations: &[CompositionDirectEvaluationBinding],
+        direct_split: Option<CompositionDirectSplitBinding>,
     ) -> Result<Self, PreparedCompositionError> {
         Self::prepare_impl(
             arena,
@@ -1612,6 +1663,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             mode,
             direct_retention,
             direct_evaluations,
+            direct_split,
         )
     }
 
@@ -1626,6 +1678,7 @@ impl<'a> PreparedCompositionGraph<'a> {
         mode: CompositionLaunchMode,
         direct_retention: Option<&DirectCompositionRetentionPlan>,
         direct_evaluations: &[CompositionDirectEvaluationBinding],
+        direct_split: Option<CompositionDirectSplitBinding>,
     ) -> Result<Self, PreparedCompositionError> {
         let requirements =
             composition_workspace_requirements_with_retention(plan, trace, mode, direct_retention)?;
@@ -1679,18 +1732,29 @@ impl<'a> PreparedCompositionGraph<'a> {
                 });
             }
         }
+        let binding_mode = if direct_split.is_some() {
+            CompositionOutputMode::DirectRetainedEvaluations
+        } else {
+            CompositionOutputMode::CoefficientSplit
+        };
+        validate_output_mode(slots.output, binding_mode)?;
         let slot_requirements = requirements.arena_slot_requirements(slots)?;
         let descriptor_requirement = slot_requirements[0];
         let descriptors = bind_slot(arena, descriptor_requirement)?;
         let lde_tile = bind_slot(arena, slot_requirements[1])?;
         let accumulators = bind_slot(arena, slot_requirements[2])?;
         let random_coefficient_powers = bind_slot(arena, slot_requirements[3])?;
-        let composition_coefficients: [ArenaSlice; SPLIT_COORDINATES] = slot_requirements[4..]
-            .iter()
-            .map(|&requirement| bind_slot(arena, requirement))
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .expect("exactly eight output requirements");
+        let composition_coefficients = match slots.output {
+            CompositionOutputSlots::CoefficientSplit(_) => Some(
+                slot_requirements[4..]
+                    .iter()
+                    .map(|&requirement| bind_slot(arena, requirement))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .try_into()
+                    .expect("exactly eight coefficient output requirements"),
+            ),
+            CompositionOutputSlots::DirectRetainedEvaluations => None,
+        };
         let random_coefficient = bind_minimum(arena, inputs.random_coefficient, SECURE_WORDS)?;
         let forward_twiddles = require_input_min(
             arena,
@@ -2287,6 +2351,22 @@ impl<'a> PreparedCompositionGraph<'a> {
         }
         arena.context().sync()?;
 
+        let output = match direct_split {
+            Some(binding) => PreparedCompositionOutput::DirectRetainedEvaluations(
+                direct_split::prepare_direct_split(
+                    arena,
+                    &requirements,
+                    accumulators,
+                    inverse_twiddles,
+                    forward_twiddles,
+                    binding,
+                )?,
+            ),
+            None => PreparedCompositionOutput::CoefficientSplit(
+                composition_coefficients.expect("coefficient mode was checked before binding"),
+            ),
+        };
+
         Ok(Self {
             arena,
             requirements,
@@ -2301,7 +2381,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             relation_alpha_powers,
             _claimed_sums: claimed_sums,
             _direct_evaluations: direct_evaluation_slices,
-            composition_coefficients,
+            output,
             components: prepared_components,
             waves: prepared_waves,
             lane_components,
@@ -2453,48 +2533,73 @@ impl<'a> PreparedCompositionGraph<'a> {
             .accumulators
             .last()
             .expect("non-empty plan has an accumulator");
-        check_status("composition_interpolate", unsafe {
-            raw::stwo_ntt_b2n_columns_on(
-                self.descriptors
-                    .as_u32_ptr()
-                    .add(self.requirements.final_coordinate_pointers)
-                    .cast::<*mut u32>(),
-                max_accumulator.log_size,
-                SECURE_COORDINATES as u32,
-                self.inverse_twiddles.as_u32_ptr(),
-                u32::try_from(self.inverse_twiddles.len_words())
-                    .map_err(|_| PreparedCompositionError::SizeOverflow)?,
-                1u32 << (max_accumulator.log_size - 1),
-                stream,
-            )
-        })?;
+        match &self.output {
+            PreparedCompositionOutput::DirectRetainedEvaluations(direct_split) => {
+                direct_split.launch()?;
+            }
+            PreparedCompositionOutput::CoefficientSplit(composition_coefficients) => {
+                check_status("composition_interpolate", unsafe {
+                    raw::stwo_ntt_b2n_columns_on(
+                        self.descriptors
+                            .as_u32_ptr()
+                            .add(self.requirements.final_coordinate_pointers)
+                            .cast::<*mut u32>(),
+                        max_accumulator.log_size,
+                        SECURE_COORDINATES as u32,
+                        self.inverse_twiddles.as_u32_ptr(),
+                        u32::try_from(self.inverse_twiddles.len_words())
+                            .map_err(|_| PreparedCompositionError::SizeOverflow)?,
+                        1u32 << (max_accumulator.log_size - 1),
+                        stream,
+                    )
+                })?;
 
-        let full_rows = pow2(max_accumulator.log_size)?;
-        let half_rows = self.requirements.output_coefficient_words;
-        let bytes = half_rows
-            .checked_mul(WORD_BYTES)
-            .ok_or(PreparedCompositionError::SizeOverflow)?;
-        let max_coordinates = unsafe {
-            self.accumulators
-                .as_u32_ptr()
-                .add(max_accumulator.offset_words)
-        };
-        for coordinate in 0..SECURE_COORDINATES {
-            let source = unsafe { max_coordinates.add(coordinate * full_rows) };
-            unsafe {
-                context.memcpy_d2d_async(
-                    self.composition_coefficients[coordinate].as_void_ptr(),
-                    source.cast::<c_void>(),
-                    bytes,
-                )?;
-                context.memcpy_d2d_async(
-                    self.composition_coefficients[SECURE_COORDINATES + coordinate].as_void_ptr(),
-                    source.add(half_rows).cast::<c_void>(),
-                    bytes,
-                )?;
+                let full_rows = pow2(max_accumulator.log_size)?;
+                let half_rows = self.requirements.output_coefficient_words;
+                let bytes = half_rows
+                    .checked_mul(WORD_BYTES)
+                    .ok_or(PreparedCompositionError::SizeOverflow)?;
+                let max_coordinates = unsafe {
+                    self.accumulators
+                        .as_u32_ptr()
+                        .add(max_accumulator.offset_words)
+                };
+                for coordinate in 0..SECURE_COORDINATES {
+                    let source = unsafe { max_coordinates.add(coordinate * full_rows) };
+                    unsafe {
+                        context.memcpy_d2d_async(
+                            composition_coefficients[coordinate].as_void_ptr(),
+                            source.cast::<c_void>(),
+                            bytes,
+                        )?;
+                        context.memcpy_d2d_async(
+                            composition_coefficients[SECURE_COORDINATES + coordinate].as_void_ptr(),
+                            source.add(half_rows).cast::<c_void>(),
+                            bytes,
+                        )?;
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    pub fn output_mode(&self) -> CompositionOutputMode {
+        match &self.output {
+            PreparedCompositionOutput::CoefficientSplit(_) => {
+                CompositionOutputMode::CoefficientSplit
+            }
+            PreparedCompositionOutput::DirectRetainedEvaluations(_) => {
+                CompositionOutputMode::DirectRetainedEvaluations
+            }
+        }
+    }
+
+    pub fn direct_split_traffic(&self) -> Option<stwo_backend_cuda::CompositionSplitTraffic> {
+        match &self.output {
+            PreparedCompositionOutput::CoefficientSplit(_) => None,
+            PreparedCompositionOutput::DirectRetainedEvaluations(graph) => Some(graph.traffic()),
+        }
     }
 
     fn enqueue_wave(
@@ -2619,8 +2724,11 @@ impl<'a> PreparedCompositionGraph<'a> {
         &self.requirements
     }
 
-    pub fn composition_coefficients(&self) -> [ArenaSlice; SPLIT_COORDINATES] {
-        self.composition_coefficients
+    pub fn composition_coefficients(&self) -> Option<[ArenaSlice; SPLIT_COORDINATES]> {
+        match &self.output {
+            PreparedCompositionOutput::CoefficientSplit(coefficients) => Some(*coefficients),
+            PreparedCompositionOutput::DirectRetainedEvaluations(_) => None,
+        }
     }
 }
 
@@ -3610,15 +3718,50 @@ mod tests {
             lde_tile: ArenaSlotId(2),
             accumulators: ArenaSlotId(3),
             random_coefficient_powers: ArenaSlotId(4),
-            composition_coefficients: std::array::from_fn(|index| ArenaSlotId(5 + index as u32)),
+            output: CompositionOutputSlots::CoefficientSplit(std::array::from_fn(|index| {
+                ArenaSlotId(5 + index as u32)
+            })),
         };
         let arena = requirements.arena_slot_requirements(&slots).unwrap();
         assert_eq!(arena.len(), 12);
         assert_eq!(arena[3].len_words, 2 * SECURE_WORDS);
         assert!(arena[4..].iter().all(|slot| slot.len_words == 1usize << 6));
 
+        let direct_slots = CompositionWorkspaceSlots {
+            output: CompositionOutputSlots::DirectRetainedEvaluations,
+            ..slots
+        };
+        assert_eq!(
+            requirements
+                .arena_slot_requirements(&direct_slots)
+                .unwrap()
+                .len(),
+            4,
+            "direct output ownership must not retain coefficient slots"
+        );
+        assert_eq!(
+            validate_output_mode(direct_slots.output, CompositionOutputMode::CoefficientSplit,),
+            Err(PreparedCompositionError::OutputModeMismatch {
+                slots: CompositionOutputMode::DirectRetainedEvaluations,
+                binding: CompositionOutputMode::CoefficientSplit,
+            })
+        );
+        assert_eq!(
+            validate_output_mode(
+                slots.output,
+                CompositionOutputMode::DirectRetainedEvaluations,
+            ),
+            Err(PreparedCompositionError::OutputModeMismatch {
+                slots: CompositionOutputMode::CoefficientSplit,
+                binding: CompositionOutputMode::DirectRetainedEvaluations,
+            })
+        );
+
         let mut duplicate = slots;
-        duplicate.composition_coefficients[7] = duplicate.descriptors;
+        let CompositionOutputSlots::CoefficientSplit(ref mut outputs) = duplicate.output else {
+            unreachable!();
+        };
+        outputs[7] = duplicate.descriptors;
         assert_eq!(
             requirements
                 .arena_slot_requirements(&duplicate)
