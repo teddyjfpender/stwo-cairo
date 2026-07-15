@@ -14,7 +14,10 @@ use stwo_backend_cuda::{
     QuotientNumeratorSourceKind, QuotientNumeratorStagedSingleWriteError,
 };
 
-use crate::arena_plan::{ArenaBinding, OpenedColumnSource, QuotientNumeratorSchedule};
+use crate::arena_plan::{
+    validate_quotient_producer_b2n_selection, ArenaBinding, OpenedColumnSource,
+    QuotientNumeratorSchedule, QuotientProducerB2nSelectionError,
+};
 use crate::graphs::GraphWorkspace;
 use crate::prepared_composition::CompositionOutputMode;
 
@@ -52,6 +55,11 @@ pub enum ResidentOodsError {
     NumeratorSchedule(QuotientNumeratorSingleWriteError),
     NumeratorStagedSchedule(QuotientNumeratorStagedSingleWriteError),
     StagedNumeratorBinding(&'static str),
+    QuotientSourceLogsMismatch {
+        planned: Vec<u32>,
+        bound: Vec<u32>,
+    },
+    QuotientProducerB2n(QuotientProducerB2nSelectionError),
     Quotient(PreparedQuotientError),
 }
 
@@ -96,6 +104,12 @@ impl From<QuotientNumeratorStagedSingleWriteError> for ResidentOodsError {
 impl From<PreparedQuotientError> for ResidentOodsError {
     fn from(value: PreparedQuotientError) -> Self {
         Self::Quotient(value)
+    }
+}
+
+impl From<QuotientProducerB2nSelectionError> for ResidentOodsError {
+    fn from(value: QuotientProducerB2nSelectionError) -> Self {
+        Self::QuotientProducerB2n(value)
     }
 }
 
@@ -409,14 +423,50 @@ impl<'a> ResidentOodsPipeline<'a> {
 
         let quotient_plan = workspace.plan().quotient();
         let quotient_sources = numerator.quotient_sources();
-        let quotient = PreparedQuotientGraph::prepare(
-            arena,
+        let quotient_logs = quotient_plan
+            .partial_numerators
+            .iter()
+            .map(|source| source.log_size)
+            .collect::<Vec<_>>();
+        let bound_quotient_logs = quotient_sources
+            .iter()
+            .map(|source| source.log_size)
+            .collect::<Vec<_>>();
+        if quotient_logs != bound_quotient_logs {
+            return Err(ResidentOodsError::QuotientSourceLogsMismatch {
+                planned: quotient_logs,
+                bound: bound_quotient_logs,
+            });
+        }
+        validate_quotient_producer_b2n_selection(
+            workspace.plan().protocol_identity().resident_backend,
             quotient_plan.config,
-            &quotient_sources,
-            bind_logical(workspace, quotient_plan.forward_twiddles)?,
-            bind_logical(workspace, quotient_plan.inverse_subdomain_twiddles)?,
-            &quotient_plan.slots,
+            &bound_quotient_logs,
+            quotient_plan.producer_b2n.as_ref(),
         )?;
+        let forward_twiddles = bind_logical(workspace, quotient_plan.forward_twiddles)?;
+        let inverse_subdomain_twiddles =
+            bind_logical(workspace, quotient_plan.inverse_subdomain_twiddles)?;
+        let quotient = if let Some(program) = &quotient_plan.producer_b2n {
+            PreparedQuotientGraph::prepare_with_producer_b2n(
+                arena,
+                quotient_plan.config,
+                &quotient_sources,
+                forward_twiddles,
+                inverse_subdomain_twiddles,
+                &quotient_plan.slots,
+                program.clone(),
+            )?
+        } else {
+            PreparedQuotientGraph::prepare(
+                arena,
+                quotient_plan.config,
+                &quotient_sources,
+                forward_twiddles,
+                inverse_subdomain_twiddles,
+                &quotient_plan.slots,
+            )?
+        };
         require_same_slice(
             quotient.sample_points_destination(),
             bind_logical(workspace, numerator_plan.sample_points_destination)?,

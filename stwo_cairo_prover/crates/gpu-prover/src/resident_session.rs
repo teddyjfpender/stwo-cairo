@@ -31,7 +31,7 @@ use stwo_cairo_prover::witness::relation_sources::RelationSourceError;
 
 use crate::arena_plan::{
     ArenaPlanError, CompositionSlabArenaCounterfactual, ExecutionTableGeometry, ProofArenaPlan,
-    ResidentBackend,
+    QuotientProducerB2nSelectionReceipt, ResidentBackend,
 };
 use crate::composition_plan::{CompositionPlan, CompositionPlanError, CompositionProofBindings};
 use crate::fixed_table_materializer::{
@@ -272,6 +272,7 @@ pub struct ResidentSessionTelemetry {
     pub arena_words: usize,
     pub transcript_segments: usize,
     pub protocol_policy: Option<ProtocolPlanPolicy>,
+    pub quotient_producer_b2n: QuotientProducerB2nSelectionReceipt,
     pub prepared_numerator_schedule: Option<PreparedNumeratorSchedule>,
     pub trace_commit_inputs: Option<ResidentTraceCommitInputTelemetry>,
     pub composition_commit: Option<ResidentCompositionCommitTelemetry>,
@@ -897,6 +898,7 @@ fn run_materialized_session<R>(
         arena_words: workspace.plan().total_words(),
         transcript_segments: executable.transcript().segments().len(),
         protocol_policy: Some(executable.protocol_policy()),
+        quotient_producer_b2n: workspace.plan().quotient_producer_b2n_selection_receipt(),
         prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
         trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
         composition_commit: Some(runtime.composition_commit_telemetry()),
@@ -1564,7 +1566,7 @@ pub fn with_resident_pre_witness_session<R>(
     });
     let (entry, materialization) = cache.materialize_entry_or_reuse(&executable)?;
     let runtime_lease = entry.arm_runtime_lease()?;
-    let (twiddle_report, preprocessed, arena_words, alpha_words) = {
+    let (twiddle_report, preprocessed, arena_words, alpha_words, quotient_producer_b2n) = {
         let workspace = runtime_lease.workspace();
         let twiddle_report = if workspace.fixed_twiddles_ready() {
             ResidentTwiddleStageReport {
@@ -1587,6 +1589,7 @@ pub fn with_resident_pre_witness_session<R>(
             stage_preprocessed_commitment(workspace, Arc::clone(&preprocessed_trace))?,
             workspace.plan().total_words(),
             workspace.plan().relation().requirements.alpha_words,
+            workspace.plan().quotient_producer_b2n_selection_receipt(),
         )
     };
     if alpha_words % SECURE_EXTENSION_DEGREE != 0 {
@@ -1678,6 +1681,7 @@ pub fn with_resident_pre_witness_session<R>(
                     arena_words,
                     transcript_segments: executable.transcript().segments().len(),
                     protocol_policy: Some(executable.protocol_policy()),
+                    quotient_producer_b2n,
                     prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
                     trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
                     composition_commit: Some(runtime.composition_commit_telemetry()),

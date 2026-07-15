@@ -70,6 +70,10 @@ pub(crate) fn gpu_native_session_context(
             "gpu_prepared_numerator_eligible_groups": null,
             "gpu_prepared_numerator_legacy_groups": null,
             "gpu_prepared_numerator_packed_output_rows": null,
+            "gpu_quotient_producer_b2n": null,
+            "gpu_quotient_producer_b2n_production_selected": null,
+            "gpu_quotient_producer_b2n_eliminated_logical_bytes": null,
+            "gpu_quotient_producer_b2n_eliminated_kernel_launches": null,
             "gpu_trace_commit_direct_commitments": null,
             "gpu_trace_commit_separate_interpolation_graph_invocations": null,
             "gpu_trace_commit_separate_interpolation_kernel_launches": null,
@@ -138,6 +142,54 @@ pub(crate) fn gpu_native_session_context(
         });
     };
     resident_session_telemetry_json(telemetry)
+}
+
+fn quotient_producer_b2n_receipt_json(
+    selection: stwo_cairo_gpu_prover::arena_plan::QuotientProducerB2nSelectionReceipt,
+) -> serde_json::Value {
+    let program = selection.program.map(|receipt| {
+        json!({
+            "schedule": {
+                "lifting_log_size": receipt.schedule.lifting_log_size,
+                "subdomain_log_size": receipt.schedule.subdomain_log_size,
+                "sample_count": receipt.schedule.sample_count,
+                "producer_stages": receipt.schedule.producer_stages,
+                "continuation_intervals": receipt.schedule.continuation_intervals,
+            },
+            "resources": {
+                "sm_arch": receipt.resources.sm_arch,
+                "cuda_toolkit_major": receipt.resources.cuda_toolkit_major,
+                "cuda_toolkit_minor": receipt.resources.cuda_toolkit_minor,
+                "launch_threads": receipt.resources.launch_threads,
+                "min_blocks_per_sm": receipt.resources.min_blocks_per_sm,
+                "ptxas_registers_per_thread": receipt.resources.ptxas_registers_per_thread,
+                "max_registers_per_thread": receipt.resources.max_registers_per_thread,
+                "ptxas_stack_bytes": receipt.resources.ptxas_stack_bytes,
+                "ptxas_spill_store_bytes": receipt.resources.ptxas_spill_store_bytes,
+                "ptxas_spill_load_bytes": receipt.resources.ptxas_spill_load_bytes,
+                "static_shared_bytes": receipt.resources.static_shared_bytes,
+                "zero_spills_required": receipt.resources.zero_spills_required,
+            },
+            "traffic": {
+                "coordinate_image_bytes": receipt.traffic.coordinate_image_bytes,
+                "unchanged_partial_read_bytes": receipt.traffic.unchanged_partial_read_bytes,
+                "denominator_factors": receipt.traffic.denominator_factors,
+                "batch_inverse_calls": receipt.traffic.batch_inverse_calls,
+                "fallback_logical_bytes": receipt.traffic.fallback_logical_bytes,
+                "fused_logical_bytes": receipt.traffic.fused_logical_bytes,
+                "eliminated_logical_bytes": receipt.traffic.eliminated_logical_bytes,
+                "fallback_kernel_launches": receipt.traffic.fallback_kernel_launches,
+                "fused_kernel_launches": receipt.traffic.fused_kernel_launches,
+                "eliminated_kernel_launches": receipt.traffic.eliminated_kernel_launches,
+            },
+        })
+    });
+    json!({
+        "schema": "stwo.quotient-producer-b2n-selection.v1",
+        "resident_backend": selection.resident_backend.cli_name(),
+        "production_selected": selection.production_selected,
+        "program": program,
+    })
 }
 
 pub(crate) fn resident_session_telemetry_json(
@@ -224,6 +276,7 @@ pub(crate) fn resident_session_telemetry_json(
             ),
             None => (None, None, None, None),
         };
+    let quotient_producer_b2n = telemetry.quotient_producer_b2n.program;
     json!({
         "gpu_graph_a_setup_gate_passed": telemetry.require_strict_graph_a().is_ok(),
         "gpu_host_preparation_total_ns": host.map(|value| value.total_ns),
@@ -274,6 +327,10 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_prepared_numerator_eligible_groups": eligible_groups,
         "gpu_prepared_numerator_legacy_groups": legacy_groups,
         "gpu_prepared_numerator_packed_output_rows": packed_output_rows,
+        "gpu_quotient_producer_b2n": quotient_producer_b2n_receipt_json(telemetry.quotient_producer_b2n),
+        "gpu_quotient_producer_b2n_production_selected": telemetry.quotient_producer_b2n.production_selected,
+        "gpu_quotient_producer_b2n_eliminated_logical_bytes": quotient_producer_b2n.map(|value| value.traffic.eliminated_logical_bytes),
+        "gpu_quotient_producer_b2n_eliminated_kernel_launches": quotient_producer_b2n.map(|value| value.traffic.eliminated_kernel_launches),
         "gpu_trace_commit_direct_commitments": trace_commit_inputs.map(|value| value.direct_commitments),
         "gpu_trace_commit_separate_interpolation_graph_invocations": trace_commit_inputs.map(|value| value.separate_interpolation_graph_invocations),
         "gpu_trace_commit_separate_interpolation_kernel_launches": trace_commit_inputs.map(|value| value.separate_interpolation_kernel_launches),
@@ -466,6 +523,54 @@ mod tests {
         );
         assert!(parse_operational_safety_reserve_bytes(Some("0")).is_err());
         assert!(parse_operational_safety_reserve_bytes(Some("1.5")).is_err());
+    }
+
+    #[test]
+    fn quotient_producer_b2n_receipt_is_machine_readable_and_exact() {
+        let program = stwo_backend_cuda::QuotientProducerB2nProgram::compile(
+            stwo_backend_cuda::QuotientWorkspaceConfig {
+                lifting_log_size: 25,
+                log_blowup_factor: 2,
+            },
+            &[23; 19],
+        )
+        .unwrap();
+        let telemetry = ResidentSessionTelemetry {
+            quotient_producer_b2n:
+                stwo_cairo_gpu_prover::arena_plan::QuotientProducerB2nSelectionReceipt {
+                    resident_backend:
+                        stwo_cairo_gpu_prover::arena_plan::ResidentBackend::ReplacementV1,
+                    production_selected: true,
+                    program: Some(program.receipt()),
+                },
+            ..ResidentSessionTelemetry::default()
+        };
+        let value = resident_session_telemetry_json(&telemetry);
+        assert_eq!(
+            value["gpu_quotient_producer_b2n"]["schema"],
+            "stwo.quotient-producer-b2n-selection.v1"
+        );
+        assert_eq!(
+            value["gpu_quotient_producer_b2n"]["production_selected"],
+            true
+        );
+        assert_eq!(
+            value["gpu_quotient_producer_b2n"]["program"]["schedule"]["sample_count"],
+            19
+        );
+        assert_eq!(
+            value["gpu_quotient_producer_b2n_eliminated_logical_bytes"],
+            5_637_144_576u64
+        );
+        assert_eq!(
+            value["gpu_quotient_producer_b2n_eliminated_kernel_launches"],
+            21
+        );
+        assert_eq!(
+            value["gpu_quotient_producer_b2n"]["program"]["resources"]
+                ["ptxas_registers_per_thread"],
+            98
+        );
     }
 
     #[test]

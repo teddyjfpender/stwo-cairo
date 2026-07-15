@@ -54,7 +54,8 @@ use stwo_backend_cuda::{
     QuotientNumeratorSingleWriteError, QuotientNumeratorSourceKind,
     QuotientNumeratorStagedSingleWriteError, QuotientNumeratorStagedSingleWritePlan,
     QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
-    QuotientNumeratorWorkspaceSlots, QuotientOodsSample, QuotientWorkspaceConfig,
+    QuotientNumeratorWorkspaceSlots, QuotientOodsSample, QuotientProducerB2nError,
+    QuotientProducerB2nProgram, QuotientProducerB2nReceipt, QuotientWorkspaceConfig,
     QuotientWorkspaceRequirements, QuotientWorkspaceSlots, RelationGraphError,
     RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots, RelationLaunchMode,
     RelationTailMode, TraceDecommitGeometry, TraceDecommitSlots, TraceSourceGroupGeometry,
@@ -2806,6 +2807,7 @@ struct LogicalQuotientNumeratorSource {
 struct LogicalQuotientWorkspace {
     config: QuotientWorkspaceConfig,
     requirements: QuotientWorkspaceRequirements,
+    producer_b2n: Option<QuotientProducerB2nProgram>,
     forward_twiddles: LogicalBufferId,
     inverse_subdomain_twiddles: LogicalBufferId,
     partial_numerators: Vec<LogicalQuotientNumeratorSource>,
@@ -3487,6 +3489,9 @@ pub struct PlannedQuotientNumeratorSource {
 pub struct PlannedQuotientWorkspace {
     pub config: QuotientWorkspaceConfig,
     pub requirements: QuotientWorkspaceRequirements,
+    /// Pure, exact-shape ReplacementV1 selection. Runtime binding must execute
+    /// this program when present and may never probe or adaptively fall back.
+    pub producer_b2n: Option<QuotientProducerB2nProgram>,
     pub forward_twiddles: ArenaBinding,
     pub inverse_subdomain_twiddles: ArenaBinding,
     pub partial_numerators: Vec<PlannedQuotientNumeratorSource>,
@@ -3496,6 +3501,61 @@ pub struct PlannedQuotientWorkspace {
     /// Binding form of `slots.output_values`; this preserves the logical
     /// QuotientTile identity and its exact contiguous length for FRI setup.
     pub output_values: ArenaBinding,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QuotientProducerB2nSelectionReceipt {
+    pub resident_backend: ResidentBackend,
+    pub production_selected: bool,
+    pub program: Option<QuotientProducerB2nReceipt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QuotientProducerB2nSelectionError {
+    Compile(QuotientProducerB2nError),
+    IdentityDrift {
+        resident_backend: ResidentBackend,
+        config: QuotientWorkspaceConfig,
+        partial_log_sizes: Vec<u32>,
+        expected: Option<QuotientProducerB2nProgram>,
+        selected: Option<QuotientProducerB2nProgram>,
+    },
+}
+
+fn select_quotient_producer_b2n(
+    resident_backend: ResidentBackend,
+    config: QuotientWorkspaceConfig,
+    partial_log_sizes: &[u32],
+) -> Result<Option<QuotientProducerB2nProgram>, QuotientProducerB2nSelectionError> {
+    match resident_backend {
+        ResidentBackend::LegacyResident => Ok(None),
+        ResidentBackend::ReplacementV1 => {
+            match QuotientProducerB2nProgram::compile(config, partial_log_sizes) {
+                Ok(program) => Ok(Some(program)),
+                Err(QuotientProducerB2nError::UnsupportedShape(_)) => Ok(None),
+                Err(error) => Err(QuotientProducerB2nSelectionError::Compile(error)),
+            }
+        }
+    }
+}
+
+pub(crate) fn validate_quotient_producer_b2n_selection(
+    resident_backend: ResidentBackend,
+    config: QuotientWorkspaceConfig,
+    partial_log_sizes: &[u32],
+    selected: Option<&QuotientProducerB2nProgram>,
+) -> Result<(), QuotientProducerB2nSelectionError> {
+    let expected = select_quotient_producer_b2n(resident_backend, config, partial_log_sizes)?;
+    if expected.as_ref() != selected {
+        return Err(QuotientProducerB2nSelectionError::IdentityDrift {
+            resident_backend,
+            config,
+            partial_log_sizes: partial_log_sizes.to_vec(),
+            expected,
+            selected: selected.cloned(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -3910,7 +3970,11 @@ impl ProofArenaPlan {
         let oods = resolve_oods_slots(logical_oods, &bindings)?;
         let quotient_numerator =
             resolve_quotient_numerator_slots(logical_quotient_numerator, &bindings)?;
-        let quotient = resolve_quotient_slots(logical_quotient, &bindings)?;
+        let quotient = resolve_quotient_slots(
+            protocol.identity.resident_backend,
+            logical_quotient,
+            &bindings,
+        )?;
         let fri = resolve_fri_slots(logical_fri, &bindings)?;
         let final_fri_pow = resolve_final_fri_pow_slots(logical_final_fri_pow, &bindings)?;
         let decommit = resolve_decommit_slots(logical_decommit, &bindings)?;
@@ -4160,6 +4224,18 @@ impl ProofArenaPlan {
         &self.quotient
     }
 
+    pub fn quotient_producer_b2n_selection_receipt(&self) -> QuotientProducerB2nSelectionReceipt {
+        QuotientProducerB2nSelectionReceipt {
+            resident_backend: self.protocol_identity.resident_backend,
+            production_selected: self.quotient.producer_b2n.is_some(),
+            program: self
+                .quotient
+                .producer_b2n
+                .as_ref()
+                .map(QuotientProducerB2nProgram::receipt),
+        }
+    }
+
     pub fn transcript(&self) -> &PlannedTranscriptWorkspace {
         &self.transcript
     }
@@ -4356,6 +4432,7 @@ pub enum ArenaPlanError {
     QuotientNumeratorSchedule(QuotientNumeratorSingleWriteError),
     QuotientNumeratorStaged(QuotientNumeratorStagedSingleWriteError),
     Quotient(PreparedQuotientError),
+    QuotientProducerB2n(QuotientProducerB2nSelectionError),
     Fri(PreparedFriError),
     FriFinal(PreparedFriFinalError),
     Pow(PreparedBlake2sPowError),
@@ -7271,6 +7348,12 @@ fn append_protocol_buffers(
         &protocol.quotient.partial_numerator_log_sizes,
     )
     .map_err(ArenaPlanError::Quotient)?;
+    let quotient_producer_b2n = select_quotient_producer_b2n(
+        protocol.identity.resident_backend,
+        quotient_config,
+        &protocol.quotient.partial_numerator_log_sizes,
+    )
+    .map_err(ArenaPlanError::QuotientProducerB2n)?;
     let oods_config = protocol.oods_workspace_config();
     let oods_source_kinds = protocol.oods_source_kinds()?;
     let oods_topologies = protocol.oods.column_topologies(&oods_source_kinds)?;
@@ -8049,6 +8132,7 @@ fn append_protocol_buffers(
     let logical_quotient = LogicalQuotientWorkspace {
         config: quotient_config,
         requirements: quotient_requirements,
+        producer_b2n: quotient_producer_b2n,
         forward_twiddles,
         inverse_subdomain_twiddles: quotient_inverse_twiddles,
         partial_numerators: partial_numerators.clone(),
@@ -9830,9 +9914,22 @@ fn validate_quotient_numerator_source_binding(
 }
 
 fn resolve_quotient_slots(
+    resident_backend: ResidentBackend,
     logical: LogicalQuotientWorkspace,
     bindings: &[ArenaBinding],
 ) -> Result<PlannedQuotientWorkspace, ArenaPlanError> {
+    let partial_log_sizes = logical
+        .partial_numerators
+        .iter()
+        .map(|source| source.log_size)
+        .collect::<Vec<_>>();
+    validate_quotient_producer_b2n_selection(
+        resident_backend,
+        logical.config,
+        &partial_log_sizes,
+        logical.producer_b2n.as_ref(),
+    )
+    .map_err(ArenaPlanError::QuotientProducerB2n)?;
     let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
     let slots = QuotientWorkspaceSlots {
@@ -9910,6 +10007,7 @@ fn resolve_quotient_slots(
     Ok(PlannedQuotientWorkspace {
         config: logical.config,
         requirements: logical.requirements,
+        producer_b2n: logical.producer_b2n,
         forward_twiddles,
         inverse_subdomain_twiddles,
         partial_numerators,
@@ -11106,6 +11204,101 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn quotient_producer_b2n_selection_is_exact_and_fail_closed() {
+        let config = QuotientWorkspaceConfig {
+            lifting_log_size: 25,
+            log_blowup_factor: 2,
+        };
+        let logs = [23, 22, 21];
+        let selected = select_quotient_producer_b2n(ResidentBackend::ReplacementV1, config, &logs)
+            .unwrap()
+            .expect("the exact ReplacementV1 shape must select production fusion");
+        validate_quotient_producer_b2n_selection(
+            ResidentBackend::ReplacementV1,
+            config,
+            &logs,
+            Some(&selected),
+        )
+        .unwrap();
+
+        for result in [
+            validate_quotient_producer_b2n_selection(
+                ResidentBackend::LegacyResident,
+                config,
+                &logs,
+                Some(&selected),
+            ),
+            validate_quotient_producer_b2n_selection(
+                ResidentBackend::ReplacementV1,
+                QuotientWorkspaceConfig {
+                    lifting_log_size: 24,
+                    ..config
+                },
+                &logs,
+                Some(&selected),
+            ),
+            validate_quotient_producer_b2n_selection(
+                ResidentBackend::ReplacementV1,
+                config,
+                &[23, 22, 20],
+                Some(&selected),
+            ),
+            validate_quotient_producer_b2n_selection(
+                ResidentBackend::ReplacementV1,
+                config,
+                &[22, 23, 21],
+                Some(&selected),
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(QuotientProducerB2nSelectionError::IdentityDrift { .. })
+            ));
+        }
+
+        let drifted_program = QuotientProducerB2nProgram::compile(config, &[23, 22, 20]).unwrap();
+        assert!(matches!(
+            validate_quotient_producer_b2n_selection(
+                ResidentBackend::ReplacementV1,
+                config,
+                &logs,
+                Some(&drifted_program),
+            ),
+            Err(QuotientProducerB2nSelectionError::IdentityDrift { .. })
+        ));
+
+        let unsupported = QuotientWorkspaceConfig {
+            lifting_log_size: 24,
+            log_blowup_factor: 2,
+        };
+        assert_eq!(
+            select_quotient_producer_b2n(ResidentBackend::ReplacementV1, unsupported, &logs,)
+                .unwrap(),
+            None
+        );
+        validate_quotient_producer_b2n_selection(
+            ResidentBackend::ReplacementV1,
+            unsupported,
+            &logs,
+            None,
+        )
+        .unwrap();
+        validate_quotient_producer_b2n_selection(
+            ResidentBackend::LegacyResident,
+            config,
+            &logs,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            select_quotient_producer_b2n(ResidentBackend::ReplacementV1, config, &[]),
+            Err(QuotientProducerB2nSelectionError::Compile(
+                QuotientProducerB2nError::EmptySources
+            ))
+        ));
     }
 
     #[test]

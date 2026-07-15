@@ -59,6 +59,8 @@ mod arena_preflight_fixed_image_receipt;
 mod arena_preflight_hybrid;
 #[path = "arena_preflight/ntt_lde_receipt.rs"]
 mod arena_preflight_ntt_lde_receipt;
+#[path = "arena_preflight/quotient_producer_b2n_receipt.rs"]
+mod arena_preflight_quotient_producer_b2n_receipt;
 #[path = "../arena_preflight_staged.rs"]
 mod arena_preflight_staged;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1052,6 +1054,7 @@ fn report_json(
             "hybrid_traffic_model": hybrid_traffic,
         },
         "quotient_numerator_staged_single_write": arena_preflight_staged::json(arena),
+        "quotient_producer_b2n": arena_preflight_quotient_producer_b2n_receipt::json(arena),
         "composition_wave_current_plan": composition_wave_current_plan,
         "ntt_lde_direct_slab_frontier": ntt_lde_direct_slab_frontier,
         "quotient_combine_pass_byte_model": {
