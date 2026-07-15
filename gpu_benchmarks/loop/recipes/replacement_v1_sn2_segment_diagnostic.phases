@@ -1,0 +1,19 @@
+# shellcheck shell=bash
+# Content-hashed, diagnostic-only SN2 loop. It reuses the production build and
+# AOT identity gates, runs two byte-identical verified proofs, and records the
+# 14 CUDA-event graph intervals without creating a promotable timing seal.
+
+# shellcheck disable=SC2034 # Consumed by the sourced common recipe.
+REPLACEMENT_SN2_COUNTER_POLICY=timing-only
+REPLACEMENT_SN2_MODE=diagnostic
+# shellcheck disable=SC1091 # Pod-side absolute path is resolved after sync.
+source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
+
+phase ambient_override_gate checkpoint_reject_ambient_overrides
+phase source_input_identity checkpoint_source_input_identity iteration
+phase hardware_identity checkpoint_hardware_identity
+phase build checkpoint_build
+phase adapted_input_identity checkpoint_adapted_input_identity
+phase aot_identity checkpoint_aot_identity
+phase sn2_segment_diagnostic checkpoint_run_sn2 diagnostic 2
+phase sn2_segment_diagnostic_validate checkpoint_validate_sn2 diagnostic 2
