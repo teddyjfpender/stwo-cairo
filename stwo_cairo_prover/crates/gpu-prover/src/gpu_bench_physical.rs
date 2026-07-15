@@ -73,6 +73,12 @@ pub(crate) fn gpu_native_session_context(
             "gpu_trace_commit_direct_commitments": null,
             "gpu_trace_commit_separate_interpolation_graph_invocations": null,
             "gpu_trace_commit_separate_interpolation_kernel_launches": null,
+            "gpu_trace_commit_terminal_fused_commitments": null,
+            "gpu_trace_commit_terminal_materialized_commitments": null,
+            "gpu_trace_commit_terminal_fixed16_batches": null,
+            "gpu_trace_commit_terminal_materialized_batches": null,
+            "gpu_trace_commit_terminal_net_device_bytes_removed": null,
+            "gpu_trace_commit_terminal_net_cuda_launches_removed": null,
             "gpu_composition_direct_retained_evaluations": null,
             "gpu_composition_direct_split_graphs": null,
             "gpu_composition_precomputed_compact_commitments": null,
@@ -270,6 +276,12 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_trace_commit_direct_commitments": trace_commit_inputs.map(|value| value.direct_commitments),
         "gpu_trace_commit_separate_interpolation_graph_invocations": trace_commit_inputs.map(|value| value.separate_interpolation_graph_invocations),
         "gpu_trace_commit_separate_interpolation_kernel_launches": trace_commit_inputs.map(|value| value.separate_interpolation_kernel_launches),
+        "gpu_trace_commit_terminal_fused_commitments": trace_commit_inputs.map(|value| value.terminal_fused_commitments),
+        "gpu_trace_commit_terminal_materialized_commitments": trace_commit_inputs.map(|value| value.terminal_materialized_commitments),
+        "gpu_trace_commit_terminal_fixed16_batches": trace_commit_inputs.map(|value| value.terminal_fixed16_batches),
+        "gpu_trace_commit_terminal_materialized_batches": trace_commit_inputs.map(|value| value.terminal_materialized_batches),
+        "gpu_trace_commit_terminal_net_device_bytes_removed": trace_commit_inputs.map(|value| value.terminal_net_device_bytes_removed),
+        "gpu_trace_commit_terminal_net_cuda_launches_removed": trace_commit_inputs.map(|value| value.terminal_net_cuda_launches_removed),
         "gpu_composition_direct_retained_evaluations": composition_commit.map(|value| value.direct_retained_evaluations),
         "gpu_composition_direct_split_graphs": composition_commit.map(|value| value.direct_split_graphs),
         "gpu_composition_precomputed_compact_commitments": composition_commit.map(|value| value.precomputed_compact_commitments),
@@ -485,6 +497,8 @@ mod tests {
         assert!(value["gpu_trace_commit_direct_commitments"].is_null());
         assert!(value["gpu_trace_commit_separate_interpolation_graph_invocations"].is_null());
         assert!(value["gpu_trace_commit_separate_interpolation_kernel_launches"].is_null());
+        assert!(value["gpu_trace_commit_terminal_fused_commitments"].is_null());
+        assert!(value["gpu_trace_commit_terminal_net_device_bytes_removed"].is_null());
         assert!(value["gpu_composition_split_launch_mode"].is_null());
         assert!(value["gpu_composition_split_executed_logical_bytes"].is_null());
         assert!(value["gpu_composition_split_executed_kernel_launches"].is_null());
@@ -498,6 +512,12 @@ mod tests {
                     direct_commitments: 0,
                     separate_interpolation_graph_invocations: 2,
                     separate_interpolation_kernel_launches: 36,
+                    terminal_fused_commitments: 0,
+                    terminal_materialized_commitments: 0,
+                    terminal_fixed16_batches: 0,
+                    terminal_materialized_batches: 0,
+                    terminal_net_device_bytes_removed: 0,
+                    terminal_net_cuda_launches_removed: 0,
                 },
             ),
             ..ResidentSessionTelemetry::default()
@@ -511,6 +531,11 @@ mod tests {
         assert_eq!(
             value["gpu_trace_commit_separate_interpolation_kernel_launches"],
             36
+        );
+        assert_eq!(value["gpu_trace_commit_terminal_fused_commitments"], 0);
+        assert_eq!(
+            value["gpu_trace_commit_terminal_materialized_commitments"],
+            0
         );
     }
 
@@ -697,6 +722,12 @@ mod tests {
                     direct_commitments: 2,
                     separate_interpolation_graph_invocations: 0,
                     separate_interpolation_kernel_launches: 0,
+                    terminal_fused_commitments: 2,
+                    terminal_materialized_commitments: 0,
+                    terminal_fixed16_batches: 7,
+                    terminal_materialized_batches: 3,
+                    terminal_net_device_bytes_removed: 1_073_741_824,
+                    terminal_net_cuda_launches_removed: 4,
                 },
             ),
             workspace_key: Some(WorkspaceKey::new(ProofShapeKey(0), 0x5678)),
@@ -740,6 +771,17 @@ mod tests {
         assert_eq!(
             value["gpu_trace_commit_separate_interpolation_kernel_launches"],
             0
+        );
+        assert_eq!(value["gpu_trace_commit_terminal_fused_commitments"], 2);
+        assert_eq!(value["gpu_trace_commit_terminal_fixed16_batches"], 7);
+        assert_eq!(value["gpu_trace_commit_terminal_materialized_batches"], 3);
+        assert_eq!(
+            value["gpu_trace_commit_terminal_net_device_bytes_removed"],
+            1_073_741_824u64
+        );
+        assert_eq!(
+            value["gpu_trace_commit_terminal_net_cuda_launches_removed"],
+            4
         );
         assert_eq!(value["gpu_policy_commit_mode"], "domain-progressive");
         assert_eq!(

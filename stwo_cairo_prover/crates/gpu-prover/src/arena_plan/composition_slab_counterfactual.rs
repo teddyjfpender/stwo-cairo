@@ -216,6 +216,7 @@ fn same_commitment_geometry(direct: &[PlannedCommitment], fallback: &[PlannedCom
                 && direct.domain_cooperative_program == fallback.domain_cooperative_program
                 && direct.compact_domain_program == fallback.compact_domain_program
                 && direct.direct_retained_b2n_program == fallback.direct_retained_b2n_program
+                && direct.direct_compact_terminal == fallback.direct_compact_terminal
                 && direct.config == fallback.config
                 && direct.grouped_column_log_sizes == fallback.grouped_column_log_sizes
                 && direct.grouped_column_sources == fallback.grouped_column_sources

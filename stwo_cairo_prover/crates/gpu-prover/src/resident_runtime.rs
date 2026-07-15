@@ -18,14 +18,15 @@ use stwo_backend_cuda::{
     CommitEvaluationGroup, CommitProgram, CompactDomainBindingError, CompactDomainProgram,
     CompositionSplitTraffic, CudaExecContext, CudaExecTelemetry, CudaRuntimeError,
     DecommitAssembly, DecommitColumnSource, DecommitTreeGeometry, DecommitTreeSources,
-    DeviceTranscriptError, DirectCompactDomainBindingError, DomainCooperativeBindingError,
-    DomainCooperativeProgram, ExecutionTablesHostData, FixedTableSourceColumn,
-    FriDecommitOwnedSources, MemoryBaseTracePart, ModeAwareCommitWorkspaceRequirements,
-    ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError, PreparedBlake2sPowGraph,
-    PreparedBlake2sTranscript, PreparedBlakeGFusedFeed, PreparedCommitError, PreparedCommitGraph,
-    PreparedCompactDomainCommitGraph, PreparedDecommitError, PreparedDecommitGraph,
-    PreparedDirectCompactDomainCommitGraph, PreparedEcOpError, PreparedEcOpGraph,
-    PreparedEcOpIngestTelemetry, PreparedExecutionTablesError, PreparedExecutionTablesGraph,
+    DeviceTranscriptError, DirectCompactDomainBindingError, DirectCompactTerminalBatchMode,
+    DirectCompactTerminalReceipt, DomainCooperativeBindingError, DomainCooperativeProgram,
+    ExecutionTablesHostData, FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
+    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError,
+    PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedBlakeGFusedFeed,
+    PreparedCommitError, PreparedCommitGraph, PreparedCompactDomainCommitGraph,
+    PreparedDecommitError, PreparedDecommitGraph, PreparedDirectCompactDomainCommitGraph,
+    PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
+    PreparedExecutionTablesError, PreparedExecutionTablesGraph,
     PreparedExecutionTablesIngestTelemetry, PreparedFixedTableError, PreparedFixedTableGraph,
     PreparedFriError, PreparedFriFinalError, PreparedFriFinalGraph, PreparedFriGraph,
     PreparedInterpolationError, PreparedInterpolationGraph, PreparedMemoryBaseTraceError,
@@ -46,8 +47,9 @@ use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
 use stwo_cairo_prover::witness::proof_shape::{ProofShapeKey, TracePartId};
 
 use crate::arena_plan::{
-    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, DynamicCommitmentLeafSchedule,
-    PlannedFixedTableSource, PlannedRecordedMultiplicityFeedGraph, ResidentBackend,
+    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, DirectCompactTerminalPlan,
+    DynamicCommitmentLeafSchedule, PlannedFixedTableSource, PlannedRecordedMultiplicityFeedGraph,
+    ResidentBackend,
 };
 use crate::composition_plan::CompositionProofBindings;
 use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
@@ -123,6 +125,12 @@ pub struct ResidentTraceCommitInputTelemetry {
     pub direct_commitments: u32,
     pub separate_interpolation_graph_invocations: u32,
     pub separate_interpolation_kernel_launches: usize,
+    pub terminal_fused_commitments: u32,
+    pub terminal_materialized_commitments: u32,
+    pub terminal_fixed16_batches: u32,
+    pub terminal_materialized_batches: u32,
+    pub terminal_net_device_bytes_removed: u64,
+    pub terminal_net_cuda_launches_removed: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1355,6 +1363,77 @@ impl PreparedResidentCommitment<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TraceCommitTerminalTelemetry {
+    fused_commitments: u32,
+    materialized_commitments: u32,
+    fixed16_batches: u32,
+    materialized_batches: u32,
+    net_device_bytes_removed: u64,
+    net_cuda_launches_removed: i32,
+}
+
+fn fused_trace_commit_terminal_telemetry<'a>(
+    receipts: impl IntoIterator<Item = &'a DirectCompactTerminalReceipt>,
+) -> TraceCommitTerminalTelemetry {
+    let mut telemetry = TraceCommitTerminalTelemetry::default();
+    for receipt in receipts {
+        telemetry.fused_commitments += 1;
+        telemetry.fixed16_batches += receipt
+            .batches
+            .iter()
+            .filter(|batch| {
+                matches!(
+                    batch.mode,
+                    DirectCompactTerminalBatchMode::Fixed16Hybrid { .. }
+                )
+            })
+            .count() as u32;
+        telemetry.materialized_batches += receipt
+            .batches
+            .iter()
+            .filter(|batch| batch.mode == DirectCompactTerminalBatchMode::Materialized)
+            .count() as u32;
+        telemetry.net_device_bytes_removed += receipt.net_device_bytes_removed;
+        telemetry.net_cuda_launches_removed += receipt.net_cuda_launches_removed;
+    }
+    telemetry
+}
+
+fn planned_trace_commit_terminal_telemetry(
+    workspace: &GraphWorkspace,
+) -> TraceCommitTerminalTelemetry {
+    let mut telemetry = TraceCommitTerminalTelemetry::default();
+    for selection in workspace
+        .plan()
+        .commitments()
+        .iter()
+        .filter(|commitment| {
+            matches!(
+                commitment.id,
+                CommitmentTreeId::Base | CommitmentTreeId::Interaction
+            )
+        })
+        .filter_map(|commitment| commitment.direct_compact_terminal.as_ref())
+    {
+        match selection {
+            DirectCompactTerminalPlan::Materialized { batches } => {
+                telemetry.materialized_commitments += 1;
+                telemetry.materialized_batches += *batches;
+            }
+            DirectCompactTerminalPlan::Fused(program) => {
+                let selected = fused_trace_commit_terminal_telemetry([program.receipt()]);
+                telemetry.fused_commitments += selected.fused_commitments;
+                telemetry.fixed16_batches += selected.fixed16_batches;
+                telemetry.materialized_batches += selected.materialized_batches;
+                telemetry.net_device_bytes_removed += selected.net_device_bytes_removed;
+                telemetry.net_cuda_launches_removed += selected.net_cuda_launches_removed;
+            }
+        }
+    }
+    telemetry
+}
+
 enum PreparedTraceCommitInput<'a> {
     Interpolate(PreparedInterpolationGraph<'a>),
     DirectEvaluations,
@@ -1379,12 +1458,14 @@ impl PreparedTraceCommitInput<'_> {
 fn trace_commit_input_telemetry(
     base: &PreparedTraceCommitInput<'_>,
     interaction: &PreparedTraceCommitInput<'_>,
+    terminal: TraceCommitTerminalTelemetry,
 ) -> ResidentTraceCommitInputTelemetry {
     trace_commit_input_telemetry_from_modes(
         base.mode(),
         interaction.mode(),
         base.interpolation_kernel_launches(),
         interaction.interpolation_kernel_launches(),
+        terminal,
     )
 }
 
@@ -1393,6 +1474,7 @@ fn trace_commit_input_telemetry_from_modes(
     interaction: TraceCommitInputMode,
     base_interpolation_launches: usize,
     interaction_interpolation_launches: usize,
+    terminal: TraceCommitTerminalTelemetry,
 ) -> ResidentTraceCommitInputTelemetry {
     let direct_commitments = [base, interaction]
         .into_iter()
@@ -1403,6 +1485,12 @@ fn trace_commit_input_telemetry_from_modes(
         separate_interpolation_graph_invocations: 2 - direct_commitments,
         separate_interpolation_kernel_launches: base_interpolation_launches
             + interaction_interpolation_launches,
+        terminal_fused_commitments: terminal.fused_commitments,
+        terminal_materialized_commitments: terminal.materialized_commitments,
+        terminal_fixed16_batches: terminal.fixed16_batches,
+        terminal_materialized_batches: terminal.materialized_batches,
+        terminal_net_device_bytes_removed: terminal.net_device_bytes_removed,
+        terminal_net_cuda_launches_removed: terminal.net_cuda_launches_removed,
     }
 }
 
@@ -2047,6 +2135,11 @@ impl<'a> ResidentGraphRuntime<'a> {
         {
             let precomputed_composition = planned.id == CommitmentTreeId::Composition
                 && composition.output_mode() == CompositionOutputMode::DirectRetainedEvaluations;
+            if planned.direct_retained_b2n_program.is_some()
+                != planned.direct_compact_terminal.is_some()
+            {
+                return Err(ResidentRuntimeError::CommitModeMismatch);
+            }
             let direct_inputs = planned
                 .direct_retained_b2n_program
                 .as_ref()
@@ -2227,16 +2320,39 @@ impl<'a> ResidentGraphRuntime<'a> {
                                         planned.direct_retained_b2n_program.as_ref(),
                                         direct_inputs.as_ref(),
                                     ) {
-                                        let graph = compact.bind_prepared_direct(
-                                            arena,
-                                            base,
-                                            domain,
-                                            direct_program,
-                                            slots,
-                                            &direct_inputs.columns,
-                                            direct_inputs.inverse_twiddles,
-                                            direct_inputs.forward_twiddles,
-                                        )?;
+                                        let terminal = planned
+                                            .direct_compact_terminal
+                                            .as_ref()
+                                            .ok_or(ResidentRuntimeError::CommitModeMismatch)?;
+                                        let graph = match terminal {
+                                            DirectCompactTerminalPlan::Materialized { .. } => {
+                                                compact.bind_prepared_direct(
+                                                    arena,
+                                                    base,
+                                                    domain,
+                                                    direct_program,
+                                                    slots,
+                                                    &direct_inputs.columns,
+                                                    direct_inputs.inverse_twiddles,
+                                                    direct_inputs.forward_twiddles,
+                                                )?
+                                            }
+                                            DirectCompactTerminalPlan::Fused(program) => compact
+                                                .bind_prepared_direct_terminal_fused(
+                                                    arena,
+                                                    base,
+                                                    domain,
+                                                    direct_program,
+                                                    program.clone(),
+                                                    slots,
+                                                    &direct_inputs.columns,
+                                                    direct_inputs.inverse_twiddles,
+                                                    direct_inputs.forward_twiddles,
+                                                )?,
+                                        };
+                                        if terminal.receipt() != graph.terminal_receipt() {
+                                            return Err(ResidentRuntimeError::CommitModeMismatch);
+                                        }
                                         if !direct_retained_outputs_match(
                                             graph.retained_evaluations(),
                                             &evaluation_outputs,
@@ -2298,18 +2414,23 @@ impl<'a> ResidentGraphRuntime<'a> {
             prepare_trace_commit_input(workspace, &commitments, CommitmentTreeId::Base)?;
         let interaction_commit_input =
             prepare_trace_commit_input(workspace, &commitments, CommitmentTreeId::Interaction)?;
-        let input_telemetry =
-            trace_commit_input_telemetry(&base_commit_input, &interaction_commit_input);
+        let input_telemetry = trace_commit_input_telemetry(
+            &base_commit_input,
+            &interaction_commit_input,
+            planned_trace_commit_terminal_telemetry(workspace),
+        );
         let expected_input_telemetry = match protocol_identity.resident_backend {
-            ResidentBackend::ReplacementV1 => ResidentTraceCommitInputTelemetry {
-                direct_commitments: 2,
-                separate_interpolation_graph_invocations: 0,
-                separate_interpolation_kernel_launches: 0,
-            },
-            ResidentBackend::LegacyResident => ResidentTraceCommitInputTelemetry {
-                direct_commitments: 0,
-                separate_interpolation_graph_invocations: 2,
-                separate_interpolation_kernel_launches: workspace
+            ResidentBackend::ReplacementV1 => trace_commit_input_telemetry_from_modes(
+                TraceCommitInputMode::DirectEvaluations,
+                TraceCommitInputMode::DirectEvaluations,
+                0,
+                0,
+                planned_trace_commit_terminal_telemetry(workspace),
+            ),
+            ResidentBackend::LegacyResident => trace_commit_input_telemetry_from_modes(
+                TraceCommitInputMode::Interpolate,
+                TraceCommitInputMode::Interpolate,
+                workspace
                     .plan()
                     .commitments()
                     .iter()
@@ -2319,9 +2440,18 @@ impl<'a> ResidentGraphRuntime<'a> {
                             CommitmentTreeId::Base | CommitmentTreeId::Interaction
                         )
                     })
+                    .filter(|commitment| commitment.id == CommitmentTreeId::Base)
                     .map(|commitment| commitment.interpolation_batches.len())
                     .sum(),
-            },
+                workspace
+                    .plan()
+                    .commitments()
+                    .iter()
+                    .filter(|commitment| commitment.id == CommitmentTreeId::Interaction)
+                    .map(|commitment| commitment.interpolation_batches.len())
+                    .sum(),
+                TraceCommitTerminalTelemetry::default(),
+            ),
         };
         if input_telemetry != expected_input_telemetry {
             return Err(ResidentRuntimeError::CommitModeMismatch);
@@ -2845,7 +2975,11 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// node count used by the hot-path budget. Replacement-v1 must report zero
     /// separately launched Base/Interaction interpolation graphs.
     pub fn trace_commit_input_telemetry(&self) -> ResidentTraceCommitInputTelemetry {
-        trace_commit_input_telemetry(&self.base_commit_input, &self.interaction_commit_input)
+        trace_commit_input_telemetry(
+            &self.base_commit_input,
+            &self.interaction_commit_input,
+            planned_trace_commit_terminal_telemetry(self.workspace),
+        )
     }
 
     /// Exact producer/consumer ownership at the Composition commitment edge.
@@ -5531,11 +5665,25 @@ mod tests {
                 TraceCommitInputMode::DirectEvaluations,
                 0,
                 0,
+                TraceCommitTerminalTelemetry {
+                    fused_commitments: 2,
+                    materialized_commitments: 0,
+                    fixed16_batches: 7,
+                    materialized_batches: 3,
+                    net_device_bytes_removed: 4096,
+                    net_cuda_launches_removed: 4,
+                },
             ),
             ResidentTraceCommitInputTelemetry {
                 direct_commitments: 2,
                 separate_interpolation_graph_invocations: 0,
                 separate_interpolation_kernel_launches: 0,
+                terminal_fused_commitments: 2,
+                terminal_materialized_commitments: 0,
+                terminal_fixed16_batches: 7,
+                terminal_materialized_batches: 3,
+                terminal_net_device_bytes_removed: 4096,
+                terminal_net_cuda_launches_removed: 4,
             }
         );
         assert_eq!(
@@ -5544,11 +5692,18 @@ mod tests {
                 TraceCommitInputMode::Interpolate,
                 18,
                 18,
+                TraceCommitTerminalTelemetry::default(),
             ),
             ResidentTraceCommitInputTelemetry {
                 direct_commitments: 0,
                 separate_interpolation_graph_invocations: 2,
                 separate_interpolation_kernel_launches: 36,
+                terminal_fused_commitments: 0,
+                terminal_materialized_commitments: 0,
+                terminal_fixed16_batches: 0,
+                terminal_materialized_batches: 0,
+                terminal_net_device_bytes_removed: 0,
+                terminal_net_cuda_launches_removed: 0,
             }
         );
     }

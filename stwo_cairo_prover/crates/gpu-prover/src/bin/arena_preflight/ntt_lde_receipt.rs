@@ -10,7 +10,7 @@ use stwo_backend_cuda::{
 };
 use stwo_cairo_gpu_prover::arena_plan::{
     BufferPurpose, CommitmentColumnSource, CommitmentTreeId, CompositionSlabArenaCounterfactual,
-    OpenedColumnSource, PlannedCommitment, ProofArenaPlan, ProofEpoch,
+    DirectCompactTerminalPlan, OpenedColumnSource, PlannedCommitment, ProofArenaPlan, ProofEpoch,
 };
 use stwo_cairo_gpu_prover::prepared_composition::CompositionOutputMode;
 
@@ -305,6 +305,30 @@ fn tree_receipt(
                 .direct_retained_b2n_program
                 .as_ref()
                 .map_or(0, |program| program.batches().len()),
+            "direct_compact_terminal_mode": match commitment.direct_compact_terminal.as_ref() {
+                None => "not-applicable",
+                Some(DirectCompactTerminalPlan::Materialized { .. }) => "materialized",
+                Some(DirectCompactTerminalPlan::Fused(_)) => "fixed16-hybrid",
+            },
+            "direct_compact_terminal_fixed16_batches": commitment
+                .direct_compact_terminal
+                .as_ref()
+                .and_then(DirectCompactTerminalPlan::receipt)
+                .map_or(0, |receipt| receipt.fixed_terminal_launches),
+            "direct_compact_terminal_materialized_batches": commitment
+                .direct_compact_terminal
+                .as_ref()
+                .map_or(0, DirectCompactTerminalPlan::materialized_batches),
+            "direct_compact_terminal_net_device_bytes_removed": commitment
+                .direct_compact_terminal
+                .as_ref()
+                .and_then(DirectCompactTerminalPlan::receipt)
+                .map_or(0, |receipt| receipt.net_device_bytes_removed),
+            "direct_compact_terminal_net_cuda_launches_removed": commitment
+                .direct_compact_terminal
+                .as_ref()
+                .and_then(DirectCompactTerminalPlan::receipt)
+                .map_or(0, |receipt| receipt.net_cuda_launches_removed),
             "transform_coefficient_image_bytes": bytes(totals.coefficient_words)?,
             "logical_coefficient_bytes": bytes(totals.resident_coefficient_words)?,
             "retained_evaluation_bytes": bytes(totals.evaluation_words)?,

@@ -33,7 +33,8 @@ use stwo_backend_cuda::{
     CompactDomainProgramError, CompositionSplitProgram, CudaExecContext, DecommitColumnGeometry,
     DecommitSourceMode, DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots,
     DecommitWorkspaceConfig, DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena,
-    DeviceTranscriptError, DirectCompactDomainBindingError, DirectRetainedB2nError,
+    DeviceTranscriptError, DirectCompactDomainBindingError, DirectCompactTerminalError,
+    DirectCompactTerminalFallbackReason, DirectCompactTerminalProgram, DirectRetainedB2nError,
     DirectRetainedB2nProgram, DomainCooperativeProgram, DomainCooperativeProgramError,
     EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
     ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
@@ -2513,6 +2514,7 @@ struct LogicalCommitWorkspace {
     domain_cooperative_program: Option<DomainCooperativeProgram>,
     compact_domain_program: Option<CompactDomainProgram>,
     direct_retained_b2n_program: Option<DirectRetainedB2nProgram>,
+    direct_compact_terminal: Option<DirectCompactTerminalPlan>,
     interpolation_mode: InterpolationLaunchMode,
     config: CommitWorkspaceConfig,
     grouped_column_log_sizes: Vec<Vec<u32>>,
@@ -3302,6 +3304,10 @@ pub struct PlannedCommitment {
     /// Replacement-v1 Base/Interaction one-owner evaluation-to-LDE program.
     /// `None` for Preprocessed, Composition, and every legacy commitment.
     pub direct_retained_b2n_program: Option<DirectRetainedB2nProgram>,
+    /// Compile-time terminal selection for a direct Base/Interaction commit.
+    /// Runtime binding must execute this exact choice and may not probe or
+    /// fall back after the arena topology has been sealed.
+    pub direct_compact_terminal: Option<DirectCompactTerminalPlan>,
     pub config: CommitWorkspaceConfig,
     pub grouped_column_log_sizes: Vec<Vec<u32>>,
     pub grouped_column_sources: Vec<Vec<CommitmentColumnSource>>,
@@ -3318,6 +3324,39 @@ pub struct PlannedCommitment {
     pub retained_layers_bottom_up: Vec<ArenaBinding>,
     pub interpolation_mode: InterpolationLaunchMode,
     pub interpolation_batches: Vec<PlannedInterpolationBatch>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DirectCompactTerminalPlan {
+    /// The exact shape has no profitable qualified terminal batch, or the
+    /// pure compiler rejected it as an explicitly unsupported topology.
+    Materialized { batches: u32 },
+    /// At least one batch uses the qualified fixed16 terminal path. The
+    /// program also seals every mixed-shape materialized batch in order.
+    Fused(DirectCompactTerminalProgram),
+}
+
+impl DirectCompactTerminalPlan {
+    pub fn receipt(&self) -> Option<&stwo_backend_cuda::DirectCompactTerminalReceipt> {
+        match self {
+            Self::Materialized { .. } => None,
+            Self::Fused(program) => Some(program.receipt()),
+        }
+    }
+
+    pub fn materialized_batches(&self) -> u32 {
+        match self {
+            Self::Materialized { batches } => *batches,
+            Self::Fused(program) => program
+                .receipt()
+                .batches
+                .iter()
+                .filter(|batch| {
+                    batch.mode == stwo_backend_cuda::DirectCompactTerminalBatchMode::Materialized
+                })
+                .count() as u32,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4225,6 +4264,7 @@ pub enum ArenaPlanError {
     CompactDomainProgram(CompactDomainProgramError),
     CompactDomainBinding(CompactDomainBindingError),
     DirectRetainedB2n(DirectRetainedB2nError),
+    DirectCompactTerminal(DirectCompactTerminalError),
     DirectCompactDomainBinding(DirectCompactDomainBindingError),
     DirectCommitCoefficientReaders {
         tree: CommitmentTreeId,
@@ -6967,6 +7007,43 @@ fn direct_retained_b2n_program(
         .map_err(ArenaPlanError::DirectRetainedB2n)
 }
 
+fn direct_compact_terminal_plan(
+    backend: ResidentBackend,
+    tree: CommitmentTreeId,
+    compact: Option<&CompactDomainProgram>,
+    direct: Option<&DirectRetainedB2nProgram>,
+) -> Result<Option<DirectCompactTerminalPlan>, ArenaPlanError> {
+    if backend != ResidentBackend::ReplacementV1
+        || !matches!(tree, CommitmentTreeId::Base | CommitmentTreeId::Interaction)
+    {
+        return Ok(None);
+    }
+    let compact = compact.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+        "replacement direct terminal selection is missing its compact program",
+    ))?;
+    let direct = direct.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+        "replacement direct terminal selection is missing its direct program",
+    ))?;
+    match DirectCompactTerminalProgram::compile(compact, direct) {
+        Ok(program) if program.receipt().fixed_terminal_launches != 0 => {
+            Ok(Some(DirectCompactTerminalPlan::Fused(program)))
+        }
+        Ok(_)
+        | Err(DirectCompactTerminalError::Fallback(
+            DirectCompactTerminalFallbackReason::UnsupportedLogSize(_)
+            | DirectCompactTerminalFallbackReason::UnsupportedBatchWidth(_)
+            | DirectCompactTerminalFallbackReason::CounterOverflow,
+        )) => Ok(Some(DirectCompactTerminalPlan::Materialized {
+            batches: direct
+                .batches()
+                .len()
+                .try_into()
+                .map_err(|_| ArenaPlanError::SizeOverflow)?,
+        })),
+        Err(error) => Err(ArenaPlanError::DirectCompactTerminal(error)),
+    }
+}
+
 fn composition_output_plan(
     protocol: &ProtocolGeometry,
     requirements: &CompositionWorkspaceRequirements,
@@ -7412,6 +7489,12 @@ fn append_protocol_buffers(
             compact_domain_program.as_ref(),
             late_coefficient_ownership,
         )?;
+        let direct_compact_terminal = direct_compact_terminal_plan(
+            protocol.identity.resident_backend,
+            geometry.id,
+            compact_domain_program.as_ref(),
+            direct_retained_b2n_program.as_ref(),
+        )?;
         let in_place_slab = match (&requirements, storage_mode) {
             (
                 ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
@@ -7737,6 +7820,7 @@ fn append_protocol_buffers(
             domain_cooperative_program,
             compact_domain_program,
             direct_retained_b2n_program,
+            direct_compact_terminal,
             interpolation_mode: protocol.identity.interpolation_mode,
             config: geometry.config,
             grouped_column_log_sizes: geometry.grouped_column_log_sizes.clone(),
@@ -9173,6 +9257,7 @@ fn resolve_commitment_slots(
         domain_cooperative_program: logical.domain_cooperative_program,
         compact_domain_program: logical.compact_domain_program,
         direct_retained_b2n_program: logical.direct_retained_b2n_program,
+        direct_compact_terminal: logical.direct_compact_terminal,
         config: logical.config,
         grouped_column_log_sizes: logical.grouped_column_log_sizes,
         grouped_column_sources: logical.grouped_column_sources,
@@ -10846,6 +10931,86 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    fn direct_terminal_programs(
+        coefficient_log_sizes: Vec<u32>,
+    ) -> (CompactDomainProgram, DirectRetainedB2nProgram) {
+        let lifting_log_size = coefficient_log_sizes.iter().copied().max().unwrap() + 1;
+        let base = CommitProgram::compile(
+            CommitWorkspaceConfig {
+                log_blowup_factor: 1,
+                lifting_log_size,
+                unretained_bottom_layers: 4,
+                max_fused_tail_levels: 2,
+            },
+            ProgressiveCommitGeometry {
+                lifting_log_size,
+                log_blowup_factor: 1,
+                groups: vec![ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes,
+                    retain_evaluations: true,
+                }],
+            },
+            ProgressiveNttLeafFusionMode::Fused16,
+            true,
+        )
+        .unwrap();
+        let domain = DomainCooperativeProgram::compile_mode_a(&base).unwrap();
+        let compact = CompactDomainProgram::compile(&base, &domain).unwrap();
+        let direct = DirectRetainedB2nProgram::compile(TraceTreeRole::Base, &base).unwrap();
+        (compact, direct)
+    }
+
+    #[test]
+    fn replacement_direct_terminal_selection_is_compiled_not_probed() {
+        let (compact, direct) = direct_terminal_programs(vec![3; 5]);
+        assert_eq!(
+            direct_compact_terminal_plan(
+                ResidentBackend::ReplacementV1,
+                CommitmentTreeId::Base,
+                Some(&compact),
+                Some(&direct),
+            )
+            .unwrap(),
+            Some(DirectCompactTerminalPlan::Materialized { batches: 1 })
+        );
+
+        let (compact, direct) = direct_terminal_programs(vec![12; 19]);
+        let selected = direct_compact_terminal_plan(
+            ResidentBackend::ReplacementV1,
+            CommitmentTreeId::Base,
+            Some(&compact),
+            Some(&direct),
+        )
+        .unwrap()
+        .unwrap();
+        let receipt = selected.receipt().expect("log13 width19 must fuse");
+        assert_eq!(receipt.fixed_terminal_launches, 1);
+        assert_eq!(receipt.batches.len(), 1);
+        assert!(receipt.net_device_bytes_removed > 0);
+        assert!(receipt.net_cuda_launches_removed > 0);
+
+        assert_eq!(
+            direct_compact_terminal_plan(
+                ResidentBackend::LegacyResident,
+                CommitmentTreeId::Base,
+                Some(&compact),
+                Some(&direct),
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            direct_compact_terminal_plan(
+                ResidentBackend::ReplacementV1,
+                CommitmentTreeId::Composition,
+                Some(&compact),
+                Some(&direct),
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

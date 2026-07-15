@@ -4,7 +4,9 @@ use stwo_backend_cuda::{
     CommitProgram, CommitProgramTraffic, CompactDomainOperation, CompactDomainProgram,
     DomainCooperativeOperation, DomainCooperativeProgram, ProgressiveCommitStorageMode,
 };
-use stwo_cairo_gpu_prover::arena_plan::{CommitmentTreeId, PlannedCommitment, ResidentBackend};
+use stwo_cairo_gpu_prover::arena_plan::{
+    CommitmentTreeId, DirectCompactTerminalPlan, PlannedCommitment, ResidentBackend,
+};
 
 fn tree_name(tree: CommitmentTreeId) -> String {
     match tree {
@@ -213,6 +215,20 @@ fn commitment_receipt(commitment: &PlannedCommitment) -> serde_json::Value {
         }),
         "compact_domain_program": compact.map(|program| {
             compact_program_receipt(program, base, domain)
+        }),
+        "direct_compact_terminal": commitment.direct_compact_terminal.as_ref().map(|selection| {
+            let receipt = selection.receipt();
+            serde_json::json!({
+                "mode": match selection {
+                    DirectCompactTerminalPlan::Materialized { .. } => "materialized",
+                    DirectCompactTerminalPlan::Fused(_) => "fixed16-hybrid",
+                },
+                "materialized_batches": selection.materialized_batches(),
+                "fixed16_batches": receipt.map_or(0, |receipt| receipt.fixed_terminal_launches),
+                "net_device_bytes_removed": receipt.map_or(0, |receipt| receipt.net_device_bytes_removed),
+                "net_cuda_launches_removed": receipt.map_or(0, |receipt| receipt.net_cuda_launches_removed),
+                "same_gpu_timing_credit_applied": receipt.is_some_and(|receipt| receipt.same_gpu_timing_credit_applied),
+            })
         }),
     })
 }

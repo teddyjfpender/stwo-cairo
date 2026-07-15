@@ -434,13 +434,23 @@ impl ResidentSessionTelemetry {
                     "replacement prepared-runtime refresh telemetry drifted",
                 ));
             }
-            if self.trace_commit_inputs
-                != Some(ResidentTraceCommitInputTelemetry {
-                    direct_commitments: 2,
-                    separate_interpolation_graph_invocations: 0,
-                    separate_interpolation_kernel_launches: 0,
-                })
-            {
+            if self.trace_commit_inputs.is_none_or(|trace| {
+                trace.direct_commitments != 2
+                    || trace.separate_interpolation_graph_invocations != 0
+                    || trace.separate_interpolation_kernel_launches != 0
+                    || trace
+                        .terminal_fused_commitments
+                        .checked_add(trace.terminal_materialized_commitments)
+                        != Some(2)
+                    || trace
+                        .terminal_fixed16_batches
+                        .checked_add(trace.terminal_materialized_batches)
+                        .is_none_or(|batches| batches == 0)
+                    || (trace.terminal_fused_commitments == 0)
+                        != (trace.terminal_fixed16_batches == 0)
+                    || (trace.terminal_fused_commitments == 0)
+                        != (trace.terminal_net_device_bytes_removed == 0)
+            }) {
                 return Err(ResidentSessionError::StrictArchitectureTelemetry(
                     "replacement trace commits did not report the exact direct-input contract",
                 ));
@@ -3099,6 +3109,12 @@ mod tests {
                 direct_commitments: 2,
                 separate_interpolation_graph_invocations: 0,
                 separate_interpolation_kernel_launches: 0,
+                terminal_fused_commitments: 2,
+                terminal_materialized_commitments: 0,
+                terminal_fixed16_batches: 2,
+                terminal_materialized_batches: 0,
+                terminal_net_device_bytes_removed: 4096,
+                terminal_net_cuda_launches_removed: 2,
             }),
             composition_commit: Some(ResidentCompositionCommitTelemetry {
                 direct_retained_evaluations: true,
@@ -3238,20 +3254,65 @@ mod tests {
                 direct_commitments: 1,
                 separate_interpolation_graph_invocations: 0,
                 separate_interpolation_kernel_launches: 0,
+                terminal_fused_commitments: 2,
+                terminal_materialized_commitments: 0,
+                terminal_fixed16_batches: 2,
+                terminal_materialized_batches: 0,
+                terminal_net_device_bytes_removed: 4096,
+                terminal_net_cuda_launches_removed: 2,
             }),
             Some(ResidentTraceCommitInputTelemetry {
                 direct_commitments: 2,
                 separate_interpolation_graph_invocations: 1,
                 separate_interpolation_kernel_launches: 0,
+                terminal_fused_commitments: 2,
+                terminal_materialized_commitments: 0,
+                terminal_fixed16_batches: 2,
+                terminal_materialized_batches: 0,
+                terminal_net_device_bytes_removed: 4096,
+                terminal_net_cuda_launches_removed: 2,
             }),
             Some(ResidentTraceCommitInputTelemetry {
                 direct_commitments: 2,
                 separate_interpolation_graph_invocations: 0,
                 separate_interpolation_kernel_launches: 1,
+                terminal_fused_commitments: 2,
+                terminal_materialized_commitments: 0,
+                terminal_fixed16_batches: 2,
+                terminal_materialized_batches: 0,
+                terminal_net_device_bytes_removed: 4096,
+                terminal_net_cuda_launches_removed: 2,
             }),
         ] {
             let mut drifted = valid.clone();
             drifted.trace_commit_inputs = trace_commit_inputs;
+            assert!(drifted.require_strict_graph_a().is_err());
+        }
+
+        let mut materialized_terminal = valid.clone();
+        materialized_terminal.trace_commit_inputs = Some(ResidentTraceCommitInputTelemetry {
+            direct_commitments: 2,
+            separate_interpolation_graph_invocations: 0,
+            separate_interpolation_kernel_launches: 0,
+            terminal_fused_commitments: 0,
+            terminal_materialized_commitments: 2,
+            terminal_fixed16_batches: 0,
+            terminal_materialized_batches: 2,
+            terminal_net_device_bytes_removed: 0,
+            terminal_net_cuda_launches_removed: 0,
+        });
+        assert!(materialized_terminal.require_strict_graph_a().is_ok());
+
+        let terminal_mutations: [fn(&mut ResidentTraceCommitInputTelemetry); 3] = [
+            |trace: &mut ResidentTraceCommitInputTelemetry| trace.terminal_fused_commitments = 1,
+            |trace: &mut ResidentTraceCommitInputTelemetry| trace.terminal_fixed16_batches = 0,
+            |trace: &mut ResidentTraceCommitInputTelemetry| {
+                trace.terminal_net_device_bytes_removed = 0
+            },
+        ];
+        for mutate in terminal_mutations {
+            let mut drifted = valid.clone();
+            mutate(drifted.trace_commit_inputs.as_mut().unwrap());
             assert!(drifted.require_strict_graph_a().is_err());
         }
 
