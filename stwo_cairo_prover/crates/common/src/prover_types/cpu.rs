@@ -47,6 +47,7 @@ impl ProverType for M31 {
     }
 }
 
+#[repr(C)]
 #[derive(
     Copy,
     Clone,
@@ -57,6 +58,8 @@ impl ProverType for M31 {
     Eq,
     PartialEq,
     Hash,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
     CairoSerialize,
     CairoDeserialize,
 )]
@@ -65,6 +68,12 @@ pub struct CasmState {
     pub ap: M31,
     pub fp: M31,
 }
+
+const _: () = assert!(core::mem::size_of::<CasmState>() == 3 * core::mem::size_of::<u32>());
+const _: () = assert!(core::mem::align_of::<CasmState>() == core::mem::align_of::<u32>());
+const _: () = assert!(core::mem::offset_of!(CasmState, pc) == 0);
+const _: () = assert!(core::mem::offset_of!(CasmState, ap) == core::mem::size_of::<u32>());
+const _: () = assert!(core::mem::offset_of!(CasmState, fp) == 2 * core::mem::size_of::<u32>());
 
 impl CasmState {
     pub fn values(&self) -> [M31; 3] {
@@ -83,6 +92,36 @@ impl ProverType for CasmState {
     }
     fn r#type() -> String {
         "CasmState".to_string()
+    }
+}
+
+#[cfg(test)]
+mod casm_state_layout_tests {
+    use super::{CasmState, M31};
+
+    #[test]
+    fn casm_state_is_exactly_three_native_u32_words() {
+        let states = [
+            CasmState {
+                pc: M31::from_u32_unchecked(1),
+                ap: M31::from_u32_unchecked(2),
+                fp: M31::from_u32_unchecked(3),
+            },
+            CasmState {
+                pc: M31::from_u32_unchecked(4),
+                ap: M31::from_u32_unchecked(5),
+                fp: M31::from_u32_unchecked(6),
+            },
+        ];
+        assert_eq!(
+            core::mem::size_of::<CasmState>(),
+            3 * core::mem::size_of::<u32>()
+        );
+        assert_eq!(
+            core::mem::align_of::<CasmState>(),
+            core::mem::align_of::<u32>()
+        );
+        assert_eq!(bytemuck::cast_slice::<_, u32>(&states), &[1, 2, 3, 4, 5, 6]);
     }
 }
 
