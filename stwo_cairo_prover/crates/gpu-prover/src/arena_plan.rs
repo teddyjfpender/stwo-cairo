@@ -31,30 +31,30 @@ use stwo_backend_cuda::{
     CommitWorkspaceSlots, CudaExecContext, DecommitColumnGeometry, DecommitSourceMode,
     DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots, DecommitWorkspaceConfig,
     DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena, DeviceTranscriptError,
-    EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
-    ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
-    FixedTableContiguousWorkspaceSlots, FriDecommitGeometry, FriDecommitSlots,
-    FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriFoldLaunchMode, FriMerkleTreeSlots,
-    FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots, InterpolationLaunchMode,
-    MerkleFromLeavesSlots, ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
-    OodsColumnTopology, OodsSourceKind, OodsWorkspaceConfig, OodsWorkspaceRequirements,
-    OodsWorkspaceSlots, PreparedBlake2sPowError, PreparedCommitError, PreparedDecommitError,
-    PreparedExecutionTablesError, PreparedFixedTableError, PreparedFriError, PreparedFriFinalError,
-    PreparedOodsError, PreparedProgressiveCommitError, PreparedQuotientError,
-    PreparedQuotientNumeratorError, PreparedWitnessCasmInputError, PreparedWitnessError,
-    PreparedWitnessFeedError, PreparedWitnessInputGatherError, ProgressiveBatchRequirements,
-    ProgressiveBatchSlots, ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
-    ProgressiveCommitMode, ProgressiveCommitStorageMode, ProgressiveCommitWorkspaceSlots,
-    ProgressiveLeafWorkspaceSlots, ProgressiveNttLeafFusionMode, QuotientNumeratorColumnTopology,
-    QuotientNumeratorSingleWriteError, QuotientNumeratorSourceKind,
-    QuotientNumeratorStagedSingleWriteError, QuotientNumeratorStagedSingleWritePlan,
-    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
-    QuotientNumeratorWorkspaceSlots, QuotientOodsSample, QuotientWorkspaceConfig,
-    QuotientWorkspaceRequirements, QuotientWorkspaceSlots, RelationGraphError,
-    RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots, RelationLaunchMode,
-    RelationTailMode, ShapeWideCommitProgram, ShapeWideCommitProgramError, TraceDecommitGeometry,
-    TraceDecommitSlots, TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRole,
-    TranscriptInputId, TranscriptOutputId, WitnessCasmInputRequirements, WitnessCasmInputSlots,
+    DomainCooperativeProgram, DomainCooperativeProgramError, EcOpMultiplicityGeometry,
+    EcOpWorkspaceRequirements, EcOpWorkspaceSlots, ExecutionTablesWorkspaceRequirements,
+    ExecutionTablesWorkspaceSlots, FixedTableContiguousWorkspaceSlots, FriDecommitGeometry,
+    FriDecommitSlots, FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriFoldLaunchMode,
+    FriMerkleTreeSlots, FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots,
+    InterpolationLaunchMode, MerkleFromLeavesSlots, ModeAwareCommitWorkspaceRequirements,
+    ModeAwareCommitWorkspaceSlots, OodsColumnTopology, OodsSourceKind, OodsWorkspaceConfig,
+    OodsWorkspaceRequirements, OodsWorkspaceSlots, PreparedBlake2sPowError, PreparedCommitError,
+    PreparedDecommitError, PreparedExecutionTablesError, PreparedFixedTableError, PreparedFriError,
+    PreparedFriFinalError, PreparedOodsError, PreparedProgressiveCommitError,
+    PreparedQuotientError, PreparedQuotientNumeratorError, PreparedWitnessCasmInputError,
+    PreparedWitnessError, PreparedWitnessFeedError, PreparedWitnessInputGatherError,
+    ProgressiveBatchRequirements, ProgressiveBatchSlots, ProgressiveCommitGeometry,
+    ProgressiveCommitGroupGeometry, ProgressiveCommitMode, ProgressiveCommitStorageMode,
+    ProgressiveCommitWorkspaceSlots, ProgressiveLeafWorkspaceSlots, ProgressiveNttLeafFusionMode,
+    QuotientNumeratorColumnTopology, QuotientNumeratorSingleWriteError,
+    QuotientNumeratorSourceKind, QuotientNumeratorStagedSingleWriteError,
+    QuotientNumeratorStagedSingleWritePlan, QuotientNumeratorWorkspaceConfig,
+    QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
+    QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
+    RelationGraphError, RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots,
+    RelationLaunchMode, RelationTailMode, TraceDecommitGeometry, TraceDecommitSlots,
+    TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRole, TranscriptInputId,
+    TranscriptOutputId, WitnessCasmInputRequirements, WitnessCasmInputSlots,
     WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode,
     WitnessFeedWorkspaceSlots, WitnessInputCompactLayout, WitnessInputCompactRequirements,
     WitnessInputCompactSlots, WitnessInputGatherEdge, WitnessInputGatherRequirements,
@@ -617,6 +617,26 @@ pub enum ResidentBackend {
     ReplacementV1 = 1,
 }
 
+/// Immutable leaf executor for the three dynamic trace commitments. The fixed
+/// preprocessed commitment is constructed once by the source cache and is not
+/// selected by this schedule.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum DynamicCommitmentLeafSchedule {
+    #[default]
+    LegacyPerBatch = 0,
+    RetainedDomainCooperative = 1,
+}
+
+impl DynamicCommitmentLeafSchedule {
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::LegacyPerBatch => "legacy-per-batch",
+            Self::RetainedDomainCooperative => "retained-domain-cooperative",
+        }
+    }
+}
+
 impl ResidentBackend {
     pub const fn cli_name(self) -> &'static str {
         match self {
@@ -685,6 +705,7 @@ pub struct ProtocolIdentity {
     pub fri_fold_launch_mode: FriFoldLaunchMode,
     pub witness_feed_launch_mode: WitnessFeedLaunchMode,
     pub resident_backend: ResidentBackend,
+    pub dynamic_commitment_leaf_schedule: DynamicCommitmentLeafSchedule,
     pub quotient_numerator_schedule: QuotientNumeratorSchedule,
     pub quotient_numerator_source_policy: QuotientNumeratorSourcePolicy,
     pub commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
@@ -713,6 +734,7 @@ impl ProtocolIdentity {
         fri_fold_launch_mode: FriFoldLaunchMode,
         witness_feed_launch_mode: WitnessFeedLaunchMode,
         resident_backend: ResidentBackend,
+        dynamic_commitment_leaf_schedule: DynamicCommitmentLeafSchedule,
         quotient_numerator_schedule: QuotientNumeratorSchedule,
         commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
         direct_composition_retention_mode: DirectCompositionRetentionMode,
@@ -742,6 +764,7 @@ impl ProtocolIdentity {
             fri_fold_launch_mode,
             witness_feed_launch_mode,
             resident_backend,
+            dynamic_commitment_leaf_schedule,
             quotient_numerator_schedule,
             quotient_numerator_source_policy,
             commit_mode,
@@ -1390,6 +1413,23 @@ impl ProtocolGeometry {
         {
             return Err(ArenaPlanError::InvalidProtocolGeometry(
                 "zero or overflowing PCS/FRI dimension",
+            ));
+        }
+        if !matches!(
+            (
+                self.identity.resident_backend,
+                self.identity.dynamic_commitment_leaf_schedule,
+            ),
+            (
+                ResidentBackend::LegacyResident,
+                DynamicCommitmentLeafSchedule::LegacyPerBatch,
+            ) | (
+                ResidentBackend::ReplacementV1,
+                DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            )
+        ) {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "resident backend and dynamic commitment leaf schedule must be selected together",
             ));
         }
         if self.lifting_log_size > self.max_domain_log_size {
@@ -2054,6 +2094,7 @@ impl ProtocolGeometry {
         feed(&[self.identity.fri_fold_launch_mode as u8]);
         feed(&[self.identity.witness_feed_launch_mode as u8]);
         feed(&[self.identity.resident_backend as u8]);
+        feed(&[self.identity.dynamic_commitment_leaf_schedule as u8]);
         feed(&(self.quotient_numerator_lde_tile_columns() as u64).to_le_bytes());
         feed(&[self.identity.quotient_numerator_schedule as u8]);
         feed(&[self.identity.quotient_numerator_source_policy as u8]);
@@ -2445,7 +2486,7 @@ struct LogicalCommitWorkspace {
     id: CommitmentTreeId,
     storage_mode: ProgressiveCommitStorageMode,
     commit_program: Option<CommitProgram>,
-    shape_wide_program: Option<Result<ShapeWideCommitProgram, ShapeWideCommitProgramError>>,
+    domain_cooperative_program: Option<DomainCooperativeProgram>,
     interpolation_mode: InterpolationLaunchMode,
     config: CommitWorkspaceConfig,
     grouped_column_log_sizes: Vec<Vec<u32>>,
@@ -3229,7 +3270,7 @@ pub struct PlannedCommitment {
     pub id: CommitmentTreeId,
     pub storage_mode: ProgressiveCommitStorageMode,
     pub commit_program: Option<CommitProgram>,
-    pub shape_wide_program: Option<Result<ShapeWideCommitProgram, ShapeWideCommitProgramError>>,
+    pub domain_cooperative_program: Option<DomainCooperativeProgram>,
     pub config: CommitWorkspaceConfig,
     pub grouped_column_log_sizes: Vec<Vec<u32>>,
     pub grouped_column_sources: Vec<Vec<CommitmentColumnSource>>,
@@ -4108,6 +4149,7 @@ pub enum ArenaPlanError {
     Commit(PreparedCommitError),
     ProgressiveCommit(PreparedProgressiveCommitError),
     CommitProgram(CommitProgramError),
+    DomainCooperativeProgram(DomainCooperativeProgramError),
     Composition(PreparedCompositionError),
     Oods(PreparedOodsError),
     QuotientNumerator(PreparedQuotientNumeratorError),
@@ -6628,6 +6670,58 @@ fn direct_composition_logical_source(
         ))
 }
 
+fn dynamic_commitment_leaf_program(
+    schedule: DynamicCommitmentLeafSchedule,
+    tree: CommitmentTreeId,
+    base: Option<&CommitProgram>,
+) -> Result<Option<DomainCooperativeProgram>, ArenaPlanError> {
+    match (schedule, tree, base) {
+        (
+            DynamicCommitmentLeafSchedule::LegacyPerBatch,
+            CommitmentTreeId::Preprocessed
+            | CommitmentTreeId::Base
+            | CommitmentTreeId::Interaction
+            | CommitmentTreeId::Composition,
+            None,
+        ) => Ok(None),
+        (
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            CommitmentTreeId::Preprocessed,
+            Some(_),
+        ) => Ok(None),
+        (
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            CommitmentTreeId::Base | CommitmentTreeId::Interaction | CommitmentTreeId::Composition,
+            Some(program),
+        ) => DomainCooperativeProgram::compile_mode_a(program)
+            .map(Some)
+            .map_err(ArenaPlanError::DomainCooperativeProgram),
+        (
+            DynamicCommitmentLeafSchedule::LegacyPerBatch,
+            CommitmentTreeId::Preprocessed
+            | CommitmentTreeId::Base
+            | CommitmentTreeId::Interaction
+            | CommitmentTreeId::Composition,
+            Some(_),
+        ) => Err(ArenaPlanError::InvalidProtocolGeometry(
+            "legacy dynamic commitment unexpectedly owns a replacement program",
+        )),
+        (
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            CommitmentTreeId::Preprocessed
+            | CommitmentTreeId::Base
+            | CommitmentTreeId::Interaction
+            | CommitmentTreeId::Composition,
+            None,
+        ) => Err(ArenaPlanError::InvalidProtocolGeometry(
+            "cooperative commitment is missing its base program",
+        )),
+        (_, CommitmentTreeId::Fri(_), _) => Err(ArenaPlanError::InvalidProtocolGeometry(
+            "dynamic trace commitment schedule cannot own an FRI tree",
+        )),
+    }
+}
+
 fn append_protocol_buffers(
     logical: &mut Vec<LogicalBuffer>,
     released_commitment_aliases: &mut Vec<ReleasedCommitmentAlias>,
@@ -6933,9 +7027,11 @@ fn append_protocol_buffers(
                 ));
             }
         };
-        let shape_wide_program = commit_program
-            .as_ref()
-            .map(ShapeWideCommitProgram::compile_replacement_v1);
+        let domain_cooperative_program = dynamic_commitment_leaf_program(
+            protocol.identity.dynamic_commitment_leaf_schedule,
+            geometry.id,
+            commit_program.as_ref(),
+        )?;
         let in_place_slab = match (&requirements, storage_mode) {
             (
                 ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
@@ -7250,7 +7346,7 @@ fn append_protocol_buffers(
             id: geometry.id,
             storage_mode,
             commit_program,
-            shape_wide_program,
+            domain_cooperative_program,
             interpolation_mode: protocol.identity.interpolation_mode,
             config: geometry.config,
             grouped_column_log_sizes: geometry.grouped_column_log_sizes.clone(),
@@ -8685,7 +8781,7 @@ fn resolve_commitment_slots(
         id: logical.id,
         storage_mode: logical.storage_mode,
         commit_program: logical.commit_program,
-        shape_wide_program: logical.shape_wide_program,
+        domain_cooperative_program: logical.domain_cooperative_program,
         config: logical.config,
         grouped_column_log_sizes: logical.grouped_column_log_sizes,
         grouped_column_sources: logical.grouped_column_sources,
@@ -10323,6 +10419,103 @@ mod tests {
     use crate::relation_table::CAIRO_RELATION_GRAPH;
     use crate::schedule_table::CAIRO_SCHEDULE;
 
+    fn retained_commit_program(retain_evaluations: bool) -> CommitProgram {
+        CommitProgram::compile(
+            CommitWorkspaceConfig {
+                log_blowup_factor: 1,
+                lifting_log_size: 7,
+                unretained_bottom_layers: 4,
+                max_fused_tail_levels: 2,
+            },
+            ProgressiveCommitGeometry {
+                lifting_log_size: 7,
+                log_blowup_factor: 1,
+                groups: vec![ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![3; 17],
+                    retain_evaluations,
+                }],
+            },
+            ProgressiveNttLeafFusionMode::Fused16,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dynamic_commitment_leaf_schedule_is_exhaustive_and_fail_closed() {
+        let retained = retained_commit_program(true);
+        let expected = DomainCooperativeProgram::compile_mode_a(&retained).unwrap();
+        for tree in [
+            CommitmentTreeId::Base,
+            CommitmentTreeId::Interaction,
+            CommitmentTreeId::Composition,
+        ] {
+            assert_eq!(
+                dynamic_commitment_leaf_program(
+                    DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+                    tree,
+                    Some(&retained),
+                )
+                .unwrap(),
+                Some(expected.clone())
+            );
+        }
+        assert_eq!(
+            dynamic_commitment_leaf_program(
+                DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+                CommitmentTreeId::Preprocessed,
+                Some(&retained),
+            )
+            .unwrap(),
+            None
+        );
+        assert!(matches!(
+            dynamic_commitment_leaf_program(
+                DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+                CommitmentTreeId::Base,
+                None,
+            ),
+            Err(ArenaPlanError::InvalidProtocolGeometry(_))
+        ));
+        assert!(matches!(
+            dynamic_commitment_leaf_program(
+                DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+                CommitmentTreeId::Fri(0),
+                Some(&retained),
+            ),
+            Err(ArenaPlanError::InvalidProtocolGeometry(_))
+        ));
+        assert_eq!(
+            dynamic_commitment_leaf_program(
+                DynamicCommitmentLeafSchedule::LegacyPerBatch,
+                CommitmentTreeId::Base,
+                None,
+            )
+            .unwrap(),
+            None
+        );
+        assert!(matches!(
+            dynamic_commitment_leaf_program(
+                DynamicCommitmentLeafSchedule::LegacyPerBatch,
+                CommitmentTreeId::Base,
+                Some(&retained),
+            ),
+            Err(ArenaPlanError::InvalidProtocolGeometry(_))
+        ));
+
+        let unretained = retained_commit_program(false);
+        assert!(matches!(
+            dynamic_commitment_leaf_program(
+                DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+                CommitmentTreeId::Interaction,
+                Some(&unretained),
+            ),
+            Err(ArenaPlanError::DomainCooperativeProgram(
+                DomainCooperativeProgramError::RequiresRetainedEvaluations { .. }
+            ))
+        ));
+    }
+
     fn test_buffer(id: u32, words: usize, first: ProofEpoch, last: ProofEpoch) -> LogicalBuffer {
         LogicalBuffer {
             id: LogicalBufferId(id),
@@ -11122,6 +11315,7 @@ mod tests {
                 fri_fold_launch_mode: FriFoldLaunchMode::PerFold,
                 witness_feed_launch_mode: WitnessFeedLaunchMode::GlobalAtomics,
                 resident_backend: ResidentBackend::LegacyResident,
+                dynamic_commitment_leaf_schedule: DynamicCommitmentLeafSchedule::LegacyPerBatch,
                 quotient_numerator_schedule: QuotientNumeratorSchedule::LegacyBatches,
                 quotient_numerator_source_policy: QuotientNumeratorSourcePolicy::CoefficientsOnly,
                 commit_mode: ProgressiveCommitMode::FullLifting,
@@ -11252,13 +11446,17 @@ mod tests {
         fused_interpolation.identity.interpolation_mode =
             InterpolationLaunchMode::StageFusedOutOfPlace;
         assert_ne!(protocol.key(), fused_interpolation.key());
-        let identity_mutations: [fn(&mut ProtocolGeometry); 7] = [
+        let identity_mutations: [fn(&mut ProtocolGeometry); 8] = [
             |changed| changed.identity.blake2s_interior_fused = true,
             |changed| changed.identity.composition_launch_mode = CompositionLaunchMode::Wide,
             |changed| changed.identity.relation_tail_mode = RelationTailMode::Scan,
             |changed| changed.identity.fri_fold_launch_mode = FriFoldLaunchMode::FusedTriple,
             |changed| changed.identity.witness_feed_launch_mode = WitnessFeedLaunchMode::Privatized,
             |changed| changed.identity.resident_backend = ResidentBackend::ReplacementV1,
+            |changed| {
+                changed.identity.dynamic_commitment_leaf_schedule =
+                    DynamicCommitmentLeafSchedule::RetainedDomainCooperative
+            },
             |changed| {
                 changed.identity.quotient_numerator_schedule =
                     QuotientNumeratorSchedule::HybridSingleWrite

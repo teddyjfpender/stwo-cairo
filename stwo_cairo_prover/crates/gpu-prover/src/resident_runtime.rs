@@ -14,9 +14,10 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo_backend_cuda::{
     ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitEvaluationGroup,
-    CommitProgramBindingError, CudaExecTelemetry, CudaRuntimeError, DecommitAssembly,
-    DecommitColumnSource, DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError,
-    ExecutionTablesHostData, FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
+    CommitProgram, CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
+    DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError,
+    DomainCooperativeBindingError, DomainCooperativeProgram, ExecutionTablesHostData,
+    FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
     ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError,
     PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedBlakeGFusedFeed,
     PreparedCommitError, PreparedCommitGraph, PreparedDecommitError, PreparedDecommitGraph,
@@ -41,8 +42,8 @@ use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
 use stwo_cairo_prover::witness::proof_shape::{ProofShapeKey, TracePartId};
 
 use crate::arena_plan::{
-    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedFixedTableSource,
-    PlannedRecordedMultiplicityFeedGraph, ResidentBackend,
+    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, DynamicCommitmentLeafSchedule,
+    PlannedFixedTableSource, PlannedRecordedMultiplicityFeedGraph, ResidentBackend,
 };
 use crate::composition_plan::CompositionProofBindings;
 use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
@@ -427,7 +428,7 @@ pub enum ResidentRuntimeError {
     Graph(GraphError),
     Commit(PreparedCommitError),
     ProgressiveCommit(PreparedProgressiveCommitError),
-    CommitProgramBinding(CommitProgramBindingError),
+    DomainCooperativeBinding(DomainCooperativeBindingError),
     CommitModeMismatch,
     Interpolation(PreparedInterpolationError),
     SourceStage(ResidentSourceStageError),
@@ -491,9 +492,26 @@ impl From<PreparedProgressiveCommitError> for ResidentRuntimeError {
     }
 }
 
-impl From<CommitProgramBindingError> for ResidentRuntimeError {
-    fn from(value: CommitProgramBindingError) -> Self {
-        Self::CommitProgramBinding(value)
+impl From<DomainCooperativeBindingError> for ResidentRuntimeError {
+    fn from(value: DomainCooperativeBindingError) -> Self {
+        Self::DomainCooperativeBinding(value)
+    }
+}
+
+fn exact_dynamic_commit_program<'a>(
+    backend: ResidentBackend,
+    schedule: DynamicCommitmentLeafSchedule,
+    cooperative: Option<&'a DomainCooperativeProgram>,
+    base: Option<&'a CommitProgram>,
+) -> Result<(&'a DomainCooperativeProgram, &'a CommitProgram), ResidentRuntimeError> {
+    match (backend, schedule, cooperative, base) {
+        (
+            ResidentBackend::ReplacementV1,
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            Some(cooperative),
+            Some(base),
+        ) => Ok((cooperative, base)),
+        _ => Err(ResidentRuntimeError::CommitModeMismatch),
     }
 }
 
@@ -1726,12 +1744,20 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .iter()
                         .map(|group| group.as_ref().map(|group| group.columns.clone()))
                         .collect();
-                    let ntt_fusion = match protocol_identity.resident_backend {
-                        ResidentBackend::LegacyResident => ProgressiveNttLeafFusionMode::Separate,
-                        ResidentBackend::ReplacementV1 => ProgressiveNttLeafFusionMode::Fused16,
-                    };
                     let graph = match planned.storage_mode {
                         ProgressiveCommitStorageMode::Separate => {
+                            if !matches!(
+                                (
+                                    protocol_identity.resident_backend,
+                                    protocol_identity.dynamic_commitment_leaf_schedule,
+                                ),
+                                (
+                                    ResidentBackend::LegacyResident,
+                                    DynamicCommitmentLeafSchedule::LegacyPerBatch,
+                                )
+                            ) {
+                                return Err(ResidentRuntimeError::CommitModeMismatch);
+                            }
                             PreparedProgressiveCommitGraph::prepare_with_modes_and_ntt_fusion(
                                 arena,
                                 planned.config,
@@ -1742,14 +1768,25 @@ impl<'a> ResidentGraphRuntime<'a> {
                                 twiddles,
                                 protocol_identity.commit_mode,
                                 protocol_identity.blake2s_interior_fused,
-                                ntt_fusion,
+                                ProgressiveNttLeafFusionMode::Separate,
                             )?
                         }
-                        ProgressiveCommitStorageMode::InPlaceSlab => planned
-                            .commit_program
-                            .as_ref()
-                            .ok_or(ResidentRuntimeError::CommitModeMismatch)?
-                            .bind(arena, slots, &coefficients, &flat_retained, twiddles)?,
+                        ProgressiveCommitStorageMode::InPlaceSlab => {
+                            let (program, base) = exact_dynamic_commit_program(
+                                protocol_identity.resident_backend,
+                                protocol_identity.dynamic_commitment_leaf_schedule,
+                                planned.domain_cooperative_program.as_ref(),
+                                planned.commit_program.as_ref(),
+                            )?;
+                            program.bind(
+                                arena,
+                                base,
+                                slots,
+                                &coefficients,
+                                &flat_retained,
+                                twiddles,
+                            )?
+                        }
                     };
                     PreparedResidentCommitment::Progressive {
                         graph,
@@ -4515,6 +4552,85 @@ fn require_complete_captured_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retained_commit_program() -> CommitProgram {
+        use stwo_backend_cuda::{
+            CommitWorkspaceConfig, ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
+        };
+
+        CommitProgram::compile(
+            CommitWorkspaceConfig {
+                log_blowup_factor: 1,
+                lifting_log_size: 7,
+                unretained_bottom_layers: 4,
+                max_fused_tail_levels: 2,
+            },
+            ProgressiveCommitGeometry {
+                lifting_log_size: 7,
+                log_blowup_factor: 1,
+                groups: vec![ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: vec![3; 17],
+                    retain_evaluations: true,
+                }],
+            },
+            ProgressiveNttLeafFusionMode::Fused16,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dynamic_commit_runtime_requires_the_exact_program_pair() {
+        let base = retained_commit_program();
+        let cooperative = DomainCooperativeProgram::compile_mode_a(&base).unwrap();
+        let selected = exact_dynamic_commit_program(
+            ResidentBackend::ReplacementV1,
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            Some(&cooperative),
+            Some(&base),
+        )
+        .unwrap();
+        assert!(core::ptr::eq(selected.0, &cooperative));
+        assert!(core::ptr::eq(selected.1, &base));
+
+        for (backend, schedule) in [
+            (
+                ResidentBackend::LegacyResident,
+                DynamicCommitmentLeafSchedule::LegacyPerBatch,
+            ),
+            (
+                ResidentBackend::LegacyResident,
+                DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            ),
+            (
+                ResidentBackend::ReplacementV1,
+                DynamicCommitmentLeafSchedule::LegacyPerBatch,
+            ),
+        ] {
+            assert!(matches!(
+                exact_dynamic_commit_program(backend, schedule, Some(&cooperative), Some(&base)),
+                Err(ResidentRuntimeError::CommitModeMismatch)
+            ));
+        }
+        assert!(matches!(
+            exact_dynamic_commit_program(
+                ResidentBackend::ReplacementV1,
+                DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+                None,
+                Some(&base),
+            ),
+            Err(ResidentRuntimeError::CommitModeMismatch)
+        ));
+        assert!(matches!(
+            exact_dynamic_commit_program(
+                ResidentBackend::ReplacementV1,
+                DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+                Some(&cooperative),
+                None,
+            ),
+            Err(ResidentRuntimeError::CommitModeMismatch)
+        ));
+    }
 
     #[test]
     fn replacement_execution_config_seals_every_gpu_native_witness_choice() {

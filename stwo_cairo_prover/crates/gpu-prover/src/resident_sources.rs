@@ -33,7 +33,8 @@ use stwo_cairo_prover::witness::relation_sources::{
 };
 
 use crate::arena_plan::{
-    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedCommitment, ResidentBackend,
+    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, DynamicCommitmentLeafSchedule,
+    PlannedCommitment, ResidentBackend,
 };
 use crate::fixed_table_materializer::{
     pedersen_points_18_column_index, PEDERSEN_POINTS_18_COLUMN_COUNT, PEDERSEN_POINTS_18_LOG_SIZE,
@@ -717,6 +718,9 @@ pub fn stage_preprocessed_commitment(
         .ok_or(ResidentSourceStageError::MissingCommitment(
             CommitmentTreeId::Preprocessed,
         ))?;
+    if commitment.domain_cooperative_program.is_some() {
+        return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch);
+    }
     if workspace.preprocessed_commitment_ready() {
         return Ok(ResidentPreprocessedStageReport {
             cache_hit: true,
@@ -1083,9 +1087,23 @@ pub fn stage_preprocessed_commitment(
                     twiddles,
                     protocol_identity.commit_mode,
                     protocol_identity.blake2s_interior_fused,
-                    match protocol_identity.resident_backend {
-                        ResidentBackend::LegacyResident => ProgressiveNttLeafFusionMode::Separate,
-                        ResidentBackend::ReplacementV1 => ProgressiveNttLeafFusionMode::Fused16,
+                    match (
+                        protocol_identity.resident_backend,
+                        protocol_identity.dynamic_commitment_leaf_schedule,
+                    ) {
+                        (
+                            ResidentBackend::LegacyResident,
+                            DynamicCommitmentLeafSchedule::LegacyPerBatch,
+                        ) => ProgressiveNttLeafFusionMode::Separate,
+                        (
+                            ResidentBackend::ReplacementV1,
+                            DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+                        ) => ProgressiveNttLeafFusionMode::Fused16,
+                        _ => {
+                            return Err(
+                                ResidentSourceStageError::PreprocessedCommitBindingMismatch,
+                            );
+                        }
                     },
                 )?;
                 commit.launch()?;

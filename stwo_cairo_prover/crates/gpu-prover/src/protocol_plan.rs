@@ -18,9 +18,9 @@ use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId, TraceP
 
 use crate::arena_plan::{
     BufferPurpose, CommitmentColumnSource, CommitmentGeometry, CommitmentTreeId, DecommitStrategy,
-    OodsColumnGeometry, OodsGeometry, OpenedColumnSource, ProofEpoch, ProtocolGeometry,
-    ProtocolIdentity, QuotientGeometry, QuotientNumeratorSchedule, QuotientNumeratorSourcePolicy,
-    ResidentBackend, TranscriptGeometry,
+    DynamicCommitmentLeafSchedule, OodsColumnGeometry, OodsGeometry, OpenedColumnSource,
+    ProofEpoch, ProtocolGeometry, ProtocolIdentity, QuotientGeometry, QuotientNumeratorSchedule,
+    QuotientNumeratorSourcePolicy, ResidentBackend, TranscriptGeometry,
 };
 use crate::composition_plan::CompositionPlan;
 use crate::direct_composition_retention::{
@@ -48,6 +48,7 @@ pub const BLAKE2S_MERKLE_CHANNEL_TAG: u64 = 0x424c_414b_4532_5331;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolPlanPolicy {
     pub resident_backend: ResidentBackend,
+    pub dynamic_commitment_leaf_schedule: DynamicCommitmentLeafSchedule,
     pub quotient_numerator_schedule: QuotientNumeratorSchedule,
     pub channel_tag: u64,
     /// Hash of the AOT manifest actually loaded by the runtime.  Zero is never
@@ -77,6 +78,7 @@ impl ProtocolPlanPolicy {
     ) -> Self {
         Self {
             resident_backend: ResidentBackend::LegacyResident,
+            dynamic_commitment_leaf_schedule: DynamicCommitmentLeafSchedule::LegacyPerBatch,
             quotient_numerator_schedule: QuotientNumeratorSchedule::LegacyBatches,
             channel_tag: BLAKE2S_MERKLE_CHANNEL_TAG,
             kernel_manifest_hash,
@@ -107,6 +109,8 @@ impl ProtocolPlanPolicy {
         let mut policy =
             Self::starknet_blake2s(kernel_manifest_hash, composition_max_kernel_instrs);
         policy.resident_backend = ResidentBackend::ReplacementV1;
+        policy.dynamic_commitment_leaf_schedule =
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative;
         policy.quotient_numerator_schedule = QuotientNumeratorSchedule::StagedPackedSingleWrite;
         policy.retained_lde_budget_bytes = 64 * 1024 * 1024 * 1024;
         policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive;
@@ -737,7 +741,8 @@ fn plan_oods_geometry(
 fn resident_backend_contract_matches(policy: ProtocolPlanPolicy) -> bool {
     match policy.resident_backend {
         ResidentBackend::LegacyResident => {
-            policy.quotient_numerator_schedule == QuotientNumeratorSchedule::LegacyBatches
+            policy.dynamic_commitment_leaf_schedule == DynamicCommitmentLeafSchedule::LegacyPerBatch
+                && policy.quotient_numerator_schedule == QuotientNumeratorSchedule::LegacyBatches
         }
         ResidentBackend::ReplacementV1 => {
             policy
@@ -1027,6 +1032,7 @@ fn plan_protocol_from_logs(
             policy.fri_fold_launch_mode,
             policy.witness_feed_launch_mode,
             policy.resident_backend,
+            policy.dynamic_commitment_leaf_schedule,
             policy.quotient_numerator_schedule,
             policy.commit_mode,
             policy.direct_composition_retention_mode,
@@ -1520,6 +1526,10 @@ mod tests {
         let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
         assert_eq!(policy.resident_backend, ResidentBackend::ReplacementV1);
         assert_eq!(
+            policy.dynamic_commitment_leaf_schedule,
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative
+        );
+        assert_eq!(
             policy.quotient_numerator_schedule,
             QuotientNumeratorSchedule::StagedPackedSingleWrite
         );
@@ -1553,7 +1563,7 @@ mod tests {
         );
         assert!(resident_backend_contract_matches(policy));
 
-        let mutations: [fn(&mut ProtocolPlanPolicy); 11] = [
+        let mutations: [fn(&mut ProtocolPlanPolicy); 12] = [
             |policy| policy.retained_lde_budget_bytes -= 1,
             |policy| policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::FullLifting,
             |policy| {
@@ -1568,6 +1578,10 @@ mod tests {
                     stwo_backend_cuda::InterpolationLaunchMode::StageWiseCopyThenInPlace
             },
             |policy| policy.quotient_numerator_schedule = QuotientNumeratorSchedule::LegacyBatches,
+            |policy| {
+                policy.dynamic_commitment_leaf_schedule =
+                    DynamicCommitmentLeafSchedule::LegacyPerBatch
+            },
             |policy| policy.blake2s_interior_fused = true,
             |policy| policy.composition_launch_mode = CompositionLaunchMode::Wide,
             |policy| policy.relation_tail_mode = RelationTailMode::Scan,
@@ -1579,6 +1593,12 @@ mod tests {
             mutate(&mut drifted);
             assert!(!resident_backend_contract_matches(drifted));
         }
+
+        let mut legacy = ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048);
+        assert!(resident_backend_contract_matches(legacy));
+        legacy.dynamic_commitment_leaf_schedule =
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative;
+        assert!(!resident_backend_contract_matches(legacy));
     }
 
     fn empty_oods() -> OodsGeometry {
