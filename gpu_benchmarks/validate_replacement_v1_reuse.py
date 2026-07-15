@@ -22,6 +22,14 @@ def require_resident_reuse(
         raise SystemExit("final repetition did not reuse the replacement host plan")
     if record.get("gpu_shape_executable_materialization") != "reused":
         raise SystemExit("final repetition did not reuse the shape executable")
+    if record.get("gpu_prepared_runtime_materialization") != "reused":
+        raise SystemExit("final repetition did not reuse the prepared CUDA runtime")
+    if record.get("gpu_prepared_runtime_capture_ready_at_entry") is not True:
+        raise SystemExit("final repetition did not enter with a complete captured topology")
+    if record.get("gpu_prepared_runtime_capture_ready_at_exit") is not True:
+        raise SystemExit("final repetition did not exit with a complete captured topology")
+    if record.get("gpu_statement_refresh_present") is not True:
+        raise SystemExit("final repetition did not refresh statement-varying CUDA inputs")
     for field, expected in {
         "gpu_host_plan_cache_hits": reps - 1,
         "gpu_host_plan_cache_misses": 1,
@@ -34,7 +42,22 @@ def require_resident_reuse(
         "gpu_shape_executable_cache_source_generation_passes": 1,
         "gpu_shape_executable_cache_binding_recipe_compilations": 1,
         "gpu_shape_executable_cache_capacity_rejections": 0,
+        "gpu_execution_tables_ingest_descriptor_h2d_copies": 0,
+        "gpu_composition_direct_split_graphs": 1,
+        "gpu_composition_precomputed_compact_commitments": 1,
+        "gpu_composition_coefficient_commit_paths": 0,
+        "gpu_composition_split_fused_d2d_nodes": 0,
         "gpu_hot_allocations": 0,
+        "gpu_hot_allocation_bytes": 0,
+        "gpu_hot_frees": 0,
+        "gpu_hot_d2d_bytes": 0,
+        "gpu_hot_memset_bytes": 0,
+        "gpu_hot_fill_words": 0,
+        "gpu_hot_capture_begins": 0,
+        "gpu_hot_capture_finishes": 0,
+        "gpu_hot_capture_aborts": 0,
+        "gpu_hot_lane_forks": 0,
+        "gpu_hot_lane_joins": 0,
     }.items():
         _require_exact_int(record, field, expected)
     if record.get("gpu_workspace_materialization") != "reused":

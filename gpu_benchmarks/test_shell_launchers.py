@@ -17,102 +17,90 @@ from validate_replacement_v1_reuse import require_resident_reuse
 
 
 ROOT = Path(__file__).resolve().parent
-NUMERATOR_SCHEMA = "stwo.sn3_quotient_numerator_hybrid.host_wall.v5"
-SOURCE_SHA = "12" * 32
-MODULE_SHA = "34" * 32
 
 
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def valid_sn3_numerator_record() -> dict[str, object]:
+def valid_stage4_native_receipt(stwo_head: str) -> dict[str, object]:
     digest = "56" * 32
-    identity = {
-        "topology_fixture_blake3": "ea31e3ff054c8d12d32d5b84a3d712987b31bb1fd3fb044fb27758453b49fbda",
-        "input_recipe_blake3": "e4c2f871c2d05b81588a5407f06cb49c7ed76834d2e363d2214bd34e7defcf31",
-        "timed_sample_index": 0,
-        "timed_sample_causally_validated": True,
-        "capture_revalidated": True,
-        "post_timing_revalidated": True,
-    }
-    for field in (
-        "eager_legacy_blake3",
-        "eager_hybrid_blake3",
-        "captured_legacy_blake3",
-        "captured_hybrid_blake3",
-        "timed_legacy_blake3",
-        "timed_hybrid_blake3",
-        "post_timing_legacy_blake3",
-        "post_timing_hybrid_blake3",
-    ):
-        identity[field] = digest
     return {
-        "schema": NUMERATOR_SCHEMA,
-        "topology": {
-            "group_logs": [23, 19, 20, 6, 16, 18, 8, 7, 21, 14, 17, 11, 23, 15, 10, 4, 13, 12, 22],
-            "groups": 19,
-            "eligible_groups": 18,
-            "legacy_groups": 1,
-            "coefficient_columns": 161,
-            "coefficient_sources": 152,
-            "total_batches": 74,
-            "coefficient_batches": 71,
-            "terms": 6_341,
-        },
-        "bytes": {
-            "legacy_logical_output": 59_993_989_376,
-            "hybrid_logical_output": 20_266_867_968,
-            "validated_numerator_output": 402_644_224,
-            "validated_auxiliary_output": 912,
-            "validated_canonical_output": 402_645_136,
-            "shared_data_dual_workspace_arena": 41_889_121_376,
-            "workspace_span_each": 67_901_168,
-            "second_workspace_arena_delta": 67_901_152,
-        },
-        "device_memory": {
-            "total": 85_000_000_000,
-            "free_before_arena": 80_000_000_000,
-            "free_after_arena": 38_000_000_000,
-            "isolated_pool_used_after_arena": 41_889_121_376,
-            "isolated_pool_reserved_after_arena": 42_000_000_000,
-        },
-        "identity": identity,
-        "artifact_identity": {
-            "identity_complete": True,
-            "source_projection_sha256": SOURCE_SHA,
-            "cuda_module_sha256": MODULE_SHA,
-            "cuda_build_mode": "cuda",
-        },
-        "warmups": 3,
-        "iterations": 5,
-        "minimum_iterations": 5,
-        "samples_ms": {
-            "legacy": [10.0, 11.0, 12.0, 13.0, 14.0],
-            "hybrid": [5.0, 6.0, 7.0, 8.0, 9.0],
-        },
-        "host_wall_ms": {
-            "legacy": {"p50": 12.0, "p95": 14.0},
-            "hybrid": {"p50": 7.0, "p95": 9.0},
-        },
-        "speedup": {"p50": 1.714285714, "p95": 1.555555556},
+        "schema": "stwo.replacement-stage4-native.v1",
+        "passed": True,
+        "failure": None,
+        "git_commit": stwo_head,
+        "executable_blake3": digest,
+        "source_blake3": digest,
+        "cuda_device": "NVIDIA H100 80GB HBM3, GPU-test, 9.0, 550.54.15",
+        "nvcc_version": "Cuda compilation tools, release 12.4, V12.4.131",
+        "requested_cuda_arch": "sm_90",
+        "total_memory_bytes": 85_000_000_000,
+        "free_memory_before_bytes": 80_000_000_000,
+        "free_memory_after_bytes": 79_000_000_000,
+        "performance_requested": False,
+        "performance_failure": None,
+        "performance": [],
+        "fixtures": [
+            {
+                "name": "staged-packed-quotient-mixed-topology",
+                "production_apis": [
+                    "quotient_numerator_staged_single_write_plan_with_overflow_capacities",
+                    "PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write",
+                ],
+                "cases": 2,
+                "arena_bytes": 4096,
+                "checks": {
+                    "eager_reference": True,
+                    "legacy_candidate_byte_identity": True,
+                    "captured_graph_mutation": True,
+                    "source_preservation": True,
+                    "guard_preservation": True,
+                },
+                "hashes": {
+                    "eager_outputs": digest,
+                    "mutated_graph_outputs": digest,
+                },
+            },
+            {
+                "name": "mode-a-domain-cooperative-commit",
+                "production_apis": [
+                    "CommitProgram::bind",
+                    "DomainCooperativeProgram::compile_mode_a",
+                    "DomainCooperativeProgram::bind",
+                ],
+                "cases": 9,
+                "arena_bytes": 8192,
+                "checks": {
+                    "raw_prefix_boundary_identity": True,
+                    "eager_reference": True,
+                    "legacy_candidate_byte_identity": True,
+                    "captured_graph_mutation": True,
+                    "source_preservation": True,
+                    "guard_preservation": True,
+                },
+                "hashes": {
+                    "raw_prefix_states": digest,
+                    "raw_prefix_hashes": digest,
+                    "eager_root_and_retained": digest,
+                    "mutated_graph_root_and_retained": digest,
+                },
+            },
+        ],
     }
 
 
 class ShellLauncherTests(unittest.TestCase):
-    def test_replacement_sn2_numerator_v5_seals_diagnostic(self) -> None:
+    def test_replacement_sn2_stage4_native_seals_diagnostic(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
         source = common.read_text(encoding="utf-8")
-        self.assertIn(f"CHECKPOINT_NUMERATOR_SCHEMA={NUMERATOR_SCHEMA}", source)
-        self.assertEqual(source.count(NUMERATOR_SCHEMA), 1)
-        self.assertNotIn(NUMERATOR_SCHEMA.removesuffix("5") + "4", source)
-        self.assertIn(
-            'checkpoint_validate_numerator_record "$out" "$source_sha" "$module_sha"',
-            source,
-        )
+        self.assertIn("checkpoint_validate_stage4_native_receipt", source)
+        self.assertIn("replacement_stage4_native_bytes_match", source)
+        self.assertNotIn("sn3_hybrid_graph_host_wall_benchmark", source)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            stwo_head = "ab" * 20
             gpu_bench = root / "gpu_bench"
             aot_check = root / "aot_index_check"
             aot_manifest = root / "aot_manifest.json"
@@ -132,12 +120,21 @@ class ShellLauncherTests(unittest.TestCase):
             artifacts = {
                 "source_input_identity.json": {
                     "schema": "stwo.replacement-v1-sn2.source-input-identity.v1",
-                    "source": {"stwo": "head-a", "stwo_cairo": "head-b"},
+                    "source": {
+                        "stwo": {"head": stwo_head, "worktree_sha256": "12" * 32},
+                        "stwo_cairo": {"head": "cd" * 20, "worktree_sha256": "34" * 32},
+                    },
                     "inputs": {"SN_PIE_2.zip": "input-a"},
                 },
                 "hardware_identity.json": {
                     "schema": "stwo.replacement-v1-sn2.hardware-identity.v2",
                     "name": "test H100",
+                    "uuid": "GPU-test",
+                },
+                "counter_acceptance.json": {
+                    "schema": "stwo.replacement-v1.counter-acceptance.v1",
+                    "pass": True,
+                    "gpu_uuid": "GPU-test",
                 },
                 "build_identity.json": {
                     "schema": "stwo.replacement-v1-sn2.build-identity.v1",
@@ -151,7 +148,7 @@ class ShellLauncherTests(unittest.TestCase):
                     "adapter_binary_sha256": gpu_bench_sha,
                 },
                 "fp256_carry_oracles.json": {"pass": True},
-                "numerator_ab.json": valid_sn3_numerator_record(),
+                "stage4_native.json": valid_stage4_native_receipt(stwo_head),
                 "aot_identity.json": {
                     "gpu_bench_sha256": gpu_bench_sha,
                     "checker_binary_sha256": aot_check_sha,
@@ -166,8 +163,15 @@ class ShellLauncherTests(unittest.TestCase):
                     "gpu_proof_blake3": "ab" * 32,
                     "gpu_protocol_key": "protocol-v1",
                     "gpu_shape_executable_topology_digest": "topology-v1",
-                    "gpu_prepared_numerator_eligible_groups": 18,
-                    "gpu_prepared_numerator_legacy_groups": 1,
+                    "gpu_prepared_numerator_schedule": "staged-packed-single-write",
+                    "gpu_prepared_numerator_packed_output_rows": 20_971_472,
+                    "gpu_composition_part_count": 153,
+                    "gpu_composition_wave_count": 18,
+                    "gpu_graph_submit_gap_ns_max_samples": [1_000_000, 2_000_000],
+                    "gpu_graph_submit_gap_ns_total_samples": [13_000_000, 26_000_000],
+                    "gpu_graph_submit_gap_ns_average_samples": [1_000_000.0, 2_000_000.0],
+                    "gpu_graph_submit_launches_samples": [14, 14],
+                    "gpu_graph_submit_gap_strict_gate_passed": True,
                 },
             }
             for name, record in artifacts.items():
@@ -190,8 +194,7 @@ class ShellLauncherTests(unittest.TestCase):
                 "TEST_AOT_CHECK": str(aot_check),
                 "TEST_AOT_MANIFEST": str(aot_manifest),
                 "TEST_SEAL": str(seal),
-                "TEST_SOURCE_SHA": SOURCE_SHA,
-                "TEST_MODULE_SHA": MODULE_SHA,
+                "STWO_PARITY_REF_STWO_HEAD": stwo_head,
             }
             result = subprocess.run(
                 [
@@ -202,8 +205,8 @@ class ShellLauncherTests(unittest.TestCase):
                     'CHECKPOINT_AOT_CHECK="$TEST_AOT_CHECK"; '
                     'CHECKPOINT_AOT_MANIFEST="$TEST_AOT_MANIFEST"; '
                     'CHECKPOINT_SEAL="$TEST_SEAL"; '
-                    'checkpoint_validate_numerator_record '
-                    '"$RUN/fixture.numerator_ab.json" "$TEST_SOURCE_SHA" "$TEST_MODULE_SHA"; '
+                    'checkpoint_validate_stage4_native_receipt '
+                    '"$RUN/fixture.stage4_native.json"; '
                     "checkpoint_seal_diagnostic",
                 ],
                 check=False,
@@ -215,8 +218,23 @@ class ShellLauncherTests(unittest.TestCase):
             sealed = json.loads(seal.read_text(encoding="utf-8"))
             self.assertTrue(sealed["diagnostic_pass"])
             self.assertEqual(
-                sealed["receipts_sha256"]["numerator"],
-                file_sha256(root / "fixture.numerator_ab.json"),
+                sealed["receipts_sha256"]["stage4"],
+                file_sha256(root / "fixture.stage4_native.json"),
+            )
+            self.assertEqual(
+                sealed["receipts_sha256"]["counter"],
+                file_sha256(root / "fixture.counter_acceptance.json"),
+            )
+            self.assertEqual(
+                sealed["shape_receipt"],
+                {
+                    "protocol_key": "protocol-v1",
+                    "topology_digest": "topology-v1",
+                    "numerator_schedule": "staged-packed-single-write",
+                    "numerator_packed_output_rows": 20_971_472,
+                    "composition_part_count": 153,
+                    "composition_wave_count": 18,
+                },
             )
 
     def test_replacement_sn2_aot_identity_derives_exact_key_count(self) -> None:
@@ -224,8 +242,32 @@ class ShellLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest = root / "aot_manifest.json"
+            entries = [
+                {
+                    "kind": "constraint",
+                    "label": f"constraint_{index}",
+                    "cache_key": f"{index:016x}",
+                }
+                for index in range(219)
+            ]
+            entries.extend(
+                {
+                    "kind": "constraint",
+                    "label": f"wave_log_{index}",
+                    "cache_key": f"{219 + index:016x}",
+                }
+                for index in range(119)
+            )
+            entries.extend(
+                {
+                    "kind": "witness",
+                    "label": f"witness_{index}",
+                    "cache_key": f"{338 + index:016x}",
+                }
+                for index in range(35)
+            )
             manifest.write_text(
-                json.dumps([{"cache_key": char * 16} for char in "a12"]) + "\n",
+                json.dumps(entries) + "\n",
                 encoding="utf-8",
             )
             checker = root / "aot_index_check"
@@ -233,7 +275,9 @@ class ShellLauncherTests(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 "printf '%s\\n' '{\"pass\":true,\"sm\":90,"
                 "\"loaded_manifest_hash\":\"1234567890abcdef\","
-                "\"required_unique_key_count\":'\"${TEST_COUNT:-3}\"',"
+                "\"required_unique_key_count\":'\"${TEST_COUNT:-373}\"',"
+                "\"embedded_entry_count\":'\"${TEST_EMBEDDED_COUNT:-373}\"',"
+                "\"embedded_arch_entry_count\":'\"${TEST_EMBEDDED_ARCH_COUNT:-373}\"',"
                 "\"missing_keys\":[]}'\n",
                 encoding="utf-8",
             )
@@ -267,20 +311,47 @@ class ShellLauncherTests(unittest.TestCase):
                 (root / "fixture.aot_identity.json").read_text(encoding="utf-8")
             )
             self.assertEqual(identity["schema"], "stwo.replacement-v1-sn2.aot-identity.v1")
-            self.assertEqual(identity["required_unique_key_count"], 3)
+            self.assertEqual(identity["required_unique_key_count"], 373)
+            self.assertEqual(identity["manifest_entry_count"], 373)
+            self.assertEqual(identity["manifest_witness_count"], 35)
+            self.assertEqual(identity["manifest_ordinary_constraint_count"], 219)
+            self.assertEqual(identity["manifest_composition_wave_count"], 119)
 
             rejected = subprocess.run(
                 ["bash", "-c", command], capture_output=True, text=True,
-                env={**env, "TEST_COUNT": "4"},
+                env={**env, "TEST_COUNT": "374"},
             )
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("identity/coverage failed", rejected.stderr)
 
-    def test_replacement_sn2_numerator_validator_rejects_mutations(self) -> None:
+            for field in ("TEST_EMBEDDED_COUNT", "TEST_EMBEDDED_ARCH_COUNT"):
+                rejected = subprocess.run(
+                    ["bash", "-c", command],
+                    capture_output=True,
+                    text=True,
+                    env={**env, field: "374"},
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("identity/coverage failed", rejected.stderr)
+
+            mutated = copy.deepcopy(entries)
+            mutated[-1]["kind"] = "unknown"
+            manifest.write_text(json.dumps(mutated) + "\n", encoding="utf-8")
+            rejected = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                text=True,
+                env={**env, "TEST_MANIFEST_SHA": file_sha256(manifest)},
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("replacement AOT pack shape drifted", rejected.stderr)
+
+    def test_replacement_sn2_stage4_validator_rejects_mutations(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            record_path = root / "numerator.json"
+            record_path = root / "stage4.json"
+            stwo_head = "ab" * 20
             env = {
                 **os.environ,
                 "REPLACEMENT_SN2_MODE": "diagnostic",
@@ -289,8 +360,7 @@ class ShellLauncherTests(unittest.TestCase):
                 "RUN": str(root),
                 "COMMON": str(common),
                 "RECORD": str(record_path),
-                "TEST_SOURCE_SHA": SOURCE_SHA,
-                "TEST_MODULE_SHA": MODULE_SHA,
+                "STWO_PARITY_REF_STWO_HEAD": stwo_head,
             }
 
             def validate(record: dict[str, object]) -> subprocess.CompletedProcess[str]:
@@ -299,8 +369,8 @@ class ShellLauncherTests(unittest.TestCase):
                     [
                         "bash",
                         "-c",
-                        'source "$COMMON"; checkpoint_validate_numerator_record '
-                        '"$RECORD" "$TEST_SOURCE_SHA" "$TEST_MODULE_SHA"',
+                        'source "$COMMON"; checkpoint_validate_stage4_native_receipt '
+                        '"$RECORD"',
                     ],
                     check=False,
                     capture_output=True,
@@ -308,39 +378,22 @@ class ShellLauncherTests(unittest.TestCase):
                     env=env,
                 )
 
-            valid = valid_sn3_numerator_record()
+            valid = valid_stage4_native_receipt(stwo_head)
             accepted = validate(valid)
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
-            self.assertIn('"exact_numerator_ab": "PASS"', accepted.stdout)
+            self.assertIn('"replacement_stage4_native": "PASS"', accepted.stdout)
 
             mutations = (
-                ("schema", ("schema",), NUMERATOR_SCHEMA.removesuffix("5") + "4"),
-                ("group logs", ("topology", "group_logs", 0), 22),
-                ("group count", ("topology", "eligible_groups"), 17),
-                ("batch count", ("topology", "total_batches"), 73),
-                ("legacy modeled bytes", ("bytes", "legacy_logical_output"), 59_993_989_375),
-                ("hybrid modeled bytes", ("bytes", "hybrid_logical_output"), 20_266_867_967),
-                (
-                    "validated numerator bytes",
-                    ("bytes", "validated_numerator_output"),
-                    402_644_223,
-                ),
-                ("validated auxiliary bytes", ("bytes", "validated_auxiliary_output"), 913),
-                ("validated split", ("bytes", "validated_canonical_output"), 402_645_137),
-                ("warmups", ("warmups",), 2),
-                ("iterations", ("iterations",), 6),
-                ("causal flag", ("identity", "timed_sample_causally_validated"), False),
-                ("nonpositive sample", ("samples_ms", "legacy", 0), 0.0),
-                ("nonfinite sample", ("samples_ms", "hybrid", 0), float("nan")),
-                ("nearest-rank p50", ("host_wall_ms", "legacy", "p50"), 11.0),
-                ("nearest-rank p95", ("host_wall_ms", "hybrid", "p95"), 8.0),
-                ("speedup", ("speedup", "p95"), 2.0),
-                ("free-memory order", ("device_memory", "free_after_arena"), 81_000_000_000),
-                (
-                    "pool-memory order",
-                    ("device_memory", "isolated_pool_reserved_after_arena"),
-                    41_000_000_000,
-                ),
+                ("schema", ("schema",), "stwo.replacement-stage4-native.v0"),
+                ("pass", ("passed",), False),
+                ("commit", ("git_commit",), "cd" * 20),
+                ("architecture", ("requested_cuda_arch",), "sm_89"),
+                ("performance mode", ("performance_requested",), True),
+                ("memory", ("total_memory_bytes",), 0),
+                ("quotient cases", ("fixtures", 0, "cases"), 1),
+                ("mode-a API", ("fixtures", 1, "production_apis", 0), "wrong"),
+                ("failed check", ("fixtures", 0, "checks", "legacy_candidate_byte_identity"), False),
+                ("invalid hash", ("fixtures", 1, "hashes", "raw_prefix_states"), "invalid"),
             )
             for label, path, value in mutations:
                 mutated = copy.deepcopy(valid)
@@ -351,6 +404,233 @@ class ShellLauncherTests(unittest.TestCase):
                 with self.subTest(label=label):
                     rejected = validate(mutated)
                     self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+            for fixtures in (
+                [*copy.deepcopy(valid["fixtures"]), copy.deepcopy(valid["fixtures"][0])],  # type: ignore[index]
+                [*copy.deepcopy(valid["fixtures"]), "hidden-extra"],  # type: ignore[index]
+            ):
+                mutated = copy.deepcopy(valid)
+                mutated["fixtures"] = fixtures
+                self.assertNotEqual(validate(mutated).returncode, 0)
+
+    def test_replacement_sn2_sealed_phase_order_is_fail_closed_then_profiles(self) -> None:
+        recipe = (
+            ROOT / "loop" / "recipes" / "replacement_v1_sn2_sealed.phases"
+        ).read_text(encoding="utf-8")
+        phases = [
+            line.split()[1]
+            for line in recipe.splitlines()
+            if line.startswith("phase ")
+        ]
+        self.assertLess(
+            phases.index("counter_permission_acceptance"), phases.index("build")
+        )
+        self.assertLess(
+            phases.index("replacement_stage4_native"), phases.index("aot_identity")
+        )
+        self.assertNotIn("exact_numerator_ab", phases)
+        timing_validation = phases.index("timing_sn2_validate")
+        self.assertLess(timing_validation, phases.index("nsys_profile"))
+        self.assertLess(timing_validation, phases.index("ncu_profile"))
+        self.assertEqual(phases[-1], "promotion_verdict")
+
+        common = (
+            ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('CHECKPOINT_AOT_TOTAL=373', common)
+        self.assertIn('CHECKPOINT_AOT_WITNESS=35', common)
+        self.assertIn('CHECKPOINT_AOT_ORDINARY_CONSTRAINT=219', common)
+        self.assertIn('CHECKPOINT_AOT_COMPOSITION_WAVE=119', common)
+        self.assertIn(
+            'CHECKPOINT_AOT_MANIFEST_SHA256=1ff3089cf9c6c9284ddfbdcfd8258d3d329a115d1285ee8c066f563175005fa4',
+            common,
+        )
+        self.assertIn('STWO_STAGE4_GIT_COMMIT="$STWO_PARITY_REF_STWO_HEAD"', common)
+        self.assertIn('r.get("gpu_prepared_numerator_eligible_groups") is None', common)
+        self.assertIn('r.get("gpu_prepared_numerator_legacy_groups") == 0', common)
+        self.assertIn('r.get("gpu_policy_composition_launch_mode") == "wave"', common)
+        self.assertIn('args+=(--capture-slow-graph-submit)', common)
+        self.assertIn('benchmark_graph_submit_capture_mode', common)
+        self.assertIn('return 0\n}', common[common.index("checkpoint_nsys_profile()"):])
+        gpu_bench = (
+            ROOT.parent
+            / "stwo_cairo_prover"
+            / "crates"
+            / "gpu-prover"
+            / "src"
+            / "bin"
+            / "gpu_bench.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn('flag("--capture-slow-graph-submit")', gpu_bench)
+        self.assertIn('gpu_graph_submit_gap_ns_max_samples', gpu_bench)
+        self.assertIn('gpu_graph_submit_gap_ns_total_samples', gpu_bench)
+        self.assertIn('claimed_graph_submit_gap_ns(&samples)', gpu_bench)
+        self.assertIn('graph_submit_gap_average_ns(*sample)', gpu_bench)
+        self.assertIn('gap_count = launches - 1', common)
+        self.assertGreaterEqual(
+            gpu_bench.count(
+                "--capture-slow-graph-submit is supported only by the standard serial benchmark"
+            ),
+            3,
+        )
+
+    def test_replacement_sn2_promotion_thresholds_fail_soft(self) -> None:
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = {
+                "record.json": {
+                    "checkpoint_validation": {"verdict": "PASS"},
+                    "performance_claim_admissible": True,
+                    "gpu_graph_submit_gap_strict_gate_passed": True,
+                    "gpu_host_preparation_total_ns": 120_000_001,
+                    "useful_mhz_median": 11.999,
+                    "useful_mhz_at_warm_p95": 11.0,
+                    "gpu_max_graph_submit_gap_ms": 1.0,
+                },
+                "nsys_profile.json": {"status": "FAIL"},
+                "ncu_profile.json": {"status": "PASS"},
+            }
+            for name, record in records.items():
+                (root / f"fixture.{name}").write_text(
+                    json.dumps(record) + "\n", encoding="utf-8"
+                )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$COMMON"; CHECKPOINT_PREFIX=fixture; '
+                    "checkpoint_assess_sn2_promotion",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "REPLACEMENT_SN2_MODE": "timing",
+                    "CAIRO": str(root / "stwo-cairo" / "stwo_cairo_prover"),
+                    "STWO": str(root / "stwo"),
+                    "RUN": str(root),
+                    "COMMON": str(common),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            verdict = json.loads(
+                (root / "fixture.promotion.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(verdict["verdict"], "FAIL")
+            self.assertTrue(verdict["soft_failure"])
+            self.assertEqual(
+                set(verdict["failed_checks"]),
+                {
+                    "host_preparation_within_budget",
+                    "useful_mhz_at_or_above_floor",
+                    "nsys_profile_passed",
+                },
+            )
+
+    def test_replacement_sn2_ncu_receipt_requires_exact_launch_topology(self) -> None:
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proof = root / "proof.bin"
+            proof.write_bytes(b"proof")
+            proof_sha = file_sha256(proof)
+            report = root / "profile.ncu-rep"
+            report.write_bytes(b"report")
+            stdout = root / "stdout.txt"
+            stdout.write_text(
+                json.dumps(
+                    {
+                        "program": "SN_PIE_2.zip",
+                        "backend": "cuda",
+                        "gpu_proof_blake3": "ab" * 32,
+                        "verified_reps": 2,
+                        "proof_byte_equal": True,
+                        "simd_reference_byte_equal": True,
+                        "proof_mutation_rejected": True,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stderr = root / "stderr.txt"
+            stderr.write_text("", encoding="utf-8")
+            seal = root / "seal.json"
+            seal.write_text(
+                json.dumps(
+                    {
+                        "schema": "stwo.replacement-v1-sn2.checkpoint-seal.v3",
+                        "diagnostic_pass": True,
+                        "proof_dump_sha256": proof_sha,
+                        "proof_blake3": "ab" * 32,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            gpu_bench = root / "gpu_bench"
+            gpu_bench.write_bytes(b"gpu-bench")
+            table = root / "profile.csv"
+            out = root / "receipt.json"
+            env = {
+                **os.environ,
+                "REPLACEMENT_SN2_MODE": "timing",
+                "CAIRO": str(root / "stwo-cairo" / "stwo_cairo_prover"),
+                "STWO": str(root / "stwo"),
+                "RUN": str(root),
+                "COMMON": str(common),
+                "TEST_GPU_BENCH": str(gpu_bench),
+                "PROOF": str(proof),
+                "REPORT": str(report),
+                "TABLE": str(table),
+                "STDOUT": str(stdout),
+                "STDERR": str(stderr),
+                "SEAL": str(seal),
+                "OUT": str(out),
+            }
+            command = (
+                'source "$COMMON"; CHECKPOINT_GPU_BENCH="$TEST_GPU_BENCH"; '
+                'CHECKPOINT_SEAL="$SEAL"; checkpoint_write_profile_receipt ncu 0 '
+                '"$PROOF" "$REPORT" "$TABLE" "$STDOUT" "$STDERR" "$OUT"'
+            )
+
+            def validate(kernels: list[str]) -> dict[str, object]:
+                rows = ["ID,Process ID,Kernel Name,Metric Name,Metric Value"]
+                rows.extend(
+                    f'{index},7,"{kernel}",sm__cycles_elapsed.avg,100'
+                    for index, kernel in enumerate(kernels, 1)
+                )
+                table.write_text("\n".join(rows) + "\n", encoding="utf-8")
+                result = subprocess.run(
+                    ["bash", "-c", command],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(out.read_text(encoding="utf-8"))
+
+            waves = [f"stwo_composition_wave_{index:016x}" for index in range(18)]
+            numerator = "stwo_quotient_numerator_packed_single_write_kernel"
+            accepted = validate([*waves, numerator])
+            self.assertEqual(accepted["status"], "PASS")
+            self.assertEqual(
+                accepted["ncu_launch_topology"],
+                {
+                    "selected_launch_count": 19,
+                    "composition_wave_launch_count": 18,
+                    "distinct_composition_wave_kernel_count": 18,
+                    "packed_numerator_launch_count": 1,
+                },
+            )
+            for kernels in (
+                [*waves[:-1], numerator],
+                [*waves[:-1], waves[0], numerator],
+                [*waves, numerator, numerator],
+            ):
+                with self.subTest(kernels=len(kernels)):
+                    self.assertEqual(validate(kernels)["status"], "FAIL")
 
     def test_replacement_sn2_ecc_policy_is_explicit_and_sealed(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
@@ -434,6 +714,10 @@ class ShellLauncherTests(unittest.TestCase):
             "gpu_host_plan_cache_collisions": 0,
             "gpu_host_preparation_total_ns": 80_000_000,
             "gpu_shape_executable_materialization": "reused",
+            "gpu_prepared_runtime_materialization": "reused",
+            "gpu_prepared_runtime_capture_ready_at_entry": True,
+            "gpu_prepared_runtime_capture_ready_at_exit": True,
+            "gpu_statement_refresh_present": True,
             "gpu_shape_executable_cache_hits": 1,
             "gpu_shape_executable_cache_misses": 1,
             "gpu_shape_executable_cache_compilations": 1,
@@ -441,7 +725,22 @@ class ShellLauncherTests(unittest.TestCase):
             "gpu_shape_executable_cache_binding_recipe_compilations": 1,
             "gpu_shape_executable_cache_capacity_rejections": 0,
             "gpu_workspace_materialization": "reused",
+            "gpu_execution_tables_ingest_descriptor_h2d_copies": 0,
+            "gpu_composition_direct_split_graphs": 1,
+            "gpu_composition_precomputed_compact_commitments": 1,
+            "gpu_composition_coefficient_commit_paths": 0,
+            "gpu_composition_split_fused_d2d_nodes": 0,
             "gpu_hot_allocations": 0,
+            "gpu_hot_allocation_bytes": 0,
+            "gpu_hot_frees": 0,
+            "gpu_hot_d2d_bytes": 0,
+            "gpu_hot_memset_bytes": 0,
+            "gpu_hot_fill_words": 0,
+            "gpu_hot_capture_begins": 0,
+            "gpu_hot_capture_finishes": 0,
+            "gpu_hot_capture_aborts": 0,
+            "gpu_hot_lane_forks": 0,
+            "gpu_hot_lane_joins": 0,
         }
         require_resident_reuse(valid, 2, max_host_preparation_ns=120_000_000)
         require_resident_reuse(
@@ -458,9 +757,14 @@ class ShellLauncherTests(unittest.TestCase):
             source[validator:],
         )
         self.assertIn(
-            "require_resident_reuse(r, reps, max_host_preparation_ns=120_000_000)",
+            "require_resident_reuse(r, reps)",
             source[validator:],
         )
+        validator_body = source[validator:source.index("checkpoint_seal_diagnostic()")]
+        self.assertNotIn("max_host_preparation_ns", validator_body)
+        promotion = source[source.index("checkpoint_assess_sn2_promotion()") :]
+        self.assertIn("gpu_host_preparation_total_ns", promotion)
+        self.assertIn("CHECKPOINT_PROMOTION_HOST_PREPARATION_NS", source)
 
         for field, expected in valid.items():
             mutations = (
@@ -468,6 +772,14 @@ class ShellLauncherTests(unittest.TestCase):
                 if field in {
                     "gpu_host_plan_cache_materialization",
                     "gpu_shape_executable_materialization",
+                    "gpu_prepared_runtime_materialization",
+                }
+                else (False, None)
+                if field
+                in {
+                    "gpu_prepared_runtime_capture_ready_at_entry",
+                    "gpu_prepared_runtime_capture_ready_at_exit",
+                    "gpu_statement_refresh_present",
                 }
                 else ("materialized", None)
                 if field == "gpu_workspace_materialization"

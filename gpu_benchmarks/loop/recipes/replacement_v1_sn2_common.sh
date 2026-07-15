@@ -17,9 +17,20 @@ CHECKPOINT_AOT_MANIFEST="$STWO/crates/backend-cuda-kernels/cuda/generated/aot_ma
 CHECKPOINT_GPU_BENCH="$CAIRO/target/release/gpu_bench"
 CHECKPOINT_AOT_CHECK="$CAIRO/target/release/aot_index_check"
 CHECKPOINT_SEAL=/workspace/bench_inputs/replacement_v1_sn2_checkpoint.seal.json
-CHECKPOINT_NUMERATOR_SCHEMA=stwo.sn3_quotient_numerator_hybrid.host_wall.v5
 CHECKPOINT_EMPTY_WORKTREE_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-CHECKPOINT_AOT_MANIFEST_SHA256=3a6214cbf8417b74d7f6618d7840cc8269d2c7f69017263033f4a905866af954
+CHECKPOINT_AOT_MANIFEST_SHA256=1ff3089cf9c6c9284ddfbdcfd8258d3d329a115d1285ee8c066f563175005fa4
+CHECKPOINT_AOT_TOTAL=373
+CHECKPOINT_AOT_WITNESS=35
+CHECKPOINT_AOT_ORDINARY_CONSTRAINT=219
+CHECKPOINT_AOT_COMPOSITION_WAVE=119
+CHECKPOINT_SN2_PACKED_OUTPUT_ROWS=20971472
+CHECKPOINT_SN2_COMPOSITION_PARTS=153
+CHECKPOINT_SN2_COMPOSITION_WAVES=18
+CHECKPOINT_PROMOTION_HOST_PREPARATION_NS=120000000
+CHECKPOINT_PROMOTION_USEFUL_MHZ=12
+CHECKPOINT_NCU_KERNEL_REGEX='regex:stwo_composition_wave_.*|stwo_quotient_numerator_packed_single_write_kernel'
+CHECKPOINT_NCU_LAUNCH_COUNT=19
+CHECKPOINT_NSYS_FALLBACK=/opt/nvidia/nsight-systems/2024.6.2/bin/nsys
 
 # One architecture, one compiler fingerprint, and one persistent target/cache line.
 export STWO_CUDA_ARCH=sm_90
@@ -48,6 +59,45 @@ checkpoint_require_hash() {
     || { echo "$label is not a lowercase SHA-$bits identity: $value" >&2; return 1; }
 }
 
+checkpoint_require_aot_manifest_shape() {
+  AOT_TOTAL="$CHECKPOINT_AOT_TOTAL" AOT_WITNESS="$CHECKPOINT_AOT_WITNESS" \
+    AOT_ORDINARY="$CHECKPOINT_AOT_ORDINARY_CONSTRAINT" \
+    AOT_WAVE="$CHECKPOINT_AOT_COMPOSITION_WAVE" \
+    python3 - "$CHECKPOINT_AOT_MANIFEST" <<'PY'
+import json, os, re, sys
+
+entries = json.load(open(sys.argv[1], encoding="utf-8"))
+if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+    raise SystemExit("replacement AOT manifest is malformed")
+witness = [entry for entry in entries if entry.get("kind") == "witness"]
+waves = [entry for entry in entries
+         if entry.get("kind") == "constraint"
+         and re.fullmatch(r"wave_log_[0-9]+", str(entry.get("label", "")))]
+ordinary = [entry for entry in entries
+            if entry.get("kind") == "constraint" and entry not in waves]
+classified = witness + waves + ordinary
+expected = {
+    "total": int(os.environ["AOT_TOTAL"]),
+    "witness": int(os.environ["AOT_WITNESS"]),
+    "ordinary_constraint": int(os.environ["AOT_ORDINARY"]),
+    "composition_wave": int(os.environ["AOT_WAVE"]),
+}
+actual = {
+    "total": len(entries),
+    "witness": len(witness),
+    "ordinary_constraint": len(ordinary),
+    "composition_wave": len(waves),
+}
+if actual != expected or len(classified) != len(entries):
+    raise SystemExit(f"replacement AOT pack shape drifted: expected={expected}, actual={actual}")
+keys = [entry.get("cache_key") for entry in entries]
+if (any(not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{16}", key) for key in keys)
+        or len(set(keys)) != len(keys)):
+    raise SystemExit("replacement AOT pack cache keys are invalid or duplicated")
+print(json.dumps({"replacement_aot_pack": "PASS", **actual}, sort_keys=True))
+PY
+}
+
 checkpoint_require_clean_source_identity() {
   checkpoint_require_hash "${STWO_PARITY_REF_STWO_HEAD:-}" 160 stwo_head
   checkpoint_require_hash "${STWO_PARITY_REF_STWO_CAIRO_HEAD:-}" 160 stwo_cairo_head
@@ -74,6 +124,7 @@ checkpoint_source_input_identity() {
   boot_actual="$(checkpoint_sha256 "$CHECKPOINT_BOOTLOADER")"
   [[ "$raw_actual" == "$raw_expected" ]] || { echo "SN2 PIE identity mismatch" >&2; return 1; }
   [[ "$boot_actual" == "$boot_expected" ]] || { echo "bootloader identity mismatch" >&2; return 1; }
+  checkpoint_require_aot_manifest_shape || return 1
   [[ "$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")" == "$CHECKPOINT_AOT_MANIFEST_SHA256" ]] \
     || { echo "AOT manifest identity drifted; regenerate and deliberately repin this recipe" >&2; return 1; }
 
@@ -93,6 +144,12 @@ record = {
     "inputs": {
         "SN_PIE_2.zip": os.environ["RAW_SHA"],
         "simple_bootloader_compiled.json": os.environ["BOOT_SHA"],
+    },
+    "aot_pack": {
+        "total": 373,
+        "witness": 35,
+        "ordinary_constraint": 219,
+        "composition_wave": 119,
     },
 }
 with open(os.environ["OUT"], "w", encoding="utf-8") as stream:
@@ -139,6 +196,102 @@ record = {"schema": "stwo.replacement-v1-sn2.hardware-identity.v2", "name": name
 with open(os.environ["OUT"], "w", encoding="utf-8") as stream:
     json.dump(record, stream, sort_keys=True)
     stream.write("\n")
+print(json.dumps(record, sort_keys=True))
+PY
+}
+
+checkpoint_counter_acceptance() {
+  local binary raw log out rc
+  binary="/tmp/stwo-replacement-counter-acceptance.$$"
+  raw="$(checkpoint_artifact counter_acceptance.csv)"
+  log="$(checkpoint_artifact counter_acceptance.txt)"
+  out="$(checkpoint_artifact counter_acceptance.json)"
+  rm -f "$binary" "$raw" "$out"
+  set +e
+  {
+    command -v nvcc && command -v ncu && ncu --version && ncu --query-metrics >/dev/null
+  } >"$log" 2>&1
+  rc=$?
+  if [[ $rc -eq 0 ]]; then
+    nvcc -std=c++14 -O2 -lineinfo -arch=sm_90 -x cu -o "$binary" - >>"$log" 2>&1 <<'CU'
+#include <cstdio>
+#include <cuda_runtime.h>
+
+__global__ void checkpoint_counter_kernel(int *value) {
+    if (threadIdx.x == 0) *value = 1;
+}
+
+int main() {
+    int *device = nullptr;
+    int host = 0;
+    if (cudaMalloc(&device, sizeof(int)) != cudaSuccess) return 1;
+    if (cudaMemset(device, 0, sizeof(int)) != cudaSuccess) return 2;
+    checkpoint_counter_kernel<<<1, 32>>>(device);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    if (cudaMemcpy(&host, device, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    if (cudaFree(device) != cudaSuccess) return 5;
+    if (host != 1) return 6;
+    std::printf("CHECKPOINT_COUNTER_KERNEL_RESULT=1\n");
+    return 0;
+}
+CU
+    rc=$?
+  fi
+  if [[ $rc -eq 0 ]]; then
+    "$binary" >>"$log" 2>&1
+    rc=$?
+  fi
+  if [[ $rc -eq 0 ]]; then
+    ncu --target-processes all --kernel-name regex:checkpoint_counter_kernel \
+      --metrics sm__cycles_elapsed.avg --csv "$binary" >"$raw" 2>&1
+    rc=$?
+  fi
+  [[ ! -f "$raw" ]] || cat "$raw" >>"$log"
+  set -e
+  rm -f "$binary"
+  cat "$log"
+  [[ $rc -eq 0 ]] || { echo "NCU counter-permission acceptance failed rc=$rc" >&2; return "$rc"; }
+  python3 - "$raw" "$log" "$(checkpoint_artifact hardware_identity.json)" "$out" <<'PY'
+import csv, hashlib, json, math, pathlib, sys
+
+raw, log, hardware_path, out = map(pathlib.Path, sys.argv[1:])
+hardware = json.loads(hardware_path.read_text(encoding="utf-8"))
+if (hardware.get("schema") != "stwo.replacement-v1-sn2.hardware-identity.v2"
+        or not isinstance(hardware.get("uuid"), str) or not hardware["uuid"]):
+    raise SystemExit("counter acceptance has no sealed GPU identity")
+rows = csv.reader(raw.read_text(encoding="utf-8", errors="replace").splitlines())
+columns = None
+values = []
+for row in rows:
+    if all(field in row for field in ("Kernel Name", "Metric Name", "Metric Value")):
+        columns = {field: row.index(field)
+                   for field in ("Kernel Name", "Metric Name", "Metric Value")}
+        continue
+    if columns is None or max(columns.values()) >= len(row):
+        continue
+    if ("checkpoint_counter_kernel" not in row[columns["Kernel Name"]]
+            or row[columns["Metric Name"]] != "sm__cycles_elapsed.avg"):
+        continue
+    try:
+        value = float(row[columns["Metric Value"]].replace(",", ""))
+    except ValueError:
+        continue
+    if math.isfinite(value) and value > 0:
+        values.append(value)
+text = log.read_text(encoding="utf-8", errors="replace")
+if len(values) != 1 or "CHECKPOINT_COUNTER_KERNEL_RESULT=1" not in text:
+    raise SystemExit(f"counter acceptance did not produce one valid metric: {values}")
+record = {
+    "schema": "stwo.replacement-v1.counter-acceptance.v1",
+    "pass": True,
+    "kernel": "checkpoint_counter_kernel",
+    "metric": "sm__cycles_elapsed.avg",
+    "metric_value": values[0],
+    "gpu_uuid": hardware.get("uuid"),
+    "raw_csv_sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
+    "acceptance_log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
+}
+out.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
 print(json.dumps(record, sort_keys=True))
 PY
 }
@@ -251,221 +404,105 @@ print(json.dumps(record, sort_keys=True))
 PY
 }
 
-checkpoint_numerator_source_sha() {
-  cd "$STWO"
-  local files=(
-    crates/backend-cuda/tests/prepared_quotient_numerator_sn3_bench_native.rs
-    crates/backend-cuda/tests/support/sn3_quotient_numerator_bench.rs
-    crates/backend-cuda/tests/support/sn3_quotient_topology_fixture.rs
-    crates/backend-cuda/src/backend/quotient_numerator_single_write.rs
-    crates/backend-cuda/src/backend/prepared_quotient_numerator.rs
-    crates/backend-cuda/src/backend/prepared_quotient_numerator/plan.rs
-    crates/backend-cuda/src/backend/prepared_quotient_numerator/bindings.rs
-    crates/backend-cuda/src/backend/prepared_quotient_numerator/launch.rs
-    crates/backend-cuda/src/backend/prepared_quotient_numerator/single_write.rs
-    crates/backend-cuda-kernels/cuda/quotient_numerator_single_write.cu
-    crates/backend-cuda-kernels/cuda/quotient_numerator_single_write.cuh
-    crates/backend-cuda-kernels/cuda/quotients.cu
-    crates/backend-cuda-kernels/cuda/quotients.cuh
-  )
-  sha256sum "${files[@]}" | sha256sum | cut -d' ' -f1
+checkpoint_validate_stage4_native_receipt() {
+  STWO_HEAD="$STWO_PARITY_REF_STWO_HEAD" python3 - "$1" <<'PY'
+import json, os, re, sys
+
+record = json.load(open(sys.argv[1], encoding="utf-8"))
+if (record.get("schema") != "stwo.replacement-stage4-native.v1"
+        or record.get("passed") is not True
+        or record.get("failure") is not None
+        or record.get("git_commit") != os.environ["STWO_HEAD"]
+        or record.get("requested_cuda_arch") != "sm_90"
+        or record.get("performance_requested") is not False
+        or record.get("performance_failure") is not None
+        or record.get("performance") != []):
+    raise SystemExit(f"invalid replacement Stage-4 native receipt: {record}")
+for field in ("executable_blake3", "source_blake3"):
+    if not re.fullmatch(r"[0-9a-f]{64}", str(record.get(field, ""))):
+        raise SystemExit(f"invalid Stage-4 identity field: {field}")
+for field in ("cuda_device", "nvcc_version"):
+    if not isinstance(record.get(field), str) or not record[field].strip():
+        raise SystemExit(f"missing Stage-4 tool/device identity: {field}")
+if (not isinstance(record.get("total_memory_bytes"), int)
+        or record["total_memory_bytes"] <= 0
+        or not isinstance(record.get("free_memory_before_bytes"), int)
+        or not isinstance(record.get("free_memory_after_bytes"), int)
+        or not 0 <= record["free_memory_before_bytes"] <= record["total_memory_bytes"]
+        or not 0 <= record["free_memory_after_bytes"] <= record["total_memory_bytes"]):
+    raise SystemExit("invalid Stage-4 device-memory identity")
+fixtures = record.get("fixtures")
+if not isinstance(fixtures, list):
+    raise SystemExit("Stage-4 fixture list is missing")
+by_name = {fixture.get("name"): fixture for fixture in fixtures if isinstance(fixture, dict)}
+expected = {
+    "staged-packed-quotient-mixed-topology": {
+        "cases": 2,
+        "production_apis": [
+            "quotient_numerator_staged_single_write_plan_with_overflow_capacities",
+            "PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write",
+        ],
+        "checks": ["eager_reference", "legacy_candidate_byte_identity",
+                   "captured_graph_mutation", "source_preservation", "guard_preservation"],
+        "hashes": ["eager_outputs", "mutated_graph_outputs"],
+    },
+    "mode-a-domain-cooperative-commit": {
+        "cases": 9,
+        "production_apis": [
+            "CommitProgram::bind",
+            "DomainCooperativeProgram::compile_mode_a",
+            "DomainCooperativeProgram::bind",
+        ],
+        "checks": ["raw_prefix_boundary_identity", "eager_reference",
+                   "legacy_candidate_byte_identity", "captured_graph_mutation",
+                   "source_preservation", "guard_preservation"],
+        "hashes": ["raw_prefix_states", "raw_prefix_hashes",
+                   "eager_root_and_retained", "mutated_graph_root_and_retained"],
+    },
 }
-
-checkpoint_validate_numerator_record() {
-  local record="${1:?numerator record required}" source_sha="${2:?source SHA required}"
-  local module_sha="${3:?module SHA required}"
-  NUMERATOR_SCHEMA="$CHECKPOINT_NUMERATOR_SCHEMA" SOURCE_SHA="$source_sha" MODULE_SHA="$module_sha" \
-    python3 - "$record" <<'PY'
-import json, math, os, re, sys
-
-r = json.load(open(sys.argv[1], encoding="utf-8"))
-group_logs = [23, 19, 20, 6, 16, 18, 8, 7, 21, 14, 17, 11, 23, 15, 10, 4, 13, 12, 22]
-topology = {"groups": 19, "eligible_groups": 18, "legacy_groups": 1,
-            "coefficient_columns": 161, "coefficient_sources": 152,
-            "total_batches": 74, "coefficient_batches": 71, "terms": 6341}
-geometry = {"legacy_logical_output": 59993989376, "hybrid_logical_output": 20266867968,
-            "validated_numerator_output": 402644224, "validated_auxiliary_output": 912,
-            "validated_canonical_output": 402645136,
-            "shared_data_dual_workspace_arena": 41889121376,
-            "workspace_span_each": 67901168, "second_workspace_arena_delta": 67901152}
-
-def require(condition, message):
-    if not condition: raise SystemExit(message)
-
-def exact_int(container, field, expected):
-    value = container.get(field)
-    require(isinstance(value, int) and not isinstance(value, bool) and value == expected,
-            f"{field}: expected integer {expected}, got {value!r}")
-
-def nonnegative_int(container, field):
-    value = container.get(field)
-    require(isinstance(value, int) and not isinstance(value, bool) and value >= 0,
-            f"{field}: expected nonnegative integer, got {value!r}")
-    return value
-
-def positive(value, label):
-    require(isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value) and value > 0,
-            f"{label}: expected finite positive number, got {value!r}")
-    return float(value)
-
-def nearest_rank(samples, percentage):
-    ordered = sorted(samples)
-    return ordered[max(0, math.ceil(percentage * len(ordered) / 100) - 1)]
-
-require(r.get("schema") == os.environ["NUMERATOR_SCHEMA"], "exact numerator schema drifted")
-top = r.get("topology")
-require(isinstance(top, dict) and top.get("group_logs") == group_logs,
-        "exact numerator group logs drifted")
-for field, expected in topology.items(): exact_int(top, field, expected)
-
-byte_geometry = r.get("bytes")
-require(isinstance(byte_geometry, dict), "exact numerator byte geometry is missing")
-for field, expected in geometry.items(): exact_int(byte_geometry, field, expected)
-require(byte_geometry["validated_canonical_output"] ==
-        byte_geometry["validated_numerator_output"] + byte_geometry["validated_auxiliary_output"],
-        "validated numerator/auxiliary byte split is inconsistent")
-
-memory = r.get("device_memory")
-require(isinstance(memory, dict), "exact numerator device-memory record is missing")
-total = nonnegative_int(memory, "total")
-free_before = nonnegative_int(memory, "free_before_arena")
-free_after = nonnegative_int(memory, "free_after_arena")
-used = nonnegative_int(memory, "isolated_pool_used_after_arena")
-reserved = nonnegative_int(memory, "isolated_pool_reserved_after_arena")
-arena = geometry["shared_data_dual_workspace_arena"]
-require(0 <= free_after <= free_before <= total, "device free-memory ordering is invalid")
-require(arena <= used <= reserved <= total, "isolated-pool memory ordering is invalid")
-require(free_before >= arena, "device lacked the exact arena bytes before allocation")
-
-exact_int(r, "warmups", 3)
-exact_int(r, "iterations", 5)
-exact_int(r, "minimum_iterations", 5)
-identity = r.get("identity")
-require(isinstance(identity, dict), "exact numerator identity is missing")
-exact_int(identity, "timed_sample_index", 0)
-for field in ("timed_sample_causally_validated", "capture_revalidated",
-              "post_timing_revalidated"):
-    require(identity.get(field) is True, f"{field} did not pass")
-
-samples, host_wall, speedup = r.get("samples_ms"), r.get("host_wall_ms"), r.get("speedup")
-require(isinstance(samples, dict) and isinstance(host_wall, dict) and isinstance(speedup, dict),
-        "numerator timing record is incomplete")
-recomputed = {}
-for arm in ("legacy", "hybrid"):
-    raw = samples.get(arm)
-    require(isinstance(raw, list) and len(raw) == 5, f"{arm} sample count drifted")
-    checked = [positive(value, f"{arm} sample {index}") for index, value in enumerate(raw)]
-    reported = host_wall.get(arm)
-    require(isinstance(reported, dict), f"{arm} percentiles are missing")
-    recomputed[arm] = {}
-    for percentile in (50, 95):
-        label = f"p{percentile}"
-        expected = nearest_rank(checked, percentile)
-        actual = positive(reported.get(label), f"{arm} {label}")
-        require(math.isclose(actual, expected, rel_tol=0, abs_tol=5e-10),
-                f"{arm} {label} is not nearest-rank")
-        recomputed[arm][label] = actual
-
-# Samples/percentiles have six decimals; speedups use unrounded values and have nine.
-for label in ("p50", "p95"):
-    legacy, hybrid = recomputed["legacy"][label], recomputed["hybrid"][label]
-    require(hybrid > 0.5e-6, f"hybrid {label} is below timing precision")
-    lower = (legacy - 0.5e-6) / (hybrid + 0.5e-6)
-    upper = (legacy + 0.5e-6) / (hybrid - 0.5e-6)
-    actual = positive(speedup.get(label), f"speedup {label}")
-    require(actual + 0.5e-9 >= lower and actual - 0.5e-9 <= upper,
-            f"speedup {label} is inconsistent")
-
-require(identity.get("topology_fixture_blake3") ==
-        "ea31e3ff054c8d12d32d5b84a3d712987b31bb1fd3fb044fb27758453b49fbda",
-        "topology fixture identity drifted")
-require(identity.get("input_recipe_blake3") ==
-        "e4c2f871c2d05b81588a5407f06cb49c7ed76834d2e363d2214bd34e7defcf31",
-        "input recipe identity drifted")
-digest_fields = ("eager_legacy_blake3", "eager_hybrid_blake3", "captured_legacy_blake3",
-                 "captured_hybrid_blake3", "timed_legacy_blake3", "timed_hybrid_blake3",
-                 "post_timing_legacy_blake3", "post_timing_hybrid_blake3")
-digests = [identity.get(field) for field in digest_fields]
-require(len(set(digests)) == 1 and re.fullmatch(r"[0-9a-f]{64}", str(digests[0])),
-        "legacy/hybrid numerator outputs are not exactly identical")
-artifact = r.get("artifact_identity")
-require(isinstance(artifact, dict) and artifact.get("identity_complete") is True
-        and artifact.get("source_projection_sha256") == os.environ["SOURCE_SHA"]
-        and artifact.get("cuda_module_sha256") == os.environ["MODULE_SHA"]
-        and artifact.get("cuda_build_mode") == "cuda",
-        "exact numerator artifact identity is incomplete")
-print(json.dumps({"exact_numerator_ab": "PASS", "p50_speedup": speedup["p50"],
-                  "p95_speedup": speedup["p95"]}, sort_keys=True))
+if (len(fixtures) != len(expected)
+        or any(not isinstance(fixture, dict) for fixture in fixtures)
+        or len(by_name) != len(fixtures)
+        or set(by_name) != set(expected)):
+    raise SystemExit(f"Stage-4 fixture set drifted: {sorted(map(str, by_name))}")
+for name, identity in expected.items():
+    fixture = by_name[name]
+    checks = fixture.get("checks")
+    hashes = fixture.get("hashes")
+    if (fixture.get("cases") != identity["cases"]
+            or fixture.get("production_apis") != identity["production_apis"]
+            or not isinstance(fixture.get("arena_bytes"), int)
+            or fixture["arena_bytes"] <= 0
+            or not isinstance(checks, dict) or set(checks) != set(identity["checks"])
+            or any(value is not True for value in checks.values())
+            or not isinstance(hashes, dict) or set(hashes) != set(identity["hashes"])
+            or any(not re.fullmatch(r"[0-9a-f]{64}", str(value))
+                   for value in hashes.values())):
+        raise SystemExit(f"Stage-4 fixture receipt is incomplete: {name}")
+print(json.dumps({"replacement_stage4_native": "PASS",
+                  "fixtures": sorted(by_name)}, sort_keys=True))
 PY
 }
 
-checkpoint_exact_numerator_ab() {
-  local build_json build_err executable source_sha module_sha log out
+checkpoint_stage4_native() {
+  local log out
   checkpoint_reject_ambient_overrides
-  build_json="$(checkpoint_artifact numerator_build.jsonl.txt)"
-  build_err="$(checkpoint_artifact numerator_build.stderr.txt)"
-  log="$(checkpoint_artifact numerator_ab.txt)"
-  out="$(checkpoint_artifact numerator_ab.json)"
+  log="$(checkpoint_artifact stage4_native.txt)"
+  out="$(checkpoint_artifact stage4_native.json)"
+  rm -f "$out"
   cd "$STWO"
-  # Reuse the already-built Cairo release dependency graph; Cargo hashes feature
-  # variants safely, while a second workspace target would rebuild the CUDA pack.
-  if ! env CARGO_TARGET_DIR="$CAIRO/target" cargo test --release --locked -p stwo-backend-cuda \
-      --test prepared_quotient_numerator_sn3_bench_native \
-      sn3_hybrid_graph_host_wall_benchmark --no-run --message-format=json \
-      >"$build_json" 2>"$build_err"; then
-    cat "$build_err"
-    return 1
-  fi
-  executable="$(python3 - "$build_json" <<'PY'
-import json, sys
-matches = []
-for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
-    try: value = json.loads(line)
-    except json.JSONDecodeError: continue
-    target = value.get("target") or {}
-    if (value.get("reason") == "compiler-artifact"
-            and target.get("name") == "prepared_quotient_numerator_sn3_bench_native"
-            and value.get("executable")):
-        matches.append(value["executable"])
-if len(matches) != 1:
-    raise SystemExit(f"expected one exact numerator test executable, got {matches}")
-print(matches[0])
-PY
-)"
-  [[ -x "$executable" ]] || { echo "missing exact numerator test executable: $executable" >&2; return 1; }
-  source_sha="$(checkpoint_numerator_source_sha)"
-  module_sha="$(checkpoint_sha256 "$executable")"
-  if ! env CARGO_TARGET_DIR="$CAIRO/target" STWO_SN3_NUMERATOR_BENCH_ITERS=5 \
-      STWO_SN3_NUMERATOR_SOURCE_PROJECTION_SHA256="$source_sha" \
-      STWO_SN3_NUMERATOR_CUDA_MODULE_SHA256="$module_sha" \
+  if ! env CARGO_TARGET_DIR="$CAIRO/target" \
+      STWO_STAGE4_GIT_COMMIT="$STWO_PARITY_REF_STWO_HEAD" \
+      STWO_STAGE4_NATIVE_RECEIPT="$out" \
       cargo test --release --locked -p stwo-backend-cuda \
-      --test prepared_quotient_numerator_sn3_bench_native \
-      sn3_hybrid_graph_host_wall_benchmark \
-      -- --ignored --exact --nocapture --test-threads=1 >"$log" 2>&1; then
+      --test replacement_stage4_native replacement_stage4_native_bytes_match \
+      -- --exact --nocapture --test-threads=1 >"$log" 2>&1; then
     cat "$log"
     return 1
   fi
-  checkpoint_require_one_test "$log" sn3_hybrid_graph_host_wall_benchmark
-  NUMERATOR_SCHEMA="$CHECKPOINT_NUMERATOR_SCHEMA" python3 - "$log" "$out" <<'PY'
-import json, os, sys
-decoder = json.JSONDecoder()
-records = []
-for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
-    marker = line.find(f'{{"schema":"{os.environ["NUMERATOR_SCHEMA"]}"')
-    if marker >= 0:
-        records.append(decoder.raw_decode(line[marker:])[0])
-if len(records) != 1:
-    raise SystemExit(f"expected one exact numerator A/B record, got {len(records)}")
-r = records[0]
-with open(sys.argv[2], "w", encoding="utf-8") as stream:
-    json.dump(r, stream, sort_keys=True)
-    stream.write("\n")
-PY
-  if ! checkpoint_validate_numerator_record "$out" "$source_sha" "$module_sha"; then
-    rm -f "$out"
-    return 1
-  fi
+  checkpoint_require_one_test "$log" replacement_stage4_native_bytes_match
+  [[ -s "$out" ]] || { echo "replacement Stage-4 native gate emitted no receipt" >&2; return 1; }
+  checkpoint_validate_stage4_native_receipt "$out"
   cat "$log"
 }
 
@@ -473,6 +510,7 @@ checkpoint_aot_identity() {
   local manifest_sha key_lines raw out key expected_key_count
   local -a keys key_args
   checkpoint_reject_ambient_overrides
+  checkpoint_require_aot_manifest_shape || return 1
   manifest_sha="$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")"
   [[ "$manifest_sha" == "$CHECKPOINT_AOT_MANIFEST_SHA256" ]] \
     || { echo "AOT manifest SHA-256 drifted" >&2; return 1; }
@@ -493,7 +531,8 @@ PY
   )" || return 1
   keys=()
   while IFS= read -r key; do keys+=("$key"); done <<<"$key_lines"
-  [[ ${#keys[@]} -gt 0 ]] || { echo "AOT key extraction failed" >&2; return 1; }
+  [[ ${#keys[@]} -eq $CHECKPOINT_AOT_TOTAL ]] \
+    || { echo "AOT key extraction expected $CHECKPOINT_AOT_TOTAL keys, got ${#keys[@]}" >&2; return 1; }
   expected_key_count="${#keys[@]}"
   key_args=()
   for key in "${keys[@]}"; do key_args+=(--key "$key"); done
@@ -502,18 +541,27 @@ PY
   out="$(checkpoint_artifact aot_identity.json)"
   MANIFEST_SHA="$manifest_sha" CHECKER_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_CHECK")" \
     GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
-    EXPECTED_KEY_COUNT="$expected_key_count" python3 - "$raw" "$out" <<'PY'
+    EXPECTED_KEY_COUNT="$expected_key_count" AOT_WITNESS="$CHECKPOINT_AOT_WITNESS" \
+    AOT_ORDINARY="$CHECKPOINT_AOT_ORDINARY_CONSTRAINT" \
+    AOT_WAVE="$CHECKPOINT_AOT_COMPOSITION_WAVE" python3 - "$raw" "$out" <<'PY'
 import json, os, re, sys
 result = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = int(os.environ["EXPECTED_KEY_COUNT"])
 if (result.get("pass") is not True or result.get("sm") != 90
-        or result.get("required_unique_key_count") != int(os.environ["EXPECTED_KEY_COUNT"])
+        or result.get("required_unique_key_count") != expected
+        or result.get("embedded_entry_count") != expected
+        or result.get("embedded_arch_entry_count") != expected
         or result.get("missing_keys") != []
         or not re.fullmatch(r"(?!0{16})[0-9a-f]{16}", result.get("loaded_manifest_hash", ""))):
     raise SystemExit(f"embedded sm_90 AOT pack identity/coverage failed: {result}")
 record = {"schema": "stwo.replacement-v1-sn2.aot-identity.v1", **result,
           "manifest_sha256": os.environ["MANIFEST_SHA"],
           "checker_binary_sha256": os.environ["CHECKER_SHA"],
-          "gpu_bench_sha256": os.environ["GPU_BENCH_SHA"]}
+          "gpu_bench_sha256": os.environ["GPU_BENCH_SHA"],
+          "manifest_entry_count": int(os.environ["EXPECTED_KEY_COUNT"]),
+          "manifest_witness_count": int(os.environ["AOT_WITNESS"]),
+          "manifest_ordinary_constraint_count": int(os.environ["AOT_ORDINARY"]),
+          "manifest_composition_wave_count": int(os.environ["AOT_WAVE"])}
 with open(sys.argv[2], "w", encoding="utf-8") as stream:
     json.dump(record, stream, sort_keys=True)
     stream.write("\n")
@@ -538,6 +586,9 @@ checkpoint_reject_ambient_overrides() {
     STWO_CUDA_WITNESS_JIT_MAX_INSTRS STWO_JIT_CACHE_DIR STWO_JIT_CUBIN_CACHE
     STWO_JIT_DISABLE_SPLIT STWO_JIT_FORCE_RELAX STWO_JIT_LOG STWO_JIT_MAX_KERNEL_INSTRS
     STWO_JIT_NVRTC_OPTS STWO_JIT_PARALLEL_COMPILE STWO_WITNESS_JIT_SELFTEST
+    STWO_STAGE4_NATIVE_PERF STWO_STAGE4_NATIVE_PERF_LOGS
+    STWO_STAGE4_NATIVE_PERF_WARMUPS STWO_STAGE4_NATIVE_PERF_ITERATIONS
+    STWO_STAGE4_GIT_COMMIT STWO_STAGE4_NATIVE_RECEIPT
     STWO_BENCH_REQUIRE_GPU_NATIVE_ARCHITECTURE STWO_BENCH_REQUIRE_GPU_PCS_RUNTIME_MODE
     STWO_BENCH_REQUIRE_PROOF_BYTE_EQUAL STWO_BENCH_REQUIRE_SIMD_REFERENCE_BYTE_EQUAL
     STWO_BENCH_REQUIRE_PROOF_MUTATION_REJECTED GPU_PCS_RUNTIME_MODE
@@ -559,7 +610,11 @@ checkpoint_run_sn2() {
     --require-proof-mutation-rejected
   )
   [[ "$mode" == diagnostic || "$mode" == timing ]] || { echo "invalid checkpoint mode: $mode" >&2; return 2; }
-  if [[ "$mode" == diagnostic ]]; then args+=(--diagnostic-allow-slow-graph-submit); fi
+  if [[ "$mode" == diagnostic ]]; then
+    args+=(--diagnostic-allow-slow-graph-submit)
+  else
+    args+=(--capture-slow-graph-submit)
+  fi
   checkpoint_reject_ambient_overrides
   stdout="$(checkpoint_artifact stdout.txt)"
   stderr="$(checkpoint_artifact stderr.txt)"
@@ -601,9 +656,12 @@ checkpoint_validate_sn2() {
   aot="$(checkpoint_artifact aot_identity.json)"
   proof="$(checkpoint_artifact proof.bin)"
   out="$(checkpoint_artifact record.json)"
-  python3 - "$stdout" "$aot" "$proof" "$CHECKPOINT_SEAL" "$out" "$mode" "$reps" \
+  PACKED_ROWS="$CHECKPOINT_SN2_PACKED_OUTPUT_ROWS" \
+    COMPOSITION_PARTS="$CHECKPOINT_SN2_COMPOSITION_PARTS" \
+    COMPOSITION_WAVES="$CHECKPOINT_SN2_COMPOSITION_WAVES" \
+    python3 - "$stdout" "$aot" "$proof" "$CHECKPOINT_SEAL" "$out" "$mode" "$reps" \
     "$CHECKPOINT_ROOT/gpu_benchmarks" <<'PY'
-import hashlib, json, math, re, sys
+import hashlib, json, math, os, re, sys
 
 raw_path, aot_path, proof_path, seal_path, out_path, mode, reps_text, module_path = sys.argv[1:]
 sys.path.insert(0, module_path)
@@ -644,23 +702,26 @@ for field in ("gpu_pcs_stage_started", "gpu_pcs_stage_finished"):
     stages = r.get(field)
     require(isinstance(stages, dict) and set(stages) == expected_stages and all(bool(value) for value in stages.values()), f"incomplete {field}")
 require(r.get("gpu_graph_a_setup_gate_passed") is True, "strict Graph-A setup gate failed")
-require(r.get("gpu_planned_numerator_schedule") == "hybrid-single-write", "planned numerator schedule drifted")
-require(r.get("gpu_prepared_numerator_schedule") == "hybrid-single-write", "actual numerator schedule fell back")
-require(isinstance(r.get("gpu_prepared_numerator_eligible_groups"), int) and r["gpu_prepared_numerator_eligible_groups"] > 0, "no hybrid numerator group executed")
-require(isinstance(r.get("gpu_prepared_numerator_legacy_groups"), int) and r["gpu_prepared_numerator_legacy_groups"] >= 0, "invalid legacy numerator group count")
+require(r.get("gpu_planned_numerator_schedule") == "staged-packed-single-write", "planned numerator schedule drifted")
+require(r.get("gpu_prepared_numerator_schedule") == "staged-packed-single-write", "actual numerator schedule fell back")
+require(r.get("gpu_prepared_numerator_eligible_groups") is None, "staged numerator unexpectedly reported eligible groups")
+require(r.get("gpu_prepared_numerator_legacy_groups") == 0, "staged numerator executed legacy groups")
+require(r.get("gpu_prepared_numerator_packed_output_rows") == int(os.environ["PACKED_ROWS"]), "staged numerator packed-row count drifted")
+require(r.get("gpu_composition_part_count") == int(os.environ["COMPOSITION_PARTS"]), "composition part count drifted")
+require(r.get("gpu_composition_wave_count") == int(os.environ["COMPOSITION_WAVES"]), "composition wave count drifted")
 require(isinstance(r.get("gpu_protocol_key"), int) and not isinstance(r["gpu_protocol_key"], bool)
         and 0 < r["gpu_protocol_key"] < 2**64, "protocol key is not a nonzero u64")
 topology_digest = r.get("gpu_shape_executable_topology_digest")
 require(hex64(topology_digest) and topology_digest != "0" * 64,
         "topology digest is not a nonzero 256-bit identity")
-require_resident_reuse(r, reps, max_host_preparation_ns=120_000_000)
+require_resident_reuse(r, reps)
 require(r.get("gpu_policy_retained_lde_budget_bytes") == 64 * 1024**3, "replacement-v1 LDE policy drifted")
 require(r.get("gpu_policy_commit_mode") == "domain-progressive", "replacement-v1 commit policy drifted")
 require(r.get("gpu_policy_direct_composition_retention") == "exact-native", "replacement-v1 composition retention drifted")
 require(r.get("gpu_policy_numerator_source") == "reuse-retained-evaluations", "replacement-v1 numerator source drifted")
 require(r.get("gpu_policy_interpolation_mode") == "stage-fused-out-of-place", "replacement-v1 interpolation policy drifted")
 require(r.get("gpu_policy_blake2s_interior_fused") is False, "replacement-v1 Blake interior policy drifted")
-require(r.get("gpu_policy_composition_launch_mode") == "serial", "replacement-v1 composition launch policy drifted")
+require(r.get("gpu_policy_composition_launch_mode") == "wave", "replacement-v1 composition launch policy drifted")
 require(r.get("gpu_policy_relation_tail_mode") == "segmented", "replacement-v1 relation-tail policy drifted")
 require(r.get("gpu_policy_fri_fold_launch_mode") == "per-fold", "replacement-v1 FRI-fold policy drifted")
 require(r.get("gpu_policy_witness_feed_launch_mode") == "global-atomics", "replacement-v1 witness-feed policy drifted")
@@ -682,21 +743,57 @@ require(hex64(r.get("gpu_proof_blake3")) and r.get("simd_reference_blake3") == r
 require(r.get("proof_mutation_required") is True, "structured proof mutation was not required")
 require(r.get("proof_mutation_kind") == "interaction_claim.memory_id_to_big.claimed_sum_plus_one", "wrong structured proof mutation")
 require(r.get("proof_mutation_rejected") is True and r.get("proof_mutation_error_class") == "invalid_logup_sum", "structured proof mutation was not deterministically rejected")
-require(isinstance(r.get("gpu_max_graph_submit_gap_ms"), (int, float)) and math.isfinite(r["gpu_max_graph_submit_gap_ms"]) and r["gpu_max_graph_submit_gap_ms"] >= 0, "missing graph-submit timing")
+max_gap_samples = r.get("gpu_graph_submit_gap_ns_max_samples")
+total_gap_samples = r.get("gpu_graph_submit_gap_ns_total_samples")
+average_gap_samples = r.get("gpu_graph_submit_gap_ns_average_samples")
+graph_launch_samples = r.get("gpu_graph_submit_launches_samples")
+require(all(isinstance(values, list) and len(values) == reps for values in
+            (max_gap_samples, total_gap_samples, average_gap_samples, graph_launch_samples)),
+        "graph-submit sample vectors do not match proof repetitions")
+for index, (maximum, total, average, launches) in enumerate(zip(
+        max_gap_samples, total_gap_samples, average_gap_samples, graph_launch_samples)):
+    require(isinstance(maximum, int) and not isinstance(maximum, bool) and maximum >= 0,
+            f"invalid graph-submit maximum at repetition {index}")
+    require(isinstance(total, int) and not isinstance(total, bool) and total >= maximum,
+            f"invalid graph-submit total at repetition {index}")
+    require(isinstance(launches, int) and not isinstance(launches, bool) and launches > 1,
+            f"graph-submit average needs at least two launches at repetition {index}")
+    gap_count = launches - 1
+    require(isinstance(average, (int, float)) and not isinstance(average, bool)
+            and math.isfinite(average)
+            and math.isclose(average, total / gap_count, rel_tol=1e-12, abs_tol=1e-6),
+            f"invalid graph-submit average at repetition {index}")
+warm_max_gap_samples = max_gap_samples[1:] if reps > 1 else max_gap_samples
+claimed_max_gap_ns = max(warm_max_gap_samples)
+claimed_graph_gate = claimed_max_gap_ns < 50_000_000
+require(r.get("gpu_graph_submit_warm_sample_count") == len(warm_max_gap_samples),
+        "graph-submit warm sample count drifted")
+require(r.get("gpu_graph_submit_gap_ns_total") == total_gap_samples[-1],
+        "final graph-submit total differs from repetition vector")
+require(r.get("gpu_graph_launches") == graph_launch_samples[-1],
+        "final graph-launch count differs from repetition vector")
+require(isinstance(r.get("gpu_max_graph_submit_gap_ms"), (int, float))
+        and math.isfinite(r["gpu_max_graph_submit_gap_ms"])
+        and math.isclose(r["gpu_max_graph_submit_gap_ms"], claimed_max_gap_ns / 1_000_000,
+                         rel_tol=0, abs_tol=1e-9),
+        "aggregate graph-submit maximum differs from warm samples")
+require(r.get("gpu_graph_submit_gap_strict_gate_passed") is claimed_graph_gate,
+        "aggregate graph-submit gate differs from warm samples")
 require(r.get("performance_measurement_available") is True, "GPU timing is unavailable")
 if mode == "diagnostic":
     require(reps == 2 and r.get("benchmark_diagnostic_mode") is True, "first checkpoint must be reps=2 diagnostic")
     require(r.get("benchmark_diagnostic_reason") == "graph-submit-gap-only", "diagnostic softened more than graph-submit")
+    require(r.get("benchmark_graph_submit_capture_mode") is False, "diagnostic unexpectedly used timing capture mode")
     require(r.get("performance_claim_admissible") is False, "diagnostic timing must not be admissible")
 elif mode == "timing":
     require(reps >= 6 and r.get("benchmark_diagnostic_mode") is False and r.get("benchmark_diagnostic_reason") is None, "timing follow-on must have diagnostics disabled")
-    require(r.get("performance_claim_admissible") is True, "timing follow-on is not admissible")
-    require(r.get("gpu_graph_submit_gap_strict_gate_passed") is True, "timing follow-on exceeded strict graph-submit gap")
+    require(r.get("benchmark_graph_submit_capture_mode") is True, "timing follow-on did not enable soft graph-gap capture")
+    require(r.get("performance_claim_admissible") is (r.get("gpu_graph_submit_gap_strict_gate_passed") is True), "timing admissibility disagrees with observed graph-submit gate")
     require(r.get("warm_sample_count") == reps - 1, "timing follow-on lacks the expected warm samples")
     for field in ("prove_s_warm_median", "prove_s_warm_p95", "useful_mhz_median", "useful_mhz_at_warm_p95"):
         require(isinstance(r.get(field), (int, float)) and math.isfinite(r[field]) and r[field] > 0, f"invalid timing metric {field}")
     seal = json.load(open(seal_path, encoding="utf-8"))
-    require(seal.get("schema") == "stwo.replacement-v1-sn2.checkpoint-seal.v2"
+    require(seal.get("schema") == "stwo.replacement-v1-sn2.checkpoint-seal.v3"
             and seal.get("diagnostic_pass") is True, "timing seal is not a passing diagnostic")
     require(r["gpu_proof_blake3"] == seal.get("proof_blake3"), "timing proof digest differs from diagnostic")
     proof_sha256 = hashlib.sha256(open(proof_path, "rb").read()).hexdigest()
@@ -705,8 +802,10 @@ elif mode == "timing":
     require(shape == {
         "protocol_key": r["gpu_protocol_key"],
         "topology_digest": r["gpu_shape_executable_topology_digest"],
-        "numerator_eligible_groups": r["gpu_prepared_numerator_eligible_groups"],
-        "numerator_legacy_groups": r["gpu_prepared_numerator_legacy_groups"],
+        "numerator_schedule": r["gpu_prepared_numerator_schedule"],
+        "numerator_packed_output_rows": r["gpu_prepared_numerator_packed_output_rows"],
+        "composition_part_count": r["gpu_composition_part_count"],
+        "composition_wave_count": r["gpu_composition_wave_count"],
     }, "timing shape/numerator receipt differs from diagnostic")
 else:
     raise SystemExit(f"unknown validation mode: {mode}")
@@ -725,42 +824,54 @@ PY
 }
 
 checkpoint_seal_diagnostic() {
-  local source hardware build adapted carry numerator aot record proof proof_sha run_seal
+  local source hardware counter build adapted carry stage4 aot record proof proof_sha run_seal
   checkpoint_reject_ambient_overrides
   source="$(checkpoint_artifact source_input_identity.json)"
   hardware="$(checkpoint_artifact hardware_identity.json)"
+  counter="$(checkpoint_artifact counter_acceptance.json)"
   build="$(checkpoint_artifact build_identity.json)"
   adapted="$(checkpoint_artifact adapted_input_identity.json)"
   carry="$(checkpoint_artifact fp256_carry_oracles.json)"
-  numerator="$(checkpoint_artifact numerator_ab.json)"
+  stage4="$(checkpoint_artifact stage4_native.json)"
   aot="$(checkpoint_artifact aot_identity.json)"
   record="$(checkpoint_artifact record.json)"
   proof="$(checkpoint_artifact proof.bin)"
   proof_sha="$(awk '{print $1}' "$(checkpoint_artifact proof.sha256.txt)")"
   run_seal="$(checkpoint_artifact seal.json)"
-  for path in "$source" "$hardware" "$build" "$adapted" "$carry" "$numerator" "$aot" "$record" "$proof"; do
+  for path in "$source" "$hardware" "$counter" "$build" "$adapted" "$carry" "$stage4" "$aot" "$record" "$proof"; do
     [[ -s "$path" ]] || { echo "cannot seal missing checkpoint receipt: $path" >&2; return 1; }
   done
   checkpoint_require_hash "$proof_sha" 256 proof_dump_sha256
-  SOURCE="$source" HARDWARE="$hardware" BUILD="$build" ADAPTED="$adapted" CARRY="$carry" \
-    NUMERATOR="$numerator" AOT="$aot" RECORD="$record" PROOF="$proof" PROOF_SHA="$proof_sha" \
+  SOURCE="$source" HARDWARE="$hardware" COUNTER="$counter" \
+    BUILD="$build" ADAPTED="$adapted" CARRY="$carry" \
+    STAGE4="$stage4" AOT="$aot" RECORD="$record" PROOF="$proof" PROOF_SHA="$proof_sha" \
     GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
     AOT_CHECK_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_CHECK")" \
     AOT_MANIFEST_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")" \
-    NUMERATOR_SCHEMA="$CHECKPOINT_NUMERATOR_SCHEMA" OUT="$CHECKPOINT_SEAL" python3 - <<'PY'
+    OUT="$CHECKPOINT_SEAL" python3 - <<'PY'
 import hashlib, json, os, tempfile
 def load(name):
     with open(os.environ[name], encoding="utf-8") as stream: return json.load(stream)
 def sha(name):
     return hashlib.sha256(open(os.environ[name], "rb").read()).hexdigest()
-source, hardware, build, adapted = map(load, ("SOURCE", "HARDWARE", "BUILD", "ADAPTED"))
-carry, numerator, aot, record = map(load, ("CARRY", "NUMERATOR", "AOT", "RECORD"))
+source, hardware, counter, build, adapted = map(
+    load, ("SOURCE", "HARDWARE", "COUNTER", "BUILD", "ADAPTED"))
+carry, stage4, aot, record = map(load, ("CARRY", "STAGE4", "AOT", "RECORD"))
 if (source.get("schema") != "stwo.replacement-v1-sn2.source-input-identity.v1"
         or hardware.get("schema") != "stwo.replacement-v1-sn2.hardware-identity.v2"
+        or counter.get("schema") != "stwo.replacement-v1.counter-acceptance.v1"
+        or counter.get("pass") is not True
+        or counter.get("gpu_uuid") != hardware.get("uuid")
         or build.get("schema") != "stwo.replacement-v1-sn2.build-identity.v1"
         or adapted.get("schema") != "stwo.replacement-v1-sn2.adapted-input-identity.v1"
         or carry.get("pass") is not True
-        or numerator.get("schema") != os.environ["NUMERATOR_SCHEMA"]
+        or stage4.get("schema") != "stwo.replacement-stage4-native.v1"
+        or stage4.get("passed") is not True
+        or stage4.get("failure") is not None
+        or stage4.get("git_commit") != source.get("source", {}).get("stwo", {}).get("head")
+        or hardware.get("uuid") not in stage4.get("cuda_device", "")
+        or stage4.get("requested_cuda_arch") != "sm_90"
+        or stage4.get("performance_requested") is not False
         or record.get("checkpoint_validation", {}).get("verdict") != "PASS"
         or record["checkpoint_validation"].get("mode") != "diagnostic"):
     raise SystemExit("diagnostic receipts are not sealable")
@@ -774,7 +885,7 @@ if (build.get("gpu_bench_sha256") != os.environ["GPU_BENCH_SHA"]
     raise SystemExit("diagnostic receipt/binary identity cross-check failed")
 if sha("PROOF") != os.environ["PROOF_SHA"]:
     raise SystemExit("diagnostic proof hash receipt differs from proof bytes")
-seal = {"schema": "stwo.replacement-v1-sn2.checkpoint-seal.v2", "diagnostic_pass": True,
+seal = {"schema": "stwo.replacement-v1-sn2.checkpoint-seal.v3", "diagnostic_pass": True,
         "source": source["source"], "inputs": source["inputs"], "hardware": hardware,
         "adapted_input_sha256": adapted["sha256"],
         "gpu_bench_sha256": os.environ["GPU_BENCH_SHA"],
@@ -783,14 +894,23 @@ seal = {"schema": "stwo.replacement-v1-sn2.checkpoint-seal.v2", "diagnostic_pass
         "aot_loaded_manifest_hash": aot["loaded_manifest_hash"],
         "proof_dump_sha256": os.environ["PROOF_SHA"],
         "proof_blake3": record["gpu_proof_blake3"],
+        "diagnostic_graph_submit_receipt": {
+            "max_ns_samples": record["gpu_graph_submit_gap_ns_max_samples"],
+            "total_ns_samples": record["gpu_graph_submit_gap_ns_total_samples"],
+            "average_ns_samples": record["gpu_graph_submit_gap_ns_average_samples"],
+            "graph_launches_samples": record["gpu_graph_submit_launches_samples"],
+            "strict_gate_passed": record["gpu_graph_submit_gap_strict_gate_passed"],
+        },
         "shape_receipt": {
             "protocol_key": record["gpu_protocol_key"],
             "topology_digest": record["gpu_shape_executable_topology_digest"],
-            "numerator_eligible_groups": record["gpu_prepared_numerator_eligible_groups"],
-            "numerator_legacy_groups": record["gpu_prepared_numerator_legacy_groups"],
+            "numerator_schedule": record["gpu_prepared_numerator_schedule"],
+            "numerator_packed_output_rows": record["gpu_prepared_numerator_packed_output_rows"],
+            "composition_part_count": record["gpu_composition_part_count"],
+            "composition_wave_count": record["gpu_composition_wave_count"],
         },
         "receipts_sha256": {name.lower(): sha(name) for name in
-            ("SOURCE", "HARDWARE", "BUILD", "ADAPTED", "CARRY", "NUMERATOR", "AOT", "RECORD")}}
+            ("SOURCE", "HARDWARE", "COUNTER", "BUILD", "ADAPTED", "CARRY", "STAGE4", "AOT", "RECORD")}}
 directory = os.path.dirname(os.environ["OUT"])
 fd, temporary = tempfile.mkstemp(prefix="replacement-v1-sn2-seal.", dir=directory, text=True)
 try:
@@ -826,7 +946,7 @@ checkpoint_verify_sealed_diagnostic() {
   CURRENT_HARDWARE="$current_hardware" python3 - "$CHECKPOINT_SEAL" <<'PY'
 import json, os, sys
 seal = json.load(open(sys.argv[1], encoding="utf-8"))
-if seal.get("schema") != "stwo.replacement-v1-sn2.checkpoint-seal.v2" or seal.get("diagnostic_pass") is not True:
+if seal.get("schema") != "stwo.replacement-v1-sn2.checkpoint-seal.v3" or seal.get("diagnostic_pass") is not True:
     raise SystemExit("checkpoint seal is not a passing diagnostic")
 expected_source = {"stwo": {"head": os.environ["STWO_PARITY_REF_STWO_HEAD"],
                              "worktree_sha256": os.environ["STWO_PARITY_REF_STWO_WORKTREE_HASH"]},
@@ -855,4 +975,251 @@ print(json.dumps({"sealed_diagnostic": "PASS", "proof_blake3": seal["proof_blake
                   "gpu": hardware["name"], "uuid": hardware["uuid"]}, sort_keys=True))
 PY
   cp "$CHECKPOINT_SEAL" "$run_seal"
+}
+
+checkpoint_write_profile_receipt() {
+  local profiler="$1" rc="$2" proof="$3" report="$4" table="$5"
+  local stdout="$6" stderr="$7" out="$8"
+  PROFILE="$profiler" RC="$rc" GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
+    NCU_LAUNCH_COUNT="$CHECKPOINT_NCU_LAUNCH_COUNT" \
+    COMPOSITION_WAVES="$CHECKPOINT_SN2_COMPOSITION_WAVES" \
+    python3 - "$proof" "$report" "$table" "$stdout" "$stderr" "$CHECKPOINT_SEAL" "$out" <<'PY'
+import csv, hashlib, json, os, pathlib, sys
+
+proof, report, table, stdout, stderr, seal_path, out = map(pathlib.Path, sys.argv[1:])
+profile = os.environ["PROFILE"]
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+reasons = []
+try:
+    rc = int(os.environ["RC"])
+except ValueError:
+    rc = -1
+    reasons.append("invalid profiler return code")
+if rc != 0:
+    reasons.append(f"{profile} exited with status {rc}")
+for label, path in (("profiler report", report), ("imported counter table", table),
+                    ("profile proof", proof)):
+    if not path.is_file() or path.stat().st_size == 0:
+        reasons.append(f"missing {label}")
+try:
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    seal = {}
+    reasons.append(f"unreadable diagnostic seal: {error}")
+if (seal.get("schema") != "stwo.replacement-v1-sn2.checkpoint-seal.v3"
+        or seal.get("diagnostic_pass") is not True):
+    reasons.append("profile did not consume a passing v3 diagnostic seal")
+proof_sha = digest(proof)
+if proof_sha is not None and proof_sha != seal.get("proof_dump_sha256"):
+    reasons.append("profile proof bytes differ from sealed diagnostic")
+records = []
+if stdout.is_file():
+    for line in stdout.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(value, dict) and value.get("program") == "SN_PIE_2.zip"
+                and value.get("backend") == "cuda"):
+            records.append(value)
+if len(records) != 1:
+    reasons.append(f"expected one profiled SN2 record, got {len(records)}")
+else:
+    record = records[0]
+    if (record.get("gpu_proof_blake3") != seal.get("proof_blake3")
+            or record.get("verified_reps") != 2
+            or record.get("proof_byte_equal") is not True
+            or record.get("simd_reference_byte_equal") is not True
+            or record.get("proof_mutation_rejected") is not True):
+        reasons.append("profiled execution did not reproduce the sealed correctness identity")
+ncu_topology = None
+if profile == "ncu" and table.is_file():
+    launches = {}
+    columns = None
+    for row in csv.reader(table.read_text(encoding="utf-8", errors="replace").splitlines()):
+        if "ID" in row and "Kernel Name" in row:
+            columns = {field: row.index(field) for field in ("ID", "Kernel Name")}
+            columns["Process ID"] = row.index("Process ID") if "Process ID" in row else None
+            continue
+        if columns is None or max(index for index in columns.values() if index is not None) >= len(row):
+            continue
+        kernel = row[columns["Kernel Name"]]
+        if ("stwo_composition_wave_" not in kernel
+                and "stwo_quotient_numerator_packed_single_write_kernel" not in kernel):
+            continue
+        launch_id = row[columns["ID"]]
+        process_id = row[columns["Process ID"]] if columns["Process ID"] is not None else ""
+        if not launch_id:
+            continue
+        key = (process_id, launch_id)
+        if key in launches and launches[key] != kernel:
+            reasons.append(f"NCU launch identity mapped to multiple kernels: {key}")
+        launches[key] = kernel
+    kernels = list(launches.values())
+    waves = [kernel for kernel in kernels if "stwo_composition_wave_" in kernel]
+    numerator = [kernel for kernel in kernels
+                 if "stwo_quotient_numerator_packed_single_write_kernel" in kernel]
+    ncu_topology = {
+        "selected_launch_count": len(kernels),
+        "composition_wave_launch_count": len(waves),
+        "distinct_composition_wave_kernel_count": len(set(waves)),
+        "packed_numerator_launch_count": len(numerator),
+    }
+    expected_launches = int(os.environ["NCU_LAUNCH_COUNT"])
+    expected_waves = int(os.environ["COMPOSITION_WAVES"])
+    if (len(kernels) != expected_launches or len(waves) != expected_waves
+            or len(set(waves)) != expected_waves or len(numerator) != 1):
+        reasons.append(f"NCU selected-kernel topology drifted: {ncu_topology}")
+record = {
+    "schema": "stwo.replacement-v1-sn2.profile-receipt.v1",
+    "profiler": profile,
+    "status": "PASS" if not reasons else "FAIL",
+    "soft_failure_reasons": reasons,
+    "command_return_code": rc,
+    "gpu_bench_sha256": os.environ["GPU_BENCH_SHA"],
+    "diagnostic_seal_sha256": digest(seal_path),
+    "proof_sha256": proof_sha,
+    "report_bytes": report.stat().st_size if report.is_file() else 0,
+    "report_sha256": digest(report),
+    "table_bytes": table.stat().st_size if table.is_file() else 0,
+    "table_sha256": digest(table),
+    "stdout_sha256": digest(stdout),
+    "stderr_sha256": digest(stderr),
+    "ncu_launch_topology": ncu_topology,
+}
+out.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+print(json.dumps(record, sort_keys=True))
+PY
+}
+
+checkpoint_nsys_profile() {
+  local base report table stdout stderr proof out rc table_rc nsys_bin
+  checkpoint_reject_ambient_overrides
+  base="$(checkpoint_artifact nsys_profile)"
+  report="$base.nsys-rep"
+  table="$(checkpoint_artifact nsys_profile.csv)"
+  stdout="$(checkpoint_artifact nsys_profile.stdout.txt)"
+  stderr="$(checkpoint_artifact nsys_profile.stderr.txt)"
+  proof="$(checkpoint_artifact nsys_profile.proof.bin)"
+  out="$(checkpoint_artifact nsys_profile.json)"
+  nsys_bin="$(command -v nsys || true)"
+  [[ -n "$nsys_bin" ]] || nsys_bin="$CHECKPOINT_NSYS_FALLBACK"
+  rm -f "$report" "$table" "$stdout" "$stderr" "$proof" "$out"
+  set +e
+  "$nsys_bin" profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+    --cuda-graph-trace=graph --stats=false --wait=all \
+    --force-overwrite=true --output="$base" \
+    env STWO_BENCH_TRACE=json STWO_DUMP_PROOF="$proof" \
+    "$CHECKPOINT_GPU_BENCH" --pie "$CHECKPOINT_PIE" --backend cuda --engine gpu-native \
+    --resident-backend replacement-v1 --require-gpu-native-architecture \
+    --require-gpu-pcs-runtime-mode arena-graph --reuse-input --reps 2 \
+    --require-proof-byte-equal --require-simd-reference-byte-equal \
+    --require-proof-mutation-rejected --diagnostic-allow-slow-graph-submit \
+    >"$stdout" 2>"$stderr"
+  rc=$?
+  if [[ -s "$report" ]]; then
+    "$nsys_bin" stats --report cuda_gpu_kern_sum,cuda_api_sum --format csv "$report" \
+      >"$table" 2>>"$stderr"
+    table_rc=$?
+    [[ $rc -ne 0 ]] || rc=$table_rc
+  fi
+  set -e
+  checkpoint_write_profile_receipt nsys "$rc" "$proof" "$report" "$table" \
+    "$stdout" "$stderr" "$out"
+  return 0
+}
+
+checkpoint_ncu_profile() {
+  local base report table stdout stderr proof out rc table_rc
+  checkpoint_reject_ambient_overrides
+  base="$(checkpoint_artifact ncu_profile)"
+  report="$base.ncu-rep"
+  table="$(checkpoint_artifact ncu_profile.csv)"
+  stdout="$(checkpoint_artifact ncu_profile.stdout.txt)"
+  stderr="$(checkpoint_artifact ncu_profile.stderr.txt)"
+  proof="$(checkpoint_artifact ncu_profile.proof.bin)"
+  out="$(checkpoint_artifact ncu_profile.json)"
+  rm -f "$report" "$table" "$stdout" "$stderr" "$proof" "$out"
+  set +e
+  ncu --target-processes all --kernel-name "$CHECKPOINT_NCU_KERNEL_REGEX" \
+    --launch-count "$CHECKPOINT_NCU_LAUNCH_COUNT" --set basic -f -o "$base" \
+    env STWO_BENCH_TRACE=json STWO_DUMP_PROOF="$proof" \
+    "$CHECKPOINT_GPU_BENCH" --pie "$CHECKPOINT_PIE" --backend cuda --engine gpu-native \
+    --resident-backend replacement-v1 --require-gpu-native-architecture \
+    --require-gpu-pcs-runtime-mode arena-graph --reuse-input --reps 2 \
+    --require-proof-byte-equal --require-simd-reference-byte-equal \
+    --require-proof-mutation-rejected --diagnostic-allow-slow-graph-submit \
+    >"$stdout" 2>"$stderr"
+  rc=$?
+  if [[ -s "$report" ]]; then
+    ncu --import "$report" --page raw --csv >"$table" 2>>"$stderr"
+    table_rc=$?
+    [[ $rc -ne 0 ]] || rc=$table_rc
+  fi
+  set -e
+  checkpoint_write_profile_receipt ncu "$rc" "$proof" "$report" "$table" \
+    "$stdout" "$stderr" "$out"
+  return 0
+}
+
+checkpoint_assess_sn2_promotion() {
+  local timing nsys ncu out
+  timing="$(checkpoint_artifact record.json)"
+  nsys="$(checkpoint_artifact nsys_profile.json)"
+  ncu="$(checkpoint_artifact ncu_profile.json)"
+  out="$(checkpoint_artifact promotion.json)"
+  HOST_LIMIT="$CHECKPOINT_PROMOTION_HOST_PREPARATION_NS" \
+    MHZ_FLOOR="$CHECKPOINT_PROMOTION_USEFUL_MHZ" \
+    python3 - "$timing" "$nsys" "$ncu" "$out" <<'PY'
+import hashlib, json, os, sys
+
+evidence_paths = sys.argv[1:4]
+timing, nsys, ncu = (json.load(open(path, encoding="utf-8")) for path in evidence_paths)
+host_limit = int(os.environ["HOST_LIMIT"])
+mhz_floor = float(os.environ["MHZ_FLOOR"])
+checks = {
+    "hard_checkpoint_validation_passed": timing.get("checkpoint_validation", {}).get("verdict") == "PASS",
+    "performance_claim_admissible": timing.get("performance_claim_admissible") is True,
+    "graph_submit_gap_strict": timing.get("gpu_graph_submit_gap_strict_gate_passed") is True,
+    "host_preparation_within_budget": isinstance(timing.get("gpu_host_preparation_total_ns"), int)
+        and not isinstance(timing.get("gpu_host_preparation_total_ns"), bool)
+        and timing["gpu_host_preparation_total_ns"] <= host_limit,
+    "useful_mhz_at_or_above_floor": isinstance(timing.get("useful_mhz_median"), (int, float))
+        and not isinstance(timing.get("useful_mhz_median"), bool)
+        and timing["useful_mhz_median"] >= mhz_floor,
+    "nsys_profile_passed": nsys.get("status") == "PASS",
+    "ncu_profile_passed": ncu.get("status") == "PASS",
+}
+failed = [name for name, passed in checks.items() if not passed]
+record = {
+    "schema": "stwo.replacement-v1-sn2.promotion-verdict.v1",
+    "verdict": "PASS" if not failed else "FAIL",
+    "soft_failure": bool(failed),
+    "failed_checks": failed,
+    "checks": checks,
+    "thresholds": {
+        "host_preparation_total_ns_max": host_limit,
+        "useful_mhz_median_min": mhz_floor,
+    },
+    "measurements": {
+        "gpu_host_preparation_total_ns": timing.get("gpu_host_preparation_total_ns"),
+        "useful_mhz_median": timing.get("useful_mhz_median"),
+        "useful_mhz_at_warm_p95": timing.get("useful_mhz_at_warm_p95"),
+        "gpu_max_graph_submit_gap_ms": timing.get("gpu_max_graph_submit_gap_ms"),
+    },
+    "profile_status": {"nsys": nsys.get("status"), "ncu": ncu.get("status")},
+    "evidence_sha256": {
+        name: hashlib.sha256(open(path, "rb").read()).hexdigest()
+        for name, path in zip(("timing_record", "nsys_receipt", "ncu_receipt"), evidence_paths)
+    },
+}
+with open(sys.argv[4], "w", encoding="utf-8") as stream:
+    json.dump(record, stream, sort_keys=True)
+    stream.write("\n")
+print(json.dumps(record, sort_keys=True))
+PY
+  return 0
 }
