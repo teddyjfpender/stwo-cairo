@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# shellcheck disable=SC1091,SC2034 # Pod-side source consumes the mode variables.
 # pod_run: require_clean_sources
 # Seal the diagnostic and admit timing in one detached pod session so the GPU
 # and release binary cannot drift between correctness and measurement.
@@ -13,6 +14,7 @@ phase ambient_override_gate checkpoint_reject_ambient_overrides
 phase source_input_identity checkpoint_source_input_identity
 phase hardware_identity checkpoint_hardware_identity
 phase counter_permission_acceptance checkpoint_counter_acceptance
+phase nsys_tool_identity checkpoint_nsys_tool_identity
 phase build checkpoint_build
 phase adapted_input_identity checkpoint_adapted_input_identity
 phase fp256_carry_oracles checkpoint_fp256_carry_oracles

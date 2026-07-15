@@ -1,0 +1,21 @@
+# shellcheck shell=bash
+# Deliberately non-promotable edit loop. It accepts dirty, content-hashed
+# worktrees; builds the changed release binary against persistent Cargo/CUDA
+# caches; then runs one six-repetition, byte-identical, verifier-backed SN2
+# checkpoint. Promotion-only carry, Stage-4, counter, and profiler gates stay in
+# replacement_v1_sn2_{sealed,timing_only}.phases.
+
+# shellcheck disable=SC2034 # Consumed by the sourced common recipe.
+REPLACEMENT_SN2_COUNTER_POLICY='timing-only'
+REPLACEMENT_SN2_MODE=iteration
+# shellcheck disable=SC1091 # Pod-side absolute path is resolved after sync.
+source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
+
+phase ambient_override_gate checkpoint_reject_ambient_overrides
+phase source_input_identity checkpoint_source_input_identity iteration
+phase hardware_identity checkpoint_hardware_identity
+phase build checkpoint_build
+phase adapted_input_identity checkpoint_adapted_input_identity
+phase aot_identity checkpoint_aot_identity
+phase sn2_iteration checkpoint_run_sn2 iteration 6
+phase sn2_iteration_validate checkpoint_validate_sn2 iteration 6

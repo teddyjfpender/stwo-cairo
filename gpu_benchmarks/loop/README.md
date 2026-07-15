@@ -45,6 +45,33 @@ BOOTLOADER_JSON_SOURCE=/path/to/simple_bootloader_compiled.json \
                 [--skip-sync] [--gate-only]
 ```
 
+For the ordinary replacement-backend edit loop, use the smaller end-to-end SN2
+checkpoint instead of rerunning promotion qualification:
+
+```bash
+BENCH_POD_ID=<pod-id> ./quick_sn2.sh
+```
+
+It first runs the CPU-only launcher/provenance tests locally, before starting a paid
+pod. It accepts dirty worktrees only because both benchmark-relevant source
+projections are content-hashed and synced exactly; ignored caches, runtime receipts,
+and persistent PIE fixtures are not source. It reuses the persistent Cargo/CUDA
+caches, rebuilds the changed release binary, checks the pinned input and AOT
+identities, then runs six verifier-backed SN2 proofs with fresh SIMD byte equality
+and deterministic mutation rejection. The result is explicitly `iteration_only`
+and never formal-promotion eligible. Carry-oracle, Stage-4 native, NCU, and Nsight
+gates remain mandatory in the sealed qualification recipes, but no longer consume
+every edit cycle.
+
+The 2026-07-15 H100 receipt bounds this lane at roughly **7–10 minutes** for a
+changed full-SN2 candidate on a prepared pod: 364 s release build, 10 s input
+adaptation, about 2 s AOT identity, 56 s proof checkpoint, plus sync/bootstrap.
+That is about 2.5x shorter than the 18.8-minute qualification core. An unchanged
+sealed binary can rerun the timing checkpoint in about one minute. This is the
+full-proof integration lane, not the seconds-scale kernel lab. Current SN2 peaks
+at 50.018 decimal GB VRAM, so use an 80 GB GPU here; use cheaper GPUs for the
+kernel/transcript-segment replay lane, not this full proof.
+
 | Flag          | Meaning                                                                 |
 |---------------|-------------------------------------------------------------------------|
 | `--pie SEL`   | Which PIE to benchmark: `1..4` = `SN_PIE_<n>.zip`, `10t` = 10-transfer. Default `2`. |

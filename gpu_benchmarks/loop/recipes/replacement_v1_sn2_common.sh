@@ -107,11 +107,15 @@ print(json.dumps({"replacement_aot_pack": "PASS", **actual}, sort_keys=True))
 PY
 }
 
-checkpoint_require_clean_source_identity() {
+checkpoint_require_source_identity() {
   checkpoint_require_hash "${STWO_PARITY_REF_STWO_HEAD:-}" 160 stwo_head
   checkpoint_require_hash "${STWO_PARITY_REF_STWO_CAIRO_HEAD:-}" 160 stwo_cairo_head
   checkpoint_require_hash "${STWO_PARITY_REF_STWO_WORKTREE_HASH:-}" 256 stwo_worktree_hash
   checkpoint_require_hash "${STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH:-}" 256 stwo_cairo_worktree_hash
+}
+
+checkpoint_require_clean_source_identity() {
+  checkpoint_require_source_identity
   [[ "$STWO_PARITY_REF_STWO_WORKTREE_HASH" == "$CHECKPOINT_EMPTY_WORKTREE_SHA256" ]] \
     || { echo "checkpoint requires a fully committed stwo tree" >&2; return 1; }
   [[ "$STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH" == "$CHECKPOINT_EMPTY_WORKTREE_SHA256" ]] \
@@ -119,8 +123,12 @@ checkpoint_require_clean_source_identity() {
 }
 
 checkpoint_source_input_identity() {
-  local raw_expected raw_actual boot_expected boot_actual out
-  checkpoint_require_clean_source_identity
+  local source_policy="${1:-clean}" raw_expected raw_actual boot_expected boot_actual out
+  case "$source_policy" in
+    clean) checkpoint_require_clean_source_identity ;;
+    iteration) checkpoint_require_source_identity ;;
+    *) echo "invalid checkpoint source policy: $source_policy" >&2; return 2 ;;
+  esac
   [[ "$STWO_BOOTLOADER_JSON" == "$CHECKPOINT_BOOTLOADER" ]] \
     || { echo "pod bootloader path drifted: $STWO_BOOTLOADER_JSON" >&2; return 1; }
   for path in "$CHECKPOINT_PIE" "$CHECKPOINT_BOOTLOADER" \
@@ -137,13 +145,16 @@ checkpoint_source_input_identity() {
   [[ "$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")" == "$CHECKPOINT_AOT_MANIFEST_SHA256" ]] \
     || { echo "AOT manifest identity drifted; regenerate and deliberately repin this recipe" >&2; return 1; }
 
-  # A failed diagnostic must not leave an older timing-admissible seal behind.
-  rm -f "$CHECKPOINT_SEAL"
+  # A failed promotion diagnostic must not leave an older admissible seal behind.
+  # Iteration runs never consume or mutate a promotion seal.
+  [[ "$source_policy" != clean ]] || rm -f "$CHECKPOINT_SEAL"
   out="$(checkpoint_artifact source_input_identity.json)"
-  RAW_SHA="$raw_actual" BOOT_SHA="$boot_actual" OUT="$out" python3 - <<'PY'
+  RAW_SHA="$raw_actual" BOOT_SHA="$boot_actual" SOURCE_POLICY="$source_policy" \
+    OUT="$out" python3 - <<'PY'
 import json, os
 record = {
     "schema": "stwo.replacement-v1-sn2.source-input-identity.v1",
+    "source_policy": os.environ["SOURCE_POLICY"],
     "source": {
         "stwo": {"head": os.environ["STWO_PARITY_REF_STWO_HEAD"],
                  "worktree_sha256": os.environ["STWO_PARITY_REF_STWO_WORKTREE_HASH"]},
@@ -202,6 +213,26 @@ record = {"schema": "stwo.replacement-v1-sn2.hardware-identity.v2", "name": name
           "persistence_mode": persistence, "mig_mode": mig, "ecc_mode": ecc,
           "compute_mode": compute_mode, "power_limit_w": power_limit,
           "max_sm_clock_mhz": max_sm, "max_memory_clock_mhz": max_memory}
+with open(os.environ["OUT"], "w", encoding="utf-8") as stream:
+    json.dump(record, stream, sort_keys=True)
+    stream.write("\n")
+print(json.dumps(record, sort_keys=True))
+PY
+}
+
+checkpoint_nsys_tool_identity() {
+  local nsys_bin version out
+  nsys_bin="$(command -v nsys || true)"
+  [[ -n "$nsys_bin" ]] || nsys_bin="$CHECKPOINT_NSYS_FALLBACK"
+  [[ -x "$nsys_bin" ]] \
+    || { echo "required Nsight Systems executable is absent: $nsys_bin" >&2; return 1; }
+  version="$("$nsys_bin" --version 2>&1)" \
+    || { echo "Nsight Systems version probe failed: $nsys_bin" >&2; return 1; }
+  out="$(checkpoint_artifact nsys_tool_identity.json)"
+  NSYS_PATH="$nsys_bin" NSYS_VERSION="$version" OUT="$out" python3 - <<'PY'
+import json, os
+record = {"schema": "stwo.replacement-v1-sn2.nsys-tool-identity.v1",
+          "path": os.environ["NSYS_PATH"], "version": os.environ["NSYS_VERSION"]}
 with open(os.environ["OUT"], "w", encoding="utf-8") as stream:
     json.dump(record, stream, sort_keys=True)
     stream.write("\n")
@@ -664,6 +695,8 @@ checkpoint_reject_ambient_overrides() {
     STWO_BENCH_REQUIRE_GPU_NATIVE_ARCHITECTURE STWO_BENCH_REQUIRE_GPU_PCS_RUNTIME_MODE
     STWO_BENCH_REQUIRE_PROOF_BYTE_EQUAL STWO_BENCH_REQUIRE_SIMD_REFERENCE_BYTE_EQUAL
     STWO_BENCH_REQUIRE_PROOF_MUTATION_REJECTED GPU_PCS_RUNTIME_MODE
+    STWO_CUDA_NVCC STWO_CUDA_NVCC_FLAGS STWO_CUDA_HOST_COMPILER
+    NVCC_PREPEND_FLAGS NVCC_APPEND_FLAGS NVCC_CCBIN CUDAHOSTCXX
     CUDA_LAUNCH_BLOCKING CUDA_DEVICE_MAX_CONNECTIONS
   )
   for name in "${forbidden[@]}"; do
@@ -681,7 +714,8 @@ checkpoint_run_sn2() {
     --require-proof-byte-equal --require-simd-reference-byte-equal
     --require-proof-mutation-rejected
   )
-  [[ "$mode" == diagnostic || "$mode" == timing ]] || { echo "invalid checkpoint mode: $mode" >&2; return 2; }
+  [[ "$mode" == diagnostic || "$mode" == timing || "$mode" == iteration ]] \
+    || { echo "invalid checkpoint mode: $mode" >&2; return 2; }
   if [[ "$mode" == diagnostic ]]; then
     args+=(--diagnostic-allow-slow-graph-submit)
   else
@@ -722,6 +756,43 @@ PY
   cat "$stdout"
 }
 
+checkpoint_mark_iteration_non_promotable() {
+  python3 - "$1" <<'PY'
+import json, os, sys, tempfile
+
+path = sys.argv[1]
+record = json.load(open(path, encoding="utf-8"))
+validation = record.get("checkpoint_validation") or {}
+raw_admissible = record.get("performance_claim_admissible")
+graph_gate = record.get("gpu_graph_submit_gap_strict_gate_passed")
+if (validation.get("verdict") != "PASS"
+        or validation.get("mode") != "iteration"
+        or validation.get("formal_promotion_eligible") is not False
+        or validation.get("counter_profile_admissible") is not False
+        or record.get("iteration_only") is not True
+        or record.get("formal_promotion_eligible") is not False
+        or not isinstance(raw_admissible, bool)
+        or not isinstance(graph_gate, bool)
+        or raw_admissible is not graph_gate):
+    raise SystemExit("iteration result is not safe to mark non-promotable")
+record["iteration_timing_gate_passed"] = raw_admissible
+record["performance_claim_admissible"] = False
+directory = os.path.dirname(path) or "."
+fd, temporary = tempfile.mkstemp(prefix="sn2-iteration.", dir=directory, text=True)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(record, stream, sort_keys=True)
+        stream.write("\n")
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+print(json.dumps({"iteration_only": True, "formal_promotion_eligible": False,
+                  "performance_claim_admissible": False,
+                  "iteration_timing_gate_passed": raw_admissible}, sort_keys=True))
+PY
+}
+
 checkpoint_validate_sn2() {
   local mode="$1" reps="$2" stdout aot proof out
   stdout="$(checkpoint_artifact stdout.txt)"
@@ -732,6 +803,11 @@ checkpoint_validate_sn2() {
     COMPOSITION_PARTS="$CHECKPOINT_SN2_COMPOSITION_PARTS" \
     COMPOSITION_WAVES="$CHECKPOINT_SN2_COMPOSITION_WAVES" \
     COUNTER_POLICY="$REPLACEMENT_SN2_COUNTER_POLICY" \
+    SOURCE_RECEIPT="$(checkpoint_artifact source_input_identity.json)" \
+    HARDWARE_RECEIPT="$(checkpoint_artifact hardware_identity.json)" \
+    BUILD_RECEIPT="$(checkpoint_artifact build_identity.json)" \
+    ADAPTED_RECEIPT="$(checkpoint_artifact adapted_input_identity.json)" \
+    GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
     python3 - "$stdout" "$aot" "$proof" "$CHECKPOINT_SEAL" "$out" "$mode" "$reps" \
     "$CHECKPOINT_ROOT/gpu_benchmarks" <<'PY'
 import hashlib, json, math, os, re, sys
@@ -861,45 +937,78 @@ if mode == "diagnostic":
     require(r.get("benchmark_diagnostic_reason") == "graph-submit-gap-only", "diagnostic softened more than graph-submit")
     require(r.get("benchmark_graph_submit_capture_mode") is False, "diagnostic unexpectedly used timing capture mode")
     require(r.get("performance_claim_admissible") is False, "diagnostic timing must not be admissible")
-elif mode == "timing":
-    require(reps >= 6 and r.get("benchmark_diagnostic_mode") is False and r.get("benchmark_diagnostic_reason") is None, "timing follow-on must have diagnostics disabled")
-    require(r.get("benchmark_graph_submit_capture_mode") is True, "timing follow-on did not enable soft graph-gap capture")
-    require(r.get("performance_claim_admissible") is (r.get("gpu_graph_submit_gap_strict_gate_passed") is True), "timing admissibility disagrees with observed graph-submit gate")
-    require(r.get("warm_sample_count") == reps - 1, "timing follow-on lacks the expected warm samples")
+elif mode in ("timing", "iteration"):
+    require(reps >= 6 and r.get("benchmark_diagnostic_mode") is False and r.get("benchmark_diagnostic_reason") is None, f"{mode} run must have diagnostics disabled")
+    require(r.get("benchmark_graph_submit_capture_mode") is True, f"{mode} run did not enable soft graph-gap capture")
+    require(r.get("performance_claim_admissible") is (r.get("gpu_graph_submit_gap_strict_gate_passed") is True), f"{mode} timing admissibility disagrees with observed graph-submit gate")
+    require(r.get("warm_sample_count") == reps - 1, f"{mode} run lacks the expected warm samples")
     for field in ("prove_s_warm_median", "prove_s_warm_p95", "useful_mhz_median", "useful_mhz_at_warm_p95"):
         require(isinstance(r.get(field), (int, float)) and math.isfinite(r[field]) and r[field] > 0, f"invalid timing metric {field}")
-    seal = json.load(open(seal_path, encoding="utf-8"))
-    expected_seal = ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_profile_admissible
-                     else "stwo.replacement-v1-sn2.timing-only-seal.v1")
-    require(seal.get("schema") == expected_seal and seal.get("diagnostic_pass") is True,
-            "timing seal is not a passing diagnostic for the selected counter policy")
-    if counter_profile_admissible:
-        require("counter_policy" not in seal and "counter_profile_admissible" not in seal,
-                "strict v3 seal was altered by a counter waiver")
+    if mode == "iteration":
+        require(counter_policy == "timing-only",
+                "iteration timing must remain outside the counter-qualified promotion lane")
     else:
-        require(seal.get("counter_policy") == "timing-only"
-                and seal.get("counter_profile_admissible") is False
-                and seal.get("counter_status") == "UNAVAILABLE",
-                "timing-only seal omitted the counter-profile asterisk")
-    require(r["gpu_proof_blake3"] == seal.get("proof_blake3"), "timing proof digest differs from diagnostic")
-    proof_sha256 = hashlib.sha256(open(proof_path, "rb").read()).hexdigest()
-    require(proof_sha256 == seal.get("proof_dump_sha256"), "timing proof bytes differ from diagnostic")
-    shape = seal.get("shape_receipt") or {}
-    require(shape == {
-        "protocol_key": r["gpu_protocol_key"],
-        "topology_digest": r["gpu_shape_executable_topology_digest"],
-        "numerator_schedule": r["gpu_prepared_numerator_schedule"],
-        "numerator_packed_output_rows": r["gpu_prepared_numerator_packed_output_rows"],
-        "composition_part_count": r["gpu_composition_part_count"],
-        "composition_wave_count": r["gpu_composition_wave_count"],
-    }, "timing shape/numerator receipt differs from diagnostic")
+        seal = json.load(open(seal_path, encoding="utf-8"))
+        expected_seal = ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_profile_admissible
+                         else "stwo.replacement-v1-sn2.timing-only-seal.v1")
+        require(seal.get("schema") == expected_seal and seal.get("diagnostic_pass") is True,
+                "timing seal is not a passing diagnostic for the selected counter policy")
+        if counter_profile_admissible:
+            require("counter_policy" not in seal and "counter_profile_admissible" not in seal,
+                    "strict v3 seal was altered by a counter waiver")
+        else:
+            require(seal.get("counter_policy") == "timing-only"
+                    and seal.get("counter_profile_admissible") is False
+                    and seal.get("counter_status") == "UNAVAILABLE",
+                    "timing-only seal omitted the counter-profile asterisk")
+        require(r["gpu_proof_blake3"] == seal.get("proof_blake3"), "timing proof digest differs from diagnostic")
+        proof_sha256 = hashlib.sha256(open(proof_path, "rb").read()).hexdigest()
+        require(proof_sha256 == seal.get("proof_dump_sha256"), "timing proof bytes differ from diagnostic")
+        shape = seal.get("shape_receipt") or {}
+        require(shape == {
+            "protocol_key": r["gpu_protocol_key"],
+            "topology_digest": r["gpu_shape_executable_topology_digest"],
+            "numerator_schedule": r["gpu_prepared_numerator_schedule"],
+            "numerator_packed_output_rows": r["gpu_prepared_numerator_packed_output_rows"],
+            "composition_part_count": r["gpu_composition_part_count"],
+            "composition_wave_count": r["gpu_composition_wave_count"],
+        }, "timing shape/numerator receipt differs from diagnostic")
 else:
     raise SystemExit(f"unknown validation mode: {mode}")
 r["counter_profile_admissible"] = counter_profile_admissible
+if mode == "iteration":
+    source_receipt = json.load(open(os.environ["SOURCE_RECEIPT"], encoding="utf-8"))
+    hardware_receipt = json.load(open(os.environ["HARDWARE_RECEIPT"], encoding="utf-8"))
+    build_receipt = json.load(open(os.environ["BUILD_RECEIPT"], encoding="utf-8"))
+    adapted_receipt = json.load(open(os.environ["ADAPTED_RECEIPT"], encoding="utf-8"))
+    require(source_receipt.get("schema") == "stwo.replacement-v1-sn2.source-input-identity.v1"
+            and source_receipt.get("source_policy") == "iteration",
+            "iteration source/input receipt is absent or promotable")
+    require(hardware_receipt.get("schema") == "stwo.replacement-v1-sn2.hardware-identity.v2"
+            and hardware_receipt.get("name") == r.get("gpu"),
+            "iteration GPU differs from the hardware receipt")
+    require(build_receipt.get("schema") == "stwo.replacement-v1-sn2.build-identity.v1"
+            and build_receipt.get("gpu_bench_sha256") == os.environ["GPU_BENCH_SHA"]
+            and adapted_receipt.get("adapter_binary_sha256") == os.environ["GPU_BENCH_SHA"]
+            and aot.get("gpu_bench_sha256") == os.environ["GPU_BENCH_SHA"],
+            "iteration binary identity differs across build, adapter, AOT, and execution")
+    r["iteration_only"] = True
+    r["formal_promotion_eligible"] = False
+    r["iteration_identity"] = {
+        "source": source_receipt["source"],
+        "inputs": source_receipt["inputs"],
+        "hardware": hardware_receipt,
+        "gpu_bench_sha256": os.environ["GPU_BENCH_SHA"],
+        "aot_manifest_sha256": aot["manifest_sha256"],
+        "adapted_input_sha256": adapted_receipt["sha256"],
+        "proof_dump_sha256": hashlib.sha256(open(proof_path, "rb").read()).hexdigest(),
+    }
 r["checkpoint_validation"] = {"schema": "stwo.replacement-v1-sn2.record-validation.v1",
                               "verdict": "PASS", "mode": mode,
                               "graph_submit_timing_soft": mode == "diagnostic",
                               "counter_profile_admissible": counter_profile_admissible}
+if mode == "iteration":
+    r["checkpoint_validation"]["formal_promotion_eligible"] = False
 with open(out_path, "w", encoding="utf-8") as stream:
     json.dump(r, stream, sort_keys=True)
     stream.write("\n")
@@ -909,6 +1018,7 @@ print(json.dumps({"replacement_v1_sn2": "PASS", "mode": mode,
                   "graph_submit_gap_ms": r["gpu_max_graph_submit_gap_ms"],
                   "graph_submit_gate": r.get("gpu_graph_submit_gap_strict_gate_passed")}, sort_keys=True))
 PY
+  [[ "$mode" != iteration ]] || checkpoint_mark_iteration_non_promotable "$out"
 }
 
 checkpoint_seal_diagnostic() {

@@ -11,8 +11,8 @@
 #   2. BOOTSTRAP the reset container layer: apt rsync + rustup (the /workspace
 #      volume persists target/, Rustup/Cargo homes, and caches; the container
 #      layer does NOT).
-#   3. rsync BOTH repos (stwo, stwo-cairo) with the exact excludes bench_loop
-#      uses, so a later bench_loop sync is a no-op.
+#   3. Stage and rsync the exact benchmark-relevant source projection of BOTH
+#      repos (tracked plus non-ignored untracked files, excluding run state).
 #   4. Install and verify the repo-pinned Rust toolchain after the toolchain
 #      manifest exists on the pod.
 #   5. Upload a PHASES fragment (your file) into a detached, setsid on-pod
@@ -57,6 +57,8 @@
 #
 # DRY_RUN=1 prints the plan (endpoint resolve, rsync, phase names) without
 # starting the pod.
+# POD_RUN_POLL_INTERVAL controls phase-sentinel polling (default 30 seconds;
+# quick_sn2.sh uses 2 seconds so short gates do not add minutes of idle time).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,8 +66,12 @@ CAIRO_LOCAL="${CAIRO_LOCAL:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 STWO_LOCAL="${STWO_LOCAL:-${CAIRO_LOCAL}/../stwo}"
 POD_CONF="${POD_CONF:-${SCRIPT_DIR}/pod.conf}"
 RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results}"
+SOURCE_PROJECTION_TOOL="${SCRIPT_DIR}/stage_source_projection.sh"
 POD_RUSTUP_HOME="${POD_RUSTUP_HOME:-/workspace/.rustup-persist}"
 POD_CARGO_HOME="${POD_CARGO_HOME:-/workspace/.cargo-persist}"
+POD_RUN_POLL_INTERVAL="${POD_RUN_POLL_INTERVAL:-30}"
+[[ "$POD_RUN_POLL_INTERVAL" =~ ^[1-9][0-9]*$ && "$POD_RUN_POLL_INTERVAL" -le 60 ]] \
+  || { echo "POD_RUN_POLL_INTERVAL must be an integer from 1 to 60 seconds" >&2; exit 2; }
 printf -v POD_RUSTUP_HOME_Q '%q' "$POD_RUSTUP_HOME"
 printf -v POD_CARGO_HOME_Q '%q' "$POD_CARGO_HOME"
 
@@ -109,16 +115,24 @@ source_head() {
   git -C "$1" rev-parse HEAD 2>/dev/null
 }
 
-# Match the release runners: the head is recorded separately, while this hash
-# binds tracked changes plus untracked paths/content (excluding run results).
+# Match the transported source projection: the head is recorded separately,
+# while this hash binds tracked changes plus non-ignored untracked paths/content.
+# Runtime receipts and large PIE fixtures persist remotely but are not source.
 source_hash() {
   local repo="$1"
   git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || return 1
   (
-    git -C "$repo" diff --binary HEAD -- . ':(exclude)gpu_benchmarks/loop/results' || exit 1
+    git -C "$repo" diff --binary HEAD -- . \
+      ':(exclude)gpu_benchmarks/loop/results/**' \
+      ':(exclude)gpu_benchmarks/loop/ledger.jsonl' \
+      ':(exclude)gpu_benchmarks/pie/sn/**' \
+      ':(exclude)gpu_benchmarks/pie/*.zip' || exit 1
     git -C "$repo" ls-files --others --exclude-standard -z |
       while IFS= read -r -d '' path; do
-        [[ "$path" == gpu_benchmarks/loop/results/* ]] && continue
+        case "$path" in
+          gpu_benchmarks/loop/results/*|gpu_benchmarks/loop/ledger.jsonl|\
+          gpu_benchmarks/pie/sn/*|gpu_benchmarks/pie/*.zip) continue ;;
+        esac
         if [[ -L "$repo/$path" ]]; then
           link_hash="$(readlink -n "$repo/$path" | sha256_stream | cut -d' ' -f1)" || exit 1
           printf 'untracked-symlink\0%s\0%s\0' "$path" "$link_hash"
@@ -139,6 +153,9 @@ valid_source_identity() {
   [[ ${#1} -eq 40 && "$1" != *[!0-9a-f]* &&
      ${#2} -eq 64 && "$2" != *[!0-9a-f]* ]]
 }
+
+[[ -x "$SOURCE_PROJECTION_TOOL" ]] \
+  || { echo "source projection tool is absent or not executable: $SOURCE_PROJECTION_TOOL" >&2; exit 2; }
 
 STWO_HEAD="$(source_head "$STWO_LOCAL")" \
   || { echo "cannot resolve stwo source head: $STWO_LOCAL" >&2; exit 2; }
@@ -175,11 +192,12 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   note "DRY_RUN: pod=$POD_ID key=$KEY"
   note "DRY_RUN: RUSTUP_HOME=$POD_RUSTUP_HOME CARGO_HOME=$POD_CARGO_HOME"
   note "DRY_RUN: source stwo=${STWO_HEAD}:${STWO_WORKTREE_HASH} stwo-cairo=${CAIRO_HEAD}:${CAIRO_WORKTREE_HASH}"
-  note "DRY_RUN: would bootstrap, rsync $STWO_LOCAL and $CAIRO_LOCAL, install the pinned toolchain, run the phases above, fetch to $RESULTS_DIR/$LABEL, stop the pod."
+  note "DRY_RUN: would bootstrap, stage and rsync exact source projections from $STWO_LOCAL and $CAIRO_LOCAL, install the pinned toolchain, run the phases above, fetch to $RESULTS_DIR/$LABEL, stop the pod."
   exit 0
 fi
 
 POD_STOPPED=0
+PROJECTION_ROOT=""
 stop_pod() {
   [[ "$POD_STOPPED" == 1 ]] && return 0
   note "stopping pod $POD_ID"
@@ -193,6 +211,8 @@ stop_pod() {
 cleanup() {
   local rc=$?
   trap - EXIT
+  [[ -z "$PROJECTION_ROOT" || ! -d "$PROJECTION_ROOT" ]] \
+    || rm -rf -- "$PROJECTION_ROOT"
   if ! stop_pod; then
     [[ "$rc" != 0 ]] || rc=1
   fi
@@ -229,19 +249,27 @@ pssh "set -e
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none >/dev/null
   fi" || { note "BOOTSTRAP FAILED"; exit 1; }
 
-# --- 3. rsync both repos (bench_loop-identical excludes) ---
+# --- 3. stage the exact hashed source projection, then rsync both repos ---
+PROJECTION_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/stwo-pod-run.XXXXXX")"
+note "stage content-hashed source projections"
+"$SOURCE_PROJECTION_TOOL" "$STWO_LOCAL" "$PROJECTION_ROOT/stwo" \
+  || { note "STAGE stwo source projection FAILED"; exit 1; }
+"$SOURCE_PROJECTION_TOOL" "$CAIRO_LOCAL" "$PROJECTION_ROOT/stwo-cairo" \
+  || { note "STAGE stwo-cairo source projection FAILED"; exit 1; }
 note "rsync stwo"
-rsync -azc --delete --partial --no-owner --no-group --no-perms --no-times \
+rsync -azc --delete --partial --no-owner --no-group --perms --no-times \
   --exclude=target --exclude=.git \
   -e "ssh ${SSH_OPTS[*]} -i $KEY -p $PORT" \
-  "${STWO_LOCAL}/" "root@${HOST}:${STWO_POD}/" || { note "SYNC stwo FAILED"; exit 1; }
+  "$PROJECTION_ROOT/stwo/" "root@${HOST}:${STWO_POD}/" \
+  || { note "SYNC stwo FAILED"; exit 1; }
 note "rsync stwo-cairo"
-rsync -azc --delete --partial --no-owner --no-group --no-perms --no-times \
+rsync -azc --delete --partial --no-owner --no-group --perms --no-times \
   --exclude=target --exclude=.git \
   --exclude='gpu_benchmarks/pie/sn/' --exclude='gpu_benchmarks/pie/*.zip' \
   --exclude='gpu_benchmarks/loop/results' --exclude='gpu_benchmarks/loop/ledger.jsonl' \
   -e "ssh ${SSH_OPTS[*]} -i $KEY -p $PORT" \
-  "${CAIRO_LOCAL}/" "root@${HOST}:${CAIRO_POD}/" || { note "SYNC stwo-cairo FAILED"; exit 1; }
+  "$PROJECTION_ROOT/stwo-cairo/" "root@${HOST}:${CAIRO_POD}/" \
+  || { note "SYNC stwo-cairo FAILED"; exit 1; }
 
 # The cache fallback below is valid only for the exact source tree transported
 # by this run. Reject a local edit racing the checksum sync.
@@ -342,7 +370,7 @@ for p in $PHASE_NAMES; do
       PHASE_FAILED=1
       break
     fi
-    sleep 30
+    sleep "$POD_RUN_POLL_INTERVAL"
   done
   (( PHASE_FAILED == 0 )) || break
 done

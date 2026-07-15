@@ -539,7 +539,8 @@ class ShellLauncherTests(unittest.TestCase):
             phases,
             [
                 "ambient_override_gate", "source_input_identity", "hardware_identity",
-                "counter_permission_acceptance", "build", "adapted_input_identity",
+                "counter_permission_acceptance", "nsys_tool_identity", "build",
+                "adapted_input_identity",
                 "fp256_carry_oracles", "replacement_stage4_native", "aot_identity",
                 "sn2_diagnostic", "sn2_diagnostic_validate", "seal_passing_diagnostic",
                 "timing_ambient_override_gate", "timing_sealed_diagnostic_identity",
@@ -600,7 +601,8 @@ class ShellLauncherTests(unittest.TestCase):
             phases,
             [
                 "ambient_override_gate", "source_input_identity", "hardware_identity",
-                "counter_permission_receipt", "build", "adapted_input_identity",
+                "counter_permission_receipt", "nsys_tool_identity", "build",
+                "adapted_input_identity",
                 "fp256_carry_oracles", "replacement_stage4_native", "aot_identity",
                 "sn2_diagnostic", "sn2_diagnostic_validate", "seal_passing_diagnostic",
                 "timing_sealed_diagnostic_identity", "timing_sn2",
@@ -727,6 +729,175 @@ checkpoint_counter_timing_only
             self.assertEqual(
                 verdict["profile_status"]["ncu"], "OMITTED_COUNTER_UNAVAILABLE"
             )
+
+    def test_replacement_sn2_iteration_is_fast_and_non_promotable(self) -> None:
+        recipe_path = ROOT / "loop" / "recipes" / "replacement_v1_sn2_iteration.phases"
+        recipe = recipe_path.read_text(encoding="utf-8")
+        phases = [
+            line.split()[1] for line in recipe.splitlines() if line.startswith("phase ")
+        ]
+        self.assertNotIn("# pod_run: require_clean_sources", recipe)
+        self.assertIn("checkpoint_source_input_identity iteration", recipe)
+        self.assertEqual(
+            phases,
+            [
+                "ambient_override_gate", "source_input_identity", "hardware_identity",
+                "build", "adapted_input_identity", "aot_identity", "sn2_iteration",
+                "sn2_iteration_validate",
+            ],
+        )
+        self.assertNotIn("carry", " ".join(phases))
+        self.assertNotIn("stage4", " ".join(phases))
+        self.assertNotIn("profile", " ".join(phases))
+
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        source = common.read_text(encoding="utf-8")
+        self.assertIn('mode in ("timing", "iteration")', source)
+        self.assertIn('r["formal_promotion_eligible"] = False', source)
+        self.assertIn('"formal_promotion_eligible"] = False', source)
+        self.assertIn('source_receipt.get("source_policy") == "iteration"', source)
+        self.assertIn('"proof_dump_sha256": hashlib.sha256', source)
+        self.assertIn('"gpu_bench_sha256": os.environ["GPU_BENCH_SHA"]', source)
+
+        env = {
+            **os.environ,
+            "REPLACEMENT_SN2_MODE": "iteration",
+            "REPLACEMENT_SN2_COUNTER_POLICY": "timing-only",
+            "CAIRO": "/workspace/stwo-cairo/stwo_cairo_prover",
+            "STWO": "/workspace/stwo",
+            "RUN": "/tmp",
+            "COMMON": str(common),
+            "STWO_PARITY_REF_STWO_HEAD": "ab" * 20,
+            "STWO_PARITY_REF_STWO_CAIRO_HEAD": "cd" * 20,
+            "STWO_PARITY_REF_STWO_WORKTREE_HASH": "12" * 32,
+            "STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH": "34" * 32,
+        }
+        result = subprocess.run(
+            [
+                "bash", "-c",
+                'source "$COMMON"; checkpoint_require_source_identity; '
+                "if checkpoint_require_clean_source_identity 2>/dev/null; then exit 9; fi",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        forbidden_env = {
+            name: value
+            for name, value in env.items()
+            if name not in {"STWO_CUDA_NVCC", "STWO_CUDA_NVCC_FLAGS",
+                            "STWO_CUDA_HOST_COMPILER",
+                            "NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS",
+                            "NVCC_CCBIN", "CUDAHOSTCXX"}
+        }
+        forbidden_env["NVCC_APPEND_FLAGS"] = "-lineinfo"
+        rejected = subprocess.run(
+            ["bash", "-c", 'source "$COMMON"; checkpoint_reject_ambient_overrides'],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=forbidden_env,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("checkpoint rejects ambient override NVCC_APPEND_FLAGS", rejected.stderr)
+
+        wrapper = (ROOT / "loop" / "quick_sn2.sh").read_text(encoding="utf-8")
+        self.assertIn("replacement_v1_sn2_iteration.phases", wrapper)
+        self.assertIn('exec "$loop_dir/pod_run.sh"', wrapper)
+        self.assertIn('POD_RUN_POLL_INTERVAL:-2', wrapper)
+        self.assertIn('rustc --edition=2021 -D warnings --test', wrapper)
+        self.assertIn('crates/backend-cuda-kernels/build.rs', wrapper)
+        pod_run = (ROOT / "loop" / "pod_run.sh").read_text(encoding="utf-8")
+        self.assertIn('sleep "$POD_RUN_POLL_INTERVAL"', pod_run)
+        self.assertNotIn("    sleep 30\n", pod_run)
+
+    def test_replacement_sn2_profiles_fail_before_build_without_nsys(self) -> None:
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_nsys = root / "nsys-fallback"
+            fake_nsys.write_text("#!/bin/sh\necho 'Nsight Systems 2024.6.2'\n", encoding="utf-8")
+            fake_nsys.chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": "/usr/bin:/bin",
+                "REPLACEMENT_SN2_MODE": "diagnostic",
+                "CAIRO": "/workspace/stwo-cairo/stwo_cairo_prover",
+                "STWO": "/workspace/stwo",
+                "RUN": str(root),
+                "COMMON": str(common),
+                "FAKE_NSYS": str(fake_nsys),
+            }
+            command = (
+                'source "$COMMON"; CHECKPOINT_PREFIX=fixture; '
+                'CHECKPOINT_NSYS_FALLBACK="$FAKE_NSYS"; checkpoint_nsys_tool_identity'
+            )
+            accepted = subprocess.run(
+                ["bash", "-c", command], check=False, capture_output=True, text=True, env=env
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            identity = json.loads(
+                (root / "fixture.nsys_tool_identity.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(identity["path"], str(fake_nsys))
+            self.assertIn("2024.6.2", identity["version"])
+
+            fake_nsys.unlink()
+            rejected = subprocess.run(
+                ["bash", "-c", command], check=False, capture_output=True, text=True, env=env
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("required Nsight Systems executable is absent", rejected.stderr)
+
+    def test_replacement_sn2_iteration_forces_publication_admissibility_false(self) -> None:
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record_path = root / "iteration.json"
+            valid = {
+                "performance_claim_admissible": True,
+                "gpu_graph_submit_gap_strict_gate_passed": True,
+                "iteration_only": True,
+                "formal_promotion_eligible": False,
+                "checkpoint_validation": {
+                    "verdict": "PASS",
+                    "mode": "iteration",
+                    "counter_profile_admissible": False,
+                    "formal_promotion_eligible": False,
+                },
+            }
+            record_path.write_text(json.dumps(valid) + "\n", encoding="utf-8")
+            env = {
+                **os.environ,
+                "REPLACEMENT_SN2_MODE": "iteration",
+                "REPLACEMENT_SN2_COUNTER_POLICY": "timing-only",
+                "CAIRO": "/workspace/stwo-cairo/stwo_cairo_prover",
+                "STWO": "/workspace/stwo",
+                "RUN": str(root),
+                "COMMON": str(common),
+                "RECORD": str(record_path),
+            }
+            command = 'source "$COMMON"; checkpoint_mark_iteration_non_promotable "$RECORD"'
+            accepted = subprocess.run(
+                ["bash", "-c", command], check=False, capture_output=True, text=True, env=env
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            marked = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertFalse(marked["performance_claim_admissible"])
+            self.assertTrue(marked["iteration_timing_gate_passed"])
+            self.assertFalse(marked["formal_promotion_eligible"])
+
+            invalid = copy.deepcopy(valid)
+            invalid["formal_promotion_eligible"] = True
+            record_path.write_text(json.dumps(invalid) + "\n", encoding="utf-8")
+            rejected = subprocess.run(
+                ["bash", "-c", command], check=False, capture_output=True, text=True, env=env
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(json.loads(record_path.read_text())["formal_promotion_eligible"], True)
 
     def test_replacement_sn2_promotion_thresholds_fail_soft(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
@@ -1100,6 +1271,100 @@ checkpoint_counter_timing_only
         ]
         self.assertEqual(bytecode, [])
 
+    def test_pod_run_source_projection_is_exact_and_executable(self) -> None:
+        helper = ROOT / "loop" / "stage_source_projection.sh"
+        self.assertTrue(os.access(helper, os.X_OK))
+        self.assertNotEqual(helper.stat().st_mode & 0o111, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            projection = root / "projection"
+            repository.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "projection@example.invalid"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Projection Test"],
+                cwd=repository,
+                check=True,
+            )
+
+            (repository / ".gitignore").write_text("ignored.cache\n", encoding="utf-8")
+            (repository / "unchanged.txt").write_text("unchanged\n", encoding="utf-8")
+            (repository / "modified.txt").write_text("before\n", encoding="utf-8")
+            (repository / "deleted.txt").write_text("delete me\n", encoding="utf-8")
+            executable = repository / "executable.sh"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o644)
+
+            runtime_files = (
+                repository / "gpu_benchmarks" / "loop" / "results" / "run.json",
+                repository / "gpu_benchmarks" / "loop" / "ledger.jsonl",
+                repository / "gpu_benchmarks" / "pie" / "sn" / "SN_PIE_2.zip",
+            )
+            for path in runtime_files:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("runtime only\n", encoding="utf-8")
+
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "projection fixture"],
+                cwd=repository,
+                check=True,
+            )
+
+            (repository / "modified.txt").write_text("after\n", encoding="utf-8")
+            (repository / "deleted.txt").unlink()
+            executable.chmod(0o751)
+            untracked = repository / "untracked.txt"
+            untracked.write_text("untracked\n", encoding="utf-8")
+            untracked.chmod(0o600)
+            (repository / "ignored.cache").write_text("ignored\n", encoding="utf-8")
+            (repository / "gpu_benchmarks" / "pie" / "SN_PIE_3.zip").write_text(
+                "runtime only\n", encoding="utf-8"
+            )
+            (repository / "modified-link").symlink_to("modified.txt")
+
+            subprocess.run(
+                [str(helper), str(repository), str(projection)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            expected = {
+                ".gitignore",
+                "executable.sh",
+                "modified-link",
+                "modified.txt",
+                "unchanged.txt",
+                "untracked.txt",
+            }
+            projected_files = {
+                str(path.relative_to(projection))
+                for path in projection.rglob("*")
+                if path.is_file() or path.is_symlink()
+            }
+            self.assertEqual(projected_files, expected)
+            self.assertEqual((projection / "unchanged.txt").read_text(), "unchanged\n")
+            self.assertEqual((projection / "modified.txt").read_text(), "after\n")
+            self.assertEqual((projection / "untracked.txt").read_text(), "untracked\n")
+            self.assertTrue((projection / "modified-link").is_symlink())
+            self.assertEqual(os.readlink(projection / "modified-link"), "modified.txt")
+            for relative in expected - {"modified-link"}:
+                source = repository / relative
+                copied = projection / relative
+                self.assertTrue(copied.is_file() and not copied.is_symlink())
+                self.assertEqual(copied.stat().st_mode & 0o7777, source.stat().st_mode & 0o7777)
+
+        pod_run = (ROOT / "loop" / "pod_run.sh").read_text(encoding="utf-8")
+        self.assertEqual(pod_run.count("--perms"), 2)
+        self.assertNotIn("--no-perms", pod_run)
+
     def test_generated_heredocs_are_not_captured_by_command_substitution(self) -> None:
         source = (ROOT / "loop" / "perf_gates.sh").read_text(encoding="utf-8")
         self.assertNotIn('="$(cat <<EOF', source)
@@ -1295,7 +1560,8 @@ printf '%s\n' "$body" | bash -n
         ]
         self.assertEqual(projection_body.count("--no-perms"), 2)
         self.assertEqual(sync_body.count("--no-perms"), 2)
-        self.assertEqual(pod_run.count("--no-perms"), 2)
+        self.assertEqual(pod_run.count("--perms"), 2)
+        self.assertNotIn("--no-perms", pod_run)
         self.assertEqual(projection_body.count("--no-times"), 2)
         self.assertEqual(sync_body.count("--no-times"), 2)
         self.assertEqual(pod_run.count("--no-times"), 2)
