@@ -1679,6 +1679,34 @@ pub fn is_supported_recorded_input_label(label: &str) -> bool {
     RECORDED_INPUT_LABELS.contains(&label)
 }
 
+/// Replacement-v1 row-major Casm ingress geometry. `Some` means the recorded
+/// lane consumes canonical `[pc, ap, fp]` states; the value records whether the
+/// generated writer also binds an explicit iota input column.
+pub fn recorded_casm_input_includes_iota(label: &str) -> Option<bool> {
+    Some(match label {
+        "add_opcode"
+        | "assert_eq_opcode"
+        | "jnz_opcode_taken"
+        | "add_opcode_small"
+        | "assert_eq_opcode_imm"
+        | "assert_eq_opcode_double_deref"
+        | "call_opcode_abs"
+        | "call_opcode_rel_imm"
+        | "jnz_opcode_non_taken"
+        | "jump_opcode_abs"
+        | "jump_opcode_double_deref"
+        | "jump_opcode_rel"
+        | "jump_opcode_rel_imm"
+        | "ret_opcode"
+        | "add_ap_opcode"
+        | "mul_opcode"
+        | "mul_opcode_small"
+        | "qm_31_add_mul_opcode" => false,
+        "blake_compress_opcode" => true,
+        _ => return None,
+    })
+}
+
 /// Borrow a canonical opcode source without building pc/ap/fp/enabler slabs.
 /// The returned slice aliases its generator and therefore cannot outlive the
 /// generator-owned resident session.

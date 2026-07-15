@@ -26,6 +26,7 @@ use stwo_backend_cuda::{
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::cairo_claim_generator::CairoClaimGenerator;
 use stwo_cairo_prover::witness::exec_context::WitnessResidencyReport;
+use stwo_cairo_prover::witness::jit_prove_backend::recorded_casm_input_attempt;
 use stwo_cairo_prover::witness::relation_sources::RelationSourceError;
 
 use crate::arena_plan::{ArenaPlanError, ExecutionTableGeometry, ProofArenaPlan};
@@ -39,7 +40,8 @@ use crate::plan::{ProofPlan, ProofPlanError};
 use crate::protocol_discovery::{ProtocolDiscoveryError, ProtocolTranscriptDiscovery};
 use crate::protocol_plan::{ProtocolPlanError, ProtocolPlanPolicy};
 use crate::recorded_witness_inputs::{
-    recorded_witness_inputs_for_plan, DeviceCompactColumn, DeviceEdgeColumn, DeviceEdgeSourceKind,
+    recorded_witness_inputs_for_plan, recorded_witness_inputs_for_replacement_plan,
+    DeviceCasmColumn, DeviceCompactColumn, DeviceEdgeColumn, DeviceEdgeSourceKind,
     DeviceGatherColumn, DeviceNativeColumn, DeviceSeedColumn, PlannedRecordedWitnessInputs,
     RecordedInputColumnProvenance, RecordedWitnessPlanError,
 };
@@ -774,6 +776,7 @@ pub fn with_resident_session<R>(
 struct ResidentWitnessInputRoute<'a> {
     columns: Vec<ResidentWitnessInputColumn<'a>>,
     seed_scalars: Vec<u32>,
+    casm_words: Option<&'a [u32]>,
 }
 
 fn recorded_input_matches_gather(
@@ -852,6 +855,7 @@ fn recorded_input_matches_gather(
 fn resident_host_witness_inputs<'a>(
     recorded: &'a PlannedRecordedWitnessInputs,
     arena: &ProofArenaPlan,
+    generator: &'a CairoClaimGenerator,
 ) -> Result<Vec<ResidentWitnessInputRoute<'a>>, ResidentSessionError> {
     if recorded.lanes.len() != arena.witness().components.len() {
         return Err(ResidentSessionError::PlannedShapeMismatch {
@@ -882,6 +886,55 @@ fn resident_host_witness_inputs<'a>(
                     actual: lane.columns.len(),
                 });
             }
+            if let Some(casm) = &component.input_casm {
+                let expected = [
+                    DeviceCasmColumn::Pc,
+                    DeviceCasmColumn::Ap,
+                    DeviceCasmColumn::Fp,
+                    DeviceCasmColumn::Enabler,
+                    DeviceCasmColumn::Iota,
+                ];
+                if lane.columns.iter().enumerate().any(|(ordinal, source)| {
+                    !matches!(
+                        source,
+                        RecordedInputColumnProvenance::DeviceCasm(column)
+                            if expected.get(ordinal) == Some(column)
+                                && (ordinal < 4 || casm.requirements.include_iota)
+                    )
+                }) {
+                    return Err(ResidentSessionError::RecordedWitnessInputRoute {
+                        component: lane.component,
+                        ordinal: lane
+                            .columns
+                            .iter()
+                            .position(|source| {
+                                !matches!(source, RecordedInputColumnProvenance::DeviceCasm(_))
+                            })
+                            .unwrap_or(0),
+                    });
+                }
+                let attempt = recorded_casm_input_attempt(generator, lane.component)
+                    .map_err(RecordedWitnessPlanError::Inputs)?
+                    .ok_or(ResidentSessionError::RecordedWitnessInputRoute {
+                        component: lane.component,
+                        ordinal: 0,
+                    })?;
+                if attempt.inputs.len() != casm.requirements.n_real_rows
+                    || attempt.include_iota != casm.requirements.include_iota
+                {
+                    return Err(ResidentSessionError::PlannedShapeMismatch {
+                        context: "borrowed Casm source vs planned row-major input",
+                        component: Some(lane.component),
+                        expected: casm.requirements.n_real_rows,
+                        actual: attempt.inputs.len(),
+                    });
+                }
+                return Ok(ResidentWitnessInputRoute {
+                    columns: Vec::new(),
+                    seed_scalars: Vec::new(),
+                    casm_words: Some(bytemuck::cast_slice(attempt.inputs)),
+                });
+            }
             if let Some(producer) = component.native_input_producer {
                 if lane.columns.iter().enumerate().all(|(ordinal, source)| {
                     matches!(
@@ -895,6 +948,7 @@ fn resident_host_witness_inputs<'a>(
                     return Ok(ResidentWitnessInputRoute {
                         columns: Vec::new(),
                         seed_scalars: Vec::new(),
+                        casm_words: None,
                     });
                 }
                 return Err(ResidentSessionError::RecordedWitnessInputRoute {
@@ -930,6 +984,7 @@ fn resident_host_witness_inputs<'a>(
                 return Ok(ResidentWitnessInputRoute {
                     columns: Vec::new(),
                     seed_scalars: Vec::new(),
+                    casm_words: None,
                 });
             }
 
@@ -975,6 +1030,7 @@ fn resident_host_witness_inputs<'a>(
                 return Ok(ResidentWitnessInputRoute {
                     columns: Vec::new(),
                     seed_scalars: Vec::new(),
+                    casm_words: None,
                 });
             }
 
@@ -1015,6 +1071,7 @@ fn resident_host_witness_inputs<'a>(
                 return Ok(ResidentWitnessInputRoute {
                     columns: Vec::new(),
                     seed_scalars,
+                    casm_words: None,
                 });
             }
 
@@ -1053,6 +1110,7 @@ fn resident_host_witness_inputs<'a>(
             Ok(ResidentWitnessInputRoute {
                 columns,
                 seed_scalars: Vec::new(),
+                casm_words: None,
             })
         })
         .collect()
@@ -1091,7 +1149,14 @@ pub fn with_resident_session_from_generator<R>(
         .map(|ec_op| ec_op.ec_op_builtin_segment_start as usize);
     require_strict_resident_witness_coverage(&exact_plan)?;
     let planned_claim = planned_cairo_claim(&generator, &exact_plan)?;
-    let recorded = recorded_witness_inputs_for_plan(&generator, &exact_plan)?;
+    let recorded = match protocol_policy.resident_backend {
+        crate::arena_plan::ResidentBackend::LegacyResident => {
+            recorded_witness_inputs_for_plan(&generator, &exact_plan)?
+        }
+        crate::arena_plan::ResidentBackend::ReplacementV1 => {
+            recorded_witness_inputs_for_replacement_plan(&generator, &exact_plan)?
+        }
+    };
     recorded.require_resolved()?;
     let memory = &recorded.execution_memory;
     let public_memory_seed = public_memory_multiplicity_seed_words(&planned_claim, memory)?;
@@ -1126,7 +1191,7 @@ pub fn with_resident_session_from_generator<R>(
         .iter()
         .map(|encoded| encoded.0)
         .collect::<Vec<_>>();
-    let host_columns = resident_host_witness_inputs(&recorded, executable.arena())?;
+    let host_columns = resident_host_witness_inputs(&recorded, executable.arena(), &generator)?;
     let witness_inputs = recorded
         .lanes
         .iter()
@@ -1135,6 +1200,7 @@ pub fn with_resident_session_from_generator<R>(
             component: lane.component,
             columns: &route.columns,
             seed_scalars: (!route.seed_scalars.is_empty()).then_some(route.seed_scalars.as_slice()),
+            casm_words: route.casm_words,
         })
         .collect::<Vec<_>>();
 
@@ -1397,8 +1463,15 @@ pub fn plan_resident_preflight_with_cache_for(
     require_strict_resident_witness_coverage(&exact_plan).map_err(ResidentSessionError::from)?;
     let planned_claim =
         planned_cairo_claim(generator, &exact_plan).map_err(ResidentSessionError::from)?;
-    let recorded = recorded_witness_inputs_for_plan(generator, &exact_plan)
-        .map_err(ResidentSessionError::from)?;
+    let recorded = match resident_backend {
+        crate::arena_plan::ResidentBackend::LegacyResident => {
+            recorded_witness_inputs_for_plan(generator, &exact_plan)
+        }
+        crate::arena_plan::ResidentBackend::ReplacementV1 => {
+            recorded_witness_inputs_for_replacement_plan(generator, &exact_plan)
+        }
+    }
+    .map_err(ResidentSessionError::from)?;
     recorded
         .require_resolved()
         .map_err(ResidentSessionError::from)?;

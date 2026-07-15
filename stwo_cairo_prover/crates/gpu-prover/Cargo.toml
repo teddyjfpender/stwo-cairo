@@ -42,6 +42,7 @@ tracing-subscriber = { workspace = true, features = ["fmt"] }
 libc = "0.2"
 bincode = "1"
 blake3 = "1"
+bytemuck.workspace = true
 starknet-ff.workspace = true
 
 # Optional: CairoPie bootloader ingestion for gpu_bench (--pie). Same pin as the

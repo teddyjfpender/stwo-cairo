@@ -26,9 +26,10 @@ use stwo_backend_cuda::{
     PreparedFriError, PreparedFriFinalError, PreparedFriFinalGraph, PreparedFriGraph,
     PreparedInterpolationError, PreparedInterpolationGraph, PreparedMemoryBaseTraceError,
     PreparedMemoryBaseTraceGraph, PreparedNumeratorSchedule, PreparedProgressiveCommitError,
-    PreparedProgressiveCommitGraph, PreparedRelationGraph, PreparedWitnessError,
-    PreparedWitnessFeedClearGraph, PreparedWitnessFeedError, PreparedWitnessFeedGraph,
-    PreparedWitnessGraph, PreparedWitnessInputCompactGraph, PreparedWitnessInputGatherError,
+    PreparedProgressiveCommitGraph, PreparedRelationGraph, PreparedWitnessCasmInputError,
+    PreparedWitnessCasmInputStage, PreparedWitnessError, PreparedWitnessFeedClearGraph,
+    PreparedWitnessFeedError, PreparedWitnessFeedGraph, PreparedWitnessGraph,
+    PreparedWitnessInputCompactGraph, PreparedWitnessInputGatherError,
     PreparedWitnessInputGatherGraph, PreparedWitnessInputSeedGraph, PreparedWitnessMode,
     ProgressiveNttLeafFusionMode, RelationChallenges, RelationGraphError, RelationInstanceSources,
     TraceDecommitSources, TraceSourceGroup, TranscriptInputBinding, TranscriptInputId,
@@ -209,6 +210,7 @@ pub struct ResidentWitnessInput<'a> {
     pub component: &'static str,
     pub columns: &'a [ResidentWitnessInputColumn<'a>],
     pub seed_scalars: Option<&'a [u32]>,
+    pub casm_words: Option<&'a [u32]>,
 }
 
 pub struct ResidentWitnessInputColumn<'a> {
@@ -440,6 +442,7 @@ pub enum ResidentRuntimeError {
     Relation(RelationGraphError),
     ExecutionTables(PreparedExecutionTablesError),
     EcOp(PreparedEcOpError),
+    WitnessCasmInput(PreparedWitnessCasmInputError),
     WitnessInputGather(PreparedWitnessInputGatherError),
     Witness(PreparedWitnessError),
     WitnessFeed(PreparedWitnessFeedError),
@@ -562,6 +565,12 @@ impl From<PreparedExecutionTablesError> for ResidentRuntimeError {
 impl From<PreparedEcOpError> for ResidentRuntimeError {
     fn from(value: PreparedEcOpError) -> Self {
         Self::EcOp(value)
+    }
+}
+
+impl From<PreparedWitnessCasmInputError> for ResidentRuntimeError {
+    fn from(value: PreparedWitnessCasmInputError) -> Self {
+        Self::WitnessCasmInput(value)
     }
 }
 
@@ -689,6 +698,7 @@ struct PreparedResidentWitness<'a> {
     input_gather: Option<PreparedWitnessInputGatherGraph<'a>>,
     input_seed: Option<PreparedWitnessInputSeedGraph<'a>>,
     input_compact: Option<PreparedWitnessInputCompactGraph<'a>>,
+    input_casm: Option<PreparedWitnessCasmInputStage<'a>>,
     writer: PreparedWitnessGraph<'a>,
 }
 
@@ -1244,6 +1254,18 @@ impl<'a> ResidentGraphRuntime<'a> {
                             .map_err(ResidentRuntimeError::from)
                         })
                         .transpose()?;
+                    let input_casm = component
+                        .input_casm
+                        .as_ref()
+                        .map(|casm| {
+                            PreparedWitnessCasmInputStage::prepare(
+                                arena,
+                                &casm.requirements,
+                                &casm.slots,
+                            )
+                            .map_err(ResidentRuntimeError::from)
+                        })
+                        .transpose()?;
                     let writer = if component.blake_g_fused {
                         PreparedWitnessGraph::prepare_blake_g_fused_with_execution_tables(
                             arena,
@@ -1272,6 +1294,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                         input_gather,
                         input_seed,
                         input_compact,
+                        input_casm,
                         writer,
                     })
                 })
@@ -1934,6 +1957,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             if (prepared.input_gather.is_some()
                 || prepared.input_seed.is_some()
                 || prepared.input_compact.is_some()
+                || prepared.input_casm.is_some()
                 || prepared.native_input_producer.is_some())
                 && !input.columns.is_empty()
             {
@@ -1944,6 +1968,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             if prepared.input_gather.is_none()
                 && prepared.input_seed.is_none()
                 && prepared.input_compact.is_none()
+                && prepared.input_casm.is_none()
                 && prepared.native_input_producer.is_none()
                 && destinations.len() != input.columns.len()
             {
@@ -1976,6 +2001,39 @@ impl<'a> ResidentGraphRuntime<'a> {
                             .as_ref()
                             .map_or(0, |seed| seed.requirements().scalar_words),
                         actual: input.seed_scalars.map_or(0, <[u32]>::len),
+                    })
+                }
+            }
+            match (&prepared.input_casm, input.casm_words) {
+                (Some(casm), Some(words)) => {
+                    // `inputs` remains borrowed until the one fence below, so
+                    // the prepared stage's immutable-address DMA contract is
+                    // upheld for the complete upload/scatter sequence.
+                    unsafe { casm.ingest_and_launch(words)? };
+                    let bytes = words
+                        .len()
+                        .checked_mul(core::mem::size_of::<u32>())
+                        .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                    report.columns += 1;
+                    report.h2d_copies += 1;
+                    report.h2d_bytes = report
+                        .h2d_bytes
+                        .checked_add(bytes)
+                        .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                }
+                (None, None) => {}
+                (Some(casm), None) => {
+                    return Err(ResidentRuntimeError::WitnessInputColumnCount {
+                        component: input.component,
+                        expected: casm.requirements().staging_words,
+                        actual: 0,
+                    })
+                }
+                (None, Some(words)) => {
+                    return Err(ResidentRuntimeError::WitnessInputColumnCount {
+                        component: input.component,
+                        expected: 0,
+                        actual: words.len(),
                     })
                 }
             }
@@ -2893,8 +2951,10 @@ impl<'a> ResidentGraphRuntime<'a> {
                 &planned.input_seed,
                 &prepared.input_compact,
                 &planned.input_compact,
+                &prepared.input_casm,
+                &planned.input_casm,
             ) {
-                (None, None, None, None, None, None) => {
+                (None, None, None, None, None, None, None, None) => {
                     if !slices_match_slots(
                         prepared.writer.input_columns(),
                         &planned.slots.input_columns,
@@ -2903,7 +2963,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                         return Err(reject("ingested input columns"));
                     }
                 }
-                (Some(gather), Some(planned_gather), None, None, None, None) => {
+                (Some(gather), Some(planned_gather), None, None, None, None, None, None) => {
                     if !slices_match_slots(
                         gather.consumer_input_columns(),
                         &planned.slots.input_columns,
@@ -2926,7 +2986,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                         return Err(reject("device-edge input gather"));
                     }
                 }
-                (None, None, Some(seed), Some(planned_seed), None, None) => {
+                (None, None, Some(seed), Some(planned_seed), None, None, None, None) => {
                     let [seed_scalars, seed_pointers] = seed.descriptor_slices();
                     if !slices_match_slots(
                         seed.consumer_input_columns(),
@@ -2948,7 +3008,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                         return Err(reject("device-seeded input columns"));
                     }
                 }
-                (None, None, None, None, Some(compact), Some(planned_compact)) => {
+                (None, None, None, None, Some(compact), Some(planned_compact), None, None) => {
                     let [source_pointers, descriptors, output_pointers] =
                         compact.descriptor_slices();
                     let [tuple_scratch, sort_keys_a, sort_keys_b, sort_indices_a, sort_indices_b, run_heads, run_positions, n_unique, sort_temp, scan_temp] =
@@ -2988,6 +3048,27 @@ impl<'a> ResidentGraphRuntime<'a> {
                         || scan_temp.id() != slots.scan_temp
                     {
                         return Err(reject("device-compacted input columns"));
+                    }
+                }
+                (None, None, None, None, None, None, Some(casm), Some(planned_casm)) => {
+                    if casm.requirements() != &planned_casm.requirements
+                        || casm.staging().id() != planned_casm.slots.staging
+                        || !slices_match_slots(
+                            casm.consumer_input_columns(),
+                            &planned.slots.input_columns,
+                            &planned.requirements.input_column_words,
+                        )
+                        || casm
+                            .consumer_input_columns()
+                            .iter()
+                            .map(|slice| slice.id())
+                            .ne(prepared
+                                .writer
+                                .input_columns()
+                                .iter()
+                                .map(|slice| slice.id()))
+                    {
+                        return Err(reject("row-major Casm input columns"));
                     }
                 }
                 _ => return Err(reject("input preparation presence")),

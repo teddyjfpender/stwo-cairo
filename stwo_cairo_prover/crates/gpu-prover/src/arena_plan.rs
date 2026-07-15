@@ -21,15 +21,16 @@ use stwo_backend_cuda::{
     fri_workspace_requirements, oods_workspace_requirements,
     progressive_commit_workspace_requirements_for_mode, quotient_numerator_hybrid_plan,
     quotient_numerator_workspace_requirements, quotient_workspace_requirements,
-    witness_input_compact_requirements, witness_input_gather_requirements,
-    witness_workspace_requirements, ArenaError, ArenaLayout, ArenaSlotId, ArenaSlotSpec,
-    Blake2sFriAssemblyShape, Blake2sPowWorkspaceRequirements, Blake2sPowWorkspaceSlots,
-    Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape, Blake2sTranscriptRequirements,
-    Blake2sTranscriptWorkspaceSlots, CommitBatchRequirements, CommitBatchSlots, CommitGroupSlots,
-    CommitWorkspaceConfig, CommitWorkspaceSlots, CudaExecContext, DecommitColumnGeometry,
-    DecommitSourceMode, DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots,
-    DecommitWorkspaceConfig, DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena,
-    DeviceTranscriptError, EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
+    witness_casm_input_requirements, witness_input_compact_requirements,
+    witness_input_gather_requirements, witness_workspace_requirements, ArenaError, ArenaLayout,
+    ArenaSlotId, ArenaSlotSpec, Blake2sFriAssemblyShape, Blake2sPowWorkspaceRequirements,
+    Blake2sPowWorkspaceSlots, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,
+    Blake2sTranscriptRequirements, Blake2sTranscriptWorkspaceSlots, CommitBatchRequirements,
+    CommitBatchSlots, CommitGroupSlots, CommitWorkspaceConfig, CommitWorkspaceSlots,
+    CudaExecContext, DecommitColumnGeometry, DecommitSourceMode, DecommitTreeGeometry,
+    DecommitTreeRequirements, DecommitTreeSlots, DecommitWorkspaceConfig,
+    DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena, DeviceTranscriptError,
+    EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
     ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
     FixedTableContiguousWorkspaceSlots, FriDecommitGeometry, FriDecommitSlots,
     FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriFoldLaunchMode, FriMerkleTreeSlots,
@@ -39,10 +40,10 @@ use stwo_backend_cuda::{
     OodsWorkspaceSlots, PreparedBlake2sPowError, PreparedCommitError, PreparedDecommitError,
     PreparedExecutionTablesError, PreparedFixedTableError, PreparedFriError, PreparedFriFinalError,
     PreparedOodsError, PreparedProgressiveCommitError, PreparedQuotientError,
-    PreparedQuotientNumeratorError, PreparedWitnessError, PreparedWitnessFeedError,
-    PreparedWitnessInputGatherError, ProgressiveBatchRequirements, ProgressiveBatchSlots,
-    ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry, ProgressiveCommitMode,
-    ProgressiveCommitWorkspaceSlots, ProgressiveLeafWorkspaceSlots,
+    PreparedQuotientNumeratorError, PreparedWitnessCasmInputError, PreparedWitnessError,
+    PreparedWitnessFeedError, PreparedWitnessInputGatherError, ProgressiveBatchRequirements,
+    ProgressiveBatchSlots, ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
+    ProgressiveCommitMode, ProgressiveCommitWorkspaceSlots, ProgressiveLeafWorkspaceSlots,
     QuotientNumeratorColumnTopology, QuotientNumeratorSingleWriteError,
     QuotientNumeratorSourceKind, QuotientNumeratorWorkspaceConfig,
     QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
@@ -50,14 +51,17 @@ use stwo_backend_cuda::{
     RelationGraphError, RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots,
     RelationLaunchMode, RelationTailMode, TraceDecommitGeometry, TraceDecommitSlots,
     TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRole, TranscriptInputId,
-    TranscriptOutputId, WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots,
-    WitnessFeedLaunchMode, WitnessFeedWorkspaceSlots, WitnessInputCompactLayout,
-    WitnessInputCompactRequirements, WitnessInputCompactSlots, WitnessInputGatherEdge,
-    WitnessInputGatherRequirements, WitnessInputGatherSlots, WitnessInputSeedRequirements,
-    WitnessInputSeedSlots, WitnessWorkspaceRequirements, WitnessWorkspaceSlots,
-    EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_SMALL_LIMBS,
+    TranscriptOutputId, WitnessCasmInputRequirements, WitnessCasmInputSlots,
+    WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode,
+    WitnessFeedWorkspaceSlots, WitnessInputCompactLayout, WitnessInputCompactRequirements,
+    WitnessInputCompactSlots, WitnessInputGatherEdge, WitnessInputGatherRequirements,
+    WitnessInputGatherSlots, WitnessInputSeedRequirements, WitnessInputSeedSlots,
+    WitnessWorkspaceRequirements, WitnessWorkspaceSlots, EXECUTION_TABLE_BIG_LIMBS,
+    EXECUTION_TABLE_SMALL_LIMBS,
 };
-use stwo_cairo_prover::witness::jit_prove_backend::{BlakeGRecordedLane, BuiltinLaneSpec};
+use stwo_cairo_prover::witness::jit_prove_backend::{
+    recorded_casm_input_includes_iota, BlakeGRecordedLane, BuiltinLaneSpec,
+};
 use stwo_cairo_prover::witness::proof_shape::{
     ProofShapeError, RowResolution, TracePartId, TracePartShape,
 };
@@ -2729,6 +2733,12 @@ struct LogicalWitnessInputCompact {
 }
 
 #[derive(Clone, Debug)]
+struct LogicalWitnessCasmInput {
+    requirements: WitnessCasmInputRequirements,
+    staging: LogicalBufferId,
+}
+
+#[derive(Clone, Debug)]
 struct LogicalWitnessComponent {
     component: &'static str,
     part: TracePartId,
@@ -2751,6 +2761,7 @@ struct LogicalWitnessComponent {
     input_gather: Option<LogicalWitnessInputGather>,
     input_seed: Option<LogicalWitnessInputSeed>,
     input_compact: Option<LogicalWitnessInputCompact>,
+    input_casm: Option<LogicalWitnessCasmInput>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2884,6 +2895,12 @@ pub struct PlannedWitnessInputCompact {
 }
 
 #[derive(Clone, Debug)]
+pub struct PlannedWitnessCasmInput {
+    pub requirements: WitnessCasmInputRequirements,
+    pub slots: WitnessCasmInputSlots,
+}
+
+#[derive(Clone, Debug)]
 pub struct PlannedExecutionTablesWorkspace {
     pub requirements: ExecutionTablesWorkspaceRequirements,
     pub slots: ExecutionTablesWorkspaceSlots,
@@ -2908,6 +2925,7 @@ pub struct PlannedWitnessComponent {
     pub input_gather: Option<PlannedWitnessInputGather>,
     pub input_seed: Option<PlannedWitnessInputSeed>,
     pub input_compact: Option<PlannedWitnessInputCompact>,
+    pub input_casm: Option<PlannedWitnessCasmInput>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3510,6 +3528,7 @@ impl ProofArenaPlan {
             plan,
             logical_execution_tables.is_some(),
             blake_g_fused,
+            protocol.identity.resident_backend,
         )?;
         let logical_relation = append_relation_buffers(
             &mut logical,
@@ -3958,6 +3977,7 @@ pub enum ArenaPlanError {
     Relation(RelationGraphError),
     ExecutionTables(PreparedExecutionTablesError),
     Witness(PreparedWitnessError),
+    WitnessCasmInput(PreparedWitnessCasmInputError),
     WitnessInputGather(PreparedWitnessInputGatherError),
     WitnessFeed(PreparedWitnessFeedError),
     FixedTable(PreparedFixedTableError),
@@ -4249,6 +4269,7 @@ fn append_witness_buffers(
     proof: &ProofPlan,
     shared_execution_tables: bool,
     blake_g_fused: bool,
+    resident_backend: ResidentBackend,
 ) -> Result<LogicalWitnessWorkspace, ArenaPlanError> {
     let mut recordings = BTreeMap::new();
     for (label, program) in stwo_cairo_prover::witness::jit_prove_backend::all_lane_recordings() {
@@ -4262,6 +4283,48 @@ fn append_witness_buffers(
     let persistent = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble)?;
     let input_lifetime = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Witness)?;
     let witness_lifetime = BufferLifetime::at(ProofEpoch::Witness);
+    let casm_staging_words = if resident_backend == ResidentBackend::ReplacementV1 {
+        topological_component_order(proof)?
+            .into_iter()
+            .filter(|component| {
+                component.node.facts.witness_writer.kind == WitnessWriterKind::RecordedAot
+                    && component.runtime.is_present()
+                    && recorded_casm_input_includes_iota(component.node.id).is_some()
+            })
+            .map(|component| {
+                let parts = capacity_parts(&component.runtime.rows)?;
+                if parts.len() != 1 || parts[0].part != TracePartId::Main {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "recorded Casm witness must have one main trace part",
+                    ));
+                }
+                let n_real = usize::try_from(parts[0].n_real_rows)
+                    .map_err(|_| ArenaPlanError::SizeOverflow)?;
+                let include_iota = recorded_casm_input_includes_iota(component.node.id)
+                    .expect("filtered Casm component");
+                witness_casm_input_requirements(n_real, include_iota)
+                    .map(|requirements| requirements.staging_words)
+                    .map_err(ArenaPlanError::WitnessCasmInput)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+    } else {
+        None
+    };
+    let casm_staging = casm_staging_words
+        .map(|words| {
+            push_buffer_id(
+                logical,
+                None,
+                None,
+                BufferPurpose::WitnessInput,
+                0,
+                words,
+                BufferLifetime::at(ProofEpoch::Ingest),
+            )
+        })
+        .transpose()?;
     let mut components = Vec::new();
     for component in topological_component_order(proof)? {
         if component.node.facts.witness_writer.kind != WitnessWriterKind::RecordedAot
@@ -4453,7 +4516,37 @@ fn append_witness_buffers(
                 candidate.node.id == "ec_op_builtin" && candidate.runtime.is_present()
             }))
         .then_some("ec_op_builtin");
-        let input_compact = if native_input_producer.is_none() {
+        let input_casm = if resident_backend == ResidentBackend::ReplacementV1 {
+            recorded_casm_input_includes_iota(component.node.id)
+                .map(|include_iota| {
+                    let n_real = usize::try_from(part.n_real_rows)
+                        .map_err(|_| ArenaPlanError::SizeOverflow)?;
+                    let casm_requirements = witness_casm_input_requirements(n_real, include_iota)
+                        .map_err(ArenaPlanError::WitnessCasmInput)?;
+                    if casm_requirements.consumer_rows != rows
+                        || casm_requirements.consumer_input_column_words
+                            != requirements.input_column_words
+                    {
+                        return Err(ArenaPlanError::WitnessInputGatherGeometry {
+                            component: component.node.id,
+                            expected_real_rows: n_real,
+                            actual_real_rows: casm_requirements.n_real_rows,
+                            expected_padded_rows: rows,
+                            actual_padded_rows: casm_requirements.consumer_rows,
+                        });
+                    }
+                    Ok(LogicalWitnessCasmInput {
+                        requirements: casm_requirements,
+                        staging: casm_staging.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                            "replacement Casm staging slot is missing",
+                        ))?,
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let input_compact = if native_input_producer.is_none() && input_casm.is_none() {
             append_witness_input_compact(
                 logical,
                 proof,
@@ -4466,20 +4559,21 @@ fn append_witness_buffers(
         } else {
             None
         };
-        let input_gather = if input_compact.is_none() && native_input_producer.is_none() {
-            append_witness_input_gather(
-                logical,
-                proof,
-                component.node,
-                &program,
-                part,
-                &input_columns,
-                persistent,
-            )?
-        } else {
-            None
-        };
-        let input_seed = if native_input_producer.is_none() {
+        let input_gather =
+            if input_compact.is_none() && native_input_producer.is_none() && input_casm.is_none() {
+                append_witness_input_gather(
+                    logical,
+                    proof,
+                    component.node,
+                    &program,
+                    part,
+                    &input_columns,
+                    persistent,
+                )?
+            } else {
+                None
+            };
+        let input_seed = if native_input_producer.is_none() && input_casm.is_none() {
             append_witness_input_seed(
                 logical,
                 component.node,
@@ -4494,6 +4588,7 @@ fn append_witness_buffers(
         if usize::from(input_gather.is_some())
             + usize::from(input_seed.is_some())
             + usize::from(input_compact.is_some())
+            + usize::from(input_casm.is_some())
             > 1
         {
             return Err(ArenaPlanError::InvalidProtocolGeometry(
@@ -4523,6 +4618,7 @@ fn append_witness_buffers(
             input_gather,
             input_seed,
             input_compact,
+            input_casm,
         });
     }
     Ok(LogicalWitnessWorkspace { components })
@@ -9378,6 +9474,22 @@ fn resolve_witness_slots(
                     })
                 })
                 .transpose()?;
+            let input_casm = component
+                .input_casm
+                .map(|casm| {
+                    let slots = WitnessCasmInputSlots {
+                        staging: physical(casm.staging)?,
+                        consumer_input_columns: input_column_slots.clone(),
+                    };
+                    casm.requirements
+                        .arena_slot_requirements(&slots)
+                        .map_err(ArenaPlanError::WitnessCasmInput)?;
+                    Ok::<_, ArenaPlanError>(PlannedWitnessCasmInput {
+                        requirements: casm.requirements,
+                        slots,
+                    })
+                })
+                .transpose()?;
             Ok(PlannedWitnessComponent {
                 component: component.component,
                 part: component.part,
@@ -9390,6 +9502,7 @@ fn resolve_witness_slots(
                 input_gather,
                 input_seed,
                 input_compact,
+                input_casm,
             })
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
@@ -9911,6 +10024,126 @@ mod tests {
             len_words: words,
             lifetime: BufferLifetime::new(first, last).unwrap(),
         }
+    }
+
+    fn opcode_only_plan() -> ProofPlan {
+        let default_shape = CairoClaimGenerator::default().proof_shape(None).unwrap();
+        let mut components = default_shape.components().to_vec();
+        for (id, n_real, padded) in [("add_opcode", 17, 32), ("blake_compress_opcode", 9, 16)] {
+            *components
+                .iter_mut()
+                .find(|component| component.id == id)
+                .unwrap() = RuntimeComponentShape::uniform(id, n_real, padded).unwrap();
+        }
+        let shape = ProofShape::new(components).unwrap();
+        ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap()
+    }
+
+    fn opcode_witness_logical_buffers(proof: &ProofPlan) -> Vec<LogicalBuffer> {
+        let mut logical = Vec::new();
+        for component in &proof.components {
+            for part in capacity_parts(&component.runtime.rows).unwrap() {
+                let rows = usize::try_from(part.padded_rows).unwrap();
+                for ordinal in
+                    0..trace_width(component.node.facts.trace_columns, part.part).unwrap()
+                {
+                    push_buffer_id(
+                        &mut logical,
+                        Some(component.node.id),
+                        Some(part.part),
+                        BufferPurpose::BaseTrace,
+                        ordinal,
+                        rows,
+                        BufferLifetime::at(ProofEpoch::Witness),
+                    )
+                    .unwrap();
+                }
+                if let Some(words) = component.node.facts.lookup_words {
+                    push_component_flat_buffer(
+                        &mut logical,
+                        component.node.id,
+                        part.part,
+                        BufferPurpose::LookupInputs,
+                        words,
+                        part.padded_rows,
+                        BufferLifetime::new(ProofEpoch::Witness, ProofEpoch::Interaction).unwrap(),
+                    )
+                    .unwrap();
+                }
+                if let Some(words) = component.node.facts.sub_words {
+                    push_component_flat_buffer(
+                        &mut logical,
+                        component.node.id,
+                        part.part,
+                        BufferPurpose::SubcomponentInputs,
+                        words,
+                        part.padded_rows,
+                        BufferLifetime::at(ProofEpoch::Witness),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        logical
+    }
+
+    #[test]
+    fn replacement_reuses_one_row_major_casm_staging_slot_and_legacy_stays_host_routed() {
+        let proof = opcode_only_plan();
+        let mut replacement_logical = opcode_witness_logical_buffers(&proof);
+        let replacement = append_witness_buffers(
+            &mut replacement_logical,
+            &proof,
+            true,
+            false,
+            ResidentBackend::ReplacementV1,
+        )
+        .unwrap();
+        assert_eq!(replacement.components.len(), 2);
+        let casm = replacement
+            .components
+            .iter()
+            .map(|component| component.input_casm.as_ref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(casm[0].staging, casm[1].staging);
+        assert_eq!(
+            replacement_logical
+                .iter()
+                .find(|buffer| buffer.id == casm[0].staging)
+                .unwrap()
+                .len_words,
+            17 * stwo_backend_cuda::WITNESS_CASM_STATE_WORDS,
+        );
+        assert!(replacement.components.iter().all(|component| {
+            component.input_gather.is_none()
+                && component.input_seed.is_none()
+                && component.input_compact.is_none()
+        }));
+        let blake = replacement
+            .components
+            .iter()
+            .find(|component| component.component == "blake_compress_opcode")
+            .unwrap();
+        assert!(blake.input_casm.as_ref().unwrap().requirements.include_iota);
+
+        let mut legacy_logical = opcode_witness_logical_buffers(&proof);
+        let legacy = append_witness_buffers(
+            &mut legacy_logical,
+            &proof,
+            true,
+            false,
+            ResidentBackend::LegacyResident,
+        )
+        .unwrap();
+        assert!(legacy
+            .components
+            .iter()
+            .all(|component| component.input_casm.is_none()));
+        assert_eq!(
+            legacy_logical.len() + 1,
+            replacement_logical.len(),
+            "replacement adds exactly one reusable staging allocation",
+        );
     }
 
     #[test]
