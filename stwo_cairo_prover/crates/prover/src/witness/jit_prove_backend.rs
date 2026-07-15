@@ -1174,6 +1174,17 @@ pub struct RecordedWitnessInputAttempt {
     pub host_pedersen_points_18: bool,
 }
 
+/// Borrowed replacement-v1 opcode input. `CasmState` is a `repr(C)` Pod of
+/// exactly `[pc, ap, fp]`; the resident session owns this borrow through its
+/// one post-ingress fence and never materializes padded host columns.
+#[derive(Debug)]
+pub struct RecordedCasmInputAttempt<'a> {
+    pub label: &'static str,
+    pub program: stwo_backend_cuda::jit_witness::isa::WitnessProgram,
+    pub inputs: &'a [CasmState],
+    pub include_iota: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedDeviceInputSeed {
     pub n_real: usize,
@@ -1205,6 +1216,27 @@ fn opcode_input_attempt<C: OpcodeLaneSpec>(
         program: recording.program,
         input_source: RecordedWitnessInputSource::Host(inputs),
         host_pedersen_points_18: false,
+    })
+}
+
+fn casm_input_attempt<'a>(
+    label: &'static str,
+    recording: RecordingOutput,
+    n_trace: usize,
+    n_lookup: usize,
+    n_sub: usize,
+    inputs: &'a [CasmState],
+    include_iota: bool,
+) -> Result<RecordedCasmInputAttempt<'a>, RecordedWitnessInputsError> {
+    validate_recording(label, &recording, n_trace, n_lookup, n_sub)?;
+    if recording.program.n_inputs as usize != 4 + usize::from(include_iota) {
+        return Err(RecordedWitnessInputsError::RecordingShape(label));
+    }
+    Ok(RecordedCasmInputAttempt {
+        label,
+        program: recording.program,
+        inputs,
+        include_iota,
     })
 }
 
@@ -1645,6 +1677,83 @@ pub fn recorded_device_seed_scalar_count(label: &str) -> Option<usize> {
 
 pub fn is_supported_recorded_input_label(label: &str) -> bool {
     RECORDED_INPUT_LABELS.contains(&label)
+}
+
+/// Borrow a canonical opcode source without building pc/ap/fp/enabler slabs.
+/// The returned slice aliases its generator and therefore cannot outlive the
+/// generator-owned resident session.
+pub fn recorded_casm_input_attempt<'a>(
+    generator: &'a crate::witness::cairo_claim_generator::CairoClaimGenerator,
+    label: &'static str,
+) -> Result<Option<RecordedCasmInputAttempt<'a>>, RecordedWitnessInputsError> {
+    macro_rules! op {
+        ($field:ident, $lane:ty) => {
+            generator
+                .$field
+                .as_ref()
+                .map(|gen| {
+                    casm_input_attempt(
+                        <$lane as OpcodeLaneSpec>::LABEL,
+                        <$lane as OpcodeLaneSpec>::record(),
+                        <$lane as OpcodeLaneSpec>::N_TRACE,
+                        <$lane as OpcodeLaneSpec>::N_LOOKUP_WORDS,
+                        <$lane as OpcodeLaneSpec>::N_SUB_WORDS,
+                        <$lane as OpcodeLaneSpec>::inputs(gen),
+                        false,
+                    )
+                })
+                .transpose()?
+        };
+    }
+    macro_rules! direct {
+        ($field:ident, $lane:ty, $include_iota:expr) => {
+            generator
+                .$field
+                .as_ref()
+                .map(|gen| {
+                    casm_input_attempt(
+                        <$lane as BuiltinLaneSpec>::LABEL,
+                        <$lane as BuiltinLaneSpec>::record(),
+                        <$lane as BuiltinLaneSpec>::N_TRACE,
+                        <$lane as BuiltinLaneSpec>::N_LOOKUP_WORDS,
+                        <$lane as BuiltinLaneSpec>::N_SUB_WORDS,
+                        &gen.inputs,
+                        $include_iota,
+                    )
+                })
+                .transpose()?
+        };
+    }
+    Ok(match label {
+        "add_opcode" => op!(add_opcode, AddOpcodeLane),
+        "assert_eq_opcode" => op!(assert_eq_opcode, AssertEqOpcodeLane),
+        "jnz_opcode_taken" => op!(jnz_opcode_taken, JnzOpcodeTakenLane),
+        "add_opcode_small" => op!(add_opcode_small, AddOpcodeSmallLane),
+        "assert_eq_opcode_imm" => op!(assert_eq_opcode_imm, AssertEqOpcodeImmLane),
+        "assert_eq_opcode_double_deref" => {
+            op!(assert_eq_opcode_double_deref, AssertEqOpcodeDoubleDerefLane)
+        }
+        "call_opcode_abs" => op!(call_opcode_abs, CallOpcodeAbsLane),
+        "call_opcode_rel_imm" => op!(call_opcode_rel_imm, CallOpcodeRelImmLane),
+        "jnz_opcode_non_taken" => op!(jnz_opcode_non_taken, JnzOpcodeNonTakenLane),
+        "jump_opcode_abs" => op!(jump_opcode_abs, JumpOpcodeAbsLane),
+        "jump_opcode_double_deref" => {
+            op!(jump_opcode_double_deref, JumpOpcodeDoubleDerefLane)
+        }
+        "jump_opcode_rel" => op!(jump_opcode_rel, JumpOpcodeRelLane),
+        "jump_opcode_rel_imm" => op!(jump_opcode_rel_imm, JumpOpcodeRelImmLane),
+        "ret_opcode" => op!(ret_opcode, RetOpcodeLane),
+        "add_ap_opcode" => direct!(add_ap_opcode, AddApOpcodeLane, false),
+        "mul_opcode" => direct!(mul_opcode, MulOpcodeLane, false),
+        "mul_opcode_small" => direct!(mul_opcode_small, MulOpcodeSmallLane, false),
+        "blake_compress_opcode" => {
+            direct!(blake_compress_opcode, BlakeCompressOpcodeLane, true)
+        }
+        "qm_31_add_mul_opcode" => {
+            direct!(qm_31_add_mul_opcode, Qm31AddMulOpcodeLane, false)
+        }
+        _ => None,
+    })
 }
 
 /// Try to build one lane's canonical host columns without consuming its claim
@@ -4346,6 +4455,38 @@ mod emitted_lane_tests {
         assert_eq!(&columns.columns[1][..3], &[2, 5, 2]);
         assert_eq!(&columns.columns[2][..3], &[3, 6, 3]);
         assert_eq!(&columns.columns[3][..3], &[1, 1, 0]);
+    }
+
+    #[test]
+    fn borrowed_casm_attempt_preserves_source_and_recorded_tail_shape() {
+        let inputs = [CasmState::default()];
+        let plain = casm_input_attempt(
+            <AddOpcodeLane as OpcodeLaneSpec>::LABEL,
+            <AddOpcodeLane as OpcodeLaneSpec>::record(),
+            <AddOpcodeLane as OpcodeLaneSpec>::N_TRACE,
+            <AddOpcodeLane as OpcodeLaneSpec>::N_LOOKUP_WORDS,
+            <AddOpcodeLane as OpcodeLaneSpec>::N_SUB_WORDS,
+            &inputs,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plain.inputs.as_ptr(), inputs.as_ptr());
+        assert_eq!(plain.program.n_inputs, 4);
+        assert!(!plain.include_iota);
+
+        let iota = casm_input_attempt(
+            <BlakeCompressOpcodeLane as BuiltinLaneSpec>::LABEL,
+            <BlakeCompressOpcodeLane as BuiltinLaneSpec>::record(),
+            <BlakeCompressOpcodeLane as BuiltinLaneSpec>::N_TRACE,
+            <BlakeCompressOpcodeLane as BuiltinLaneSpec>::N_LOOKUP_WORDS,
+            <BlakeCompressOpcodeLane as BuiltinLaneSpec>::N_SUB_WORDS,
+            &inputs,
+            true,
+        )
+        .unwrap();
+        assert_eq!(iota.inputs.as_ptr(), inputs.as_ptr());
+        assert_eq!(iota.program.n_inputs, 5);
+        assert!(iota.include_iota);
     }
 
     #[test]
