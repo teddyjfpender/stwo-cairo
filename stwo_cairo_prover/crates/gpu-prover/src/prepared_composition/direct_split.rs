@@ -8,6 +8,17 @@ use stwo_backend_cuda::{
 
 use super::{CompositionWorkspaceRequirements, PreparedCompositionError, SECURE_COORDINATES};
 
+// The SM90 log-24 fused boundary needs 207 registers across a 512-thread CTA,
+// so CUDA caps that function at 256 threads and rejects its graph with 701.
+// Log 25 uses the legal 256-thread specialization; log 24 takes the same checked
+// field map through the spill-free terminal path.
+const fn production_split_mode(evaluation_log_size: u32) -> CompositionSplitLaunchMode {
+    match evaluation_log_size {
+        25 => CompositionSplitLaunchMode::FusedFirstForward,
+        _ => CompositionSplitLaunchMode::TerminalFallback,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompositionOutputMode {
     CoefficientSplit,
@@ -82,7 +93,7 @@ pub(super) fn prepare_direct_split<'a>(
     let graph = PreparedCompositionSplitGraph::prepare(
         arena,
         binding.program,
-        CompositionSplitLaunchMode::FusedFirstForward,
+        production_split_mode(binding.program.schedule().evaluation_log_size),
         binding.pointer_slots,
         CompositionSplitColumns {
             source_evaluations,
@@ -106,4 +117,21 @@ pub(super) fn prepare_direct_split<'a>(
         ));
     }
     Ok(graph)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_split_mode_respects_the_sm90_launch_budget() {
+        assert_eq!(
+            production_split_mode(24),
+            CompositionSplitLaunchMode::TerminalFallback
+        );
+        assert_eq!(
+            production_split_mode(25),
+            CompositionSplitLaunchMode::FusedFirstForward
+        );
+    }
 }
