@@ -25,6 +25,9 @@ use crate::direct_composition_retention::{
     direct_composition_plan_key, DirectCompositionRetentionPlan,
 };
 
+mod binding_refresh;
+pub use binding_refresh::CompositionBindingRefreshTelemetry;
+
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const SECURE_WORDS: usize = 4;
 const SECURE_COORDINATES: usize = 4;
