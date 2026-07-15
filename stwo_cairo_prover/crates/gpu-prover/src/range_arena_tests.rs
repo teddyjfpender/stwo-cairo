@@ -250,6 +250,84 @@ fn malformed_transition_shape_is_rejected_before_placement() {
 }
 
 #[test]
+fn named_released_commitment_alias_has_exact_identity_offset_and_extent() {
+    let logical = vec![
+        buffer(
+            0,
+            BufferPurpose::CommitProgressiveStatePing,
+            0,
+            256,
+            ProofEpoch::BaseCommit,
+            ProofEpoch::BaseCommit,
+        ),
+        buffer(
+            1,
+            BufferPurpose::QuotientNumeratorLdeTile,
+            1,
+            256,
+            ProofEpoch::Quotient,
+            ProofEpoch::Quotient,
+        ),
+    ];
+    let alias = ReleasedCommitmentAlias {
+        commitment: CommitmentTreeId::Base,
+        released_slab: LogicalBufferId(0),
+        quotient_staging: LogicalBufferId(1),
+        used_words: 192,
+    };
+    let plan = plan_range_arena_with_released_commitments(&logical, &[], &[alias]).unwrap();
+    assert_eq!(binding(&plan, 0).physical, binding(&plan, 1).physical);
+    assert_eq!(offset(&plan, 0), offset(&plan, 1));
+    assert_eq!(
+        plan.layout
+            .slot(binding(&plan, 0).physical)
+            .unwrap()
+            .len_words,
+        256
+    );
+}
+
+#[test]
+fn named_released_commitment_alias_rejects_swaps_overlap_and_extent_drift() {
+    let valid = vec![
+        buffer(
+            0,
+            BufferPurpose::CommitProgressiveStatePing,
+            0,
+            256,
+            ProofEpoch::BaseCommit,
+            ProofEpoch::BaseCommit,
+        ),
+        buffer(
+            1,
+            BufferPurpose::QuotientNumeratorLdeTile,
+            1,
+            256,
+            ProofEpoch::Quotient,
+            ProofEpoch::Quotient,
+        ),
+    ];
+    let alias = ReleasedCommitmentAlias {
+        commitment: CommitmentTreeId::Base,
+        released_slab: LogicalBufferId(0),
+        quotient_staging: LogicalBufferId(1),
+        used_words: 192,
+    };
+    let mut swapped = alias;
+    swapped.commitment = CommitmentTreeId::Interaction;
+    assert!(plan_range_arena_with_released_commitments(&valid, &[], &[swapped]).is_err());
+
+    let mut overlapping = valid.clone();
+    overlapping[0].lifetime =
+        BufferLifetime::new(ProofEpoch::BaseCommit, ProofEpoch::Quotient).unwrap();
+    assert!(plan_range_arena_with_released_commitments(&overlapping, &[], &[alias]).is_err());
+
+    let mut wrong_extent = valid;
+    wrong_extent[1].len_words = 255;
+    assert!(plan_range_arena_with_released_commitments(&wrong_extent, &[], &[alias]).is_err());
+}
+
+#[test]
 fn identical_input_rebuilds_identical_ids_offsets_and_lengths() {
     let logical = vec![
         buffer(

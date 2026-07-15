@@ -20,15 +20,16 @@ use stwo_backend_cuda::{
     execution_tables_workspace_requirements, fri_final_workspace_requirements,
     fri_workspace_requirements, oods_workspace_requirements,
     progressive_commit_workspace_requirements_for_mode, quotient_numerator_hybrid_plan,
+    quotient_numerator_staged_single_write_plan_with_overflow_capacities,
     quotient_numerator_workspace_requirements, quotient_workspace_requirements,
     witness_casm_input_requirements, witness_input_compact_requirements,
     witness_input_gather_requirements, witness_workspace_requirements, ArenaError, ArenaLayout,
     ArenaSlotId, ArenaSlotSpec, Blake2sFriAssemblyShape, Blake2sPowWorkspaceRequirements,
     Blake2sPowWorkspaceSlots, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,
     Blake2sTranscriptRequirements, Blake2sTranscriptWorkspaceSlots, CommitBatchRequirements,
-    CommitBatchSlots, CommitGroupSlots, CommitWorkspaceConfig, CommitWorkspaceSlots,
-    CudaExecContext, DecommitColumnGeometry, DecommitSourceMode, DecommitTreeGeometry,
-    DecommitTreeRequirements, DecommitTreeSlots, DecommitWorkspaceConfig,
+    CommitBatchSlots, CommitGroupSlots, CommitProgram, CommitProgramError, CommitWorkspaceConfig,
+    CommitWorkspaceSlots, CudaExecContext, DecommitColumnGeometry, DecommitSourceMode,
+    DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots, DecommitWorkspaceConfig,
     DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena, DeviceTranscriptError,
     EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
     ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
@@ -43,15 +44,17 @@ use stwo_backend_cuda::{
     PreparedQuotientNumeratorError, PreparedWitnessCasmInputError, PreparedWitnessError,
     PreparedWitnessFeedError, PreparedWitnessInputGatherError, ProgressiveBatchRequirements,
     ProgressiveBatchSlots, ProgressiveCommitGeometry, ProgressiveCommitGroupGeometry,
-    ProgressiveCommitMode, ProgressiveCommitWorkspaceSlots, ProgressiveLeafWorkspaceSlots,
-    QuotientNumeratorColumnTopology, QuotientNumeratorSingleWriteError,
-    QuotientNumeratorSourceKind, QuotientNumeratorWorkspaceConfig,
-    QuotientNumeratorWorkspaceRequirements, QuotientNumeratorWorkspaceSlots, QuotientOodsSample,
-    QuotientWorkspaceConfig, QuotientWorkspaceRequirements, QuotientWorkspaceSlots,
-    RelationGraphError, RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots,
-    RelationLaunchMode, RelationTailMode, TraceDecommitGeometry, TraceDecommitSlots,
-    TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRole, TranscriptInputId,
-    TranscriptOutputId, WitnessCasmInputRequirements, WitnessCasmInputSlots,
+    ProgressiveCommitMode, ProgressiveCommitStorageMode, ProgressiveCommitWorkspaceSlots,
+    ProgressiveLeafWorkspaceSlots, ProgressiveNttLeafFusionMode, QuotientNumeratorColumnTopology,
+    QuotientNumeratorSingleWriteError, QuotientNumeratorSourceKind,
+    QuotientNumeratorStagedSingleWriteError, QuotientNumeratorStagedSingleWritePlan,
+    QuotientNumeratorWorkspaceConfig, QuotientNumeratorWorkspaceRequirements,
+    QuotientNumeratorWorkspaceSlots, QuotientOodsSample, QuotientWorkspaceConfig,
+    QuotientWorkspaceRequirements, QuotientWorkspaceSlots, RelationGraphError,
+    RelationGraphRequirements, RelationGraphSlots, RelationInstanceSlots, RelationLaunchMode,
+    RelationTailMode, ShapeWideCommitProgram, ShapeWideCommitProgramError, TraceDecommitGeometry,
+    TraceDecommitSlots, TraceSourceGroupGeometry, TraceSourceGroupSlots, TraceTreeRole,
+    TranscriptInputId, TranscriptOutputId, WitnessCasmInputRequirements, WitnessCasmInputSlots,
     WitnessFeedClearWorkspaceRequirements, WitnessFeedClearWorkspaceSlots, WitnessFeedLaunchMode,
     WitnessFeedWorkspaceSlots, WitnessInputCompactLayout, WitnessInputCompactRequirements,
     WitnessInputCompactSlots, WitnessInputGatherEdge, WitnessInputGatherRequirements,
@@ -87,7 +90,7 @@ use crate::prepared_composition::{
 };
 use crate::proof_bundle::{ResidentProofBundleError, ResidentProofBundleLayout};
 use crate::range_allocator::RangeAllocationError;
-use crate::range_arena::{plan_range_arena, validate_transition_aliases};
+use crate::range_arena::{plan_range_arena_with_released_commitments, ReleasedCommitmentAlias};
 use crate::relation::RelationTracePart;
 use crate::relation_execution::{
     RelationExecutionError, RelationExecutionPlan, RelationInstanceSourcePlan, RelationSourcePlane,
@@ -2372,6 +2375,8 @@ struct LogicalQuotientNumeratorWorkspace {
     schedule: QuotientNumeratorSchedule,
     config: QuotientNumeratorWorkspaceConfig,
     requirements: QuotientNumeratorWorkspaceRequirements,
+    staged_single_write: Option<QuotientNumeratorStagedSingleWritePlan>,
+    staged_overflows: Vec<LogicalStagedQuotientOverflow>,
     columns: Vec<LogicalQuotientNumeratorColumn>,
     oods_sample_points: LogicalBufferId,
     oods_sampled_values: LogicalBufferId,
@@ -2396,9 +2401,20 @@ struct LogicalQuotientNumeratorWorkspace {
     lde_tile: Option<LogicalBufferId>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LogicalStagedQuotientOverflow {
+    commitment: CommitmentTreeId,
+    released_slab: LogicalBufferId,
+    staging: LogicalBufferId,
+    used_words: usize,
+}
+
 #[derive(Clone, Debug)]
 struct LogicalCommitWorkspace {
     id: CommitmentTreeId,
+    storage_mode: ProgressiveCommitStorageMode,
+    commit_program: Option<CommitProgram>,
+    shape_wide_program: Option<Result<ShapeWideCommitProgram, ShapeWideCommitProgramError>>,
     interpolation_mode: InterpolationLaunchMode,
     config: CommitWorkspaceConfig,
     grouped_column_log_sizes: Vec<Vec<u32>>,
@@ -3151,6 +3167,10 @@ pub struct PlannedQuotientNumeratorWorkspace {
     pub schedule: QuotientNumeratorSchedule,
     pub config: QuotientNumeratorWorkspaceConfig,
     pub requirements: QuotientNumeratorWorkspaceRequirements,
+    /// Replacement-v1 coefficient-inclusive single-write manifest. It stays
+    /// address-free; `staged_overflow` is the only additional arena binding.
+    pub staged_single_write: Option<QuotientNumeratorStagedSingleWritePlan>,
+    pub staged_overflows: Vec<PlannedStagedQuotientOverflow>,
     pub columns: Vec<PlannedQuotientNumeratorColumn>,
     pub oods_sample_points: ArenaBinding,
     pub oods_sampled_values: ArenaBinding,
@@ -3162,12 +3182,23 @@ pub struct PlannedQuotientNumeratorWorkspace {
     pub slots: QuotientNumeratorWorkspaceSlots,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlannedStagedQuotientOverflow {
+    pub commitment: CommitmentTreeId,
+    pub released_slab: ArenaBinding,
+    pub staging: ArenaBinding,
+    pub used_words: usize,
+}
+
 /// Exact prepared-commit inputs resolved to physical arena slots after liveness
 /// coloring. The canonical log groups are retained so the caller can bind the
 /// corresponding coefficient columns without rediscovering ordering.
 #[derive(Clone, Debug)]
 pub struct PlannedCommitment {
     pub id: CommitmentTreeId,
+    pub storage_mode: ProgressiveCommitStorageMode,
+    pub commit_program: Option<CommitProgram>,
+    pub shape_wide_program: Option<Result<ShapeWideCommitProgram, ShapeWideCommitProgramError>>,
     pub config: CommitWorkspaceConfig,
     pub grouped_column_log_sizes: Vec<Vec<u32>>,
     pub grouped_column_sources: Vec<Vec<CommitmentColumnSource>>,
@@ -3400,6 +3431,7 @@ impl ProofArenaPlan {
         });
         let mut logical = Vec::new();
         let mut transition_aliases = Vec::new();
+        let mut released_commitment_aliases = Vec::new();
         for component in &plan.components {
             let parts = capacity_parts(&component.runtime.rows)?;
             for part in parts {
@@ -3556,6 +3588,7 @@ impl ProofArenaPlan {
             logical_transcript,
         ) = append_protocol_buffers(
             &mut logical,
+            &mut released_commitment_aliases,
             protocol,
             composition,
             retained_preprocessed_evaluations.as_ref(),
@@ -3588,10 +3621,18 @@ impl ProofArenaPlan {
         // Retain the old whole-slot result as an exact same-shape comparator,
         // but bind production execution to the checked range-packed layout.
         let (_, whole_slot_specs, whole_slot_total_words) =
-            color_logical_buffers(&logical, &transition_aliases)?;
+            color_logical_buffers_with_released_commitments(
+                &logical,
+                &transition_aliases,
+                &released_commitment_aliases,
+            )?;
         ArenaLayout::new(whole_slot_total_words, &whole_slot_specs)
             .map_err(ArenaPlanError::Arena)?;
-        let range_arena = plan_range_arena(&logical, &transition_aliases)?;
+        let range_arena = plan_range_arena_with_released_commitments(
+            &logical,
+            &transition_aliases,
+            &released_commitment_aliases,
+        )?;
         let bindings = range_arena.bindings;
         let layout = range_arena.layout;
         validate_aliases(&logical, &bindings)?;
@@ -4035,10 +4076,12 @@ pub enum ArenaPlanError {
     },
     Commit(PreparedCommitError),
     ProgressiveCommit(PreparedProgressiveCommitError),
+    CommitProgram(CommitProgramError),
     Composition(PreparedCompositionError),
     Oods(PreparedOodsError),
     QuotientNumerator(PreparedQuotientNumeratorError),
     QuotientNumeratorSchedule(QuotientNumeratorSingleWriteError),
+    QuotientNumeratorStaged(QuotientNumeratorStagedSingleWriteError),
     Quotient(PreparedQuotientError),
     Fri(PreparedFriError),
     FriFinal(PreparedFriFinalError),
@@ -6556,6 +6599,7 @@ fn direct_composition_logical_source(
 
 fn append_protocol_buffers(
     logical: &mut Vec<LogicalBuffer>,
+    released_commitment_aliases: &mut Vec<ReleasedCommitmentAlias>,
     protocol: &ProtocolGeometry,
     composition: &CompositionPlan,
     retained_preprocessed_evaluations: Option<&BTreeSet<&'static str>>,
@@ -6820,32 +6864,109 @@ fn append_protocol_buffers(
                 requirements.merkle.tail_outputs.as_slice(),
             ),
         };
-        let leaf_state = push_buffer_id(
-            logical,
-            None,
-            None,
-            BufferPurpose::MerkleLeafState,
-            ordinal()?,
-            leaf_words,
-            if geometry.config.unretained_bottom_layers == 0 {
-                retained
-            } else {
-                at
-            },
-        )?;
-        let merkle_scratch = merkle_scratch_words
-            .map(|words| {
-                push_buffer_id(
+        let storage_mode = match (protocol.identity.resident_backend, &requirements) {
+            (
+                ResidentBackend::ReplacementV1,
+                ModeAwareCommitWorkspaceRequirements::DomainProgressive(_),
+            ) => ProgressiveCommitStorageMode::InPlaceSlab,
+            (ResidentBackend::ReplacementV1, _) => {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "replacement-v1 commitment is not domain-progressive",
+                ));
+            }
+            (ResidentBackend::LegacyResident, _) => ProgressiveCommitStorageMode::Separate,
+        };
+        let commit_program = match (&requirements, storage_mode) {
+            (
+                ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+                ProgressiveCommitStorageMode::InPlaceSlab,
+            ) => {
+                let program = CommitProgram::compile(
+                    geometry.config,
+                    requirements.leaves.plan.geometry.clone(),
+                    ProgressiveNttLeafFusionMode::Fused16,
+                    protocol.identity.blake2s_interior_fused,
+                )
+                .map_err(ArenaPlanError::CommitProgram)?;
+                if program.requirements() != requirements {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "commitment program requirements drifted from the arena",
+                    ));
+                }
+                Some(program)
+            }
+            (_, ProgressiveCommitStorageMode::Separate) => None,
+            _ => {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "commitment program storage does not match its workspace geometry",
+                ));
+            }
+        };
+        let shape_wide_program = commit_program
+            .as_ref()
+            .map(ShapeWideCommitProgram::compile_replacement_v1);
+        let in_place_slab = match (&requirements, storage_mode) {
+            (
+                ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+                ProgressiveCommitStorageMode::InPlaceSlab,
+            ) => {
+                if geometry.config.unretained_bottom_layers == 0 {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "in-place commitment requires an unretained Merkle prefix",
+                    ));
+                }
+                Some(push_buffer_id(
                     logical,
                     None,
                     None,
-                    BufferPurpose::MerkleLayerScratch,
+                    BufferPurpose::CommitProgressiveStatePing,
                     ordinal()?,
-                    words,
+                    requirements
+                        .leaves
+                        .in_place_slab_words()
+                        .map_err(ArenaPlanError::ProgressiveCommit)?,
                     at,
-                )
-            })
-            .transpose()?;
+                )?)
+            }
+            (_, ProgressiveCommitStorageMode::Separate) => None,
+            _ => {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "in-place commitment storage requires domain-progressive geometry",
+                ));
+            }
+        };
+        let leaf_state = match in_place_slab {
+            Some(slab) => slab,
+            None => push_buffer_id(
+                logical,
+                None,
+                None,
+                BufferPurpose::MerkleLeafState,
+                ordinal()?,
+                leaf_words,
+                if geometry.config.unretained_bottom_layers == 0 {
+                    retained
+                } else {
+                    at
+                },
+            )?,
+        };
+        let merkle_scratch = match in_place_slab {
+            Some(slab) => merkle_scratch_words.map(|_| slab),
+            None => merkle_scratch_words
+                .map(|words| {
+                    push_buffer_id(
+                        logical,
+                        None,
+                        None,
+                        BufferPurpose::MerkleLayerScratch,
+                        ordinal()?,
+                        words,
+                        at,
+                    )
+                })
+                .transpose()?,
+        };
         let retained_layers = retained_layer_requirements
             .iter()
             .map(|layer| {
@@ -7014,30 +7135,36 @@ fn append_protocol_buffers(
                         )
                     })
                     .transpose()?;
-                let state_ping = push_buffer_id(
-                    logical,
-                    None,
-                    None,
-                    BufferPurpose::CommitProgressiveStatePing,
-                    ordinal()?,
-                    requirements.leaves.state_ping_words,
-                    at,
-                )?;
-                let state_pong = requirements
-                    .leaves
-                    .state_pong_words
-                    .map(|words| {
-                        push_buffer_id(
-                            logical,
-                            None,
-                            None,
-                            BufferPurpose::CommitProgressiveStatePong,
-                            ordinal()?,
-                            words,
-                            at,
-                        )
-                    })
-                    .transpose()?;
+                let state_ping = match in_place_slab {
+                    Some(slab) => slab,
+                    None => push_buffer_id(
+                        logical,
+                        None,
+                        None,
+                        BufferPurpose::CommitProgressiveStatePing,
+                        ordinal()?,
+                        requirements.leaves.state_ping_words,
+                        at,
+                    )?,
+                };
+                let state_pong = match in_place_slab {
+                    Some(slab) => requirements.leaves.state_pong_words.map(|_| slab),
+                    None => requirements
+                        .leaves
+                        .state_pong_words
+                        .map(|words| {
+                            push_buffer_id(
+                                logical,
+                                None,
+                                None,
+                                BufferPurpose::CommitProgressiveStatePong,
+                                ordinal()?,
+                                words,
+                                at,
+                            )
+                        })
+                        .transpose()?,
+                };
                 let batches = requirements
                     .leaves
                     .batches
@@ -7090,6 +7217,9 @@ fn append_protocol_buffers(
                 .collect::<Result<Vec<_>, ArenaPlanError>>()?;
         logical_commitments.push(LogicalCommitWorkspace {
             id: geometry.id,
+            storage_mode,
+            commit_program,
+            shape_wide_program,
             interpolation_mode: protocol.identity.interpolation_mode,
             config: geometry.config,
             grouped_column_log_sizes: geometry.grouped_column_log_sizes.clone(),
@@ -7946,6 +8076,77 @@ fn append_protocol_buffers(
         quotient_numerator_requirements.lde_tile_words,
         numerator_live,
     )?;
+    let mut released_slabs = logical_commitments
+        .iter()
+        .filter_map(|commitment| {
+            let (
+                ProgressiveCommitStorageMode::InPlaceSlab,
+                ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+                LogicalCommitLeafWorkspace::DomainProgressive { state_ping, .. },
+            ) = (
+                commitment.storage_mode,
+                &commitment.requirements,
+                &commitment.leaf_workspace,
+            )
+            else {
+                return None;
+            };
+            Some(
+                requirements
+                    .leaves
+                    .in_place_slab_words()
+                    .map(|words| (commitment.id, *state_ping, words)),
+            )
+        })
+        .collect::<Result<Vec<_>, PreparedProgressiveCommitError>>()
+        .map_err(ArenaPlanError::ProgressiveCommit)?;
+    released_slabs.sort_by_key(|&(_, _, words)| core::cmp::Reverse(words));
+    let overflow_capacities = released_slabs
+        .iter()
+        .map(|&(_, _, words)| words)
+        .collect::<Vec<_>>();
+    let staged_single_write = (protocol.identity.resident_backend
+        == ResidentBackend::ReplacementV1)
+        .then(|| {
+            quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+                quotient_numerator_config,
+                &quotient_numerator_topologies,
+                &overflow_capacities,
+            )
+            .map_err(ArenaPlanError::QuotientNumeratorStaged)
+        })
+        .transpose()?;
+    let mut staged_overflows = Vec::new();
+    if let Some(plan) = &staged_single_write {
+        for (role, (&used_words, &(commitment, released_slab, capacity_words))) in plan
+            .overflow_role_words()
+            .iter()
+            .zip(&released_slabs)
+            .enumerate()
+        {
+            let staging = push_buffer_id(
+                logical,
+                None,
+                None,
+                BufferPurpose::QuotientNumeratorLdeTile,
+                u32::try_from(role + 1).map_err(|_| ArenaPlanError::SizeOverflow)?,
+                capacity_words,
+                numerator_live,
+            )?;
+            released_commitment_aliases.push(ReleasedCommitmentAlias {
+                commitment,
+                released_slab,
+                quotient_staging: staging,
+                used_words,
+            });
+            staged_overflows.push(LogicalStagedQuotientOverflow {
+                commitment,
+                released_slab,
+                staging,
+                used_words,
+            });
+        }
+    }
     let numerator_columns = opened_columns
         .into_iter()
         .zip(quotient_numerator_topologies)
@@ -7970,6 +8171,8 @@ fn append_protocol_buffers(
         schedule: protocol.identity.quotient_numerator_schedule,
         config: quotient_numerator_config,
         requirements: quotient_numerator_requirements,
+        staged_single_write,
+        staged_overflows,
         columns: numerator_columns,
         oods_sample_points,
         oods_sampled_values,
@@ -8426,12 +8629,32 @@ fn resolve_commitment_slots(
             merkle: merkle_slots,
         }),
     };
-    logical
-        .requirements
-        .arena_slot_requirements(&slots)
-        .map_err(ArenaPlanError::ProgressiveCommit)?;
+    match (logical.storage_mode, &logical.requirements, &slots) {
+        (ProgressiveCommitStorageMode::Separate, requirements, slots) => {
+            requirements
+                .arena_slot_requirements(slots)
+                .map_err(ArenaPlanError::ProgressiveCommit)?;
+        }
+        (
+            ProgressiveCommitStorageMode::InPlaceSlab,
+            ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+            ModeAwareCommitWorkspaceSlots::DomainProgressive(slots),
+        ) => {
+            requirements
+                .arena_slot_requirements_in_place(slots)
+                .map_err(ArenaPlanError::ProgressiveCommit)?;
+        }
+        _ => {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "commitment storage mode does not match its workspace geometry",
+            ));
+        }
+    }
     Ok(PlannedCommitment {
         id: logical.id,
+        storage_mode: logical.storage_mode,
+        commit_program: logical.commit_program,
+        shape_wide_program: logical.shape_wide_program,
         config: logical.config,
         grouped_column_log_sizes: logical.grouped_column_log_sizes,
         grouped_column_sources: logical.grouped_column_sources,
@@ -8743,13 +8966,60 @@ fn resolve_quotient_numerator_slots(
         coefficient_output_ptrs: logical.coefficient_output_ptrs.map(physical).transpose()?,
         lde_tile: logical.lde_tile.map(physical).transpose()?,
     };
-    let workspace_ids = logical
+    let manifest_role_words = logical
+        .staged_single_write
+        .as_ref()
+        .map(|plan| plan.overflow_role_words())
+        .unwrap_or_default();
+    if manifest_role_words.len() != logical.staged_overflows.len() {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "staged quotient overflow role count does not match its manifest",
+        ));
+    }
+    let mut workspace_ids = logical
         .requirements
         .arena_slot_requirements(&slots)
         .map_err(ArenaPlanError::QuotientNumerator)?
         .into_iter()
         .map(|requirement| requirement.id)
         .collect::<std::collections::BTreeSet<_>>();
+    let staged_overflows = logical
+        .staged_overflows
+        .into_iter()
+        .zip(manifest_role_words)
+        .map(|(role, manifest_words)| {
+            let released_slab = binding(role.released_slab)?;
+            let staging = binding(role.staging)?;
+            if role.used_words != manifest_words
+                || role.used_words > staging.len_words
+                || released_slab.physical != staging.physical
+                || released_slab.len_words != staging.len_words
+            {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "staged quotient role is not the exact named released slab",
+                ));
+            }
+            if !workspace_ids.insert(staging.physical) {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "staged quotient overflow aliases a live numerator role",
+                ));
+            }
+            Ok(PlannedStagedQuotientOverflow {
+                commitment: role.commitment,
+                released_slab,
+                staging,
+                used_words: role.used_words,
+            })
+        })
+        .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+    if staged_overflows
+        .windows(2)
+        .any(|pair| pair[0].staging.physical == pair[1].staging.physical)
+    {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "staged quotient overflow roles share one released slab",
+        ));
+    }
     let columns = logical
         .columns
         .into_iter()
@@ -8822,6 +9092,8 @@ fn resolve_quotient_numerator_slots(
         schedule: logical.schedule,
         config: logical.config,
         requirements: logical.requirements,
+        staged_single_write: logical.staged_single_write,
+        staged_overflows,
         columns,
         oods_sample_points,
         oods_sampled_values,
@@ -9766,11 +10038,24 @@ struct ColorUnit {
     occupied_epochs: u16,
 }
 
+#[cfg(test)]
 fn color_logical_buffers(
     logical: &[LogicalBuffer],
     transition_aliases: &[(LogicalBufferId, LogicalBufferId)],
 ) -> Result<(Vec<ArenaBinding>, Vec<ArenaSlotSpec>, usize), ArenaPlanError> {
-    let aliases = validate_transition_aliases(logical, transition_aliases)?;
+    color_logical_buffers_with_released_commitments(logical, transition_aliases, &[])
+}
+
+fn color_logical_buffers_with_released_commitments(
+    logical: &[LogicalBuffer],
+    transition_aliases: &[(LogicalBufferId, LogicalBufferId)],
+    released_commitment_aliases: &[ReleasedCommitmentAlias],
+) -> Result<(Vec<ArenaBinding>, Vec<ArenaSlotSpec>, usize), ArenaPlanError> {
+    let aliases = crate::range_arena::validate_arena_aliases(
+        logical,
+        transition_aliases,
+        released_commitment_aliases,
+    )?;
 
     let mut units = Vec::with_capacity(logical.len() - aliases.pair_count());
     let mut visited = BTreeSet::new();

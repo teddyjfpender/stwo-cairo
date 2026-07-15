@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use stwo_backend_cuda::{ArenaLayout, ArenaRangeSpec, ArenaSlotId, ArenaSlotSpec};
 
 use crate::arena_plan::{
-    ArenaBinding, ArenaPlanError, BufferPurpose, LogicalBuffer, LogicalBufferId, ProofEpoch,
-    ARENA_ALIGNMENT_WORDS,
+    ArenaBinding, ArenaPlanError, BufferPurpose, CommitmentTreeId, LogicalBuffer, LogicalBufferId,
+    ProofEpoch, ARENA_ALIGNMENT_WORDS,
 };
 use crate::range_allocator::{
     allocate_ranges, validate_range_layout, AliasGroupId, RangeId, RangeRequest,
@@ -55,6 +55,16 @@ pub(crate) struct PlannedRangeArena {
     pub(crate) excess_over_raw_peak_words: usize,
     pub(crate) range_view_count: usize,
     pub(crate) range_view_words: usize,
+}
+
+/// Typed non-adjacent reuse owned by replacement-v1. The quotient role is
+/// padded to the full released slab; `used_words` remains the manifest extent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReleasedCommitmentAlias {
+    pub(crate) commitment: CommitmentTreeId,
+    pub(crate) released_slab: LogicalBufferId,
+    pub(crate) quotient_staging: LogicalBufferId,
+    pub(crate) used_words: usize,
 }
 
 /// Validate the only semantic alias admitted by the resident prover: an
@@ -133,11 +143,101 @@ pub(crate) fn validate_transition_aliases(
     })
 }
 
+pub(crate) fn validate_arena_aliases(
+    logical: &[LogicalBuffer],
+    transition_aliases: &[(LogicalBufferId, LogicalBufferId)],
+    released_commitment_aliases: &[ReleasedCommitmentAlias],
+) -> Result<ValidatedTransitionAliases, ArenaPlanError> {
+    let mut validated = validate_transition_aliases(logical, transition_aliases)?;
+    let index_by_id = logical
+        .iter()
+        .enumerate()
+        .map(|(index, buffer)| (buffer.id, index))
+        .collect::<BTreeMap<_, _>>();
+    for (alias_index, alias) in released_commitment_aliases.iter().enumerate() {
+        let released_index = *index_by_id
+            .get(&alias.released_slab)
+            .ok_or(ArenaPlanError::MissingBinding(alias.released_slab))?;
+        let staging_index = *index_by_id
+            .get(&alias.quotient_staging)
+            .ok_or(ArenaPlanError::MissingBinding(alias.quotient_staging))?;
+        let released = &logical[released_index];
+        let staging = &logical[staging_index];
+        let expected_epoch = match alias.commitment {
+            CommitmentTreeId::Preprocessed => ProofEpoch::Ingest,
+            CommitmentTreeId::Base => ProofEpoch::BaseCommit,
+            CommitmentTreeId::Interaction => ProofEpoch::InteractionCommit,
+            CommitmentTreeId::Composition => ProofEpoch::CompositionCommit,
+            CommitmentTreeId::Fri(_) => {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "FRI storage cannot own quotient staging",
+                ));
+            }
+        };
+        let unused = released_index != staging_index
+            && !validated.partner_by_index.contains_key(&released_index)
+            && !validated.partner_by_index.contains_key(&staging_index);
+        if released.purpose != BufferPurpose::CommitProgressiveStatePing
+            || staging.purpose != BufferPurpose::QuotientNumeratorLdeTile
+            || staging.ordinal == 0
+            || released.len_words != staging.len_words
+            || alias.used_words == 0
+            || alias.used_words > staging.len_words
+            || released.lifetime != crate::arena_plan::BufferLifetime::at(expected_epoch)
+            || staging.lifetime != crate::arena_plan::BufferLifetime::at(ProofEpoch::Quotient)
+            || released.lifetime.overlaps(staging.lifetime)
+            || released.lifetime.last as u8 >= staging.lifetime.first as u8
+            || !unused
+        {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "invalid released-commitment quotient-staging alias",
+            ));
+        }
+        let group_index = transition_aliases
+            .len()
+            .checked_add(alias_index)
+            .and_then(|index| index.checked_add(1))
+            .ok_or(ArenaPlanError::SizeOverflow)?;
+        let group =
+            AliasGroupId(u32::try_from(group_index).map_err(|_| ArenaPlanError::SizeOverflow)?);
+        let owner = alias.released_slab.min(alias.quotient_staging);
+        validated
+            .partner_by_index
+            .insert(released_index, staging_index);
+        validated
+            .partner_by_index
+            .insert(staging_index, released_index);
+        validated
+            .group_by_logical
+            .insert(alias.released_slab, group);
+        validated
+            .group_by_logical
+            .insert(alias.quotient_staging, group);
+        validated
+            .slot_owner_by_logical
+            .insert(alias.released_slab, owner);
+        validated
+            .slot_owner_by_logical
+            .insert(alias.quotient_staging, owner);
+        validated.pair_count += 1;
+    }
+    Ok(validated)
+}
+
+#[cfg(test)]
 pub(crate) fn plan_range_arena(
     logical: &[LogicalBuffer],
     transition_aliases: &[(LogicalBufferId, LogicalBufferId)],
 ) -> Result<PlannedRangeArena, ArenaPlanError> {
-    let aliases = validate_transition_aliases(logical, transition_aliases)?;
+    plan_range_arena_with_released_commitments(logical, transition_aliases, &[])
+}
+
+pub(crate) fn plan_range_arena_with_released_commitments(
+    logical: &[LogicalBuffer],
+    transition_aliases: &[(LogicalBufferId, LogicalBufferId)],
+    released_commitment_aliases: &[ReleasedCommitmentAlias],
+) -> Result<PlannedRangeArena, ArenaPlanError> {
+    let aliases = validate_arena_aliases(logical, transition_aliases, released_commitment_aliases)?;
     let requests = logical
         .iter()
         .map(|buffer| RangeRequest {

@@ -14,9 +14,9 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo_backend_cuda::{
     ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitEvaluationGroup,
-    CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
-    DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError, ExecutionTablesHostData,
-    FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
+    CommitProgramBindingError, CudaExecTelemetry, CudaRuntimeError, DecommitAssembly,
+    DecommitColumnSource, DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError,
+    ExecutionTablesHostData, FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
     ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError,
     PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedBlakeGFusedFeed,
     PreparedCommitError, PreparedCommitGraph, PreparedDecommitError, PreparedDecommitGraph,
@@ -31,10 +31,10 @@ use stwo_backend_cuda::{
     PreparedWitnessFeedError, PreparedWitnessFeedGraph, PreparedWitnessGraph,
     PreparedWitnessInputCompactGraph, PreparedWitnessInputGatherError,
     PreparedWitnessInputGatherGraph, PreparedWitnessInputSeedGraph, PreparedWitnessMode,
-    ProgressiveNttLeafFusionMode, RelationChallenges, RelationGraphError, RelationInstanceSources,
-    TraceDecommitSources, TraceSourceGroup, TranscriptInputBinding, TranscriptInputId,
-    TranscriptMirrorReport, TranscriptOutputBinding, TranscriptOutputId, TranscriptSegmentCursor,
-    TranscriptSegmentStart,
+    ProgressiveCommitStorageMode, ProgressiveNttLeafFusionMode, RelationChallenges,
+    RelationGraphError, RelationInstanceSources, TraceDecommitSources, TraceSourceGroup,
+    TranscriptInputBinding, TranscriptInputId, TranscriptMirrorReport, TranscriptOutputBinding,
+    TranscriptOutputId, TranscriptSegmentCursor, TranscriptSegmentStart,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
@@ -427,6 +427,7 @@ pub enum ResidentRuntimeError {
     Graph(GraphError),
     Commit(PreparedCommitError),
     ProgressiveCommit(PreparedProgressiveCommitError),
+    CommitProgramBinding(CommitProgramBindingError),
     CommitModeMismatch,
     Interpolation(PreparedInterpolationError),
     SourceStage(ResidentSourceStageError),
@@ -487,6 +488,12 @@ impl From<PreparedCommitError> for ResidentRuntimeError {
 impl From<PreparedProgressiveCommitError> for ResidentRuntimeError {
     fn from(value: PreparedProgressiveCommitError) -> Self {
         Self::ProgressiveCommit(value)
+    }
+}
+
+impl From<CommitProgramBindingError> for ResidentRuntimeError {
+    fn from(value: CommitProgramBindingError) -> Self {
+        Self::CommitProgramBinding(value)
     }
 }
 
@@ -1719,26 +1726,33 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .iter()
                         .map(|group| group.as_ref().map(|group| group.columns.clone()))
                         .collect();
+                    let ntt_fusion = match protocol_identity.resident_backend {
+                        ResidentBackend::LegacyResident => ProgressiveNttLeafFusionMode::Separate,
+                        ResidentBackend::ReplacementV1 => ProgressiveNttLeafFusionMode::Fused16,
+                    };
+                    let graph = match planned.storage_mode {
+                        ProgressiveCommitStorageMode::Separate => {
+                            PreparedProgressiveCommitGraph::prepare_with_modes_and_ntt_fusion(
+                                arena,
+                                planned.config,
+                                requirements,
+                                slots,
+                                &coefficients,
+                                &flat_retained,
+                                twiddles,
+                                protocol_identity.commit_mode,
+                                protocol_identity.blake2s_interior_fused,
+                                ntt_fusion,
+                            )?
+                        }
+                        ProgressiveCommitStorageMode::InPlaceSlab => planned
+                            .commit_program
+                            .as_ref()
+                            .ok_or(ResidentRuntimeError::CommitModeMismatch)?
+                            .bind(arena, slots, &coefficients, &flat_retained, twiddles)?,
+                    };
                     PreparedResidentCommitment::Progressive {
-                        graph: PreparedProgressiveCommitGraph::prepare_with_modes_and_ntt_fusion(
-                            arena,
-                            planned.config,
-                            requirements,
-                            slots,
-                            &coefficients,
-                            &flat_retained,
-                            twiddles,
-                            protocol_identity.commit_mode,
-                            protocol_identity.blake2s_interior_fused,
-                            match protocol_identity.resident_backend {
-                                ResidentBackend::LegacyResident => {
-                                    ProgressiveNttLeafFusionMode::Separate
-                                }
-                                ResidentBackend::ReplacementV1 => {
-                                    ProgressiveNttLeafFusionMode::Fused16
-                                }
-                            },
-                        )?,
+                        graph,
                         retained_evaluations: grouped_retained,
                     }
                 }
@@ -3181,19 +3195,16 @@ impl<'a> ResidentGraphRuntime<'a> {
                     component: planned.plan.component,
                     role,
                 };
-                if prepared
-                    .source_columns()
-                    .iter()
-                    .zip(&planned.sources)
-                    .any(|(prepared, planned)| match planned {
+                if prepared.source_columns().iter().zip(&planned.sources).any(
+                    |(prepared, planned)| match planned {
                         PlannedFixedTableSource::Arena(binding) => {
                             prepared.arena_slot() != Some(binding.physical)
                         }
                         PlannedFixedTableSource::RegisteredPedersen18 { column } => {
                             prepared.registered_pedersen_index() != Some(*column)
                         }
-                    })
-                    || prepared.source_columns().len() != planned.sources.len()
+                    },
+                ) || prepared.source_columns().len() != planned.sources.len()
                 {
                     return Err(reject("preprocessed sources"));
                 }
