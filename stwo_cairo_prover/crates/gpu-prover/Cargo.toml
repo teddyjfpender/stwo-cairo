@@ -72,6 +72,10 @@ required-features = ["emit-tools"]
 name = "prepared_composition_native"
 required-features = ["direct-retention-test-api"]
 
+[[test]]
+name = "prepared_composition_wave_native"
+required-features = ["direct-retention-test-api"]
+
 [dependencies.stwo-cairo-dev-utils]
 path = "../dev_utils"
 optional = true

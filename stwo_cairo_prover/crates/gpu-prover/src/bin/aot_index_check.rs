@@ -56,13 +56,19 @@ fn main() -> ExitCode {
         Err(error) => return fail(error),
     };
     let manifest_hash = stwo_backend_cuda::aot::loaded_manifest_hash();
+    let embedded_entry_count = stwo_backend_cuda::aot::loaded_kernel_count();
+    let embedded_arch_entry_count =
+        stwo_backend_cuda::aot::loaded_kernel_count_for_arch(sm / 10, sm % 10);
     let missing = keys
         .iter()
         .copied()
         .filter(|key| !stwo_backend_cuda::aot::contains_loaded_kernel(*key, sm / 10, sm % 10))
         .map(|key| format!("{key:016x}"))
         .collect::<Vec<_>>();
-    let pass = manifest_hash != 0 && missing.is_empty();
+    let pass = manifest_hash != 0
+        && missing.is_empty()
+        && embedded_entry_count == keys.len()
+        && embedded_arch_entry_count == keys.len();
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
@@ -70,6 +76,8 @@ fn main() -> ExitCode {
             "sm": sm,
             "loaded_manifest_hash": format!("{manifest_hash:016x}"),
             "required_unique_key_count": keys.len(),
+            "embedded_entry_count": embedded_entry_count,
+            "embedded_arch_entry_count": embedded_arch_entry_count,
             "missing_keys": missing,
         }))
         .unwrap()

@@ -19,6 +19,7 @@
 //!             [--reps 3] [--pipeline <depth>] [--reuse-input] [--adapt-only] \
 //!             [--require-proof-byte-equal] [--require-gpu-native-architecture] \
 //!             [--diagnostic-allow-slow-graph-submit] \
+//!             [--capture-slow-graph-submit] \
 //!             [--operational-safety-reserve-bytes N] \
 //!             [--require-simd-reference-byte-equal] \
 //!             [--require-proof-mutation-rejected] \
@@ -341,13 +342,17 @@ fn gpu_native_prover_config() -> GpuProverConfig {
         runtime_mode,
     )
     .unwrap_or_else(|error| panic!("GPU resident backend gate failed: {error}"));
-    config.allow_slow_graph_submit_diagnostic = graph_submit_gap_diagnostic();
+    assert!(
+        !(graph_submit_gap_diagnostic() && graph_submit_gap_capture()),
+        "graph-submit diagnostic and capture modes are mutually exclusive"
+    );
+    config.allow_slow_graph_submit_diagnostic = graph_submit_gap_budget_relaxed();
     config.operational_safety_reserve_bytes = gpu_bench_physical::operational_safety_reserve_bytes(
         arg("--operational-safety-reserve-bytes"),
     );
     assert!(
         !config.allow_slow_graph_submit_diagnostic || config.strict,
-        "--diagnostic-allow-slow-graph-submit requires the strict ArenaGraph architecture gate"
+        "slow graph-submit capture requires the strict ArenaGraph architecture gate"
     );
     config
 }
@@ -386,6 +391,14 @@ fn graph_submit_gap_diagnostic() -> bool {
     flag("--diagnostic-allow-slow-graph-submit")
 }
 
+fn graph_submit_gap_capture() -> bool {
+    flag("--capture-slow-graph-submit")
+}
+
+fn graph_submit_gap_budget_relaxed() -> bool {
+    graph_submit_gap_diagnostic() || graph_submit_gap_capture()
+}
+
 fn required_gpu_pcs_runtime_mode() -> RequiredCudaPcsRuntimeMode {
     let value = arg("--require-gpu-pcs-runtime-mode")
         .or_else(|| std::env::var("STWO_BENCH_REQUIRE_GPU_PCS_RUNTIME_MODE").ok())
@@ -410,6 +423,14 @@ fn performance_claim_admissible_for(
 ) -> bool {
     performance_measurement_available_for(selected_engine, architecture_required, mode)
         && !diagnostic
+}
+
+fn graph_capture_claim_admissible(
+    base_admissible: bool,
+    capture_enabled: bool,
+    observed_gate: Option<bool>,
+) -> bool {
+    base_admissible && (!capture_enabled || observed_gate == Some(true))
 }
 
 fn performance_measurement_available() -> bool {
@@ -1096,8 +1117,10 @@ fn record_context(backend: &str) -> serde_json::Value {
         "benchmark_diagnostic_mode": graph_submit_gap_diagnostic(),
         "benchmark_diagnostic_reason": graph_submit_gap_diagnostic()
             .then_some("graph-submit-gap-only"),
+        "benchmark_graph_submit_capture_mode": graph_submit_gap_capture(),
         "performance_measurement_available": performance_measurement_available(),
-        "performance_claim_admissible": performance_claim_admissible(),
+        "performance_claim_admissible": performance_claim_admissible()
+            && !graph_submit_gap_capture(),
     });
     merge_json(
         merge_json(
@@ -1128,6 +1151,17 @@ fn gpu_native_pcs_context(telemetry: Option<&CudaPcsDriverTelemetry>) -> serde_j
             "gpu_hot_h2d_bytes": null,
             "gpu_hot_d2h_bytes": null,
             "gpu_hot_allocations": null,
+            "gpu_hot_allocation_bytes": null,
+            "gpu_hot_frees": null,
+            "gpu_hot_d2d_bytes": null,
+            "gpu_hot_memset_bytes": null,
+            "gpu_hot_fill_words": null,
+            "gpu_hot_capture_begins": null,
+            "gpu_hot_capture_finishes": null,
+            "gpu_hot_capture_aborts": null,
+            "gpu_hot_lane_forks": null,
+            "gpu_hot_lane_joins": null,
+            "gpu_graph_submit_gap_ns_total": null,
             "gpu_max_graph_submit_gap_ms": null,
             "gpu_graph_submit_gap_strict_gate_passed": null,
         });
@@ -1165,6 +1199,17 @@ fn pcs_telemetry_json(telemetry: &CudaPcsDriverTelemetry) -> serde_json::Value {
         "gpu_hot_h2d_bytes": exec.map(|value| value.h2d_bytes),
         "gpu_hot_d2h_bytes": exec.map(|value| value.d2h_bytes),
         "gpu_hot_allocations": exec.map(|value| value.allocations),
+        "gpu_hot_allocation_bytes": exec.map(|value| value.allocation_bytes),
+        "gpu_hot_frees": exec.map(|value| value.frees),
+        "gpu_hot_d2d_bytes": exec.map(|value| value.d2d_bytes),
+        "gpu_hot_memset_bytes": exec.map(|value| value.memset_bytes),
+        "gpu_hot_fill_words": exec.map(|value| value.fill_words),
+        "gpu_hot_capture_begins": exec.map(|value| value.capture_begins),
+        "gpu_hot_capture_finishes": exec.map(|value| value.capture_finishes),
+        "gpu_hot_capture_aborts": exec.map(|value| value.capture_aborts),
+        "gpu_hot_lane_forks": exec.map(|value| value.lane_forks),
+        "gpu_hot_lane_joins": exec.map(|value| value.lane_joins),
+        "gpu_graph_submit_gap_ns_total": exec.map(|value| value.graph_submit_gap_ns_total),
         "gpu_max_graph_submit_gap_ms": exec.map(|value| {
             value.graph_submit_gap_ns_max as f64 / 1_000_000.0
         }),
@@ -1213,6 +1258,7 @@ fn merge_json(mut base: serde_json::Value, extra: serde_json::Value) -> serde_js
 
 struct RepOutcome {
     times: Vec<f64>,
+    graph_submit_samples: Vec<Option<GraphSubmitSample>>,
     proof_loop_started_unix_ns: u64,
     proof_loop_finished_unix_ns: u64,
     proof_size: usize,
@@ -1224,6 +1270,83 @@ struct RepOutcome {
     simd_reference: Option<SimdReferenceRecord>,
     proof_mutation: Option<ProofMutationRecord>,
     vram_peak_gb: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphSubmitSample {
+    total_ns: u64,
+    max_ns: u64,
+    graph_launches: u64,
+}
+
+fn last_graph_submit_sample() -> Option<GraphSubmitSample> {
+    let exec = last_gpu_native_pcs_telemetry()?.exec?;
+    Some(GraphSubmitSample {
+        total_ns: exec.graph_submit_gap_ns_total,
+        max_ns: exec.graph_submit_gap_ns_max,
+        graph_launches: exec.graph_launches,
+    })
+}
+
+fn claimed_graph_submit_gap_ns(samples: &[GraphSubmitSample]) -> Option<u64> {
+    let warm_start = usize::from(samples.len() > 1);
+    samples[warm_start..]
+        .iter()
+        .map(|sample| sample.max_ns)
+        .max()
+}
+
+fn graph_submit_gap_average_ns(sample: GraphSubmitSample) -> Option<f64> {
+    let gap_count = sample.graph_launches.checked_sub(1)?;
+    (gap_count != 0).then(|| sample.total_ns as f64 / gap_count as f64)
+}
+
+fn graph_submit_distribution_context(outcome: &RepOutcome) -> serde_json::Value {
+    if outcome.graph_submit_samples.len() != outcome.times.len()
+        || outcome.graph_submit_samples.iter().any(Option::is_none)
+    {
+        return json!({});
+    }
+    let samples = outcome
+        .graph_submit_samples
+        .iter()
+        .map(|sample| sample.expect("graph-submit samples were checked above"))
+        .collect::<Vec<_>>();
+    let max_ns = samples
+        .iter()
+        .map(|sample| sample.max_ns)
+        .collect::<Vec<_>>();
+    let total_ns = samples
+        .iter()
+        .map(|sample| sample.total_ns)
+        .collect::<Vec<_>>();
+    let launches = samples
+        .iter()
+        .map(|sample| sample.graph_launches)
+        .collect::<Vec<_>>();
+    let averages_ns = samples
+        .iter()
+        .map(|sample| graph_submit_gap_average_ns(*sample))
+        .collect::<Vec<_>>();
+    let warm_start = usize::from(samples.len() > 1);
+    let claimed = &samples[warm_start..];
+    let claimed_max_ns = claimed_graph_submit_gap_ns(&samples).unwrap_or(0);
+    let strict_gate_passed = claimed_max_ns < 50_000_000;
+    let claim_admissible = graph_capture_claim_admissible(
+        performance_claim_admissible(),
+        graph_submit_gap_capture(),
+        Some(strict_gate_passed),
+    );
+    json!({
+        "performance_claim_admissible": claim_admissible,
+        "gpu_graph_submit_gap_ns_max_samples": max_ns,
+        "gpu_graph_submit_gap_ns_total_samples": total_ns,
+        "gpu_graph_submit_gap_ns_average_samples": averages_ns,
+        "gpu_graph_submit_launches_samples": launches,
+        "gpu_graph_submit_warm_sample_count": claimed.len(),
+        "gpu_max_graph_submit_gap_ms": claimed_max_ns as f64 / 1_000_000.0,
+        "gpu_graph_submit_gap_strict_gate_passed": strict_gate_passed,
+    })
 }
 
 fn unix_time_ns() -> u64 {
@@ -1603,7 +1726,11 @@ fn print_main_record(
             "simd_reference_s": simd_reference.map(|reference| round3(reference.elapsed_s)),
         }),
     );
-    println!("{}", merge_json(record, record_context(backend)));
+    let record = merge_json(record, record_context(backend));
+    println!(
+        "{}",
+        merge_json(record, graph_submit_distribution_context(outcome))
+    );
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1627,6 +1754,10 @@ enum PieMode {
 /// concurrent scheduler must beat; the metric plumbing here is reused by that
 /// concurrent version (which will overlap the proves on distinct streams).
 fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
+    assert!(
+        !graph_submit_gap_capture(),
+        "--capture-slow-graph-submit is supported only by the standard serial benchmark"
+    );
     assert!(n >= 1, "--resident-pipeline <N> must be >= 1");
     let variant = source.preprocessed_variant();
     prewarm_pedersen_tables(variant);
@@ -1717,6 +1848,10 @@ fn run_resident_pipeline(source: &InputSource, backend: &str, n: usize) {
 /// It also installs migration defaults for the legacy resident generation;
 /// replacement-v1 carries those choices in its sealed execution config.
 fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
+    assert!(
+        !graph_submit_gap_capture(),
+        "--capture-slow-graph-submit is supported only by the standard serial benchmark"
+    );
     assert!(n >= 1, "--resident-concurrent <N> must be >= 1");
     assert_eq!(backend, "cuda", "resident-concurrent is cuda-only");
     assert_eq!(
@@ -1867,6 +2002,10 @@ fn run_pipelined(
     producers: usize,
     pie_mode: PieMode,
 ) {
+    assert!(
+        !graph_submit_gap_capture(),
+        "--capture-slow-graph-submit is supported only by the standard serial benchmark"
+    );
     assert!(depth >= 1, "--pipeline depth must be >= 1");
     assert!(producers >= 1, "--producers must be >= 1");
     let program = source.label();
@@ -1968,6 +2107,7 @@ fn run_pipelined(
 
     let outcome = RepOutcome {
         times,
+        graph_submit_samples: Vec::new(),
         proof_loop_started_unix_ns,
         proof_loop_finished_unix_ns,
         proof_size: validation.proof_size,
@@ -2350,6 +2490,7 @@ fn main() {
     let mut reusable_input = reuse_input.then_some(loaded.input);
 
     let mut times = Vec::new();
+    let mut graph_submit_samples = Vec::with_capacity(reps);
     let mut proofs = Vec::with_capacity(reps);
     let mut vram_peak_gb = 0.0f64;
     let proof_loop_started_unix_ns = unix_time_ns();
@@ -2363,6 +2504,11 @@ fn main() {
             }
         };
         let (proof, elapsed, rep_vram) = prove_sampled!(backend.as_str(), input, variant);
+        graph_submit_samples.push(
+            (engine() == "gpu-native")
+                .then(last_graph_submit_sample)
+                .flatten(),
+        );
         vram_peak_gb = vram_peak_gb.max(rep_vram);
         times.push(elapsed);
         proofs.push(proof);
@@ -2383,6 +2529,7 @@ fn main() {
     let validation = validate_proofs(proofs, true, true, simd_reference.as_ref());
     let outcome = RepOutcome {
         times,
+        graph_submit_samples,
         proof_loop_started_unix_ns,
         proof_loop_finished_unix_ns,
         proof_size: validation.proof_size,
@@ -2418,15 +2565,16 @@ mod tests {
     use stwo_backend_cuda::CudaExecTelemetry;
 
     use super::{
-        cairo_verification_error_class, configure_resident_backend, initial_proof_byte_equal,
+        cairo_verification_error_class, claimed_graph_submit_gap_ns, configure_resident_backend,
+        graph_capture_claim_admissible, graph_submit_gap_average_ns, initial_proof_byte_equal,
         mutate_claimed_sum, parse_resident_backend_args, pcs_telemetry_json,
         performance_claim_admissible_for, proof_byte_equal_gate_passes, proof_mutation_gate_passes,
         quantile, resident_session_telemetry_json, simd_reference_gate_passes,
         simd_reference_reuse_input_gate_passes, throughput_mhz, validate_gpu_native_architecture,
         validate_resident_session_architecture, validate_strict_aot_provenance, AotRuntimeStats,
         CairoVerificationError, CudaPcsDriverTelemetry, CudaPcsRuntimeMode, GpuProverConfig,
-        RequiredCudaPcsRuntimeMode, ResidentBackend, ResidentSessionTelemetry, SecureField,
-        REQUIRED_CUDA_PCS_ARCHITECTURE,
+        GraphSubmitSample, RequiredCudaPcsRuntimeMode, ResidentBackend, ResidentSessionTelemetry,
+        SecureField, REQUIRED_CUDA_PCS_ARCHITECTURE,
     };
 
     fn complete_telemetry(runtime_mode: CudaPcsRuntimeMode) -> CudaPcsDriverTelemetry {
@@ -2590,6 +2738,40 @@ mod tests {
     }
 
     #[test]
+    fn graph_gap_capture_admits_only_an_observed_passing_gate() {
+        assert!(graph_capture_claim_admissible(true, false, None));
+        assert!(graph_capture_claim_admissible(true, true, Some(true)));
+        assert!(!graph_capture_claim_admissible(true, true, Some(false)));
+        assert!(!graph_capture_claim_admissible(true, true, None));
+        assert!(!graph_capture_claim_admissible(false, false, Some(true)));
+    }
+
+    #[test]
+    fn graph_gap_claim_uses_every_warm_repetition() {
+        let sample = |max_ns| GraphSubmitSample {
+            total_ns: max_ns,
+            max_ns,
+            graph_launches: 1,
+        };
+        let samples = [sample(90_000_000), sample(10_000_000), sample(60_000_000)];
+        assert_eq!(claimed_graph_submit_gap_ns(&samples), Some(60_000_000));
+        assert_eq!(claimed_graph_submit_gap_ns(&samples[..1]), Some(90_000_000));
+        assert_eq!(claimed_graph_submit_gap_ns(&[]), None);
+    }
+
+    #[test]
+    fn graph_gap_average_uses_inter_launch_gap_count() {
+        let sample = |graph_launches| GraphSubmitSample {
+            total_ns: 13_000_000,
+            max_ns: 1_000_000,
+            graph_launches,
+        };
+        assert_eq!(graph_submit_gap_average_ns(sample(14)), Some(1_000_000.0));
+        assert_eq!(graph_submit_gap_average_ns(sample(1)), None);
+        assert_eq!(graph_submit_gap_average_ns(sample(0)), None);
+    }
+
+    #[test]
     fn proof_equality_requires_two_comparable_proofs() {
         assert_eq!(initial_proof_byte_equal(true, 1), None);
         assert_eq!(initial_proof_byte_equal(false, 2), None);
@@ -2662,6 +2844,8 @@ mod tests {
         let exec = CudaExecTelemetry {
             graph_launches: 14,
             kernel_launches: 2_530,
+            graph_submit_gap_ns_total: 42_000_000,
+            graph_submit_gap_ns_max: 3_000_000,
             ..CudaExecTelemetry::default()
         };
         let telemetry = CudaPcsDriverTelemetry::completed_arena_graph(exec, 14, 2_530);
@@ -2670,6 +2854,8 @@ mod tests {
         assert_eq!(json["gpu_kernel_launches"], 2_530);
         assert_eq!(json["gpu_expected_graph_launches"], 14);
         assert_eq!(json["gpu_expected_kernel_launches"], 2_530);
+        assert_eq!(json["gpu_graph_submit_gap_ns_total"], 42_000_000);
+        assert_eq!(json["gpu_max_graph_submit_gap_ms"], 3.0);
     }
 
     #[test]

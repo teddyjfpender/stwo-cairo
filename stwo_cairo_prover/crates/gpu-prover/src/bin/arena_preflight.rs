@@ -1171,7 +1171,10 @@ fn main() -> ExitCode {
         };
     let ntt_lde_direct_slab_frontier = match resident_backend {
         ResidentBackend::ReplacementV1 => {
-            match arena_preflight_ntt_lde_receipt::json(&report.arena) {
+            match arena_preflight_ntt_lde_receipt::json(
+                &report.arena,
+                report.composition_slab_counterfactual.as_ref(),
+            ) {
                 Ok(receipt) => receipt,
                 Err(error) => return fail("ntt_lde_direct_slab_frontier", error),
             }

@@ -92,9 +92,14 @@ fn profile_receipt(directory: &Path, fixture: &SealedSnFixture) -> serde_json::V
         .max_evaluation_log_size;
     assert!(matches!(evaluation_log, 24 | 25));
     let receipt = report
-        .arena
-        .composition_slab_arena_counterfactual()
-        .unwrap_or_else(|error| panic!("{} Composition slab receipt: {error:?}", fixture.profile));
+        .composition_slab_counterfactual
+        .as_ref()
+        .unwrap_or_else(|| {
+            panic!(
+                "{} Direct Composition slab receipt is absent",
+                fixture.profile
+            )
+        });
     let expected_coefficient_words = 8usize
         .checked_mul(
             1usize
@@ -121,14 +126,17 @@ fn profile_receipt(directory: &Path, fixture: &SealedSnFixture) -> serde_json::V
         "composition_evaluation_log": evaluation_log,
         "non_output_protocol_geometry_identical": true,
         "commitment_geometry_identical": true,
-        "alias_inputs_reconstructed_and_revalidated": true,
+        "non_output_logical_geometry_identical": true,
+        "production_alias_inputs_revalidated": true,
         "timing_credit": false,
         "fallback_coefficient_buffers": receipt.fallback_coefficient_buffers,
         "fallback_coefficient_words": receipt.fallback_coefficient_words,
         "fallback_coefficient_bytes": bytes(receipt.fallback_coefficient_words),
-        "identical_logical_prefix_buffers": receipt.identical_logical_prefix_buffers,
+        "fallback_coefficient_insertion_index": receipt.fallback_coefficient_insertion_index,
+        "identical_non_output_logical_buffers": receipt.identical_non_output_logical_buffers,
         "transition_alias_pairs": receipt.transition_alias_pairs,
         "released_commitment_alias_pairs": receipt.released_commitment_alias_pairs,
+        "fallback_coefficient_alias_pairs": receipt.fallback_coefficient_alias_pairs,
         "direct": {
             "total_words": receipt.direct.total_words,
             "total_bytes": bytes(receipt.direct.total_words),
@@ -164,7 +172,7 @@ fn profile_receipt(directory: &Path, fixture: &SealedSnFixture) -> serde_json::V
         } else {
             "exact-forced-fallback-minus-direct"
         },
-        "epoch_live_words": epoch_json(&receipt),
+        "epoch_live_words": epoch_json(receipt),
     })
 }
 
@@ -182,7 +190,7 @@ fn direct_composition_slab_physical_receipt_on_sn1_through_sn4() {
     eprintln!(
         "STWO_COMPOSITION_SLAB_PHYSICAL_RECEIPT_JSON={}",
         serde_json::to_string(&serde_json::json!({
-            "schema": "stwo.composition-slab-physical-counterfactual.v1",
+            "schema": "stwo.composition-slab-physical-counterfactual.matrix.v1",
             "profiles": receipts,
         }))
         .unwrap()

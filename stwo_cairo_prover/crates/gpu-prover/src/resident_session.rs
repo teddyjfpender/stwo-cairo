@@ -29,7 +29,10 @@ use stwo_cairo_prover::witness::exec_context::WitnessResidencyReport;
 use stwo_cairo_prover::witness::jit_prove_backend::recorded_casm_input_attempt;
 use stwo_cairo_prover::witness::relation_sources::RelationSourceError;
 
-use crate::arena_plan::{ArenaPlanError, ExecutionTableGeometry, ProofArenaPlan, ResidentBackend};
+use crate::arena_plan::{
+    ArenaPlanError, CompositionSlabArenaCounterfactual, ExecutionTableGeometry, ProofArenaPlan,
+    ResidentBackend,
+};
 use crate::composition_plan::{CompositionPlan, CompositionPlanError, CompositionProofBindings};
 use crate::fixed_table_materializer::{
     PEDERSEN_POINTS_18_COLUMN_COUNT, PEDERSEN_POINTS_18_ROW_COUNT,
@@ -37,8 +40,9 @@ use crate::fixed_table_materializer::{
 use crate::graphs::GraphWorkspace;
 use crate::memory_ledger::{AllocatorPoolCheckpoint, PhysicalMemoryInputs};
 use crate::plan::{ProofPlan, ProofPlanError};
+use crate::prepared_composition::CompositionOutputMode;
 use crate::protocol_discovery::{ProtocolDiscoveryError, ProtocolTranscriptDiscovery};
-use crate::protocol_plan::{ProtocolPlanError, ProtocolPlanPolicy};
+use crate::protocol_plan::{plan_protocol_geometry, ProtocolPlanError, ProtocolPlanPolicy};
 use crate::recorded_witness_inputs::{
     recorded_witness_inputs_for_plan, recorded_witness_inputs_for_raw_replacement_plan,
     DeviceCasmColumn, DeviceCompactColumn, DeviceEdgeColumn, DeviceEdgeSourceKind,
@@ -50,7 +54,8 @@ use crate::replacement_host_cache::{
 };
 use crate::resident_input::ResidentProverInputOwner;
 use crate::resident_runtime::{
-    ResidentGraphRuntime, ResidentRuntimeError, ResidentTraceCommitInputTelemetry,
+    ResidentCompositionCommitTelemetry, ResidentGraphRuntime, ResidentRuntimeError,
+    ResidentStatementRefreshTelemetry, ResidentTraceCommitInputTelemetry,
     ResidentWitnessIngestReport, ResidentWitnessInput, ResidentWitnessInputColumn,
     ResidentWorkspaceIdentity, SealedResidentExecutionConfig,
 };
@@ -73,8 +78,8 @@ use crate::transcript_plan::{
     encode_static_transcript_inputs, CairoBlake2sTranscriptPlan, TranscriptPlanError,
 };
 use crate::workspace_cache::{
-    WorkspaceCache, WorkspaceCacheError, WorkspaceCacheTelemetry, WorkspaceKey,
-    WorkspaceMaterialization,
+    PreparedRuntimeMaterialization, WorkspaceCache, WorkspaceCacheError, WorkspaceCacheTelemetry,
+    WorkspaceKey, WorkspaceMaterialization,
 };
 
 mod physical_memory;
@@ -259,12 +264,17 @@ pub struct ResidentSessionTelemetry {
     pub shape_executable_topology_digest: Option<[u8; 32]>,
     pub workspace_key: Option<WorkspaceKey>,
     pub workspace_materialization: Option<WorkspaceMaterialization>,
+    pub prepared_runtime_materialization: Option<PreparedRuntimeMaterialization>,
+    pub prepared_runtime_capture_ready_at_entry: Option<bool>,
+    pub prepared_runtime_capture_ready_at_exit: Option<bool>,
+    pub statement_refresh: Option<ResidentStatementRefreshTelemetry>,
     pub cache: WorkspaceCacheTelemetry,
     pub arena_words: usize,
     pub transcript_segments: usize,
     pub protocol_policy: Option<ProtocolPlanPolicy>,
     pub prepared_numerator_schedule: Option<PreparedNumeratorSchedule>,
     pub trace_commit_inputs: Option<ResidentTraceCommitInputTelemetry>,
+    pub composition_commit: Option<ResidentCompositionCommitTelemetry>,
     pub base: ResidentSourceStageReport,
     pub twiddles: ResidentTwiddleStageReport,
     pub preprocessed: ResidentPreprocessedStageReport,
@@ -371,6 +381,58 @@ impl ResidentSessionTelemetry {
             ));
         }
         if policy.resident_backend == ResidentBackend::ReplacementV1 {
+            let runtime_materialization = self.prepared_runtime_materialization.ok_or(
+                ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement prepared-runtime materialization was not reported",
+                ),
+            )?;
+            let workspace_materialization = self.workspace_materialization.ok_or(
+                ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement workspace materialization was not reported",
+                ),
+            )?;
+            let expected_capture_ready_at_entry =
+                runtime_materialization == PreparedRuntimeMaterialization::Reused;
+            if self.prepared_runtime_capture_ready_at_entry != Some(expected_capture_ready_at_entry)
+            {
+                return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement prepared-runtime entry capture state disagreed with materialization",
+                ));
+            }
+            if self.prepared_runtime_capture_ready_at_exit != Some(true) {
+                return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement prepared-runtime was not capture-ready at session exit",
+                ));
+            }
+            if workspace_materialization == WorkspaceMaterialization::Materialized
+                && runtime_materialization == PreparedRuntimeMaterialization::Reused
+            {
+                return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement workspace and prepared-runtime reuse disagreed",
+                ));
+            }
+            if (runtime_materialization == PreparedRuntimeMaterialization::Reused)
+                != self.statement_refresh.is_some()
+            {
+                return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement prepared-runtime refresh contract drifted",
+                ));
+            }
+            if self.statement_refresh.is_some_and(|refresh| {
+                refresh.public_memory_seed_h2d_copies > 1
+                    || refresh.public_memory_seed_sync_calls > 1
+                    || (refresh.public_memory_seed_h2d_copies == 0)
+                        != (refresh.public_memory_seed_h2d_bytes == 0)
+                    || (refresh.public_memory_seed_h2d_copies == 0)
+                        != (refresh.public_memory_seed_sync_calls == 0)
+                    || (refresh.composition.h2d_copies == 0) != (refresh.composition.h2d_bytes == 0)
+                    || refresh.composition.sync_calls
+                        != usize::from(refresh.composition.h2d_copies != 0)
+            }) {
+                return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement prepared-runtime refresh telemetry drifted",
+                ));
+            }
             if self.trace_commit_inputs
                 != Some(ResidentTraceCommitInputTelemetry {
                     direct_commitments: 2,
@@ -380,6 +442,41 @@ impl ResidentSessionTelemetry {
             {
                 return Err(ResidentSessionError::StrictArchitectureTelemetry(
                     "replacement trace commits did not report the exact direct-input contract",
+                ));
+            }
+            let composition_commit = self.composition_commit.ok_or(
+                ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement composition commitment telemetry was not reported",
+                ),
+            )?;
+            let execution_receipt = composition_commit.execution_receipt.ok_or(
+                ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement composition execution receipt was not reported",
+                ),
+            )?;
+            if execution_receipt.part_count == 0
+                || execution_receipt.wave_count == 0
+                || execution_receipt.wave_count > execution_receipt.part_count
+            {
+                return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement composition execution receipt was invalid",
+                ));
+            }
+            if !composition_commit.direct_retained_evaluations
+                || composition_commit.direct_split_graphs != 1
+                || composition_commit.precomputed_compact_commitments != 1
+                || composition_commit.coefficient_commit_paths != 0
+                || composition_commit.split_traffic.is_none_or(|traffic| {
+                    traffic.source_image_bytes == 0
+                        || traffic.retained_image_bytes == 0
+                        || traffic.fused_logical_bytes >= traffic.current_logical_bytes
+                        || traffic.fused_kernel_launches >= traffic.current_kernel_launches
+                        || traffic.current_d2d_nodes != 8
+                        || traffic.fused_d2d_nodes != 0
+                })
+            {
+                return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement composition commitment did not use the exact direct split",
                 ));
             }
             let audit =
@@ -464,6 +561,9 @@ impl ResidentSessionTelemetry {
         if execution_tables.sync_calls != 1
             || execution_tables.compact_h2d_copies > 3
             || execution_tables.descriptor_h2d_copies > 2
+            || (self.prepared_runtime_materialization
+                == Some(PreparedRuntimeMaterialization::Reused)
+                && execution_tables.descriptor_h2d_copies != 0)
         {
             return Err(ResidentSessionError::StrictArchitectureTelemetry(
                 "prepared execution-table ingest exceeded its one-fence contract",
@@ -755,12 +855,17 @@ fn run_materialized_session<R>(
         shape_executable_topology_digest: Some(executable.topology().digest()),
         workspace_key: Some(executable.workspace_key()),
         workspace_materialization: Some(workspace_materialization),
+        prepared_runtime_materialization: None,
+        prepared_runtime_capture_ready_at_entry: None,
+        prepared_runtime_capture_ready_at_exit: None,
+        statement_refresh: None,
         cache: WorkspaceCacheTelemetry::default(),
         arena_words: workspace.plan().total_words(),
         transcript_segments: executable.transcript().segments().len(),
         protocol_policy: Some(executable.protocol_policy()),
         prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
         trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
+        composition_commit: Some(runtime.composition_commit_telemetry()),
         base,
         twiddles: ResidentTwiddleStageReport::default(),
         preprocessed,
@@ -1415,8 +1520,15 @@ pub fn with_resident_pre_witness_session<R>(
         })
         .collect::<Vec<_>>();
 
-    let (result, mut telemetry) = {
-        let (workspace, materialization) = cache.materialize_or_reuse(&executable)?;
+    let execution_tables_host = Some(ExecutionTablesHostData {
+        addr_to_id: raw_address_to_id,
+        f252_values: &memory.f252_values,
+        small_values: &memory.small_values,
+    });
+    let (entry, materialization) = cache.materialize_entry_or_reuse(&executable)?;
+    let runtime_lease = entry.arm_runtime_lease()?;
+    let (twiddle_report, preprocessed, arena_words, alpha_words) = {
+        let workspace = runtime_lease.workspace();
         let twiddle_report = if workspace.fixed_twiddles_ready() {
             ResidentTwiddleStageReport {
                 cache_hit: true,
@@ -1433,110 +1545,139 @@ pub fn with_resident_pre_witness_session<R>(
             drop(twiddles);
             report
         };
-        let preprocessed =
-            stage_preprocessed_commitment(workspace, Arc::clone(&preprocessed_trace))?;
-
-        let alpha_words = workspace.plan().relation().requirements.alpha_words;
-        if alpha_words % SECURE_EXTENSION_DEGREE != 0 {
-            return Err(ResidentSessionError::InvalidRelationAlphaWords(alpha_words));
-        }
-        let setup_alphas = vec![SecureField::zero(); alpha_words / SECURE_EXTENSION_DEGREE];
-        let mut runtime = ResidentGraphRuntime::prepare(
-            workspace,
-            ResidentWorkspaceIdentity::of(workspace),
-            execution_config,
-            RelationChallenges {
-                alpha_powers: &setup_alphas,
-                z: SecureField::zero(),
-            },
-            executable.transcript(),
-            executable.composition(),
-            &composition_bindings,
-            Some(ExecutionTablesHostData {
-                addr_to_id: raw_address_to_id,
-                f252_values: &memory.f252_values,
-                small_values: &memory.small_values,
-            }),
-            ec_op_segment_start,
-            Some(Arc::clone(&preprocessed_trace)),
-            Some(&public_memory_seed),
-        )?;
-        let execution_tables_ingest = runtime.execution_tables_ingest_telemetry();
-        let ec_op_ingest = runtime.ec_op_ingest_telemetry();
-        let witness_ingest = runtime.upload_witness_inputs_at_ingest(&witness_inputs)?;
-        let transcript_inputs = encode_static_transcript_inputs(channel_salt, pcs, &planned_claim)?;
-        runtime.upload_transcript_inputs_at_ingest(&transcript_inputs)?;
-        let transcript_ingest_bytes =
-            transcript_inputs
-                .iter()
-                .try_fold(0usize, |bytes, (_, words)| {
-                    words
-                        .len()
-                        .checked_mul(core::mem::size_of::<u32>())
-                        .and_then(|next| bytes.checked_add(next))
-                        .ok_or(ResidentSessionError::SizeOverflow)
-                })?;
-        let session_ns = session_start.elapsed().as_nanos();
-        let mut telemetry = ResidentSessionTelemetry {
-            host_preparation: Some(ResidentHostPreparationAudit {
-                backend: input_backend,
-                ingest_ns: ingress_audit.ingest_ns,
-                session_ns,
-                total_ns: ingress_audit.ingest_ns.saturating_add(session_ns),
-                ownership: ResidentHostOwnershipContract {
-                    prover_input_moves: 1,
-                    prover_input_clones: 0,
-                    memory_slab_clones: 0,
-                    casm_slab_clones: 0,
-                    execution_memory_arc_clones: 1,
-                    recorded_program_arc_clones: usize::from(
-                        input_backend == ResidentBackend::ReplacementV1,
-                    ) * recorded.lanes.len(),
-                },
-                claim_generator_constructions: ingress_audit.claim_generator_constructions,
-                replacement_host_cache: ingress_audit.replacement_host_cache,
-            }),
-            shape_executable_materialization: Some(executable_materialization),
-            shape_executable_cache,
-            shape_executable_topology_digest: Some(executable.topology().digest()),
-            workspace_key: Some(executable.workspace_key()),
-            workspace_materialization: Some(materialization),
-            cache: WorkspaceCacheTelemetry::default(),
-            arena_words: workspace.plan().total_words(),
-            transcript_segments: executable.transcript().segments().len(),
-            protocol_policy: Some(executable.protocol_policy()),
-            prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
-            trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
-            base: ResidentSourceStageReport::default(),
-            twiddles: twiddle_report,
-            preprocessed,
-            lookups: ResidentLookupStageReport::default(),
-            transcript_ingest_bytes,
-            transcript_ingest_copies: transcript_inputs.len(),
-            witness: WitnessResidencyReport::default(),
-            execution_tables_ingest,
-            ec_op_ingest,
-            recorded_witness_ingest: witness_ingest,
-            allocator_pool_checkpoint: None,
-            physical_memory_inputs: policy_inputs(operational_safety_reserve_bytes)?,
-            physical_memory_checkpoint_error: None,
-        };
-        let result = run(
-            &mut runtime,
-            ResidentSessionArtifacts {
-                claim: &planned_claim,
-                proof_plan: &exact_plan,
-                discovery: executable.discovery(),
-                transcript_plan: executable.transcript(),
-                composition_plan: executable.composition(),
-                telemetry: &telemetry,
-            },
-        )?;
-        if let Err(error) = capture_pool_checkpoint(workspace, &mut telemetry) {
-            telemetry.physical_memory_checkpoint_error = Some(error.to_string());
-        }
-        (result, telemetry)
+        (
+            twiddle_report,
+            stage_preprocessed_commitment(workspace, Arc::clone(&preprocessed_trace))?,
+            workspace.plan().total_words(),
+            workspace.plan().relation().requirements.alpha_words,
+        )
     };
+    if alpha_words % SECURE_EXTENSION_DEGREE != 0 {
+        return Err(ResidentSessionError::InvalidRelationAlphaWords(alpha_words));
+    }
+
+    let runtime_session: Result<(R, ResidentSessionTelemetry), ResidentSessionError> =
+        runtime_lease.with_runtime(
+            |workspace| {
+                let setup_alphas = vec![SecureField::zero(); alpha_words / SECURE_EXTENSION_DEGREE];
+                ResidentGraphRuntime::prepare(
+                    workspace,
+                    ResidentWorkspaceIdentity::of(workspace),
+                    execution_config,
+                    RelationChallenges {
+                        alpha_powers: &setup_alphas,
+                        z: SecureField::zero(),
+                    },
+                    executable.transcript(),
+                    executable.composition(),
+                    &composition_bindings,
+                    execution_tables_host,
+                    ec_op_segment_start,
+                    Some(Arc::clone(&preprocessed_trace)),
+                    Some(&public_memory_seed),
+                )
+            },
+            |runtime, runtime_materialization| {
+                let statement_refresh = (runtime_materialization
+                    == PreparedRuntimeMaterialization::Reused)
+                    .then(|| {
+                        runtime.refresh_statement_inputs(
+                            &composition_bindings,
+                            execution_tables_host,
+                            ec_op_segment_start,
+                            Some(&public_memory_seed),
+                        )
+                    })
+                    .transpose()?;
+                let execution_tables_ingest = runtime.execution_tables_ingest_telemetry();
+                let ec_op_ingest = runtime.ec_op_ingest_telemetry();
+                let prepared_runtime_capture_ready_at_entry = runtime.prepared_capture_ready()?;
+                let witness_ingest = runtime.upload_witness_inputs_at_ingest(&witness_inputs)?;
+                let transcript_inputs =
+                    encode_static_transcript_inputs(channel_salt, pcs, &planned_claim)?;
+                runtime.upload_transcript_inputs_at_ingest(&transcript_inputs)?;
+                let transcript_ingest_bytes =
+                    transcript_inputs
+                        .iter()
+                        .try_fold(0usize, |bytes, (_, words)| {
+                            words
+                                .len()
+                                .checked_mul(core::mem::size_of::<u32>())
+                                .and_then(|next| bytes.checked_add(next))
+                                .ok_or(ResidentSessionError::SizeOverflow)
+                        })?;
+                let session_ns = session_start.elapsed().as_nanos();
+                let mut telemetry = ResidentSessionTelemetry {
+                    host_preparation: Some(ResidentHostPreparationAudit {
+                        backend: input_backend,
+                        ingest_ns: ingress_audit.ingest_ns,
+                        session_ns,
+                        total_ns: ingress_audit.ingest_ns.saturating_add(session_ns),
+                        ownership: ResidentHostOwnershipContract {
+                            prover_input_moves: 1,
+                            prover_input_clones: 0,
+                            memory_slab_clones: 0,
+                            casm_slab_clones: 0,
+                            execution_memory_arc_clones: 1,
+                            recorded_program_arc_clones: usize::from(
+                                input_backend == ResidentBackend::ReplacementV1,
+                            ) * recorded.lanes.len(),
+                        },
+                        claim_generator_constructions: ingress_audit.claim_generator_constructions,
+                        replacement_host_cache: ingress_audit.replacement_host_cache,
+                    }),
+                    shape_executable_materialization: Some(executable_materialization),
+                    shape_executable_cache,
+                    shape_executable_topology_digest: Some(executable.topology().digest()),
+                    workspace_key: Some(executable.workspace_key()),
+                    workspace_materialization: Some(materialization),
+                    prepared_runtime_materialization: Some(runtime_materialization),
+                    prepared_runtime_capture_ready_at_entry: Some(
+                        prepared_runtime_capture_ready_at_entry,
+                    ),
+                    prepared_runtime_capture_ready_at_exit: None,
+                    statement_refresh,
+                    cache: WorkspaceCacheTelemetry::default(),
+                    arena_words,
+                    transcript_segments: executable.transcript().segments().len(),
+                    protocol_policy: Some(executable.protocol_policy()),
+                    prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
+                    trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
+                    composition_commit: Some(runtime.composition_commit_telemetry()),
+                    base: ResidentSourceStageReport::default(),
+                    twiddles: twiddle_report,
+                    preprocessed,
+                    lookups: ResidentLookupStageReport::default(),
+                    transcript_ingest_bytes,
+                    transcript_ingest_copies: transcript_inputs.len(),
+                    witness: WitnessResidencyReport::default(),
+                    execution_tables_ingest,
+                    ec_op_ingest,
+                    recorded_witness_ingest: witness_ingest,
+                    allocator_pool_checkpoint: None,
+                    physical_memory_inputs: policy_inputs(operational_safety_reserve_bytes)?,
+                    physical_memory_checkpoint_error: None,
+                };
+                let result = run(
+                    runtime,
+                    ResidentSessionArtifacts {
+                        claim: &planned_claim,
+                        proof_plan: &exact_plan,
+                        discovery: executable.discovery(),
+                        transcript_plan: executable.transcript(),
+                        composition_plan: executable.composition(),
+                        telemetry: &telemetry,
+                    },
+                )?;
+                runtime.require_complete_captured_topology()?;
+                telemetry.prepared_runtime_capture_ready_at_exit = Some(true);
+                Ok((result, telemetry))
+            },
+        );
+    let (result, mut telemetry) = runtime_session?;
+    if let Err(error) = capture_pool_checkpoint(entry.workspace(), &mut telemetry) {
+        telemetry.physical_memory_checkpoint_error = Some(error.to_string());
+    }
     telemetry.cache = cache.telemetry();
     Ok((result, telemetry))
 }
@@ -1617,6 +1758,9 @@ pub struct ResidentPreflightReport {
     pub multiplicities: crate::multiplicity_pipeline::GraphAMultiplicityPlan,
     /// The full arena plan the workspace cache would materialize.
     pub arena: Arc<ProofArenaPlan>,
+    /// Production-order-exact comparison against a second complete build with
+    /// only Direct Composition output forced back to CoefficientSplit.
+    pub composition_slab_counterfactual: Option<CompositionSlabArenaCounterfactual>,
     pub transcript_segments: usize,
     /// Persistent host-control-plane result used by the real preflight path.
     pub shape_executable_materialization: ShapeExecutableMaterialization,
@@ -1844,6 +1988,12 @@ fn plan_resident_preflight_with_cache_source(
             Err(other) => return Err(ResidentSessionError::from(other).into()),
         };
     let memory = &recorded.execution_memory;
+    let execution_tables = ExecutionTableGeometry::new(
+        memory.address_to_id.len(),
+        memory.f252_values.len(),
+        memory.small_values.len(),
+    )
+    .with_public_memory_entries(public_memory_entries);
     let control_plane_start = Instant::now();
     let selection = executable_cache
         .compile_or_bind(ShapeCompileRequest {
@@ -1852,18 +2002,48 @@ fn plan_resident_preflight_with_cache_source(
             preprocessed_trace,
             pcs,
             include_all_preprocessed_columns,
-            execution_tables: Some(
-                ExecutionTableGeometry::new(
-                    memory.address_to_id.len(),
-                    memory.f252_values.len(),
-                    memory.small_values.len(),
-                )
-                .with_public_memory_entries(public_memory_entries),
-            ),
+            execution_tables: Some(execution_tables),
             policy: protocol_policy,
         })
         .map_err(ResidentSessionError::from)?;
     let shape_executable_control_plane_ns = control_plane_start.elapsed().as_nanos();
+    let composition_slab_counterfactual = if selection
+        .executable
+        .arena()
+        .composition()
+        .output_plan
+        .mode()
+        == CompositionOutputMode::DirectRetainedEvaluations
+    {
+        let protocol = plan_protocol_geometry(
+            &exact_plan,
+            &planned_claim,
+            preprocessed_trace,
+            &pcs,
+            include_all_preprocessed_columns,
+            protocol_policy,
+            selection.executable.transcript(),
+            selection.executable.discovery(),
+            selection.executable.composition(),
+        )
+        .map_err(ResidentSessionError::from)?;
+        let fallback = ProofArenaPlan::build_with_execution_tables_forced_composition_coefficients(
+            &exact_plan,
+            &protocol,
+            selection.executable.composition(),
+            execution_tables,
+        )
+        .map_err(ResidentSessionError::from)?;
+        Some(
+            selection
+                .executable
+                .arena()
+                .composition_slab_arena_counterfactual(&fallback)
+                .map_err(ResidentSessionError::from)?,
+        )
+    } else {
+        None
+    };
 
     let present_components: Vec<&'static str> = exact_plan
         .components
@@ -1886,6 +2066,7 @@ fn plan_resident_preflight_with_cache_source(
         recorded_lanes,
         multiplicities,
         arena: Arc::clone(selection.executable.arena()),
+        composition_slab_counterfactual,
         transcript_segments: selection.executable.transcript().segments().len(),
         shape_executable_materialization: selection.materialization,
         shape_executable_cache: executable_cache.telemetry(),
@@ -2876,6 +3057,10 @@ mod tests {
                 stwo_cairo_prover::witness::proof_shape::ProofShapeKey(9),
                 11,
             )),
+            workspace_materialization: Some(WorkspaceMaterialization::Materialized),
+            prepared_runtime_materialization: Some(PreparedRuntimeMaterialization::Materialized),
+            prepared_runtime_capture_ready_at_entry: Some(false),
+            prepared_runtime_capture_ready_at_exit: Some(true),
             protocol_policy: Some(policy),
             prepared_numerator_schedule: Some(PreparedNumeratorSchedule::StagedPackedSingleWrite {
                 packed_output_rows: 1,
@@ -2884,6 +3069,21 @@ mod tests {
                 direct_commitments: 2,
                 separate_interpolation_graph_invocations: 0,
                 separate_interpolation_kernel_launches: 0,
+            }),
+            composition_commit: Some(ResidentCompositionCommitTelemetry {
+                direct_retained_evaluations: true,
+                direct_split_graphs: 1,
+                precomputed_compact_commitments: 1,
+                coefficient_commit_paths: 0,
+                split_traffic: Some(
+                    stwo_backend_cuda::CompositionSplitProgram::compile(24)
+                        .unwrap()
+                        .traffic(),
+                ),
+                execution_receipt: Some(crate::prepared_composition::CompositionExecutionReceipt {
+                    part_count: 2,
+                    wave_count: 1,
+                }),
             }),
             execution_tables_ingest: Some(PreparedExecutionTablesIngestTelemetry {
                 compact_h2d_bytes: 0,
@@ -2895,6 +3095,76 @@ mod tests {
             ..ResidentSessionTelemetry::default()
         };
         assert!(valid.require_strict_graph_a().is_ok());
+
+        let mut missing_composition_execution = valid.clone();
+        missing_composition_execution
+            .composition_commit
+            .as_mut()
+            .unwrap()
+            .execution_receipt = None;
+        assert!(missing_composition_execution
+            .require_strict_graph_a()
+            .is_err());
+
+        let mut warm = valid.clone();
+        warm.workspace_materialization = Some(WorkspaceMaterialization::Reused);
+        warm.prepared_runtime_materialization = Some(PreparedRuntimeMaterialization::Reused);
+        warm.prepared_runtime_capture_ready_at_entry = Some(true);
+        warm.statement_refresh = Some(ResidentStatementRefreshTelemetry::default());
+        warm.execution_tables_ingest
+            .as_mut()
+            .unwrap()
+            .descriptor_h2d_copies = 0;
+        assert!(warm.require_strict_graph_a().is_ok());
+
+        let mut missing_capture_entry = valid.clone();
+        missing_capture_entry.prepared_runtime_capture_ready_at_entry = None;
+        assert!(missing_capture_entry.require_strict_graph_a().is_err());
+
+        let mut cold_capture_ready_at_entry = valid.clone();
+        cold_capture_ready_at_entry.prepared_runtime_capture_ready_at_entry = Some(true);
+        assert!(cold_capture_ready_at_entry
+            .require_strict_graph_a()
+            .is_err());
+
+        let mut warm_capture_not_ready_at_entry = warm.clone();
+        warm_capture_not_ready_at_entry.prepared_runtime_capture_ready_at_entry = Some(false);
+        assert!(warm_capture_not_ready_at_entry
+            .require_strict_graph_a()
+            .is_err());
+
+        let mut incomplete_capture_exit = valid.clone();
+        incomplete_capture_exit.prepared_runtime_capture_ready_at_exit = Some(false);
+        assert!(incomplete_capture_exit.require_strict_graph_a().is_err());
+
+        let mut mismatched_reuse = warm;
+        mismatched_reuse.workspace_materialization = Some(WorkspaceMaterialization::Materialized);
+        assert!(mismatched_reuse.require_strict_graph_a().is_err());
+
+        let mut stale_statement = valid.clone();
+        stale_statement.workspace_materialization = Some(WorkspaceMaterialization::Reused);
+        stale_statement.prepared_runtime_materialization =
+            Some(PreparedRuntimeMaterialization::Reused);
+        assert!(stale_statement.require_strict_graph_a().is_err());
+
+        let mut coefficient_composition = valid.clone();
+        coefficient_composition
+            .composition_commit
+            .as_mut()
+            .unwrap()
+            .coefficient_commit_paths = 1;
+        assert!(coefficient_composition.require_strict_graph_a().is_err());
+
+        let mut copied_composition = valid.clone();
+        copied_composition
+            .composition_commit
+            .as_mut()
+            .unwrap()
+            .split_traffic
+            .as_mut()
+            .unwrap()
+            .fused_d2d_nodes = 1;
+        assert!(copied_composition.require_strict_graph_a().is_err());
 
         for trace_commit_inputs in [
             None,

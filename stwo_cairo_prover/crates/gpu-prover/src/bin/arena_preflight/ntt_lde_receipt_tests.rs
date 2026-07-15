@@ -101,3 +101,24 @@ fn butterfly_with_zero_is_twiddle_independent_duplication() {
         assert_eq!((left, right), (value, value));
     }
 }
+
+#[test]
+fn direct_coverage_rejects_missing_canonical_column() {
+    let batches = [vec![0, 1], vec![3]];
+    assert!(validate_exact_canonical_coverage(4, batches.iter().map(Vec::as_slice),).is_err());
+}
+
+#[test]
+fn direct_coverage_rejects_duplicate_canonical_column() {
+    let batches = [vec![0, 1], vec![1, 2]];
+    assert!(validate_exact_canonical_coverage(3, batches.iter().map(Vec::as_slice),).is_err());
+}
+
+#[test]
+fn direct_coverage_requires_exact_canonical_order() {
+    let batches = [vec![0, 1], vec![2, 3]];
+    validate_exact_canonical_coverage(4, batches.iter().map(Vec::as_slice)).unwrap();
+
+    let reordered = [vec![0, 2], vec![1, 3]];
+    assert!(validate_exact_canonical_coverage(4, reordered.iter().map(Vec::as_slice),).is_err());
+}

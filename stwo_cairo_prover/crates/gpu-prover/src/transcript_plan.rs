@@ -52,6 +52,20 @@ pub enum CairoTranscriptInput {
     QueryPowNonce,
 }
 
+/// Canonical, complete host-ingest set. Every other transcript input is
+/// produced by a prepared device graph after a Fiat-Shamir boundary.
+pub const CAIRO_STATIC_TRANSCRIPT_INPUTS: [CairoTranscriptInput; 9] = [
+    CairoTranscriptInput::ChannelSalt,
+    CairoTranscriptInput::PcsConfig,
+    CairoTranscriptInput::ClaimComponentCount,
+    CairoTranscriptInput::ClaimEnableBits,
+    CairoTranscriptInput::ClaimLogSizes,
+    CairoTranscriptInput::ClaimProgramLength,
+    CairoTranscriptInput::ClaimPublicData,
+    CairoTranscriptInput::ClaimOutputRoot,
+    CairoTranscriptInput::ClaimProgramRoot,
+];
+
 impl CairoTranscriptInput {
     pub fn id(self) -> Result<TranscriptInputId, TranscriptPlanError> {
         let id = match self {

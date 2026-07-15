@@ -9,8 +9,8 @@ use stwo_backend_cuda::{
     OodsSourceKind, QuotientNumeratorSourceKind, TraceTreeRole,
 };
 use stwo_cairo_gpu_prover::arena_plan::{
-    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, OpenedColumnSource, PlannedCommitment,
-    ProofArenaPlan, ProofEpoch,
+    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, CompositionSlabArenaCounterfactual,
+    OpenedColumnSource, PlannedCommitment, ProofArenaPlan, ProofEpoch,
 };
 use stwo_cairo_gpu_prover::prepared_composition::CompositionOutputMode;
 
@@ -65,9 +65,13 @@ impl Totals {
     }
 }
 
-pub(crate) fn json(arena: &ProofArenaPlan) -> Result<Value, String> {
+pub(crate) fn json(
+    arena: &ProofArenaPlan,
+    composition_slab: Option<&CompositionSlabArenaCounterfactual>,
+) -> Result<Value, String> {
     validate_late_consumers(arena)?;
-    let (composition_slab_physical, composition_slab_granted_bytes) = physical::json(arena)?;
+    let (composition_slab_physical, composition_slab_granted_bytes) =
+        physical::json(composition_slab)?;
     let mut totals = Totals::default();
     let mut trees = Vec::new();
     for tree in [
@@ -103,7 +107,6 @@ pub(crate) fn json(arena: &ProofArenaPlan) -> Result<Value, String> {
         ],
         "unqualified_gates": [
             "Composition L24/L25 native output, leaf, retained-layer, and root byte identity",
-            "sealed adapted-SN1-SN4 Composition physical receipt test execution",
             "counter-enabled replay timing after byte qualification",
         ],
         "h100_timing_credit_ns": 0,

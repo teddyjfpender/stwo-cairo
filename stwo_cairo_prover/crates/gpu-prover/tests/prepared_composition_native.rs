@@ -168,6 +168,7 @@ fn real_component_and_plan() -> (RangeCheckComponent, CompositionPlan) {
             total_constraints,
             max_evaluation_log_size: EVALUATION_LOG_SIZE,
             components: vec![component_plan],
+            wave_kernels: Vec::new(),
         },
     )
 }
@@ -683,6 +684,7 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
         total_constraints: 3 * constraints,
         max_evaluation_log_size: fallback.evaluation_log_size,
         components: vec![direct_a.clone(), fallback.clone(), direct_b.clone()],
+        wave_kernels: Vec::new(),
     };
     let source = |slot, log_size| CompositionCoefficientSource { slot, log_size };
     // Exact evaluator order is D,F,D,F,D,F: preprocessed, base, then four
@@ -1012,6 +1014,7 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
         total_constraints: 2 * constraints,
         max_evaluation_log_size: EVALUATION_LOG_SIZE,
         components: vec![direct_a, all_direct_b],
+        wave_kernels: Vec::new(),
     };
     let all_direct_trace = topology();
     let all_direct_baseline =
@@ -1226,6 +1229,7 @@ fn serial_and_wide_modes_match_cpu_and_each_other() {
             lower_component_plan("range_check_6", &component_6, 0),
             lower_component_plan("range_check_8", &component_8, constraints_6),
         ],
+        wave_kernels: Vec::new(),
     };
     let source = |slot, log_size| CompositionCoefficientSource { slot, log_size };
     let trace = CompositionTraceTopology {

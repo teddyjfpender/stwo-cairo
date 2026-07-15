@@ -1063,7 +1063,13 @@ where
         input: ProverInput,
         params: ProverParameters,
     ) -> Result<ResidentPreparationState, GpuError> {
-        let (_, telemetry) = self.with_strict_resident_session(input, params, |_, _| Ok(()))?;
+        let (_, telemetry) = self.with_strict_resident_session(input, params, |runtime, _| {
+            if !runtime.prepared_capture_ready()? {
+                runtime.capture_all_prepared_subgraphs()?;
+            }
+            runtime.require_complete_captured_topology()?;
+            Ok(())
+        })?;
         Ok(ResidentPreparationState {
             telemetry,
             readiness: ResidentExecutionReadiness::ReadyForResidentProofReplay,
@@ -1493,13 +1499,14 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
         ),
         GpuError,
     > {
+        self.last_pcs_telemetry = None;
+        self.last_resident_session_telemetry = None;
+        self.last_aot_stats = None;
         if !self.config.strict {
             return Err(GpuError::Config(
                 "resident Blake2s proving requires strict GPU-native mode".to_string(),
             ));
         }
-        self.last_pcs_telemetry = None;
-        self.last_aot_stats = None;
         aot::reset_runtime_stats();
         let allow_slow_graph_submit_diagnostic = self.config.allow_slow_graph_submit_diagnostic;
 
@@ -1517,7 +1524,16 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
             session_telemetry,
         ) = self.with_strict_resident_session(input, params, |runtime, artifacts| {
             runtime.require_prepared_witness_coverage()?;
-            runtime.capture_all_prepared_subgraphs()?;
+            if artifacts
+                .telemetry
+                .prepared_runtime_materialization
+                .is_none()
+            {
+                return Err(ResidentRuntimeError::MissingPreparedRuntimeMaterialization);
+            }
+            if !runtime.prepared_capture_ready()? {
+                runtime.capture_all_prepared_subgraphs()?;
+            }
             let expected_graphs = u64::try_from(runtime.require_complete_captured_topology()?)
                 .map_err(|_| ResidentRuntimeError::FriRoundIndexTooLarge(usize::MAX))?;
             let expected_kernel_launches = runtime.captured_graph_kernel_node_count()?;
@@ -1525,7 +1541,7 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
                 .workspace_proof_bundle_bytes()
                 .ok_or(ResidentRuntimeError::TranscriptRequirementsMismatch)?;
             runtime.begin_hot_path_telemetry();
-            runtime.replay_all_prepared_subgraphs(2)?;
+            runtime.replay_all_prepared_subgraphs()?;
             let bundle = runtime.read_proof_bundle_once()?;
             let exec = runtime.require_hot_path_budget(resident_hot_path_budget(
                 transcript_mode,
@@ -1580,12 +1596,11 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
             lifting_log_size,
         )?;
 
-        self.last_pcs_telemetry = Some(CudaPcsDriverTelemetry::completed_arena_graph(
+        let pcs_telemetry = CudaPcsDriverTelemetry::completed_arena_graph(
             exec,
             expected_graphs,
             expected_kernel_launches,
-        ));
-        self.last_resident_session_telemetry = Some(session_telemetry);
+        );
         let aot_stats = aot::runtime_stats();
         if aot_stats.aot_misses != 0
             || aot_stats.runtime_loads != 0
@@ -1596,19 +1611,20 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
                 "strict GPU-native AOT provenance failed: {aot_stats:?}"
             )));
         }
+
+        let proof = CairoProof {
+            claim,
+            interaction_pow: bundle.interaction_pow,
+            interaction_claim,
+            extended_stark_proof: proof,
+            channel_salt: params.channel_salt,
+            preprocessed_trace_variant: params.preprocessed_trace,
+        };
+        self.last_pcs_telemetry = Some(pcs_telemetry);
+        self.last_resident_session_telemetry = Some(session_telemetry);
         self.last_aot_stats = Some(aot_stats);
 
-        Ok((
-            CairoProof {
-                claim,
-                interaction_pow: bundle.interaction_pow,
-                interaction_claim,
-                extended_stark_proof: proof,
-                channel_salt: params.channel_salt,
-                preprocessed_trace_variant: params.preprocessed_trace,
-            },
-            transcript_mirror,
-        ))
+        Ok((proof, transcript_mirror))
     }
 }
 

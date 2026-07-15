@@ -15,20 +15,21 @@ use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo_backend_cuda::{
     ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitCoefficientGroup,
     CommitEvaluationGroup, CommitProgram, CompactDomainBindingError, CompactDomainProgram,
-    CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
-    DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError,
-    DirectCompactDomainBindingError, DomainCooperativeBindingError, DomainCooperativeProgram,
-    ExecutionTablesHostData, FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
-    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError,
-    PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedBlakeGFusedFeed,
-    PreparedCommitError, PreparedCommitGraph, PreparedCompactDomainCommitGraph,
-    PreparedDecommitError, PreparedDecommitGraph, PreparedDirectCompactDomainCommitGraph,
-    PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
-    PreparedExecutionTablesError, PreparedExecutionTablesGraph,
+    CompositionSplitTraffic, CudaExecContext, CudaExecTelemetry, CudaRuntimeError,
+    DecommitAssembly, DecommitColumnSource, DecommitTreeGeometry, DecommitTreeSources,
+    DeviceTranscriptError, DirectCompactDomainBindingError, DomainCooperativeBindingError,
+    DomainCooperativeProgram, ExecutionTablesHostData, FixedTableSourceColumn,
+    FriDecommitOwnedSources, MemoryBaseTracePart, ModeAwareCommitWorkspaceRequirements,
+    ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError, PreparedBlake2sPowGraph,
+    PreparedBlake2sTranscript, PreparedBlakeGFusedFeed, PreparedCommitError, PreparedCommitGraph,
+    PreparedCompactDomainCommitGraph, PreparedDecommitError, PreparedDecommitGraph,
+    PreparedDirectCompactDomainCommitGraph, PreparedEcOpError, PreparedEcOpGraph,
+    PreparedEcOpIngestTelemetry, PreparedExecutionTablesError, PreparedExecutionTablesGraph,
     PreparedExecutionTablesIngestTelemetry, PreparedFixedTableError, PreparedFixedTableGraph,
     PreparedFriError, PreparedFriFinalError, PreparedFriFinalGraph, PreparedFriGraph,
     PreparedInterpolationError, PreparedInterpolationGraph, PreparedMemoryBaseTraceError,
-    PreparedMemoryBaseTraceGraph, PreparedNumeratorSchedule, PreparedProgressiveCommitError,
+    PreparedMemoryBaseTraceGraph, PreparedNumeratorSchedule,
+    PreparedPrecomputedCompactDomainCommitGraph, PreparedProgressiveCommitError,
     PreparedProgressiveCommitGraph, PreparedRelationGraph, PreparedWitnessCasmInputError,
     PreparedWitnessCasmInputStage, PreparedWitnessError, PreparedWitnessFeedClearGraph,
     PreparedWitnessFeedError, PreparedWitnessFeedGraph, PreparedWitnessGraph,
@@ -50,9 +51,12 @@ use crate::arena_plan::{
 use crate::composition_plan::CompositionProofBindings;
 use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
 use crate::graphs::{
-    bind_arena_binding, GraphCaptureStatus, GraphError, GraphSegment, GraphWorkspace,
+    bind_arena_binding, GraphCaptureStatus, GraphError, GraphKey, GraphSegment, GraphWorkspace,
 };
 use crate::multiplicity_pipeline::{FixedMultiplicityCoverageGap, MultiplicityFeedBlocker};
+use crate::prepared_composition::{
+    CompositionBindingRefreshTelemetry, CompositionExecutionReceipt, CompositionOutputMode,
+};
 use crate::proof_bundle::{
     ResidentProofBundle, ResidentProofBundleError, ResidentProofBundleLayout,
 };
@@ -64,14 +68,45 @@ use crate::resident_direct_commit::{
 };
 use crate::resident_oods::{ResidentOodsError, ResidentOodsPipeline};
 use crate::resident_sources::{
-    commitment_groups, prepare_commitment_interpolation, ResidentSourceStageError,
+    commitment_group, commitment_groups, prepare_commitment_interpolation, ResidentSourceStageError,
 };
 use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::transcript_plan::{
     CairoBlake2sTranscriptPlan, CairoTranscriptInput, CairoTranscriptOutput,
     CairoTranscriptSegment, TranscriptPlanError, TranscriptSegmentPlan,
+    CAIRO_STATIC_TRANSCRIPT_INPUTS,
 };
 use crate::{PreparedCompositionError, PreparedCompositionGraph};
+
+/// One setup drain even through ordinary errors or unwinding. Host buffers
+/// borrowed by asynchronous ingress must never be released while DMA is live.
+struct SetupFence<'context> {
+    context: &'context CudaExecContext,
+    drained: bool,
+}
+
+impl<'context> SetupFence<'context> {
+    fn new(context: &'context CudaExecContext) -> Self {
+        Self {
+            context,
+            drained: false,
+        }
+    }
+
+    fn drain(&mut self) -> Result<(), CudaRuntimeError> {
+        let result = self.context.sync();
+        self.drained = true;
+        result
+    }
+}
+
+impl Drop for SetupFence<'_> {
+    fn drop(&mut self) {
+        if !self.drained {
+            let _ = self.context.sync();
+        }
+    }
+}
 
 /// Complete cache identity of one materialized resident workspace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +121,16 @@ pub struct ResidentTraceCommitInputTelemetry {
     pub direct_commitments: u32,
     pub separate_interpolation_graph_invocations: u32,
     pub separate_interpolation_kernel_launches: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentCompositionCommitTelemetry {
+    pub direct_retained_evaluations: bool,
+    pub direct_split_graphs: u32,
+    pub precomputed_compact_commitments: u32,
+    pub coefficient_commit_paths: u32,
+    pub split_traffic: Option<CompositionSplitTraffic>,
+    pub execution_receipt: Option<CompositionExecutionReceipt>,
 }
 
 impl ResidentWorkspaceIdentity {
@@ -240,6 +285,14 @@ pub struct ResidentWitnessIngestReport {
     pub sync_calls: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResidentStatementRefreshTelemetry {
+    pub public_memory_seed_h2d_bytes: usize,
+    pub public_memory_seed_h2d_copies: usize,
+    pub public_memory_seed_sync_calls: usize,
+    pub composition: CompositionBindingRefreshTelemetry,
+}
+
 /// Machine-checkable host-boundary budget for one warm resident replay. Setup,
 /// compact-input ingest and the final proof copy are measured separately; the
 /// transcript-bounded graph hot path itself must not cross PCIe or synchronize.
@@ -316,6 +369,8 @@ impl ResidentHotPathBudget {
 
 #[derive(Debug)]
 pub enum ResidentRuntimeError {
+    PersistentRuntimePoisoned,
+    MissingPreparedRuntimeMaterialization,
     WorkspaceIdentityMismatch {
         expected: ResidentWorkspaceIdentity,
         actual: ResidentWorkspaceIdentity,
@@ -430,6 +485,7 @@ pub enum ResidentRuntimeError {
         expected: usize,
         actual: usize,
     },
+    MissingCapturedGraphKey(GraphKey),
     FriRoundOutOfOrder {
         expected: usize,
         actual: usize,
@@ -1168,6 +1224,10 @@ enum PreparedResidentCommitment<'a> {
         graph: PreparedDirectCompactDomainCommitGraph<'a>,
         retained_evaluations: Vec<Option<Vec<ArenaSlice>>>,
     },
+    PrecomputedCompact {
+        graph: PreparedPrecomputedCompactDomainCommitGraph<'a>,
+        retained_evaluations: Vec<Option<Vec<ArenaSlice>>>,
+    },
 }
 
 impl PreparedResidentCommitment<'_> {
@@ -1187,6 +1247,9 @@ impl PreparedResidentCommitment<'_> {
             Self::DirectCompact { graph, .. } => graph
                 .launch()
                 .map_err(ResidentLaunchError::DirectCompactDomainCommit),
+            Self::PrecomputedCompact { graph, .. } => graph
+                .launch()
+                .map_err(ResidentLaunchError::CompactDomainCommit),
         }
     }
 
@@ -1196,6 +1259,7 @@ impl PreparedResidentCommitment<'_> {
             Self::Progressive { graph, .. } => graph.root_slice(),
             Self::Compact { graph, .. } => graph.root_slice(),
             Self::DirectCompact { graph, .. } => graph.root_slice(),
+            Self::PrecomputedCompact { graph, .. } => graph.root_slice(),
         }
     }
 
@@ -1205,6 +1269,7 @@ impl PreparedResidentCommitment<'_> {
             Self::Progressive { graph, .. } => graph.retained_layers_bottom_up(),
             Self::Compact { graph, .. } => graph.retained_layers_bottom_up(),
             Self::DirectCompact { graph, .. } => graph.retained_layers_bottom_up(),
+            Self::PrecomputedCompact { graph, .. } => graph.retained_layers_bottom_up(),
         }
     }
 
@@ -1222,6 +1287,10 @@ impl PreparedResidentCommitment<'_> {
             | Self::DirectCompact {
                 retained_evaluations,
                 ..
+            }
+            | Self::PrecomputedCompact {
+                retained_evaluations,
+                ..
             } => retained_evaluations,
         }
     }
@@ -1232,6 +1301,7 @@ impl PreparedResidentCommitment<'_> {
             Self::Progressive { graph, .. } => Ok(graph.read_root_at_transcript_boundary()?),
             Self::Compact { graph, .. } => Ok(graph.read_root_at_transcript_boundary()?),
             Self::DirectCompact { graph, .. } => Ok(graph.read_root_at_transcript_boundary()?),
+            Self::PrecomputedCompact { graph, .. } => Ok(graph.read_root_at_transcript_boundary()?),
         }
     }
 }
@@ -1285,6 +1355,20 @@ fn trace_commit_input_telemetry_from_modes(
         separate_interpolation_kernel_launches: base_interpolation_launches
             + interaction_interpolation_launches,
     }
+}
+
+fn validate_static_transcript_ingest_set(
+    inputs: &[(CairoTranscriptInput, Vec<u32>)],
+) -> Result<(), ResidentRuntimeError> {
+    if inputs.len() != CAIRO_STATIC_TRANSCRIPT_INPUTS.len()
+        || !inputs
+            .iter()
+            .zip(CAIRO_STATIC_TRANSCRIPT_INPUTS)
+            .all(|((actual, _), expected)| *actual == expected)
+    {
+        return Err(ResidentRuntimeError::TranscriptRequirementsMismatch);
+    }
+    Ok(())
 }
 
 fn prepare_trace_commit_input<'a>(
@@ -1358,7 +1442,12 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// `setup_relation_challenges` initializes device storage only; interaction
     /// launch remains blocked until [`Self::upload_relation_challenges`] records
     /// the real post-base-commit transcript challenge.
-    pub fn prepare(
+    ///
+    /// Construction is crate-private because the persistent workspace owner
+    /// relies on every runtime borrow being rooted in its pinned workspace. A
+    /// public mutator may update owned device state, but must never retain a
+    /// non-workspace borrow or replace that ownership root.
+    pub(crate) fn prepare(
         workspace: &'a GraphWorkspace,
         expected_identity: ResidentWorkspaceIdentity,
         execution_config: SealedResidentExecutionConfig,
@@ -1904,17 +1993,17 @@ impl<'a> ResidentGraphRuntime<'a> {
             .iter()
             .filter(|planned| planned.id != CommitmentTreeId::Preprocessed)
         {
+            let precomputed_composition = planned.id == CommitmentTreeId::Composition
+                && composition.output_mode() == CompositionOutputMode::DirectRetainedEvaluations;
             let direct_inputs = planned
                 .direct_retained_b2n_program
                 .as_ref()
                 .map(|_| direct_commitment_inputs(workspace, planned))
                 .transpose()?;
-            let groups = direct_inputs
-                .is_none()
+            let groups = (direct_inputs.is_none() && !precomputed_composition)
                 .then(|| commitment_groups(workspace, planned))
                 .transpose()?;
-            let twiddles = direct_inputs
-                .is_none()
+            let twiddles = (direct_inputs.is_none() && !precomputed_composition)
                 .then(|| bind_arena_binding(arena, planned.twiddles))
                 .transpose()?;
             let retained_evaluations = planned
@@ -2051,7 +2140,38 @@ impl<'a> ResidentGraphRuntime<'a> {
                                     domain,
                                     base,
                                 } => {
-                                    if let (Some(direct_program), Some(direct_inputs)) = (
+                                    if precomputed_composition {
+                                        let [Some(outputs)] = evaluation_outputs.as_slice() else {
+                                            return Err(
+                                                ResidentRuntimeError::DirectRetainedOutputMismatch(
+                                                    planned.id,
+                                                ),
+                                            );
+                                        };
+                                        let flat_outputs =
+                                            outputs.iter().copied().map(Some).collect::<Vec<_>>();
+                                        let graph = compact.bind_prepared_evaluations(
+                                            arena,
+                                            base,
+                                            domain,
+                                            slots,
+                                            &flat_outputs,
+                                        )?;
+                                        if !direct_retained_outputs_match(
+                                            graph.retained_evaluations(),
+                                            &evaluation_outputs,
+                                        ) {
+                                            return Err(
+                                                ResidentRuntimeError::DirectRetainedOutputMismatch(
+                                                    planned.id,
+                                                ),
+                                            );
+                                        }
+                                        PreparedResidentCommitment::PrecomputedCompact {
+                                            graph,
+                                            retained_evaluations: grouped_retained,
+                                        }
+                                    } else if let (Some(direct_program), Some(direct_inputs)) = (
                                         planned.direct_retained_b2n_program.as_ref(),
                                         direct_inputs.as_ref(),
                                     ) {
@@ -2111,6 +2231,15 @@ impl<'a> ResidentGraphRuntime<'a> {
                 }
                 _ => return Err(ResidentRuntimeError::CommitModeMismatch),
             };
+            if planned.id == CommitmentTreeId::Composition
+                && precomputed_composition
+                    != matches!(
+                        &prepared,
+                        PreparedResidentCommitment::PrecomputedCompact { .. }
+                    )
+            {
+                return Err(ResidentRuntimeError::CommitModeMismatch);
+            }
             commitments.push((planned.id, prepared));
         }
         let base_commit_input =
@@ -2314,6 +2443,74 @@ impl<'a> ResidentGraphRuntime<'a> {
         self.ec_op_ingest
     }
 
+    /// Rebind every statement-varying input of a persistent same-shape
+    /// runtime. Prepared kernels, descriptor addresses, graph executables and
+    /// immutable LUT/twiddle payloads are never rebuilt here.
+    pub fn refresh_statement_inputs(
+        &mut self,
+        composition_bindings: &CompositionProofBindings,
+        execution_tables_host: Option<ExecutionTablesHostData<'_>>,
+        ec_op_segment_start: Option<usize>,
+        public_memory_seed_host: Option<&[u32]>,
+    ) -> Result<ResidentStatementRefreshTelemetry, ResidentRuntimeError> {
+        self.execution_tables_ingest = match (&self.execution_tables, execution_tables_host) {
+            (Some(prepared), Some(host)) => Some(prepared.ingest(host)?),
+            (Some(_), None) => return Err(ResidentRuntimeError::MissingPreparedExecutionTables),
+            (None, Some(_)) => return Err(ResidentRuntimeError::UnexpectedPreparedExecutionTables),
+            (None, None) => None,
+        };
+        self.ec_op_ingest = match (&self.ec_op, ec_op_segment_start) {
+            (Some(prepared), Some(segment_start)) => {
+                Some(prepared.ingest_segment_start(segment_start)?)
+            }
+            (Some(_), None) => return Err(ResidentRuntimeError::MissingPreparedEcOpSegment),
+            (None, Some(_)) => return Err(ResidentRuntimeError::UnexpectedPreparedEcOpSegment),
+            (None, None) => None,
+        };
+
+        let public_seed = self
+            .multiplicity
+            .as_ref()
+            .and_then(|multiplicity| multiplicity.public_memory_seed.as_ref());
+        let (
+            public_memory_seed_h2d_bytes,
+            public_memory_seed_h2d_copies,
+            public_memory_seed_sync_calls,
+        ) = match (public_seed, public_memory_seed_host) {
+            (Some(prepared), Some(words)) => {
+                prepared.upload_source(words)?;
+                (
+                    words
+                        .len()
+                        .checked_mul(core::mem::size_of::<u32>())
+                        .ok_or(ResidentRuntimeError::SizeOverflow)?,
+                    usize::from(!words.is_empty()),
+                    1,
+                )
+            }
+            (Some(_), None) => {
+                return Err(ResidentRuntimeError::PublicMemoryMultiplicitySeed(
+                    "prepared seed has no claim-bound source",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(ResidentRuntimeError::PublicMemoryMultiplicitySeed(
+                    "claim-bound source has no prepared seed",
+                ))
+            }
+            (None, None) => (0, 0, 0),
+        };
+        let composition = self
+            .composition
+            .refresh_proof_bindings(composition_bindings)?;
+        Ok(ResidentStatementRefreshTelemetry {
+            public_memory_seed_h2d_bytes,
+            public_memory_seed_h2d_copies,
+            public_memory_seed_sync_calls,
+            composition,
+        })
+    }
+
     pub fn prepared_numerator_schedule(&self) -> PreparedNumeratorSchedule {
         self.oods.numerator_schedule()
     }
@@ -2331,84 +2528,161 @@ impl<'a> ResidentGraphRuntime<'a> {
                 actual: inputs.len(),
             });
         }
-        let mut seen = Vec::with_capacity(inputs.len());
-        let mut report = ResidentWitnessIngestReport {
-            components: inputs.len(),
-            ..ResidentWitnessIngestReport::default()
-        };
-        for input in inputs {
-            if seen.contains(&input.component) {
-                return Err(ResidentRuntimeError::DuplicateWitnessInput(input.component));
-            }
-            seen.push(input.component);
-            let prepared = self
-                .witness
-                .iter()
-                .find(|prepared| prepared.component == input.component)
-                .ok_or(ResidentRuntimeError::MissingPreparedWitness(
-                    input.component,
-                ))?;
-            let destinations = prepared.writer.input_columns();
-            if (prepared.input_gather.is_some()
-                || prepared.input_seed.is_some()
-                || prepared.input_compact.is_some()
-                || prepared.input_casm.is_some()
-                || prepared.native_input_producer.is_some())
-                && !input.columns.is_empty()
-            {
-                return Err(ResidentRuntimeError::UnexpectedGatheredWitnessHostInput(
-                    input.component,
-                ));
-            }
-            if prepared.input_gather.is_none()
-                && prepared.input_seed.is_none()
-                && prepared.input_compact.is_none()
-                && prepared.input_casm.is_none()
-                && prepared.native_input_producer.is_none()
-                && destinations.len() != input.columns.len()
-            {
-                return Err(ResidentRuntimeError::WitnessInputColumnCount {
-                    component: input.component,
-                    expected: destinations.len(),
-                    actual: input.columns.len(),
-                });
-            }
-            match (&prepared.input_seed, input.seed_scalars) {
-                (Some(seed), Some(values)) => {
-                    seed.ingest_scalars(values)?;
-                    let bytes = values
-                        .len()
-                        .checked_mul(core::mem::size_of::<u32>())
-                        .ok_or(ResidentRuntimeError::SizeOverflow)?;
-                    report.columns += values.len();
-                    report.h2d_copies += usize::from(!values.is_empty());
-                    report.h2d_bytes = report
-                        .h2d_bytes
-                        .checked_add(bytes)
-                        .ok_or(ResidentRuntimeError::SizeOverflow)?;
+        let context = self.workspace.arena().context();
+        let mut fence = SetupFence::new(context);
+        let ingest = (|| {
+            let mut seen = Vec::with_capacity(inputs.len());
+            let mut report = ResidentWitnessIngestReport {
+                components: inputs.len(),
+                ..ResidentWitnessIngestReport::default()
+            };
+            for input in inputs {
+                if seen.contains(&input.component) {
+                    return Err(ResidentRuntimeError::DuplicateWitnessInput(input.component));
                 }
-                (None, None) => {}
-                _ => {
+                seen.push(input.component);
+                let prepared = self
+                    .witness
+                    .iter()
+                    .find(|prepared| prepared.component == input.component)
+                    .ok_or(ResidentRuntimeError::MissingPreparedWitness(
+                        input.component,
+                    ))?;
+                let destinations = prepared.writer.input_columns();
+                if (prepared.input_gather.is_some()
+                    || prepared.input_seed.is_some()
+                    || prepared.input_compact.is_some()
+                    || prepared.input_casm.is_some()
+                    || prepared.native_input_producer.is_some())
+                    && !input.columns.is_empty()
+                {
+                    return Err(ResidentRuntimeError::UnexpectedGatheredWitnessHostInput(
+                        input.component,
+                    ));
+                }
+                if prepared.input_gather.is_none()
+                    && prepared.input_seed.is_none()
+                    && prepared.input_compact.is_none()
+                    && prepared.input_casm.is_none()
+                    && prepared.native_input_producer.is_none()
+                    && destinations.len() != input.columns.len()
+                {
                     return Err(ResidentRuntimeError::WitnessInputColumnCount {
                         component: input.component,
-                        expected: prepared
-                            .input_seed
-                            .as_ref()
-                            .map_or(0, |seed| seed.requirements().scalar_words),
-                        actual: input.seed_scalars.map_or(0, <[u32]>::len),
-                    })
+                        expected: destinations.len(),
+                        actual: input.columns.len(),
+                    });
                 }
-            }
-            match (&prepared.input_casm, input.casm_words) {
-                (Some(casm), Some(words)) => {
-                    // `inputs` remains borrowed until the one fence below, so
-                    // the prepared stage's immutable-address DMA contract is
-                    // upheld for the complete upload/scatter sequence.
-                    unsafe { casm.ingest_and_launch(words)? };
-                    let bytes = words
+                match (&prepared.input_seed, input.seed_scalars) {
+                    (Some(seed), Some(values)) => {
+                        seed.ingest_scalars(values)?;
+                        let bytes = values
+                            .len()
+                            .checked_mul(core::mem::size_of::<u32>())
+                            .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                        report.columns += values.len();
+                        report.h2d_copies += usize::from(!values.is_empty());
+                        report.h2d_bytes = report
+                            .h2d_bytes
+                            .checked_add(bytes)
+                            .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(ResidentRuntimeError::WitnessInputColumnCount {
+                            component: input.component,
+                            expected: prepared
+                                .input_seed
+                                .as_ref()
+                                .map_or(0, |seed| seed.requirements().scalar_words),
+                            actual: input.seed_scalars.map_or(0, <[u32]>::len),
+                        })
+                    }
+                }
+                match (&prepared.input_casm, input.casm_words) {
+                    (Some(casm), Some(words)) => {
+                        // `inputs` remains borrowed until the one fence below, so
+                        // the prepared stage's immutable-address DMA contract is
+                        // upheld for the complete upload/scatter sequence.
+                        unsafe { casm.ingest_and_launch(words)? };
+                        let bytes = words
+                            .len()
+                            .checked_mul(core::mem::size_of::<u32>())
+                            .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                        report.columns += 1;
+                        report.h2d_copies += 1;
+                        report.h2d_bytes = report
+                            .h2d_bytes
+                            .checked_add(bytes)
+                            .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                    }
+                    (None, None) => {}
+                    (Some(casm), None) => {
+                        return Err(ResidentRuntimeError::WitnessInputColumnCount {
+                            component: input.component,
+                            expected: casm.requirements().staging_words,
+                            actual: 0,
+                        })
+                    }
+                    (None, Some(words)) => {
+                        return Err(ResidentRuntimeError::WitnessInputColumnCount {
+                            component: input.component,
+                            expected: 0,
+                            actual: words.len(),
+                        })
+                    }
+                }
+                let mut seen_columns = Vec::with_capacity(input.columns.len());
+                for source in input.columns {
+                    if source.ordinal >= destinations.len() {
+                        return Err(ResidentRuntimeError::WitnessInputColumnCount {
+                            component: input.component,
+                            expected: destinations.len(),
+                            actual: source.ordinal + 1,
+                        });
+                    }
+                    if seen_columns.contains(&source.ordinal) {
+                        return Err(ResidentRuntimeError::DuplicateWitnessInputColumn {
+                            component: input.component,
+                            ordinal: source.ordinal,
+                        });
+                    }
+                    seen_columns.push(source.ordinal);
+                    let destination = destinations[source.ordinal];
+                    // The prepared writer reads exactly `row_count` words from each
+                    // input column's slot base, and the arena may pool the backing
+                    // slot larger than that (whole-slot binds over disjoint
+                    // lifetimes). Pin the host payload to the writer requirement —
+                    // not the pooled slot length — and fail closed on capacity.
+                    let required_words = prepared.writer.row_count();
+                    if source.words.len() != required_words {
+                        return Err(ResidentRuntimeError::WitnessInputRowCount {
+                            component: input.component,
+                            column: source.ordinal,
+                            expected: required_words,
+                            actual: source.words.len(),
+                        });
+                    }
+                    if destination.len_words() < required_words {
+                        return Err(ResidentRuntimeError::WitnessInputRowCount {
+                            component: input.component,
+                            column: source.ordinal,
+                            expected: required_words,
+                            actual: destination.len_words(),
+                        });
+                    }
+                    let bytes = source
+                        .words
                         .len()
                         .checked_mul(core::mem::size_of::<u32>())
                         .ok_or(ResidentRuntimeError::SizeOverflow)?;
+                    unsafe {
+                        self.workspace.arena().context().memcpy_h2d_async(
+                            destination.as_void_ptr(),
+                            source.words.as_ptr().cast(),
+                            bytes,
+                        )?;
+                    }
                     report.columns += 1;
                     report.h2d_copies += 1;
                     report.h2d_bytes = report
@@ -2416,82 +2690,12 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .checked_add(bytes)
                         .ok_or(ResidentRuntimeError::SizeOverflow)?;
                 }
-                (None, None) => {}
-                (Some(casm), None) => {
-                    return Err(ResidentRuntimeError::WitnessInputColumnCount {
-                        component: input.component,
-                        expected: casm.requirements().staging_words,
-                        actual: 0,
-                    })
-                }
-                (None, Some(words)) => {
-                    return Err(ResidentRuntimeError::WitnessInputColumnCount {
-                        component: input.component,
-                        expected: 0,
-                        actual: words.len(),
-                    })
-                }
             }
-            let mut seen_columns = Vec::with_capacity(input.columns.len());
-            for source in input.columns {
-                if source.ordinal >= destinations.len() {
-                    return Err(ResidentRuntimeError::WitnessInputColumnCount {
-                        component: input.component,
-                        expected: destinations.len(),
-                        actual: source.ordinal + 1,
-                    });
-                }
-                if seen_columns.contains(&source.ordinal) {
-                    return Err(ResidentRuntimeError::DuplicateWitnessInputColumn {
-                        component: input.component,
-                        ordinal: source.ordinal,
-                    });
-                }
-                seen_columns.push(source.ordinal);
-                let destination = destinations[source.ordinal];
-                // The prepared writer reads exactly `row_count` words from each
-                // input column's slot base, and the arena may pool the backing
-                // slot larger than that (whole-slot binds over disjoint
-                // lifetimes). Pin the host payload to the writer requirement —
-                // not the pooled slot length — and fail closed on capacity.
-                let required_words = prepared.writer.row_count();
-                if source.words.len() != required_words {
-                    return Err(ResidentRuntimeError::WitnessInputRowCount {
-                        component: input.component,
-                        column: source.ordinal,
-                        expected: required_words,
-                        actual: source.words.len(),
-                    });
-                }
-                if destination.len_words() < required_words {
-                    return Err(ResidentRuntimeError::WitnessInputRowCount {
-                        component: input.component,
-                        column: source.ordinal,
-                        expected: required_words,
-                        actual: destination.len_words(),
-                    });
-                }
-                let bytes = source
-                    .words
-                    .len()
-                    .checked_mul(core::mem::size_of::<u32>())
-                    .ok_or(ResidentRuntimeError::SizeOverflow)?;
-                unsafe {
-                    self.workspace.arena().context().memcpy_h2d_async(
-                        destination.as_void_ptr(),
-                        source.words.as_ptr().cast(),
-                        bytes,
-                    )?;
-                }
-                report.columns += 1;
-                report.h2d_copies += 1;
-                report.h2d_bytes = report
-                    .h2d_bytes
-                    .checked_add(bytes)
-                    .ok_or(ResidentRuntimeError::SizeOverflow)?;
-            }
-        }
-        self.workspace.arena().context().sync()?;
+            Ok::<_, ResidentRuntimeError>(report)
+        })();
+        let fence_result = fence.drain();
+        let mut report = ingest?;
+        fence_result?;
         report.sync_calls = 1;
         Ok(report)
     }
@@ -2512,6 +2716,33 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// separately launched Base/Interaction interpolation graphs.
     pub fn trace_commit_input_telemetry(&self) -> ResidentTraceCommitInputTelemetry {
         trace_commit_input_telemetry(&self.base_commit_input, &self.interaction_commit_input)
+    }
+
+    /// Exact producer/consumer ownership at the Composition commitment edge.
+    /// A direct split has one upstream graph, one coefficient-free compact
+    /// consumer, and no coefficient-to-LDE commitment path.
+    pub fn composition_commit_telemetry(&self) -> ResidentCompositionCommitTelemetry {
+        let direct_retained_evaluations =
+            self.composition.output_mode() == CompositionOutputMode::DirectRetainedEvaluations;
+        let precomputed_compact_commitments = self
+            .commitments
+            .iter()
+            .filter(|(id, commitment)| {
+                *id == CommitmentTreeId::Composition
+                    && matches!(
+                        commitment,
+                        PreparedResidentCommitment::PrecomputedCompact { .. }
+                    )
+            })
+            .count() as u32;
+        ResidentCompositionCommitTelemetry {
+            direct_retained_evaluations,
+            direct_split_graphs: u32::from(direct_retained_evaluations),
+            precomputed_compact_commitments,
+            coefficient_commit_paths: u32::from(!direct_retained_evaluations),
+            split_traffic: self.composition.direct_split_traffic(),
+            execution_receipt: self.composition.requirements().execution_receipt,
+        }
     }
 
     pub fn require_hot_path_budget(
@@ -2632,6 +2863,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         &self,
         inputs: &[(CairoTranscriptInput, Vec<u32>)],
     ) -> Result<(), ResidentRuntimeError> {
+        validate_static_transcript_ingest_set(inputs)?;
         let mut seen = Vec::with_capacity(inputs.len());
         let mut uploads = Vec::with_capacity(inputs.len());
         for (semantic, words) in inputs {
@@ -2658,18 +2890,25 @@ impl<'a> ResidentGraphRuntime<'a> {
             let destination = self.transcript_input(*semantic)?;
             uploads.push((destination, words.as_slice()));
         }
-        for (destination, words) in uploads {
-            // SAFETY: `words` remains borrowed through the one sync below and
-            // the exact logical destination width was checked above.
-            unsafe {
-                self.workspace.arena().context().memcpy_h2d_async(
-                    destination.as_void_ptr(),
-                    words.as_ptr().cast(),
-                    words.len() * core::mem::size_of::<u32>(),
-                )?;
+        let context = self.workspace.arena().context();
+        let mut fence = SetupFence::new(context);
+        let enqueue = (|| {
+            for (destination, words) in uploads {
+                // SAFETY: `words` remains borrowed through the one sync below
+                // and the exact logical destination width was checked above.
+                unsafe {
+                    context.memcpy_h2d_async(
+                        destination.as_void_ptr(),
+                        words.as_ptr().cast(),
+                        words.len() * core::mem::size_of::<u32>(),
+                    )?;
+                }
             }
-        }
-        self.workspace.arena().context().sync()?;
+            Ok::<_, ResidentRuntimeError>(())
+        })();
+        let fence_result = fence.drain();
+        enqueue?;
+        fence_result?;
         Ok(())
     }
 
@@ -3240,10 +3479,8 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// Replay the complete transcript-bounded proof DAG. The only host loop is
     /// over true FRI challenge boundaries; component and relation work remains
     /// inside the captured graphs.
-    pub fn replay_all_prepared_subgraphs(
-        &mut self,
-        generation: u64,
-    ) -> Result<(), ResidentRuntimeError> {
+    pub fn replay_all_prepared_subgraphs(&mut self) -> Result<(), ResidentRuntimeError> {
+        let generation = next_capture_generation(&self.transcript_cursor)?;
         self.begin_transcript_generation(generation)?;
         self.replay_base_commit_only()?;
         self.replay_interaction_relation_and_commit()?;
@@ -3260,12 +3497,25 @@ impl<'a> ResidentGraphRuntime<'a> {
         self.workspace.graph_count()
     }
 
+    /// Distinguish an intentionally empty prepared runtime from a complete
+    /// captured topology. Any nonempty partial topology is corruption and
+    /// fails instead of being captured over or replayed.
+    pub fn prepared_capture_ready(&self) -> Result<bool, ResidentRuntimeError> {
+        if self.captured_graph_count() == 0 {
+            return Ok(false);
+        }
+        self.require_complete_captured_topology()?;
+        Ok(true)
+    }
+
     /// Require the protocol topology independently of the replay counters: six
     /// fixed transcript-boundary graphs plus one graph per FRI fold round.
     pub fn require_complete_captured_topology(&self) -> Result<usize, ResidentRuntimeError> {
         require_complete_captured_topology(
+            self.identity.shape_key,
+            self.identity.protocol_key,
             self.fri.round_count(),
-            self.captured_graph_count(),
+            &self.workspace.captured_graph_keys(),
             self.transcript_segment_count(),
         )
     }
@@ -4587,18 +4837,49 @@ fn resident_decommit_sources(
         if planned.id != CommitmentTreeId::Preprocessed && prepared_commitment.is_none() {
             return Err(ResidentRuntimeError::MissingPreparedCommitment(planned.id));
         }
-        let commit_groups = commitment_groups(workspace, planned)?;
-        let groups = commit_groups
-            .into_iter()
-            .zip(&geometry.groups)
+        if planned.grouped_column_sources.len() != geometry.groups.len()
+            || planned.grouped_column_log_sizes.len() != geometry.groups.len()
+            || planned.retained_evaluation_groups.len() != geometry.groups.len()
+        {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "trace decommit group counts differ from the commitment plan",
+            ));
+        }
+        let direct_composition = planned.id == CommitmentTreeId::Composition
+            && workspace.plan().composition().output_plan.mode()
+                == CompositionOutputMode::DirectRetainedEvaluations;
+        if direct_composition
+            && !matches!(
+                prepared_commitment,
+                Some(PreparedResidentCommitment::PrecomputedCompact { .. })
+            )
+        {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "direct Composition output requires the precomputed compact commitment",
+            ));
+        }
+        if direct_composition
+            && geometry.groups.iter().any(|group| {
+                group.mode != stwo_backend_cuda::DecommitSourceMode::ResidentEvaluations
+            })
+        {
+            return Err(ResidentRuntimeError::DecommitTopologyMismatch(
+                "direct Composition output requires resident-evaluation decommit groups",
+            ));
+        }
+        let groups = geometry
+            .groups
+            .iter()
             .enumerate()
-            .map(|(group_index, (group, geometry))| {
-                if group.columns.len() != geometry.columns.len()
-                    || group
-                        .columns
+            .map(|(group_index, geometry)| {
+                let planned_sources = &planned.grouped_column_sources[group_index];
+                let planned_logs = &planned.grouped_column_log_sizes[group_index];
+                if planned_sources.len() != planned_logs.len()
+                    || planned_logs.len() != geometry.columns.len()
+                    || planned_logs
                         .iter()
                         .zip(&geometry.columns)
-                        .any(|(column, geometry)| column.log_size != geometry.coefficient_log_size)
+                        .any(|(&log_size, geometry)| log_size != geometry.coefficient_log_size)
                 {
                     return Err(ResidentRuntimeError::DecommitTopologyMismatch(
                         "trace decommit columns differ from prepared commit columns",
@@ -4616,7 +4897,7 @@ fn resident_decommit_sources(
                                 "recomputed trace group owns an unexpected retained evaluation",
                             ));
                         }
-                        group
+                        commitment_group(workspace, planned, group_index)?
                             .columns
                             .into_iter()
                             .map(|column| DecommitColumnSource::Coefficients(column.coefficients))
@@ -4889,13 +5170,30 @@ fn fri_round_segment(round_index: usize) -> Result<GraphSegment, ResidentRuntime
 }
 
 fn require_complete_captured_topology(
+    shape_key: ProofShapeKey,
+    protocol_key: u64,
     fri_rounds: usize,
-    actual: usize,
+    actual_keys: &[GraphKey],
     transcript_segments: usize,
 ) -> Result<usize, ResidentRuntimeError> {
-    let expected = fri_rounds
-        .checked_add(6)
-        .ok_or(ResidentRuntimeError::SizeOverflow)?;
+    let mut expected_segments = Vec::with_capacity(
+        fri_rounds
+            .checked_add(6)
+            .ok_or(ResidentRuntimeError::SizeOverflow)?,
+    );
+    expected_segments.extend([
+        GraphSegment::IngestWitnessBaseCommit,
+        GraphSegment::InteractionCommit,
+        GraphSegment::CompositionQuotientCommit,
+        GraphSegment::OodsEvaluation,
+        GraphSegment::FriLayer(0),
+        GraphSegment::OodsQueriesDecommitAssemble,
+    ]);
+    for round in 0..fri_rounds {
+        expected_segments.push(fri_round_segment(round)?);
+    }
+    let expected = expected_segments.len();
+    let actual = actual_keys.len();
     if actual != expected
         || actual
             .checked_add(1)
@@ -4909,12 +5207,48 @@ fn require_complete_captured_topology(
             actual,
         });
     }
+    for segment in expected_segments {
+        let expected_key = GraphKey {
+            shape: shape_key,
+            protocol_key,
+            segment,
+        };
+        if !actual_keys.contains(&expected_key) {
+            return Err(ResidentRuntimeError::MissingCapturedGraphKey(expected_key));
+        }
+    }
     Ok(actual)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_transcript_ingest_requires_the_exact_canonical_set() {
+        let canonical = CAIRO_STATIC_TRANSCRIPT_INPUTS
+            .into_iter()
+            .map(|semantic| (semantic, vec![0]))
+            .collect::<Vec<_>>();
+        assert!(validate_static_transcript_ingest_set(&canonical).is_ok());
+
+        for missing in 0..canonical.len() {
+            let mut incomplete = canonical.clone();
+            incomplete.remove(missing);
+            assert!(matches!(
+                validate_static_transcript_ingest_set(&incomplete),
+                Err(ResidentRuntimeError::TranscriptRequirementsMismatch)
+            ));
+        }
+
+        let mut reordered = canonical.clone();
+        reordered.swap(0, 1);
+        assert!(validate_static_transcript_ingest_set(&reordered).is_err());
+
+        let mut dynamic_substitution = canonical;
+        dynamic_substitution[0].0 = CairoTranscriptInput::BaseRoot;
+        assert!(validate_static_transcript_ingest_set(&dynamic_substitution).is_err());
+    }
 
     fn retained_commit_program() -> CommitProgram {
         use stwo_backend_cuda::{
@@ -5303,10 +5637,39 @@ mod tests {
 
     #[test]
     fn captured_topology_is_six_fixed_graphs_plus_fri_rounds() {
-        assert_eq!(require_complete_captured_topology(8, 14, 15).unwrap(), 14);
-        assert_eq!(require_complete_captured_topology(23, 29, 30).unwrap(), 29);
+        let shape = ProofShapeKey(7);
+        let protocol = 11;
+        let keys = |fri_rounds| {
+            let mut segments = vec![
+                GraphSegment::IngestWitnessBaseCommit,
+                GraphSegment::InteractionCommit,
+                GraphSegment::CompositionQuotientCommit,
+                GraphSegment::OodsEvaluation,
+                GraphSegment::FriLayer(0),
+                GraphSegment::OodsQueriesDecommitAssemble,
+            ];
+            segments.extend((0..fri_rounds).map(|round| fri_round_segment(round).unwrap()));
+            segments
+                .into_iter()
+                .map(|segment| GraphKey {
+                    shape,
+                    protocol_key: protocol,
+                    segment,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            require_complete_captured_topology(shape, protocol, 8, &keys(8), 15).unwrap(),
+            14
+        );
+        assert_eq!(
+            require_complete_captured_topology(shape, protocol, 23, &keys(23), 30).unwrap(),
+            29
+        );
+        let incomplete = keys(8)[..13].to_vec();
         assert!(matches!(
-            require_complete_captured_topology(8, 13, 15),
+            require_complete_captured_topology(shape, protocol, 8, &incomplete, 15),
             Err(ResidentRuntimeError::CapturedGraphTopology {
                 fri_rounds: 8,
                 transcript_segments: 15,
@@ -5315,12 +5678,48 @@ mod tests {
             })
         ));
         assert!(matches!(
-            require_complete_captured_topology(8, 14, 14),
+            require_complete_captured_topology(shape, protocol, 8, &keys(8), 14),
             Err(ResidentRuntimeError::CapturedGraphTopology {
                 fri_rounds: 8,
                 transcript_segments: 14,
                 expected: 14,
                 actual: 14,
+            })
+        ));
+
+        let mut wrong_segment = keys(8);
+        wrong_segment[0].segment = GraphSegment::FriLayer(200);
+        assert!(matches!(
+            require_complete_captured_topology(shape, protocol, 8, &wrong_segment, 15),
+            Err(ResidentRuntimeError::MissingCapturedGraphKey(GraphKey {
+                segment: GraphSegment::IngestWitnessBaseCommit,
+                ..
+            }))
+        ));
+
+        let mut wrong_identity = keys(8);
+        wrong_identity[0].shape = ProofShapeKey(8);
+        assert!(matches!(
+            require_complete_captured_topology(shape, protocol, 8, &wrong_identity, 15),
+            Err(ResidentRuntimeError::MissingCapturedGraphKey(GraphKey {
+                shape: ProofShapeKey(7),
+                segment: GraphSegment::IngestWitnessBaseCommit,
+                ..
+            }))
+        ));
+
+        let mut extra = keys(8);
+        extra.push(GraphKey {
+            shape,
+            protocol_key: protocol,
+            segment: GraphSegment::FriLayer(200),
+        });
+        assert!(matches!(
+            require_complete_captured_topology(shape, protocol, 8, &extra, 15),
+            Err(ResidentRuntimeError::CapturedGraphTopology {
+                expected: 14,
+                actual: 15,
+                ..
             })
         ));
     }

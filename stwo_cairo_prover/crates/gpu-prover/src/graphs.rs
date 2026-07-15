@@ -5,7 +5,7 @@
 //! shape refill the same identity slots and replay the same executable. A shape or
 //! protocol change builds a different workspace/graph entry.
 
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -284,6 +284,10 @@ impl<T> PersistentGraphCache<T> {
     fn len(&self) -> usize {
         self.entries.borrow().len()
     }
+
+    fn keys(&self) -> Vec<GraphKey> {
+        self.entries.borrow().keys().copied().collect()
+    }
 }
 
 /// Graphs precede `arena` in declaration order, so Rust destroys all graph execs
@@ -296,10 +300,10 @@ pub struct GraphWorkspace {
     /// Fixed preprocessed coefficients, Merkle tree and transcript root are
     /// initialized as one cold-only unit per stable arena. A failed setup leaves
     /// this false, so cache reuse never trusts a partial fixed oracle.
-    preprocessed_commitment_ready: bool,
+    preprocessed_commitment_ready: Cell<bool>,
     /// Forward, inverse and quotient-subdomain twiddles are immutable for the
     /// workspace protocol key and therefore staged only once.
-    fixed_twiddles_ready: bool,
+    fixed_twiddles_ready: Cell<bool>,
 }
 
 impl GraphWorkspace {
@@ -314,8 +318,8 @@ impl GraphWorkspace {
             admission,
             plan,
             arena,
-            preprocessed_commitment_ready: false,
-            fixed_twiddles_ready: false,
+            preprocessed_commitment_ready: Cell::new(false),
+            fixed_twiddles_ready: Cell::new(false),
         })
     }
 
@@ -331,22 +335,22 @@ impl GraphWorkspace {
         &self.admission
     }
 
-    pub const fn preprocessed_commitment_ready(&self) -> bool {
-        self.preprocessed_commitment_ready
+    pub fn preprocessed_commitment_ready(&self) -> bool {
+        self.preprocessed_commitment_ready.get()
     }
 
     /// Mark the fixed oracle reusable only after coefficient interpolation,
     /// commitment and the root handoff have all synchronized successfully.
-    pub fn mark_preprocessed_commitment_ready(&mut self) {
-        self.preprocessed_commitment_ready = true;
+    pub(crate) fn mark_preprocessed_commitment_ready(&self) {
+        self.preprocessed_commitment_ready.set(true);
     }
 
-    pub const fn fixed_twiddles_ready(&self) -> bool {
-        self.fixed_twiddles_ready
+    pub fn fixed_twiddles_ready(&self) -> bool {
+        self.fixed_twiddles_ready.get()
     }
 
-    pub fn mark_fixed_twiddles_ready(&mut self) {
-        self.fixed_twiddles_ready = true;
+    pub(crate) fn mark_fixed_twiddles_ready(&self) {
+        self.fixed_twiddles_ready.set(true);
     }
 
     pub fn key(&self, segment: GraphSegment) -> GraphKey {
@@ -385,6 +389,10 @@ impl GraphWorkspace {
         self.graphs.len()
     }
 
+    pub(crate) fn captured_graph_keys(&self) -> Vec<GraphKey> {
+        self.graphs.keys()
+    }
+
     pub fn graph_kernel_node_count(&self) -> Option<u64> {
         self.graphs
             .entries
@@ -393,7 +401,7 @@ impl GraphWorkspace {
             .try_fold(0u64, |total, graph| total.checked_add(graph.kernel_nodes()))
     }
 
-    pub fn capture<E>(
+    pub(crate) fn capture<E>(
         &self,
         key: GraphKey,
         enqueue: impl FnOnce(&DeviceArena) -> Result<(), E>,
@@ -406,7 +414,7 @@ impl GraphWorkspace {
             .capture_or_reuse(key, || PhaseGraph::capture(key, &self.arena, enqueue))
     }
 
-    pub fn capture_segment<E>(
+    pub(crate) fn capture_segment<E>(
         &self,
         segment: GraphSegment,
         enqueue: impl FnOnce(&DeviceArena) -> Result<(), E>,

@@ -6,6 +6,8 @@
 
 #![cfg(stwo_cuda_link)]
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
 use cairo_air::verifier::verify_cairo;
 use cairo_air::CairoProof;
 use cairo_vm::types::layout_name::LayoutName;
@@ -16,9 +18,14 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTra
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
 use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 use stwo_cairo_gpu_prover::relation_table::CAIRO_RELATION_GRAPH;
+use stwo_cairo_gpu_prover::resident_runtime::ResidentRuntimeError;
 use stwo_cairo_gpu_prover::schedule::WitnessWriterKind;
 use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
-use stwo_cairo_gpu_prover::{phases, GpuCairoProver, GpuProverConfig};
+use stwo_cairo_gpu_prover::prover::GpuError;
+use stwo_cairo_gpu_prover::{
+    phases, GpuCairoProver, GpuProverConfig, PreparedRuntimeMaterialization,
+    ResidentSessionError, ResidentSessionTelemetry, WorkspaceMaterialization,
+};
 use stwo_cairo_prover::prover::{ChannelHash, ProverParameters};
 
 #[path = "common/base_param_variant.rs"]
@@ -48,6 +55,83 @@ fn full_policy_enabled() -> bool {
     FULL_POLICY_FLAGS
         .iter()
         .all(|name| std::env::var(name).as_deref() == Ok("1"))
+}
+
+fn assert_cold_runtime_materialization(telemetry: &ResidentSessionTelemetry) {
+    assert_eq!(
+        telemetry.workspace_materialization,
+        Some(WorkspaceMaterialization::Materialized),
+        "cold proof did not materialize its workspace",
+    );
+    assert_eq!(
+        telemetry.prepared_runtime_materialization,
+        Some(PreparedRuntimeMaterialization::Materialized),
+        "cold proof did not materialize its prepared runtime",
+    );
+    assert_eq!(
+        telemetry.prepared_runtime_capture_ready_at_entry,
+        Some(false),
+        "cold proof unexpectedly reported a pre-existing complete capture",
+    );
+    assert_eq!(
+        telemetry.prepared_runtime_capture_ready_at_exit,
+        Some(true),
+        "cold proof did not leave a complete captured topology",
+    );
+    assert!(
+        telemetry.statement_refresh.is_none(),
+        "cold proof refreshed a runtime that it had just materialized",
+    );
+}
+
+fn assert_warm_runtime_reuse(telemetry: &ResidentSessionTelemetry) {
+    assert_eq!(
+        telemetry.workspace_materialization,
+        Some(WorkspaceMaterialization::Reused),
+        "warm proof did not reuse its workspace",
+    );
+    assert_eq!(
+        telemetry.prepared_runtime_materialization,
+        Some(PreparedRuntimeMaterialization::Reused),
+        "warm proof did not reuse its prepared runtime",
+    );
+    assert_eq!(
+        telemetry.prepared_runtime_capture_ready_at_entry,
+        Some(true),
+        "warm proof did not inherit the complete cold capture",
+    );
+    assert_eq!(
+        telemetry.prepared_runtime_capture_ready_at_exit,
+        Some(true),
+        "warm proof did not preserve the complete captured topology",
+    );
+    assert!(
+        telemetry.statement_refresh.is_some(),
+        "warm proof did not refresh statement-dependent runtime inputs",
+    );
+}
+
+fn assert_installed_runtime_seals_workspace(
+    prover: &mut GpuCairoProver<Blake2sMerkleChannel>,
+    telemetry: &ResidentSessionTelemetry,
+) {
+    let key = telemetry
+        .workspace_key
+        .expect("resident session did not report its workspace key");
+    assert!(prover.graph_workspace().is_none());
+    assert!(prover.graph_workspace_for(key).is_none());
+    assert!(prover.graph_workspace_for_mut(key).is_none());
+    assert!(prover.take_graph_workspace().is_none());
+    assert!(prover.take_graph_workspace_for(key).is_none());
+}
+
+fn assert_persistent_runtime_poisoned(error: GpuError) {
+    assert!(matches!(
+        error,
+        GpuError::ResidentSession(ResidentSessionError::Runtime(
+            ResidentRuntimeError::PersistentRuntimePoisoned
+        ))
+    ));
 }
 
 fn resident_input() -> ProverInput {
@@ -172,6 +256,7 @@ fn assert_capture_safe_fixture(input: &ProverInput, params: ProverParameters) {
 fn strict_resident_cold_and_warm_proofs_match_simd_bytes() {
     let params = resident_params();
     let reference_input = resident_input();
+    let invalid_channel_input = reference_input.clone();
     assert_capture_safe_fixture(&reference_input, params);
 
     // Resident session prep and proving run before the ~20-minute SIMD
@@ -182,9 +267,21 @@ fn strict_resident_cold_and_warm_proofs_match_simd_bytes() {
     let cold = prover
         .prove_resident_blake2s(resident_input(), params)
         .unwrap();
+    let cold_session = prover
+        .last_resident_session_telemetry()
+        .expect("cold resident setup telemetry")
+        .clone();
+    assert_installed_runtime_seals_workspace(&mut prover, &cold_session);
     let warm = prover
         .prove_resident_blake2s(resident_input(), params)
         .unwrap();
+    let warm_session = prover
+        .last_resident_session_telemetry()
+        .expect("warm resident setup telemetry")
+        .clone();
+    assert_cold_runtime_materialization(&cold_session);
+    assert_warm_runtime_reuse(&warm_session);
+    assert_installed_runtime_seals_workspace(&mut prover, &warm_session);
     let cold_roots = verify_and_roots(&cold);
     let warm_roots = verify_and_roots(&warm);
     assert_eq!(cold_roots, warm_roots, "cold/warm commitment roots drifted");
@@ -221,6 +318,77 @@ fn strict_resident_cold_and_warm_proofs_match_simd_bytes() {
             FULL_POLICY_KERNEL_LAUNCH_CEILING,
         );
     }
+
+    let mut invalid_params = resident_params();
+    invalid_params.channel_hash = ChannelHash::Blake2sM31;
+    prover
+        .prove_resident_blake2s(invalid_channel_input, invalid_params)
+        .expect_err("unsupported resident channel unexpectedly proved");
+    assert!(prover.last_pcs_telemetry().is_none());
+    assert!(prover.last_resident_session_telemetry().is_none());
+    assert!(prover.last_aot_stats().is_none());
+}
+
+#[test]
+fn strict_resident_runtime_poisoned_after_incomplete_success_error_or_unwind() {
+    let params = resident_params();
+
+    let mut incomplete_config = GpuProverConfig::default();
+    incomplete_config.strict = true;
+    let mut incomplete_prover =
+        GpuCairoProver::<Blake2sMerkleChannel>::new(incomplete_config).unwrap();
+    let incomplete_error = incomplete_prover
+        .with_strict_resident_session(resident_input(), params, |_, _| Ok(()))
+        .expect_err("incomplete successful callback unexpectedly disarmed its runtime lease");
+    assert!(matches!(
+        incomplete_error,
+        GpuError::ResidentSession(ResidentSessionError::Runtime(
+            ResidentRuntimeError::CapturedGraphTopology { actual: 0, .. }
+        ))
+    ));
+    let poisoned_incomplete = incomplete_prover
+        .with_strict_resident_session(resident_input(), params, |_, _| Ok(()))
+        .expect_err("incomplete successful callback did not poison the prepared runtime");
+    assert_persistent_runtime_poisoned(poisoned_incomplete);
+
+    let mut error_config = GpuProverConfig::default();
+    error_config.strict = true;
+    let mut error_prover =
+        GpuCairoProver::<Blake2sMerkleChannel>::new(error_config).unwrap();
+    let callback_error = error_prover
+        .with_strict_resident_session(resident_input(), params, |_, _| {
+            Err::<(), _>(ResidentRuntimeError::MissingPreparedRuntimeMaterialization)
+        })
+        .expect_err("intentional resident callback error unexpectedly succeeded");
+    assert!(matches!(
+        callback_error,
+        GpuError::ResidentSession(ResidentSessionError::Runtime(
+            ResidentRuntimeError::MissingPreparedRuntimeMaterialization
+        ))
+    ));
+    let poisoned_error = error_prover
+        .with_strict_resident_session(resident_input(), params, |_, _| Ok(()))
+        .expect_err("callback error did not poison the prepared runtime");
+    assert_persistent_runtime_poisoned(poisoned_error);
+
+    let mut unwind_config = GpuProverConfig::default();
+    unwind_config.strict = true;
+    let mut unwind_prover =
+        GpuCairoProver::<Blake2sMerkleChannel>::new(unwind_config).unwrap();
+    let unwind = catch_unwind(AssertUnwindSafe(|| {
+        unwind_prover.with_strict_resident_session(
+            resident_input(),
+            params,
+            |_, _| -> Result<(), ResidentRuntimeError> {
+                panic!("intentional resident callback unwind")
+            },
+        )
+    }));
+    assert!(unwind.is_err(), "resident callback did not unwind");
+    let poisoned_unwind = unwind_prover
+        .with_strict_resident_session(resident_input(), params, |_, _| Ok(()))
+        .expect_err("callback unwind did not poison the prepared runtime");
+    assert_persistent_runtime_poisoned(poisoned_unwind);
 }
 
 /// Same workspace geometry with different compact memory content must rebuild
@@ -254,9 +422,19 @@ fn strict_resident_same_shape_changed_memory_matches_second_simd_proof() {
     let resident_first = prover
         .prove_resident_blake2s(first.clone(), params)
         .unwrap();
+    let first_session = prover
+        .last_resident_session_telemetry()
+        .expect("first resident setup telemetry")
+        .clone();
     let resident_second = prover
         .prove_resident_blake2s(second.clone(), params)
         .unwrap();
+    let second_session = prover
+        .last_resident_session_telemetry()
+        .expect("second resident setup telemetry")
+        .clone();
+    assert_cold_runtime_materialization(&first_session);
+    assert_warm_runtime_reuse(&second_session);
     let first_roots = verify_and_roots(&resident_first);
     let second_roots = verify_and_roots(&resident_second);
     assert_ne!(
@@ -288,10 +466,7 @@ fn strict_resident_same_shape_changed_memory_matches_second_simd_proof() {
         "same-shape replay reused stale execution-table content"
     );
     assert!(
-        prover
-            .last_resident_session_telemetry()
-            .expect("resident setup telemetry")
-            .cache_hit(),
+        second_session.cache_hit(),
         "changed-memory test did not reuse the exact workspace key"
     );
 }
@@ -333,9 +508,12 @@ fn strict_resident_same_workspace_changed_base_params_matches_second_simd_proof(
     let first_aot = prover
         .last_aot_stats()
         .expect("first strict AOT provenance telemetry");
-    let first_workspace = prover
+    let first_session = prover
         .last_resident_session_telemetry()
         .expect("first resident setup telemetry")
+        .clone();
+    assert_cold_runtime_materialization(&first_session);
+    let first_workspace = first_session
         .workspace_key
         .expect("first resident workspace key");
     let resident_second = prover
@@ -346,7 +524,9 @@ fn strict_resident_same_workspace_changed_base_params_matches_second_simd_proof(
         .expect("second strict AOT provenance telemetry");
     let second_session = prover
         .last_resident_session_telemetry()
-        .expect("second resident setup telemetry");
+        .expect("second resident setup telemetry")
+        .clone();
+    assert_warm_runtime_reuse(&second_session);
     assert_eq!(
         second_session.workspace_key,
         Some(first_workspace),

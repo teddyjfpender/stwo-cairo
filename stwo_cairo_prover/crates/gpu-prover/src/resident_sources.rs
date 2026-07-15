@@ -177,6 +177,7 @@ pub enum ResidentSourceStageError {
     },
     PreprocessedCommitBindingMismatch,
     MissingCommitment(CommitmentTreeId),
+    CommitmentGroupShapeMismatch(CommitmentTreeId),
     InterpolationBatchShapeMismatch(CommitmentTreeId),
     InvalidInterpolationSource {
         tree: CommitmentTreeId,
@@ -324,7 +325,7 @@ fn cleanup_after<T, E>(
 /// coefficient slots, while evaluations proven dead by the arena plan may be
 /// transformed in their exactly aliased slot.
 pub fn stage_base_trace_coefficients(
-    workspace: &mut GraphWorkspace,
+    workspace: &GraphWorkspace,
     proof_plan: &ProofPlan,
     trace: BaseTrace<CudaBackend>,
     twiddles: Option<&TwiddleTree<CudaBackend>>,
@@ -585,7 +586,7 @@ fn residency_counts(columns: usize, direct_columns: usize) -> BaseTraceResidency
 /// base evaluations are born later in the arena and interpolation is part of
 /// the captured graph.
 pub fn stage_protocol_twiddles(
-    workspace: &mut GraphWorkspace,
+    workspace: &GraphWorkspace,
     twiddles: &TwiddleTree<CudaBackend>,
 ) -> Result<ResidentTwiddleStageReport, ResidentSourceStageError> {
     if workspace.fixed_twiddles_ready() {
@@ -722,7 +723,7 @@ enum PreprocessedStageSource {
 }
 
 pub fn stage_preprocessed_commitment(
-    workspace: &mut GraphWorkspace,
+    workspace: &GraphWorkspace,
     trace: Arc<PreProcessedTrace>,
 ) -> Result<ResidentPreprocessedStageReport, ResidentSourceStageError> {
     let protocol_identity = workspace.plan().protocol_identity();
@@ -1488,52 +1489,76 @@ pub(crate) fn commitment_groups(
     workspace: &GraphWorkspace,
     planned: &PlannedCommitment,
 ) -> Result<Vec<CommitCoefficientGroup>, ResidentSourceStageError> {
-    planned
-        .grouped_column_sources
-        .iter()
-        .zip(&planned.grouped_column_log_sizes)
-        .map(|(sources, logs)| {
-            let columns = sources
-                .iter()
-                .zip(logs)
-                .map(|(&source, &log_size)| {
-                    let binding = match source {
-                        CommitmentColumnSource::Preprocessed { ordinal } => workspace
-                            .plan()
-                            .find(None, None, BufferPurpose::PreprocessedCoefficients, ordinal)
-                            .map(|(_, binding)| binding),
-                        CommitmentColumnSource::Trace {
-                            component,
-                            part,
-                            purpose,
-                            ordinal,
-                        } => workspace
-                            .plan()
-                            .find(Some(component), Some(part), purpose, ordinal)
-                            .map(|(_, binding)| binding),
-                        CommitmentColumnSource::Composition { ordinal } => workspace
-                            .plan()
-                            .find(None, None, BufferPurpose::CompositionCoefficients, ordinal)
-                            .map(|(_, binding)| binding),
-                    }
-                    .ok_or(ResidentSourceStageError::MissingArenaSource(source))?;
-                    let expected_words = checked_words(log_size)?;
-                    if binding.len_words != expected_words {
-                        return Err(ResidentSourceStageError::ArenaSourceSizeMismatch {
-                            source,
-                            expected_words,
-                            actual_words: binding.len_words,
-                        });
-                    }
-                    Ok(CommitCoefficientColumn {
-                        coefficients: workspace.bind(binding.logical)?.0,
-                        log_size,
-                    })
-                })
-                .collect::<Result<Vec<_>, ResidentSourceStageError>>()?;
-            Ok(CommitCoefficientGroup { columns })
-        })
+    if planned.grouped_column_sources.len() != planned.grouped_column_log_sizes.len() {
+        return Err(ResidentSourceStageError::CommitmentGroupShapeMismatch(
+            planned.id,
+        ));
+    }
+    (0..planned.grouped_column_sources.len())
+        .map(|group| commitment_group(workspace, planned, group))
         .collect()
+}
+
+/// Bind exactly one coefficient-backed commitment group.
+///
+/// Direct retained-evaluation consumers deliberately never call this helper;
+/// that prevents a reader-free coefficient slab from becoming an accidental
+/// runtime requirement again.
+pub(crate) fn commitment_group(
+    workspace: &GraphWorkspace,
+    planned: &PlannedCommitment,
+    group: usize,
+) -> Result<CommitCoefficientGroup, ResidentSourceStageError> {
+    let sources = planned.grouped_column_sources.get(group).ok_or(
+        ResidentSourceStageError::CommitmentGroupShapeMismatch(planned.id),
+    )?;
+    let logs = planned.grouped_column_log_sizes.get(group).ok_or(
+        ResidentSourceStageError::CommitmentGroupShapeMismatch(planned.id),
+    )?;
+    if sources.len() != logs.len() {
+        return Err(ResidentSourceStageError::CommitmentGroupShapeMismatch(
+            planned.id,
+        ));
+    }
+    let columns = sources
+        .iter()
+        .zip(logs)
+        .map(|(&source, &log_size)| {
+            let binding = match source {
+                CommitmentColumnSource::Preprocessed { ordinal } => workspace
+                    .plan()
+                    .find(None, None, BufferPurpose::PreprocessedCoefficients, ordinal)
+                    .map(|(_, binding)| binding),
+                CommitmentColumnSource::Trace {
+                    component,
+                    part,
+                    purpose,
+                    ordinal,
+                } => workspace
+                    .plan()
+                    .find(Some(component), Some(part), purpose, ordinal)
+                    .map(|(_, binding)| binding),
+                CommitmentColumnSource::Composition { ordinal } => workspace
+                    .plan()
+                    .find(None, None, BufferPurpose::CompositionCoefficients, ordinal)
+                    .map(|(_, binding)| binding),
+            }
+            .ok_or(ResidentSourceStageError::MissingArenaSource(source))?;
+            let expected_words = checked_words(log_size)?;
+            if binding.len_words != expected_words {
+                return Err(ResidentSourceStageError::ArenaSourceSizeMismatch {
+                    source,
+                    expected_words,
+                    actual_words: binding.len_words,
+                });
+            }
+            Ok(CommitCoefficientColumn {
+                coefficients: workspace.bind(binding.logical)?.0,
+                log_size,
+            })
+        })
+        .collect::<Result<Vec<_>, ResidentSourceStageError>>()?;
+    Ok(CommitCoefficientGroup { columns })
 }
 
 fn commitment_descriptor_transfers(

@@ -3436,6 +3436,12 @@ pub struct ProofArenaPlan {
     relation: PlannedRelationWorkspace,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompositionOutputOverride {
+    Planned,
+    ForceCoefficientSplit,
+}
+
 impl ProofArenaPlan {
     pub fn build(
         plan: &ProofPlan,
@@ -3459,6 +3465,40 @@ impl ProofArenaPlan {
         protocol: &ProtocolGeometry,
         composition: &CompositionPlan,
         execution_table_geometry: Option<ExecutionTableGeometry>,
+    ) -> Result<Self, ArenaPlanError> {
+        Self::build_inner_with_composition_output(
+            plan,
+            protocol,
+            composition,
+            execution_table_geometry,
+            CompositionOutputOverride::Planned,
+        )
+    }
+
+    /// Host-preflight-only counterfactual. It traverses the complete production
+    /// builder and changes only the Composition output choice at the exact
+    /// insertion point where the production planner selected Direct output.
+    pub(crate) fn build_with_execution_tables_forced_composition_coefficients(
+        plan: &ProofPlan,
+        protocol: &ProtocolGeometry,
+        composition: &CompositionPlan,
+        geometry: ExecutionTableGeometry,
+    ) -> Result<Self, ArenaPlanError> {
+        Self::build_inner_with_composition_output(
+            plan,
+            protocol,
+            composition,
+            Some(geometry),
+            CompositionOutputOverride::ForceCoefficientSplit,
+        )
+    }
+
+    fn build_inner_with_composition_output(
+        plan: &ProofPlan,
+        protocol: &ProtocolGeometry,
+        composition: &CompositionPlan,
+        execution_table_geometry: Option<ExecutionTableGeometry>,
+        composition_output_override: CompositionOutputOverride,
     ) -> Result<Self, ArenaPlanError> {
         plan.proof_shape()
             .require_arena_ready()
@@ -3692,6 +3732,7 @@ impl ProofArenaPlan {
             composition,
             retained_preprocessed_evaluations.as_ref(),
             &late_coefficient_ownership,
+            composition_output_override,
         )?;
         let logical_multiplicity = if let Some(multiplicity_plan) = multiplicity_plan {
             if multiplicity_plan.fixed.is_empty() && multiplicity_plan.runtime.is_empty() {
@@ -7043,6 +7084,7 @@ fn append_protocol_buffers(
     composition: &CompositionPlan,
     retained_preprocessed_evaluations: Option<&BTreeSet<&'static str>>,
     late_coefficient_ownership: &LateCoefficientOwnershipPlan,
+    composition_output_override: CompositionOutputOverride,
 ) -> Result<
     (
         LogicalPreprocessedWorkspace,
@@ -7097,11 +7139,23 @@ fn append_protocol_buffers(
         protocol.direct_composition_retention.as_ref(),
     )
     .map_err(ArenaPlanError::Composition)?;
-    let composition_output_plan = composition_output_plan(
+    let planned_composition_output = composition_output_plan(
         protocol,
         &composition_requirements,
         late_coefficient_ownership,
     )?;
+    let composition_output_plan = match composition_output_override {
+        CompositionOutputOverride::Planned => planned_composition_output,
+        CompositionOutputOverride::ForceCoefficientSplit => {
+            if planned_composition_output.mode() != CompositionOutputMode::DirectRetainedEvaluations
+            {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "forced Composition coefficient counterfactual requires a Direct plan",
+                ));
+            }
+            CompositionOutputPlan::CoefficientSplit
+        }
+    };
     let max_commitment_twiddle_words = commit_requirements
         .iter()
         .map(|requirements| match requirements {

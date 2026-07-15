@@ -2,12 +2,13 @@
 
 use serde_json::{json, Value};
 use stwo_cairo_gpu_prover::arena_plan::{
-    CompositionSlabArenaFootprint, ProofArenaPlan, ProofEpoch,
+    CompositionSlabArenaCounterfactual, CompositionSlabArenaFootprint, ProofEpoch,
 };
-use stwo_cairo_gpu_prover::prepared_composition::CompositionOutputMode;
 
-pub(super) fn json(arena: &ProofArenaPlan) -> Result<(Value, usize), String> {
-    if arena.composition().output_plan.mode() != CompositionOutputMode::DirectRetainedEvaluations {
+pub(super) fn json(
+    receipt: Option<&CompositionSlabArenaCounterfactual>,
+) -> Result<(Value, usize), String> {
+    let Some(receipt) = receipt else {
         return Ok((
             json!({
                 "schema": "stwo.composition-slab-physical-counterfactual.v1",
@@ -18,10 +19,7 @@ pub(super) fn json(arena: &ProofArenaPlan) -> Result<(Value, usize), String> {
             }),
             0,
         ));
-    }
-    let receipt = arena
-        .composition_slab_arena_counterfactual()
-        .map_err(|error| format!("Composition slab physical counterfactual: {error:?}"))?;
+    };
     let total_delta = signed_delta(
         receipt.forced_coefficient_fallback.total_words,
         receipt.direct.total_words,
@@ -33,17 +31,20 @@ pub(super) fn json(arena: &ProofArenaPlan) -> Result<(Value, usize), String> {
         json!({
             "schema": "stwo.composition-slab-physical-counterfactual.v1",
             "comparison": "current Direct output versus forced CoefficientSplit output",
+            "scope": "Composition output only under the identical retained-evaluation late-consumer policy; not a full legacy CoefficientSplit backend comparison",
             "non_output_protocol_geometry_identical": true,
             "commitment_geometry_identical": true,
-            "logical_prefix_identical": true,
-            "alias_inputs_reconstructed_and_revalidated": true,
+            "non_output_logical_geometry_identical": true,
+            "production_alias_inputs_revalidated": true,
             "timing_credit": false,
             "fallback_coefficient_buffers": receipt.fallback_coefficient_buffers,
             "fallback_coefficient_words": receipt.fallback_coefficient_words,
             "fallback_coefficient_bytes": bytes(receipt.fallback_coefficient_words)?,
-            "identical_logical_prefix_buffers": receipt.identical_logical_prefix_buffers,
+            "fallback_coefficient_insertion_index": receipt.fallback_coefficient_insertion_index,
+            "identical_non_output_logical_buffers": receipt.identical_non_output_logical_buffers,
             "transition_alias_pairs": receipt.transition_alias_pairs,
             "released_commitment_alias_pairs": receipt.released_commitment_alias_pairs,
+            "fallback_coefficient_alias_pairs": receipt.fallback_coefficient_alias_pairs,
             "direct": footprint_json(&receipt.direct)?,
             "forced_coefficient_fallback": footprint_json(
                 &receipt.forced_coefficient_fallback,

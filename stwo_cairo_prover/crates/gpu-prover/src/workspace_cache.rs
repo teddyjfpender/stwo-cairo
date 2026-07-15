@@ -4,6 +4,7 @@
 //! their arena, so dropping an entry is always an explicit caller decision.
 
 use std::cell::Cell;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use stwo_backend_cuda::{CudaExecContext, CudaRuntimeError};
@@ -11,6 +12,9 @@ use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
 
 use crate::arena_plan::ProofArenaPlan;
 use crate::graphs::{GraphError, GraphWorkspace};
+use crate::resident_runtime::{
+    ResidentGraphRuntime, ResidentRuntimeError, ResidentWorkspaceIdentity,
+};
 use crate::shape_executable::{ShapeExecutable, WorkspaceAdmission};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -50,6 +54,12 @@ pub enum WorkspaceMaterialization {
     Materialized,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedRuntimeMaterialization {
+    Reused,
+    Materialized,
+}
+
 #[derive(Debug)]
 pub enum WorkspaceCacheError {
     ZeroCapacity,
@@ -62,6 +72,7 @@ pub enum WorkspaceCacheError {
         capacity: usize,
         requested: WorkspaceKey,
     },
+    PreparedRuntimeInstalled(WorkspaceKey),
     Runtime(CudaRuntimeError),
     Graph(GraphError),
 }
@@ -83,8 +94,226 @@ impl std::fmt::Display for WorkspaceCacheError {
                 "workspace cache capacity {capacity} reached; refusing to evict captured graphs \
                  for {requested:?}"
             ),
+            Self::PreparedRuntimeInstalled(key) => write!(
+                f,
+                "workspace {key:?} has a prepared runtime and cannot be mutably detached"
+            ),
             Self::Runtime(error) => write!(f, "workspace CUDA context error: {error}"),
             Self::Graph(error) => write!(f, "workspace materialization error: {error}"),
+        }
+    }
+}
+
+/// Stable self-referential owner for one prepared runtime.
+///
+/// `runtime` is declared before `workspace`, so Rust drops every borrowed
+/// prepared graph before the pinned workspace and its arena. The workspace is
+/// heap-pinned before its address is extended; no API exposes mutable access or
+/// permits removal after a runtime is installed.
+pub(crate) struct ResidentWorkspaceEntry {
+    runtime: Option<ResidentGraphRuntime<'static>>,
+    workspace: Pin<Box<GraphWorkspace>>,
+    runtime_poisoned: bool,
+}
+
+/// Armed mutable access to one cached runtime. [`ResidentRuntimeLease::with_runtime`]
+/// disarms internally only after a successful callback and identity check; any
+/// ordinary error or unwind drops the armed lease and poisons the entry.
+#[must_use = "dropping an armed runtime lease poisons the cached runtime"]
+pub(crate) struct ResidentRuntimeLease<'entry> {
+    entry: &'entry mut ResidentWorkspaceEntry,
+    armed: bool,
+}
+
+impl ResidentWorkspaceEntry {
+    fn new(workspace: GraphWorkspace) -> Self {
+        Self {
+            runtime: None,
+            workspace: Box::pin(workspace),
+            runtime_poisoned: false,
+        }
+    }
+
+    pub(crate) fn workspace(&self) -> &GraphWorkspace {
+        self.workspace.as_ref().get_ref()
+    }
+
+    fn workspace_mut(&mut self) -> Option<&mut GraphWorkspace> {
+        (self.runtime.is_none() && !self.runtime_poisoned)
+            .then(|| self.workspace.as_mut().get_mut())
+    }
+
+    fn observable_workspace(&self) -> Option<&GraphWorkspace> {
+        self.can_detach().then(|| self.workspace())
+    }
+
+    fn observable_workspace_mut(&mut self) -> Option<&mut GraphWorkspace> {
+        self.workspace_mut()
+    }
+
+    fn prepare_runtime<F>(
+        &mut self,
+        prepare: F,
+    ) -> Result<PreparedRuntimeMaterialization, ResidentRuntimeError>
+    where
+        F: for<'workspace> FnOnce(
+            &'workspace GraphWorkspace,
+        )
+            -> Result<ResidentGraphRuntime<'workspace>, ResidentRuntimeError>,
+    {
+        if self.runtime_poisoned {
+            return Err(ResidentRuntimeError::PersistentRuntimePoisoned);
+        }
+        let materialization = if self.runtime.is_some() {
+            self.validate_installed_runtime_identity()?;
+            PreparedRuntimeMaterialization::Reused
+        } else {
+            let expected = ResidentWorkspaceIdentity::of(self.workspace());
+            let runtime = prepare(self.workspace());
+            self.runtime = match runtime {
+                Ok(runtime) => {
+                    if let Err(error) = require_runtime_identity(expected, runtime.identity()) {
+                        self.runtime_poisoned = true;
+                        return Err(error);
+                    }
+                    // SAFETY: the caller never observes an extended workspace
+                    // reference: the HRTB above supplies only a borrow tied to
+                    // its call. The workspace is heap-pinned, runtime is
+                    // private and dropped first, and all detach/mutable APIs
+                    // fail once installation begins.
+                    Some(unsafe {
+                        core::mem::transmute::<
+                            ResidentGraphRuntime<'_>,
+                            ResidentGraphRuntime<'static>,
+                        >(runtime)
+                    })
+                }
+                Err(error) => {
+                    // Preparation may already have uploaded descriptors or
+                    // captured arena addresses. Never retry over a partially
+                    // initialized workspace.
+                    self.runtime_poisoned = true;
+                    return Err(error);
+                }
+            };
+            PreparedRuntimeMaterialization::Materialized
+        };
+        Ok(materialization)
+    }
+
+    fn validate_installed_runtime_identity(&mut self) -> Result<(), ResidentRuntimeError> {
+        let expected = ResidentWorkspaceIdentity::of(self.workspace());
+        let actual = self
+            .runtime
+            .as_ref()
+            .expect("runtime was materialized before identity validation")
+            .identity();
+        if let Err(error) = require_runtime_identity(expected, actual) {
+            self.runtime_poisoned = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn poison_runtime(&mut self) {
+        self.runtime_poisoned = true;
+    }
+
+    pub(crate) fn arm_runtime_lease(
+        &mut self,
+    ) -> Result<ResidentRuntimeLease<'_>, ResidentRuntimeError> {
+        if self.runtime_poisoned {
+            return Err(ResidentRuntimeError::PersistentRuntimePoisoned);
+        }
+        if self.runtime.is_some() {
+            self.validate_installed_runtime_identity()?;
+        }
+        Ok(ResidentRuntimeLease {
+            entry: self,
+            armed: true,
+        })
+    }
+
+    fn can_detach(&self) -> bool {
+        self.runtime.is_none() && !self.runtime_poisoned
+    }
+
+    fn into_workspace(self) -> GraphWorkspace {
+        assert!(
+            self.can_detach(),
+            "installed or poisoned resident runtime cannot release its workspace"
+        );
+        *Pin::into_inner(self.workspace)
+    }
+}
+
+impl ResidentRuntimeLease<'_> {
+    pub(crate) fn workspace(&self) -> &GraphWorkspace {
+        self.entry.workspace()
+    }
+
+    pub(crate) fn with_runtime<P, F, R, E>(mut self, prepare: P, use_runtime: F) -> Result<R, E>
+    where
+        E: From<ResidentRuntimeError>,
+        P: for<'workspace> FnOnce(
+            &'workspace GraphWorkspace,
+        )
+            -> Result<ResidentGraphRuntime<'workspace>, ResidentRuntimeError>,
+        F: for<'scope> FnOnce(
+            &'scope mut ResidentGraphRuntime<'scope>,
+            PreparedRuntimeMaterialization,
+        ) -> Result<R, E>,
+    {
+        let materialization = self.entry.prepare_runtime(prepare).map_err(E::from)?;
+        self.entry
+            .validate_installed_runtime_identity()
+            .map_err(E::from)?;
+        let runtime = self
+            .entry
+            .runtime
+            .as_mut()
+            .expect("runtime was reused or materialized");
+        // SAFETY: `ResidentWorkspaceEntry` pins and outlives the stored runtime,
+        // which is dropped before the workspace. This cast only shortens the
+        // private storage lifetime for one HRTB-scoped callback. `R` is outside
+        // that binder, so neither the runtime nor a reference derived from it
+        // can escape in safe code. Runtime mutators must never retain a
+        // callback-scoped borrow in the stored runtime.
+        let runtime = unsafe {
+            &mut *(runtime as *mut ResidentGraphRuntime<'static> as *mut ResidentGraphRuntime<'_>)
+        };
+        let result = use_runtime(runtime, materialization);
+        if let Err(error) = self.entry.validate_installed_runtime_identity() {
+            // A callback must never be able to leave a runtime rooted in any
+            // owner other than this pinned workspace. Drop a replaced runtime
+            // now, while the callback's scope is still active, and leave the
+            // entry permanently poisoned.
+            self.entry.runtime_poisoned = true;
+            drop(self.entry.runtime.take());
+            return Err(E::from(error));
+        }
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+fn require_runtime_identity(
+    expected: ResidentWorkspaceIdentity,
+    actual: ResidentWorkspaceIdentity,
+) -> Result<(), ResidentRuntimeError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(ResidentRuntimeError::WorkspaceIdentityMismatch { expected, actual })
+    }
+}
+
+impl Drop for ResidentRuntimeLease<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.entry.poison_runtime();
         }
     }
 }
@@ -187,6 +416,7 @@ impl<K: Eq, V> BoundedCache<K, V> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn take_by_key(&mut self, key: WorkspaceKey) -> Option<V> {
         let index = self.unique_key_index(key)?;
         Some(self.entries.remove(index).value)
@@ -200,6 +430,7 @@ impl<K: Eq, V> BoundedCache<K, V> {
         }
     }
 
+    #[cfg(test)]
     fn take_only(&mut self) -> Option<V> {
         if self.entries.len() != 1 {
             return None;
@@ -231,7 +462,7 @@ impl<K: Eq, V> BoundedCache<K, V> {
 /// One cache per prover/device. Each miss creates a fresh CUDA execution context
 /// and transfers it into exactly one stable graph workspace.
 pub struct WorkspaceCache {
-    inner: BoundedCache<WorkspaceAdmission, Box<GraphWorkspace>>,
+    inner: BoundedCache<WorkspaceAdmission, ResidentWorkspaceEntry>,
 }
 
 impl WorkspaceCache {
@@ -258,21 +489,39 @@ impl WorkspaceCache {
     }
 
     /// Diagnostic short-key lookup. Returns `None` when distinct exact
-    /// admissions intentionally collide on the same short key.
+    /// admissions intentionally collide on the same short key or the entry has
+    /// installed/poisoned its persistent runtime.
     pub fn get(&self, key: WorkspaceKey) -> Option<&GraphWorkspace> {
-        self.inner.get_by_key(key).map(Box::as_ref)
+        self.inner
+            .get_by_key(key)
+            .and_then(ResidentWorkspaceEntry::observable_workspace)
     }
 
-    /// Mutable diagnostic short-key lookup with the same ambiguity rule as
-    /// [`Self::get`]. Production session admission never uses this path.
+    /// Mutable diagnostic short-key lookup with the same ambiguity and runtime
+    /// ownership rules as [`Self::get`]. Production session admission never
+    /// uses this path.
     pub fn get_mut(&mut self, key: WorkspaceKey) -> Option<&mut GraphWorkspace> {
-        self.inner.get_by_key_mut(key).map(Box::as_mut)
+        self.inner
+            .get_by_key_mut(key)
+            .and_then(ResidentWorkspaceEntry::observable_workspace_mut)
     }
 
     pub fn materialize_or_reuse(
         &mut self,
         executable: &ShapeExecutable,
     ) -> Result<(&mut GraphWorkspace, WorkspaceMaterialization), WorkspaceCacheError> {
+        let key = executable.workspace_admission().workspace_key();
+        let (entry, materialization) = self.materialize_entry_or_reuse(executable)?;
+        let workspace = entry
+            .workspace_mut()
+            .ok_or(WorkspaceCacheError::PreparedRuntimeInstalled(key))?;
+        Ok((workspace, materialization))
+    }
+
+    pub(crate) fn materialize_entry_or_reuse(
+        &mut self,
+        executable: &ShapeExecutable,
+    ) -> Result<(&mut ResidentWorkspaceEntry, WorkspaceMaterialization), WorkspaceCacheError> {
         let admission = executable.workspace_admission();
         let plan = Arc::clone(executable.arena());
         let key = WorkspaceKey::from_plan(&plan);
@@ -282,29 +531,28 @@ impl WorkspaceCache {
                 plan: key,
             });
         }
-        if let Some(index) = self.inner.exact_index(admission) {
+        let (index, materialization) = if let Some(index) = self.inner.exact_index(admission) {
             self.inner.record_lookup(true);
-            return Ok((
-                self.inner.entries[index].value.as_mut(),
-                WorkspaceMaterialization::Reused,
-            ));
-        }
-
-        self.inner.record_lookup(false);
-        self.inner.admit(admission, key)?;
-
-        let context = CudaExecContext::new()?;
-        let workspace = Box::new(GraphWorkspace::from_plan(context, plan, admission.clone())?);
-        self.inner.insert(admission.clone(), key, workspace)?;
-        self.inner.record_materialization();
-        let index = self
-            .inner
-            .exact_index(admission)
-            .expect("materialized exact admission inserted");
-        Ok((
-            self.inner.entries[index].value.as_mut(),
-            WorkspaceMaterialization::Materialized,
-        ))
+            (index, WorkspaceMaterialization::Reused)
+        } else {
+            self.inner.record_lookup(false);
+            self.inner.admit(admission, key)?;
+            let context = CudaExecContext::new()?;
+            let workspace = GraphWorkspace::from_plan(context, plan, admission.clone())?;
+            self.inner.insert(
+                admission.clone(),
+                key,
+                ResidentWorkspaceEntry::new(workspace),
+            )?;
+            self.inner.record_materialization();
+            (
+                self.inner
+                    .exact_index(admission)
+                    .expect("materialized exact admission inserted"),
+                WorkspaceMaterialization::Materialized,
+            )
+        };
+        Ok((&mut self.inner.entries[index].value, materialization))
     }
 
     /// Installs a caller-owned workspace after a temporary take. Existing keys
@@ -315,20 +563,30 @@ impl WorkspaceCache {
     ) -> Result<WorkspaceKey, WorkspaceCacheError> {
         let key = WorkspaceKey::from_workspace(&workspace);
         let admission = workspace.admission().clone();
-        self.inner.insert(admission, key, Box::new(workspace))?;
+        self.inner
+            .insert(admission, key, ResidentWorkspaceEntry::new(workspace))?;
         Ok(key)
     }
 
     pub fn take(&mut self, key: WorkspaceKey) -> Option<GraphWorkspace> {
-        self.inner.take_by_key(key).map(|workspace| *workspace)
+        let index = self.inner.unique_key_index(key)?;
+        if !self.inner.entries[index].value.can_detach() {
+            return None;
+        }
+        Some(self.inner.entries.remove(index).value.into_workspace())
     }
 
     pub(crate) fn only(&self) -> Option<&GraphWorkspace> {
-        self.inner.only().map(Box::as_ref)
+        self.inner
+            .only()
+            .and_then(ResidentWorkspaceEntry::observable_workspace)
     }
 
     pub(crate) fn take_only(&mut self) -> Option<GraphWorkspace> {
-        self.inner.take_only().map(|workspace| *workspace)
+        if self.inner.entries.len() != 1 || !self.inner.entries[0].value.can_detach() {
+            return None;
+        }
+        Some(self.inner.entries.remove(0).value.into_workspace())
     }
 }
 
@@ -437,5 +695,38 @@ mod tests {
             BoundedCache::<TestAdmission, u8>::new(0),
             Err(WorkspaceCacheError::ZeroCapacity)
         ));
+    }
+
+    #[test]
+    fn runtime_identity_requires_exact_shape_protocol_and_arena_base() {
+        let expected = ResidentWorkspaceIdentity {
+            shape_key: ProofShapeKey(7),
+            protocol_key: 11,
+            arena_base: 13,
+        };
+        assert!(require_runtime_identity(expected, expected).is_ok());
+
+        for actual in [
+            ResidentWorkspaceIdentity {
+                shape_key: ProofShapeKey(8),
+                ..expected
+            },
+            ResidentWorkspaceIdentity {
+                protocol_key: 12,
+                ..expected
+            },
+            ResidentWorkspaceIdentity {
+                arena_base: 14,
+                ..expected
+            },
+        ] {
+            assert!(matches!(
+                require_runtime_identity(expected, actual),
+                Err(ResidentRuntimeError::WorkspaceIdentityMismatch {
+                    expected: rejected_expected,
+                    actual: rejected_actual,
+                }) if rejected_expected == expected && rejected_actual == actual
+            ));
+        }
     }
 }

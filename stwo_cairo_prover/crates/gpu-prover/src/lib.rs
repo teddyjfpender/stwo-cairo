@@ -82,6 +82,6 @@ pub use resident_session::{
 };
 pub use stwo_backend_cuda::{CudaPcsDriverTelemetry, CudaPcsRuntimeMode};
 pub use workspace_cache::{
-    WorkspaceCache, WorkspaceCacheError, WorkspaceCacheTelemetry, WorkspaceKey,
-    WorkspaceMaterialization,
+    PreparedRuntimeMaterialization, WorkspaceCache, WorkspaceCacheError, WorkspaceCacheTelemetry,
+    WorkspaceKey, WorkspaceMaterialization,
 };

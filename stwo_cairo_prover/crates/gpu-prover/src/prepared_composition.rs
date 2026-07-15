@@ -310,6 +310,15 @@ pub struct CompositionWaveRequirements {
     pub parts: Vec<CompositionWavePartRequirement>,
 }
 
+/// Exact launch topology retained from the canonical, sealed wave program.
+/// Consumers must copy this receipt rather than re-deriving counts from the
+/// prepared descriptors or generated kernel names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositionExecutionReceipt {
+    pub part_count: usize,
+    pub wave_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ComponentDescriptorLayout {
     coefficient_pointers: usize,
@@ -352,6 +361,9 @@ pub struct CompositionWorkspaceRequirements {
     pub serial_components: Vec<usize>,
     /// Exact sole-owner waves. Nonempty only in [`CompositionLaunchMode::Wave`].
     pub waves: Vec<CompositionWaveRequirements>,
+    /// Canonical production execution counts. Present exactly when `mode` is
+    /// [`CompositionLaunchMode::Wave`].
+    pub execution_receipt: Option<CompositionExecutionReceipt>,
     pub components: Vec<CompositionComponentRequirements>,
     pub accumulators: Vec<CompositionAccumulatorRequirements>,
     zero_words: usize,
@@ -800,7 +812,8 @@ pub(crate) fn composition_workspace_requirements_with_retention(
     }
     let (direct_retention_plan_key, direct_retention_bitmap) =
         apply_direct_retention(&mut components, direct_retention)?;
-    let mut waves = composition_wave_requirements(plan, &components, mode, &accumulators)?;
+    let (mut waves, execution_receipt) =
+        composition_wave_requirements(plan, &components, mode, &accumulators)?;
     debug_assert_eq!(expected_random_offset, plan.total_constraints);
     let (mut lde_tile_words, wide_groups, serial_components) =
         lde_tile_layout(mode, &mut components)?;
@@ -922,6 +935,7 @@ pub(crate) fn composition_workspace_requirements_with_retention(
         wide_groups,
         serial_components,
         waves,
+        execution_receipt,
         components,
         accumulators,
         zero_words,
@@ -1198,9 +1212,15 @@ fn composition_wave_requirements(
     components: &[CompositionComponentRequirements],
     mode: CompositionLaunchMode,
     accumulators: &[CompositionAccumulatorRequirements],
-) -> Result<Vec<CompositionWaveRequirements>, PreparedCompositionError> {
+) -> Result<
+    (
+        Vec<CompositionWaveRequirements>,
+        Option<CompositionExecutionReceipt>,
+    ),
+    PreparedCompositionError,
+> {
     if mode != CompositionLaunchMode::Wave {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let canonical =
         crate::composition_wave::CompositionWaveProgram::from_plan(plan).map_err(|_| {
@@ -1304,7 +1324,13 @@ fn composition_wave_requirements(
             parts,
         });
     }
-    Ok(waves)
+    Ok((
+        waves,
+        Some(CompositionExecutionReceipt {
+            part_count: canonical.parts().len(),
+            wave_count: canonical.waves().len(),
+        }),
+    ))
 }
 
 fn validate_component_program(
@@ -1615,6 +1641,41 @@ impl<'a> PreparedCompositionGraph<'a> {
         )
     }
 
+    /// Source-backed native parity lane for bounded CUDA fixtures.
+    ///
+    /// This deliberately does not close strict AOT admission. It exercises the
+    /// production descriptor binder and launch topology with runtime-compiled
+    /// fixture kernels, but it is not an AOT-pack promotion gate. Production
+    /// callers and [`Self::prepare_with_mode_and_retention_for_test`] remain
+    /// strict and source-free on the warm path.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "direct-retention-test-api")]
+    #[doc(hidden)]
+    pub fn prepare_with_mode_and_retention_jit_for_test(
+        arena: &'a DeviceArena,
+        plan: &CompositionPlan,
+        trace: &CompositionTraceTopology,
+        inputs: &CompositionDeviceInputs,
+        slots: &CompositionWorkspaceSlots,
+        mode: CompositionLaunchMode,
+        direct_retention: Option<&DirectCompositionRetentionPlan>,
+        direct_evaluations: &[CompositionDirectEvaluationBinding],
+    ) -> Result<Self, PreparedCompositionError> {
+        Self::prepare_impl(
+            arena,
+            plan,
+            None,
+            trace,
+            inputs,
+            slots,
+            mode,
+            direct_retention,
+            direct_evaluations,
+            None,
+            false,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_with_mode_and_retention(
         arena: &'a DeviceArena,
@@ -1637,6 +1698,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             direct_retention,
             direct_evaluations,
             None,
+            true,
         )
     }
 
@@ -1664,6 +1726,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             direct_retention,
             direct_evaluations,
             direct_split,
+            true,
         )
     }
 
@@ -1679,6 +1742,7 @@ impl<'a> PreparedCompositionGraph<'a> {
         direct_retention: Option<&DirectCompositionRetentionPlan>,
         direct_evaluations: &[CompositionDirectEvaluationBinding],
         direct_split: Option<CompositionDirectSplitBinding>,
+        strict_aot: bool,
     ) -> Result<Self, PreparedCompositionError> {
         let requirements =
             composition_workspace_requirements_with_retention(plan, trace, mode, direct_retention)?;
@@ -1950,12 +2014,14 @@ impl<'a> PreparedCompositionGraph<'a> {
         }
         let alpha_power_count = relation_alpha_powers.len_words() / SECURE_WORDS;
 
-        if aot::loaded_manifest_hash() == 0 {
-            return Err(PreparedCompositionError::AotPackUnavailable);
+        if strict_aot {
+            if aot::loaded_manifest_hash() == 0 {
+                return Err(PreparedCompositionError::AotPackUnavailable);
+            }
+            // Strictness is monotonic process-wide. A prior runtime-compiled
+            // entry cannot satisfy a production graph after this point.
+            aot::require_loaded_kernels();
         }
-        // Strictness is monotonic process-wide. A prior runtime-compiled entry
-        // cannot satisfy this graph after this point.
-        aot::require_loaded_kernels();
 
         let mut descriptor_words = vec![0u32; requirements.descriptor_words];
         let max_accumulator = requirements
@@ -3308,6 +3374,7 @@ mod tests {
             CompositionLaunchMode::Serial,
         )
         .unwrap();
+        assert_eq!(source_requirements.execution_receipt, None);
         let source_count = source_requirements
             .components
             .iter()
@@ -3326,6 +3393,13 @@ mod tests {
             .components
             .iter()
             .all(|component| component.fallback_count == 0));
+        assert_eq!(
+            wave.execution_receipt,
+            Some(CompositionExecutionReceipt {
+                part_count: 2,
+                wave_count: 1,
+            })
+        );
         assert_eq!(wave.waves.len(), 1);
         assert_eq!(wave.waves[0].parts.len(), 2);
         assert_eq!(wave.waves[0].parts[1].identity.coefficient_start, 2);
