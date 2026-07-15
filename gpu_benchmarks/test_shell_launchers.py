@@ -426,6 +426,13 @@ class ShellLauncherTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         validator = source.index("checkpoint_validate_sn2()")
         valid = {
+            "gpu_host_plan_cache_materialization": "reused",
+            "gpu_host_plan_cache_hits": 1,
+            "gpu_host_plan_cache_misses": 1,
+            "gpu_host_plan_cache_compilations": 1,
+            "gpu_host_plan_cache_evictions": 0,
+            "gpu_host_plan_cache_collisions": 0,
+            "gpu_host_preparation_total_ns": 80_000_000,
             "gpu_shape_executable_materialization": "reused",
             "gpu_shape_executable_cache_hits": 1,
             "gpu_shape_executable_cache_misses": 1,
@@ -436,28 +443,55 @@ class ShellLauncherTests(unittest.TestCase):
             "gpu_workspace_materialization": "reused",
             "gpu_hot_allocations": 0,
         }
-        require_resident_reuse(valid, 2)
+        require_resident_reuse(valid, 2, max_host_preparation_ns=120_000_000)
         require_resident_reuse(
-            {**valid, "gpu_shape_executable_cache_hits": 5}, 6
+            {
+                **valid,
+                "gpu_host_plan_cache_hits": 5,
+                "gpu_shape_executable_cache_hits": 5,
+            },
+            6,
+            max_host_preparation_ns=120_000_000,
         )
         self.assertIn(
             "from validate_replacement_v1_reuse import require_resident_reuse",
             source[validator:],
         )
-        self.assertIn("require_resident_reuse(r, reps)", source[validator:])
+        self.assertIn(
+            "require_resident_reuse(r, reps, max_host_preparation_ns=120_000_000)",
+            source[validator:],
+        )
 
         for field, expected in valid.items():
             mutations = (
                 ("compiled", None)
-                if field == "gpu_shape_executable_materialization"
+                if field in {
+                    "gpu_host_plan_cache_materialization",
+                    "gpu_shape_executable_materialization",
+                }
                 else ("materialized", None)
                 if field == "gpu_workspace_materialization"
+                else (120_000_001, True, None)
+                if field == "gpu_host_preparation_total_ns"
                 else (expected + 1, bool(expected), None)
             )
             for mutation in mutations:
                 with self.subTest(field=field, mutation=mutation):
                     with self.assertRaises(SystemExit):
-                        require_resident_reuse({**valid, field: mutation}, 2)
+                        require_resident_reuse(
+                            {**valid, field: mutation},
+                            2,
+                            max_host_preparation_ns=120_000_000,
+                        )
+
+        with self.assertRaises(SystemExit):
+            require_resident_reuse(
+                {**valid, "gpu_host_preparation_total_ns": 120_000_001},
+                2,
+                max_host_preparation_ns=120_000_000,
+            )
+        with self.assertRaises(ValueError):
+            require_resident_reuse(valid, 2, max_host_preparation_ns=0)
 
     def test_source_projection_cache_exclusions_only_cover_ignored_files(self) -> None:
         projection_files = []
