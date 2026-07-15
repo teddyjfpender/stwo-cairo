@@ -76,7 +76,7 @@ fn replacement_policy_json_reports_the_exact_planned_tuple() {
     assert_eq!(value["resident_backend"], "replacement-v1");
     assert_eq!(
         value["dynamic_commitment_leaf_schedule"],
-        "retained-domain-cooperative"
+        "retained-domain-compact-h8"
     );
     assert_eq!(
         value["quotient_numerator_schedule"],

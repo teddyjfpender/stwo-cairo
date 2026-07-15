@@ -718,7 +718,9 @@ pub fn stage_preprocessed_commitment(
         .ok_or(ResidentSourceStageError::MissingCommitment(
             CommitmentTreeId::Preprocessed,
         ))?;
-    if commitment.domain_cooperative_program.is_some() {
+    if commitment.domain_cooperative_program.is_some()
+        || commitment.compact_domain_program.is_some()
+    {
         return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch);
     }
     if workspace.preprocessed_commitment_ready() {
@@ -1097,7 +1099,8 @@ pub fn stage_preprocessed_commitment(
                         ) => ProgressiveNttLeafFusionMode::Separate,
                         (
                             ResidentBackend::ReplacementV1,
-                            DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+                            DynamicCommitmentLeafSchedule::RetainedDomainCooperative
+                            | DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
                         ) => ProgressiveNttLeafFusionMode::Fused16,
                         _ => {
                             return Err(

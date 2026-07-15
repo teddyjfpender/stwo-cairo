@@ -110,7 +110,7 @@ impl ProtocolPlanPolicy {
             Self::starknet_blake2s(kernel_manifest_hash, composition_max_kernel_instrs);
         policy.resident_backend = ResidentBackend::ReplacementV1;
         policy.dynamic_commitment_leaf_schedule =
-            DynamicCommitmentLeafSchedule::RetainedDomainCooperative;
+            DynamicCommitmentLeafSchedule::RetainedDomainCompactH8;
         policy.quotient_numerator_schedule = QuotientNumeratorSchedule::StagedPackedSingleWrite;
         policy.retained_lde_budget_bytes = 64 * 1024 * 1024 * 1024;
         policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive;
@@ -1527,7 +1527,7 @@ mod tests {
         assert_eq!(policy.resident_backend, ResidentBackend::ReplacementV1);
         assert_eq!(
             policy.dynamic_commitment_leaf_schedule,
-            DynamicCommitmentLeafSchedule::RetainedDomainCooperative
+            DynamicCommitmentLeafSchedule::RetainedDomainCompactH8
         );
         assert_eq!(
             policy.quotient_numerator_schedule,

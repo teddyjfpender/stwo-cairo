@@ -16,7 +16,8 @@ use stwo::core::pcs::PcsConfig;
 use stwo_backend_cuda::jit_witness::isa::WitnessProgram;
 use stwo_backend_cuda::{
     blake2s_pow_workspace_requirements, blake_g_fusion_program_is_exact,
-    commit_workspace_requirements, decommit_workspace_requirements, ec_op_workspace_requirements,
+    commit_workspace_requirements, compact_domain_arena_slot_requirements,
+    decommit_workspace_requirements, ec_op_workspace_requirements,
     execution_tables_workspace_requirements, fri_final_workspace_requirements,
     fri_workspace_requirements, oods_workspace_requirements,
     progressive_commit_workspace_requirements_for_mode, quotient_numerator_hybrid_plan,
@@ -28,7 +29,8 @@ use stwo_backend_cuda::{
     Blake2sPowWorkspaceSlots, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape,
     Blake2sTranscriptRequirements, Blake2sTranscriptWorkspaceSlots, CommitBatchRequirements,
     CommitBatchSlots, CommitGroupSlots, CommitProgram, CommitProgramError, CommitWorkspaceConfig,
-    CommitWorkspaceSlots, CudaExecContext, DecommitColumnGeometry, DecommitSourceMode,
+    CommitWorkspaceSlots, CompactDomainBindingError, CompactDomainProgram,
+    CompactDomainProgramError, CudaExecContext, DecommitColumnGeometry, DecommitSourceMode,
     DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots, DecommitWorkspaceConfig,
     DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena, DeviceTranscriptError,
     DomainCooperativeProgram, DomainCooperativeProgramError, EcOpMultiplicityGeometry,
@@ -626,6 +628,9 @@ pub enum DynamicCommitmentLeafSchedule {
     #[default]
     LegacyPerBatch = 0,
     RetainedDomainCooperative = 1,
+    /// ReplacementV1 compact successor. The exact retained evaluation image
+    /// reconstructs Blake2s's lazy tail, so only h[8] persists per lifted row.
+    RetainedDomainCompactH8 = 2,
 }
 
 impl DynamicCommitmentLeafSchedule {
@@ -633,6 +638,7 @@ impl DynamicCommitmentLeafSchedule {
         match self {
             Self::LegacyPerBatch => "legacy-per-batch",
             Self::RetainedDomainCooperative => "retained-domain-cooperative",
+            Self::RetainedDomainCompactH8 => "retained-domain-compact-h8",
         }
     }
 }
@@ -1426,6 +1432,9 @@ impl ProtocolGeometry {
             ) | (
                 ResidentBackend::ReplacementV1,
                 DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            ) | (
+                ResidentBackend::ReplacementV1,
+                DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
             )
         ) {
             return Err(ArenaPlanError::InvalidProtocolGeometry(
@@ -2487,6 +2496,7 @@ struct LogicalCommitWorkspace {
     storage_mode: ProgressiveCommitStorageMode,
     commit_program: Option<CommitProgram>,
     domain_cooperative_program: Option<DomainCooperativeProgram>,
+    compact_domain_program: Option<CompactDomainProgram>,
     interpolation_mode: InterpolationLaunchMode,
     config: CommitWorkspaceConfig,
     grouped_column_log_sizes: Vec<Vec<u32>>,
@@ -3271,6 +3281,7 @@ pub struct PlannedCommitment {
     pub storage_mode: ProgressiveCommitStorageMode,
     pub commit_program: Option<CommitProgram>,
     pub domain_cooperative_program: Option<DomainCooperativeProgram>,
+    pub compact_domain_program: Option<CompactDomainProgram>,
     pub config: CommitWorkspaceConfig,
     pub grouped_column_log_sizes: Vec<Vec<u32>>,
     pub grouped_column_sources: Vec<Vec<CommitmentColumnSource>>,
@@ -4150,6 +4161,8 @@ pub enum ArenaPlanError {
     ProgressiveCommit(PreparedProgressiveCommitError),
     CommitProgram(CommitProgramError),
     DomainCooperativeProgram(DomainCooperativeProgramError),
+    CompactDomainProgram(CompactDomainProgramError),
+    CompactDomainBinding(CompactDomainBindingError),
     Composition(PreparedCompositionError),
     Oods(PreparedOodsError),
     QuotientNumerator(PreparedQuotientNumeratorError),
@@ -6674,7 +6687,13 @@ fn dynamic_commitment_leaf_program(
     schedule: DynamicCommitmentLeafSchedule,
     tree: CommitmentTreeId,
     base: Option<&CommitProgram>,
-) -> Result<Option<DomainCooperativeProgram>, ArenaPlanError> {
+) -> Result<
+    (
+        Option<DomainCooperativeProgram>,
+        Option<CompactDomainProgram>,
+    ),
+    ArenaPlanError,
+> {
     match (schedule, tree, base) {
         (
             DynamicCommitmentLeafSchedule::LegacyPerBatch,
@@ -6683,19 +6702,35 @@ fn dynamic_commitment_leaf_program(
             | CommitmentTreeId::Interaction
             | CommitmentTreeId::Composition,
             None,
-        ) => Ok(None),
+        ) => Ok((None, None)),
         (
             DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
             CommitmentTreeId::Preprocessed,
             Some(_),
-        ) => Ok(None),
+        )
+        | (
+            DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
+            CommitmentTreeId::Preprocessed,
+            Some(_),
+        ) => Ok((None, None)),
         (
             DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
             CommitmentTreeId::Base | CommitmentTreeId::Interaction | CommitmentTreeId::Composition,
             Some(program),
         ) => DomainCooperativeProgram::compile_mode_a(program)
-            .map(Some)
+            .map(|domain| (Some(domain), None))
             .map_err(ArenaPlanError::DomainCooperativeProgram),
+        (
+            DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
+            CommitmentTreeId::Base | CommitmentTreeId::Interaction | CommitmentTreeId::Composition,
+            Some(program),
+        ) => {
+            let domain = DomainCooperativeProgram::compile_mode_a(program)
+                .map_err(ArenaPlanError::DomainCooperativeProgram)?;
+            let compact = CompactDomainProgram::compile(program, &domain)
+                .map_err(ArenaPlanError::CompactDomainProgram)?;
+            Ok((Some(domain), Some(compact)))
+        }
         (
             DynamicCommitmentLeafSchedule::LegacyPerBatch,
             CommitmentTreeId::Preprocessed
@@ -6707,7 +6742,8 @@ fn dynamic_commitment_leaf_program(
             "legacy dynamic commitment unexpectedly owns a replacement program",
         )),
         (
-            DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative
+            | DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
             CommitmentTreeId::Preprocessed
             | CommitmentTreeId::Base
             | CommitmentTreeId::Interaction
@@ -7027,7 +7063,7 @@ fn append_protocol_buffers(
                 ));
             }
         };
-        let domain_cooperative_program = dynamic_commitment_leaf_program(
+        let (domain_cooperative_program, compact_domain_program) = dynamic_commitment_leaf_program(
             protocol.identity.dynamic_commitment_leaf_schedule,
             geometry.id,
             commit_program.as_ref(),
@@ -7048,10 +7084,15 @@ fn append_protocol_buffers(
                     None,
                     BufferPurpose::CommitProgressiveStatePing,
                     ordinal()?,
-                    requirements
-                        .leaves
-                        .in_place_slab_words()
-                        .map_err(ArenaPlanError::ProgressiveCommit)?,
+                    compact_domain_program.as_ref().map_or_else(
+                        || {
+                            requirements
+                                .leaves
+                                .in_place_slab_words()
+                                .map_err(ArenaPlanError::ProgressiveCommit)
+                        },
+                        |compact| Ok(compact.slab_words()),
+                    )?,
                     at,
                 )?)
             }
@@ -7347,6 +7388,7 @@ fn append_protocol_buffers(
             storage_mode,
             commit_program,
             domain_cooperative_program,
+            compact_domain_program,
             interpolation_mode: protocol.identity.interpolation_mode,
             config: geometry.config,
             grouped_column_log_sizes: geometry.grouped_column_log_sizes.clone(),
@@ -8208,7 +8250,7 @@ fn append_protocol_buffers(
         .filter_map(|commitment| {
             let (
                 ProgressiveCommitStorageMode::InPlaceSlab,
-                ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+                ModeAwareCommitWorkspaceRequirements::DomainProgressive(_),
                 LogicalCommitLeafWorkspace::DomainProgressive { state_ping, .. },
             ) = (
                 commitment.storage_mode,
@@ -8218,15 +8260,13 @@ fn append_protocol_buffers(
             else {
                 return None;
             };
-            Some(
-                requirements
-                    .leaves
-                    .in_place_slab_words()
-                    .map(|words| (commitment.id, *state_ping, words)),
-            )
+            Some((
+                commitment.id,
+                *state_ping,
+                logical[state_ping.0 as usize].len_words,
+            ))
         })
-        .collect::<Result<Vec<_>, PreparedProgressiveCommitError>>()
-        .map_err(ArenaPlanError::ProgressiveCommit)?;
+        .collect::<Vec<_>>();
     released_slabs.sort_by_key(|&(_, _, words)| core::cmp::Reverse(words));
     let overflow_capacities = released_slabs
         .iter()
@@ -8767,9 +8807,24 @@ fn resolve_commitment_slots(
             ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
             ModeAwareCommitWorkspaceSlots::DomainProgressive(slots),
         ) => {
-            requirements
-                .arena_slot_requirements_in_place(slots)
-                .map_err(ArenaPlanError::ProgressiveCommit)?;
+            if let Some(compact) = logical.compact_domain_program.as_ref() {
+                let base = logical.commit_program.as_ref().ok_or(
+                    ArenaPlanError::InvalidProtocolGeometry(
+                        "compact commitment is missing its base program",
+                    ),
+                )?;
+                let domain = logical.domain_cooperative_program.as_ref().ok_or(
+                    ArenaPlanError::InvalidProtocolGeometry(
+                        "compact commitment is missing its domain program",
+                    ),
+                )?;
+                compact_domain_arena_slot_requirements(compact, base, domain, slots)
+                    .map_err(ArenaPlanError::CompactDomainBinding)?;
+            } else {
+                requirements
+                    .arena_slot_requirements_in_place(slots)
+                    .map_err(ArenaPlanError::ProgressiveCommit)?;
+            }
         }
         _ => {
             return Err(ArenaPlanError::InvalidProtocolGeometry(
@@ -8782,6 +8837,7 @@ fn resolve_commitment_slots(
         storage_mode: logical.storage_mode,
         commit_program: logical.commit_program,
         domain_cooperative_program: logical.domain_cooperative_program,
+        compact_domain_program: logical.compact_domain_program,
         config: logical.config,
         grouped_column_log_sizes: logical.grouped_column_log_sizes,
         grouped_column_sources: logical.grouped_column_sources,
@@ -10444,7 +10500,8 @@ mod tests {
     #[test]
     fn dynamic_commitment_leaf_schedule_is_exhaustive_and_fail_closed() {
         let retained = retained_commit_program(true);
-        let expected = DomainCooperativeProgram::compile_mode_a(&retained).unwrap();
+        let expected_domain = DomainCooperativeProgram::compile_mode_a(&retained).unwrap();
+        let expected_compact = CompactDomainProgram::compile(&retained, &expected_domain).unwrap();
         for tree in [
             CommitmentTreeId::Base,
             CommitmentTreeId::Interaction,
@@ -10457,7 +10514,19 @@ mod tests {
                     Some(&retained),
                 )
                 .unwrap(),
-                Some(expected.clone())
+                (Some(expected_domain.clone()), None)
+            );
+            assert_eq!(
+                dynamic_commitment_leaf_program(
+                    DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
+                    tree,
+                    Some(&retained),
+                )
+                .unwrap(),
+                (
+                    Some(expected_domain.clone()),
+                    Some(expected_compact.clone())
+                )
             );
         }
         assert_eq!(
@@ -10467,7 +10536,16 @@ mod tests {
                 Some(&retained),
             )
             .unwrap(),
-            None
+            (None, None)
+        );
+        assert_eq!(
+            dynamic_commitment_leaf_program(
+                DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
+                CommitmentTreeId::Preprocessed,
+                Some(&retained),
+            )
+            .unwrap(),
+            (None, None)
         );
         assert!(matches!(
             dynamic_commitment_leaf_program(
@@ -10492,7 +10570,7 @@ mod tests {
                 None,
             )
             .unwrap(),
-            None
+            (None, None)
         );
         assert!(matches!(
             dynamic_commitment_leaf_program(

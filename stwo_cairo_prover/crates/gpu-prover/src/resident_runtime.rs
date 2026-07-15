@@ -14,13 +14,14 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo_backend_cuda::{
     ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitEvaluationGroup,
-    CommitProgram, CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
-    DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError,
-    DomainCooperativeBindingError, DomainCooperativeProgram, ExecutionTablesHostData,
-    FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
-    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError,
-    PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedBlakeGFusedFeed,
-    PreparedCommitError, PreparedCommitGraph, PreparedDecommitError, PreparedDecommitGraph,
+    CommitProgram, CompactDomainBindingError, CompactDomainProgram, CudaExecTelemetry,
+    CudaRuntimeError, DecommitAssembly, DecommitColumnSource, DecommitTreeGeometry,
+    DecommitTreeSources, DeviceTranscriptError, DomainCooperativeBindingError,
+    DomainCooperativeProgram, ExecutionTablesHostData, FixedTableSourceColumn,
+    FriDecommitOwnedSources, MemoryBaseTracePart, ModeAwareCommitWorkspaceRequirements,
+    ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError, PreparedBlake2sPowGraph,
+    PreparedBlake2sTranscript, PreparedBlakeGFusedFeed, PreparedCommitError, PreparedCommitGraph,
+    PreparedCompactDomainCommitGraph, PreparedDecommitError, PreparedDecommitGraph,
     PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
     PreparedExecutionTablesError, PreparedExecutionTablesGraph,
     PreparedExecutionTablesIngestTelemetry, PreparedFixedTableError, PreparedFixedTableGraph,
@@ -429,6 +430,7 @@ pub enum ResidentRuntimeError {
     Commit(PreparedCommitError),
     ProgressiveCommit(PreparedProgressiveCommitError),
     DomainCooperativeBinding(DomainCooperativeBindingError),
+    CompactDomainBinding(CompactDomainBindingError),
     CommitModeMismatch,
     Interpolation(PreparedInterpolationError),
     SourceStage(ResidentSourceStageError),
@@ -498,19 +500,53 @@ impl From<DomainCooperativeBindingError> for ResidentRuntimeError {
     }
 }
 
+impl From<CompactDomainBindingError> for ResidentRuntimeError {
+    fn from(value: CompactDomainBindingError) -> Self {
+        Self::CompactDomainBinding(value)
+    }
+}
+
+enum ExactDynamicCommitProgram<'a> {
+    Cooperative {
+        domain: &'a DomainCooperativeProgram,
+        base: &'a CommitProgram,
+    },
+    Compact {
+        compact: &'a CompactDomainProgram,
+        domain: &'a DomainCooperativeProgram,
+        base: &'a CommitProgram,
+    },
+}
+
 fn exact_dynamic_commit_program<'a>(
     backend: ResidentBackend,
     schedule: DynamicCommitmentLeafSchedule,
     cooperative: Option<&'a DomainCooperativeProgram>,
+    compact: Option<&'a CompactDomainProgram>,
     base: Option<&'a CommitProgram>,
-) -> Result<(&'a DomainCooperativeProgram, &'a CommitProgram), ResidentRuntimeError> {
-    match (backend, schedule, cooperative, base) {
+) -> Result<ExactDynamicCommitProgram<'a>, ResidentRuntimeError> {
+    match (backend, schedule, cooperative, compact, base) {
         (
             ResidentBackend::ReplacementV1,
             DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
             Some(cooperative),
+            None,
             Some(base),
-        ) => Ok((cooperative, base)),
+        ) => Ok(ExactDynamicCommitProgram::Cooperative {
+            domain: cooperative,
+            base,
+        }),
+        (
+            ResidentBackend::ReplacementV1,
+            DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
+            Some(domain),
+            Some(compact),
+            Some(base),
+        ) => Ok(ExactDynamicCommitProgram::Compact {
+            compact,
+            domain,
+            base,
+        }),
         _ => Err(ResidentRuntimeError::CommitModeMismatch),
     }
 }
@@ -645,6 +681,7 @@ impl From<TranscriptPlanError> for ResidentRuntimeError {
 enum ResidentLaunchError {
     Commit(PreparedCommitError),
     ProgressiveCommit(PreparedProgressiveCommitError),
+    CompactDomainCommit(CompactDomainBindingError),
     Interpolation(PreparedInterpolationError),
     Composition(PreparedCompositionError),
     Oods(ResidentOodsError),
@@ -672,6 +709,9 @@ impl core::fmt::Display for ResidentLaunchError {
                     f,
                     "resident progressive commitment launch rejected: {error}"
                 )
+            }
+            Self::CompactDomainCommit(error) => {
+                write!(f, "resident compact commitment launch rejected: {error}")
             }
             Self::Interpolation(error) => {
                 write!(f, "resident interpolation launch rejected: {error}")
@@ -1041,6 +1081,10 @@ enum PreparedResidentCommitment<'a> {
         graph: PreparedProgressiveCommitGraph<'a>,
         retained_evaluations: Vec<Option<Vec<ArenaSlice>>>,
     },
+    Compact {
+        graph: PreparedCompactDomainCommitGraph<'a>,
+        retained_evaluations: Vec<Option<Vec<ArenaSlice>>>,
+    },
 }
 
 impl PreparedResidentCommitment<'_> {
@@ -1050,6 +1094,9 @@ impl PreparedResidentCommitment<'_> {
             Self::Progressive { graph, .. } => graph
                 .launch()
                 .map_err(ResidentLaunchError::ProgressiveCommit),
+            Self::Compact { graph, .. } => graph
+                .launch()
+                .map_err(ResidentLaunchError::CompactDomainCommit),
         }
     }
 
@@ -1057,6 +1104,7 @@ impl PreparedResidentCommitment<'_> {
         match self {
             Self::Full(graph) => graph.root_slice(),
             Self::Progressive { graph, .. } => graph.root_slice(),
+            Self::Compact { graph, .. } => graph.root_slice(),
         }
     }
 
@@ -1064,6 +1112,7 @@ impl PreparedResidentCommitment<'_> {
         match self {
             Self::Full(graph) => graph.retained_layers_bottom_up(),
             Self::Progressive { graph, .. } => graph.retained_layers_bottom_up(),
+            Self::Compact { graph, .. } => graph.retained_layers_bottom_up(),
         }
     }
 
@@ -1071,6 +1120,10 @@ impl PreparedResidentCommitment<'_> {
         match self {
             Self::Full(graph) => graph.retained_evaluations(),
             Self::Progressive {
+                retained_evaluations,
+                ..
+            }
+            | Self::Compact {
                 retained_evaluations,
                 ..
             } => retained_evaluations,
@@ -1081,6 +1134,7 @@ impl PreparedResidentCommitment<'_> {
         match self {
             Self::Full(graph) => Ok(graph.read_root_at_transcript_boundary()?),
             Self::Progressive { graph, .. } => Ok(graph.read_root_at_transcript_boundary()?),
+            Self::Compact { graph, .. } => Ok(graph.read_root_at_transcript_boundary()?),
         }
     }
 }
@@ -1744,7 +1798,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .iter()
                         .map(|group| group.as_ref().map(|group| group.columns.clone()))
                         .collect();
-                    let graph = match planned.storage_mode {
+                    match planned.storage_mode {
                         ProgressiveCommitStorageMode::Separate => {
                             if !matches!(
                                 (
@@ -1758,39 +1812,67 @@ impl<'a> ResidentGraphRuntime<'a> {
                             ) {
                                 return Err(ResidentRuntimeError::CommitModeMismatch);
                             }
-                            PreparedProgressiveCommitGraph::prepare_with_modes_and_ntt_fusion(
-                                arena,
-                                planned.config,
-                                requirements,
-                                slots,
-                                &coefficients,
-                                &flat_retained,
-                                twiddles,
-                                protocol_identity.commit_mode,
-                                protocol_identity.blake2s_interior_fused,
-                                ProgressiveNttLeafFusionMode::Separate,
-                            )?
+                            let graph =
+                                PreparedProgressiveCommitGraph::prepare_with_modes_and_ntt_fusion(
+                                    arena,
+                                    planned.config,
+                                    requirements,
+                                    slots,
+                                    &coefficients,
+                                    &flat_retained,
+                                    twiddles,
+                                    protocol_identity.commit_mode,
+                                    protocol_identity.blake2s_interior_fused,
+                                    ProgressiveNttLeafFusionMode::Separate,
+                                )?;
+                            PreparedResidentCommitment::Progressive {
+                                graph,
+                                retained_evaluations: grouped_retained,
+                            }
                         }
                         ProgressiveCommitStorageMode::InPlaceSlab => {
-                            let (program, base) = exact_dynamic_commit_program(
+                            match exact_dynamic_commit_program(
                                 protocol_identity.resident_backend,
                                 protocol_identity.dynamic_commitment_leaf_schedule,
                                 planned.domain_cooperative_program.as_ref(),
+                                planned.compact_domain_program.as_ref(),
                                 planned.commit_program.as_ref(),
-                            )?;
-                            program.bind(
-                                arena,
-                                base,
-                                slots,
-                                &coefficients,
-                                &flat_retained,
-                                twiddles,
-                            )?
+                            )? {
+                                ExactDynamicCommitProgram::Cooperative { domain, base } => {
+                                    let graph = domain.bind(
+                                        arena,
+                                        base,
+                                        slots,
+                                        &coefficients,
+                                        &flat_retained,
+                                        twiddles,
+                                    )?;
+                                    PreparedResidentCommitment::Progressive {
+                                        graph,
+                                        retained_evaluations: grouped_retained,
+                                    }
+                                }
+                                ExactDynamicCommitProgram::Compact {
+                                    compact,
+                                    domain,
+                                    base,
+                                } => {
+                                    let graph = compact.bind_prepared(
+                                        arena,
+                                        base,
+                                        domain,
+                                        slots,
+                                        &coefficients,
+                                        &flat_retained,
+                                        twiddles,
+                                    )?;
+                                    PreparedResidentCommitment::Compact {
+                                        graph,
+                                        retained_evaluations: grouped_retained,
+                                    }
+                                }
+                            }
                         }
-                    };
-                    PreparedResidentCommitment::Progressive {
-                        graph,
-                        retained_evaluations: grouped_retained,
                     }
                 }
                 _ => return Err(ResidentRuntimeError::CommitModeMismatch),
@@ -4583,15 +4665,39 @@ mod tests {
     fn dynamic_commit_runtime_requires_the_exact_program_pair() {
         let base = retained_commit_program();
         let cooperative = DomainCooperativeProgram::compile_mode_a(&base).unwrap();
+        let compact = CompactDomainProgram::compile(&base, &cooperative).unwrap();
         let selected = exact_dynamic_commit_program(
             ResidentBackend::ReplacementV1,
             DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
             Some(&cooperative),
+            None,
             Some(&base),
         )
         .unwrap();
-        assert!(core::ptr::eq(selected.0, &cooperative));
-        assert!(core::ptr::eq(selected.1, &base));
+        assert!(matches!(
+            selected,
+            ExactDynamicCommitProgram::Cooperative { domain, base: selected_base }
+                if core::ptr::eq(domain, &cooperative) && core::ptr::eq(selected_base, &base)
+        ));
+
+        let selected = exact_dynamic_commit_program(
+            ResidentBackend::ReplacementV1,
+            DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
+            Some(&cooperative),
+            Some(&compact),
+            Some(&base),
+        )
+        .unwrap();
+        assert!(matches!(
+            selected,
+            ExactDynamicCommitProgram::Compact {
+                compact: selected_compact,
+                domain,
+                base: selected_base,
+            } if core::ptr::eq(selected_compact, &compact)
+                && core::ptr::eq(domain, &cooperative)
+                && core::ptr::eq(selected_base, &base)
+        ));
 
         for (backend, schedule) in [
             (
@@ -4608,7 +4714,13 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                exact_dynamic_commit_program(backend, schedule, Some(&cooperative), Some(&base)),
+                exact_dynamic_commit_program(
+                    backend,
+                    schedule,
+                    Some(&cooperative),
+                    Some(&compact),
+                    Some(&base),
+                ),
                 Err(ResidentRuntimeError::CommitModeMismatch)
             ));
         }
@@ -4616,6 +4728,7 @@ mod tests {
             exact_dynamic_commit_program(
                 ResidentBackend::ReplacementV1,
                 DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+                None,
                 None,
                 Some(&base),
             ),
@@ -4627,6 +4740,17 @@ mod tests {
                 DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
                 Some(&cooperative),
                 None,
+                None,
+            ),
+            Err(ResidentRuntimeError::CommitModeMismatch)
+        ));
+        assert!(matches!(
+            exact_dynamic_commit_program(
+                ResidentBackend::ReplacementV1,
+                DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
+                Some(&cooperative),
+                None,
+                Some(&base),
             ),
             Err(ResidentRuntimeError::CommitModeMismatch)
         ));
