@@ -61,6 +61,8 @@ def valid_record() -> dict:
         "gpu_pcs_stage_finished": {stage: 1 for stage in STAGES},
         "gpu_pcs_batched_tree_decommit": True,
         "gpu_pcs_driver_complete": True,
+        "gpu_resident_backend_requested": "replacement-v1",
+        "gpu_resident_backend": "replacement-v1",
         "gpu_native_architecture_required": True,
         "gpu_pcs_required_runtime_mode": "detached-eager",
         "gpu_native_architecture_gate_passed": True,
@@ -450,6 +452,53 @@ def local_admission_fixture(root: Path) -> tuple[dict, Path, dict[str, Path]]:
 class ArchitectureRecordTest(unittest.TestCase):
     def test_accepts_complete_typed_cuda_record(self) -> None:
         self.assertEqual(validate_record(valid_record(), "detached-eager"), [])
+
+    def test_optional_resident_backend_gate_binds_request_and_execution(self) -> None:
+        record = valid_record()
+        self.assertEqual(
+            validate_record(
+                record,
+                "detached-eager",
+                required_resident_backend="replacement-v1",
+            ),
+            [],
+        )
+        for field in (
+            "gpu_resident_backend_requested",
+            "gpu_resident_backend",
+        ):
+            with self.subTest(field=field):
+                mismatched = record.copy()
+                mismatched[field] = "legacy-resident"
+                errors = validate_record(
+                    mismatched,
+                    "detached-eager",
+                    required_resident_backend="replacement-v1",
+                )
+                self.assertTrue(any(error.startswith(f"{field}:") for error in errors))
+
+    def test_resident_backend_cli_gate_is_exact(self) -> None:
+        record = valid_record()
+        soundness = valid_soundness_artifact("detached-eager")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record_path = root / "record.jsonl"
+            soundness_path = root / "soundness.json"
+            record_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            soundness_path.write_text(json.dumps(soundness) + "\n", encoding="utf-8")
+            arguments = [
+                str(record_path),
+                "--runtime-mode",
+                "detached-eager",
+                "--soundness-gate",
+                str(soundness_path),
+                "--required-resident-backend",
+                "replacement-v1",
+            ]
+            self.assertEqual(main(arguments), 0)
+            record["gpu_resident_backend"] = "legacy-resident"
+            record_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            self.assertEqual(main(arguments), 1)
 
     def test_rejects_legacy_simd_missing_partial_and_duplicate_records(self) -> None:
         mutations = (

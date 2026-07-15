@@ -1,14 +1,20 @@
-# Fleet orchestrator — the 10–20 MHz aggregate demonstration
+# Fleet orchestrator — the 10–20 MHz aggregate target
 
-The single-card story tops out around **1–2.5 useful MHz** on a real Starknet OS PIE
-(RESULTS round 8). The path to **10–20 MHz** is not one heroic card — it is a *fleet*
-of cheap consumer cards each proving a stream of blocks, summed. This directory is the
-harness that runs that demonstration and produces the number: aggregate useful MHz,
-total \$/hr, and **\$/MHz-hr**.
+This fleet proves **whole, independent SN PIEs** on each worker. It scales block-stream
+throughput by assigning complete proofs to separate GPUs; it does not split one proof
+across cards, and aggregate useful MHz is not a single-proof latency claim. ZisK,
+Airbender, and other EVM-prover fleets are architectural reference points only: their
+workloads and published results are not evidence about this SN PIE prover.
 
-It is pure orchestration — it runs `gpu_bench`, not any prover code, and cannot change
-proof bytes. Its only correctness dependency is the standard per-pod correctness gate
-(the loop's 10-transfer PIE CUDA prove+verify), which is ON by default.
+The latest replacement-v1 SN2 diagnostic measured **3.962227 useful MHz on one H100**.
+That does not qualify a consumer-card rate. This directory measures whether a fleet of
+independently admitted workers can reach the **10–20 MHz aggregate target**, along with
+total \$/hr and **\$/MHz-hr**; it does not assume that target has already been reached.
+
+It implements no prover arithmetic, but it does select and launch `gpu_bench`, so the
+backend selection and emitted record are sealed explicitly. Its correctness dependency
+is the standard per-pod correctness gate (the loop's 10-transfer PIE CUDA prove+verify),
+which is ON by default.
 
 ```
 cd gpu_benchmarks/fleet
@@ -91,9 +97,9 @@ dropped) — and does **not** modify `bench_loop.sh`.
 
 ## Kill switch / lane toggles (how the integration agent bisects)
 
-fleet.sh runs no prover code, so it cannot alter proof bytes — there is nothing to
-default-on unsafely. Its toggles are about *which pods participate*, which is exactly
-the bisect surface:
+The backend is not a fleet toggle: gate and benchmark launches are fixed to
+`replacement-v1`. The supported toggles control *which pods participate*, which is the
+intended bisect surface:
 
 - **per-pod** — set `enabled=0` on any roster line to drop that lane without touching
   anything else, or `--only <id>` to run exactly one pod.
@@ -106,12 +112,14 @@ the bisect surface:
 A pod that fails its gate, fails to launch, or stalls is **dropped from the aggregate**
 and recorded with its status — never silently averaged into the fleet number.
 
-Every CUDA gate and performance invocation carries `--engine gpu-native` and
-`--require-gpu-native-architecture`. After pulling stdout, the fleet independently runs
+Every CUDA gate and performance invocation carries `--engine gpu-native`,
+`--resident-backend replacement-v1`, and `--require-gpu-native-architecture`. After
+pulling stdout, the fleet independently runs
 `gpu_benchmarks/validate_architecture_record.py`; a stale binary or partial record is
 dropped unless it reports the exact `cuda-typed-pcs-driver-v1` tag, the required runtime
-mode, all seven starts and finishes exactly once, batched tree decommit, and complete
-telemetry. It also rejects any AOT miss, runtime load/cache hit, or strict rejection;
+mode, `replacement-v1` as both the requested and executed resident backend, all seven
+starts and finishes exactly once, batched tree decommit, and complete telemetry. It also
+rejects any AOT miss, runtime load/cache hit, or strict rejection;
 AOT loads and AOT cache hits remain explicit counters, including legitimate zeroes when
 no generated kernel ran, and the embedded AOT manifest hash must be non-zero.
 
@@ -124,6 +132,8 @@ no generated kernel ran, and the embedded AOT manifest hash must be non-zero.
   "pods": [
     { "id": "...", "gpu": "RTX 4090", "usd_per_hr": 0.44, "status": "ok",
       "useful_mhz": 1.10, "mhz_basis": "sustained_useful_mhz",
+      "gpu_resident_backend_requested": "replacement-v1",
+      "gpu_resident_backend": "replacement-v1",
       "feed_starved_s": 0.0, "vram_peak_gb": 36.2, "usd_per_mhz_hr": 0.40 }
   ],
   "aggregate": {
@@ -148,42 +158,15 @@ no generated kernel ran, and the embedded AOT manifest hash must be non-zero.
 - **`pods_needed_for_target_*`** = ⌈target / mean_pod_useful_mhz⌉ — how many more of
   this class of pod reach 10 / 20 MHz.
 
-## The fleet math (RESULTS round 8)
+## The fleet math
 
-Round 8 proved the first real Starknet OS PIEs on CUDA and produced the cost model that
-makes the fleet the right shape. On `SN_PIE_2` (7,706,864 `n_steps`), an A40 warm prove
-of ~31.6 s split:
-
-| phase                            | share | note |
-|----------------------------------|-------|------|
-| host witness write (base + interaction) | **66%** | W3's target — the dominant lever |
-| commitments (NTT + Merkle)       | 29%   | fusion + bandwidth headroom |
-| STARK core (composition/OODS/FRI)| 8.7%  | already cheap (JIT kernel-split fix) |
-
-giving **`useful_mhz` ≈ 0.23** today per A40-class card. The round-8 verdict then lays
-out the per-card trajectory and the fleet arithmetic this harness measures:
-
-> per-GPU `useful_mhz` **0.23 today → ~1.1** with W3 witness-on-GPU + P2 stream overlap
-> on A40-class → **~2–2.5** on 4090/5090 after the VRAM diet. An aggregate **10–20 MHz**
-> is then **5–8 consumer cards** at **~\$0.15–0.35/MHz-hr** versus **~\$0.7 on H100**.
-
-The consumer-fleet economics come from two facts:
-
-1. **GPU generation stopped mattering** once the STARK core shrank (round 5: a 4090 was
-   no faster than a 3090 host — the prove is host-witness- and commit-bound, not
-   core-bound). So the fleet buys *many cheap cards*, not a few expensive ones.
-2. **Sustained throughput holds under a continuous feed** (round 8 rotate: 6 reps,
-   3-deep pipeline, 4 producers ⇒ `sustained_useful_mhz` 0.228, `feed_starved_s` 0.0 —
-   producers kept the GPU fed). So per-pod useful MHz *adds* across pods with no shared
-   bottleneck, which is why the aggregate is a clean sum.
-
-**Worked target.** At the round-8 projected ~1.1 useful MHz/card (post-W3+P2 on
-A40-class) you need ⌈10 / 1.1⌉ = **10 cards** for 10 MHz; at the projected ~2.3 MHz/card
-(4090/5090, post-VRAM-diet) you need ⌈10 / 2.3⌉ = **5 cards** for 10 MHz and **~9** for
-20 MHz — the "5–8 cards" band, widening at the top only because 20 MHz needs the upper
-per-card number. `fleet.sh` computes exactly this `pods_needed_for_target_*` from the
-*measured* mean per-pod MHz of the run, so the projection is continuously re-grounded in
-real numbers as W3/P2/P3 land.
+The only admitted fleet arithmetic is based on workers measured in the same run:
+`aggregate_useful_mhz = Σ worker_useful_mhz` and
+`usd_per_mhz_hr = Σ worker_usd_per_hr / aggregate_useful_mhz`. The report derives the
+worker count for the 10 and 20 MHz targets from that run's measured mean. It must not
+substitute the 3.962227 H100 diagnostic for an unmeasured 3090, 4090, 5090, A40, or
+48-GiB-class rate. Each hardware class needs its own complete physical-memory admission,
+correctness gate, and sustained whole-SN-PIE measurement first.
 
 ## Provenance & discipline (inherited from the loop)
 

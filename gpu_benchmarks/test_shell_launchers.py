@@ -91,6 +91,40 @@ def valid_stage4_native_receipt(stwo_head: str) -> dict[str, object]:
 
 
 class ShellLauncherTests(unittest.TestCase):
+    def test_fleet_dry_run_seals_replacement_backend(self) -> None:
+        fleet = ROOT / "fleet" / "fleet.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "fleet.conf"
+            report = root / "fleet_report.json"
+            config.write_text(
+                "dry-pod | RTX 4090 | 0.69 | | | | 1\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["bash", str(fleet)],
+                cwd=ROOT.parent,
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "DRY_RUN": "1",
+                    "FLEET_CONF": str(config),
+                    "RESULTS_DIR": str(root / "results"),
+                    "REPORT": str(report),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--resident-backend replacement-v1", result.stderr)
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(payload["aggregate"]["n_pods_ok"], 1)
+            worker = payload["pods"][0]
+            self.assertEqual(
+                worker["gpu_resident_backend_requested"], "replacement-v1"
+            )
+            self.assertEqual(worker["gpu_resident_backend"], "replacement-v1")
+
     def test_replacement_sn2_stage4_native_seals_diagnostic(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
         source = common.read_text(encoding="utf-8")

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
-# fleet.sh — the harness for the 10–20 MHz AGGREGATE proving demonstration.
+# fleet.sh — the harness for the 10–20 MHz aggregate proving target.
 #
 # Given a roster of RunPod pods (fleet.conf), this launches one rotate-mode pipelined
 # gpu_bench stream on EVERY pod concurrently, polls all of them (with per-pod stall
 # detection), collects each pod's self-describing JSON record, and computes the fleet
-# aggregate: total useful MHz, total $/hr, and $/MHz-hr — the numbers that turn "one
-# consumer card does ~1–2.5 useful MHz" into "N cards do 10–20 MHz at $X/MHz-hr".
-# It writes one fleet_report.json + a human table.
+# aggregate: total useful MHz, total $/hr, and $/MHz-hr. It writes one
+# fleet_report.json + a human table. Per-card rates must be measured on each admitted
+# hardware class; 10–20 MHz is a fleet target, not a pre-established outcome.
 #
-# This script runs NO prover code and cannot change proof bytes (pure orchestration).
-# Its only correctness dependency is the standard per-pod 10-transfer PIE CUDA
+# This script implements no prover arithmetic, but it still seals the selected backend
+# and validates the resulting record. Its correctness dependency is the standard
+# per-pod 10-transfer PIE CUDA
 # prove+verify gate (loop's gate, ON by default) — a pod that fails its gate is
 # EXCLUDED from the aggregate, never silently averaged in. Performance is never
 # reported for a pod whose gate failed.
@@ -122,7 +123,7 @@ POD_RUN_DIR="/workspace/fleet_runs"
 RUST_MIN_STACK_VAL=4194304
 BENCH_ENV="${BENCH_ENV:-}"
 GPU_PCS_RUNTIME_MODE="${GPU_PCS_RUNTIME_MODE:-arena-graph}"
-GPU_NATIVE_ARGS="--engine gpu-native --require-gpu-native-architecture --require-gpu-pcs-runtime-mode ${GPU_PCS_RUNTIME_MODE}"
+GPU_NATIVE_ARGS="--engine gpu-native --resident-backend replacement-v1 --require-gpu-native-architecture --require-gpu-pcs-runtime-mode ${GPU_PCS_RUNTIME_MODE}"
 
 # Rotate (pipeline) parameters.
 FLEET_REPS="${FLEET_REPS:-8}"
@@ -141,7 +142,7 @@ ONLY="${FLEET_ONLY:-}"
 PREP=0
 SKIP_GATE=0
 
-# The 10 / 20 MHz targets this harness exists to demonstrate.
+# The 10 / 20 MHz planning targets this harness measures against.
 TARGET_LO_MHZ=10
 TARGET_HI_MHZ=20
 
@@ -552,7 +553,7 @@ PY
 
 architecture_contract_ok() {
   python3 "$ARCHITECTURE_CHECK" "$1" --runtime-mode "$GPU_PCS_RUNTIME_MODE" \
-    --soundness-gate "$2"
+    --soundness-gate "$2" --required-resident-backend replacement-v1
 }
 
 run_soundness_gate_on_pod() {
@@ -629,7 +630,7 @@ synth_pod_out() {
   local runtime_report="DetachedEager"
   [[ "$GPU_PCS_RUNTIME_MODE" == "arena-graph" ]] && runtime_report="ArenaGraph"
   local stage_counts='{"OodsEvaluation":1,"QuotientAndCompaction":1,"FriCommitAndFold":1,"ProofOfWork":1,"FriQueryAndDecommit":1,"TreeDecommit":1,"Assembly":1}'
-  local architecture_fields='"engine":"gpu-native","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"gpu_host_syncs":1,"gpu_graph_launches":14,"gpu_expected_graph_launches":14,"gpu_transcript_segments":15,"gpu_kernel_launches":7859,"gpu_expected_kernel_launches":7859,"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25'
+  local architecture_fields='"engine":"gpu-native","gpu_resident_backend_requested":"replacement-v1","gpu_resident_backend":"replacement-v1","gpu_pcs_driver_architecture":"cuda-typed-pcs-driver-v1","gpu_pcs_runtime_mode":"'"$runtime_report"'","gpu_pcs_stage_started":'"$stage_counts"',"gpu_pcs_stage_finished":'"$stage_counts"',"gpu_pcs_batched_tree_decommit":true,"gpu_pcs_driver_complete":true,"gpu_native_architecture_required":true,"gpu_pcs_required_runtime_mode":"'"$GPU_PCS_RUNTIME_MODE"'","gpu_native_architecture_gate_passed":true,"gpu_aot_loads":2,"gpu_aot_cache_hits":5,"gpu_aot_manifest_hash":49370,"gpu_aot_misses":0,"gpu_aot_runtime_loads":0,"gpu_aot_runtime_cache_hits":0,"gpu_aot_strict_rejections":0,"gpu_aot_provenance_gate_passed":true,"performance_claim_admissible":true,"performance_measurement_available":true,"steps_per_s":244000,"mhz":0.244,"useful_mhz":0.232,"gpu_host_syncs":1,"gpu_graph_launches":14,"gpu_expected_graph_launches":14,"gpu_transcript_segments":15,"gpu_kernel_launches":7859,"gpu_expected_kernel_launches":7859,"gpu_hot_h2d_bytes":0,"gpu_hot_d2h_bytes":1024,"gpu_hot_allocations":0,"gpu_max_graph_submit_gap_ms":1.25,"gpu_graph_a_setup_gate_passed":true,"gpu_setup_base_migration_copies":0,"gpu_setup_lookup_host_copies":0,"gpu_setup_legacy_witness_fallbacks":0,"gpu_execution_tables_ingest_compact_h2d_bytes":4096,"gpu_execution_tables_ingest_compact_h2d_copies":3,"gpu_execution_tables_ingest_descriptor_h2d_bytes":64,"gpu_execution_tables_ingest_descriptor_h2d_copies":2,"gpu_execution_tables_ingest_syncs":1,"gpu_witness_ingest_syncs":1'
   if [[ "$stage" == "gate" ]]; then
     echo "{\"program\":\"gate_10t\",\"backend\":\"cuda\",${architecture_fields},\"verify_ms\":41.0,\"verified_reps\":2,\"proof_kb\":2897.5,\"proof_comparison_applicable\":true,\"proof_byte_equal\":true,\"proof_byte_equal_required\":true}" > "$dest"
     return 0
@@ -838,6 +839,8 @@ with open(manifest) as f:
             "vram_peak_gb": (rec or {}).get("vram_peak_gb"),
             "gpu_pcs_driver_architecture": (rec or {}).get("gpu_pcs_driver_architecture"),
             "gpu_pcs_runtime_mode": (rec or {}).get("gpu_pcs_runtime_mode"),
+            "gpu_resident_backend_requested": (rec or {}).get("gpu_resident_backend_requested"),
+            "gpu_resident_backend": (rec or {}).get("gpu_resident_backend"),
             "gpu_native_architecture_gate_passed": (rec or {}).get("gpu_native_architecture_gate_passed"),
             "gpu_aot_loads": (rec or {}).get("gpu_aot_loads"),
             "gpu_aot_cache_hits": (rec or {}).get("gpu_aot_cache_hits"),

@@ -863,6 +863,7 @@ def validate_record(
     required_mode: str,
     *,
     graph_gap_diagnostic: bool = False,
+    required_resident_backend: str | None = None,
 ) -> list[str]:
     errors: list[str] = []
     expected_mode = RUNTIME_MODES.get(required_mode)
@@ -885,6 +886,13 @@ def validate_record(
         "gpu_aot_strict_rejections": 0,
         "gpu_aot_provenance_gate_passed": True,
     }
+    if required_resident_backend is not None:
+        required.update(
+            {
+                "gpu_resident_backend_requested": required_resident_backend,
+                "gpu_resident_backend": required_resident_backend,
+            }
+        )
     for field, expected in required.items():
         if record.get(field) != expected:
             errors.append(f"{field}: expected {expected!r}, got {record.get(field)!r}")
@@ -1507,6 +1515,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="admit only graph-submit-gap timing as provisional",
     )
+    parser.add_argument(
+        "--required-resident-backend",
+        choices=("legacy-resident", "replacement-v1"),
+        help="require the exact requested and executed resident backend",
+    )
     parser.add_argument("--gpu-telemetry-csv", type=Path)
     parser.add_argument("--gpu-telemetry-remote-sha256")
     parser.add_argument("--gpu-telemetry-remote-size", type=int)
@@ -1596,6 +1609,7 @@ def main(argv: list[str] | None = None) -> int:
         record,
         args.runtime_mode,
         graph_gap_diagnostic=args.graph_gap_diagnostic,
+        required_resident_backend=args.required_resident_backend,
     )
     if (args.expected_program is None) != (args.expected_reps is None):
         parser.error("record measurement validation requires both --expected-program and --expected-reps")
