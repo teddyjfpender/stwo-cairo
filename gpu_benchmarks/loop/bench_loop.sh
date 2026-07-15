@@ -612,12 +612,14 @@ verify_remote_source_projection() {
   [[ "$DRY_RUN" == "1" ]] && return 0
   verify_projection_exclusions_are_ignored || return 1
   local stwo_changes cairo_changes
-  stwo_changes="$(run_rsync -azcnO --delete --itemize-changes --no-owner --no-group --no-perms \
+  stwo_changes="$(run_rsync -azcnO --delete --itemize-changes \
+    --no-owner --no-group --no-perms --no-times \
     --exclude=target --exclude=.git \
     --exclude='__pycache__/' --exclude='*.py[co]' \
     -e "$SSH_E" \
     "${STWO_LOCAL}/" "${POD_USER}@${POD_HOST}:${STWO_POD}/")" || return 1
-  cairo_changes="$(run_rsync -azcnO --delete --itemize-changes --no-owner --no-group --no-perms \
+  cairo_changes="$(run_rsync -azcnO --delete --itemize-changes \
+    --no-owner --no-group --no-perms --no-times \
     --exclude=target --exclude=.git \
     --exclude='__pycache__/' --exclude='*.py[co]' \
     --exclude='gpu_benchmarks/pie/sn/' \
@@ -919,14 +921,16 @@ sync_repos() {
     || die "source projection cache exclusions are not limited to ignored files"
 
   log "rsync stwo -> pod (excludes target/.git; --delete: stale kernels break the auto-collecting build)"
-  run_rsync -azc --delete --partial --no-owner --no-group --no-perms \
+  run_rsync -azc --delete --partial \
+    --no-owner --no-group --no-perms --no-times \
     --exclude=target --exclude=.git \
     --exclude='__pycache__/' --exclude='*.py[co]' \
     -e "$SSH_E" \
     "${STWO_LOCAL}/" "${POD_USER}@${POD_HOST}:${STWO_POD}/"
 
   log "rsync stwo-cairo -> pod (excludes target/.git/PIE zips/ledger)"
-  run_rsync -azc --delete --partial --no-owner --no-group --no-perms \
+  run_rsync -azc --delete --partial \
+    --no-owner --no-group --no-perms --no-times \
     --exclude=target --exclude=.git \
     --exclude='__pycache__/' --exclude='*.py[co]' \
     --exclude='gpu_benchmarks/pie/sn/' \

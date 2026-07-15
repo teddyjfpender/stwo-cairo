@@ -1231,6 +1231,47 @@ printf '%s\n' "$body" | bash -n
             )
             self.assertEqual(verify.stdout, "")
 
+    def test_content_only_rsync_preserves_mtime_and_copies_changed_bytes(self) -> None:
+        rsync = shutil.which("rsync")
+        if rsync is None:
+            self.skipTest("rsync is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            source_file = source / "input.rs"
+            destination_file = destination / "input.rs"
+            source_file.write_text("same bytes\n", encoding="utf-8")
+            destination_file.write_text("same bytes\n", encoding="utf-8")
+            os.utime(source_file, ns=(1_500_000_000_000_000_000,) * 2)
+            os.utime(destination_file, ns=(1_600_000_000_000_000_000,) * 2)
+            destination_mtime = destination_file.stat().st_mtime_ns
+
+            command = [rsync, "-ac", "--no-times", f"{source}/", f"{destination}/"]
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            self.assertEqual(destination_file.stat().st_mtime_ns, destination_mtime)
+
+            source_file.write_text("changed bytes\n", encoding="utf-8")
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            self.assertEqual(destination_file.read_text(encoding="utf-8"), "changed bytes\n")
+
+            verify = subprocess.run(
+                [
+                    rsync,
+                    "-acn",
+                    "--no-times",
+                    "--itemize-changes",
+                    f"{source}/",
+                    f"{destination}/",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(verify.stdout, "")
+
     def test_reset_container_is_bootstrapped_before_content_only_sync(self) -> None:
         source = (ROOT / "loop" / "bench_loop.sh").read_text(encoding="utf-8")
         pod_run = (ROOT / "loop" / "pod_run.sh").read_text(encoding="utf-8")
@@ -1255,6 +1296,9 @@ printf '%s\n' "$body" | bash -n
         self.assertEqual(projection_body.count("--no-perms"), 2)
         self.assertEqual(sync_body.count("--no-perms"), 2)
         self.assertEqual(pod_run.count("--no-perms"), 2)
+        self.assertEqual(projection_body.count("--no-times"), 2)
+        self.assertEqual(sync_body.count("--no-times"), 2)
+        self.assertEqual(pod_run.count("--no-times"), 2)
         preserved_inputs = "--exclude='gpu_benchmarks/pie/sn/'"
         self.assertEqual(projection_body.count(preserved_inputs), 1)
         self.assertEqual(sync_body.count(preserved_inputs), 1)
