@@ -102,6 +102,7 @@ pub fn runtime_policy_json(
         "composition_launch_mode": match policy.composition_launch_mode {
             stwo_cairo_gpu_prover::CompositionLaunchMode::Serial => "serial",
             stwo_cairo_gpu_prover::CompositionLaunchMode::Wide => "wide",
+            stwo_cairo_gpu_prover::CompositionLaunchMode::Wave => "wave",
         },
         "relation_tail_mode": match policy.relation_tail_mode {
             stwo_backend_cuda::RelationTailMode::Segmented => "segmented",

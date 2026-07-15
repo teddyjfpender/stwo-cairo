@@ -6,6 +6,8 @@
 //! descending random-coefficient range consumed by STWO's
 //! `DomainEvaluationAccumulator`.
 
+use std::collections::BTreeMap;
+
 use cairo_air::cairo_components::CairoComponents;
 use cairo_air::claims::{CairoClaim, CairoInteractionClaim};
 use cairo_air::relations::CommonLookupElements;
@@ -16,7 +18,11 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::TreeSubspan;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::bit_reverse;
-use stwo_backend_cuda::aot::{constraint_program, EmittedConstraintKernel};
+use stwo_backend_cuda::aot::{
+    composition_wave_kernel_identity, composition_wave_kernel_source, constraint_program,
+    CompositionWaveKernelPartIdentity, ConstraintWaveFragment, EmittedConstraintKernel,
+    EmittedKernel,
+};
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{FrameworkComponent, FrameworkEval};
 
@@ -67,6 +73,18 @@ pub struct CompositionComponentPlan {
     pub kernels: Vec<CompositionKernelPart>,
 }
 
+/// One cold-emitted, exact same-domain composition wave installed in the AOT
+/// pack. Warm proofs retain this immutable source/key but never regenerate it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionWaveKernelPlan {
+    pub evaluation_log_size: u32,
+    pub parts: Vec<CompositionWaveKernelPartIdentity>,
+    pub kernel_name: String,
+    pub cache_key: u64,
+    pub semantic_hash: u64,
+    pub source: String,
+}
+
 /// Provenance of one hoisted extension constant in the generated AOT ABI.
 /// Two structurally identical recordings with independent lookup/claim probes
 /// classify every statement-dependent slot; anything not invariant or one of
@@ -86,6 +104,13 @@ pub struct CompositionPlan {
     pub total_constraints: usize,
     pub max_evaluation_log_size: u32,
     pub components: Vec<CompositionComponentPlan>,
+    pub wave_kernels: Vec<CompositionWaveKernelPlan>,
+}
+
+struct ColdCompositionWavePart {
+    evaluation_log_size: u32,
+    identity: CompositionWaveKernelPartIdentity,
+    fragment: ConstraintWaveFragment,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,6 +202,9 @@ pub enum CompositionPlanError {
         component: &'static str,
         instance: usize,
     },
+    WaveKernelLowering {
+        evaluation_log_size: u32,
+    },
 }
 
 impl core::fmt::Display for CompositionPlanError {
@@ -227,6 +255,7 @@ pub fn plan_cairo_composition(
 
     let mut components = Vec::with_capacity(erased.len());
     let mut consumed_constraints = 0usize;
+    let mut cold_wave_parts = Vec::new();
 
     macro_rules! push_optional {
         ($( $field:ident ),+ $(,)?) => {
@@ -248,6 +277,7 @@ pub fn plan_cairo_composition(
                         max_kernel_instrs,
                         &mut consumed_constraints,
                         &mut components,
+                        &mut cold_wave_parts,
                     )?;
                 } else if probe_cairo.$field.is_some() {
                     return Err(CompositionPlanError::ProbeComponentPresence {
@@ -337,6 +367,7 @@ pub fn plan_cairo_composition(
             max_kernel_instrs,
             &mut consumed_constraints,
             &mut components,
+            &mut cold_wave_parts,
         )?;
     }
     push_optional!(
@@ -371,11 +402,13 @@ pub fn plan_cairo_composition(
         .map(|component| component.evaluation_log_size)
         .max()
         .ok_or(CompositionPlanError::Empty)?;
+    let wave_kernels = emit_composition_wave_kernels(cold_wave_parts)?;
     Ok(CompositionPlan {
         max_kernel_instrs,
         total_constraints,
         max_evaluation_log_size,
         components,
+        wave_kernels,
     })
 }
 
@@ -392,7 +425,7 @@ impl CompositionPlan {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
         };
-        feed(b"stwo-cairo-composition-plan-v2\0");
+        feed(b"stwo-cairo-composition-plan-v3\0");
         feed(&(self.max_kernel_instrs as u64).to_le_bytes());
         feed(&(self.total_constraints as u64).to_le_bytes());
         feed(&self.max_evaluation_log_size.to_le_bytes());
@@ -454,6 +487,23 @@ impl CompositionPlan {
                 feed(kernel.source.as_bytes());
             }
         }
+        feed(&[0xfc]);
+        feed(&(self.wave_kernels.len() as u64).to_le_bytes());
+        for wave in &self.wave_kernels {
+            feed(&wave.evaluation_log_size.to_le_bytes());
+            feed(&(wave.parts.len() as u64).to_le_bytes());
+            for part in &wave.parts {
+                feed(&part.semantic_hash.to_le_bytes());
+                feed(&part.coefficient_start.to_le_bytes());
+                feed(&part.coefficient_end.to_le_bytes());
+            }
+            feed(wave.kernel_name.as_bytes());
+            feed(&[0]);
+            feed(&wave.cache_key.to_le_bytes());
+            feed(&wave.semantic_hash.to_le_bytes());
+            feed(&(wave.source.len() as u64).to_le_bytes());
+            feed(wave.source.as_bytes());
+        }
         hash
     }
 }
@@ -468,6 +518,7 @@ fn push_component<E: FrameworkEval>(
     max_kernel_instrs: usize,
     consumed_constraints: &mut usize,
     output: &mut Vec<CompositionComponentPlan>,
+    cold_wave_parts: &mut Vec<ColdCompositionWavePart>,
 ) -> Result<(), CompositionPlanError> {
     let n_constraints = component.n_constraints();
     let program = constraint_program(
@@ -523,7 +574,35 @@ fn push_component<E: FrameworkEval>(
     let trace_log_size = component.evaluator().log_size();
     let evaluation_log_size = component.max_constraint_log_degree_bound();
     let denominator_inverses = denominator_inverses(trace_log_size, evaluation_log_size);
-    let kernels = program.kernels.into_iter().map(kernel_part).collect();
+    let local_ends = program
+        .kernels
+        .iter()
+        .skip(1)
+        .map(|part| part.rc_base as usize)
+        .chain(core::iter::once(n_constraints))
+        .collect::<Vec<_>>();
+    let mut kernels = Vec::with_capacity(program.kernels.len());
+    for (part, local_end) in program.kernels.into_iter().zip(local_ends) {
+        let coefficient_start = consumed_constraints
+            .checked_add(part.rc_base as usize)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(CompositionPlanError::ConstraintCountOverflow)?;
+        let coefficient_end = consumed_constraints
+            .checked_add(local_end)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(CompositionPlanError::ConstraintCountOverflow)?;
+        let identity = CompositionWaveKernelPartIdentity {
+            semantic_hash: part.kernel.semantic_hash,
+            coefficient_start,
+            coefficient_end,
+        };
+        cold_wave_parts.push(ColdCompositionWavePart {
+            evaluation_log_size,
+            identity,
+            fragment: part.wave_fragment,
+        });
+        kernels.push(kernel_part(part.kernel, part.rc_base));
+    }
     output.push(CompositionComponentPlan {
         component: name,
         instance,
@@ -681,13 +760,61 @@ fn classify_ext_params(
         .collect()
 }
 
-fn kernel_part(part: EmittedConstraintKernel) -> CompositionKernelPart {
+fn emit_composition_wave_kernels(
+    parts: Vec<ColdCompositionWavePart>,
+) -> Result<Vec<CompositionWaveKernelPlan>, CompositionPlanError> {
+    let mut domains =
+        BTreeMap::<u32, Vec<(CompositionWaveKernelPartIdentity, ConstraintWaveFragment)>>::new();
+    for part in parts {
+        domains
+            .entry(part.evaluation_log_size)
+            .or_default()
+            .push((part.identity, part.fragment));
+    }
+    domains
+        .into_iter()
+        .map(|(evaluation_log_size, parts)| {
+            let identities = parts
+                .iter()
+                .map(|(identity, _)| *identity)
+                .collect::<Vec<_>>();
+            let expected = composition_wave_kernel_identity(evaluation_log_size, &identities)
+                .ok_or(CompositionPlanError::WaveKernelLowering {
+                    evaluation_log_size,
+                })?;
+            let kernel = composition_wave_kernel_source(evaluation_log_size, &parts).ok_or(
+                CompositionPlanError::WaveKernelLowering {
+                    evaluation_log_size,
+                },
+            )?;
+            if kernel.kernel_name != expected.kernel_name
+                || kernel.cache_key != expected.cache_key
+                || kernel.semantic_hash != expected.semantic_hash
+                || expected.part_count != identities.len()
+            {
+                return Err(CompositionPlanError::WaveKernelLowering {
+                    evaluation_log_size,
+                });
+            }
+            Ok(CompositionWaveKernelPlan {
+                evaluation_log_size,
+                parts: identities,
+                kernel_name: kernel.kernel_name,
+                cache_key: kernel.cache_key,
+                semantic_hash: kernel.semantic_hash,
+                source: kernel.source,
+            })
+        })
+        .collect()
+}
+
+fn kernel_part(kernel: EmittedKernel, rc_base: u32) -> CompositionKernelPart {
     CompositionKernelPart {
-        kernel_name: part.kernel.kernel_name,
-        cache_key: part.kernel.cache_key,
-        semantic_hash: part.kernel.semantic_hash,
-        source: part.kernel.source,
-        rc_base: part.rc_base,
+        kernel_name: kernel.kernel_name,
+        cache_key: kernel.cache_key,
+        semantic_hash: kernel.semantic_hash,
+        source: kernel.source,
+        rc_base,
     }
 }
 

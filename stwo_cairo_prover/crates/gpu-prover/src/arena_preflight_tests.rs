@@ -96,7 +96,7 @@ fn replacement_policy_json_reports_the_exact_planned_tuple() {
     );
     assert_eq!(value["interpolation_mode"], "stage-fused-out-of-place");
     assert_eq!(value["blake2s_interior_fused"], false);
-    assert_eq!(value["composition_launch_mode"], "serial");
+    assert_eq!(value["composition_launch_mode"], "wave");
     assert_eq!(value["relation_tail_mode"], "segmented");
     assert_eq!(value["fri_fold_launch_mode"], "per-fold");
     assert_eq!(value["witness_feed_launch_mode"], "global-atomics");

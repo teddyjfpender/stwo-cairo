@@ -351,6 +351,7 @@ mod tests {
                 ext_param_sources: Vec::new(),
                 kernels: Vec::new(),
             }],
+            wave_kernels: Vec::new(),
         }
     }
 

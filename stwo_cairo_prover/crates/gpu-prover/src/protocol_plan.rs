@@ -119,6 +119,7 @@ impl ProtocolPlanPolicy {
             QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations;
         policy.interpolation_mode =
             stwo_backend_cuda::InterpolationLaunchMode::StageFusedOutOfPlace;
+        policy.composition_launch_mode = CompositionLaunchMode::Wave;
         policy
     }
 
@@ -967,12 +968,8 @@ fn plan_protocol_from_logs(
         DirectCompositionRetentionMode::ExactNative => {
             let composition =
                 composition.ok_or(ProtocolPlanError::DirectRetentionCompositionMissing)?;
-            let consumers = derive_direct_composition_consumers(
-                &oods,
-                composition,
-                policy.composition_launch_mode,
-            )
-            .map_err(ProtocolPlanError::DirectRetention)?;
+            let consumers = derive_direct_composition_consumers(&oods, composition)
+                .map_err(ProtocolPlanError::DirectRetention)?;
             Some(
                 plan_direct_composition_retention_from_parts(
                     &commitments,
@@ -1551,10 +1548,7 @@ mod tests {
             stwo_backend_cuda::InterpolationLaunchMode::StageFusedOutOfPlace
         );
         assert!(!policy.blake2s_interior_fused);
-        assert_eq!(
-            policy.composition_launch_mode,
-            CompositionLaunchMode::Serial
-        );
+        assert_eq!(policy.composition_launch_mode, CompositionLaunchMode::Wave);
         assert_eq!(policy.relation_tail_mode, RelationTailMode::Segmented);
         assert_eq!(policy.fri_fold_launch_mode, FriFoldLaunchMode::PerFold);
         assert_eq!(
@@ -1583,7 +1577,7 @@ mod tests {
                     DynamicCommitmentLeafSchedule::LegacyPerBatch
             },
             |policy| policy.blake2s_interior_fused = true,
-            |policy| policy.composition_launch_mode = CompositionLaunchMode::Wide,
+            |policy| policy.composition_launch_mode = CompositionLaunchMode::Serial,
             |policy| policy.relation_tail_mode = RelationTailMode::Scan,
             |policy| policy.fri_fold_launch_mode = FriFoldLaunchMode::FusedTriple,
             |policy| policy.witness_feed_launch_mode = WitnessFeedLaunchMode::Privatized,
@@ -2552,6 +2546,7 @@ mod tests {
                     rc_base: 0,
                 }],
             }],
+            wave_kernels: Vec::new(),
         };
         let mut policy = ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048);
         policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive;

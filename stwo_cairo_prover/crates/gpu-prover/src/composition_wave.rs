@@ -411,6 +411,7 @@ mod tests {
                 component("b", 6, 3, 5, &[(3, 0)]),
                 component("c", 8, 7, 8, &[(4, 0), (5, 3), (6, 5)]),
             ],
+            wave_kernels: Vec::new(),
         }
     }
 

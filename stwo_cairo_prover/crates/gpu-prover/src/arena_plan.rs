@@ -3451,16 +3451,12 @@ impl ProofArenaPlan {
             });
         }
         if let Some(direct) = &protocol.direct_composition_retention {
-            let consumers = derive_direct_composition_consumers(
-                &protocol.oods,
-                composition,
-                protocol.identity.composition_launch_mode,
-            )
-            .map_err(|_| {
-                ArenaPlanError::InvalidProtocolGeometry(
-                    "direct composition consumer derivation failed",
-                )
-            })?;
+            let consumers = derive_direct_composition_consumers(&protocol.oods, composition)
+                .map_err(|_| {
+                    ArenaPlanError::InvalidProtocolGeometry(
+                        "direct composition consumer derivation failed",
+                    )
+                })?;
             validate_direct_composition_retention_plan(protocol, &consumers, direct).map_err(
                 |_| {
                     ArenaPlanError::InvalidProtocolGeometry(
@@ -11372,6 +11368,7 @@ mod tests {
                     rc_base: 0,
                 }],
             }],
+            wave_kernels: Vec::new(),
         };
         let protocol = ProtocolGeometry {
             identity: ProtocolIdentity {
@@ -11813,12 +11810,7 @@ mod tests {
         }
         assert_eq!(keyed.iter().copied().collect::<BTreeSet<_>>().len(), 4);
 
-        let consumers = derive_direct_composition_consumers(
-            &protocol.oods,
-            &composition,
-            protocol.identity.composition_launch_mode,
-        )
-        .unwrap();
+        let consumers = derive_direct_composition_consumers(&protocol.oods, &composition).unwrap();
         let direct_plan = crate::direct_composition_retention::plan_direct_composition_retention(
             &protocol, &consumers,
         )

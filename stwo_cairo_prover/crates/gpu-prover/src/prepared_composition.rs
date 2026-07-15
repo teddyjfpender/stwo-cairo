@@ -19,7 +19,7 @@ use stwo_backend_cuda_kernels::raw::{self, CudaSecureField};
 use crate::arena_plan::{CommitmentTreeId, OpenedColumnSource};
 use crate::composition_plan::{
     CompositionComponentPlan, CompositionExtParamSource, CompositionKernelPart, CompositionPlan,
-    CompositionProofBindings,
+    CompositionProofBindings, CompositionWaveKernelPlan,
 };
 use crate::direct_composition_retention::{
     direct_composition_plan_key, DirectCompositionRetentionPlan,
@@ -31,6 +31,10 @@ const SECURE_COORDINATES: usize = 4;
 const SPLIT_COORDINATES: usize = 8;
 const TRACE_TREES: usize = 3;
 const POINTER_WORDS: usize = core::mem::size_of::<usize>().div_ceil(WORD_BYTES);
+const WAVE_PART_WORDS: usize =
+    core::mem::size_of::<raw::CudaCompositionWavePart>().div_ceil(WORD_BYTES);
+
+const _: () = assert!(WAVE_PART_WORDS == 12);
 
 pub const COMPOSITION_POINTER_ALIGNMENT_WORDS: usize = core::mem::align_of::<usize>() / WORD_BYTES;
 
@@ -68,6 +72,11 @@ pub enum CompositionLaunchMode {
     /// their dedicated main-stream launches, overlapping the small lanes.
     /// Opt-in via `STWO_CUDA_COMPOSITION_WIDE=1`.
     Wide,
+    /// One exact generated kernel owns every contribution to each evaluation-
+    /// log accumulator. ReplacementV1 selects this only after all source
+    /// columns are retained at their consumer log, so no fallback LDE or
+    /// per-component accumulator writer may coexist with a wave.
+    Wave,
 }
 
 /// `STWO_CUDA_COMPOSITION_WIDE=1` opts [`PreparedCompositionGraph::prepare`]
@@ -261,6 +270,22 @@ pub struct CompositionAccumulatorRequirements {
     pub len_words: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositionWavePartRequirement {
+    pub component: usize,
+    pub kernel: usize,
+    pub identity: aot::CompositionWaveKernelPartIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionWaveRequirements {
+    pub evaluation_log_size: u32,
+    pub row_count: usize,
+    pub accumulator_offset_words: usize,
+    pub descriptor_offset_words: usize,
+    pub parts: Vec<CompositionWavePartRequirement>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ComponentDescriptorLayout {
     coefficient_pointers: usize,
@@ -301,6 +326,8 @@ pub struct CompositionWorkspaceRequirements {
     /// Components enqueued serially on the main stream, in plan order. In
     /// `Serial` mode this is every component; in `Wide` mode, the large ones.
     pub serial_components: Vec<usize>,
+    /// Exact sole-owner waves. Nonempty only in [`CompositionLaunchMode::Wave`].
+    pub waves: Vec<CompositionWaveRequirements>,
     pub components: Vec<CompositionComponentRequirements>,
     pub accumulators: Vec<CompositionAccumulatorRequirements>,
     zero_words: usize,
@@ -530,6 +557,20 @@ pub enum PreparedCompositionError {
         kernel: usize,
         cache_key: u64,
     },
+    CompositionWaveRequiresAllDirect {
+        component: usize,
+        fallback_count: usize,
+    },
+    CompositionWavePlanDrift(&'static str),
+    CompositionWaveAotMiss {
+        wave: usize,
+        cache_key: u64,
+    },
+    CompositionWaveNameContainsNul(usize),
+    CompositionWaveLaunchMiss {
+        wave: usize,
+        cache_key: u64,
+    },
     /// Wide mode requires at least one component lane on the execution
     /// context; fail closed rather than silently degrading the topology.
     NoComponentLanes,
@@ -712,6 +753,7 @@ pub(crate) fn composition_workspace_requirements_with_retention(
     }
     let (direct_retention_plan_key, direct_retention_bitmap) =
         apply_direct_retention(&mut components, direct_retention)?;
+    let mut waves = composition_wave_requirements(plan, &components, mode, &accumulators)?;
     debug_assert_eq!(expected_random_offset, plan.total_constraints);
     let (mut lde_tile_words, wide_groups, serial_components) =
         lde_tile_layout(mode, &mut components)?;
@@ -801,6 +843,15 @@ pub(crate) fn composition_workspace_requirements_with_retention(
             base_params,
         });
     }
+    for wave in &mut waves {
+        let descriptor_words = wave
+            .parts
+            .len()
+            .checked_mul(WAVE_PART_WORDS)
+            .ok_or(PreparedCompositionError::SizeOverflow)?;
+        wave.descriptor_offset_words =
+            descriptor.take(descriptor_words, COMPOSITION_POINTER_ALIGNMENT_WORDS)?;
+    }
 
     let max_rows = pow2(plan.max_evaluation_log_size)?;
     Ok(CompositionWorkspaceRequirements {
@@ -823,6 +874,7 @@ pub(crate) fn composition_workspace_requirements_with_retention(
         mode,
         wide_groups,
         serial_components,
+        waves,
         components,
         accumulators,
         zero_words,
@@ -1045,7 +1097,7 @@ fn lde_tile_layout(
     components: &mut [CompositionComponentRequirements],
 ) -> Result<(usize, Vec<CompositionWideGroup>, Vec<usize>), PreparedCompositionError> {
     let mut lde_tile_words = 0usize;
-    if mode == CompositionLaunchMode::Serial {
+    if mode != CompositionLaunchMode::Wide {
         for component in components.iter() {
             lde_tile_words = lde_tile_words.max(component_lde_footprint_words(component)?);
         }
@@ -1092,6 +1144,120 @@ fn lde_tile_layout(
             .ok_or(PreparedCompositionError::SizeOverflow)?;
     }
     Ok((lde_tile_words, wide_groups, serial_components))
+}
+
+fn composition_wave_requirements(
+    plan: &CompositionPlan,
+    components: &[CompositionComponentRequirements],
+    mode: CompositionLaunchMode,
+    accumulators: &[CompositionAccumulatorRequirements],
+) -> Result<Vec<CompositionWaveRequirements>, PreparedCompositionError> {
+    if mode != CompositionLaunchMode::Wave {
+        return Ok(Vec::new());
+    }
+    let canonical =
+        crate::composition_wave::CompositionWaveProgram::from_plan(plan).map_err(|_| {
+            PreparedCompositionError::CompositionWavePlanDrift("canonical wave program")
+        })?;
+    for (component_index, component) in components.iter().enumerate() {
+        if component.fallback_count != 0 {
+            return Err(PreparedCompositionError::CompositionWaveRequiresAllDirect {
+                component: component_index,
+                fallback_count: component.fallback_count,
+            });
+        }
+    }
+    if canonical.waves().len() != accumulators.len()
+        || plan.wave_kernels.len() != canonical.waves().len()
+    {
+        return Err(PreparedCompositionError::CompositionWavePlanDrift(
+            "wave/accumulator count",
+        ));
+    }
+
+    let mut waves = Vec::with_capacity(canonical.waves().len());
+    for (wave_index, (canonical_wave, wave)) in
+        canonical.waves().iter().zip(&plan.wave_kernels).enumerate()
+    {
+        let evaluation_log_size = canonical_wave.evaluation_log_size;
+        if wave.evaluation_log_size != evaluation_log_size {
+            return Err(PreparedCompositionError::CompositionWavePlanDrift(
+                "evaluation-log order",
+            ));
+        }
+        let parts = canonical_wave
+            .part_ordinals
+            .iter()
+            .map(|&ordinal| {
+                let part = canonical.parts().get(ordinal).ok_or(
+                    PreparedCompositionError::CompositionWavePlanDrift("canonical part ordinal"),
+                )?;
+                if components
+                    .get(part.component_index)
+                    .is_none_or(|component| component.evaluation_log_size != evaluation_log_size)
+                {
+                    return Err(PreparedCompositionError::CompositionWavePlanDrift(
+                        "canonical component/log",
+                    ));
+                }
+                Ok(CompositionWavePartRequirement {
+                    component: part.component_index,
+                    kernel: part.kernel_index,
+                    identity: aot::CompositionWaveKernelPartIdentity {
+                        semantic_hash: part.semantic_hash,
+                        coefficient_start: u32::try_from(part.coefficient_start)
+                            .map_err(|_| PreparedCompositionError::SizeOverflow)?,
+                        coefficient_end: u32::try_from(part.coefficient_end)
+                            .map_err(|_| PreparedCompositionError::SizeOverflow)?,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, PreparedCompositionError>>()?;
+        let identities = parts.iter().map(|part| part.identity).collect::<Vec<_>>();
+        if wave.parts != identities {
+            return Err(PreparedCompositionError::CompositionWavePlanDrift(
+                "part identity/order",
+            ));
+        }
+        let expected = aot::composition_wave_kernel_identity(evaluation_log_size, &identities)
+            .ok_or(PreparedCompositionError::CompositionWavePlanDrift(
+                "invalid identity",
+            ))?;
+        if expected.part_count != parts.len()
+            || expected.kernel_name != wave.kernel_name
+            || expected.cache_key != wave.cache_key
+            || expected.semantic_hash != wave.semantic_hash
+        {
+            return Err(PreparedCompositionError::CompositionWavePlanDrift(
+                "kernel identity",
+            ));
+        }
+        let accumulator = accumulators
+            .iter()
+            .find(|accumulator| accumulator.log_size == evaluation_log_size)
+            .ok_or(PreparedCompositionError::CompositionWavePlanDrift(
+                "missing accumulator owner",
+            ))?;
+        let row_count = pow2(evaluation_log_size)?;
+        if accumulator.len_words
+            != row_count
+                .checked_mul(SECURE_COORDINATES)
+                .ok_or(PreparedCompositionError::SizeOverflow)?
+        {
+            return Err(PreparedCompositionError::CompositionWavePlanDrift(
+                "accumulator extent",
+            ));
+        }
+        debug_assert_eq!(wave_index, waves.len());
+        waves.push(CompositionWaveRequirements {
+            evaluation_log_size,
+            row_count,
+            accumulator_offset_words: accumulator.offset_words,
+            descriptor_offset_words: 0,
+            parts,
+        });
+    }
+    Ok(waves)
 }
 
 fn validate_component_program(
@@ -1303,6 +1469,15 @@ struct PreparedComponent {
     kernels: Vec<PreparedKernel>,
 }
 
+#[derive(Debug)]
+struct PreparedWave {
+    name: CString,
+    cache_key: u64,
+    descriptor_offset_words: usize,
+    accumulator_offset_words: usize,
+    row_count: u32,
+}
+
 /// Stable resident composition launch object.
 pub struct PreparedCompositionGraph<'a> {
     arena: &'a DeviceArena,
@@ -1322,6 +1497,7 @@ pub struct PreparedCompositionGraph<'a> {
     _direct_evaluations: Vec<ArenaSlice>,
     composition_coefficients: [ArenaSlice; SPLIT_COORDINATES],
     components: Vec<PreparedComponent>,
+    waves: Vec<PreparedWave>,
     /// Wide-mode fanout: `lane_components[lane]` holds component indices in
     /// enqueue order (group-contiguous, members in plan order). Empty in
     /// serial mode, so the serial launch path performs no fork/join at all.
@@ -2021,9 +2197,12 @@ impl<'a> PreparedCompositionGraph<'a> {
                 ));
             }
 
-            let mut kernels = Vec::with_capacity(component_plan.kernels.len());
-            for (kernel_index, kernel) in component_plan.kernels.iter().enumerate() {
-                kernels.push(prepare_aot_kernel(component_index, kernel_index, kernel)?);
+            let mut kernels = Vec::new();
+            if mode != CompositionLaunchMode::Wave {
+                kernels.reserve(component_plan.kernels.len());
+                for (kernel_index, kernel) in component_plan.kernels.iter().enumerate() {
+                    kernels.push(prepare_aot_kernel(component_index, kernel_index, kernel)?);
+                }
             }
             prepared_components.push(PreparedComponent {
                 evaluation_pointers: descriptor.evaluation_pointers,
@@ -2052,6 +2231,34 @@ impl<'a> PreparedCompositionGraph<'a> {
         }
         debug_assert_eq!(dynamic_index, requirements.dynamic_ext_param_count);
         debug_assert_eq!(claimed_index, requirements.claimed_sum_count);
+
+        let descriptor_ptr = descriptors.as_u32_ptr();
+        let mut prepared_waves = Vec::with_capacity(requirements.waves.len());
+        for (wave_index, wave) in requirements.waves.iter().enumerate() {
+            for (part_index, part) in wave.parts.iter().enumerate() {
+                let component = &prepared_components[part.component];
+                let base = wave
+                    .descriptor_offset_words
+                    .checked_add(
+                        part_index
+                            .checked_mul(WAVE_PART_WORDS)
+                            .ok_or(PreparedCompositionError::SizeOverflow)?,
+                    )
+                    .ok_or(PreparedCompositionError::SizeOverflow)?;
+                write_wave_part_descriptor(
+                    &mut descriptor_words,
+                    base,
+                    descriptor_ptr,
+                    component,
+                    part.identity.coefficient_start,
+                );
+            }
+            prepared_waves.push(prepare_aot_wave(
+                wave_index,
+                &plan.wave_kernels[wave_index],
+                wave,
+            )?);
+        }
 
         // The host descriptor is immutable and may be dropped only after the
         // setup upload completes. No setup values are uploaded on replay.
@@ -2093,6 +2300,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             _direct_evaluations: direct_evaluation_slices,
             composition_coefficients,
             components: prepared_components,
+            waves: prepared_waves,
             lane_components,
         })
     }
@@ -2133,12 +2341,14 @@ impl<'a> PreparedCompositionGraph<'a> {
                 )
             })?;
         }
-        unsafe {
-            context.memset_async(
-                self.accumulators.as_void_ptr(),
-                0,
-                self.accumulators.len_bytes(),
-            )?;
+        if self.requirements.mode != CompositionLaunchMode::Wave {
+            unsafe {
+                context.memset_async(
+                    self.accumulators.as_void_ptr(),
+                    0,
+                    self.accumulators.len_bytes(),
+                )?;
+            }
         }
         let total_constraints = u32::try_from(self.requirements.total_constraints)
             .map_err(|_| PreparedCompositionError::SizeOverflow)?;
@@ -2155,7 +2365,11 @@ impl<'a> PreparedCompositionGraph<'a> {
             )
         })?;
 
-        if self.lane_components.iter().all(|lane| lane.is_empty()) {
+        if self.requirements.mode == CompositionLaunchMode::Wave {
+            for (wave_index, wave) in self.waves.iter().enumerate() {
+                self.enqueue_wave(wave_index, wave, stream)?;
+            }
+        } else if self.lane_components.iter().all(|lane| lane.is_empty()) {
             // Serial topology: identical call sequence to the historical
             // launch path — plan order on the main stream, no fork/join.
             for &component in &self.requirements.serial_components {
@@ -2276,6 +2490,45 @@ impl<'a> PreparedCompositionGraph<'a> {
                     bytes,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn enqueue_wave(
+        &self,
+        wave_index: usize,
+        wave: &PreparedWave,
+        stream: *mut c_void,
+    ) -> Result<(), PreparedCompositionError> {
+        let row_count = wave.row_count as usize;
+        let accumulator = unsafe {
+            self.accumulators
+                .as_u32_ptr()
+                .add(wave.accumulator_offset_words)
+        };
+        let launched = unsafe {
+            raw::stwo_cuda_jit_eval_composition_wave_on(
+                core::ptr::null(),
+                wave.name.as_ptr(),
+                wave.cache_key,
+                self.descriptors
+                    .as_u32_ptr()
+                    .add(wave.descriptor_offset_words)
+                    .cast::<raw::CudaCompositionWavePart>(),
+                self.random_coefficient_powers.as_u32_ptr(),
+                accumulator,
+                accumulator.add(row_count),
+                accumulator.add(2 * row_count),
+                accumulator.add(3 * row_count),
+                wave.row_count,
+                stream,
+            )
+        };
+        if !launched {
+            return Err(PreparedCompositionError::CompositionWaveLaunchMiss {
+                wave: wave_index,
+                cache_key: wave.cache_key,
+            });
         }
         Ok(())
     }
@@ -2401,6 +2654,88 @@ fn prepare_aot_kernel(
         cache_key: kernel.cache_key,
         rc_base: kernel.rc_base,
     })
+}
+
+fn prepare_aot_wave(
+    wave_index: usize,
+    wave: &CompositionWaveKernelPlan,
+    requirements: &CompositionWaveRequirements,
+) -> Result<PreparedWave, PreparedCompositionError> {
+    let name = CString::new(wave.kernel_name.as_bytes())
+        .map_err(|_| PreparedCompositionError::CompositionWaveNameContainsNul(wave_index))?;
+    let found = unsafe {
+        raw::stwo_cuda_jit_precompile(core::ptr::null(), name.as_ptr(), wave.cache_key, false)
+    };
+    if !found {
+        return Err(PreparedCompositionError::CompositionWaveAotMiss {
+            wave: wave_index,
+            cache_key: wave.cache_key,
+        });
+    }
+    Ok(PreparedWave {
+        name,
+        cache_key: wave.cache_key,
+        descriptor_offset_words: requirements.descriptor_offset_words,
+        accumulator_offset_words: requirements.accumulator_offset_words,
+        row_count: u32::try_from(requirements.row_count)
+            .map_err(|_| PreparedCompositionError::SizeOverflow)?,
+    })
+}
+
+fn write_wave_part_descriptor(
+    words: &mut [u32],
+    base: usize,
+    descriptor_ptr: *mut u32,
+    component: &PreparedComponent,
+    proof_global_rc_base: u32,
+) {
+    let field = |offset: usize| base + offset / WORD_BYTES;
+    write_pointer(
+        words,
+        field(core::mem::offset_of!(
+            raw::CudaCompositionWavePart,
+            trace_cols
+        )),
+        unsafe { descriptor_ptr.add(component.evaluation_pointers) },
+    );
+    write_pointer(
+        words,
+        field(core::mem::offset_of!(
+            raw::CudaCompositionWavePart,
+            interaction_offsets
+        )),
+        unsafe { descriptor_ptr.add(component.interaction_offsets) },
+    );
+    write_pointer(
+        words,
+        field(core::mem::offset_of!(
+            raw::CudaCompositionWavePart,
+            base_params
+        )),
+        unsafe { descriptor_ptr.add(component.base_params) },
+    );
+    write_pointer(
+        words,
+        field(core::mem::offset_of!(
+            raw::CudaCompositionWavePart,
+            ext_params
+        )),
+        component.ext_params.cast_mut(),
+    );
+    write_pointer(
+        words,
+        field(core::mem::offset_of!(
+            raw::CudaCompositionWavePart,
+            denom_inv
+        )),
+        unsafe { descriptor_ptr.add(component.denominator_inverses) },
+    );
+    words[field(core::mem::offset_of!(
+        raw::CudaCompositionWavePart,
+        log_n_rows
+    ))] = component.trace_log_size;
+    words[field(core::mem::offset_of!(raw::CudaCompositionWavePart, rc_base))] =
+        proof_global_rc_base;
 }
 
 fn bind_slot(
@@ -2612,6 +2947,7 @@ mod tests {
             total_constraints: 2,
             max_evaluation_log_size: 8,
             components: vec![component("a", 5, 8, 2, 0, preprocessed, 1..4, 0..2)],
+            wave_kernels: Vec::new(),
         }
     }
 
@@ -2818,6 +3154,129 @@ mod tests {
     }
 
     #[test]
+    fn replacement_wave_requires_exact_all_direct_ownership_and_global_spans() {
+        let mut plan = CompositionPlan {
+            max_kernel_instrs: 192,
+            total_constraints: 5,
+            max_evaluation_log_size: 8,
+            components: vec![
+                component("a", 5, 8, 2, 0, vec![0], 0..1, 0..1),
+                component("b", 5, 8, 3, 2, vec![1], 1..2, 1..2),
+            ],
+            wave_kernels: Vec::new(),
+        };
+        let identities = vec![
+            aot::CompositionWaveKernelPartIdentity {
+                semantic_hash: 9,
+                coefficient_start: 0,
+                coefficient_end: 2,
+            },
+            aot::CompositionWaveKernelPartIdentity {
+                semantic_hash: 9,
+                coefficient_start: 2,
+                coefficient_end: 5,
+            },
+        ];
+        let wave_identity = aot::composition_wave_kernel_identity(8, &identities).unwrap();
+        plan.wave_kernels.push(CompositionWaveKernelPlan {
+            evaluation_log_size: 8,
+            parts: identities,
+            kernel_name: wave_identity.kernel_name,
+            cache_key: wave_identity.cache_key,
+            semantic_hash: wave_identity.semantic_hash,
+            // The strict warm binder resolves by name/key and must not require
+            // a retained cold CUDA TU.
+            source: String::new(),
+        });
+
+        let policy = crate::protocol_plan::ProtocolPlanPolicy::replacement_v1(1, 192);
+        assert_eq!(policy.composition_launch_mode, CompositionLaunchMode::Wave);
+        let source_requirements = composition_workspace_requirements_with_mode(
+            &plan,
+            &trace(),
+            CompositionLaunchMode::Serial,
+        )
+        .unwrap();
+        let source_count = source_requirements
+            .components
+            .iter()
+            .map(|component| component.sources.len())
+            .sum::<usize>();
+        let all_direct =
+            retention_plan(&source_requirements, &(0..source_count).collect::<Vec<_>>());
+        let wave = composition_workspace_requirements_with_retention(
+            &plan,
+            &trace(),
+            policy.composition_launch_mode,
+            Some(&all_direct),
+        )
+        .unwrap();
+        assert!(wave
+            .components
+            .iter()
+            .all(|component| component.fallback_count == 0));
+        assert_eq!(wave.waves.len(), 1);
+        assert_eq!(wave.waves[0].parts.len(), 2);
+        assert_eq!(wave.waves[0].parts[1].identity.coefficient_start, 2);
+        assert_eq!(wave.waves[0].parts[1].identity.coefficient_end, 5);
+
+        let one_fallback =
+            retention_plan(&source_requirements, &(1..source_count).collect::<Vec<_>>());
+        assert!(matches!(
+            composition_workspace_requirements_with_retention(
+                &plan,
+                &trace(),
+                CompositionLaunchMode::Wave,
+                Some(&one_fallback),
+            ),
+            Err(PreparedCompositionError::CompositionWaveRequiresAllDirect { .. })
+        ));
+
+        plan.wave_kernels[0].parts[1].coefficient_start += 1;
+        assert_eq!(
+            composition_workspace_requirements_with_retention(
+                &plan,
+                &trace(),
+                CompositionLaunchMode::Wave,
+                Some(&all_direct),
+            )
+            .unwrap_err(),
+            PreparedCompositionError::CompositionWavePlanDrift("part identity/order")
+        );
+    }
+
+    #[test]
+    fn wave_descriptor_writes_the_proof_global_coefficient_start() {
+        let mut words = vec![0u32; WAVE_PART_WORDS + 4];
+        let descriptor_ptr = 0x1000usize as *mut u32;
+        let component = PreparedComponent {
+            evaluation_pointers: 2,
+            fallback_coefficient_pointers: 0,
+            fallback_coefficient_sizes: 0,
+            fallback_evaluation_pointers: 0,
+            interaction_offsets: 4,
+            denominator_inverses: 8,
+            base_params: 12,
+            ext_params: 0x2000usize as *const u32,
+            accumulator_offset_words: 0,
+            trace_log_size: 17,
+            evaluation_log_size: 19,
+            row_count: 1 << 19,
+            fallback_count: 0,
+            kernels: Vec::new(),
+        };
+        write_wave_part_descriptor(&mut words, 0, descriptor_ptr, &component, 73);
+        assert_eq!(
+            words[core::mem::offset_of!(raw::CudaCompositionWavePart, log_n_rows) / WORD_BYTES],
+            17
+        );
+        assert_eq!(
+            words[core::mem::offset_of!(raw::CudaCompositionWavePart, rc_base) / WORD_BYTES],
+            73
+        );
+    }
+
+    #[test]
     fn direct_retention_interleaving_and_duplicate_occurrences_are_sealed() {
         let plan = one_component_plan(vec![0, 0, 2]);
         let legacy = composition_workspace_requirements_with_mode(
@@ -2958,6 +3417,7 @@ mod tests {
                 component("a", 5, 7, 2, 0, vec![2, 0], 1..4, 0..2),
                 component("b", 4, 6, 3, 2, vec![1], 0..2, 1..3),
             ],
+            wave_kernels: Vec::new(),
         };
         let requirements = composition_workspace_requirements_with_mode(
             &plan,
@@ -3010,6 +3470,7 @@ mod tests {
                 component("b", 4, 6, 3, 2, vec![1], 0..2, 1..3),
                 component("c", 5, 7, 1, 5, vec![0], 0..1, 0..1),
             ],
+            wave_kernels: Vec::new(),
         };
         let serial = composition_workspace_requirements_with_mode(
             &plan,
@@ -3078,6 +3539,7 @@ mod tests {
                 component("large", 19, 20, 2, 0, vec![0], 0..1, 0..1),
                 component("small", 5, 7, 1, 2, vec![0], 0..1, 0..1),
             ],
+            wave_kernels: Vec::new(),
         };
         let wide = composition_workspace_requirements_with_mode(
             &plan,
@@ -3137,6 +3599,7 @@ mod tests {
             total_constraints: 2,
             max_evaluation_log_size: 7,
             components: vec![component("a", 5, 7, 2, 0, vec![0], 0..1, 0..1)],
+            wave_kernels: Vec::new(),
         };
         let requirements = composition_workspace_requirements(&plan, &trace()).unwrap();
         let slots = CompositionWorkspaceSlots {
@@ -3170,6 +3633,7 @@ mod tests {
             total_constraints: 1,
             max_evaluation_log_size: 7,
             components: vec![component("a", 5, 7, 1, 0, vec![0], 0..1, 0..1)],
+            wave_kernels: Vec::new(),
         };
         assert!(matches!(
             composition_workspace_requirements(&plan, &too_large),
@@ -3185,6 +3649,7 @@ mod tests {
             total_constraints: 1,
             max_evaluation_log_size: 7,
             components: vec![component("a", 5, 7, 1, 1, vec![0], 0..1, 0..1)],
+            wave_kernels: Vec::new(),
         };
         assert_eq!(
             composition_workspace_requirements(&drifted, &trace()).unwrap_err(),

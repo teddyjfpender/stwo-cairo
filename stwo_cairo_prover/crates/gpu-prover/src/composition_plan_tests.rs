@@ -202,6 +202,7 @@ fn key_with_ext_source(source: CompositionExtParamSource) -> u64 {
             ext_param_sources: vec![source],
             kernels: Vec::new(),
         }],
+        wave_kernels: Vec::new(),
     }
     .key()
 }
@@ -241,6 +242,7 @@ fn base_parameter_values_are_runtime_bindings_but_slot_count_is_topology() {
             ext_param_sources: Vec::new(),
             kernels: Vec::new(),
         }],
+        wave_kernels: Vec::new(),
     };
     let original = plan.key();
     plan.components[0].base_param_values[0] = BaseField::from_u32_unchecked(11);

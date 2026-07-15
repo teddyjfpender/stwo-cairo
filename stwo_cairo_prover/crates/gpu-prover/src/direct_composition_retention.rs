@@ -192,7 +192,6 @@ impl From<PreparedCompositionError> for DirectCompositionRetentionError {
 pub fn derive_direct_composition_consumers(
     oods: &OodsGeometry,
     composition: &CompositionPlan,
-    launch_mode: CompositionLaunchMode,
 ) -> Result<Vec<DirectCompositionConsumer>, DirectCompositionRetentionError> {
     let mut proof_sources = [Vec::new(), Vec::new(), Vec::new()];
     let mut trace_trees = vec![Vec::new(), Vec::new(), Vec::new()];
@@ -228,7 +227,10 @@ pub fn derive_direct_composition_consumers(
     let requirements = composition_workspace_requirements_with_mode(
         composition,
         &CompositionTraceTopology { trees: trace_trees },
-        launch_mode,
+        // Source selection and canonical consumer order are independent of
+        // launch topology. Retention must be planned before Wave can prove
+        // every source direct, so use the source-only Serial seam here.
+        CompositionLaunchMode::Serial,
     )?;
     let mut consumers = Vec::new();
     for component in &requirements.components {
@@ -1333,10 +1335,9 @@ mod tests {
                 component("a", 7, 0, vec![2, 0], 1..4, 0..2),
                 component("b", 6, 1, vec![1], 0..2, 1..3),
             ],
+            wave_kernels: Vec::new(),
         };
-        let consumers =
-            derive_direct_composition_consumers(&oods, &composition, CompositionLaunchMode::Serial)
-                .unwrap();
+        let consumers = derive_direct_composition_consumers(&oods, &composition).unwrap();
         let expected = [
             sources[0][2],
             sources[0][0],

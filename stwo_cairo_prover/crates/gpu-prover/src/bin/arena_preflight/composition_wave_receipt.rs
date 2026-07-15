@@ -72,12 +72,12 @@ pub(crate) fn json(plan: &CompositionPlan) -> Result<Value, String> {
 
     Ok(json!({
         "schema": "stwo-current-plan-composition-wave-frontier-v1",
-        "status": "address-free-current-plan-model-only-native-not-implemented",
+        "status": "native-codegen-and-binder-present-hardware-unvalidated",
         "source": "report.arena.composition().plan",
         "source_plan_key": format!("{:016x}", program.source_plan_key()),
         "program_blake3": program_blake3,
-        "claim_boundary": "current plan structure and logical accumulator traffic only; no native execution or duration claim",
-        "native_implementation_present": false,
+        "claim_boundary": "native lowering and ReplacementV1 binder are present locally; native byte identity, SM90 resources, sanitizer and duration remain unvalidated",
+        "native_implementation_present": true,
         "h100_timing_credit_ns": 0,
         "physical_arena_credit_bytes": 0,
         "current_plan": {
@@ -127,7 +127,8 @@ pub(crate) fn json(plan: &CompositionPlan) -> Result<Value, String> {
             "current_plan_rederived": true,
             "canonical_coefficient_order_validated": true,
             "part_partition_validated": true,
-            "native_lowering_present": false,
+            "native_lowering_present": true,
+            "replacement_v1_binder_present": true,
             "native_byte_identity": false,
             "sm90_resource_receipt": false,
             "sanitizer": false,
@@ -264,6 +265,7 @@ mod tests {
                 component("a", 0, 8, 5, 0, &[(1, 0), (2, 2)]),
                 component("b", 0, 6, 4, 5, &[(3, 0), (4, 1)]),
             ],
+            wave_kernels: Vec::new(),
         }
     }
 
@@ -275,6 +277,17 @@ mod tests {
         assert_eq!(receipt["current_plan"]["total_constraints"], 9);
         assert_eq!(receipt["h100_timing_credit_ns"], 0);
         assert_eq!(receipt["physical_arena_credit_bytes"], 0);
+        assert_eq!(receipt["native_implementation_present"], true);
+        assert_eq!(
+            receipt["status"],
+            "native-codegen-and-binder-present-hardware-unvalidated"
+        );
+        assert_eq!(receipt["admission_gates"]["native_lowering_present"], true);
+        assert_eq!(
+            receipt["admission_gates"]["replacement_v1_binder_present"],
+            true
+        );
+        assert_eq!(receipt["admission_gates"]["native_byte_identity"], false);
         assert_eq!(
             receipt["historical_old_h100_reference"]["admitted_as_current"],
             false
@@ -307,6 +320,7 @@ mod tests {
             total_constraints: OLD_H100_CONSTRAINT_LAUNCHES,
             max_evaluation_log_size: 18,
             components,
+            wave_kernels: Vec::new(),
         };
         let receipt = json(&plan).unwrap();
         let historical = &receipt["historical_old_h100_reference"];

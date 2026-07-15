@@ -195,6 +195,7 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_policy_composition_launch_mode": policy.map(|value| match value.composition_launch_mode {
             stwo_cairo_gpu_prover::CompositionLaunchMode::Serial => "serial",
             stwo_cairo_gpu_prover::CompositionLaunchMode::Wide => "wide",
+            stwo_cairo_gpu_prover::CompositionLaunchMode::Wave => "wave",
         }),
         "gpu_policy_relation_tail_mode": policy.map(|value| match value.relation_tail_mode {
             stwo_backend_cuda::RelationTailMode::Segmented => "segmented",
@@ -350,7 +351,7 @@ mod tests {
             "stage-fused-out-of-place"
         );
         assert_eq!(value["gpu_policy_blake2s_interior_fused"], false);
-        assert_eq!(value["gpu_policy_composition_launch_mode"], "serial");
+        assert_eq!(value["gpu_policy_composition_launch_mode"], "wave");
         assert_eq!(value["gpu_policy_relation_tail_mode"], "segmented");
         assert_eq!(value["gpu_policy_fri_fold_launch_mode"], "per-fold");
         assert_eq!(

@@ -39,6 +39,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo_backend_cuda::aot;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+use stwo_cairo_gpu_prover::composition_plan::plan_cairo_composition;
 use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
 use stwo_cairo_gpu_prover::{phases, state};
 use stwo_cairo_prover::witness::jit_prove_backend::all_lane_recordings;
@@ -243,12 +244,8 @@ fn run_input(
     let elements = CommonLookupElements::draw(&mut Blake2sChannel::default());
     let (_evals, interaction_claim) =
         phases::interaction::run(interaction_generator, &device, &elements);
-    let components = CairoComponents::new(
-        &claim,
-        &elements,
-        &interaction_claim,
-        &preprocessed_trace.ids(),
-    );
+    let preprocessed_ids = preprocessed_trace.ids();
+    let components = CairoComponents::new(&claim, &elements, &interaction_claim, &preprocessed_ids);
 
     macro_rules! emit_fields {
         ($( $field:ident ),+ $(,)?) => {
@@ -386,6 +383,32 @@ fn run_input(
         covered
             .entry("memory_id_to_big".to_string())
             .or_insert(false);
+    }
+
+    // Wave sources must come from the exact canonical composition planner.
+    // The manual fixture traversal above is intentionally only a semantic-key
+    // coverage set: its order differs and it collapses repeated instances.
+    if max_live_u32_lanes == aot::constraint_split_max_live_u32_lanes() {
+        let plan = plan_cairo_composition(
+            &claim,
+            &elements,
+            &interaction_claim,
+            &preprocessed_ids,
+            max_instrs,
+        )
+        .expect("canonical composition-wave lowering");
+        for wave in plan.wave_kernels {
+            out.push(Emitted {
+                kind: "constraint",
+                label: format!("wave_log_{}", wave.evaluation_log_size),
+                kernel: aot::EmittedKernel {
+                    kernel_name: wave.kernel_name,
+                    cache_key: wave.cache_key,
+                    semantic_hash: wave.semantic_hash,
+                    source: wave.source,
+                },
+            });
+        }
     }
 }
 

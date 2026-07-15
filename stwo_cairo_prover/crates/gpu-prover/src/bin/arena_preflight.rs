@@ -384,21 +384,13 @@ fn load_aot_manifest(path: &str) -> Result<(BTreeMap<u64, AotManifestKernel>, St
     Ok((manifest, manifest_blake3))
 }
 
-fn required_aot_kernels(report: &ResidentPreflightReport) -> Vec<AotKernelOccurrence> {
-    let mut required = Vec::new();
-    for component in &report.arena.composition().plan.components {
-        for (kernel, part) in component.kernels.iter().enumerate() {
-            required.push(AotKernelOccurrence {
-                kind: "constraint",
-                component: component.component.to_owned(),
-                instance: component.instance,
-                kernel,
-                kernel_name: part.kernel_name.clone(),
-                semantic_hash: part.semantic_hash,
-                cache_key: part.cache_key,
-            });
-        }
-    }
+fn required_aot_kernels(
+    report: &ResidentPreflightReport,
+) -> Result<Vec<AotKernelOccurrence>, String> {
+    let mut required = required_composition_aot_kernels(
+        report.protocol_policy.resident_backend,
+        &report.arena.composition().plan,
+    )?;
     let mut witness_instances = BTreeMap::<&str, usize>::new();
     for component in &report.arena.witness().components {
         let instance = witness_instances.entry(component.component).or_default();
@@ -419,7 +411,89 @@ fn required_aot_kernels(report: &ResidentPreflightReport) -> Vec<AotKernelOccurr
         *instance += 1;
     }
     required.sort();
-    required
+    Ok(required)
+}
+
+fn required_composition_aot_kernels(
+    backend: ResidentBackend,
+    plan: &stwo_cairo_gpu_prover::composition_plan::CompositionPlan,
+) -> Result<Vec<AotKernelOccurrence>, String> {
+    let mut required = Vec::new();
+    match backend {
+        ResidentBackend::LegacyResident => {
+            for component in &plan.components {
+                for (kernel, part) in component.kernels.iter().enumerate() {
+                    required.push(AotKernelOccurrence {
+                        kind: "constraint",
+                        component: component.component.to_owned(),
+                        instance: component.instance,
+                        kernel,
+                        kernel_name: part.kernel_name.clone(),
+                        semantic_hash: part.semantic_hash,
+                        cache_key: part.cache_key,
+                    });
+                }
+            }
+        }
+        ResidentBackend::ReplacementV1 => {
+            let canonical =
+                stwo_cairo_gpu_prover::composition_wave::CompositionWaveProgram::from_plan(plan)
+                    .map_err(|error| {
+                        format!("canonical composition wave program failed: {error}")
+                    })?;
+            if plan.wave_kernels.len() != canonical.waves().len() {
+                return Err("replacement composition wave/log ownership is incomplete".to_owned());
+            }
+            for (wave_index, (wave, canonical_wave)) in
+                plan.wave_kernels.iter().zip(canonical.waves()).enumerate()
+            {
+                let canonical_parts = canonical_wave
+                    .part_ordinals
+                    .iter()
+                    .map(|&ordinal| {
+                        let part = &canonical.parts()[ordinal];
+                        Ok(stwo_backend_cuda::aot::CompositionWaveKernelPartIdentity {
+                            semantic_hash: part.semantic_hash,
+                            coefficient_start: u32::try_from(part.coefficient_start)
+                                .map_err(|_| "composition wave coefficient start overflow")?,
+                            coefficient_end: u32::try_from(part.coefficient_end)
+                                .map_err(|_| "composition wave coefficient end overflow")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, &str>>()
+                    .map_err(str::to_owned)?;
+                if wave.evaluation_log_size != canonical_wave.evaluation_log_size
+                    || wave.parts != canonical_parts
+                {
+                    return Err(format!(
+                        "composition wave {wave_index} canonical parts drifted"
+                    ));
+                }
+                let identity = stwo_backend_cuda::aot::composition_wave_kernel_identity(
+                    wave.evaluation_log_size,
+                    &wave.parts,
+                )
+                .ok_or_else(|| format!("composition wave {wave_index} identity is invalid"))?;
+                if identity.part_count != wave.parts.len()
+                    || identity.kernel_name != wave.kernel_name
+                    || identity.semantic_hash != wave.semantic_hash
+                    || identity.cache_key != wave.cache_key
+                {
+                    return Err(format!("composition wave {wave_index} identity drifted"));
+                }
+                required.push(AotKernelOccurrence {
+                    kind: "constraint",
+                    component: format!("composition_wave_log_{}", wave.evaluation_log_size),
+                    instance: wave_index,
+                    kernel: 0,
+                    kernel_name: wave.kernel_name.clone(),
+                    semantic_hash: wave.semantic_hash,
+                    cache_key: wave.cache_key,
+                });
+            }
+        }
+    }
+    Ok(required)
 }
 
 fn missing_aot_kernels(
@@ -442,9 +516,168 @@ fn missing_aot_kernels(
         .collect()
 }
 
+#[cfg(test)]
+mod composition_aot_coverage_tests {
+    use stwo::core::fields::m31::BaseField;
+    use stwo_backend_cuda::aot::CompositionWaveKernelPartIdentity;
+    use stwo_cairo_gpu_prover::composition_plan::{
+        CompositionComponentPlan, CompositionKernelPart, CompositionPlan, CompositionWaveKernelPlan,
+    };
+
+    use super::*;
+
+    fn plan() -> CompositionPlan {
+        let parts = vec![
+            CompositionWaveKernelPartIdentity {
+                semantic_hash: 13,
+                coefficient_start: 0,
+                coefficient_end: 1,
+            },
+            CompositionWaveKernelPartIdentity {
+                semantic_hash: 23,
+                coefficient_start: 1,
+                coefficient_end: 2,
+            },
+        ];
+        let wave = stwo_backend_cuda::aot::composition_wave_kernel_identity(8, &parts).unwrap();
+        CompositionPlan {
+            max_kernel_instrs: 192,
+            total_constraints: 2,
+            max_evaluation_log_size: 8,
+            components: vec![CompositionComponentPlan {
+                component: "component",
+                instance: 3,
+                trace_locations: Vec::new(),
+                preprocessed_column_indices: Vec::new(),
+                trace_log_size: 7,
+                evaluation_log_size: 8,
+                n_constraints: 2,
+                random_coefficient_offset: 0,
+                denominator_inverses: vec![BaseField::from(1)],
+                base_param_values: Vec::new(),
+                ext_param_values: Vec::new(),
+                ext_param_sources: Vec::new(),
+                kernels: vec![
+                    CompositionKernelPart {
+                        kernel_name: "part_kernel".to_owned(),
+                        cache_key: 11,
+                        semantic_hash: 13,
+                        source: "part_source".to_owned(),
+                        rc_base: 0,
+                    },
+                    CompositionKernelPart {
+                        kernel_name: "part_kernel_1".to_owned(),
+                        cache_key: 21,
+                        semantic_hash: 23,
+                        source: "part_source_1".to_owned(),
+                        rc_base: 1,
+                    },
+                ],
+            }],
+            wave_kernels: vec![CompositionWaveKernelPlan {
+                evaluation_log_size: 8,
+                parts,
+                kernel_name: wave.kernel_name,
+                cache_key: wave.cache_key,
+                semantic_hash: wave.semantic_hash,
+                source: "wave_source".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn selected_backend_requires_only_its_composition_kernel_family() {
+        let plan = plan();
+        let legacy =
+            required_composition_aot_kernels(ResidentBackend::LegacyResident, &plan).unwrap();
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(legacy[0].kernel_name, "part_kernel");
+
+        let replacement =
+            required_composition_aot_kernels(ResidentBackend::ReplacementV1, &plan).unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].component, "composition_wave_log_8");
+        assert_eq!(replacement[0].instance, 0);
+        assert_eq!(replacement[0].kernel_name, plan.wave_kernels[0].kernel_name);
+        assert_eq!(replacement[0].cache_key, plan.wave_kernels[0].cache_key);
+    }
+
+    #[test]
+    fn missing_or_mutated_selected_wave_fails_manifest_coverage() {
+        let plan = plan();
+        let required =
+            required_composition_aot_kernels(ResidentBackend::ReplacementV1, &plan).unwrap();
+        let wave = &plan.wave_kernels[0];
+        let mut manifest = BTreeMap::new();
+        manifest.insert(
+            wave.cache_key,
+            AotManifestKernel {
+                kind: "constraint".to_owned(),
+                kernel_name: wave.kernel_name.clone(),
+                semantic_hash: wave.semantic_hash,
+            },
+        );
+        assert!(missing_aot_kernels(&required, &manifest).is_empty());
+
+        manifest.get_mut(&wave.cache_key).unwrap().semantic_hash ^= 1;
+        assert_eq!(
+            missing_aot_kernels(&required, &manifest)[0].1,
+            "identity_mismatch"
+        );
+        manifest.clear();
+        assert_eq!(
+            missing_aot_kernels(&required, &manifest)[0].1,
+            "missing_key"
+        );
+    }
+
+    #[test]
+    fn empty_or_identity_mutated_wave_fails_before_manifest_lookup() {
+        let mut empty = plan();
+        empty.wave_kernels.clear();
+        assert!(required_composition_aot_kernels(ResidentBackend::ReplacementV1, &empty).is_err());
+
+        let mut drifted = plan();
+        drifted.wave_kernels[0].cache_key ^= 1;
+        assert!(
+            required_composition_aot_kernels(ResidentBackend::ReplacementV1, &drifted).is_err()
+        );
+
+        let reseal = |plan: &mut CompositionPlan| {
+            let identity = stwo_backend_cuda::aot::composition_wave_kernel_identity(
+                plan.wave_kernels[0].evaluation_log_size,
+                &plan.wave_kernels[0].parts,
+            )
+            .unwrap();
+            plan.wave_kernels[0].kernel_name = identity.kernel_name;
+            plan.wave_kernels[0].cache_key = identity.cache_key;
+            plan.wave_kernels[0].semantic_hash = identity.semantic_hash;
+        };
+        let mut omitted = plan();
+        omitted.wave_kernels[0].parts.pop();
+        reseal(&mut omitted);
+        assert!(
+            required_composition_aot_kernels(ResidentBackend::ReplacementV1, &omitted).is_err()
+        );
+
+        let mut reordered = plan();
+        reordered.wave_kernels[0].parts.swap(0, 1);
+        // Reversed proof-global spans are rejected even before resealing; make
+        // the mutation self-consistent as a different ordered program.
+        reordered.wave_kernels[0].parts[0].coefficient_start = 0;
+        reordered.wave_kernels[0].parts[0].coefficient_end = 1;
+        reordered.wave_kernels[0].parts[1].coefficient_start = 1;
+        reordered.wave_kernels[0].parts[1].coefficient_end = 2;
+        reseal(&mut reordered);
+        assert!(
+            required_composition_aot_kernels(ResidentBackend::ReplacementV1, &reordered).is_err()
+        );
+    }
+}
+
 fn aot_coverage(report: &ResidentPreflightReport, path: &str) -> Result<AotCoverage, String> {
     let (manifest, manifest_blake3) = load_aot_manifest(path)?;
-    let required = required_aot_kernels(report);
+    let required = required_aot_kernels(report)?;
     let missing = missing_aot_kernels(&required, &manifest);
     Ok(AotCoverage {
         manifest_path: path.to_owned(),
