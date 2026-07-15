@@ -16,8 +16,7 @@ use stwo::core::pcs::PcsConfig;
 use stwo_backend_cuda::jit_witness::isa::WitnessProgram;
 use stwo_backend_cuda::{
     blake2s_pow_workspace_requirements, blake_g_fusion_program_is_exact,
-    commit_workspace_requirements,
-    decommit_workspace_requirements, ec_op_workspace_requirements,
+    commit_workspace_requirements, decommit_workspace_requirements, ec_op_workspace_requirements,
     execution_tables_workspace_requirements, fri_final_workspace_requirements,
     fri_workspace_requirements, oods_workspace_requirements,
     progressive_commit_workspace_requirements_for_mode, quotient_numerator_hybrid_plan,
@@ -100,6 +99,10 @@ pub const ARENA_ALIGNMENT_WORDS: usize = 128 / core::mem::size_of::<u32>();
 const BLAKE2S_HASH_WORDS: usize = 8;
 const SECURE_FIELD_WORDS: usize = 4;
 const CAIRO_RELATION_LAUNCH_MODE: RelationLaunchMode = RelationLaunchMode::Fused;
+// Replacement-v1 seals a fixed maximum coefficient-LDE batch into its protocol
+// identity. Exact arena plus physical-reserve admission still decides whether a
+// shape fits; there is no runtime width fallback. Legacy keeps one column.
+const REPLACEMENT_NUMERATOR_LDE_TILE_COLUMNS: usize = 32;
 
 fn retain_fixed_preprocessed_evaluation(identity: &str) -> bool {
     pedersen_points_18_column_index(identity).is_none()
@@ -1141,15 +1144,22 @@ impl ProtocolGeometry {
         }
     }
 
+    fn quotient_numerator_lde_tile_columns(&self) -> usize {
+        match self.identity.resident_backend {
+            ResidentBackend::LegacyResident => 1,
+            ResidentBackend::ReplacementV1 => REPLACEMENT_NUMERATOR_LDE_TILE_COLUMNS,
+        }
+    }
+
     pub fn quotient_numerator_workspace_config(
         &self,
     ) -> Result<QuotientNumeratorWorkspaceConfig, ArenaPlanError> {
         Ok(QuotientNumeratorWorkspaceConfig {
             lifting_log_size: self.lifting_log_size,
             log_blowup_factor: self.identity.log_blowup_factor,
-            // One maximal lifted coefficient column per batch. The backend
-            // deterministically partitions same-log columns around this tile.
-            max_lde_tile_words: checked_pow2(self.lifting_log_size)?,
+            max_lde_tile_words: checked_pow2(self.lifting_log_size)?
+                .checked_mul(self.quotient_numerator_lde_tile_columns())
+                .ok_or(ArenaPlanError::SizeOverflow)?,
         })
     }
 
@@ -2007,6 +2017,7 @@ impl ProtocolGeometry {
         feed(&[self.identity.fri_fold_launch_mode as u8]);
         feed(&[self.identity.witness_feed_launch_mode as u8]);
         feed(&[self.identity.resident_backend as u8]);
+        feed(&(self.quotient_numerator_lde_tile_columns() as u64).to_le_bytes());
         feed(&[self.identity.quotient_numerator_schedule as u8]);
         feed(&[self.identity.quotient_numerator_source_policy as u8]);
         feed(&[self.identity.commit_mode as u8]);
@@ -10670,6 +10681,25 @@ mod tests {
             opened_tree_log_sizes: vec![26, 26, 26, 26],
             fri_layer_log_sizes: (2..=26).rev().collect(),
         };
+        assert_eq!(
+            protocol
+                .quotient_numerator_workspace_config()
+                .unwrap()
+                .max_lde_tile_words,
+            1 << 26,
+            "legacy graph identity keeps one maximal lifted column"
+        );
+        let mut replacement_tile = protocol.clone();
+        replacement_tile.identity.resident_backend = ResidentBackend::ReplacementV1;
+        assert_eq!(
+            replacement_tile
+                .quotient_numerator_workspace_config()
+                .unwrap()
+                .max_lde_tile_words,
+            REPLACEMENT_NUMERATOR_LDE_TILE_COLUMNS * (1 << 26),
+            "replacement graph identity seals the wider coefficient tile"
+        );
+
         let mut changed_quotient = protocol.clone();
         changed_quotient
             .quotient
