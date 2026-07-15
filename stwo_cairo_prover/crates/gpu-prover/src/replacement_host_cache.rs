@@ -5,17 +5,20 @@
 //! pointers, builtin starts, and transcript values are rebound from the current
 //! owner.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use cairo_air::air::PublicData;
 use cairo_air::claims::CairoClaim;
+use stwo::core::pcs::PcsConfig;
 use stwo_cairo_adapter::builtins::MemorySegmentAddresses;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
     PreProcessedTrace, PreProcessedTraceVariant,
 };
 
+use crate::arena_plan::ExecutionTableGeometry;
 use crate::plan::{ProofPlan, ProofPlanError};
+use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::recorded_witness_inputs::{
     PlannedRecordedWitnessInputs, RawRecordedWitnessTemplate, RecordedWitnessPlanError,
 };
@@ -30,6 +33,10 @@ use crate::resident_witness::{
     ResidentWitnessPlanError,
 };
 use crate::schedule_table::CAIRO_SCHEDULE;
+use crate::shape_executable::{
+    ShapeCompileRequest, ShapeExecutable, ShapeExecutableCache, ShapeExecutableDynamicIdentity,
+    ShapeExecutableError, ShapeExecutableSelection,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReplacementHostCacheTelemetry {
@@ -73,8 +80,37 @@ pub struct ReplacementHostTemplate {
     preprocessed_trace: Arc<PreProcessedTrace>,
     capacity_plan: Arc<ProofPlan>,
     exact_plan: Arc<ProofPlan>,
-    claim: CairoClaim,
+    claim: RawCairoClaimTemplate,
     recorded: RawRecordedWitnessTemplate,
+    shape_executable: Mutex<Option<ReplacementShapeExecutableHandle>>,
+}
+
+#[derive(Clone)]
+struct ReplacementShapeExecutableHandle {
+    dynamic: ShapeExecutableDynamicIdentity,
+    executable: Arc<ShapeExecutable>,
+}
+
+/// Typed split of a Cairo claim at the only dynamic boundary exposed by the
+/// canonical planner. `public_data` contains initial/final state, program and
+/// output memory, safe-call ids, and every public segment range. Every other
+/// claim field is presence/log-size geometry derived solely from `ProofPlan`.
+struct RawCairoClaimTemplate {
+    static_claim: CairoClaim,
+}
+
+impl RawCairoClaimTemplate {
+    fn compile(exact_plan: &ProofPlan) -> Result<Self, ResidentWitnessPlanError> {
+        Ok(Self {
+            static_claim: planned_cairo_claim_from_public_data(&PublicData::default(), exact_plan)?,
+        })
+    }
+
+    fn bind(&self, public_data: &PublicData) -> CairoClaim {
+        let mut claim = self.static_claim.clone();
+        claim.public_data = public_data.clone();
+        claim
+    }
 }
 
 impl ReplacementHostTemplate {
@@ -95,9 +131,7 @@ impl ReplacementHostTemplate {
     }
 
     pub fn bind_claim(&self, public_data: &PublicData) -> CairoClaim {
-        let mut claim = self.claim.clone();
-        claim.public_data = public_data.clone();
-        claim
+        self.claim.bind(public_data)
     }
 
     pub fn bind_recorded(
@@ -105,6 +139,63 @@ impl ReplacementHostTemplate {
         owner: &ResidentProverInputOwner,
     ) -> Result<PlannedRecordedWitnessInputs, RecordedWitnessPlanError> {
         self.recorded.bind(owner)
+    }
+
+    /// Select the shape executable without rebuilding its full static topology
+    /// on the ordinary warm path. Exact dynamic equality and exact live cache
+    /// ownership are both required; every mismatch falls back to the full
+    /// typed admission path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn select_shape_executable(
+        &self,
+        cache: &mut ShapeExecutableCache,
+        claim: &CairoClaim,
+        preprocessed_trace: &Arc<PreProcessedTrace>,
+        pcs: PcsConfig,
+        include_all_preprocessed_columns: bool,
+        execution_tables: Option<ExecutionTableGeometry>,
+        policy: ProtocolPlanPolicy,
+    ) -> Result<ShapeExecutableSelection, ShapeExecutableError> {
+        let dynamic = ShapeExecutableDynamicIdentity::new(
+            claim,
+            pcs,
+            include_all_preprocessed_columns,
+            execution_tables,
+            policy,
+        )?;
+        let template_preprocessed = Arc::ptr_eq(preprocessed_trace, &self.preprocessed_trace);
+        let handle = if template_preprocessed {
+            let handle_started = Instant::now();
+            let handle = lock_handle(&self.shape_executable).clone();
+            cache.record_replacement_handle_lock(handle_started.elapsed().as_nanos());
+            handle
+        } else {
+            None
+        };
+        if let Some(handle) = handle.filter(|handle| handle.dynamic == dynamic) {
+            if let Some(selection) = cache.bind_installed(&handle.executable, claim)? {
+                return Ok(selection);
+            }
+        }
+
+        let selection = cache.compile_or_bind(ShapeCompileRequest {
+            claim,
+            proof_plan: &self.exact_plan,
+            preprocessed_trace,
+            pcs,
+            include_all_preprocessed_columns,
+            execution_tables,
+            policy,
+        })?;
+        if template_preprocessed {
+            let update_started = Instant::now();
+            *lock_handle(&self.shape_executable) = Some(ReplacementShapeExecutableHandle {
+                dynamic,
+                executable: Arc::clone(&selection.executable),
+            });
+            cache.record_replacement_handle_lock(update_started.elapsed().as_nanos());
+        }
+        Ok(selection)
     }
 }
 
@@ -311,7 +402,7 @@ fn compile_template(
     let exact_plan =
         Arc::new(capacity_plan.strict_resident_exact(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH)?);
     require_strict_resident_witness_coverage(&exact_plan)?;
-    let claim = planned_cairo_claim_from_public_data(&PublicData::default(), &exact_plan)?;
+    let claim = RawCairoClaimTemplate::compile(&exact_plan)?;
     let recorded = RawRecordedWitnessTemplate::compile(owner, &exact_plan)?;
     Ok(ReplacementHostTemplate {
         identity,
@@ -320,7 +411,18 @@ fn compile_template(
         exact_plan,
         claim,
         recorded,
+        shape_executable: Mutex::new(None),
     })
+}
+
+fn lock_handle(
+    handle: &Mutex<Option<ReplacementShapeExecutableHandle>>,
+) -> MutexGuard<'_, Option<ReplacementShapeExecutableHandle>> {
+    // The critical section only clones or replaces a fully formed value, so a
+    // prior panic cannot leave a partially initialized invariant to reject.
+    handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

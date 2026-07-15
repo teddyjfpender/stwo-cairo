@@ -1349,23 +1349,36 @@ pub fn with_resident_pre_witness_session<R>(
     let memory = &recorded.execution_memory;
     let public_memory_seed = public_memory_multiplicity_seed_words(&planned_claim, memory)?;
     let public_memory_entries = public_memory_seed.len() / 2;
-    let selection = select_resident_executable(
-        executable_cache,
-        &planned_claim,
-        &exact_plan,
-        &preprocessed_trace,
-        pcs,
-        include_all_preprocessed_columns,
-        Some(
-            ExecutionTableGeometry::new(
-                memory.address_to_id.len(),
-                memory.f252_values.len(),
-                memory.small_values.len(),
-            )
-            .with_public_memory_entries(public_memory_entries),
-        ),
-        protocol_policy,
-    )?;
+    let execution_tables = Some(
+        ExecutionTableGeometry::new(
+            memory.address_to_id.len(),
+            memory.f252_values.len(),
+            memory.small_values.len(),
+        )
+        .with_public_memory_entries(public_memory_entries),
+    );
+    let selection = match &input {
+        ResidentPreWitnessInput::LegacyResident { .. } => select_resident_executable(
+            executable_cache,
+            &planned_claim,
+            &exact_plan,
+            &preprocessed_trace,
+            pcs,
+            include_all_preprocessed_columns,
+            execution_tables,
+            protocol_policy,
+        )?,
+        ResidentPreWitnessInput::ReplacementV1 { template, .. } => template
+            .select_shape_executable(
+                executable_cache,
+                &planned_claim,
+                &preprocessed_trace,
+                pcs,
+                include_all_preprocessed_columns,
+                execution_tables,
+                protocol_policy,
+            )?,
+    };
     let shape_executable_cache = executable_cache.telemetry();
     let ShapeExecutableSelection {
         executable,

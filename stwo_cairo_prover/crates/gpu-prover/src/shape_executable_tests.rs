@@ -69,6 +69,7 @@ fn sn2_executable() -> Arc<ShapeExecutable> {
     assert!(Arc::ptr_eq(&cold.executable, &warm.executable));
     assert_eq!(cache.telemetry().compilations, 1);
     assert_eq!(cache.telemetry().hits, 1);
+    assert_eq!(cache.telemetry().topology_key_constructions, 2);
     cold.executable
 }
 
@@ -179,6 +180,7 @@ fn public_data_felt_count_separates_same_log_after_witness_topology() {
     assert_eq!(cache.telemetry().hits, 0);
     assert_eq!(cache.telemetry().misses, 2);
     assert_eq!(cache.telemetry().capacity_rejections, 1);
+    assert_eq!(cache.telemetry().topology_key_constructions, 2);
 }
 
 #[test]

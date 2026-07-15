@@ -44,6 +44,9 @@ pub(crate) fn gpu_native_session_context(
             "gpu_shape_executable_cache_hits": null,
             "gpu_shape_executable_cache_misses": null,
             "gpu_shape_executable_cache_compilations": null,
+            "gpu_shape_executable_cache_topology_key_constructions": null,
+            "gpu_shape_executable_cache_replacement_handle_lock_ns": null,
+            "gpu_shape_executable_cache_replacement_handle_lock_ops": null,
             "gpu_shape_executable_cache_source_generation_passes": null,
             "gpu_shape_executable_cache_binding_recipe_compilations": null,
             "gpu_shape_executable_cache_capacity_rejections": null,
@@ -157,6 +160,9 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_shape_executable_cache_hits": telemetry.shape_executable_cache.hits,
         "gpu_shape_executable_cache_misses": telemetry.shape_executable_cache.misses,
         "gpu_shape_executable_cache_compilations": telemetry.shape_executable_cache.compilations,
+        "gpu_shape_executable_cache_topology_key_constructions": telemetry.shape_executable_cache.topology_key_constructions,
+        "gpu_shape_executable_cache_replacement_handle_lock_ns": telemetry.shape_executable_cache.replacement_handle_lock_ns,
+        "gpu_shape_executable_cache_replacement_handle_lock_ops": telemetry.shape_executable_cache.replacement_handle_lock_ops,
         "gpu_shape_executable_cache_source_generation_passes": telemetry.shape_executable_cache.source_generation_passes,
         "gpu_shape_executable_cache_binding_recipe_compilations": telemetry.shape_executable_cache.binding_recipe_compilations,
         "gpu_shape_executable_cache_capacity_rejections": telemetry.shape_executable_cache.capacity_rejections,
@@ -247,7 +253,9 @@ fn workspace_materialization_name(value: WorkspaceMaterialization) -> &'static s
 mod tests {
     use stwo_cairo_gpu_prover::memory_ledger::{AllocatorPoolCheckpoint, PhysicalMemoryInputs};
     use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
-    use stwo_cairo_gpu_prover::shape_executable::ShapeExecutableMaterialization;
+    use stwo_cairo_gpu_prover::shape_executable::{
+        ShapeExecutableCacheTelemetry, ShapeExecutableMaterialization,
+    };
     use stwo_cairo_gpu_prover::workspace_cache::WorkspaceKey;
     use stwo_cairo_prover::witness::proof_shape::ProofShapeKey;
 
@@ -309,6 +317,12 @@ mod tests {
             arena_words: 123,
             shape_executable_topology_digest: Some([0xab; 32]),
             shape_executable_materialization: Some(ShapeExecutableMaterialization::Compiled),
+            shape_executable_cache: ShapeExecutableCacheTelemetry {
+                topology_key_constructions: 7,
+                replacement_handle_lock_ns: 89,
+                replacement_handle_lock_ops: 5,
+                ..ShapeExecutableCacheTelemetry::default()
+            },
             ..ResidentSessionTelemetry::default()
         };
         let value = resident_session_telemetry_json(&telemetry);
@@ -341,5 +355,26 @@ mod tests {
             value["gpu_shape_executable_topology_digest"],
             "abababababababababababababababababababababababababababababababab"
         );
+        assert_eq!(
+            value["gpu_shape_executable_cache_topology_key_constructions"],
+            7
+        );
+        assert_eq!(
+            value["gpu_shape_executable_cache_replacement_handle_lock_ns"],
+            89
+        );
+        assert_eq!(
+            value["gpu_shape_executable_cache_replacement_handle_lock_ops"],
+            5
+        );
+
+        let null_schema = gpu_native_session_context(None, false);
+        for key in [
+            "gpu_shape_executable_cache_topology_key_constructions",
+            "gpu_shape_executable_cache_replacement_handle_lock_ns",
+            "gpu_shape_executable_cache_replacement_handle_lock_ops",
+        ] {
+            assert!(null_schema[key].is_null(), "{key}");
+        }
     }
 }

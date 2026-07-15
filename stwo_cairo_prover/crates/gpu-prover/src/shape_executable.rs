@@ -59,6 +59,36 @@ impl From<PcsConfig> for PcsTopology {
     }
 }
 
+/// Exact proof-varying inputs to a shape executable whose static claim, plan,
+/// and preprocessed geometry are already owned by a replacement host template.
+/// Equality is the warm-handle admission rule; no digest participates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ShapeExecutableDynamicIdentity {
+    claim_public_data_felts: u32,
+    pcs: PcsTopology,
+    include_all_preprocessed_columns: bool,
+    execution_tables: Option<ExecutionTableGeometry>,
+    policy: ProtocolPlanPolicy,
+}
+
+impl ShapeExecutableDynamicIdentity {
+    pub(crate) fn new(
+        claim: &CairoClaim,
+        pcs: PcsConfig,
+        include_all_preprocessed_columns: bool,
+        execution_tables: Option<ExecutionTableGeometry>,
+        policy: ProtocolPlanPolicy,
+    ) -> Result<Self, ShapeExecutableError> {
+        Ok(Self {
+            claim_public_data_felts: claim_public_data_felt_count(claim)?,
+            pcs: pcs.into(),
+            include_all_preprocessed_columns,
+            execution_tables,
+            policy,
+        })
+    }
+}
+
 /// Complete typed identity for every input allowed to change a compiled DAG,
 /// arena layout, launch topology, transcript schedule or proof layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +118,13 @@ impl TopologyKey {
         execution_tables: Option<ExecutionTableGeometry>,
         policy: ProtocolPlanPolicy,
     ) -> Result<Self, ShapeExecutableError> {
+        let dynamic = ShapeExecutableDynamicIdentity::new(
+            claim,
+            pcs,
+            include_all_preprocessed_columns,
+            execution_tables,
+            policy,
+        )?;
         let preprocessed_columns = canonical_preprocessed_columns(preprocessed_trace)?;
         let (component_enable_bits, component_log_sizes) = claim.component_topology();
         let mut key = Self {
@@ -96,13 +133,13 @@ impl TopologyKey {
             component_enable_bits,
             component_log_sizes,
             claim_log_sizes: claim.log_sizes().0,
-            claim_public_data_felts: claim_public_data_felt_count(claim)?,
+            claim_public_data_felts: dynamic.claim_public_data_felts,
             preprocessed_trace_variant: preprocessed_trace.variant,
             preprocessed_columns,
-            pcs: pcs.into(),
-            include_all_preprocessed_columns,
-            execution_tables,
-            policy,
+            pcs: dynamic.pcs,
+            include_all_preprocessed_columns: dynamic.include_all_preprocessed_columns,
+            execution_tables: dynamic.execution_tables,
+            policy: dynamic.policy,
             digest: [0; 32],
         };
         key.digest = key.compute_digest();
@@ -415,6 +452,14 @@ impl ShapeExecutable {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ShapeExecutableCacheTelemetry {
+    /// Full typed [`TopologyKey`] constructions. A replacement warm-handle hit
+    /// binds statement values without increasing this counter.
+    pub topology_key_constructions: u64,
+    /// Cumulative time spent acquiring and copying the replacement template's
+    /// tiny replaceable handle cell. This excludes topology construction and
+    /// statement binding.
+    pub replacement_handle_lock_ns: u128,
+    pub replacement_handle_lock_ops: u64,
     pub hits: u64,
     pub misses: u64,
     pub compilations: u64,
@@ -471,6 +516,15 @@ impl ShapeExecutableCache {
         self.telemetry
     }
 
+    pub(crate) fn record_replacement_handle_lock(&mut self, elapsed_ns: u128) {
+        self.telemetry.replacement_handle_lock_ns = self
+            .telemetry
+            .replacement_handle_lock_ns
+            .saturating_add(elapsed_ns);
+        self.telemetry.replacement_handle_lock_ops =
+            self.telemetry.replacement_handle_lock_ops.saturating_add(1);
+    }
+
     pub fn compile_or_bind(
         &mut self,
         request: ShapeCompileRequest<'_>,
@@ -484,6 +538,7 @@ impl ShapeExecutableCache {
             request.execution_tables,
             request.policy,
         )?;
+        self.telemetry.topology_key_constructions += 1;
         if let Some(executable) = self
             .entries
             .iter()
@@ -518,6 +573,36 @@ impl ShapeExecutableCache {
             bindings,
             materialization: ShapeExecutableMaterialization::Compiled,
         })
+    }
+
+    /// Bind against an executable only when this exact `Arc` is still owned by
+    /// the live cache. Missing or stale handles are never admitted here; the
+    /// caller must fall back to [`Self::compile_or_bind`].
+    pub(crate) fn bind_installed(
+        &mut self,
+        installed: &Arc<ShapeExecutable>,
+        claim: &CairoClaim,
+    ) -> Result<Option<ShapeExecutableSelection>, ShapeExecutableError> {
+        let Some(executable) = self
+            .entries
+            .iter()
+            .find(|entry| Arc::ptr_eq(entry, installed))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let bindings = bind_cairo_composition(claim, executable.composition_bindings())?;
+        self.telemetry.hits += 1;
+        Ok(Some(ShapeExecutableSelection {
+            executable,
+            bindings,
+            materialization: ShapeExecutableMaterialization::Reused,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_entries_for_test(&mut self) {
+        self.entries.clear();
     }
 }
 

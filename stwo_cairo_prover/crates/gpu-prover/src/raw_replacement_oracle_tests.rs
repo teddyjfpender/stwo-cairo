@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cairo_vm::types::layout_name::LayoutName;
+use stwo::core::pcs::PcsConfig;
 use stwo_cairo_adapter::memory::DEFAULT_ID;
 use stwo_cairo_adapter::opcodes::RECORDED_CASM_DESCRIPTORS;
 use stwo_cairo_adapter::ProverInput;
@@ -13,8 +14,9 @@ use stwo_cairo_prover::witness::jit_prove_backend::{
     lane_recording_metadata_initialization_count, ExecutionMemoryIdentity,
 };
 
-use crate::arena_plan::ResidentBackend;
+use crate::arena_plan::{ExecutionTableGeometry, ResidentBackend};
 use crate::phases;
+use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::{prepare_resident_ingest, GpuError, PreparedResidentIngest};
 use crate::recorded_witness_inputs::{
     recorded_witness_inputs_for_raw_replacement_plan, recorded_witness_inputs_for_replacement_plan,
@@ -31,6 +33,7 @@ use crate::resident_shape::{
 };
 use crate::resident_witness::{planned_cairo_claim, planned_cairo_claim_from_public_data};
 use crate::schedule_table::CAIRO_SCHEDULE;
+use crate::shape_executable::{ShapeExecutableCache, ShapeExecutableMaterialization};
 
 fn assert_cached_recorded_matches_fresh(
     cached: &PlannedRecordedWitnessInputs,
@@ -334,6 +337,147 @@ fn raw_replacement_dispatch_preserves_legacy_generator_path() {
 }
 
 #[test]
+fn raw_replacement_cached_claim_rebinds_every_public_data_field() {
+    let input = run_and_adapt(
+        &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .unwrap();
+    let owner = ResidentProverInputOwner::encode(input);
+    let mut cache = ReplacementHostCache::new(1).unwrap();
+    let template = cache
+        .compile_or_bind(&owner, PreProcessedTraceVariant::Canonical, None)
+        .unwrap()
+        .template;
+    let base = owner.public_data().clone();
+    let base_claim = serde_json::to_value(template.bind_claim(&base)).unwrap();
+    let assert_case = |label: &str, public_data: &cairo_air::air::PublicData| {
+        let cached = template.bind_claim(public_data);
+        let fresh = planned_cairo_claim_from_public_data(public_data, template.exact_plan())
+            .unwrap_or_else(|error| panic!("{label}: fresh claim failed: {error}"));
+        let cached = serde_json::to_value(cached).unwrap();
+        let fresh = serde_json::to_value(fresh).unwrap();
+        assert_ne!(cached, base_claim, "{label}: mutation was not observable");
+        assert_eq!(cached, fresh, "{label}: cached claim binding drifted");
+    };
+
+    macro_rules! scalar_case {
+        ($label:expr, $field:expr) => {{
+            let mut data = base.clone();
+            $field(&mut data);
+            assert_case($label, &data);
+        }};
+    }
+    scalar_case!("initial.pc", |data: &mut cairo_air::air::PublicData| {
+        data.initial_state.pc.0 ^= 1
+    });
+    scalar_case!("initial.ap", |data: &mut cairo_air::air::PublicData| {
+        data.initial_state.ap.0 ^= 1
+    });
+    scalar_case!("initial.fp", |data: &mut cairo_air::air::PublicData| {
+        data.initial_state.fp.0 ^= 1
+    });
+    scalar_case!("final.pc", |data: &mut cairo_air::air::PublicData| data
+        .final_state
+        .pc
+        .0 ^=
+        1);
+    scalar_case!("final.ap", |data: &mut cairo_air::air::PublicData| data
+        .final_state
+        .ap
+        .0 ^=
+        1);
+    scalar_case!("final.fp", |data: &mut cairo_air::air::PublicData| data
+        .final_state
+        .fp
+        .0 ^=
+        1);
+    scalar_case!("program.id", |data: &mut cairo_air::air::PublicData| {
+        data.public_memory.program[0].0 ^= 1
+    });
+    scalar_case!("program.value", |data: &mut cairo_air::air::PublicData| {
+        data.public_memory.program[0].1[0] ^= 1
+    });
+    scalar_case!(
+        "safe_call_id[0]",
+        |data: &mut cairo_air::air::PublicData| data.public_memory.safe_call_ids[0] ^= 1
+    );
+    scalar_case!(
+        "safe_call_id[1]",
+        |data: &mut cairo_air::air::PublicData| data.public_memory.safe_call_ids[1] ^= 1
+    );
+    if !base.public_memory.output.is_empty() {
+        scalar_case!("output.id", |data: &mut cairo_air::air::PublicData| data
+            .public_memory
+            .output[0]
+            .0 ^=
+            1);
+        scalar_case!("output.value", |data: &mut cairo_air::air::PublicData| {
+            data.public_memory.output[0].1[0] ^= 1
+        });
+    }
+
+    macro_rules! segment_cases {
+        ($field:ident) => {{
+            if base.public_memory.public_segments.$field.is_some() {
+                scalar_case!(
+                    concat!(stringify!($field), ".start"),
+                    |data: &mut cairo_air::air::PublicData| data
+                        .public_memory
+                        .public_segments
+                        .$field
+                        .as_mut()
+                        .unwrap()
+                        .start_ptr
+                        .value ^= 1
+                );
+                scalar_case!(
+                    concat!(stringify!($field), ".stop"),
+                    |data: &mut cairo_air::air::PublicData| data
+                        .public_memory
+                        .public_segments
+                        .$field
+                        .as_mut()
+                        .unwrap()
+                        .stop_ptr
+                        .value ^= 1
+                );
+            }
+        }};
+    }
+    scalar_case!(
+        "output_segment.start",
+        |data: &mut cairo_air::air::PublicData| data
+            .public_memory
+            .public_segments
+            .output
+            .start_ptr
+            .value ^= 1
+    );
+    scalar_case!(
+        "output_segment.stop",
+        |data: &mut cairo_air::air::PublicData| data
+            .public_memory
+            .public_segments
+            .output
+            .stop_ptr
+            .value ^= 1
+    );
+    segment_cases!(pedersen);
+    segment_cases!(range_check_128);
+    segment_cases!(ecdsa);
+    segment_cases!(bitwise);
+    segment_cases!(ec_op);
+    segment_cases!(keccak);
+    segment_cases!(poseidon);
+    segment_cases!(range_check_96);
+    segment_cases!(add_mod);
+    segment_cases!(mul_mod);
+}
+
+#[test]
 fn raw_replacement_host_cache_reuses_topology_and_rebinds_statement_memory_and_seeds() {
     let cold_input = run_and_adapt(
         &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
@@ -480,6 +624,204 @@ fn raw_replacement_host_cache_reuses_topology_and_rebinds_statement_memory_and_s
         warm_template.exact_plan().proof_shape(),
         fresh_exact.proof_shape()
     );
+
+    let execution_geometry = |owner: &ResidentProverInputOwner,
+                              claim: &cairo_air::claims::CairoClaim| {
+        let public_memory_entries = claim
+            .public_data
+            .public_memory
+            .get_entries(
+                claim.public_data.initial_state.pc.0,
+                claim.public_data.initial_state.ap.0,
+                claim.public_data.final_state.ap.0,
+            )
+            .count();
+        ExecutionTableGeometry::new(
+            owner.execution_memory().address_to_id.len(),
+            owner.execution_memory().f252_values.len(),
+            owner.execution_memory().small_values.len(),
+        )
+        .with_public_memory_entries(public_memory_entries)
+    };
+    let cold_geometry = execution_geometry(&cold_owner, &cold_claim);
+    let warm_geometry = execution_geometry(&warm_owner, &warm_claim);
+    assert_eq!(cold_geometry, warm_geometry);
+    let pcs = PcsConfig::default();
+    let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
+    let mut executable_cache = ShapeExecutableCache::new(2).unwrap();
+    let cold_shape = cold_template
+        .select_shape_executable(
+            &mut executable_cache,
+            &cold_claim,
+            &cold_preprocessed,
+            pcs,
+            false,
+            Some(cold_geometry),
+            policy,
+        )
+        .unwrap();
+    let warm_shape = warm_template
+        .select_shape_executable(
+            &mut executable_cache,
+            &warm_claim,
+            &cold_preprocessed,
+            pcs,
+            false,
+            Some(warm_geometry),
+            policy,
+        )
+        .unwrap();
+    assert_eq!(
+        cold_shape.materialization,
+        ShapeExecutableMaterialization::Compiled
+    );
+    assert_eq!(
+        warm_shape.materialization,
+        ShapeExecutableMaterialization::Reused
+    );
+    assert!(Arc::ptr_eq(&cold_shape.executable, &warm_shape.executable));
+    assert_eq!(
+        executable_cache.telemetry().topology_key_constructions,
+        1,
+        "cold plus warm replacement selection must build one full topology key"
+    );
+    assert_eq!(executable_cache.telemetry().hits, 1);
+    assert_eq!(executable_cache.telemetry().compilations, 1);
+    assert_eq!(
+        executable_cache.telemetry().replacement_handle_lock_ops,
+        3,
+        "cold selection locks twice to read/install; warm selection reads once"
+    );
+
+    let mut changed_statement = warm_claim.clone();
+    changed_statement
+        .public_data
+        .public_memory
+        .public_segments
+        .bitwise
+        .as_mut()
+        .expect("SN2 fixture must expose the bitwise public segment")
+        .start_ptr
+        .value ^= 1;
+    let changed_statement_shape = warm_template
+        .select_shape_executable(
+            &mut executable_cache,
+            &changed_statement,
+            &cold_preprocessed,
+            pcs,
+            false,
+            Some(warm_geometry),
+            policy,
+        )
+        .unwrap();
+    assert_eq!(
+        changed_statement_shape.materialization,
+        ShapeExecutableMaterialization::Reused
+    );
+    assert_ne!(
+        warm_shape.bindings, changed_statement_shape.bindings,
+        "a current public segment start must rebind statement values"
+    );
+    assert_eq!(
+        executable_cache.telemetry().topology_key_constructions,
+        1,
+        "statement values do not change executable topology"
+    );
+
+    let mut alternate_pcs = pcs;
+    alternate_pcs.pow_bits += 1;
+    let alternate_shape = warm_template
+        .select_shape_executable(
+            &mut executable_cache,
+            &warm_claim,
+            &cold_preprocessed,
+            alternate_pcs,
+            false,
+            Some(warm_geometry),
+            policy,
+        )
+        .unwrap();
+    assert_eq!(
+        alternate_shape.materialization,
+        ShapeExecutableMaterialization::Compiled
+    );
+    assert_eq!(executable_cache.telemetry().topology_key_constructions, 2);
+    let alternate_warm = warm_template
+        .select_shape_executable(
+            &mut executable_cache,
+            &warm_claim,
+            &cold_preprocessed,
+            alternate_pcs,
+            false,
+            Some(warm_geometry),
+            policy,
+        )
+        .unwrap();
+    assert_eq!(
+        alternate_warm.materialization,
+        ShapeExecutableMaterialization::Reused
+    );
+    assert!(Arc::ptr_eq(
+        &alternate_shape.executable,
+        &alternate_warm.executable
+    ));
+    assert_eq!(
+        executable_cache.telemetry().topology_key_constructions,
+        2,
+        "a refreshed B handle must make the next B proof key-free"
+    );
+
+    executable_cache.clear_entries_for_test();
+    let rebound_after_eviction = warm_template
+        .select_shape_executable(
+            &mut executable_cache,
+            &warm_claim,
+            &cold_preprocessed,
+            alternate_pcs,
+            false,
+            Some(warm_geometry),
+            policy,
+        )
+        .unwrap();
+    assert_eq!(
+        rebound_after_eviction.materialization,
+        ShapeExecutableMaterialization::Compiled
+    );
+    assert!(!Arc::ptr_eq(
+        &alternate_shape.executable,
+        &rebound_after_eviction.executable
+    ));
+    assert_eq!(rebound_after_eviction.bindings, alternate_warm.bindings);
+    assert_eq!(
+        executable_cache.telemetry().topology_key_constructions,
+        3,
+        "an evicted handle must fall back to full topology admission"
+    );
+    let warm_after_eviction = warm_template
+        .select_shape_executable(
+            &mut executable_cache,
+            &warm_claim,
+            &cold_preprocessed,
+            alternate_pcs,
+            false,
+            Some(warm_geometry),
+            policy,
+        )
+        .unwrap();
+    assert_eq!(
+        warm_after_eviction.materialization,
+        ShapeExecutableMaterialization::Reused
+    );
+    assert!(Arc::ptr_eq(
+        &rebound_after_eviction.executable,
+        &warm_after_eviction.executable
+    ));
+    assert_eq!(
+        executable_cache.telemetry().topology_key_constructions,
+        3,
+        "the stale fallback must refresh the handle for its next warm proof"
+    );
+    assert_eq!(executable_cache.telemetry().replacement_handle_lock_ops, 10);
     eprintln!(
         "replacement_host_cache cold_wall_ms={:.3} warm_wall_ms={:.3} warm_identity_ms={:.3} warm_select_ms={:.3}",
         cold_wall_ns as f64 / 1e6,
