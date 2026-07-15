@@ -491,7 +491,9 @@ impl std::error::Error for RelationExecutionError {}
 
 #[cfg(test)]
 mod tests {
-    use stwo_backend_cuda::{relation_batch_fused_eligible, RELATION_FUSED_MAX_COLUMNS};
+    use stwo_backend_cuda::{
+        relation_batch_fused_eligible, relation_batch_one_read_eligible, RELATION_FUSED_MAX_COLUMNS,
+    };
     use stwo_cairo_prover::witness::cairo_claim_generator::CairoClaimGenerator;
     use stwo_cairo_prover::witness::proof_shape::{
         ProofShape, RuntimeComponentShape, TracePartShape,
@@ -585,6 +587,16 @@ mod tests {
                 .sum::<usize>(),
             807
         );
+        assert_eq!(
+            execution
+                .kernel_program
+                .batches
+                .iter()
+                .map(|batch| batch.columns.len())
+                .max(),
+            Some(157),
+            "generated relation shape outgrew the 512-fraction one-read tile"
+        );
         assert_eq!(execution.relation_graph_hash, 0x7396_3831_c53d_f4a2);
         let newly_wide_batches = execution
             .kernel_program
@@ -601,6 +613,11 @@ mod tests {
             .batches
             .iter()
             .all(relation_batch_fused_eligible));
+        assert!(execution
+            .kernel_program
+            .batches
+            .iter()
+            .all(relation_batch_one_read_eligible));
         execution.requirements().unwrap();
         let sources = execution.source_plan().unwrap();
         let requirements = execution.requirements().unwrap();
@@ -651,17 +668,17 @@ mod tests {
 
         // Post-source-evaluation logical pass bytes per fraction: three-stage
         // writes pairs (32), reads+writes inverse (32), then reads fractions
-        // (32) and writes output (16) = 112. Existing narrow fused stages,
-        // rereads and overwrites output = 48. New one-read wide writes only the
+        // (32) and writes output (16) = 112. The suffix/recompute lane stages,
+        // rereads and overwrites output = 48. The one-read lane writes only the
         // final output = 16. Tuple-source/descriptor reads are deliberately
-        // excluded; this is a pass-byte model, not measured DRAM traffic.
+        // excluded; this is an exact logical pass model, not measured DRAM.
         const THREE_STAGE_BYTES: u64 = 112;
         const NARROW_FUSED_BYTES: u64 = 48;
-        const WIDE_FUSED_BYTES: u64 = 16;
+        const ONE_READ_BYTES: u64 = 16;
         let current_baseline_body_bytes = SN3_NARROW_FRACTIONS * NARROW_FUSED_BYTES
             + SN3_NEWLY_WIDE_FRACTIONS * THREE_STAGE_BYTES;
         let new_body_bytes =
-            SN3_NARROW_FRACTIONS * NARROW_FUSED_BYTES + SN3_NEWLY_WIDE_FRACTIONS * WIDE_FUSED_BYTES;
+            SN3_NARROW_FRACTIONS * NARROW_FUSED_BYTES + SN3_NEWLY_WIDE_FRACTIONS * ONE_READ_BYTES;
         let full_legacy_body_bytes = total_fractions * THREE_STAGE_BYTES;
         assert_eq!(current_baseline_body_bytes, 42_751_935_232);
         assert_eq!(new_body_bytes, 17_390_879_488);
@@ -675,6 +692,20 @@ mod tests {
             full_legacy_body_bytes - new_body_bytes,
             42_913_104_896,
             "pass bytes retired versus an all-three-stage legacy implementation"
+        );
+
+        // Every generated relation batch has at most 157 columns, so the
+        // shape-routed source sends all 538,428,432 SN3 fractions through the
+        // existing one-read tile. This is the exact additional logical-body
+        // reduction relative to the preceding adaptive-wide implementation.
+        let all_one_read_body_bytes = total_fractions * ONE_READ_BYTES;
+        let additional_retired_body_bytes = new_body_bytes - all_one_read_body_bytes;
+        assert_eq!(all_one_read_body_bytes, 8_614_854_912);
+        assert_eq!(additional_retired_body_bytes, 8_776_024_576);
+        assert_eq!(
+            additional_retired_body_bytes * 1_000_000 / new_body_bytes,
+            504_633,
+            "additional one-read logical-body reduction in integer ppm"
         );
     }
 
@@ -705,6 +736,19 @@ mod tests {
         assert!(
             ineligible.is_empty(),
             "generated production relation batches escaped fused coverage: {ineligible:?}"
+        );
+        let not_one_read = execution
+            .kernel_program
+            .batches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, batch)| {
+                (!relation_batch_one_read_eligible(batch)).then_some(execution.batches[index])
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            not_one_read.is_empty(),
+            "generated SN3 relation batches escaped one-read coverage: {not_one_read:?}"
         );
 
         let full = execution
