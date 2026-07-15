@@ -21,7 +21,7 @@ use stwo_backend_cuda::{
     CudaRuntimeError, InterpolationBatch, InterpolationColumn,
     ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedCommitError,
     PreparedCommitGraph, PreparedInterpolationError, PreparedInterpolationGraph,
-    PreparedProgressiveCommitError, PreparedProgressiveCommitGraph,
+    PreparedProgressiveCommitError, PreparedProgressiveCommitGraph, ProgressiveNttLeafFusionMode,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::base_trace::BaseTrace;
@@ -33,7 +33,7 @@ use stwo_cairo_prover::witness::relation_sources::{
 };
 
 use crate::arena_plan::{
-    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedCommitment,
+    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedCommitment, ResidentBackend,
 };
 use crate::fixed_table_materializer::{
     pedersen_points_18_column_index, PEDERSEN_POINTS_18_COLUMN_COUNT, PEDERSEN_POINTS_18_LOG_SIZE,
@@ -1073,7 +1073,7 @@ pub fn stage_preprocessed_commitment(
                         None => vec![None; group.columns.len()],
                     })
                     .collect::<Vec<_>>();
-                let commit = PreparedProgressiveCommitGraph::prepare_with_modes(
+                let commit = PreparedProgressiveCommitGraph::prepare_with_modes_and_ntt_fusion(
                     workspace.arena(),
                     commitment.config,
                     requirements,
@@ -1083,6 +1083,10 @@ pub fn stage_preprocessed_commitment(
                     twiddles,
                     protocol_identity.commit_mode,
                     protocol_identity.blake2s_interior_fused,
+                    match protocol_identity.resident_backend {
+                        ResidentBackend::LegacyResident => ProgressiveNttLeafFusionMode::Separate,
+                        ResidentBackend::ReplacementV1 => ProgressiveNttLeafFusionMode::Fused16,
+                    },
                 )?;
                 commit.launch()?;
                 (

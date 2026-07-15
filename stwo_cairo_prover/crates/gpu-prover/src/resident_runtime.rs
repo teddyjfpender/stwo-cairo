@@ -30,9 +30,10 @@ use stwo_backend_cuda::{
     PreparedWitnessFeedClearGraph, PreparedWitnessFeedError, PreparedWitnessFeedGraph,
     PreparedWitnessGraph, PreparedWitnessInputCompactGraph, PreparedWitnessInputGatherError,
     PreparedWitnessInputGatherGraph, PreparedWitnessInputSeedGraph, PreparedWitnessMode,
-    RelationChallenges, RelationGraphError, RelationInstanceSources, TraceDecommitSources,
-    TraceSourceGroup, TranscriptInputBinding, TranscriptInputId, TranscriptMirrorReport,
-    TranscriptOutputBinding, TranscriptOutputId, TranscriptSegmentCursor, TranscriptSegmentStart,
+    ProgressiveNttLeafFusionMode, RelationChallenges, RelationGraphError, RelationInstanceSources,
+    TraceDecommitSources, TraceSourceGroup, TranscriptInputBinding, TranscriptInputId,
+    TranscriptMirrorReport, TranscriptOutputBinding, TranscriptOutputId, TranscriptSegmentCursor,
+    TranscriptSegmentStart,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
@@ -1696,7 +1697,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .map(|group| group.as_ref().map(|group| group.columns.clone()))
                         .collect();
                     PreparedResidentCommitment::Progressive {
-                        graph: PreparedProgressiveCommitGraph::prepare_with_modes(
+                        graph: PreparedProgressiveCommitGraph::prepare_with_modes_and_ntt_fusion(
                             arena,
                             planned.config,
                             requirements,
@@ -1706,6 +1707,14 @@ impl<'a> ResidentGraphRuntime<'a> {
                             twiddles,
                             protocol_identity.commit_mode,
                             protocol_identity.blake2s_interior_fused,
+                            match protocol_identity.resident_backend {
+                                ResidentBackend::LegacyResident => {
+                                    ProgressiveNttLeafFusionMode::Separate
+                                }
+                                ResidentBackend::ReplacementV1 => {
+                                    ProgressiveNttLeafFusionMode::Fused16
+                                }
+                            },
                         )?,
                         retained_evaluations: grouped_retained,
                     }
