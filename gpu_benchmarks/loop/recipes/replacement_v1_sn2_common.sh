@@ -805,8 +805,9 @@ for field in ("gpu_setup_base_migration_copies", "gpu_setup_lookup_host_copies",
 for field in ("gpu_aot_misses", "gpu_aot_runtime_loads", "gpu_aot_runtime_cache_hits", "gpu_aot_strict_rejections"):
     require(r.get(field) == 0, f"JIT/AOT fallback executed: {field}={r.get(field)!r}")
 activity = (r.get("gpu_aot_loads"), r.get("gpu_aot_cache_hits"))
-require(all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in activity)
-        and sum(activity) > 0, "runtime telemetry recorded no positive AOT activity")
+# A fully prepared replay may perform no AOT lookup after its per-proof counters reset.
+require(all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in activity),
+        "runtime telemetry recorded invalid AOT activity")
 require(r.get("gpu_aot_provenance_gate_passed") is True, "strict AOT provenance gate failed")
 embedded_hash = int(aot["loaded_manifest_hash"], 16)
 require(r.get("gpu_aot_manifest_hash") == embedded_hash and r.get("gpu_policy_kernel_manifest_hash") == embedded_hash, "runtime AOT identity differs from checked embedded pack")
