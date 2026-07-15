@@ -13,13 +13,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cairo_air::claims::CairoClaim;
+use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
+use stwo_backend_cuda::{
+    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
+    PreparedProgressiveCommitError, ProgressiveCommitStorageMode,
+};
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
     PreProcessedTrace, PreProcessedTraceVariant,
 };
 
-use crate::arena_plan::{ExecutionTableGeometry, ResidentBackend};
+use crate::arena_plan::{CommitmentTreeId, ExecutionTableGeometry, ResidentBackend};
 use crate::plan::ProofPlan;
 use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::prepare_resident_ingest;
@@ -32,6 +37,10 @@ use crate::replacement_host_cache::{
 use crate::resident_input::ResidentProverInputOwner;
 use crate::resident_session::ResidentPreWitnessInput;
 use crate::resident_shape::raw_replacement_proof_plan;
+use crate::resident_sources::{
+    preprocessed_commit_binding, PreprocessedCommitBinding, PreprocessedCommitSelector,
+    PreprocessedCommitSlotMode,
+};
 use crate::resident_witness::planned_cairo_claim_from_public_data;
 use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::shape_executable::{ShapeExecutableCache, ShapeExecutableMaterialization};
@@ -446,4 +455,144 @@ fn raw_replacement_warm_template_and_shape_handle_on_sn1_through_sn4() {
     for fixture in &SEALED_SN_FIXTURES {
         run_profile(Path::new(&directory), fixture);
     }
+}
+
+/// Reproduce the preprocessed one-slab admission boundary from the exact SN2
+/// replacement shape without touching CUDA. The ordinary progressive
+/// constructor must reject the intentional repeated slot, while the planned
+/// in-place constructor must admit it. This is the host oracle for the H100
+/// `AliasedSlot` failure that preceded any kernel launch.
+#[test]
+#[ignore = "requires STWO_SN_ADAPTED_DIR containing sealed SN_PIE_2.adapted.bin"]
+fn raw_replacement_preprocessed_in_place_shape_on_sn2() {
+    let directory = std::env::var("STWO_SN_ADAPTED_DIR")
+        .expect("set STWO_SN_ADAPTED_DIR to the sealed adapted-input directory");
+    let fixture = SEALED_SN_FIXTURES
+        .iter()
+        .find(|fixture| fixture.profile == "SN2")
+        .unwrap();
+    let path = Path::new(&directory).join(fixture.file);
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("read sealed {}: {error}", path.display()));
+    assert_eq!(bytes.len(), fixture.bytes, "SN2 sealed byte length");
+    assert_eq!(
+        blake3::hash(&bytes).to_hex().as_str(),
+        fixture.blake3,
+        "SN2 sealed BLAKE3"
+    );
+    let input: ProverInput = bincode::deserialize(&bytes)
+        .unwrap_or_else(|error| panic!("decode sealed {}: {error}", path.display()));
+    drop(bytes);
+
+    let mut host_cache = ReplacementHostCache::new(1).unwrap();
+    let ingest = prepare_resident_ingest(
+        ResidentBackend::ReplacementV1,
+        Some(&mut host_cache),
+        input,
+        PreProcessedTraceVariant::Canonical,
+        None,
+    )
+    .unwrap();
+    let preprocessed = Arc::clone(&ingest.preprocessed_trace);
+    let ResidentPreWitnessInput::ReplacementV1 {
+        input: owner,
+        template,
+    } = ingest.input
+    else {
+        panic!("SN2 replacement ingest returned legacy input")
+    };
+    let claim =
+        planned_cairo_claim_from_public_data(owner.public_data(), template.exact_plan()).unwrap();
+    let geometry = execution_geometry(&owner, &claim);
+    let mut shape_cache = ShapeExecutableCache::new(1).unwrap();
+    let selected = template
+        .select_shape_executable(
+            &mut shape_cache,
+            &claim,
+            &preprocessed,
+            PcsConfig {
+                pow_bits: 26,
+                fri_config: FriConfig::new(0, 1, 70, 3),
+                lifting_log_size: None,
+            },
+            false,
+            Some(geometry),
+            ProtocolPlanPolicy::replacement_v1(0x534e_0001, 2048),
+        )
+        .unwrap();
+    let arena = selected.executable.arena();
+    let commitment = arena
+        .commitment(CommitmentTreeId::Preprocessed)
+        .expect("SN2 has a preprocessed commitment");
+    assert_eq!(
+        commitment.storage_mode,
+        ProgressiveCommitStorageMode::InPlaceSlab
+    );
+    assert!(commitment.commit_program.is_some());
+    assert!(commitment.domain_cooperative_program.is_none());
+    assert!(commitment.compact_domain_program.is_none());
+    assert!(commitment.direct_retained_b2n_program.is_none());
+
+    let (
+        ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+        ModeAwareCommitWorkspaceSlots::DomainProgressive(slots),
+    ) = (&commitment.requirements, &commitment.slots)
+    else {
+        panic!("SN2 replacement preprocessed commitment is not domain-progressive")
+    };
+    let slab = slots.leaves.state_ping;
+    assert_eq!(slots.leaves.state_pong, Some(slab));
+    assert_eq!(slots.leaves.leaf_hashes, slab);
+    assert_eq!(slots.merkle.leaves, slab);
+    assert_eq!(slots.merkle.merkle_scratch, Some(slab));
+    assert!(matches!(
+        requirements.arena_slot_requirements(slots),
+        Err(PreparedProgressiveCommitError::AliasedSlot(id)) if id == slab
+    ));
+    let admitted = requirements
+        .arena_slot_requirements_in_place(slots)
+        .unwrap();
+    assert_eq!(
+        admitted.iter().filter(|entry| entry.id == slab).count(),
+        1,
+        "the one-slab identity must be merged exactly once"
+    );
+    let program = commitment.commit_program.as_ref().unwrap();
+    assert_eq!(program.requirements(), requirements);
+    assert_eq!(program.identity().config, commitment.config);
+    assert_eq!(
+        program.identity().storage,
+        ProgressiveCommitStorageMode::InPlaceSlab
+    );
+    let protocol = arena.protocol_identity();
+    let retained_evaluation_groups = commitment
+        .evaluation_output_groups
+        .iter()
+        .map(Option::is_some)
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        preprocessed_commit_binding(PreprocessedCommitSelector {
+            tree: commitment.id,
+            backend: protocol.resident_backend,
+            schedule: protocol.dynamic_commitment_leaf_schedule,
+            commit_mode: protocol.commit_mode,
+            interior4_fused: protocol.blake2s_interior_fused,
+            storage: commitment.storage_mode,
+            config: commitment.config,
+            grouped_column_log_sizes: &commitment.grouped_column_log_sizes,
+            retained_evaluation_groups: &retained_evaluation_groups,
+            requirements: &commitment.requirements,
+            slot_mode: PreprocessedCommitSlotMode::DomainProgressive,
+            commit_program: commitment.commit_program.as_ref(),
+            has_domain_program: commitment.domain_cooperative_program.is_some(),
+            has_compact_program: commitment.compact_domain_program.is_some(),
+            has_direct_program: commitment.direct_retained_b2n_program.is_some(),
+        }),
+        Ok(PreprocessedCommitBinding::ReplacementProgressiveInPlace(_))
+    ));
+
+    eprintln!(
+        "SN2_PREPROCESSED_IN_PLACE physical={slab:?} slab_words={}",
+        requirements.leaves.in_place_slab_words().unwrap()
+    );
 }

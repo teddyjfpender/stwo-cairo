@@ -16,12 +16,16 @@ use stwo_backend_cuda::pedersen_table::{
     registered_borrowed_pedersen_table, RegisteredPedersenColumn, RegisteredPedersenTableError,
 };
 use stwo_backend_cuda::{
-    gpu_default_pool_memory, synchronize_legacy_stream_for_arena_handoff, trim_gpu_default_pool,
-    ArenaSlice, BaseFieldVec, CommitCoefficientColumn, CommitCoefficientGroup, CudaBackend,
-    CudaRuntimeError, InterpolationBatch, InterpolationColumn,
+    commit_workspace_requirements, gpu_default_pool_memory,
+    progressive_commit_workspace_requirements_for_mode,
+    synchronize_legacy_stream_for_arena_handoff, trim_gpu_default_pool, ArenaSlice, BaseFieldVec,
+    CommitCoefficientColumn, CommitCoefficientGroup, CommitProgram, CommitProgramBindingError,
+    CommitWorkspaceConfig, CudaBackend, CudaRuntimeError, InterpolationBatch, InterpolationColumn,
     ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedCommitError,
     PreparedCommitGraph, PreparedInterpolationError, PreparedInterpolationGraph,
-    PreparedProgressiveCommitError, PreparedProgressiveCommitGraph, ProgressiveNttLeafFusionMode,
+    PreparedProgressiveCommitError, PreparedProgressiveCommitGraph, ProgressiveCommitGeometry,
+    ProgressiveCommitGroupGeometry, ProgressiveCommitMode, ProgressiveCommitStorageMode,
+    ProgressiveNttLeafFusionMode,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::base_trace::BaseTrace;
@@ -236,6 +240,7 @@ pub enum ResidentSourceStageError {
     Interpolation(PreparedInterpolationError),
     Commit(PreparedCommitError),
     ProgressiveCommit(PreparedProgressiveCommitError),
+    CommitProgramBinding(CommitProgramBindingError),
 }
 
 impl core::fmt::Display for ResidentSourceStageError {
@@ -285,6 +290,12 @@ impl From<PreparedCommitError> for ResidentSourceStageError {
 impl From<PreparedProgressiveCommitError> for ResidentSourceStageError {
     fn from(value: PreparedProgressiveCommitError) -> Self {
         Self::ProgressiveCommit(value)
+    }
+}
+
+impl From<CommitProgramBindingError> for ResidentSourceStageError {
+    fn from(value: CommitProgramBindingError) -> Self {
+        Self::CommitProgramBinding(value)
     }
 }
 
@@ -722,24 +733,169 @@ enum PreprocessedStageSource {
     RegisteredPedersen(RegisteredPedersenColumn),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreprocessedCommitSlotMode {
+    FullLifting,
+    DomainProgressive,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreprocessedCommitSelector<'a> {
+    pub(crate) tree: CommitmentTreeId,
+    pub(crate) backend: ResidentBackend,
+    pub(crate) schedule: DynamicCommitmentLeafSchedule,
+    pub(crate) commit_mode: ProgressiveCommitMode,
+    pub(crate) interior4_fused: bool,
+    pub(crate) storage: ProgressiveCommitStorageMode,
+    pub(crate) config: CommitWorkspaceConfig,
+    pub(crate) grouped_column_log_sizes: &'a [Vec<u32>],
+    pub(crate) retained_evaluation_groups: &'a [bool],
+    pub(crate) requirements: &'a ModeAwareCommitWorkspaceRequirements,
+    pub(crate) slot_mode: PreprocessedCommitSlotMode,
+    pub(crate) commit_program: Option<&'a CommitProgram>,
+    pub(crate) has_domain_program: bool,
+    pub(crate) has_compact_program: bool,
+    pub(crate) has_direct_program: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PreprocessedCommitBinding<'a> {
+    LegacyFullLifting,
+    LegacyProgressiveSeparate,
+    ReplacementProgressiveInPlace(&'a CommitProgram),
+}
+
+fn preprocessed_progressive_geometry(
+    config: CommitWorkspaceConfig,
+    grouped_column_log_sizes: &[Vec<u32>],
+    retained_evaluation_groups: &[bool],
+) -> ProgressiveCommitGeometry {
+    ProgressiveCommitGeometry {
+        lifting_log_size: config.lifting_log_size,
+        log_blowup_factor: config.log_blowup_factor,
+        groups: grouped_column_log_sizes
+            .iter()
+            .zip(retained_evaluation_groups)
+            .map(
+                |(logs, &retain_evaluations)| ProgressiveCommitGroupGeometry {
+                    coefficient_log_sizes: logs.clone(),
+                    retain_evaluations,
+                },
+            )
+            .collect(),
+    }
+}
+
+/// Select the exact preprocessed commitment generation before any descriptor
+/// upload. The replacement program is recompiled from the planned geometry so
+/// all of its immutable identity, requirements and launch policy are compared
+/// before `CommitProgram::bind` can touch the device.
+pub(crate) fn preprocessed_commit_binding<'a>(
+    selector: PreprocessedCommitSelector<'a>,
+) -> Result<PreprocessedCommitBinding<'a>, ResidentSourceStageError> {
+    let mismatch = || ResidentSourceStageError::PreprocessedCommitBindingMismatch;
+    if selector.tree != CommitmentTreeId::Preprocessed
+        || selector.grouped_column_log_sizes.len() != selector.retained_evaluation_groups.len()
+        || selector.has_domain_program
+        || selector.has_compact_program
+        || selector.has_direct_program
+    {
+        return Err(mismatch());
+    }
+
+    match (
+        selector.requirements,
+        selector.slot_mode,
+        selector.backend,
+        selector.schedule,
+        selector.commit_mode,
+        selector.storage,
+        selector.commit_program,
+    ) {
+        (
+            ModeAwareCommitWorkspaceRequirements::FullLifting(requirements),
+            PreprocessedCommitSlotMode::FullLifting,
+            ResidentBackend::LegacyResident,
+            DynamicCommitmentLeafSchedule::LegacyPerBatch,
+            ProgressiveCommitMode::FullLifting,
+            ProgressiveCommitStorageMode::Separate,
+            None,
+        ) => {
+            let expected =
+                commit_workspace_requirements(selector.config, selector.grouped_column_log_sizes)
+                    .map_err(|_| mismatch())?;
+            if requirements != &expected {
+                return Err(mismatch());
+            }
+            Ok(PreprocessedCommitBinding::LegacyFullLifting)
+        }
+        (
+            ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+            PreprocessedCommitSlotMode::DomainProgressive,
+            ResidentBackend::LegacyResident,
+            DynamicCommitmentLeafSchedule::LegacyPerBatch,
+            ProgressiveCommitMode::DomainProgressive,
+            ProgressiveCommitStorageMode::Separate,
+            None,
+        ) => {
+            let geometry = preprocessed_progressive_geometry(
+                selector.config,
+                selector.grouped_column_log_sizes,
+                selector.retained_evaluation_groups,
+            );
+            let expected = progressive_commit_workspace_requirements_for_mode(
+                ProgressiveCommitMode::DomainProgressive,
+                selector.config,
+                geometry,
+            )
+            .map_err(|_| mismatch())?;
+            if requirements != &expected {
+                return Err(mismatch());
+            }
+            Ok(PreprocessedCommitBinding::LegacyProgressiveSeparate)
+        }
+        (
+            ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
+            PreprocessedCommitSlotMode::DomainProgressive,
+            ResidentBackend::ReplacementV1,
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative
+            | DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
+            ProgressiveCommitMode::DomainProgressive,
+            ProgressiveCommitStorageMode::InPlaceSlab,
+            Some(program),
+        ) => {
+            let geometry = preprocessed_progressive_geometry(
+                selector.config,
+                selector.grouped_column_log_sizes,
+                selector.retained_evaluation_groups,
+            );
+            let expected = CommitProgram::compile(
+                selector.config,
+                geometry,
+                ProgressiveNttLeafFusionMode::Fused16,
+                selector.interior4_fused,
+            )
+            .map_err(|_| mismatch())?;
+            if program != &expected || program.requirements() != requirements {
+                return Err(mismatch());
+            }
+            Ok(PreprocessedCommitBinding::ReplacementProgressiveInPlace(
+                program,
+            ))
+        }
+        _ => Err(mismatch()),
+    }
+}
+
 pub fn stage_preprocessed_commitment(
     workspace: &GraphWorkspace,
     trace: Arc<PreProcessedTrace>,
 ) -> Result<ResidentPreprocessedStageReport, ResidentSourceStageError> {
     let protocol_identity = workspace.plan().protocol_identity();
-    let planned = workspace.plan().preprocessed().clone();
-    let commitment = workspace
-        .plan()
-        .commitment(CommitmentTreeId::Preprocessed)
-        .cloned()
-        .ok_or(ResidentSourceStageError::MissingCommitment(
-            CommitmentTreeId::Preprocessed,
-        ))?;
-    if commitment.domain_cooperative_program.is_some()
-        || commitment.compact_domain_program.is_some()
-    {
-        return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch);
-    }
+    let planned = workspace.plan().preprocessed();
+    // The ready capability is published only after this immutable plan passed
+    // the selector below, launched successfully and synchronized. Do not clone
+    // or recompile its sealed commitment program on every warm proof.
     if workspace.preprocessed_commitment_ready() {
         return Ok(ResidentPreprocessedStageReport {
             cache_hit: true,
@@ -760,6 +916,41 @@ pub fn stage_preprocessed_commitment(
             ..ResidentPreprocessedStageReport::default()
         });
     }
+    let commitment = workspace
+        .plan()
+        .commitment(CommitmentTreeId::Preprocessed)
+        .ok_or(ResidentSourceStageError::MissingCommitment(
+            CommitmentTreeId::Preprocessed,
+        ))?;
+    let retained_evaluation_groups = commitment
+        .evaluation_output_groups
+        .iter()
+        .map(Option::is_some)
+        .collect::<Vec<_>>();
+    let commit_binding = preprocessed_commit_binding(PreprocessedCommitSelector {
+        tree: commitment.id,
+        backend: protocol_identity.resident_backend,
+        schedule: protocol_identity.dynamic_commitment_leaf_schedule,
+        commit_mode: protocol_identity.commit_mode,
+        interior4_fused: protocol_identity.blake2s_interior_fused,
+        storage: commitment.storage_mode,
+        config: commitment.config,
+        grouped_column_log_sizes: &commitment.grouped_column_log_sizes,
+        retained_evaluation_groups: &retained_evaluation_groups,
+        requirements: &commitment.requirements,
+        slot_mode: match &commitment.slots {
+            ModeAwareCommitWorkspaceSlots::FullLifting(_) => {
+                PreprocessedCommitSlotMode::FullLifting
+            }
+            ModeAwareCommitWorkspaceSlots::DomainProgressive(_) => {
+                PreprocessedCommitSlotMode::DomainProgressive
+            }
+        },
+        commit_program: commitment.commit_program.as_ref(),
+        has_domain_program: commitment.domain_cooperative_program.is_some(),
+        has_compact_program: commitment.compact_domain_program.is_some(),
+        has_direct_program: commitment.direct_retained_b2n_program.is_some(),
+    })?;
     if !workspace.fixed_twiddles_ready() {
         return Err(ResidentSourceStageError::FixedTwiddlesNotReady);
     }
@@ -1067,12 +1258,16 @@ pub fn stage_preprocessed_commitment(
                 ModeAwareCommitWorkspaceRequirements::FullLifting(_),
                 ModeAwareCommitWorkspaceSlots::FullLifting(slots),
             ) => {
-                let commit = PreparedCommitGraph::prepare(
+                if !matches!(commit_binding, PreprocessedCommitBinding::LegacyFullLifting) {
+                    return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch);
+                }
+                let commit = PreparedCommitGraph::prepare_with_interior_mode(
                     workspace.arena(),
                     commitment.config,
                     &groups,
                     twiddles,
                     slots,
+                    protocol_identity.blake2s_interior_fused,
                 )?;
                 commit.launch()?;
                 (
@@ -1096,36 +1291,33 @@ pub fn stage_preprocessed_commitment(
                         None => vec![None; group.columns.len()],
                     })
                     .collect::<Vec<_>>();
-                let commit = PreparedProgressiveCommitGraph::prepare_with_modes_and_ntt_fusion(
-                    workspace.arena(),
-                    commitment.config,
-                    requirements,
-                    slots,
-                    &coefficients,
-                    &retained_outputs,
-                    twiddles,
-                    protocol_identity.commit_mode,
-                    protocol_identity.blake2s_interior_fused,
-                    match (
-                        protocol_identity.resident_backend,
-                        protocol_identity.dynamic_commitment_leaf_schedule,
-                    ) {
-                        (
-                            ResidentBackend::LegacyResident,
-                            DynamicCommitmentLeafSchedule::LegacyPerBatch,
-                        ) => ProgressiveNttLeafFusionMode::Separate,
-                        (
-                            ResidentBackend::ReplacementV1,
-                            DynamicCommitmentLeafSchedule::RetainedDomainCooperative
-                            | DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
-                        ) => ProgressiveNttLeafFusionMode::Fused16,
-                        _ => {
-                            return Err(
-                                ResidentSourceStageError::PreprocessedCommitBindingMismatch,
-                            );
-                        }
-                    },
-                )?;
+                let commit = match commit_binding {
+                    PreprocessedCommitBinding::LegacyProgressiveSeparate => {
+                        PreparedProgressiveCommitGraph::prepare_with_modes_and_ntt_fusion(
+                            workspace.arena(),
+                            commitment.config,
+                            requirements,
+                            slots,
+                            &coefficients,
+                            &retained_outputs,
+                            twiddles,
+                            protocol_identity.commit_mode,
+                            protocol_identity.blake2s_interior_fused,
+                            ProgressiveNttLeafFusionMode::Separate,
+                        )?
+                    }
+                    PreprocessedCommitBinding::ReplacementProgressiveInPlace(program) => program
+                        .bind(
+                            workspace.arena(),
+                            slots,
+                            &coefficients,
+                            &retained_outputs,
+                            twiddles,
+                        )?,
+                    PreprocessedCommitBinding::LegacyFullLifting => {
+                        return Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch);
+                    }
+                };
                 commit.launch()?;
                 (
                     commit.root_slice(),
@@ -1884,6 +2076,210 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn preprocessed_commit_selector_accepts_only_the_three_sealed_generations() {
+        let config = CommitWorkspaceConfig {
+            log_blowup_factor: 1,
+            lifting_log_size: 6,
+            unretained_bottom_layers: 4,
+            max_fused_tail_levels: 2,
+        };
+        let logs = vec![vec![3, 4, 5]];
+        let retained = vec![false];
+        let geometry = preprocessed_progressive_geometry(config, &logs, &retained);
+        let full_requirements = ModeAwareCommitWorkspaceRequirements::FullLifting(
+            commit_workspace_requirements(config, &logs).unwrap(),
+        );
+        let progressive_requirements = ModeAwareCommitWorkspaceRequirements::DomainProgressive(
+            progressive_commit_workspace_requirements_for_mode(
+                ProgressiveCommitMode::DomainProgressive,
+                config,
+                geometry.clone(),
+            )
+            .unwrap(),
+        );
+        let program = CommitProgram::compile(
+            config,
+            geometry,
+            ProgressiveNttLeafFusionMode::Fused16,
+            true,
+        )
+        .unwrap();
+        let legacy_full = PreprocessedCommitSelector {
+            tree: CommitmentTreeId::Preprocessed,
+            backend: ResidentBackend::LegacyResident,
+            schedule: DynamicCommitmentLeafSchedule::LegacyPerBatch,
+            commit_mode: ProgressiveCommitMode::FullLifting,
+            interior4_fused: true,
+            storage: ProgressiveCommitStorageMode::Separate,
+            config,
+            grouped_column_log_sizes: &logs,
+            retained_evaluation_groups: &retained,
+            requirements: &full_requirements,
+            slot_mode: PreprocessedCommitSlotMode::FullLifting,
+            commit_program: None,
+            has_domain_program: false,
+            has_compact_program: false,
+            has_direct_program: false,
+        };
+        for interior4_fused in [false, true] {
+            assert!(matches!(
+                preprocessed_commit_binding(PreprocessedCommitSelector {
+                    interior4_fused,
+                    ..legacy_full
+                }),
+                Ok(PreprocessedCommitBinding::LegacyFullLifting)
+            ));
+        }
+
+        let legacy_progressive = PreprocessedCommitSelector {
+            commit_mode: ProgressiveCommitMode::DomainProgressive,
+            requirements: &progressive_requirements,
+            slot_mode: PreprocessedCommitSlotMode::DomainProgressive,
+            ..legacy_full
+        };
+        assert!(matches!(
+            preprocessed_commit_binding(legacy_progressive),
+            Ok(PreprocessedCommitBinding::LegacyProgressiveSeparate)
+        ));
+
+        for schedule in [
+            DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            DynamicCommitmentLeafSchedule::RetainedDomainCompactH8,
+        ] {
+            let replacement = PreprocessedCommitSelector {
+                backend: ResidentBackend::ReplacementV1,
+                schedule,
+                storage: ProgressiveCommitStorageMode::InPlaceSlab,
+                commit_program: Some(&program),
+                ..legacy_progressive
+            };
+            assert!(matches!(
+                preprocessed_commit_binding(replacement),
+                Ok(PreprocessedCommitBinding::ReplacementProgressiveInPlace(actual))
+                    if core::ptr::eq(actual, &program)
+            ));
+        }
+    }
+
+    #[test]
+    fn preprocessed_commit_selector_rejects_each_one_field_mutation() {
+        let config = CommitWorkspaceConfig {
+            log_blowup_factor: 1,
+            lifting_log_size: 6,
+            unretained_bottom_layers: 4,
+            max_fused_tail_levels: 2,
+        };
+        let logs = vec![vec![3, 4, 5]];
+        let retained = vec![false];
+        let geometry = preprocessed_progressive_geometry(config, &logs, &retained);
+        let requirements = ModeAwareCommitWorkspaceRequirements::DomainProgressive(
+            progressive_commit_workspace_requirements_for_mode(
+                ProgressiveCommitMode::DomainProgressive,
+                config,
+                geometry.clone(),
+            )
+            .unwrap(),
+        );
+        let full_requirements = ModeAwareCommitWorkspaceRequirements::FullLifting(
+            commit_workspace_requirements(config, &logs).unwrap(),
+        );
+        let program = CommitProgram::compile(
+            config,
+            geometry.clone(),
+            ProgressiveNttLeafFusionMode::Fused16,
+            true,
+        )
+        .unwrap();
+        let wrong_program = CommitProgram::compile(
+            config,
+            geometry.clone(),
+            ProgressiveNttLeafFusionMode::Separate,
+            true,
+        )
+        .unwrap();
+        let wrong_config = CommitWorkspaceConfig {
+            max_fused_tail_levels: 1,
+            ..config
+        };
+        let wrong_requirements = ModeAwareCommitWorkspaceRequirements::DomainProgressive(
+            progressive_commit_workspace_requirements_for_mode(
+                ProgressiveCommitMode::DomainProgressive,
+                wrong_config,
+                geometry,
+            )
+            .unwrap(),
+        );
+        let wrong_logs = vec![vec![3, 4]];
+        let wrong_retained = vec![true];
+        let empty_retained = Vec::new();
+        let baseline = PreprocessedCommitSelector {
+            tree: CommitmentTreeId::Preprocessed,
+            backend: ResidentBackend::ReplacementV1,
+            schedule: DynamicCommitmentLeafSchedule::RetainedDomainCooperative,
+            commit_mode: ProgressiveCommitMode::DomainProgressive,
+            interior4_fused: true,
+            storage: ProgressiveCommitStorageMode::InPlaceSlab,
+            config,
+            grouped_column_log_sizes: &logs,
+            retained_evaluation_groups: &retained,
+            requirements: &requirements,
+            slot_mode: PreprocessedCommitSlotMode::DomainProgressive,
+            commit_program: Some(&program),
+            has_domain_program: false,
+            has_compact_program: false,
+            has_direct_program: false,
+        };
+        let mut mutations = Vec::new();
+        macro_rules! mutate {
+            ($field:ident, $value:expr) => {{
+                let mut candidate = baseline;
+                candidate.$field = $value;
+                mutations.push(candidate);
+            }};
+        }
+        mutate!(tree, CommitmentTreeId::Base);
+        mutate!(backend, ResidentBackend::LegacyResident);
+        mutate!(schedule, DynamicCommitmentLeafSchedule::LegacyPerBatch);
+        mutate!(commit_mode, ProgressiveCommitMode::FullLifting);
+        mutate!(storage, ProgressiveCommitStorageMode::Separate);
+        mutate!(commit_program, None);
+        mutate!(commit_program, Some(&wrong_program));
+        mutate!(slot_mode, PreprocessedCommitSlotMode::FullLifting);
+        mutate!(requirements, &full_requirements);
+        mutate!(requirements, &wrong_requirements);
+        mutate!(config, wrong_config);
+        mutate!(grouped_column_log_sizes, &wrong_logs);
+        mutate!(retained_evaluation_groups, &wrong_retained);
+        mutate!(retained_evaluation_groups, &empty_retained);
+        mutate!(has_domain_program, true);
+        mutate!(has_compact_program, true);
+        mutate!(has_direct_program, true);
+        mutate!(interior4_fused, false);
+
+        for (index, candidate) in mutations.into_iter().enumerate() {
+            assert!(
+                matches!(
+                    preprocessed_commit_binding(candidate),
+                    Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch)
+                ),
+                "mutation {index} was admitted"
+            );
+        }
+
+        let legacy_with_extra_program = PreprocessedCommitSelector {
+            backend: ResidentBackend::LegacyResident,
+            schedule: DynamicCommitmentLeafSchedule::LegacyPerBatch,
+            storage: ProgressiveCommitStorageMode::Separate,
+            commit_program: Some(&program),
+            ..baseline
+        };
+        assert!(matches!(
+            preprocessed_commit_binding(legacy_with_extra_program),
+            Err(ResidentSourceStageError::PreprocessedCommitBindingMismatch)
+        ));
+    }
 
     #[test]
     fn source_fence_is_unconditional_and_preserves_the_operation_error() {
