@@ -8,13 +8,12 @@ use stwo_backend_cuda::{
 
 use super::{CompositionWorkspaceRequirements, PreparedCompositionError, SECURE_COORDINATES};
 
-// The SM90 log-24 fused boundary needs 207 registers across a 512-thread CTA,
-// so CUDA caps that function at 256 threads and rejects its graph with 701.
-// Log 25 uses the legal 256-thread specialization; log 24 takes the same checked
-// field map through the spill-free terminal path.
+// The exact log-24 10+8+6 inverse partition and the log-25 7+6+6+6 partition
+// both reach the spill-free 256-thread LOG3 fused boundary. Unknown shapes keep
+// the checked terminal fallback and are rejected earlier by program compilation.
 const fn production_split_mode(evaluation_log_size: u32) -> CompositionSplitLaunchMode {
     match evaluation_log_size {
-        25 => CompositionSplitLaunchMode::FusedFirstForward,
+        24 | 25 => CompositionSplitLaunchMode::FusedFirstForward,
         _ => CompositionSplitLaunchMode::TerminalFallback,
     }
 }
@@ -127,7 +126,7 @@ mod tests {
     fn production_split_mode_respects_the_sm90_launch_budget() {
         assert_eq!(
             production_split_mode(24),
-            CompositionSplitLaunchMode::TerminalFallback
+            CompositionSplitLaunchMode::FusedFirstForward
         );
         assert_eq!(
             production_split_mode(25),
