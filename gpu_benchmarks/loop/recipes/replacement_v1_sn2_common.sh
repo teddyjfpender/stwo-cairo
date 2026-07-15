@@ -4,6 +4,11 @@
 
 [[ -n "${REPLACEMENT_SN2_MODE:-}" ]] \
   || { echo "set REPLACEMENT_SN2_MODE before sourcing replacement_v1_sn2_common.sh" >&2; return 2; }
+REPLACEMENT_SN2_COUNTER_POLICY="${REPLACEMENT_SN2_COUNTER_POLICY:-required}"
+case "$REPLACEMENT_SN2_COUNTER_POLICY" in
+  required|timing-only) ;;
+  *) echo "invalid replacement SN2 counter policy: $REPLACEMENT_SN2_COUNTER_POLICY" >&2; return 2 ;;
+esac
 
 CHECKPOINT_ROOT="${CAIRO%/stwo_cairo_prover}"
 CHECKPOINT_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -16,7 +21,11 @@ CHECKPOINT_ADAPTED_MANIFEST="$CHECKPOINT_ROOT/gpu_benchmarks/pie/ADAPTED_SHA256S
 CHECKPOINT_AOT_MANIFEST="$STWO/crates/backend-cuda-kernels/cuda/generated/aot_manifest.json"
 CHECKPOINT_GPU_BENCH="$CAIRO/target/release/gpu_bench"
 CHECKPOINT_AOT_CHECK="$CAIRO/target/release/aot_index_check"
-CHECKPOINT_SEAL=/workspace/bench_inputs/replacement_v1_sn2_checkpoint.seal.json
+if [[ "$REPLACEMENT_SN2_COUNTER_POLICY" == timing-only ]]; then
+  CHECKPOINT_SEAL="$RUN/replacement_v1_sn2_timing_only_checkpoint.seal.json"
+else
+  CHECKPOINT_SEAL=/workspace/bench_inputs/replacement_v1_sn2_checkpoint.seal.json
+fi
 CHECKPOINT_EMPTY_WORKTREE_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 CHECKPOINT_AOT_MANIFEST_SHA256=1ff3089cf9c6c9284ddfbdcfd8258d3d329a115d1285ee8c066f563175005fa4
 CHECKPOINT_AOT_TOTAL=373
@@ -293,6 +302,69 @@ record = {
 }
 out.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
 print(json.dumps(record, sort_keys=True))
+PY
+}
+
+checkpoint_counter_timing_only() {
+  local rc raw log hardware out
+  [[ "$REPLACEMENT_SN2_COUNTER_POLICY" == timing-only ]] \
+    || { echo "counter waiver requires the timing-only policy" >&2; return 2; }
+  if checkpoint_counter_acceptance; then
+    echo "NCU counters are available; run the strict sealed recipe" >&2
+    return 1
+  else
+    rc=$?
+  fi
+  raw="$(checkpoint_artifact counter_acceptance.csv)"
+  log="$(checkpoint_artifact counter_acceptance.txt)"
+  hardware="$(checkpoint_artifact hardware_identity.json)"
+  out="$(checkpoint_artifact counter_acceptance.json)"
+  RC="$rc" python3 - "$raw" "$log" "$hardware" "$out" <<'PY'
+import csv, hashlib, json, math, os, pathlib, sys
+
+raw, log, hardware_path, out = map(pathlib.Path, sys.argv[1:])
+hardware = json.loads(hardware_path.read_text(encoding="utf-8"))
+text = log.read_text(encoding="utf-8", errors="replace")
+raw_text = raw.read_text(encoding="utf-8", errors="replace") if raw.is_file() else ""
+raw_sha = hashlib.sha256(raw.read_bytes()).hexdigest() if raw.is_file() else None
+columns = None
+values = []
+for row in csv.reader(raw_text.splitlines()):
+    if all(field in row for field in ("Kernel Name", "Metric Name", "Metric Value")):
+        columns = {field: row.index(field)
+                   for field in ("Kernel Name", "Metric Name", "Metric Value")}
+        continue
+    if columns is None or max(columns.values()) >= len(row):
+        continue
+    if ("checkpoint_counter_kernel" not in row[columns["Kernel Name"]]
+            or row[columns["Metric Name"]] != "sm__cycles_elapsed.avg"):
+        continue
+    try:
+        value = float(row[columns["Metric Value"]].replace(",", ""))
+    except ValueError:
+        continue
+    if math.isfinite(value) and value > 0:
+        values.append(value)
+unavailable = (
+    raw_sha is not None
+    and "CHECKPOINT_COUNTER_KERNEL_RESULT=1" in text
+    and "ERR_NVGPUCTRPERM" in raw_text
+    and not values
+)
+record = {
+    "schema": "stwo.replacement-v1.counter-availability.v1",
+    "status": "UNAVAILABLE" if unavailable else "FAIL",
+    "pass": False,
+    "error_code": "ERR_NVGPUCTRPERM" if unavailable else None,
+    "command_return_code": int(os.environ["RC"]),
+    "gpu_uuid": hardware.get("uuid"),
+    "raw_csv_sha256": raw_sha,
+    "acceptance_log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
+}
+out.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+print(json.dumps(record, sort_keys=True))
+if not unavailable:
+    raise SystemExit("counter failure was not the explicit NCU permission denial")
 PY
 }
 
@@ -659,6 +731,7 @@ checkpoint_validate_sn2() {
   PACKED_ROWS="$CHECKPOINT_SN2_PACKED_OUTPUT_ROWS" \
     COMPOSITION_PARTS="$CHECKPOINT_SN2_COMPOSITION_PARTS" \
     COMPOSITION_WAVES="$CHECKPOINT_SN2_COMPOSITION_WAVES" \
+    COUNTER_POLICY="$REPLACEMENT_SN2_COUNTER_POLICY" \
     python3 - "$stdout" "$aot" "$proof" "$CHECKPOINT_SEAL" "$out" "$mode" "$reps" \
     "$CHECKPOINT_ROOT/gpu_benchmarks" <<'PY'
 import hashlib, json, math, os, re, sys
@@ -668,6 +741,8 @@ sys.path.insert(0, module_path)
 from validate_replacement_v1_reuse import require_resident_reuse
 
 reps = int(reps_text)
+counter_policy = os.environ["COUNTER_POLICY"]
+counter_profile_admissible = counter_policy == "required"
 objects = []
 for line in open(raw_path, encoding="utf-8", errors="replace"):
     try: value = json.loads(line)
@@ -793,8 +868,18 @@ elif mode == "timing":
     for field in ("prove_s_warm_median", "prove_s_warm_p95", "useful_mhz_median", "useful_mhz_at_warm_p95"):
         require(isinstance(r.get(field), (int, float)) and math.isfinite(r[field]) and r[field] > 0, f"invalid timing metric {field}")
     seal = json.load(open(seal_path, encoding="utf-8"))
-    require(seal.get("schema") == "stwo.replacement-v1-sn2.checkpoint-seal.v3"
-            and seal.get("diagnostic_pass") is True, "timing seal is not a passing diagnostic")
+    expected_seal = ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_profile_admissible
+                     else "stwo.replacement-v1-sn2.timing-only-seal.v1")
+    require(seal.get("schema") == expected_seal and seal.get("diagnostic_pass") is True,
+            "timing seal is not a passing diagnostic for the selected counter policy")
+    if counter_profile_admissible:
+        require("counter_policy" not in seal and "counter_profile_admissible" not in seal,
+                "strict v3 seal was altered by a counter waiver")
+    else:
+        require(seal.get("counter_policy") == "timing-only"
+                and seal.get("counter_profile_admissible") is False
+                and seal.get("counter_status") == "UNAVAILABLE",
+                "timing-only seal omitted the counter-profile asterisk")
     require(r["gpu_proof_blake3"] == seal.get("proof_blake3"), "timing proof digest differs from diagnostic")
     proof_sha256 = hashlib.sha256(open(proof_path, "rb").read()).hexdigest()
     require(proof_sha256 == seal.get("proof_dump_sha256"), "timing proof bytes differ from diagnostic")
@@ -809,9 +894,11 @@ elif mode == "timing":
     }, "timing shape/numerator receipt differs from diagnostic")
 else:
     raise SystemExit(f"unknown validation mode: {mode}")
+r["counter_profile_admissible"] = counter_profile_admissible
 r["checkpoint_validation"] = {"schema": "stwo.replacement-v1-sn2.record-validation.v1",
                               "verdict": "PASS", "mode": mode,
-                              "graph_submit_timing_soft": mode == "diagnostic"}
+                              "graph_submit_timing_soft": mode == "diagnostic",
+                              "counter_profile_admissible": counter_profile_admissible}
 with open(out_path, "w", encoding="utf-8") as stream:
     json.dump(r, stream, sort_keys=True)
     stream.write("\n")
@@ -824,11 +911,13 @@ PY
 }
 
 checkpoint_seal_diagnostic() {
-  local source hardware counter build adapted carry stage4 aot record proof proof_sha run_seal
+  local source hardware counter counter_raw counter_log build adapted carry stage4 aot record proof proof_sha run_seal
   checkpoint_reject_ambient_overrides
   source="$(checkpoint_artifact source_input_identity.json)"
   hardware="$(checkpoint_artifact hardware_identity.json)"
   counter="$(checkpoint_artifact counter_acceptance.json)"
+  counter_raw="$(checkpoint_artifact counter_acceptance.csv)"
+  counter_log="$(checkpoint_artifact counter_acceptance.txt)"
   build="$(checkpoint_artifact build_identity.json)"
   adapted="$(checkpoint_artifact adapted_input_identity.json)"
   carry="$(checkpoint_artifact fp256_carry_oracles.json)"
@@ -838,18 +927,20 @@ checkpoint_seal_diagnostic() {
   proof="$(checkpoint_artifact proof.bin)"
   proof_sha="$(awk '{print $1}' "$(checkpoint_artifact proof.sha256.txt)")"
   run_seal="$(checkpoint_artifact seal.json)"
-  for path in "$source" "$hardware" "$counter" "$build" "$adapted" "$carry" "$stage4" "$aot" "$record" "$proof"; do
+  for path in "$source" "$hardware" "$counter" "$counter_raw" "$counter_log" "$build" "$adapted" "$carry" "$stage4" "$aot" "$record" "$proof"; do
     [[ -s "$path" ]] || { echo "cannot seal missing checkpoint receipt: $path" >&2; return 1; }
   done
   checkpoint_require_hash "$proof_sha" 256 proof_dump_sha256
   SOURCE="$source" HARDWARE="$hardware" COUNTER="$counter" \
+    COUNTER_RAW="$counter_raw" COUNTER_LOG="$counter_log" \
+    COUNTER_POLICY="$REPLACEMENT_SN2_COUNTER_POLICY" \
     BUILD="$build" ADAPTED="$adapted" CARRY="$carry" \
     STAGE4="$stage4" AOT="$aot" RECORD="$record" PROOF="$proof" PROOF_SHA="$proof_sha" \
     GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
     AOT_CHECK_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_CHECK")" \
     AOT_MANIFEST_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")" \
-    OUT="$CHECKPOINT_SEAL" python3 - <<'PY'
-import hashlib, json, os, tempfile
+    OUT="$CHECKPOINT_SEAL" python3 - <<'PY' || return $?
+import csv, hashlib, json, math, os, re, tempfile
 def load(name):
     with open(os.environ[name], encoding="utf-8") as stream: return json.load(stream)
 def sha(name):
@@ -857,11 +948,70 @@ def sha(name):
 source, hardware, counter, build, adapted = map(
     load, ("SOURCE", "HARDWARE", "COUNTER", "BUILD", "ADAPTED"))
 carry, stage4, aot, record = map(load, ("CARRY", "STAGE4", "AOT", "RECORD"))
+counter_policy = os.environ["COUNTER_POLICY"]
+counter_log_text = open(os.environ["COUNTER_LOG"], encoding="utf-8", errors="replace").read()
+counter_raw_text = open(os.environ["COUNTER_RAW"], encoding="utf-8", errors="replace").read()
+columns = None
+counter_metric_values = []
+for row in csv.reader(counter_raw_text.splitlines()):
+    if all(field in row for field in ("Kernel Name", "Metric Name", "Metric Value")):
+        columns = {field: row.index(field)
+                   for field in ("Kernel Name", "Metric Name", "Metric Value")}
+        continue
+    if columns is None or max(columns.values()) >= len(row):
+        continue
+    if ("checkpoint_counter_kernel" not in row[columns["Kernel Name"]]
+            or row[columns["Metric Name"]] != "sm__cycles_elapsed.avg"):
+        continue
+    try:
+        value = float(row[columns["Metric Value"]].replace(",", ""))
+    except ValueError:
+        continue
+    if math.isfinite(value) and value > 0:
+        counter_metric_values.append(value)
+counter_hashes_match = (
+    counter.get("raw_csv_sha256") == sha("COUNTER_RAW")
+    and counter.get("acceptance_log_sha256") == sha("COUNTER_LOG")
+    and all(re.fullmatch(r"[0-9a-f]{64}", str(counter.get(field, "")))
+            for field in ("raw_csv_sha256", "acceptance_log_sha256"))
+)
+strict_counter = (
+    counter.get("schema") == "stwo.replacement-v1.counter-acceptance.v1"
+    and counter.get("pass") is True
+    and counter.get("kernel") == "checkpoint_counter_kernel"
+    and counter.get("metric") == "sm__cycles_elapsed.avg"
+    and isinstance(counter.get("metric_value"), (int, float))
+    and not isinstance(counter.get("metric_value"), bool)
+    and math.isfinite(counter["metric_value"])
+    and counter["metric_value"] > 0
+    and counter_metric_values == [float(counter["metric_value"])]
+    and counter.get("gpu_uuid") == hardware.get("uuid")
+    and counter_hashes_match
+    and "CHECKPOINT_COUNTER_KERNEL_RESULT=1" in counter_log_text
+    and "ERR_NVGPUCTRPERM" not in counter_log_text
+    and "ERR_NVGPUCTRPERM" not in counter_raw_text
+)
+unavailable_counter = (
+    counter.get("schema") == "stwo.replacement-v1.counter-availability.v1"
+    and counter.get("status") == "UNAVAILABLE"
+    and counter.get("pass") is False
+    and counter.get("error_code") == "ERR_NVGPUCTRPERM"
+    and isinstance(counter.get("command_return_code"), int)
+    and not isinstance(counter.get("command_return_code"), bool)
+    and counter["command_return_code"] != 0
+    and counter.get("gpu_uuid") == hardware.get("uuid")
+    and counter_hashes_match
+    and "CHECKPOINT_COUNTER_KERNEL_RESULT=1" in counter_log_text
+    and "ERR_NVGPUCTRPERM" in counter_log_text
+    and "ERR_NVGPUCTRPERM" in counter_raw_text
+    and not counter_metric_values
+)
+counter_is_sealable = strict_counter if counter_policy == "required" else (
+    counter_policy == "timing-only" and unavailable_counter
+)
 if (source.get("schema") != "stwo.replacement-v1-sn2.source-input-identity.v1"
         or hardware.get("schema") != "stwo.replacement-v1-sn2.hardware-identity.v2"
-        or counter.get("schema") != "stwo.replacement-v1.counter-acceptance.v1"
-        or counter.get("pass") is not True
-        or counter.get("gpu_uuid") != hardware.get("uuid")
+        or not counter_is_sealable
         or build.get("schema") != "stwo.replacement-v1-sn2.build-identity.v1"
         or adapted.get("schema") != "stwo.replacement-v1-sn2.adapted-input-identity.v1"
         or carry.get("pass") is not True
@@ -873,7 +1023,9 @@ if (source.get("schema") != "stwo.replacement-v1-sn2.source-input-identity.v1"
         or stage4.get("requested_cuda_arch") != "sm_90"
         or stage4.get("performance_requested") is not False
         or record.get("checkpoint_validation", {}).get("verdict") != "PASS"
-        or record["checkpoint_validation"].get("mode") != "diagnostic"):
+        or record["checkpoint_validation"].get("mode") != "diagnostic"
+        or record["checkpoint_validation"].get("counter_profile_admissible")
+            is not (counter_policy == "required")):
     raise SystemExit("diagnostic receipts are not sealable")
 if (build.get("gpu_bench_sha256") != os.environ["GPU_BENCH_SHA"]
         or build.get("aot_index_check_sha256") != os.environ["AOT_CHECK_SHA"]
@@ -885,7 +1037,9 @@ if (build.get("gpu_bench_sha256") != os.environ["GPU_BENCH_SHA"]
     raise SystemExit("diagnostic receipt/binary identity cross-check failed")
 if sha("PROOF") != os.environ["PROOF_SHA"]:
     raise SystemExit("diagnostic proof hash receipt differs from proof bytes")
-seal = {"schema": "stwo.replacement-v1-sn2.checkpoint-seal.v3", "diagnostic_pass": True,
+seal = {"schema": ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_policy == "required"
+                   else "stwo.replacement-v1-sn2.timing-only-seal.v1"),
+        "diagnostic_pass": True,
         "source": source["source"], "inputs": source["inputs"], "hardware": hardware,
         "adapted_input_sha256": adapted["sha256"],
         "gpu_bench_sha256": os.environ["GPU_BENCH_SHA"],
@@ -911,6 +1065,9 @@ seal = {"schema": "stwo.replacement-v1-sn2.checkpoint-seal.v3", "diagnostic_pass
         },
         "receipts_sha256": {name.lower(): sha(name) for name in
             ("SOURCE", "HARDWARE", "COUNTER", "BUILD", "ADAPTED", "CARRY", "STAGE4", "AOT", "RECORD")}}
+if counter_policy == "timing-only":
+    seal.update({"counter_policy": counter_policy, "counter_profile_admissible": False,
+                 "counter_status": "UNAVAILABLE"})
 directory = os.path.dirname(os.environ["OUT"])
 fd, temporary = tempfile.mkstemp(prefix="replacement-v1-sn2-seal.", dir=directory, text=True)
 try:
@@ -942,12 +1099,23 @@ checkpoint_verify_sealed_diagnostic() {
   BOOT_SHA="$(checkpoint_sha256 "$CHECKPOINT_BOOTLOADER")" \
   ADAPTED_SHA="$(checkpoint_sha256 "$CHECKPOINT_ADAPTED")" \
   AOT_MANIFEST_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")" \
+  COUNTER_POLICY="$REPLACEMENT_SN2_COUNTER_POLICY" \
   CURRENT_AOT="$(checkpoint_artifact aot_identity.json)" \
   CURRENT_HARDWARE="$current_hardware" python3 - "$CHECKPOINT_SEAL" <<'PY'
 import json, os, sys
 seal = json.load(open(sys.argv[1], encoding="utf-8"))
-if seal.get("schema") != "stwo.replacement-v1-sn2.checkpoint-seal.v3" or seal.get("diagnostic_pass") is not True:
+counter_policy = os.environ["COUNTER_POLICY"]
+expected_schema = ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_policy == "required"
+                   else "stwo.replacement-v1-sn2.timing-only-seal.v1")
+if seal.get("schema") != expected_schema or seal.get("diagnostic_pass") is not True:
     raise SystemExit("checkpoint seal is not a passing diagnostic")
+if counter_policy == "required":
+    if "counter_policy" in seal or "counter_profile_admissible" in seal:
+        raise SystemExit("strict v3 checkpoint seal contains a counter waiver")
+elif (seal.get("counter_policy") != "timing-only"
+      or seal.get("counter_profile_admissible") is not False
+      or seal.get("counter_status") != "UNAVAILABLE"):
+    raise SystemExit("timing-only checkpoint seal omitted its counter-profile asterisk")
 expected_source = {"stwo": {"head": os.environ["STWO_PARITY_REF_STWO_HEAD"],
                              "worktree_sha256": os.environ["STWO_PARITY_REF_STWO_WORKTREE_HASH"]},
                    "stwo_cairo": {"head": os.environ["STWO_PARITY_REF_STWO_CAIRO_HEAD"],
@@ -981,13 +1149,17 @@ checkpoint_write_profile_receipt() {
   local profiler="$1" rc="$2" proof="$3" report="$4" table="$5"
   local stdout="$6" stderr="$7" out="$8"
   PROFILE="$profiler" RC="$rc" GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
+    COUNTER_POLICY="$REPLACEMENT_SN2_COUNTER_POLICY" \
     NCU_LAUNCH_COUNT="$CHECKPOINT_NCU_LAUNCH_COUNT" \
+    COMPOSITION_PARTS="$CHECKPOINT_SN2_COMPOSITION_PARTS" \
     COMPOSITION_WAVES="$CHECKPOINT_SN2_COMPOSITION_WAVES" \
     python3 - "$proof" "$report" "$table" "$stdout" "$stderr" "$CHECKPOINT_SEAL" "$out" <<'PY'
 import csv, hashlib, json, os, pathlib, sys
 
 proof, report, table, stdout, stderr, seal_path, out = map(pathlib.Path, sys.argv[1:])
 profile = os.environ["PROFILE"]
+counter_policy = os.environ["COUNTER_POLICY"]
+counter_profile_admissible = counter_policy == "required"
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
@@ -1009,9 +1181,19 @@ try:
 except (OSError, json.JSONDecodeError) as error:
     seal = {}
     reasons.append(f"unreadable diagnostic seal: {error}")
-if (seal.get("schema") != "stwo.replacement-v1-sn2.checkpoint-seal.v3"
-        or seal.get("diagnostic_pass") is not True):
-    reasons.append("profile did not consume a passing v3 diagnostic seal")
+expected_schema = ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_profile_admissible
+                   else "stwo.replacement-v1-sn2.timing-only-seal.v1")
+if seal.get("schema") != expected_schema or seal.get("diagnostic_pass") is not True:
+    reasons.append("profile did not consume the selected policy's passing diagnostic seal")
+elif counter_profile_admissible:
+    if "counter_policy" in seal or "counter_profile_admissible" in seal:
+        reasons.append("strict v3 diagnostic seal contains a counter waiver")
+elif (seal.get("counter_policy") != "timing-only"
+      or seal.get("counter_profile_admissible") is not False
+      or seal.get("counter_status") != "UNAVAILABLE"):
+    reasons.append("timing-only diagnostic seal omitted its counter-profile asterisk")
+if seal.get("gpu_bench_sha256") != os.environ["GPU_BENCH_SHA"]:
+    reasons.append("profile binary differs from sealed diagnostic")
 proof_sha = digest(proof)
 if proof_sha is not None and proof_sha != seal.get("proof_dump_sha256"):
     reasons.append("profile proof bytes differ from sealed diagnostic")
@@ -1030,6 +1212,13 @@ if len(records) != 1:
 else:
     record = records[0]
     if (record.get("gpu_proof_blake3") != seal.get("proof_blake3")
+            or record.get("engine") != "gpu-native"
+            or record.get("gpu_resident_backend") != "replacement-v1"
+            or record.get("gpu_pcs_runtime_mode") != "ArenaGraph"
+            or record.get("gpu_aot_provenance_gate_passed") is not True
+            or record.get("gpu_prepared_numerator_schedule") != "staged-packed-single-write"
+            or record.get("gpu_composition_part_count") != int(os.environ["COMPOSITION_PARTS"])
+            or record.get("gpu_composition_wave_count") != int(os.environ["COMPOSITION_WAVES"])
             or record.get("verified_reps") != 2
             or record.get("proof_byte_equal") is not True
             or record.get("simd_reference_byte_equal") is not True
@@ -1077,6 +1266,7 @@ record = {
     "schema": "stwo.replacement-v1-sn2.profile-receipt.v1",
     "profiler": profile,
     "status": "PASS" if not reasons else "FAIL",
+    "counter_profile_admissible": counter_profile_admissible,
     "soft_failure_reasons": reasons,
     "command_return_code": rc,
     "gpu_bench_sha256": os.environ["GPU_BENCH_SHA"],
@@ -1092,6 +1282,83 @@ record = {
 }
 out.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
 print(json.dumps(record, sort_keys=True))
+PY
+}
+
+checkpoint_profile_receipt_valid() {
+  local profiler="$1" counter_admissible="$2" base report
+  base="$(checkpoint_artifact "${profiler}_profile")"
+  if [[ "$profiler" == ncu ]]; then
+    report="$base.ncu-rep"
+  else
+    [[ "$profiler" == nsys ]] || return 2
+    report="$base.nsys-rep"
+  fi
+  python3 - "$profiler" "$counter_admissible" \
+    "$(checkpoint_artifact "${profiler}_profile.json")" "$CHECKPOINT_SEAL" \
+    "$CHECKPOINT_GPU_BENCH" "$(checkpoint_artifact "${profiler}_profile.proof.bin")" \
+    "$report" "$(checkpoint_artifact "${profiler}_profile.csv")" \
+    "$(checkpoint_artifact "${profiler}_profile.stdout.txt")" \
+    "$(checkpoint_artifact "${profiler}_profile.stderr.txt")" <<'PY'
+import hashlib, json, pathlib, re, sys
+
+profiler, admissible_text = sys.argv[1:3]
+receipt_path, seal_path, binary, proof, report, table, stdout, stderr = map(
+    pathlib.Path, sys.argv[3:])
+receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+seal = json.loads(seal_path.read_text(encoding="utf-8"))
+admissible = admissible_text == "true"
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def hash64(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+paths = (binary, proof, report, table, stdout, stderr, seal_path)
+if any(not path.is_file() for path in paths) or any(
+        path.stat().st_size == 0 for path in (binary, proof, report, table, stdout, seal_path)):
+    raise SystemExit("profile receipt artifacts are missing or empty")
+expected_topology = ({
+    "selected_launch_count": 19,
+    "composition_wave_launch_count": 18,
+    "distinct_composition_wave_kernel_count": 18,
+    "packed_numerator_launch_count": 1,
+} if profiler == "ncu" else None)
+expected_seal = ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if admissible
+                 else "stwo.replacement-v1-sn2.timing-only-seal.v1")
+checks = (
+    receipt.get("schema") == "stwo.replacement-v1-sn2.profile-receipt.v1",
+    receipt.get("profiler") == profiler,
+    receipt.get("status") == "PASS",
+    receipt.get("counter_profile_admissible") is admissible,
+    isinstance(receipt.get("command_return_code"), int)
+        and not isinstance(receipt.get("command_return_code"), bool)
+        and receipt["command_return_code"] == 0,
+    receipt.get("gpu_bench_sha256") == digest(binary) == seal.get("gpu_bench_sha256"),
+    receipt.get("diagnostic_seal_sha256") == digest(seal_path),
+    receipt.get("proof_sha256") == digest(proof) == seal.get("proof_dump_sha256"),
+    receipt.get("report_bytes") == report.stat().st_size,
+    receipt.get("table_bytes") == table.stat().st_size,
+    receipt.get("report_sha256") == digest(report),
+    receipt.get("table_sha256") == digest(table),
+    receipt.get("stdout_sha256") == digest(stdout),
+    receipt.get("stderr_sha256") == digest(stderr),
+    receipt.get("ncu_launch_topology") == expected_topology,
+    seal.get("schema") == expected_seal and seal.get("diagnostic_pass") is True,
+    all(hash64(receipt.get(field)) for field in (
+        "gpu_bench_sha256", "diagnostic_seal_sha256", "proof_sha256",
+        "report_sha256", "table_sha256", "stdout_sha256", "stderr_sha256")),
+)
+if not all(checks):
+    raise SystemExit("profile receipt does not bind the sealed execution artifacts")
+if admissible:
+    if "counter_policy" in seal or "counter_profile_admissible" in seal:
+        raise SystemExit("strict profile consumed a waived seal")
+elif (seal.get("counter_policy") != "timing-only"
+      or seal.get("counter_profile_admissible") is not False
+      or seal.get("counter_status") != "UNAVAILABLE"):
+    raise SystemExit("timing-only profile consumed an invalid waiver")
 PY
 }
 
@@ -1166,13 +1433,16 @@ checkpoint_ncu_profile() {
 }
 
 checkpoint_assess_sn2_promotion() {
-  local timing nsys ncu out
+  local timing nsys ncu out nsys_valid=false ncu_valid=false
   timing="$(checkpoint_artifact record.json)"
   nsys="$(checkpoint_artifact nsys_profile.json)"
   ncu="$(checkpoint_artifact ncu_profile.json)"
   out="$(checkpoint_artifact promotion.json)"
+  if checkpoint_profile_receipt_valid nsys true 2>/dev/null; then nsys_valid=true; fi
+  if checkpoint_profile_receipt_valid ncu true 2>/dev/null; then ncu_valid=true; fi
   HOST_LIMIT="$CHECKPOINT_PROMOTION_HOST_PREPARATION_NS" \
     MHZ_FLOOR="$CHECKPOINT_PROMOTION_USEFUL_MHZ" \
+    NSYS_VALID="$nsys_valid" NCU_VALID="$ncu_valid" \
     python3 - "$timing" "$nsys" "$ncu" "$out" <<'PY'
 import hashlib, json, os, sys
 
@@ -1182,6 +1452,7 @@ host_limit = int(os.environ["HOST_LIMIT"])
 mhz_floor = float(os.environ["MHZ_FLOOR"])
 checks = {
     "hard_checkpoint_validation_passed": timing.get("checkpoint_validation", {}).get("verdict") == "PASS",
+    "counter_profile_admissible": timing.get("counter_profile_admissible") is True,
     "performance_claim_admissible": timing.get("performance_claim_admissible") is True,
     "graph_submit_gap_strict": timing.get("gpu_graph_submit_gap_strict_gate_passed") is True,
     "host_preparation_within_budget": isinstance(timing.get("gpu_host_preparation_total_ns"), int)
@@ -1190,8 +1461,8 @@ checks = {
     "useful_mhz_at_or_above_floor": isinstance(timing.get("useful_mhz_median"), (int, float))
         and not isinstance(timing.get("useful_mhz_median"), bool)
         and timing["useful_mhz_median"] >= mhz_floor,
-    "nsys_profile_passed": nsys.get("status") == "PASS",
-    "ncu_profile_passed": ncu.get("status") == "PASS",
+    "nsys_profile_passed": os.environ["NSYS_VALID"] == "true",
+    "ncu_profile_passed": os.environ["NCU_VALID"] == "true",
 }
 failed = [name for name, passed in checks.items() if not passed]
 record = {
@@ -1217,6 +1488,91 @@ record = {
     },
 }
 with open(sys.argv[4], "w", encoding="utf-8") as stream:
+    json.dump(record, stream, sort_keys=True)
+    stream.write("\n")
+print(json.dumps(record, sort_keys=True))
+PY
+  return 0
+}
+
+checkpoint_assess_sn2_timing_only() {
+  local timing nsys out nsys_valid=false
+  [[ "$REPLACEMENT_SN2_COUNTER_POLICY" == timing-only ]] \
+    || { echo "timing-only verdict requires the timing-only counter policy" >&2; return 2; }
+  timing="$(checkpoint_artifact record.json)"
+  nsys="$(checkpoint_artifact nsys_profile.json)"
+  out="$(checkpoint_artifact timing_only_verdict.json)"
+  if checkpoint_profile_receipt_valid nsys false 2>/dev/null; then nsys_valid=true; fi
+  HOST_LIMIT="$CHECKPOINT_PROMOTION_HOST_PREPARATION_NS" \
+    MHZ_FLOOR="$CHECKPOINT_PROMOTION_USEFUL_MHZ" \
+    NSYS_VALID="$nsys_valid" \
+    python3 - "$timing" "$nsys" "$CHECKPOINT_SEAL" "$out" <<'PY'
+import hashlib, json, math, os, sys
+
+timing_path, nsys_path, seal_path, out_path = sys.argv[1:]
+timing, nsys, seal = (json.load(open(path, encoding="utf-8"))
+                      for path in (timing_path, nsys_path, seal_path))
+host_limit = int(os.environ["HOST_LIMIT"])
+mhz_floor = float(os.environ["MHZ_FLOOR"])
+
+def positive_number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+completion_checks = {
+    "hard_checkpoint_validation_passed":
+        timing.get("checkpoint_validation", {}).get("verdict") == "PASS",
+    "timing_measurement_available":
+        timing.get("performance_measurement_available") is True
+        and positive_number(timing.get("useful_mhz_median"))
+        and positive_number(timing.get("prove_s_warm_median")),
+    "counter_denial_sealed":
+        seal.get("schema") == "stwo.replacement-v1-sn2.timing-only-seal.v1"
+        and seal.get("counter_policy") == "timing-only"
+        and seal.get("counter_profile_admissible") is False
+        and seal.get("counter_status") == "UNAVAILABLE",
+    "nsys_profile_passed": os.environ["NSYS_VALID"] == "true",
+}
+promotion_target_checks = {
+    "graph_submit_gap_strict": timing.get("gpu_graph_submit_gap_strict_gate_passed") is True,
+    "host_preparation_within_budget":
+        isinstance(timing.get("gpu_host_preparation_total_ns"), int)
+        and not isinstance(timing.get("gpu_host_preparation_total_ns"), bool)
+        and timing["gpu_host_preparation_total_ns"] <= host_limit,
+    "useful_mhz_at_or_above_floor":
+        positive_number(timing.get("useful_mhz_median"))
+        and timing["useful_mhz_median"] >= mhz_floor,
+}
+failed = [name for name, passed in completion_checks.items() if not passed]
+record = {
+    "schema": "stwo.replacement-v1-sn2.timing-only-verdict.v1",
+    "verdict": "TIMING_ONLY" if not failed else "INCOMPLETE",
+    "formal_promotion_eligible": False,
+    "counter_profile_admissible": False,
+    "failed_completion_checks": failed,
+    "completion_checks": completion_checks,
+    "promotion_target_checks": promotion_target_checks,
+    "failed_promotion_targets": [name for name, passed in promotion_target_checks.items()
+                                 if not passed],
+    "thresholds": {"host_preparation_total_ns_max": host_limit,
+                   "useful_mhz_median_min": mhz_floor},
+    "measurements": {
+        "gpu_host_preparation_total_ns": timing.get("gpu_host_preparation_total_ns"),
+        "prove_s_warm_median": timing.get("prove_s_warm_median"),
+        "prove_s_warm_p95": timing.get("prove_s_warm_p95"),
+        "useful_mhz_median": timing.get("useful_mhz_median"),
+        "useful_mhz_at_warm_p95": timing.get("useful_mhz_at_warm_p95"),
+        "gpu_max_graph_submit_gap_ms": timing.get("gpu_max_graph_submit_gap_ms"),
+    },
+    "profile_status": {"nsys": nsys.get("status"),
+                       "ncu": "OMITTED_COUNTER_UNAVAILABLE"},
+    "evidence_sha256": {
+        name: hashlib.sha256(open(path, "rb").read()).hexdigest()
+        for name, path in (("timing_record", timing_path), ("nsys_receipt", nsys_path),
+                           ("timing_only_seal", seal_path))
+    },
+}
+with open(out_path, "w", encoding="utf-8") as stream:
     json.dump(record, stream, sort_keys=True)
     stream.write("\n")
 print(json.dumps(record, sort_keys=True))

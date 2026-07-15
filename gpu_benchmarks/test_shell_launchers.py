@@ -117,6 +117,14 @@ class ShellLauncherTests(unittest.TestCase):
             aot_check_sha = file_sha256(aot_check)
             aot_manifest_sha = file_sha256(aot_manifest)
             proof_sha = file_sha256(proof)
+            counter_raw = root / "fixture.counter_acceptance.csv"
+            counter_log = root / "fixture.counter_acceptance.txt"
+            counter_raw.write_text(
+                'ID,Process ID,Kernel Name,Metric Name,Metric Value\n'
+                '1,7,"checkpoint_counter_kernel",sm__cycles_elapsed.avg,123.0\n',
+                encoding="utf-8",
+            )
+            counter_log.write_text("CHECKPOINT_COUNTER_KERNEL_RESULT=1\n", encoding="utf-8")
             artifacts = {
                 "source_input_identity.json": {
                     "schema": "stwo.replacement-v1-sn2.source-input-identity.v1",
@@ -134,7 +142,12 @@ class ShellLauncherTests(unittest.TestCase):
                 "counter_acceptance.json": {
                     "schema": "stwo.replacement-v1.counter-acceptance.v1",
                     "pass": True,
+                    "kernel": "checkpoint_counter_kernel",
+                    "metric": "sm__cycles_elapsed.avg",
+                    "metric_value": 123.0,
                     "gpu_uuid": "GPU-test",
+                    "raw_csv_sha256": file_sha256(counter_raw),
+                    "acceptance_log_sha256": file_sha256(counter_log),
                 },
                 "build_identity.json": {
                     "schema": "stwo.replacement-v1-sn2.build-identity.v1",
@@ -159,6 +172,7 @@ class ShellLauncherTests(unittest.TestCase):
                     "checkpoint_validation": {
                         "verdict": "PASS",
                         "mode": "diagnostic",
+                        "counter_profile_admissible": True,
                     },
                     "gpu_proof_blake3": "ab" * 32,
                     "gpu_protocol_key": "protocol-v1",
@@ -236,6 +250,105 @@ class ShellLauncherTests(unittest.TestCase):
                     "composition_wave_count": 18,
                 },
             )
+
+            counter_path = root / "fixture.counter_acceptance.json"
+            valid_counter = json.loads(counter_path.read_text(encoding="utf-8"))
+            counter_path.write_text(
+                json.dumps({**valid_counter, "metric_value": -1}) + "\n",
+                encoding="utf-8",
+            )
+            forged = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$COMMON"; CHECKPOINT_PREFIX=fixture; '
+                    'CHECKPOINT_GPU_BENCH="$TEST_GPU_BENCH"; '
+                    'CHECKPOINT_AOT_CHECK="$TEST_AOT_CHECK"; '
+                    'CHECKPOINT_AOT_MANIFEST="$TEST_AOT_MANIFEST"; '
+                    'CHECKPOINT_SEAL="$TEST_SEAL"; checkpoint_seal_diagnostic',
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertNotEqual(forged.returncode, 0)
+            counter_path.write_text(json.dumps(valid_counter) + "\n", encoding="utf-8")
+
+            counter_log.write_text(
+                "CHECKPOINT_COUNTER_KERNEL_RESULT=1\nERR_NVGPUCTRPERM\n",
+                encoding="utf-8",
+            )
+            contaminated_counter = {
+                **valid_counter,
+                "acceptance_log_sha256": file_sha256(counter_log),
+            }
+            counter_path.write_text(
+                json.dumps(contaminated_counter) + "\n", encoding="utf-8"
+            )
+            contaminated = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$COMMON"; CHECKPOINT_PREFIX=fixture; '
+                    'CHECKPOINT_GPU_BENCH="$TEST_GPU_BENCH"; '
+                    'CHECKPOINT_AOT_CHECK="$TEST_AOT_CHECK"; '
+                    'CHECKPOINT_AOT_MANIFEST="$TEST_AOT_MANIFEST"; '
+                    'CHECKPOINT_SEAL="$TEST_SEAL"; checkpoint_seal_diagnostic',
+                ],
+                check=False, capture_output=True, text=True, env=env,
+            )
+            self.assertNotEqual(contaminated.returncode, 0)
+
+            counter_raw.write_text("ERR_NVGPUCTRPERM\n", encoding="utf-8")
+            counter_log.write_text(
+                "CHECKPOINT_COUNTER_KERNEL_RESULT=1\nERR_NVGPUCTRPERM\n",
+                encoding="utf-8",
+            )
+            counter_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "stwo.replacement-v1.counter-availability.v1",
+                        "status": "UNAVAILABLE",
+                        "pass": False,
+                        "error_code": "ERR_NVGPUCTRPERM",
+                        "command_return_code": 1,
+                        "gpu_uuid": "GPU-test",
+                        "raw_csv_sha256": file_sha256(counter_raw),
+                        "acceptance_log_sha256": file_sha256(counter_log),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            record_path = root / "fixture.record.json"
+            diagnostic = json.loads(record_path.read_text(encoding="utf-8"))
+            diagnostic["counter_profile_admissible"] = False
+            diagnostic["checkpoint_validation"]["counter_profile_admissible"] = False
+            record_path.write_text(json.dumps(diagnostic) + "\n", encoding="utf-8")
+            timing_only = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$COMMON"; CHECKPOINT_PREFIX=fixture; '
+                    'CHECKPOINT_GPU_BENCH="$TEST_GPU_BENCH"; '
+                    'CHECKPOINT_AOT_CHECK="$TEST_AOT_CHECK"; '
+                    'CHECKPOINT_AOT_MANIFEST="$TEST_AOT_MANIFEST"; '
+                    'CHECKPOINT_SEAL="$TEST_SEAL"; checkpoint_seal_diagnostic',
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**env, "REPLACEMENT_SN2_COUNTER_POLICY": "timing-only"},
+            )
+            self.assertEqual(timing_only.returncode, 0, timing_only.stderr)
+            timing_only_seal = json.loads(seal.read_text(encoding="utf-8"))
+            self.assertEqual(
+                timing_only_seal["schema"],
+                "stwo.replacement-v1-sn2.timing-only-seal.v1",
+            )
+            self.assertEqual(timing_only_seal["counter_policy"], "timing-only")
+            self.assertFalse(timing_only_seal["counter_profile_admissible"])
+            self.assertEqual(timing_only_seal["counter_status"], "UNAVAILABLE")
 
     def test_replacement_sn2_aot_identity_derives_exact_key_count(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
@@ -421,17 +534,19 @@ class ShellLauncherTests(unittest.TestCase):
             for line in recipe.splitlines()
             if line.startswith("phase ")
         ]
-        self.assertLess(
-            phases.index("counter_permission_acceptance"), phases.index("build")
+        self.assertIn("REPLACEMENT_SN2_COUNTER_POLICY=required", recipe)
+        self.assertEqual(
+            phases,
+            [
+                "ambient_override_gate", "source_input_identity", "hardware_identity",
+                "counter_permission_acceptance", "build", "adapted_input_identity",
+                "fp256_carry_oracles", "replacement_stage4_native", "aot_identity",
+                "sn2_diagnostic", "sn2_diagnostic_validate", "seal_passing_diagnostic",
+                "timing_ambient_override_gate", "timing_sealed_diagnostic_identity",
+                "timing_sn2", "timing_sn2_validate", "nsys_profile", "ncu_profile",
+                "promotion_verdict",
+            ],
         )
-        self.assertLess(
-            phases.index("replacement_stage4_native"), phases.index("aot_identity")
-        )
-        self.assertNotIn("exact_numerator_ab", phases)
-        timing_validation = phases.index("timing_sn2_validate")
-        self.assertLess(timing_validation, phases.index("nsys_profile"))
-        self.assertLess(timing_validation, phases.index("ncu_profile"))
-        self.assertEqual(phases[-1], "promotion_verdict")
 
         common = (
             ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
@@ -473,6 +588,146 @@ class ShellLauncherTests(unittest.TestCase):
             3,
         )
 
+    def test_replacement_sn2_timing_only_lane_seals_exact_counter_denial(self) -> None:
+        recipe = (
+            ROOT / "loop" / "recipes" / "replacement_v1_sn2_timing_only.phases"
+        ).read_text(encoding="utf-8")
+        phases = [
+            line.split()[1] for line in recipe.splitlines() if line.startswith("phase ")
+        ]
+        self.assertIn("REPLACEMENT_SN2_COUNTER_POLICY='timing-only'", recipe)
+        self.assertEqual(
+            phases,
+            [
+                "ambient_override_gate", "source_input_identity", "hardware_identity",
+                "counter_permission_receipt", "build", "adapted_input_identity",
+                "fp256_carry_oracles", "replacement_stage4_native", "aot_identity",
+                "sn2_diagnostic", "sn2_diagnostic_validate", "seal_passing_diagnostic",
+                "timing_sealed_diagnostic_identity", "timing_sn2",
+                "timing_sn2_validate", "nsys_profile", "timing_only_verdict",
+            ],
+        )
+
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "fixture.hardware_identity.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "stwo.replacement-v1-sn2.hardware-identity.v2",
+                        "uuid": "GPU-test",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env = {
+                **os.environ,
+                "REPLACEMENT_SN2_MODE": "diagnostic",
+                "REPLACEMENT_SN2_COUNTER_POLICY": "timing-only",
+                "CAIRO": str(root / "stwo-cairo" / "stwo_cairo_prover"),
+                "STWO": str(root / "stwo"),
+                "RUN": str(root),
+                "COMMON": str(common),
+            }
+            command = r'''
+source "$COMMON"
+CHECKPOINT_PREFIX=fixture
+checkpoint_counter_acceptance() {
+  printf '%s\n' CHECKPOINT_COUNTER_KERNEL_RESULT=1 ERR_NVGPUCTRPERM >"$(checkpoint_artifact counter_acceptance.txt)"
+  printf '%s\n' ERR_NVGPUCTRPERM >"$(checkpoint_artifact counter_acceptance.csv)"
+  return 13
+}
+checkpoint_counter_timing_only
+'''
+            accepted = subprocess.run(
+                ["bash", "-c", command], check=False, capture_output=True, text=True, env=env
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            receipt = json.loads(
+                (root / "fixture.counter_acceptance.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["status"], "UNAVAILABLE")
+            self.assertFalse(receipt["pass"])
+            self.assertEqual(receipt["command_return_code"], 13)
+            self.assertEqual(receipt["gpu_uuid"], "GPU-test")
+            self.assertEqual(
+                receipt["raw_csv_sha256"],
+                file_sha256(root / "fixture.counter_acceptance.csv"),
+            )
+            self.assertEqual(
+                receipt["acceptance_log_sha256"],
+                file_sha256(root / "fixture.counter_acceptance.txt"),
+            )
+
+            rejected = subprocess.run(
+                ["bash", "-c", command.replace("ERR_NVGPUCTRPERM", "generic failure")],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            failed = json.loads(
+                (root / "fixture.counter_acceptance.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(failed["status"], "FAIL")
+
+            (root / "fixture.record.json").write_text(
+                json.dumps(
+                    {
+                        "checkpoint_validation": {"verdict": "PASS"},
+                        "performance_measurement_available": True,
+                        "gpu_graph_submit_gap_strict_gate_passed": True,
+                        "gpu_host_preparation_total_ns": 100_000_000,
+                        "prove_s_warm_median": 0.5,
+                        "prove_s_warm_p95": 0.6,
+                        "useful_mhz_median": 15.0,
+                        "useful_mhz_at_warm_p95": 13.0,
+                        "gpu_max_graph_submit_gap_ms": 1.0,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "fixture.nsys_profile.json").write_text(
+                json.dumps({"status": "PASS"}) + "\n", encoding="utf-8"
+            )
+            (root / "replacement_v1_sn2_timing_only_checkpoint.seal.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "stwo.replacement-v1-sn2.timing-only-seal.v1",
+                        "counter_policy": "timing-only",
+                        "counter_profile_admissible": False,
+                        "counter_status": "UNAVAILABLE",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            verdict_result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$COMMON"; CHECKPOINT_PREFIX=fixture; '
+                    "checkpoint_assess_sn2_timing_only",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**env, "REPLACEMENT_SN2_MODE": "timing"},
+            )
+            self.assertEqual(verdict_result.returncode, 0, verdict_result.stderr)
+            verdict = json.loads(
+                (root / "fixture.timing_only_verdict.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(verdict["verdict"], "INCOMPLETE")
+            self.assertFalse(verdict["formal_promotion_eligible"])
+            self.assertIn("nsys_profile_passed", verdict["failed_completion_checks"])
+            self.assertEqual(
+                verdict["profile_status"]["ncu"], "OMITTED_COUNTER_UNAVAILABLE"
+            )
+
     def test_replacement_sn2_promotion_thresholds_fail_soft(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
         with tempfile.TemporaryDirectory() as directory:
@@ -480,6 +735,7 @@ class ShellLauncherTests(unittest.TestCase):
             records = {
                 "record.json": {
                     "checkpoint_validation": {"verdict": "PASS"},
+                    "counter_profile_admissible": True,
                     "performance_claim_admissible": True,
                     "gpu_graph_submit_gap_strict_gate_passed": True,
                     "gpu_host_preparation_total_ns": 120_000_001,
@@ -525,6 +781,7 @@ class ShellLauncherTests(unittest.TestCase):
                     "host_preparation_within_budget",
                     "useful_mhz_at_or_above_floor",
                     "nsys_profile_passed",
+                    "ncu_profile_passed",
                 },
             )
 
@@ -543,6 +800,13 @@ class ShellLauncherTests(unittest.TestCase):
                     {
                         "program": "SN_PIE_2.zip",
                         "backend": "cuda",
+                        "engine": "gpu-native",
+                        "gpu_resident_backend": "replacement-v1",
+                        "gpu_pcs_runtime_mode": "ArenaGraph",
+                        "gpu_aot_provenance_gate_passed": True,
+                        "gpu_prepared_numerator_schedule": "staged-packed-single-write",
+                        "gpu_composition_part_count": 153,
+                        "gpu_composition_wave_count": 18,
                         "gpu_proof_blake3": "ab" * 32,
                         "verified_reps": 2,
                         "proof_byte_equal": True,
@@ -555,12 +819,15 @@ class ShellLauncherTests(unittest.TestCase):
             )
             stderr = root / "stderr.txt"
             stderr.write_text("", encoding="utf-8")
+            gpu_bench = root / "gpu_bench"
+            gpu_bench.write_bytes(b"gpu-bench")
             seal = root / "seal.json"
             seal.write_text(
                 json.dumps(
                     {
                         "schema": "stwo.replacement-v1-sn2.checkpoint-seal.v3",
                         "diagnostic_pass": True,
+                        "gpu_bench_sha256": file_sha256(gpu_bench),
                         "proof_dump_sha256": proof_sha,
                         "proof_blake3": "ab" * 32,
                     }
@@ -568,8 +835,6 @@ class ShellLauncherTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            gpu_bench = root / "gpu_bench"
-            gpu_bench.write_bytes(b"gpu-bench")
             table = root / "profile.csv"
             out = root / "receipt.json"
             env = {
@@ -624,6 +889,14 @@ class ShellLauncherTests(unittest.TestCase):
                     "packed_numerator_launch_count": 1,
                 },
             )
+            gpu_bench.write_bytes(b"substituted-gpu-bench")
+            substituted = validate([*waves, numerator])
+            self.assertEqual(substituted["status"], "FAIL")
+            self.assertIn(
+                "profile binary differs from sealed diagnostic",
+                substituted["soft_failure_reasons"],
+            )
+            gpu_bench.write_bytes(b"gpu-bench")
             for kernels in (
                 [*waves[:-1], numerator],
                 [*waves[:-1], waves[0], numerator],

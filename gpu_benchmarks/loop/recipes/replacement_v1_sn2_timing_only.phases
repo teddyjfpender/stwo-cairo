@@ -1,18 +1,18 @@
 # shellcheck shell=bash
 # pod_run: require_clean_sources
-# Seal the diagnostic and admit timing in one detached pod session so the GPU
-# and release binary cannot drift between correctness and measurement.
-# Correctness and identity stay fail-closed. Host/MHz/profile promotion checks
-# write a soft verdict after the sealed timing record so evidence is never lost.
+# Timing-only fallback for hosts that expose H100 execution but deny NCU
+# performance counters. Correctness and identity remain fail-closed. The
+# counter waiver, NCU unavailability, and failed promotion are sealed as an
+# explicit asterisk; use replacement_v1_sn2_sealed.phases for formal promotion.
 
-REPLACEMENT_SN2_COUNTER_POLICY=required
+REPLACEMENT_SN2_COUNTER_POLICY='timing-only'
 REPLACEMENT_SN2_MODE=diagnostic
 source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
 
 phase ambient_override_gate checkpoint_reject_ambient_overrides
 phase source_input_identity checkpoint_source_input_identity
 phase hardware_identity checkpoint_hardware_identity
-phase counter_permission_acceptance checkpoint_counter_acceptance
+phase counter_permission_receipt checkpoint_counter_timing_only
 phase build checkpoint_build
 phase adapted_input_identity checkpoint_adapted_input_identity
 phase fp256_carry_oracles checkpoint_fp256_carry_oracles
@@ -25,10 +25,8 @@ phase seal_passing_diagnostic checkpoint_seal_diagnostic
 REPLACEMENT_SN2_MODE=timing
 source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
 
-phase timing_ambient_override_gate checkpoint_reject_ambient_overrides
 phase timing_sealed_diagnostic_identity checkpoint_verify_sealed_diagnostic
 phase timing_sn2 checkpoint_run_sn2 timing 6
 phase timing_sn2_validate checkpoint_validate_sn2 timing 6
 phase nsys_profile checkpoint_nsys_profile
-phase ncu_profile checkpoint_ncu_profile
-phase promotion_verdict checkpoint_assess_sn2_promotion
+phase timing_only_verdict checkpoint_assess_sn2_timing_only
