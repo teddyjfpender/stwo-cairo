@@ -36,6 +36,8 @@ pub mod range_allocator;
 mod range_arena;
 #[cfg(test)]
 mod raw_replacement_oracle_tests;
+#[cfg(test)]
+mod raw_replacement_sn_matrix_tests;
 pub mod recorded_witness_inputs;
 pub mod relation;
 pub mod relation_execution;

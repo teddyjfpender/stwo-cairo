@@ -35,7 +35,7 @@ use crate::resident_witness::{planned_cairo_claim, planned_cairo_claim_from_publ
 use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::shape_executable::{ShapeExecutableCache, ShapeExecutableMaterialization};
 
-fn assert_cached_recorded_matches_fresh(
+pub(super) fn assert_cached_recorded_matches_fresh(
     cached: &PlannedRecordedWitnessInputs,
     fresh: &PlannedRecordedWitnessInputs,
 ) {
