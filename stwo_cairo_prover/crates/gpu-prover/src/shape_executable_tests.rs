@@ -285,6 +285,15 @@ fn admission_rejects_forced_digest_and_layout_collisions() {
 }
 
 #[test]
+fn composition_plan_has_one_arena_owned_allocation() {
+    let executable = sn2_executable();
+    assert!(core::ptr::eq(
+        executable.composition(),
+        &executable.arena().composition().plan,
+    ));
+}
+
+#[test]
 fn binding_recipe_rejects_identity_span_word_and_extension_drift() {
     let fixture = sn2_fixture();
     let executable = sn2_executable();

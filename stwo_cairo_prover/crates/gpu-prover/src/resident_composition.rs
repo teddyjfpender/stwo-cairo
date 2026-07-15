@@ -167,6 +167,13 @@ fn require_current_composition_plan<'a>(
     cached: &CompositionPlan,
     current: &'a CompositionPlan,
 ) -> Result<&'a CompositionPlan, ResidentCompositionError> {
+    // Production warm reuse reaches this boundary through two clones of the
+    // same arena Arc. Its composition plan is therefore the same allocation;
+    // no structural scan or full plan clone is needed.
+    if core::ptr::eq(cached, current) {
+        return Ok(current);
+    }
+
     let drift = || ResidentCompositionError::CurrentPlanTopologyDrift {
         cached_key: cached.key(),
         current_key: current.key(),
@@ -315,6 +322,8 @@ fn relation_claimed_sum_key(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use stwo::core::fields::m31::BaseField;
     use stwo_cairo_prover::witness::proof_shape::TracePartId;
 
@@ -437,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_reuse_accepts_current_base_values_only_after_full_topology_check() {
+    fn separate_workspace_reuse_accepts_base_values_and_rejects_drift() {
         let cached = composition_fixture(&[7, 11]);
         let current = composition_fixture(&[17, 19]);
         assert_eq!(cached.key(), current.key());
@@ -457,6 +466,17 @@ mod tests {
         assert!(matches!(
             require_current_composition_plan(&cached, &structural_drift),
             Err(ResidentCompositionError::CurrentPlanTopologyDrift { .. })
+        ));
+    }
+
+    #[test]
+    fn same_arc_plan_uses_pointer_identity_admission() {
+        let cached = Arc::new(composition_fixture(&[7, 11]));
+        let current = Arc::clone(&cached);
+        assert!(Arc::ptr_eq(&cached, &current));
+        assert!(core::ptr::eq(
+            require_current_composition_plan(cached.as_ref(), current.as_ref()).unwrap(),
+            current.as_ref(),
         ));
     }
 

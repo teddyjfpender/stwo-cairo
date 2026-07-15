@@ -407,7 +407,6 @@ pub struct ShapeExecutable {
     admission: WorkspaceAdmission,
     discovery: ProtocolTranscriptDiscovery,
     transcript: CairoBlake2sTranscriptPlan,
-    composition: CompositionPlan,
     composition_bindings: CompositionBindingPlan,
     arena: Arc<ProofArenaPlan>,
 }
@@ -438,7 +437,7 @@ impl ShapeExecutable {
     }
 
     pub(crate) fn composition(&self) -> &CompositionPlan {
-        &self.composition
+        &self.arena.composition().plan
     }
 
     pub(crate) fn protocol_policy(&self) -> ProtocolPlanPolicy {
@@ -682,7 +681,6 @@ fn compile_shape_executable(
         admission,
         discovery,
         transcript,
-        composition,
         composition_bindings,
         arena,
     })
