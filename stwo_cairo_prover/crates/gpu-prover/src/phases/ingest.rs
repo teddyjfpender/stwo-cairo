@@ -14,8 +14,10 @@ use tracing::{span, Level};
 
 use crate::plan::ProofPlan;
 use crate::relation_table::CAIRO_RELATION_GRAPH;
+use crate::resident_input::ResidentProverInputOwner;
+use crate::resident_shape::{raw_replacement_proof_plan, RawResidentShapeError};
 use crate::schedule_table::CAIRO_SCHEDULE;
-use crate::state::IngestOutput;
+use crate::state::{IngestOutput, ReplacementIngestOutput};
 
 pub fn run(
     input: ProverInput,
@@ -57,6 +59,32 @@ pub fn run(
         generator,
         proof_plan,
     }
+}
+
+/// ReplacementV1 ingest: move the adapter output into its resident owner and
+/// derive the exact capacity contract directly from those canonical fields.
+/// This path never constructs a `CairoClaimGenerator` and never clones memory
+/// or Casm slabs.
+pub fn run_replacement(
+    input: ProverInput,
+    variant: PreProcessedTraceVariant,
+    opt_n_id_to_big_components: Option<usize>,
+) -> Result<ReplacementIngestOutput, RawResidentShapeError> {
+    let span = span!(Level::INFO, "Write Preprocessed trace").entered();
+    let preprocessed_trace = Arc::new(variant.to_preprocessed_trace());
+    span.exit();
+
+    let input = ResidentProverInputOwner::encode(input);
+    let proof_plan = Arc::new(raw_replacement_proof_plan(
+        &input,
+        Arc::clone(&preprocessed_trace),
+        opt_n_id_to_big_components,
+    )?);
+    Ok(ReplacementIngestOutput {
+        preprocessed_trace,
+        input,
+        proof_plan,
+    })
 }
 
 /// Replace every device-compacted consumer's pending rows in the OBSERVED

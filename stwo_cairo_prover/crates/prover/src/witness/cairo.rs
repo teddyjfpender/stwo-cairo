@@ -1,4 +1,5 @@
 use std::array;
+use std::cell::Cell;
 use std::sync::Arc;
 
 use cairo_air::air::{
@@ -14,6 +15,17 @@ use crate::witness::cairo_claim_generator::{get_sub_components, CairoClaimGenera
 use crate::witness::opcodes::get_opcodes;
 use crate::witness::prelude::{AddInputs, PreProcessedTrace, M31};
 use crate::witness::range_checks::get_range_checks;
+
+thread_local! {
+    static CLAIM_GENERATOR_CONSTRUCTIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Per-thread construction witness used by the resident backend admission
+/// gate. Thread-local scope makes the audit deterministic under parallel tests.
+#[doc(hidden)]
+pub fn claim_generator_constructions() -> u64 {
+    CLAIM_GENERATOR_CONSTRUCTIONS.get()
+}
 
 fn extract_public_segments(
     memory: &Memory,
@@ -131,6 +143,7 @@ pub fn create_cairo_claim_generator(
     input: ProverInput,
     preprocessed_trace: Arc<PreProcessedTrace>,
 ) -> CairoClaimGenerator {
+    CLAIM_GENERATOR_CONSTRUCTIONS.set(claim_generator_constructions().saturating_add(1));
     let public_data = public_data_from_prover_input(&input);
     let ProverInput {
         state_transitions,

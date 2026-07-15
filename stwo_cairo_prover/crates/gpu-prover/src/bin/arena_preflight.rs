@@ -5,7 +5,7 @@
 //! De-risks the first strict resident attempt on a large PIE by running the
 //! EXACT planning pipeline the resident session runs
 //! (`resident_session::plan_resident_preflight`, which mirrors
-//! `with_resident_session_from_generator` up to workspace materialization):
+//! `with_resident_pre_witness_session` up to workspace materialization):
 //! ingest -> strict_resident_exact -> strict witness coverage -> planned claim
 //! -> recorded witness inputs (require_resolved) -> Graph-A multiplicity plan
 //! -> protocol/arena plan. It then prints one JSON record with the component
@@ -67,7 +67,8 @@ use stwo_cairo_gpu_prover::memory_ledger::{PhysicalMemoryLedger, ARENA_IDLE_DEFI
 use stwo_cairo_gpu_prover::phases;
 use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
 use stwo_cairo_gpu_prover::resident_session::{
-    plan_resident_preflight_for, ResidentPreflightError, ResidentPreflightReport,
+    plan_raw_resident_preflight, plan_resident_preflight_for, ResidentPreflightError,
+    ResidentPreflightReport,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -852,16 +853,37 @@ fn main() -> ExitCode {
         fri_config: FriConfig::new(0, 1, 70, 3),
         lifting_log_size: None,
     };
-    let ingest = phases::ingest::run(input, variant, None);
-    let compacted_rows = compacted_consumer_rows(&ingest.proof_plan);
-    let report = match plan_resident_preflight_for(
-        &ingest.generator,
-        &ingest.proof_plan,
-        &ingest.preprocessed_trace,
-        pcs,
-        false,
-        resident_backend,
-    ) {
+    let planned = match resident_backend {
+        ResidentBackend::LegacyResident => {
+            let ingest = phases::ingest::run(input, variant, None);
+            let compacted_rows = compacted_consumer_rows(&ingest.proof_plan);
+            plan_resident_preflight_for(
+                &ingest.generator,
+                &ingest.proof_plan,
+                &ingest.preprocessed_trace,
+                pcs,
+                false,
+                resident_backend,
+            )
+            .map(|report| (compacted_rows, report))
+        }
+        ResidentBackend::ReplacementV1 => {
+            let ingest = match phases::ingest::run_replacement(input, variant, None) {
+                Ok(ingest) => ingest,
+                Err(error) => return fail("replacement_ingest", error.to_string()),
+            };
+            let compacted_rows = compacted_consumer_rows(&ingest.proof_plan);
+            plan_raw_resident_preflight(
+                &ingest.input,
+                &ingest.proof_plan,
+                &ingest.preprocessed_trace,
+                pcs,
+                false,
+            )
+            .map(|report| (compacted_rows, report))
+        }
+    };
+    let (compacted_rows, report) = match planned {
         Ok(report) => report,
         Err(ResidentPreflightError::Session(error)) => {
             return fail("resident_session_plan", format!("{error:?}"))

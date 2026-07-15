@@ -29,7 +29,7 @@ use stwo_cairo_prover::witness::exec_context::WitnessResidencyReport;
 use stwo_cairo_prover::witness::jit_prove_backend::recorded_casm_input_attempt;
 use stwo_cairo_prover::witness::relation_sources::RelationSourceError;
 
-use crate::arena_plan::{ArenaPlanError, ExecutionTableGeometry, ProofArenaPlan};
+use crate::arena_plan::{ArenaPlanError, ExecutionTableGeometry, ProofArenaPlan, ResidentBackend};
 use crate::composition_plan::{CompositionPlan, CompositionPlanError, CompositionProofBindings};
 use crate::fixed_table_materializer::{
     PEDERSEN_POINTS_18_COLUMN_COUNT, PEDERSEN_POINTS_18_ROW_COUNT,
@@ -40,11 +40,12 @@ use crate::plan::{ProofPlan, ProofPlanError};
 use crate::protocol_discovery::{ProtocolDiscoveryError, ProtocolTranscriptDiscovery};
 use crate::protocol_plan::{ProtocolPlanError, ProtocolPlanPolicy};
 use crate::recorded_witness_inputs::{
-    recorded_witness_inputs_for_plan, recorded_witness_inputs_for_replacement_plan,
+    recorded_witness_inputs_for_plan, recorded_witness_inputs_for_raw_replacement_plan,
     DeviceCasmColumn, DeviceCompactColumn, DeviceEdgeColumn, DeviceEdgeSourceKind,
     DeviceGatherColumn, DeviceNativeColumn, DeviceSeedColumn, PlannedRecordedWitnessInputs,
     RecordedInputColumnProvenance, RecordedWitnessPlanError,
 };
+use crate::resident_input::ResidentProverInputOwner;
 use crate::resident_runtime::{
     ResidentGraphRuntime, ResidentRuntimeError, ResidentWitnessIngestReport, ResidentWitnessInput,
     ResidentWitnessInputColumn, ResidentWorkspaceIdentity, SealedResidentExecutionConfig,
@@ -56,7 +57,8 @@ use crate::resident_sources::{
     ResidentSourceStageReport, ResidentTwiddleStageReport,
 };
 use crate::resident_witness::{
-    planned_cairo_claim, require_strict_resident_witness_coverage, ResidentWitnessPlanError,
+    planned_cairo_claim, planned_cairo_claim_from_public_data,
+    require_strict_resident_witness_coverage, ResidentWitnessPlanError,
 };
 use crate::shape_executable::{
     ShapeCompileRequest, ShapeExecutable, ShapeExecutableCache, ShapeExecutableCacheTelemetry,
@@ -91,14 +93,137 @@ pub struct ResidentSessionRequest {
 /// every recorded CUDA writer destination from birth.
 pub struct ResidentPreWitnessSessionRequest {
     pub preprocessed_trace: Arc<PreProcessedTrace>,
-    pub generator: CairoClaimGenerator,
-    pub capacity_plan: Arc<ProofPlan>,
+    pub input: ResidentPreWitnessInput,
+    pub ingress_audit: ResidentIngressAudit,
     pub channel_salt: u32,
     pub pcs: PcsConfig,
     pub include_all_preprocessed_columns: bool,
     pub operational_safety_reserve_bytes: Option<NonZeroUsize>,
     pub protocol_policy: ProtocolPlanPolicy,
     pub execution_config: SealedResidentExecutionConfig,
+}
+
+/// The backend tag and its ownership model are one value, so policy dispatch
+/// cannot accidentally route ReplacementV1 through a legacy generator.
+pub enum ResidentPreWitnessInput {
+    LegacyResident {
+        generator: CairoClaimGenerator,
+        capacity_plan: Arc<ProofPlan>,
+    },
+    ReplacementV1 {
+        input: ResidentProverInputOwner,
+        capacity_plan: Arc<ProofPlan>,
+    },
+}
+
+impl ResidentPreWitnessInput {
+    pub const fn backend(&self) -> ResidentBackend {
+        match self {
+            Self::LegacyResident { .. } => ResidentBackend::LegacyResident,
+            Self::ReplacementV1 { .. } => ResidentBackend::ReplacementV1,
+        }
+    }
+
+    fn capacity_plan(&self) -> &ProofPlan {
+        match self {
+            Self::LegacyResident { capacity_plan, .. }
+            | Self::ReplacementV1 { capacity_plan, .. } => capacity_plan,
+        }
+    }
+
+    fn ec_op_segment_start(&self) -> Option<usize> {
+        match self {
+            Self::LegacyResident { generator, .. } => generator
+                .ec_op_builtin
+                .as_ref()
+                .map(|ec_op| ec_op.ec_op_builtin_segment_start as usize),
+            Self::ReplacementV1 { input, .. } => input
+                .builtin_segments()
+                .ec_op_builtin
+                .map(|segment| segment.begin_addr),
+        }
+    }
+
+    fn planned_claim(&self, exact_plan: &ProofPlan) -> Result<CairoClaim, ResidentSessionError> {
+        Ok(match self {
+            Self::LegacyResident { generator, .. } => planned_cairo_claim(generator, exact_plan)?,
+            Self::ReplacementV1 { input, .. } => {
+                planned_cairo_claim_from_public_data(input.public_data(), exact_plan)?
+            }
+        })
+    }
+
+    fn recorded_inputs(
+        &self,
+        exact_plan: &ProofPlan,
+    ) -> Result<PlannedRecordedWitnessInputs, ResidentSessionError> {
+        Ok(match self {
+            Self::LegacyResident { generator, .. } => {
+                recorded_witness_inputs_for_plan(generator, exact_plan)?
+            }
+            Self::ReplacementV1 { input, .. } => {
+                recorded_witness_inputs_for_raw_replacement_plan(input, exact_plan)?
+            }
+        })
+    }
+
+    fn casm_words(
+        &self,
+        label: &'static str,
+    ) -> Result<Option<ResidentCasmWords<'_>>, ResidentSessionError> {
+        Ok(match self {
+            Self::LegacyResident { generator, .. } => recorded_casm_input_attempt(generator, label)
+                .map_err(RecordedWitnessPlanError::Inputs)?
+                .map(|attempt| ResidentCasmWords {
+                    words: bytemuck::cast_slice(attempt.inputs),
+                    rows: attempt.inputs.len(),
+                    include_iota: attempt.include_iota,
+                }),
+            Self::ReplacementV1 { input, .. } => {
+                input.casm_input(label).map(|source| ResidentCasmWords {
+                    words: bytemuck::cast_slice(source.states),
+                    rows: source.states.len(),
+                    include_iota: source.descriptor.include_iota,
+                })
+            }
+        })
+    }
+}
+
+struct ResidentCasmWords<'a> {
+    words: &'a [u32],
+    rows: usize,
+    include_iota: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentIngressAudit {
+    pub ingest_ns: u128,
+    pub claim_generator_constructions: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentHostPreparationAudit {
+    pub backend: ResidentBackend,
+    pub ingest_ns: u128,
+    pub session_ns: u128,
+    pub total_ns: u128,
+    /// Structural ownership facts, verified by move-preserving pointer tests.
+    /// These are not allocator counters; changing the ingress data flow must
+    /// update both this contract and its production-path oracle.
+    pub ownership: ResidentHostOwnershipContract,
+    /// Measured by the thread-local constructor witness around real ingest.
+    pub claim_generator_constructions: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentHostOwnershipContract {
+    pub prover_input_moves: usize,
+    pub prover_input_clones: usize,
+    pub memory_slab_clones: usize,
+    pub casm_slab_clones: usize,
+    pub execution_memory_arc_clones: usize,
+    pub recorded_program_arc_clones: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +242,7 @@ pub struct ResidentPreparationState {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResidentSessionTelemetry {
+    pub host_preparation: Option<ResidentHostPreparationAudit>,
     pub shape_executable_materialization: Option<ShapeExecutableMaterialization>,
     pub shape_executable_cache: ShapeExecutableCacheTelemetry,
     pub shape_executable_topology_digest: Option<[u8; 32]>,
@@ -232,6 +358,26 @@ impl ResidentSessionTelemetry {
                 "replacement-v1 policy tuple drifted",
             ));
         }
+        if policy.resident_backend == ResidentBackend::ReplacementV1 {
+            let audit =
+                self.host_preparation
+                    .ok_or(ResidentSessionError::StrictArchitectureTelemetry(
+                        "replacement host preparation audit was not reported",
+                    ))?;
+            if audit.backend != ResidentBackend::ReplacementV1
+                || audit.ownership.prover_input_moves != 1
+                || audit.ownership.prover_input_clones != 0
+                || audit.ownership.memory_slab_clones != 0
+                || audit.ownership.casm_slab_clones != 0
+                || audit.claim_generator_constructions != 0
+                || audit.ownership.execution_memory_arc_clones != 1
+                || audit.ownership.recorded_program_arc_clones == 0
+            {
+                return Err(ResidentSessionError::StrictArchitectureTelemetry(
+                    "replacement host ownership contract drifted",
+                ));
+            }
+        }
         let prepared = self.prepared_numerator_schedule.ok_or(
             ResidentSessionError::StrictArchitectureTelemetry(
                 "prepared quotient-numerator schedule was not reported",
@@ -316,6 +462,11 @@ pub struct ResidentSessionArtifacts<'a> {
 
 #[derive(Debug)]
 pub enum ResidentSessionError {
+    BackendInputMismatch {
+        input: ResidentBackend,
+        policy: ResidentBackend,
+        runtime: ResidentBackend,
+    },
     UnsealedProofPlan,
     EmptyTraceGeometry,
     InvalidLiftingLogSize {
@@ -558,6 +709,7 @@ fn run_materialized_session<R>(
                     .ok_or(ResidentSessionError::SizeOverflow)
             })?;
     let mut telemetry = ResidentSessionTelemetry {
+        host_preparation: None,
         shape_executable_materialization: Some(shape_executable_materialization),
         shape_executable_cache,
         shape_executable_topology_digest: Some(executable.topology().digest()),
@@ -713,7 +865,7 @@ fn ensure_process_owned_pedersen_table(
 
 /// Compatibility hand-off for callers that already own a sealed witness. It
 /// still enforces arena-born base columns; a detached legacy witness is rejected
-/// before staging. New callers use [`with_resident_session_from_generator`].
+/// before staging. New callers use [`with_resident_pre_witness_session`].
 pub fn with_resident_session<R>(
     executable_cache: &mut ShapeExecutableCache,
     cache: &mut WorkspaceCache,
@@ -855,7 +1007,7 @@ fn recorded_input_matches_gather(
 fn resident_host_witness_inputs<'a>(
     recorded: &'a PlannedRecordedWitnessInputs,
     arena: &ProofArenaPlan,
-    generator: &'a CairoClaimGenerator,
+    input: &'a ResidentPreWitnessInput,
 ) -> Result<Vec<ResidentWitnessInputRoute<'a>>, ResidentSessionError> {
     if recorded.lanes.len() != arena.witness().components.len() {
         return Err(ResidentSessionError::PlannedShapeMismatch {
@@ -913,26 +1065,26 @@ fn resident_host_witness_inputs<'a>(
                             .unwrap_or(0),
                     });
                 }
-                let attempt = recorded_casm_input_attempt(generator, lane.component)
-                    .map_err(RecordedWitnessPlanError::Inputs)?
-                    .ok_or(ResidentSessionError::RecordedWitnessInputRoute {
+                let source = input.casm_words(lane.component)?.ok_or(
+                    ResidentSessionError::RecordedWitnessInputRoute {
                         component: lane.component,
                         ordinal: 0,
-                    })?;
-                if attempt.inputs.len() != casm.requirements.n_real_rows
-                    || attempt.include_iota != casm.requirements.include_iota
+                    },
+                )?;
+                if source.rows != casm.requirements.n_real_rows
+                    || source.include_iota != casm.requirements.include_iota
                 {
                     return Err(ResidentSessionError::PlannedShapeMismatch {
                         context: "borrowed Casm source vs planned row-major input",
                         component: Some(lane.component),
                         expected: casm.requirements.n_real_rows,
-                        actual: attempt.inputs.len(),
+                        actual: source.rows,
                     });
                 }
                 return Ok(ResidentWitnessInputRoute {
                     columns: Vec::new(),
                     seed_scalars: Vec::new(),
-                    casm_words: Some(bytemuck::cast_slice(attempt.inputs)),
+                    casm_words: Some(source.words),
                 });
             }
             if let Some(producer) = component.native_input_producer {
@@ -1116,10 +1268,10 @@ fn resident_host_witness_inputs<'a>(
         .collect()
 }
 
-/// Strict Graph-A hand-off. Planning and compact input extraction happen before
-/// workspace materialization; the legacy witness writer and host interaction
-/// generator are never executed on this path.
-pub fn with_resident_session_from_generator<R>(
+/// Strict Graph-A hand-off. The backend-tagged input owns either the legacy
+/// generator or the generator-free ReplacementV1 adapter output; policy drift
+/// is rejected before shape planning or workspace materialization.
+pub fn with_resident_pre_witness_session<R>(
     executable_cache: &mut ShapeExecutableCache,
     cache: &mut WorkspaceCache,
     request: ResidentPreWitnessSessionRequest,
@@ -1128,10 +1280,11 @@ pub fn with_resident_session_from_generator<R>(
         ResidentSessionArtifacts<'_>,
     ) -> Result<R, ResidentRuntimeError>,
 ) -> Result<(R, ResidentSessionTelemetry), ResidentSessionError> {
+    let session_start = Instant::now();
     let ResidentPreWitnessSessionRequest {
         preprocessed_trace,
-        generator,
-        capacity_plan,
+        input,
+        ingress_audit,
         channel_salt,
         pcs,
         include_all_preprocessed_columns,
@@ -1139,24 +1292,21 @@ pub fn with_resident_session_from_generator<R>(
         protocol_policy,
         execution_config,
     } = request;
-    let exact_plan = Arc::new(capacity_plan.strict_resident_exact(
+    let input_backend = input.backend();
+    validate_pre_witness_dispatch(
+        input_backend,
+        protocol_policy.resident_backend,
+        execution_config.resident_backend(),
+        ingress_audit.claim_generator_constructions,
+    )?;
+    let exact_plan = Arc::new(input.capacity_plan().strict_resident_exact(
         &crate::schedule_table::CAIRO_SCHEDULE,
         &crate::relation_table::CAIRO_RELATION_GRAPH,
     )?);
-    let ec_op_segment_start = generator
-        .ec_op_builtin
-        .as_ref()
-        .map(|ec_op| ec_op.ec_op_builtin_segment_start as usize);
+    let ec_op_segment_start = input.ec_op_segment_start();
     require_strict_resident_witness_coverage(&exact_plan)?;
-    let planned_claim = planned_cairo_claim(&generator, &exact_plan)?;
-    let recorded = match protocol_policy.resident_backend {
-        crate::arena_plan::ResidentBackend::LegacyResident => {
-            recorded_witness_inputs_for_plan(&generator, &exact_plan)?
-        }
-        crate::arena_plan::ResidentBackend::ReplacementV1 => {
-            recorded_witness_inputs_for_replacement_plan(&generator, &exact_plan)?
-        }
-    };
+    let planned_claim = input.planned_claim(&exact_plan)?;
+    let recorded = input.recorded_inputs(&exact_plan)?;
     recorded.require_resolved()?;
     let memory = &recorded.execution_memory;
     let public_memory_seed = public_memory_multiplicity_seed_words(&planned_claim, memory)?;
@@ -1186,12 +1336,8 @@ pub fn with_resident_session_from_generator<R>(
     } = selection;
 
     ensure_process_owned_pedersen_table(&executable)?;
-    let raw_address_to_id = memory
-        .address_to_id
-        .iter()
-        .map(|encoded| encoded.0)
-        .collect::<Vec<_>>();
-    let host_columns = resident_host_witness_inputs(&recorded, executable.arena(), &generator)?;
+    let raw_address_to_id: &[u32] = bytemuck::cast_slice(&memory.address_to_id);
+    let host_columns = resident_host_witness_inputs(&recorded, executable.arena(), &input)?;
     let witness_inputs = recorded
         .lanes
         .iter()
@@ -1242,7 +1388,7 @@ pub fn with_resident_session_from_generator<R>(
             executable.composition(),
             &composition_bindings,
             Some(ExecutionTablesHostData {
-                addr_to_id: &raw_address_to_id,
+                addr_to_id: raw_address_to_id,
                 f252_values: &memory.f252_values,
                 small_values: &memory.small_values,
             }),
@@ -1265,7 +1411,25 @@ pub fn with_resident_session_from_generator<R>(
                         .and_then(|next| bytes.checked_add(next))
                         .ok_or(ResidentSessionError::SizeOverflow)
                 })?;
+        let session_ns = session_start.elapsed().as_nanos();
         let mut telemetry = ResidentSessionTelemetry {
+            host_preparation: Some(ResidentHostPreparationAudit {
+                backend: input_backend,
+                ingest_ns: ingress_audit.ingest_ns,
+                session_ns,
+                total_ns: ingress_audit.ingest_ns.saturating_add(session_ns),
+                ownership: ResidentHostOwnershipContract {
+                    prover_input_moves: 1,
+                    prover_input_clones: 0,
+                    memory_slab_clones: 0,
+                    casm_slab_clones: 0,
+                    execution_memory_arc_clones: 1,
+                    recorded_program_arc_clones: usize::from(
+                        input_backend == ResidentBackend::ReplacementV1,
+                    ) * recorded.lanes.len(),
+                },
+                claim_generator_constructions: ingress_audit.claim_generator_constructions,
+            }),
             shape_executable_materialization: Some(executable_materialization),
             shape_executable_cache,
             shape_executable_topology_digest: Some(executable.topology().digest()),
@@ -1308,6 +1472,28 @@ pub fn with_resident_session_from_generator<R>(
     };
     telemetry.cache = cache.telemetry();
     Ok((result, telemetry))
+}
+
+fn validate_pre_witness_dispatch(
+    input: ResidentBackend,
+    policy: ResidentBackend,
+    runtime: ResidentBackend,
+    claim_generator_constructions: u64,
+) -> Result<(), ResidentSessionError> {
+    if input != policy || input != runtime {
+        return Err(ResidentSessionError::BackendInputMismatch {
+            input,
+            policy,
+            runtime,
+        });
+    }
+    let expected_generators = u64::from(input == ResidentBackend::LegacyResident);
+    if claim_generator_constructions != expected_generators {
+        return Err(ResidentSessionError::StrictArchitectureTelemetry(
+            "resident ingest claim-generator construction contract drifted",
+        ));
+    }
+    Ok(())
 }
 
 /// How the preflight bound the [`ProtocolPlanPolicy`]: to the AOT pack embedded
@@ -1379,7 +1565,7 @@ pub struct ResidentPreflightReport {
 }
 
 /// Plan the strict resident session end-to-end WITHOUT touching CUDA: the same
-/// fail-closed pipeline as [`with_resident_session_from_generator`] up to (and
+/// fail-closed pipeline as [`with_resident_pre_witness_session`] up to (and
 /// including) the full arena plan — ingest artifacts in, exact plan, strict
 /// witness coverage, planned claim, recorded witness inputs (`require_resolved`),
 /// Graph-A multiplicity plan, protocol/arena plan. Every failure is fail-closed;
@@ -1402,8 +1588,8 @@ pub fn plan_resident_preflight(
     )
 }
 
-/// Explicit resident-generation preflight. Replacement generations never read
-/// legacy topology flags, even when a loaded AOT pack is unavailable locally.
+/// Generator-backed preflight. Passing ReplacementV1 fails closed; replacement
+/// tooling must use [`plan_raw_resident_preflight`].
 pub fn plan_resident_preflight_for(
     generator: &CairoClaimGenerator,
     capacity_plan: &ProofPlan,
@@ -1413,14 +1599,34 @@ pub fn plan_resident_preflight_for(
     resident_backend: crate::arena_plan::ResidentBackend,
 ) -> Result<ResidentPreflightReport, ResidentPreflightError> {
     let mut executable_cache = ShapeExecutableCache::new(1).map_err(ResidentSessionError::from)?;
-    plan_resident_preflight_with_cache_for(
+    plan_resident_preflight_with_cache_source(
         &mut executable_cache,
-        generator,
+        ResidentPreflightSource::Legacy(generator),
         capacity_plan,
         preprocessed_trace,
         pcs,
         include_all_preprocessed_columns,
         resident_backend,
+    )
+}
+
+/// Generator-free ReplacementV1 preflight used by the production harness.
+pub fn plan_raw_resident_preflight(
+    input: &ResidentProverInputOwner,
+    capacity_plan: &ProofPlan,
+    preprocessed_trace: &PreProcessedTrace,
+    pcs: PcsConfig,
+    include_all_preprocessed_columns: bool,
+) -> Result<ResidentPreflightReport, ResidentPreflightError> {
+    let mut executable_cache = ShapeExecutableCache::new(1).map_err(ResidentSessionError::from)?;
+    plan_resident_preflight_with_cache_source(
+        &mut executable_cache,
+        ResidentPreflightSource::Replacement(input),
+        capacity_plan,
+        preprocessed_trace,
+        pcs,
+        include_all_preprocessed_columns,
+        ResidentBackend::ReplacementV1,
     )
 }
 
@@ -1454,6 +1660,71 @@ pub fn plan_resident_preflight_with_cache_for(
     include_all_preprocessed_columns: bool,
     resident_backend: crate::arena_plan::ResidentBackend,
 ) -> Result<ResidentPreflightReport, ResidentPreflightError> {
+    plan_resident_preflight_with_cache_source(
+        executable_cache,
+        ResidentPreflightSource::Legacy(generator),
+        capacity_plan,
+        preprocessed_trace,
+        pcs,
+        include_all_preprocessed_columns,
+        resident_backend,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ResidentPreflightSource<'a> {
+    Legacy(&'a CairoClaimGenerator),
+    Replacement(&'a ResidentProverInputOwner),
+}
+
+impl ResidentPreflightSource<'_> {
+    const fn backend(self) -> ResidentBackend {
+        match self {
+            Self::Legacy(_) => ResidentBackend::LegacyResident,
+            Self::Replacement(_) => ResidentBackend::ReplacementV1,
+        }
+    }
+
+    fn planned_claim(self, exact_plan: &ProofPlan) -> Result<CairoClaim, ResidentSessionError> {
+        Ok(match self {
+            Self::Legacy(generator) => planned_cairo_claim(generator, exact_plan)?,
+            Self::Replacement(input) => {
+                planned_cairo_claim_from_public_data(input.public_data(), exact_plan)?
+            }
+        })
+    }
+
+    fn recorded_inputs(
+        self,
+        exact_plan: &ProofPlan,
+    ) -> Result<PlannedRecordedWitnessInputs, ResidentSessionError> {
+        Ok(match self {
+            Self::Legacy(generator) => recorded_witness_inputs_for_plan(generator, exact_plan)?,
+            Self::Replacement(input) => {
+                recorded_witness_inputs_for_raw_replacement_plan(input, exact_plan)?
+            }
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_resident_preflight_with_cache_source(
+    executable_cache: &mut ShapeExecutableCache,
+    source: ResidentPreflightSource<'_>,
+    capacity_plan: &ProofPlan,
+    preprocessed_trace: &PreProcessedTrace,
+    pcs: PcsConfig,
+    include_all_preprocessed_columns: bool,
+    resident_backend: ResidentBackend,
+) -> Result<ResidentPreflightReport, ResidentPreflightError> {
+    if source.backend() != resident_backend {
+        return Err(ResidentSessionError::BackendInputMismatch {
+            input: source.backend(),
+            policy: resident_backend,
+            runtime: resident_backend,
+        }
+        .into());
+    }
     let exact_plan = capacity_plan
         .strict_resident_exact(
             &crate::schedule_table::CAIRO_SCHEDULE,
@@ -1461,17 +1732,8 @@ pub fn plan_resident_preflight_with_cache_for(
         )
         .map_err(ResidentSessionError::from)?;
     require_strict_resident_witness_coverage(&exact_plan).map_err(ResidentSessionError::from)?;
-    let planned_claim =
-        planned_cairo_claim(generator, &exact_plan).map_err(ResidentSessionError::from)?;
-    let recorded = match resident_backend {
-        crate::arena_plan::ResidentBackend::LegacyResident => {
-            recorded_witness_inputs_for_plan(generator, &exact_plan)
-        }
-        crate::arena_plan::ResidentBackend::ReplacementV1 => {
-            recorded_witness_inputs_for_replacement_plan(generator, &exact_plan)
-        }
-    }
-    .map_err(ResidentSessionError::from)?;
+    let planned_claim = source.planned_claim(&exact_plan)?;
+    let recorded = source.recorded_inputs(&exact_plan)?;
     recorded
         .require_resolved()
         .map_err(ResidentSessionError::from)?;
@@ -1642,7 +1904,7 @@ mod tests {
     }
 
     /// Host-side replication of the pre-witness session planning
-    /// (`with_resident_session_from_generator` up to the
+    /// (`with_resident_pre_witness_session` up to the
     /// `resident_host_witness_inputs` shape check), so a recorded-lane vs
     /// arena-plan drift is caught on any machine instead of surfacing as an
     /// opaque `PlannedShapeMismatch` twenty minutes into an H100 parity run.
@@ -2202,7 +2464,7 @@ mod tests {
         use stwo_backend_cuda::ArenaSlotId;
 
         let mut failures = Vec::new();
-        let mut check_slot = |failures: &mut Vec<String>,
+        let check_slot = |failures: &mut Vec<String>,
                               component: &str,
                               kind: &str,
                               label: String,
@@ -2515,6 +2777,21 @@ mod tests {
     fn strict_telemetry_admits_only_the_prepared_replacement_schedule() {
         let policy = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
         let valid = ResidentSessionTelemetry {
+            host_preparation: Some(ResidentHostPreparationAudit {
+                backend: ResidentBackend::ReplacementV1,
+                ingest_ns: 10,
+                session_ns: 20,
+                total_ns: 30,
+                ownership: ResidentHostOwnershipContract {
+                    prover_input_moves: 1,
+                    prover_input_clones: 0,
+                    memory_slab_clones: 0,
+                    casm_slab_clones: 0,
+                    execution_memory_arc_clones: 1,
+                    recorded_program_arc_clones: 35,
+                },
+                claim_generator_constructions: 0,
+            }),
             shape_executable_topology_digest: Some([7; 32]),
             workspace_key: Some(WorkspaceKey::new(
                 stwo_cairo_prover::witness::proof_shape::ProofShapeKey(9),
@@ -2547,6 +2824,60 @@ mod tests {
             .unwrap()
             .retained_lde_budget_bytes -= 1;
         assert!(drifted_policy.require_strict_graph_a().is_err());
+    }
+
+    #[test]
+    fn pre_witness_dispatch_is_backend_sealed_and_counts_generators() {
+        assert!(validate_pre_witness_dispatch(
+            ResidentBackend::ReplacementV1,
+            ResidentBackend::ReplacementV1,
+            ResidentBackend::ReplacementV1,
+            0,
+        )
+        .is_ok());
+        assert!(validate_pre_witness_dispatch(
+            ResidentBackend::LegacyResident,
+            ResidentBackend::LegacyResident,
+            ResidentBackend::LegacyResident,
+            1,
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_pre_witness_dispatch(
+                ResidentBackend::ReplacementV1,
+                ResidentBackend::LegacyResident,
+                ResidentBackend::ReplacementV1,
+                0,
+            ),
+            Err(ResidentSessionError::BackendInputMismatch { .. })
+        ));
+        assert!(matches!(
+            validate_pre_witness_dispatch(
+                ResidentBackend::ReplacementV1,
+                ResidentBackend::ReplacementV1,
+                ResidentBackend::LegacyResident,
+                0,
+            ),
+            Err(ResidentSessionError::BackendInputMismatch { .. })
+        ));
+        assert!(matches!(
+            validate_pre_witness_dispatch(
+                ResidentBackend::ReplacementV1,
+                ResidentBackend::ReplacementV1,
+                ResidentBackend::ReplacementV1,
+                1,
+            ),
+            Err(ResidentSessionError::StrictArchitectureTelemetry(_))
+        ));
+        assert!(matches!(
+            validate_pre_witness_dispatch(
+                ResidentBackend::LegacyResident,
+                ResidentBackend::LegacyResident,
+                ResidentBackend::LegacyResident,
+                0,
+            ),
+            Err(ResidentSessionError::StrictArchitectureTelemetry(_))
+        ));
     }
 
     #[test]

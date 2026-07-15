@@ -5,6 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Instant;
 
 use cairo_air::cairo_components::CairoComponents;
 use cairo_air::claims::{lookup_sum, CairoClaim, CairoInteractionClaim};
@@ -61,14 +62,16 @@ use crate::resident_runtime::{
     SealedResidentExecutionConfig,
 };
 use crate::resident_session::{
-    with_resident_session, with_resident_session_from_generator, ResidentExecutionReadiness,
-    ResidentPreWitnessSessionRequest, ResidentPreparationState, ResidentSessionArtifacts,
-    ResidentSessionError, ResidentSessionRequest, ResidentSessionTelemetry,
+    with_resident_pre_witness_session, with_resident_session, ResidentExecutionReadiness,
+    ResidentIngressAudit, ResidentPreWitnessInput, ResidentPreWitnessSessionRequest,
+    ResidentPreparationState, ResidentSessionArtifacts, ResidentSessionError,
+    ResidentSessionRequest, ResidentSessionTelemetry,
 };
+use crate::resident_shape::RawResidentShapeError;
 use crate::schedule::ScheduleError;
 use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::shape_executable::{ShapeExecutable, ShapeExecutableCache};
-use crate::state::{IngestOutput, WitnessOutput};
+use crate::state::{IngestOutput, ReplacementIngestOutput, WitnessOutput};
 use crate::workspace_cache::{
     WorkspaceCache, WorkspaceCacheError, WorkspaceKey, WorkspaceMaterialization,
 };
@@ -155,6 +158,7 @@ pub enum GpuError {
     Graph(GraphError),
     WorkspaceCache(WorkspaceCacheError),
     ResidentSession(ResidentSessionError),
+    RawResidentShape(RawResidentShapeError),
     ProofAssembly(Blake2sProofAssemblyError),
 }
 
@@ -391,6 +395,12 @@ impl From<ResidentSessionError> for GpuError {
     }
 }
 
+impl From<RawResidentShapeError> for GpuError {
+    fn from(e: RawResidentShapeError) -> Self {
+        GpuError::RawResidentShape(e)
+    }
+}
+
 impl From<Blake2sProofAssemblyError> for GpuError {
     fn from(e: Blake2sProofAssemblyError) -> Self {
         GpuError::ProofAssembly(e)
@@ -408,6 +418,7 @@ impl std::fmt::Display for GpuError {
             GpuError::Graph(e) => write!(f, "gpu-prover CUDA graph error: {e}"),
             GpuError::WorkspaceCache(e) => write!(f, "gpu-prover workspace cache error: {e}"),
             GpuError::ResidentSession(e) => write!(f, "gpu-prover resident session error: {e}"),
+            GpuError::RawResidentShape(e) => write!(f, "gpu-prover raw resident shape error: {e}"),
             GpuError::ProofAssembly(e) => write!(f, "gpu-prover proof assembly error: {e}"),
         }
     }
@@ -663,6 +674,71 @@ struct PendingGpuCairoProver {
     witness_artifact_plan: Arc<WitnessArtifactPlan>,
 }
 
+pub(crate) struct PreparedResidentIngest {
+    pub preprocessed_trace:
+        Arc<stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace>,
+    pub input: ResidentPreWitnessInput,
+    pub audit: ResidentIngressAudit,
+}
+
+/// The sole production backend dispatch before a resident session. The input
+/// is consumed exactly once; the replacement arm cannot name or construct a
+/// `CairoClaimGenerator`.
+pub(crate) fn prepare_resident_ingest(
+    backend: ResidentBackend,
+    input: ProverInput,
+    variant: stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant,
+    opt_n_id_to_big_components: Option<usize>,
+) -> Result<PreparedResidentIngest, GpuError> {
+    let start = Instant::now();
+    let before = stwo_cairo_prover::witness::cairo::claim_generator_constructions();
+    let (preprocessed_trace, input) = match backend {
+        ResidentBackend::LegacyResident => {
+            let IngestOutput {
+                preprocessed_trace,
+                generator,
+                proof_plan,
+            } = phases::ingest::run(input, variant, opt_n_id_to_big_components);
+            (
+                preprocessed_trace,
+                ResidentPreWitnessInput::LegacyResident {
+                    generator,
+                    capacity_plan: proof_plan,
+                },
+            )
+        }
+        ResidentBackend::ReplacementV1 => {
+            let ReplacementIngestOutput {
+                preprocessed_trace,
+                input,
+                proof_plan,
+            } = phases::ingest::run_replacement(input, variant, opt_n_id_to_big_components)?;
+            (
+                preprocessed_trace,
+                ResidentPreWitnessInput::ReplacementV1 {
+                    input,
+                    capacity_plan: proof_plan,
+                },
+            )
+        }
+    };
+    let claim_generator_constructions =
+        stwo_cairo_prover::witness::cairo::claim_generator_constructions().saturating_sub(before);
+    if backend == ResidentBackend::ReplacementV1 && claim_generator_constructions != 0 {
+        return Err(GpuError::Config(
+            "ReplacementV1 ingest constructed a CairoClaimGenerator".to_owned(),
+        ));
+    }
+    Ok(PreparedResidentIngest {
+        preprocessed_trace,
+        input,
+        audit: ResidentIngressAudit {
+            ingest_ns: start.elapsed().as_nanos(),
+            claim_generator_constructions,
+        },
+    })
+}
+
 impl PendingGpuCairoProver {
     fn commit<MC>(self) -> GpuCairoProver<MC>
     where
@@ -866,25 +942,26 @@ where
             ));
         }
 
-        let IngestOutput {
+        let PreparedResidentIngest {
             preprocessed_trace,
-            generator,
-            proof_plan,
-        } = phases::ingest::run(
+            input,
+            audit,
+        } = prepare_resident_ingest(
+            self.config.resident_backend,
             input,
             params.preprocessed_trace,
             params.opt_n_id_to_big_components,
-        );
+        )?;
         let protocol_policy = self.resident_protocol_policy.ok_or_else(|| {
             GpuError::Config("strict resident protocol policy was not resolved".to_string())
         })?;
-        Ok(with_resident_session_from_generator(
+        Ok(with_resident_pre_witness_session(
             &mut self.shape_executable_cache,
             &mut self.workspace_cache,
             ResidentPreWitnessSessionRequest {
                 preprocessed_trace,
-                generator,
-                capacity_plan: proof_plan,
+                input,
+                ingress_audit: audit,
                 channel_salt: params.channel_salt,
                 pcs: params.pcs_config,
                 include_all_preprocessed_columns: params.include_all_preprocessed_columns,

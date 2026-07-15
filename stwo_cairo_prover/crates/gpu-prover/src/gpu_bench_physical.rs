@@ -103,6 +103,7 @@ pub(crate) fn resident_session_telemetry_json(
     });
     let missing_physical_ids = telemetry.physical_memory_inputs.missing_allocation_ids();
     let policy = telemetry.protocol_policy;
+    let host = telemetry.host_preparation;
     let topology_digest = telemetry.shape_executable_topology_digest.map(|digest| {
         digest
             .iter()
@@ -127,6 +128,15 @@ pub(crate) fn resident_session_telemetry_json(
         };
     json!({
         "gpu_graph_a_setup_gate_passed": telemetry.require_strict_graph_a().is_ok(),
+        "gpu_host_preparation_total_ns": host.map(|value| value.total_ns),
+        "gpu_host_preparation_ingest_ns": host.map(|value| value.ingest_ns),
+        "gpu_host_preparation_session_ns": host.map(|value| value.session_ns),
+        "gpu_host_claim_generator_constructions": host.map(|value| value.claim_generator_constructions),
+        "gpu_host_structural_prover_input_clones": host.map(|value| value.ownership.prover_input_clones),
+        "gpu_host_structural_memory_slab_clones": host.map(|value| value.ownership.memory_slab_clones),
+        "gpu_host_structural_casm_slab_clones": host.map(|value| value.ownership.casm_slab_clones),
+        "gpu_host_structural_execution_memory_arc_clones": host.map(|value| value.ownership.execution_memory_arc_clones),
+        "gpu_host_structural_recorded_program_arc_clones": host.map(|value| value.ownership.recorded_program_arc_clones),
         "gpu_resident_backend": policy.map(|value| value.resident_backend.cli_name()),
         "gpu_protocol_key": telemetry.workspace_key.map(|value| value.protocol_key),
         "gpu_arena_words": telemetry.arena_words,

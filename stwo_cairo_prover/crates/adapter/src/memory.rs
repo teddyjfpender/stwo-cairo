@@ -243,7 +243,8 @@ impl DerefMut for MemoryBuilder {
 /// Cannot be assigned as a valid ID, as [`DEFAULT_ID`] > 2**[`LOG_MEMORY_ADDRESS_BOUND`].
 pub const DEFAULT_ID: u32 = LARGE_MEMORY_VALUE_ID_BASE - 1;
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[repr(transparent)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Pod, Zeroable)]
 pub struct EncodedMemoryValueId(pub u32);
 impl EncodedMemoryValueId {
     pub fn encode(value: MemoryValueId) -> EncodedMemoryValueId {

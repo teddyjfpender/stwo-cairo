@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cairo_vm::types::layout_name::LayoutName;
+use stwo_cairo_adapter::opcodes::RECORDED_CASM_DESCRIPTORS;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
@@ -10,12 +11,15 @@ use stwo_cairo_prover::witness::jit_prove_backend::{
     lane_recording_metadata_initialization_count, ExecutionMemoryIdentity,
 };
 
+use crate::arena_plan::ResidentBackend;
 use crate::phases;
+use crate::prover::{prepare_resident_ingest, GpuError, PreparedResidentIngest};
 use crate::recorded_witness_inputs::{
     recorded_witness_inputs_for_raw_replacement_plan, recorded_witness_inputs_for_replacement_plan,
 };
 use crate::relation_table::CAIRO_RELATION_GRAPH;
 use crate::resident_input::ResidentProverInputOwner;
+use crate::resident_session::ResidentPreWitnessInput;
 use crate::resident_shape::{raw_replacement_proof_plan, RawResidentShapeError};
 use crate::resident_witness::{planned_cairo_claim, planned_cairo_claim_from_public_data};
 use crate::schedule_table::CAIRO_SCHEDULE;
@@ -179,11 +183,102 @@ fn raw_replacement_fails_closed_on_nonempty_generic_opcode() {
         .casm_states_by_opcode
         .generic_opcode
         .push(input.state_transitions.initial_state);
-    let owner = ResidentProverInputOwner::encode(input);
-    let preprocessed = Arc::new(PreProcessedTraceVariant::Canonical.to_preprocessed_trace());
     assert!(matches!(
-        raw_replacement_proof_plan(&owner, preprocessed, None),
-        Err(RawResidentShapeError::GenericOpcodeUnsupported { rows: 1 })
+        prepare_resident_ingest(
+            ResidentBackend::ReplacementV1,
+            input,
+            PreProcessedTraceVariant::Canonical,
+            None,
+        ),
+        Err(GpuError::RawResidentShape(
+            RawResidentShapeError::GenericOpcodeUnsupported { rows: 1 }
+        ))
+    ));
+}
+
+#[test]
+fn raw_replacement_production_ingest_is_move_only_and_generator_free() {
+    let input = run_and_adapt(
+        &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .unwrap();
+    let address_to_id = input.memory.address_to_id.as_ptr();
+    let f252_values = input.memory.f252_values.as_ptr();
+    let small_values = input.memory.small_values.as_ptr();
+    let public_memory_addresses = input.public_memory_addresses.as_ptr();
+    let casm_states = RECORDED_CASM_DESCRIPTORS
+        .iter()
+        .filter_map(|descriptor| {
+            let states = descriptor.states(&input.state_transitions.casm_states_by_opcode);
+            (!states.is_empty()).then_some((descriptor.label, states.as_ptr(), states.len()))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !casm_states.is_empty(),
+        "fixture must contain recorded Casm lanes"
+    );
+    let constructions = stwo_cairo_prover::witness::cairo::claim_generator_constructions();
+
+    let PreparedResidentIngest {
+        input,
+        audit,
+        preprocessed_trace: _,
+    } = prepare_resident_ingest(
+        ResidentBackend::ReplacementV1,
+        input,
+        PreProcessedTraceVariant::Canonical,
+        None,
+    )
+    .unwrap();
+    assert_eq!(audit.claim_generator_constructions, 0);
+    assert_eq!(
+        stwo_cairo_prover::witness::cairo::claim_generator_constructions(),
+        constructions
+    );
+    assert!(audit.ingest_ns > 0);
+    let ResidentPreWitnessInput::ReplacementV1 { input, .. } = input else {
+        panic!("replacement dispatch returned a legacy generator")
+    };
+    assert_eq!(
+        input.execution_memory().address_to_id.as_ptr(),
+        address_to_id
+    );
+    assert_eq!(input.execution_memory().f252_values.as_ptr(), f252_values);
+    assert_eq!(input.execution_memory().small_values.as_ptr(), small_values);
+    assert_eq!(
+        input.public_memory_addresses().as_ptr(),
+        public_memory_addresses
+    );
+    for (label, pointer, rows) in casm_states {
+        let moved = input.casm_input(label).unwrap().states;
+        assert_eq!(moved.len(), rows, "{label}");
+        assert_eq!(moved.as_ptr(), pointer, "{label}");
+    }
+}
+
+#[test]
+fn raw_replacement_dispatch_preserves_legacy_generator_path() {
+    let input = run_and_adapt(
+        &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .unwrap();
+    let PreparedResidentIngest { input, audit, .. } = prepare_resident_ingest(
+        ResidentBackend::LegacyResident,
+        input,
+        PreProcessedTraceVariant::Canonical,
+        None,
+    )
+    .unwrap();
+    assert_eq!(audit.claim_generator_constructions, 1);
+    assert!(matches!(
+        input,
+        ResidentPreWitnessInput::LegacyResident { .. }
     ));
 }
 

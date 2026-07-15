@@ -20,6 +20,7 @@ use stwo_cairo_prover::witness::exec_context::{
 use stwo_cairo_prover::witness::memory_witness_backend::MemoryIdToBigWitness;
 
 use crate::plan::ProofPlan;
+use crate::resident_input::ResidentProverInputOwner;
 
 /// Output of the ingest phase: the preprocessed trace and the claim generator
 /// (adapter output digested into per-component packed inputs).
@@ -28,6 +29,14 @@ pub struct IngestOutput {
     pub generator: CairoClaimGenerator,
     /// The generated component/relation capacity contract. It is retained for
     /// the whole proof instead of being collapsed to a shape key after ingest.
+    pub proof_plan: Arc<ProofPlan>,
+}
+
+/// Generator-free ingest result owned by the ReplacementV1 session. Every
+/// adapter allocation is moved once into `input`; no witness slab is rebuilt.
+pub struct ReplacementIngestOutput {
+    pub preprocessed_trace: Arc<PreProcessedTrace>,
+    pub input: ResidentProverInputOwner,
     pub proof_plan: Arc<ProofPlan>,
 }
 
