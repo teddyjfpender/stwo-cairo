@@ -633,6 +633,9 @@ pub enum QuotientNumeratorSchedule {
     #[default]
     LegacyBatches = 0,
     HybridSingleWrite = 1,
+    /// Coefficient-inclusive replacement schedule: materialize each required
+    /// LDE into arena-owned epoch roles, then write every useful row once.
+    StagedPackedSingleWrite = 2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1560,17 +1563,45 @@ impl ProtocolGeometry {
             &numerator_topologies,
         )
         .map_err(ArenaPlanError::QuotientNumerator)?;
-        if self.identity.quotient_numerator_schedule == QuotientNumeratorSchedule::HybridSingleWrite
+        if (self.identity.resident_backend == ResidentBackend::ReplacementV1)
+            != (self.identity.quotient_numerator_schedule
+                == QuotientNumeratorSchedule::StagedPackedSingleWrite)
         {
-            let hybrid = quotient_numerator_hybrid_plan(
-                self.quotient_numerator_workspace_config()?,
-                &numerator_topologies,
-            )
-            .map_err(ArenaPlanError::QuotientNumeratorSchedule)?;
-            if hybrid.requirements() != &numerator_requirements {
-                return Err(ArenaPlanError::InvalidProtocolGeometry(
-                    "hybrid numerator requirements drifted from the canonical workspace",
-                ));
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "replacement-v1 and staged packed numerator identities must be selected together",
+            ));
+        }
+        match self.identity.quotient_numerator_schedule {
+            QuotientNumeratorSchedule::LegacyBatches => {}
+            QuotientNumeratorSchedule::HybridSingleWrite => {
+                let hybrid = quotient_numerator_hybrid_plan(
+                    self.quotient_numerator_workspace_config()?,
+                    &numerator_topologies,
+                )
+                .map_err(ArenaPlanError::QuotientNumeratorSchedule)?;
+                if hybrid.requirements() != &numerator_requirements {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "hybrid numerator requirements drifted from the canonical workspace",
+                    ));
+                }
+            }
+            QuotientNumeratorSchedule::StagedPackedSingleWrite => {
+                if self.identity.resident_backend != ResidentBackend::ReplacementV1 {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "staged packed numerator is restricted to replacement-v1",
+                    ));
+                }
+                let staged = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+                    self.quotient_numerator_workspace_config()?,
+                    &numerator_topologies,
+                    &[usize::MAX],
+                )
+                .map_err(ArenaPlanError::QuotientNumeratorStaged)?;
+                if staged.requirements() != &numerator_requirements {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "staged numerator requirements drifted from the canonical workspace",
+                    ));
+                }
             }
         }
         let numerator_logs = numerator_requirements
@@ -8105,8 +8136,8 @@ fn append_protocol_buffers(
         .iter()
         .map(|&(_, _, words)| words)
         .collect::<Vec<_>>();
-    let staged_single_write = (protocol.identity.resident_backend
-        == ResidentBackend::ReplacementV1)
+    let staged_single_write = (protocol.identity.quotient_numerator_schedule
+        == QuotientNumeratorSchedule::StagedPackedSingleWrite)
         .then(|| {
             quotient_numerator_staged_single_write_plan_with_overflow_capacities(
                 quotient_numerator_config,
@@ -9001,7 +9032,7 @@ fn resolve_quotient_numerator_slots(
             }
             if !workspace_ids.insert(staging.physical) {
                 return Err(ArenaPlanError::InvalidProtocolGeometry(
-                    "staged quotient overflow aliases a live numerator role",
+                    "staged quotient overflow aliases a live numerator role or another overflow",
                 ));
             }
             Ok(PlannedStagedQuotientOverflow {
@@ -9012,14 +9043,6 @@ fn resolve_quotient_numerator_slots(
             })
         })
         .collect::<Result<Vec<_>, ArenaPlanError>>()?;
-    if staged_overflows
-        .windows(2)
-        .any(|pair| pair[0].staging.physical == pair[1].staging.physical)
-    {
-        return Err(ArenaPlanError::InvalidProtocolGeometry(
-            "staged quotient overflow roles share one released slab",
-        ));
-    }
     let columns = logical
         .columns
         .into_iter()

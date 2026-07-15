@@ -122,6 +122,7 @@ fn numerator_schedule_name(value: QuotientNumeratorSchedule) -> &'static str {
     match value {
         QuotientNumeratorSchedule::LegacyBatches => "legacy-batches",
         QuotientNumeratorSchedule::HybridSingleWrite => "hybrid-single-write",
+        QuotientNumeratorSchedule::StagedPackedSingleWrite => "staged-packed-single-write",
     }
 }
 

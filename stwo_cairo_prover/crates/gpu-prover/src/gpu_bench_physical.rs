@@ -124,6 +124,9 @@ pub(crate) fn resident_session_telemetry_json(
                 Some(eligible_groups),
                 Some(legacy_groups),
             ),
+            Some(PreparedNumeratorSchedule::StagedPackedSingleWrite { .. }) => {
+                (Some("staged-packed-single-write"), None, Some(0))
+            }
             None => (None, None, None),
         };
     json!({
@@ -213,6 +216,7 @@ fn numerator_schedule_name(schedule: QuotientNumeratorSchedule) -> &'static str 
     match schedule {
         QuotientNumeratorSchedule::LegacyBatches => "legacy-batches",
         QuotientNumeratorSchedule::HybridSingleWrite => "hybrid-single-write",
+        QuotientNumeratorSchedule::StagedPackedSingleWrite => "staged-packed-single-write",
     }
 }
 
@@ -289,9 +293,8 @@ mod tests {
     fn replacement_policy_and_actual_schedule_are_machine_readable() {
         let telemetry = ResidentSessionTelemetry {
             protocol_policy: Some(ProtocolPlanPolicy::replacement_v1(0x1234, 2048)),
-            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::HybridCandidate {
-                eligible_groups: 18,
-                legacy_groups: 1,
+            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::StagedPackedSingleWrite {
+                packed_output_rows: 50_331_088,
             }),
             workspace_key: Some(WorkspaceKey::new(ProofShapeKey(0), 0x5678)),
             arena_words: 123,
@@ -304,14 +307,14 @@ mod tests {
         assert_eq!(value["gpu_protocol_key"], 0x5678);
         assert_eq!(
             value["gpu_planned_numerator_schedule"],
-            "hybrid-single-write"
+            "staged-packed-single-write"
         );
         assert_eq!(
             value["gpu_prepared_numerator_schedule"],
-            "hybrid-single-write"
+            "staged-packed-single-write"
         );
-        assert_eq!(value["gpu_prepared_numerator_eligible_groups"], 18);
-        assert_eq!(value["gpu_prepared_numerator_legacy_groups"], 1);
+        assert!(value["gpu_prepared_numerator_eligible_groups"].is_null());
+        assert_eq!(value["gpu_prepared_numerator_legacy_groups"], 0);
         assert_eq!(value["gpu_policy_commit_mode"], "domain-progressive");
         assert_eq!(
             value["gpu_policy_interpolation_mode"],

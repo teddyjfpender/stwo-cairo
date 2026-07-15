@@ -394,6 +394,10 @@ impl ResidentSessionTelemetry {
                     eligible_groups, ..
                 },
             ) => eligible_groups != 0,
+            (
+                crate::arena_plan::QuotientNumeratorSchedule::StagedPackedSingleWrite,
+                PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows },
+            ) => packed_output_rows != 0,
             _ => false,
         };
         if !schedule_matches {
@@ -2798,9 +2802,8 @@ mod tests {
                 11,
             )),
             protocol_policy: Some(policy),
-            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::HybridCandidate {
-                eligible_groups: 18,
-                legacy_groups: 1,
+            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::StagedPackedSingleWrite {
+                packed_output_rows: 1,
             }),
             execution_tables_ingest: Some(PreparedExecutionTablesIngestTelemetry {
                 compact_h2d_bytes: 0,

@@ -6,11 +6,12 @@
 //! dependency order. No caller may recreate quotient constants on the host.
 
 use stwo_backend_cuda::{
-    ArenaError, ArenaSlice, OodsColumnSource, OodsPolynomialColumn, OodsSourceKind,
-    PreparedNumeratorSchedule, PreparedOodsError, PreparedOodsGraph, PreparedQuotientError,
-    PreparedQuotientGraph, PreparedQuotientNumeratorError, PreparedQuotientNumeratorGraph,
-    QuotientNumeratorColumn, QuotientNumeratorColumnSource, QuotientNumeratorDestination,
-    QuotientNumeratorSingleWriteError, QuotientNumeratorSourceKind,
+    quotient_numerator_staged_single_write_plan_with_overflow_capacities, ArenaError, ArenaSlice,
+    OodsColumnSource, OodsPolynomialColumn, OodsSourceKind, PreparedNumeratorSchedule,
+    PreparedOodsError, PreparedOodsGraph, PreparedQuotientError, PreparedQuotientGraph,
+    PreparedQuotientNumeratorError, PreparedQuotientNumeratorGraph, QuotientNumeratorColumn,
+    QuotientNumeratorColumnSource, QuotientNumeratorDestination, QuotientNumeratorSingleWriteError,
+    QuotientNumeratorSourceKind, QuotientNumeratorStagedSingleWriteError,
 };
 
 use crate::arena_plan::{ArenaBinding, OpenedColumnSource, QuotientNumeratorSchedule};
@@ -48,6 +49,8 @@ pub enum ResidentOodsError {
     Oods(PreparedOodsError),
     Numerator(PreparedQuotientNumeratorError),
     NumeratorSchedule(QuotientNumeratorSingleWriteError),
+    NumeratorStagedSchedule(QuotientNumeratorStagedSingleWriteError),
+    StagedNumeratorBinding(&'static str),
     Quotient(PreparedQuotientError),
 }
 
@@ -80,6 +83,12 @@ impl From<PreparedQuotientNumeratorError> for ResidentOodsError {
 impl From<QuotientNumeratorSingleWriteError> for ResidentOodsError {
     fn from(value: QuotientNumeratorSingleWriteError) -> Self {
         Self::NumeratorSchedule(value)
+    }
+}
+
+impl From<QuotientNumeratorStagedSingleWriteError> for ResidentOodsError {
+    fn from(value: QuotientNumeratorStagedSingleWriteError) -> Self {
+        Self::NumeratorStagedSchedule(value)
     }
 }
 
@@ -238,6 +247,13 @@ impl<'a> ResidentOodsPipeline<'a> {
         let first_linear_terms_destination =
             bind_logical(workspace, numerator_plan.first_linear_terms_destination)?;
         let forward_twiddles = bind_logical(workspace, numerator_plan.forward_twiddles)?;
+        if (numerator_plan.schedule == QuotientNumeratorSchedule::StagedPackedSingleWrite)
+            != numerator_plan.staged_single_write.is_some()
+        {
+            return Err(ResidentOodsError::StagedNumeratorBinding(
+                "planned schedule and staged quotient manifest presence differ",
+            ));
+        }
         let numerator = match numerator_plan.schedule {
             QuotientNumeratorSchedule::LegacyBatches => PreparedQuotientNumeratorGraph::prepare(
                 arena,
@@ -267,6 +283,80 @@ impl<'a> ResidentOodsPipeline<'a> {
                     &numerator_plan.slots,
                 )?
             }
+            QuotientNumeratorSchedule::StagedPackedSingleWrite => {
+                let staged = numerator_plan.staged_single_write.as_ref().ok_or(
+                    ResidentOodsError::StagedNumeratorBinding(
+                        "replacement schedule has no staged quotient manifest",
+                    ),
+                )?;
+                if staged.requirements() != &numerator_plan.requirements {
+                    return Err(ResidentOodsError::StagedNumeratorBinding(
+                        "staged quotient manifest differs from the arena requirements",
+                    ));
+                }
+                let rebound_topology = numerator_plan
+                    .columns
+                    .iter()
+                    .map(|column| column.topology.clone())
+                    .collect::<Vec<_>>();
+                let rebound_capacities = numerator_plan
+                    .staged_overflows
+                    .iter()
+                    .map(|role| role.staging.len_words)
+                    .collect::<Vec<_>>();
+                let rebound = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
+                    numerator_plan.config,
+                    &rebound_topology,
+                    &rebound_capacities,
+                )?;
+                if &rebound != staged {
+                    return Err(ResidentOodsError::StagedNumeratorBinding(
+                        "runtime arena roles recompile to a different staged quotient program",
+                    ));
+                }
+                let role_words = staged.overflow_role_words();
+                if role_words.len() != numerator_plan.staged_overflows.len() {
+                    return Err(ResidentOodsError::StagedNumeratorBinding(
+                        "staged quotient manifest and arena role counts differ",
+                    ));
+                }
+                let overflow_roles = numerator_plan
+                    .staged_overflows
+                    .iter()
+                    .zip(role_words)
+                    .map(|(role, required_words)| {
+                        if role.used_words != required_words
+                            || role.used_words > role.staging.len_words
+                            || role.released_slab.physical != role.staging.physical
+                            || role.released_slab.len_words != role.staging.len_words
+                        {
+                            return Err(ResidentOodsError::StagedNumeratorBinding(
+                                "staged quotient role is not its exact released arena slab",
+                            ));
+                        }
+                        bind_exact(
+                            workspace,
+                            role.staging,
+                            role.staging.len_words,
+                            "staged quotient overflow role",
+                        )
+                    })
+                    .collect::<Result<Vec<_>, ResidentOodsError>>()?;
+                PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
+                    arena,
+                    numerator_plan.config,
+                    &numerator_columns,
+                    oods_sample_points,
+                    oods_sampled_values,
+                    random_coefficient,
+                    sample_points_destination,
+                    first_linear_terms_destination,
+                    &destinations,
+                    forward_twiddles,
+                    &numerator_plan.slots,
+                    &overflow_roles,
+                )?
+            }
         };
         let schedule_matches = matches!(
             (numerator_plan.schedule, numerator.schedule()),
@@ -276,8 +366,22 @@ impl<'a> ResidentOodsPipeline<'a> {
             ) | (
                 QuotientNumeratorSchedule::HybridSingleWrite,
                 PreparedNumeratorSchedule::HybridCandidate { .. }
+            ) | (
+                QuotientNumeratorSchedule::StagedPackedSingleWrite,
+                PreparedNumeratorSchedule::StagedPackedSingleWrite { .. }
             )
         );
+        if let (
+            Some(staged),
+            PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows },
+        ) = (&numerator_plan.staged_single_write, numerator.schedule())
+        {
+            if packed_output_rows != staged.packed_output_rows() {
+                return Err(ResidentOodsError::StagedNumeratorBinding(
+                    "prepared packed row count differs from the sealed arena manifest",
+                ));
+            }
+        }
         if !schedule_matches {
             return Err(ResidentOodsError::NumeratorScheduleMismatch {
                 planned: numerator_plan.schedule,

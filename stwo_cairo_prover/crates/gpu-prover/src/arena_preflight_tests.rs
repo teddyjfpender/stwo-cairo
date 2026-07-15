@@ -74,7 +74,10 @@ fn replacement_policy_json_reports_the_exact_planned_tuple() {
         RelationLaunchMode::Fused,
     );
     assert_eq!(value["resident_backend"], "replacement-v1");
-    assert_eq!(value["quotient_numerator_schedule"], "hybrid-single-write");
+    assert_eq!(
+        value["quotient_numerator_schedule"],
+        "staged-packed-single-write"
+    );
     assert_eq!(value["kernel_manifest_hash"], "0000000000001234");
     assert_eq!(value["composition_max_kernel_instrs"], 2048);
     assert_eq!(

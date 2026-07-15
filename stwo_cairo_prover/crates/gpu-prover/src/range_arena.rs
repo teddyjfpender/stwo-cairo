@@ -281,7 +281,7 @@ pub(crate) fn plan_range_arena_with_released_commitments(
             Some(spec) => {
                 if spec.slot != candidate.slot || spec.live_mask & candidate.live_mask != 0 {
                     return Err(ArenaPlanError::InvalidProtocolGeometry(
-                        "transition alias range view does not match exactly",
+                        "required arena alias range view does not match exactly",
                     ));
                 }
                 spec.live_mask |= candidate.live_mask;
@@ -301,14 +301,16 @@ pub(crate) fn plan_range_arena_with_released_commitments(
 
     // SAFETY: every mask is derived directly from the inclusive BufferLifetime
     // used by resident execution. `validate_range_layout` independently proves
-    // exact lengths, alignment, bounds, required transition offsets, and no
-    // overlap at any live epoch. The semantic validator above collapses only
-    // equal-shaped adjacent interpolation transitions; every other logical
-    // range keeps a unique slot id. Resident execution establishes a CUDA
-    // happens-before edge across lifetime boundaries: forked lanes are joined
-    // by events before their successor, and graph segments enqueue in protocol
-    // order on the workspace stream. Thus disjoint masks cannot access reused
-    // bytes concurrently even though an epoch boundary need not host-sync.
+    // exact lengths, alignment, bounds, required alias offsets, and no overlap
+    // at any live epoch. The semantic validator admits exactly two typed alias
+    // contracts: equal-shaped adjacent interpolation transitions, and a named
+    // progressive-commit slab released before one equal-shaped quotient role.
+    // Every other logical range keeps a unique slot id. Resident execution
+    // establishes the required strict CUDA happens-before edge across both
+    // contracts: forked lanes are joined by events before their successor, and
+    // graph segments enqueue in protocol order on the workspace stream. Thus
+    // disjoint masks cannot access reused bytes concurrently even though an
+    // epoch boundary need not host-sync.
     let layout = unsafe { ArenaLayout::new_reused(range_layout.total_words(), &specs) }
         .map_err(ArenaPlanError::Arena)?;
     validate_runtime_views(logical, &bindings, &specs, &aliases)?;

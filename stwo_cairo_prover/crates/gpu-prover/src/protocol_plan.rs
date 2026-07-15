@@ -107,7 +107,7 @@ impl ProtocolPlanPolicy {
         let mut policy =
             Self::starknet_blake2s(kernel_manifest_hash, composition_max_kernel_instrs);
         policy.resident_backend = ResidentBackend::ReplacementV1;
-        policy.quotient_numerator_schedule = QuotientNumeratorSchedule::HybridSingleWrite;
+        policy.quotient_numerator_schedule = QuotientNumeratorSchedule::StagedPackedSingleWrite;
         policy.retained_lde_budget_bytes = 64 * 1024 * 1024 * 1024;
         policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive;
         policy.direct_composition_retention_mode = DirectCompositionRetentionMode::ExactNative;
@@ -1521,7 +1521,7 @@ mod tests {
         assert_eq!(policy.resident_backend, ResidentBackend::ReplacementV1);
         assert_eq!(
             policy.quotient_numerator_schedule,
-            QuotientNumeratorSchedule::HybridSingleWrite
+            QuotientNumeratorSchedule::StagedPackedSingleWrite
         );
         assert_eq!(policy.retained_lde_budget_bytes, 64 * 1024 * 1024 * 1024);
         assert_eq!(

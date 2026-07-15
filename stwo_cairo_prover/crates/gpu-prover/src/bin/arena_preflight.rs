@@ -51,6 +51,8 @@
 mod arena_preflight_cli;
 #[path = "../arena_preflight_hybrid.rs"]
 mod arena_preflight_hybrid;
+#[path = "../arena_preflight_staged.rs"]
+mod arena_preflight_staged;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::process::ExitCode;
@@ -788,6 +790,7 @@ fn report_json(
             "groups": single_write_groups,
             "hybrid_traffic_model": hybrid_traffic,
         },
+        "quotient_numerator_staged_single_write": arena_preflight_staged::json(arena),
         "quotient_combine_pass_byte_model": {
             "rows": quotient_combine.rows,
             "samples": quotient_combine.samples,
