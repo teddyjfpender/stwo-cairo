@@ -12,6 +12,7 @@ use std::sync::Arc;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
+use stwo_backend_cuda::CompositionSplitLaunchMode;
 use stwo_backend_cuda::{
     ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitCoefficientGroup,
     CommitEvaluationGroup, CommitProgram, CompactDomainBindingError, CompactDomainProgram,
@@ -129,8 +130,33 @@ pub struct ResidentCompositionCommitTelemetry {
     pub direct_split_graphs: u32,
     pub precomputed_compact_commitments: u32,
     pub coefficient_commit_paths: u32,
+    pub split_launch_mode: Option<CompositionSplitLaunchMode>,
     pub split_traffic: Option<CompositionSplitTraffic>,
     pub execution_receipt: Option<CompositionExecutionReceipt>,
+}
+
+impl ResidentCompositionCommitTelemetry {
+    pub fn split_executed_logical_bytes(self) -> Option<u64> {
+        match (self.split_launch_mode?, self.split_traffic?) {
+            (CompositionSplitLaunchMode::FusedFirstForward, traffic) => {
+                Some(traffic.fused_logical_bytes)
+            }
+            (CompositionSplitLaunchMode::TerminalFallback, traffic) => {
+                Some(traffic.terminal_fallback_logical_bytes)
+            }
+        }
+    }
+
+    pub fn split_executed_kernel_launches(self) -> Option<u32> {
+        match (self.split_launch_mode?, self.split_traffic?) {
+            (CompositionSplitLaunchMode::FusedFirstForward, traffic) => {
+                Some(traffic.fused_kernel_launches)
+            }
+            (CompositionSplitLaunchMode::TerminalFallback, traffic) => {
+                Some(traffic.terminal_fallback_kernel_launches)
+            }
+        }
+    }
 }
 
 impl ResidentWorkspaceIdentity {
@@ -2740,6 +2766,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             direct_split_graphs: u32::from(direct_retained_evaluations),
             precomputed_compact_commitments,
             coefficient_commit_paths: u32::from(!direct_retained_evaluations),
+            split_launch_mode: self.composition.direct_split_launch_mode(),
             split_traffic: self.composition.direct_split_traffic(),
             execution_receipt: self.composition.requirements().execution_receipt,
         }

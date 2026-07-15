@@ -466,11 +466,22 @@ impl ResidentSessionTelemetry {
                 || composition_commit.direct_split_graphs != 1
                 || composition_commit.precomputed_compact_commitments != 1
                 || composition_commit.coefficient_commit_paths != 0
+                || composition_commit.split_launch_mode.is_none()
+                || composition_commit
+                    .split_executed_logical_bytes()
+                    .is_none_or(|bytes| bytes == 0)
+                || composition_commit
+                    .split_executed_kernel_launches()
+                    .is_none_or(|launches| launches == 0)
                 || composition_commit.split_traffic.is_none_or(|traffic| {
                     traffic.source_image_bytes == 0
                         || traffic.retained_image_bytes == 0
-                        || traffic.fused_logical_bytes >= traffic.current_logical_bytes
-                        || traffic.fused_kernel_launches >= traffic.current_kernel_launches
+                        || traffic.fused_logical_bytes >= traffic.terminal_fallback_logical_bytes
+                        || traffic.terminal_fallback_logical_bytes >= traffic.current_logical_bytes
+                        || traffic.fused_kernel_launches
+                            >= traffic.terminal_fallback_kernel_launches
+                        || traffic.terminal_fallback_kernel_launches
+                            >= traffic.current_kernel_launches
                         || traffic.current_d2d_nodes != 8
                         || traffic.fused_d2d_nodes != 0
                 })
@@ -3075,6 +3086,9 @@ mod tests {
                 direct_split_graphs: 1,
                 precomputed_compact_commitments: 1,
                 coefficient_commit_paths: 0,
+                split_launch_mode: Some(
+                    stwo_backend_cuda::CompositionSplitLaunchMode::TerminalFallback,
+                ),
                 split_traffic: Some(
                     stwo_backend_cuda::CompositionSplitProgram::compile(24)
                         .unwrap()
@@ -3154,6 +3168,14 @@ mod tests {
             .unwrap()
             .coefficient_commit_paths = 1;
         assert!(coefficient_composition.require_strict_graph_a().is_err());
+
+        let mut missing_split_mode = valid.clone();
+        missing_split_mode
+            .composition_commit
+            .as_mut()
+            .unwrap()
+            .split_launch_mode = None;
+        assert!(missing_split_mode.require_strict_graph_a().is_err());
 
         let mut copied_composition = valid.clone();
         copied_composition

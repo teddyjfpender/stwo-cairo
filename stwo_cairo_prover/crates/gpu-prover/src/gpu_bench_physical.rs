@@ -79,9 +79,14 @@ pub(crate) fn gpu_native_session_context(
             "gpu_composition_wave_count": null,
             "gpu_composition_split_source_image_bytes": null,
             "gpu_composition_split_retained_image_bytes": null,
+            "gpu_composition_split_launch_mode": null,
+            "gpu_composition_split_executed_logical_bytes": null,
+            "gpu_composition_split_executed_kernel_launches": null,
             "gpu_composition_split_current_logical_bytes": null,
+            "gpu_composition_split_terminal_fallback_logical_bytes": null,
             "gpu_composition_split_fused_logical_bytes": null,
             "gpu_composition_split_current_kernel_launches": null,
+            "gpu_composition_split_terminal_fallback_kernel_launches": null,
             "gpu_composition_split_fused_kernel_launches": null,
             "gpu_composition_split_current_d2d_nodes": null,
             "gpu_composition_split_fused_d2d_nodes": null,
@@ -236,9 +241,14 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_composition_wave_count": composition_execution.map(|value| value.wave_count),
         "gpu_composition_split_source_image_bytes": composition_traffic.map(|value| value.source_image_bytes),
         "gpu_composition_split_retained_image_bytes": composition_traffic.map(|value| value.retained_image_bytes),
+        "gpu_composition_split_launch_mode": composition_commit.and_then(|value| value.split_launch_mode).map(composition_split_launch_mode_name),
+        "gpu_composition_split_executed_logical_bytes": composition_commit.and_then(|value| value.split_executed_logical_bytes()),
+        "gpu_composition_split_executed_kernel_launches": composition_commit.and_then(|value| value.split_executed_kernel_launches()),
         "gpu_composition_split_current_logical_bytes": composition_traffic.map(|value| value.current_logical_bytes),
+        "gpu_composition_split_terminal_fallback_logical_bytes": composition_traffic.map(|value| value.terminal_fallback_logical_bytes),
         "gpu_composition_split_fused_logical_bytes": composition_traffic.map(|value| value.fused_logical_bytes),
         "gpu_composition_split_current_kernel_launches": composition_traffic.map(|value| value.current_kernel_launches),
+        "gpu_composition_split_terminal_fallback_kernel_launches": composition_traffic.map(|value| value.terminal_fallback_kernel_launches),
         "gpu_composition_split_fused_kernel_launches": composition_traffic.map(|value| value.fused_kernel_launches),
         "gpu_composition_split_current_d2d_nodes": composition_traffic.map(|value| value.current_d2d_nodes),
         "gpu_composition_split_fused_d2d_nodes": composition_traffic.map(|value| value.fused_d2d_nodes),
@@ -304,6 +314,15 @@ fn numerator_schedule_name(schedule: QuotientNumeratorSchedule) -> &'static str 
         QuotientNumeratorSchedule::LegacyBatches => "legacy-batches",
         QuotientNumeratorSchedule::HybridSingleWrite => "hybrid-single-write",
         QuotientNumeratorSchedule::StagedPackedSingleWrite => "staged-packed-single-write",
+    }
+}
+
+fn composition_split_launch_mode_name(
+    mode: stwo_backend_cuda::CompositionSplitLaunchMode,
+) -> &'static str {
+    match mode {
+        stwo_backend_cuda::CompositionSplitLaunchMode::FusedFirstForward => "fused-first-forward",
+        stwo_backend_cuda::CompositionSplitLaunchMode::TerminalFallback => "terminal-fallback",
     }
 }
 
@@ -386,6 +405,9 @@ mod tests {
         assert!(value["gpu_trace_commit_direct_commitments"].is_null());
         assert!(value["gpu_trace_commit_separate_interpolation_graph_invocations"].is_null());
         assert!(value["gpu_trace_commit_separate_interpolation_kernel_launches"].is_null());
+        assert!(value["gpu_composition_split_launch_mode"].is_null());
+        assert!(value["gpu_composition_split_executed_logical_bytes"].is_null());
+        assert!(value["gpu_composition_split_executed_kernel_launches"].is_null());
     }
 
     #[test]
@@ -414,6 +436,9 @@ mod tests {
 
     #[test]
     fn persistent_runtime_and_direct_composition_are_machine_readable() {
+        let terminal_traffic = stwo_backend_cuda::CompositionSplitProgram::compile(24)
+            .unwrap()
+            .traffic();
         let telemetry = ResidentSessionTelemetry {
             workspace_materialization: Some(WorkspaceMaterialization::Reused),
             prepared_runtime_materialization: Some(PreparedRuntimeMaterialization::Reused),
@@ -437,11 +462,10 @@ mod tests {
                     direct_split_graphs: 1,
                     precomputed_compact_commitments: 1,
                     coefficient_commit_paths: 0,
-                    split_traffic: Some(
-                        stwo_backend_cuda::CompositionSplitProgram::compile(24)
-                            .unwrap()
-                            .traffic(),
+                    split_launch_mode: Some(
+                        stwo_backend_cuda::CompositionSplitLaunchMode::TerminalFallback,
                     ),
+                    split_traffic: Some(terminal_traffic),
                     execution_receipt: Some(
                         stwo_cairo_gpu_prover::prepared_composition::CompositionExecutionReceipt {
                             part_count: 153,
@@ -483,8 +507,54 @@ mod tests {
         assert_eq!(value["gpu_composition_coefficient_commit_paths"], 0);
         assert_eq!(value["gpu_composition_part_count"], 153);
         assert_eq!(value["gpu_composition_wave_count"], 18);
+        assert_eq!(
+            value["gpu_composition_split_launch_mode"],
+            "terminal-fallback"
+        );
+        assert_eq!(
+            value["gpu_composition_split_executed_logical_bytes"],
+            terminal_traffic.terminal_fallback_logical_bytes
+        );
+        assert_eq!(
+            value["gpu_composition_split_executed_kernel_launches"],
+            terminal_traffic.terminal_fallback_kernel_launches
+        );
+        assert_eq!(
+            value["gpu_composition_split_current_logical_bytes"],
+            terminal_traffic.current_logical_bytes
+        );
+        assert_eq!(
+            value["gpu_composition_split_terminal_fallback_logical_bytes"],
+            terminal_traffic.terminal_fallback_logical_bytes
+        );
+        assert_eq!(
+            value["gpu_composition_split_fused_logical_bytes"],
+            terminal_traffic.fused_logical_bytes
+        );
         assert_eq!(value["gpu_composition_split_current_d2d_nodes"], 8);
         assert_eq!(value["gpu_composition_split_fused_d2d_nodes"], 0);
+
+        let fused_traffic = stwo_backend_cuda::CompositionSplitProgram::compile(25)
+            .unwrap()
+            .traffic();
+        let mut fused = telemetry;
+        let composition = fused.composition_commit.as_mut().unwrap();
+        composition.split_launch_mode =
+            Some(stwo_backend_cuda::CompositionSplitLaunchMode::FusedFirstForward);
+        composition.split_traffic = Some(fused_traffic);
+        let fused_value = resident_session_telemetry_json(&fused);
+        assert_eq!(
+            fused_value["gpu_composition_split_launch_mode"],
+            "fused-first-forward"
+        );
+        assert_eq!(
+            fused_value["gpu_composition_split_executed_logical_bytes"],
+            fused_traffic.fused_logical_bytes
+        );
+        assert_eq!(
+            fused_value["gpu_composition_split_executed_kernel_launches"],
+            fused_traffic.fused_kernel_launches
+        );
     }
 
     #[test]

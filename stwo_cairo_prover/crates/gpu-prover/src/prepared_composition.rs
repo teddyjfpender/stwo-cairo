@@ -2668,6 +2668,15 @@ impl<'a> PreparedCompositionGraph<'a> {
         }
     }
 
+    pub fn direct_split_launch_mode(
+        &self,
+    ) -> Option<stwo_backend_cuda::CompositionSplitLaunchMode> {
+        match &self.output {
+            PreparedCompositionOutput::CoefficientSplit(_) => None,
+            PreparedCompositionOutput::DirectRetainedEvaluations(graph) => Some(graph.mode()),
+        }
+    }
+
     fn enqueue_wave(
         &self,
         wave_index: usize,
