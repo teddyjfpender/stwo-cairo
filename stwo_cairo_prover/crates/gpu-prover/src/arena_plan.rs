@@ -730,6 +730,10 @@ pub struct ProtocolIdentity {
     pub direct_composition_group_rounded_bytes: usize,
     pub numerator_evaluation_group_rounded_bytes: usize,
     pub retained_evaluation_union_bytes: usize,
+    /// Cold-once preprocessed LDE bytes added beyond the Direct Composition
+    /// image. Existing Direct outputs are excluded because the union owns them
+    /// already; this field seals the incremental physical policy exactly.
+    pub fixed_image_incremental_evaluation_bytes: usize,
 }
 
 impl ProtocolIdentity {
@@ -759,6 +763,7 @@ impl ProtocolIdentity {
         quotient_numerator_source_policy: QuotientNumeratorSourcePolicy,
         numerator_evaluation_group_rounded_bytes: usize,
         retained_evaluation_union_bytes: usize,
+        fixed_image_incremental_evaluation_bytes: usize,
     ) -> Self {
         Self {
             pow_bits: pcs.pow_bits,
@@ -789,6 +794,7 @@ impl ProtocolIdentity {
             direct_composition_group_rounded_bytes,
             numerator_evaluation_group_rounded_bytes,
             retained_evaluation_union_bytes,
+            fixed_image_incremental_evaluation_bytes,
         }
     }
 }
@@ -1031,9 +1037,7 @@ impl ProtocolGeometry {
             .iter()
             .map(|column| {
                 let tree = match column.source {
-                    OpenedColumnSource::Preprocessed { .. } => {
-                        return Ok(OodsSourceKind::Coefficients);
-                    }
+                    OpenedColumnSource::Preprocessed { .. } => CommitmentTreeId::Preprocessed,
                     OpenedColumnSource::Trace {
                         purpose: BufferPurpose::BaseCoefficients,
                         ..
@@ -1114,9 +1118,7 @@ impl ProtocolGeometry {
                     return Ok(QuotientNumeratorSourceKind::Coefficients);
                 }
                 let tree = match column.source {
-                    OpenedColumnSource::Preprocessed { .. } => {
-                        return Ok(QuotientNumeratorSourceKind::Coefficients);
-                    }
+                    OpenedColumnSource::Preprocessed { .. } => CommitmentTreeId::Preprocessed,
                     OpenedColumnSource::Trace {
                         purpose: BufferPurpose::BaseCoefficients,
                         ..
@@ -1918,6 +1920,50 @@ impl ProtocolGeometry {
                     "quotient numerator retention requires progressive commit",
                 ));
             }
+            for (commitment_index, commitment) in self.commitments.iter().enumerate() {
+                if commitment.id != CommitmentTreeId::Preprocessed {
+                    continue;
+                }
+                for (group, &selected) in commitment.numerator_evaluation_groups.iter().enumerate()
+                {
+                    if !selected {
+                        continue;
+                    }
+                    let sources = &commitment.grouped_column_sources[group];
+                    let logs = &commitment.grouped_column_log_sizes[group];
+                    if sources.len() != logs.len()
+                        || sources.iter().zip(logs).any(|(&source, &log)| {
+                            self.oods
+                                .columns
+                                .iter()
+                                .filter(|column| {
+                                    column.source == OpenedColumnSource::from(source)
+                                        && column.coefficient_log_size == log
+                                })
+                                .count()
+                                != 1
+                        })
+                        || !sources.iter().any(|&source| {
+                            self.oods.columns.iter().any(|column| {
+                                column.source == OpenedColumnSource::from(source)
+                                    && !column.shape_points.is_empty()
+                            })
+                        })
+                    {
+                        return Err(ArenaPlanError::InvalidProtocolGeometry(
+                            "fixed-image numerator group does not cover exact sampled sources",
+                        ));
+                    }
+                    if self.identity.decommit_strategy == DecommitStrategy::HybridByGroup
+                        && !commitment.retained_evaluation_groups[group]
+                    {
+                        return Err(ArenaPlanError::InvalidProtocolGeometry(
+                            "fixed-image numerator group is not reused by hybrid decommit",
+                        ));
+                    }
+                    expected_numerator[commitment_index][group] = true;
+                }
+            }
             for column in self
                 .oods
                 .columns
@@ -1986,6 +2032,7 @@ impl ProtocolGeometry {
         let mut direct_bytes = 0usize;
         let mut numerator_bytes = 0usize;
         let mut union_bytes = 0usize;
+        let mut fixed_image_incremental_bytes = 0usize;
         for commitment in &self.commitments {
             for group in 0..commitment.grouped_column_log_sizes.len() {
                 let direct = commitment.direct_composition_evaluation_groups[group];
@@ -1996,6 +2043,14 @@ impl ProtocolGeometry {
                     union_bytes = union_bytes
                         .checked_add(bytes)
                         .ok_or(ArenaPlanError::SizeOverflow)?;
+                    if commitment.id == CommitmentTreeId::Preprocessed
+                        && !direct
+                        && (numerator || decommit)
+                    {
+                        fixed_image_incremental_bytes = fixed_image_incremental_bytes
+                            .checked_add(bytes)
+                            .ok_or(ArenaPlanError::SizeOverflow)?;
+                    }
                     if direct {
                         direct_bytes = direct_bytes
                             .checked_add(bytes)
@@ -2020,6 +2075,8 @@ impl ProtocolGeometry {
         if self.identity.direct_composition_group_rounded_bytes != direct_bytes
             || self.identity.numerator_evaluation_group_rounded_bytes != numerator_bytes
             || self.identity.retained_evaluation_union_bytes != identity_union_bytes
+            || self.identity.fixed_image_incremental_evaluation_bytes
+                != fixed_image_incremental_bytes
         {
             return Err(ArenaPlanError::InvalidProtocolGeometry(
                 "retained evaluation physical byte identity drifted",
@@ -2127,6 +2184,7 @@ impl ProtocolGeometry {
         );
         feed(&(self.identity.direct_composition_group_rounded_bytes as u64).to_le_bytes());
         feed(&(self.identity.retained_evaluation_union_bytes as u64).to_le_bytes());
+        feed(&(self.identity.fixed_image_incremental_evaluation_bytes as u64).to_le_bytes());
         if self.identity.quotient_numerator_source_policy
             == QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations
         {
@@ -6674,6 +6732,7 @@ fn retained_oods_source(
     coefficient_log_size: u32,
 ) -> Result<LogicalBufferId, ArenaPlanError> {
     let tree = match source {
+        OpenedColumnSource::Preprocessed { .. } => CommitmentTreeId::Preprocessed,
         OpenedColumnSource::Trace {
             purpose: BufferPurpose::BaseCoefficients,
             ..
@@ -6683,9 +6742,9 @@ fn retained_oods_source(
             ..
         } => CommitmentTreeId::Interaction,
         OpenedColumnSource::Composition { .. } => CommitmentTreeId::Composition,
-        _ => {
+        OpenedColumnSource::Trace { .. } => {
             return Err(ArenaPlanError::InvalidProtocolGeometry(
-                "evaluation-backed OODS source is not dynamic",
+                "evaluation-backed OODS source is not committed",
             ));
         }
     };
@@ -6754,6 +6813,7 @@ fn retained_quotient_numerator_source(
     coefficient_log_size: u32,
 ) -> Result<LogicalBufferId, ArenaPlanError> {
     let tree = match source {
+        OpenedColumnSource::Preprocessed { .. } => CommitmentTreeId::Preprocessed,
         OpenedColumnSource::Trace {
             purpose: BufferPurpose::BaseCoefficients,
             ..
@@ -6763,9 +6823,9 @@ fn retained_quotient_numerator_source(
             ..
         } => CommitmentTreeId::Interaction,
         OpenedColumnSource::Composition { .. } => CommitmentTreeId::Composition,
-        _ => {
+        OpenedColumnSource::Trace { .. } => {
             return Err(ArenaPlanError::InvalidProtocolGeometry(
-                "evaluation-backed quotient numerator source is not dynamic",
+                "evaluation-backed quotient numerator source is not committed",
             ));
         }
     };
@@ -7336,7 +7396,12 @@ fn append_protocol_buffers(
                     BufferPurpose::PreprocessedCoefficients,
                     ordinal,
                     checked_pow2(log_size)?,
-                    cached_workspace,
+                    BufferLifetime::new(
+                        ProofEpoch::Ingest,
+                        late_coefficient_ownership
+                            .final_consumer(OpenedColumnSource::Preprocessed { ordinal })
+                            .map_err(ArenaPlanError::InvalidProtocolGeometry)?,
+                    )?,
                 )?,
             })
         })
@@ -11936,6 +12001,7 @@ mod tests {
                 direct_composition_group_rounded_bytes: 0,
                 numerator_evaluation_group_rounded_bytes: 0,
                 retained_evaluation_union_bytes: 0,
+                fixed_image_incremental_evaluation_bytes: 0,
             },
             preprocessed_column_ids: vec![
                 "test_preprocessed".to_owned(),

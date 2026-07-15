@@ -44,6 +44,18 @@ use crate::transcript_plan::{
 /// Starknet block benchmark.  It is intentionally not a Rust `TypeId` or hash.
 pub const BLAKE2S_MERKLE_CHANNEL_TAG: u64 = 0x424c_414b_4532_5331;
 
+/// Maximum incremental cold-once preprocessed LDE payload added to the first
+/// replacement FixedImage beyond groups already retained for Direct
+/// Composition. Existing Direct outputs are process-persistent already, so
+/// charging them twice would reject free OODS/numerator/decommit reuse.
+///
+/// Two GiB is the largest whole-GiB envelope that keeps the current worst SN4
+/// known-cold model below 69 GiB, preserving at least 7 GiB of the 76 GiB
+/// operational ceiling for context, modules, graphs, pool slack, profiling and
+/// the deployment safety reserve. The complete physical ledger remains the
+/// final admission gate.
+pub const REPLACEMENT_FIXED_IMAGE_INCREMENTAL_LDE_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
 /// Runtime choices that affect graph topology or opening residency.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolPlanPolicy {
@@ -58,6 +70,9 @@ pub struct ProtocolPlanPolicy {
     pub decommit_strategy: DecommitStrategy,
     /// Maximum persistent canonical LDE storage selected by the hybrid opener.
     pub retained_lde_budget_bytes: usize,
+    /// Maximum additional persistent preprocessed LDE beyond the Direct
+    /// Composition image. Selection is by whole canonical commitment group.
+    pub fixed_image_incremental_lde_budget_bytes: usize,
     pub unretained_bottom_layers: u32,
     pub max_fused_tail_levels: u32,
     pub commit_mode: stwo_backend_cuda::ProgressiveCommitMode,
@@ -85,6 +100,7 @@ impl ProtocolPlanPolicy {
             composition_max_kernel_instrs,
             decommit_strategy: DecommitStrategy::HybridByGroup,
             retained_lde_budget_bytes: 8 * 1024 * 1024 * 1024,
+            fixed_image_incremental_lde_budget_bytes: 0,
             unretained_bottom_layers: 4,
             max_fused_tail_levels: 12,
             commit_mode: stwo_backend_cuda::ProgressiveCommitMode::FullLifting,
@@ -113,6 +129,8 @@ impl ProtocolPlanPolicy {
             DynamicCommitmentLeafSchedule::RetainedDomainCompactH8;
         policy.quotient_numerator_schedule = QuotientNumeratorSchedule::StagedPackedSingleWrite;
         policy.retained_lde_budget_bytes = 64 * 1024 * 1024 * 1024;
+        policy.fixed_image_incremental_lde_budget_bytes =
+            REPLACEMENT_FIXED_IMAGE_INCREMENTAL_LDE_BUDGET_BYTES;
         policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive;
         policy.direct_composition_retention_mode = DirectCompositionRetentionMode::ExactNative;
         policy.quotient_numerator_source_policy =
@@ -986,6 +1004,7 @@ fn plan_protocol_from_logs(
         &oods,
         policy.decommit_strategy,
         policy.retained_lde_budget_bytes,
+        policy.fixed_image_incremental_lde_budget_bytes,
         direct_composition_retention.as_ref(),
         policy.quotient_numerator_source_policy,
     )?;
@@ -1050,6 +1069,7 @@ fn plan_protocol_from_logs(
             } else {
                 0
             },
+            retention.fixed_image_incremental_group_rounded_bytes,
         ),
         preprocessed_column_ids: preprocessed_trace
             .ids()
@@ -1081,9 +1101,15 @@ fn select_retained_evaluation_groups(
     oods: &OodsGeometry,
     strategy: DecommitStrategy,
     budget_bytes: usize,
+    fixed_image_incremental_budget_bytes: usize,
     direct: Option<&DirectCompositionRetentionPlan>,
     numerator_policy: QuotientNumeratorSourcePolicy,
 ) -> Result<RetentionSelection, ProtocolPlanError> {
+    if fixed_image_incremental_budget_bytes > budget_bytes
+        || fixed_image_incremental_budget_bytes % core::mem::size_of::<u32>() != 0
+    {
+        return Err(ProtocolPlanError::InvalidRetainedLdeBudget);
+    }
     for commitment in commitments.iter_mut() {
         commitment.retained_evaluation_groups =
             vec![false; commitment.grouped_column_log_sizes.len()];
@@ -1142,7 +1168,7 @@ fn select_retained_evaluation_groups(
         });
     }
 
-    let numerator_words = commitments.iter().try_fold(0usize, |total, commitment| {
+    let dynamic_numerator_words = commitments.iter().try_fold(0usize, |total, commitment| {
         commitment
             .grouped_column_log_sizes
             .iter()
@@ -1157,7 +1183,7 @@ fn select_retained_evaluation_groups(
                 }
             })
     })?;
-    let mandatory_words = commitments.iter().try_fold(0usize, |total, commitment| {
+    let dynamic_mandatory_words = commitments.iter().try_fold(0usize, |total, commitment| {
         commitment
             .grouped_column_log_sizes
             .iter()
@@ -1173,14 +1199,33 @@ fn select_retained_evaluation_groups(
                 }
             })
     })?;
-    if mandatory_words > budget_words {
+    if dynamic_mandatory_words > budget_words {
         return Err(ProtocolPlanError::NumeratorRetentionBudgetExceeded {
-            required_bytes: mandatory_words
+            required_bytes: dynamic_mandatory_words
                 .checked_mul(core::mem::size_of::<u32>())
                 .ok_or(ProtocolPlanError::SizeOverflow)?,
             budget_bytes,
         });
     }
+
+    let fixed_image = if numerator_policy == QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations
+    {
+        select_fixed_image_groups(
+            commitments,
+            oods,
+            strategy,
+            fixed_image_incremental_budget_bytes / core::mem::size_of::<u32>(),
+            budget_words - dynamic_mandatory_words,
+        )?
+    } else {
+        FixedImageSelection::default()
+    };
+    let numerator_words = dynamic_numerator_words
+        .checked_add(fixed_image.numerator_words)
+        .ok_or(ProtocolPlanError::SizeOverflow)?;
+    let mandatory_words = dynamic_mandatory_words
+        .checked_add(fixed_image.incremental_words)
+        .ok_or(ProtocolPlanError::SizeOverflow)?;
 
     match strategy {
         DecommitStrategy::RecomputeQueriedLde => {}
@@ -1220,6 +1265,10 @@ fn select_retained_evaluation_groups(
         union_group_rounded_bytes: union_words
             .checked_mul(core::mem::size_of::<u32>())
             .ok_or(ProtocolPlanError::SizeOverflow)?,
+        fixed_image_incremental_group_rounded_bytes: fixed_image
+            .incremental_words
+            .checked_mul(core::mem::size_of::<u32>())
+            .ok_or(ProtocolPlanError::SizeOverflow)?,
     })
 }
 
@@ -1228,6 +1277,118 @@ struct RetentionSelection {
     direct_group_rounded_bytes: usize,
     numerator_group_rounded_bytes: usize,
     union_group_rounded_bytes: usize,
+    fixed_image_incremental_group_rounded_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FixedImageSelection {
+    numerator_words: usize,
+    incremental_words: usize,
+}
+
+fn select_fixed_image_groups(
+    commitments: &mut [CommitmentGeometry],
+    oods: &OodsGeometry,
+    strategy: DecommitStrategy,
+    mut incremental_words_remaining: usize,
+    mut union_words_remaining: usize,
+) -> Result<FixedImageSelection, ProtocolPlanError> {
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        group: usize,
+        words: usize,
+        weighted_log: u128,
+        has_sampled_column: bool,
+    }
+
+    let fixed = commitments
+        .iter_mut()
+        .find(|commitment| commitment.id == CommitmentTreeId::Preprocessed)
+        .ok_or(ProtocolPlanError::NumeratorRetention(
+            "preprocessed source tree is missing",
+        ))?;
+    let mut candidates = Vec::new();
+    for (group, (sources, logs)) in fixed
+        .grouped_column_sources
+        .iter()
+        .zip(&fixed.grouped_column_log_sizes)
+        .enumerate()
+    {
+        if sources.len() != logs.len() {
+            return Err(ProtocolPlanError::NumeratorRetention(
+                "preprocessed source/log width mismatch",
+            ));
+        }
+        let mut weighted_log = 0u128;
+        let mut has_sampled_column = false;
+        for (&source, &log_size) in sources.iter().zip(logs) {
+            let opened = OpenedColumnSource::from(source);
+            let matching = oods
+                .columns
+                .iter()
+                .filter(|column| column.source == opened)
+                .collect::<Vec<_>>();
+            if matching.len() != 1 || matching[0].coefficient_log_size != log_size {
+                return Err(ProtocolPlanError::NumeratorRetention(
+                    "preprocessed source mapping is ambiguous or has the wrong log",
+                ));
+            }
+            has_sampled_column |= !matching[0].shape_points.is_empty();
+            let evaluation_log = log_size
+                .checked_add(fixed.config.log_blowup_factor)
+                .ok_or(ProtocolPlanError::SizeOverflow)?;
+            let column_words = 1usize
+                .checked_shl(evaluation_log)
+                .ok_or(ProtocolPlanError::SizeOverflow)?;
+            weighted_log = weighted_log
+                .checked_add((column_words as u128) * u128::from(evaluation_log))
+                .ok_or(ProtocolPlanError::SizeOverflow)?;
+        }
+        if has_sampled_column || strategy == DecommitStrategy::HybridByGroup {
+            candidates.push(Candidate {
+                group,
+                words: retained_group_words(fixed, logs)?,
+                weighted_log,
+                has_sampled_column,
+            });
+        }
+    }
+    // Maximize avoided NTT work per fixed byte. Stable ties prefer the smaller
+    // whole group, then canonical proof order, so no partial group can leak in.
+    candidates.sort_by(|left, right| {
+        (right.weighted_log * left.words as u128)
+            .cmp(&(left.weighted_log * right.words as u128))
+            .then_with(|| left.words.cmp(&right.words))
+            .then_with(|| left.group.cmp(&right.group))
+    });
+
+    let mut selected = FixedImageSelection::default();
+    for candidate in candidates {
+        let already_retained = fixed.direct_composition_evaluation_groups[candidate.group];
+        let incremental_words = if already_retained { 0 } else { candidate.words };
+        if incremental_words > incremental_words_remaining
+            || incremental_words > union_words_remaining
+        {
+            continue;
+        }
+        if candidate.has_sampled_column {
+            fixed.numerator_evaluation_groups[candidate.group] = true;
+            selected.numerator_words = selected
+                .numerator_words
+                .checked_add(candidate.words)
+                .ok_or(ProtocolPlanError::SizeOverflow)?;
+        }
+        if strategy == DecommitStrategy::HybridByGroup {
+            fixed.retained_evaluation_groups[candidate.group] = true;
+        }
+        incremental_words_remaining -= incremental_words;
+        union_words_remaining -= incremental_words;
+        selected.incremental_words = selected
+            .incremental_words
+            .checked_add(incremental_words)
+            .ok_or(ProtocolPlanError::SizeOverflow)?;
+    }
+    Ok(selected)
 }
 
 fn select_numerator_evaluation_groups(
@@ -1323,8 +1484,9 @@ fn select_decommit_groups(
     }
 
     let mut candidates = Vec::new();
-    // The fixed preprocessed commitment has its own process-persistent cache.
-    // Hybrid per-proof storage is reserved for the three dynamic trees.
+    // The fixed preprocessed commitment is selected separately under its
+    // FixedImage cap. Remaining hybrid per-proof storage is reserved for the
+    // three dynamic trees.
     for (commitment_index, commitment) in commitments.iter().enumerate().skip(1) {
         for (group_index, logs) in commitment.grouped_column_log_sizes.iter().enumerate() {
             let words = retained_group_words(commitment, logs)?;
@@ -1532,6 +1694,10 @@ mod tests {
         );
         assert_eq!(policy.retained_lde_budget_bytes, 64 * 1024 * 1024 * 1024);
         assert_eq!(
+            policy.fixed_image_incremental_lde_budget_bytes,
+            REPLACEMENT_FIXED_IMAGE_INCREMENTAL_LDE_BUDGET_BYTES
+        );
+        assert_eq!(
             policy.commit_mode,
             stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive
         );
@@ -1557,8 +1723,9 @@ mod tests {
         );
         assert!(resident_backend_contract_matches(policy));
 
-        let mutations: [fn(&mut ProtocolPlanPolicy); 12] = [
+        let mutations: [fn(&mut ProtocolPlanPolicy); 13] = [
             |policy| policy.retained_lde_budget_bytes -= 1,
+            |policy| policy.fixed_image_incremental_lde_budget_bytes -= 1,
             |policy| policy.commit_mode = stwo_backend_cuda::ProgressiveCommitMode::FullLifting,
             |policy| {
                 policy.direct_composition_retention_mode = DirectCompositionRetentionMode::Disabled
@@ -1650,6 +1817,7 @@ mod tests {
             &empty_oods(),
             DecommitStrategy::HybridByGroup,
             (1usize << 13) * core::mem::size_of::<u32>(),
+            0,
             None,
             QuotientNumeratorSourcePolicy::CoefficientsOnly,
         )
@@ -1873,6 +2041,7 @@ mod tests {
                 &empty_oods(),
                 DecommitStrategy::RecomputeQueriedLde,
                 rounded_bytes,
+                0,
                 Some(&direct),
                 QuotientNumeratorSourcePolicy::CoefficientsOnly,
             )
@@ -1888,6 +2057,7 @@ mod tests {
                 &empty_oods(),
                 DecommitStrategy::HybridByGroup,
                 rounded_bytes,
+                0,
                 Some(&direct),
                 QuotientNumeratorSourcePolicy::CoefficientsOnly,
             )
@@ -1901,6 +2071,7 @@ mod tests {
                 &empty_oods(),
                 DecommitStrategy::HybridByGroup,
                 rounded_bytes,
+                0,
                 None,
                 QuotientNumeratorSourcePolicy::CoefficientsOnly,
             )
@@ -1915,6 +2086,7 @@ mod tests {
                     &empty_oods(),
                     DecommitStrategy::RecomputeQueriedLde,
                     rounded_bytes - 1,
+                    0,
                     Some(&direct),
                     QuotientNumeratorSourcePolicy::CoefficientsOnly,
                 ),
@@ -1953,6 +2125,7 @@ mod tests {
             &oods,
             DecommitStrategy::RecomputeQueriedLde,
             rounded_bytes,
+            0,
             None,
             QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
         )
@@ -1969,6 +2142,7 @@ mod tests {
                 &oods,
                 DecommitStrategy::RecomputeQueriedLde,
                 rounded_bytes - core::mem::size_of::<u32>(),
+                0,
                 None,
                 QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
             ),
@@ -1985,6 +2159,7 @@ mod tests {
             &oods,
             DecommitStrategy::RecomputeQueriedLde,
             rounded_bytes,
+            0,
             Some(&direct),
             QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
         )
@@ -2001,6 +2176,7 @@ mod tests {
             &oods,
             DecommitStrategy::HybridByGroup,
             rounded_bytes,
+            0,
             Some(&direct),
             QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
         )
@@ -2012,6 +2188,7 @@ mod tests {
             &mut coefficients_only,
             &oods,
             DecommitStrategy::RecomputeQueriedLde,
+            0,
             0,
             None,
             QuotientNumeratorSourcePolicy::CoefficientsOnly,
@@ -2036,11 +2213,112 @@ mod tests {
             &sampled_preprocessed,
             DecommitStrategy::RecomputeQueriedLde,
             rounded_bytes,
+            0,
             None,
             QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
         )
         .unwrap();
         assert_eq!(preprocessed_ignored[0].numerator_evaluation_groups, [false]);
+    }
+
+    #[test]
+    fn fixed_image_selection_is_whole_group_budgeted_and_reused_by_decommit() {
+        let config = CommitWorkspaceConfig {
+            log_blowup_factor: 1,
+            lifting_log_size: 6,
+            unretained_bottom_layers: 0,
+            max_fused_tail_levels: 0,
+        };
+        let mut commitments = vec![CommitmentGeometry {
+            id: CommitmentTreeId::Preprocessed,
+            created: ProofEpoch::Ingest,
+            config,
+            grouped_column_log_sizes: vec![vec![4, 4], vec![5]],
+            grouped_column_sources: vec![
+                vec![
+                    CommitmentColumnSource::Preprocessed { ordinal: 0 },
+                    CommitmentColumnSource::Preprocessed { ordinal: 1 },
+                ],
+                vec![CommitmentColumnSource::Preprocessed { ordinal: 2 }],
+            ],
+            retained_evaluation_groups: Vec::new(),
+            direct_composition_evaluation_groups: Vec::new(),
+            numerator_evaluation_groups: Vec::new(),
+        }];
+        let offset = stwo::core::poly::circle::CanonicCoset::new(4).step();
+        let mut oods = empty_oods();
+        oods.columns = [4, 4, 5]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, coefficient_log_size)| OodsColumnGeometry {
+                source: OpenedColumnSource::Preprocessed {
+                    ordinal: ordinal as u32,
+                },
+                coefficient_log_size,
+                evaluation_log_size: coefficient_log_size + 1,
+                shape_points: vec![
+                    stwo::core::circle::SECURE_FIELD_CIRCLE_GEN
+                        + offset.into_ef::<stwo::core::fields::qm31::SecureField>(),
+                ],
+                offset_points: vec![offset],
+            })
+            .collect();
+        let group_bytes = 64 * core::mem::size_of::<u32>();
+        let selected = select_retained_evaluation_groups(
+            &mut commitments,
+            &oods,
+            DecommitStrategy::HybridByGroup,
+            group_bytes,
+            group_bytes,
+            None,
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+        )
+        .unwrap();
+
+        // Equal-byte groups prefer the higher-log NTT work. Both intents bind
+        // the same one allocation; the two-column group is not partly kept.
+        assert_eq!(commitments[0].numerator_evaluation_groups, [false, true]);
+        assert_eq!(commitments[0].retained_evaluation_groups, [false, true]);
+        assert_eq!(
+            selected.fixed_image_incremental_group_rounded_bytes,
+            group_bytes
+        );
+        assert_eq!(selected.numerator_group_rounded_bytes, group_bytes);
+        assert_eq!(selected.union_group_rounded_bytes, group_bytes);
+
+        let mut one_word_short = commitments;
+        let selected = select_retained_evaluation_groups(
+            &mut one_word_short,
+            &oods,
+            DecommitStrategy::HybridByGroup,
+            group_bytes,
+            group_bytes - core::mem::size_of::<u32>(),
+            None,
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+        )
+        .unwrap();
+        assert_eq!(selected.fixed_image_incremental_group_rounded_bytes, 0);
+        assert_eq!(
+            one_word_short[0].numerator_evaluation_groups,
+            [false, false]
+        );
+        assert_eq!(one_word_short[0].retained_evaluation_groups, [false, false]);
+
+        let mut direct_owned = one_word_short;
+        direct_owned[0].direct_composition_evaluation_groups = vec![false, true];
+        let selected = select_retained_evaluation_groups(
+            &mut direct_owned,
+            &oods,
+            DecommitStrategy::HybridByGroup,
+            group_bytes,
+            0,
+            None,
+            QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
+        )
+        .unwrap();
+        assert_eq!(selected.fixed_image_incremental_group_rounded_bytes, 0);
+        assert_eq!(direct_owned[0].numerator_evaluation_groups, [false, true]);
+        assert_eq!(direct_owned[0].retained_evaluation_groups, [false, true]);
     }
 
     #[test]
@@ -2055,6 +2333,7 @@ mod tests {
             &oods,
             DecommitStrategy::HybridByGroup,
             budget,
+            0,
             Some(&direct),
             QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
         )
@@ -2085,6 +2364,7 @@ mod tests {
                 &sampled_base_oods(0),
                 DecommitStrategy::RecomputeQueriedLde,
                 budget,
+                0,
                 Some(&bad_direct),
                 QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
             ),
@@ -2099,6 +2379,7 @@ mod tests {
                 &sampled_base_oods(99),
                 DecommitStrategy::RecomputeQueriedLde,
                 budget,
+                0,
                 None,
                 QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
             ),
@@ -2116,6 +2397,7 @@ mod tests {
                 &sampled_base_oods(0),
                 DecommitStrategy::RecomputeQueriedLde,
                 budget,
+                0,
                 None,
                 QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
             ),

@@ -5221,23 +5221,29 @@ fn resident_decommit_sources(
                             .collect()
                     }
                     stwo_backend_cuda::DecommitSourceMode::ResidentEvaluations => {
-                        let graph = prepared_commitment.ok_or(
-                            ResidentRuntimeError::DecommitTopologyMismatch(
-                                "fixed preprocessed tree cannot use per-proof retained LDEs",
-                            ),
-                        )?;
-                        let actual = graph
-                            .retained_evaluations()
-                            .get(group_index)
-                            .and_then(Option::as_ref)
-                            .ok_or(ResidentRuntimeError::DecommitTopologyMismatch(
-                                "prepared commitment did not retain its planned evaluation group",
-                            ))?;
                         let expected = planned_retained.as_ref().ok_or(
                             ResidentRuntimeError::DecommitTopologyMismatch(
                                 "resident trace group has no arena binding",
                             ),
                         )?;
+                        let actual = if planned.id == CommitmentTreeId::Preprocessed {
+                            expected
+                                .iter()
+                                .map(|&binding| bind_arena_binding(arena, binding))
+                                .collect::<Result<Vec<_>, _>>()?
+                        } else {
+                            prepared_commitment
+                                .ok_or(ResidentRuntimeError::MissingPreparedCommitment(
+                                    planned.id,
+                                ))?
+                                .retained_evaluations()
+                                .get(group_index)
+                                .and_then(Option::as_ref)
+                                .cloned()
+                                .ok_or(ResidentRuntimeError::DecommitTopologyMismatch(
+                                    "prepared commitment did not retain its planned evaluation group",
+                                ))?
+                        };
                         if actual.len() != expected.len() {
                             return Err(ResidentRuntimeError::DecommitTopologyMismatch(
                                 "retained trace evaluation width differs from the arena plan",
@@ -5251,8 +5257,7 @@ fn resident_decommit_sources(
                             )?;
                         }
                         actual
-                            .iter()
-                            .copied()
+                            .into_iter()
                             .map(DecommitColumnSource::ResidentEvaluation)
                             .collect()
                     }

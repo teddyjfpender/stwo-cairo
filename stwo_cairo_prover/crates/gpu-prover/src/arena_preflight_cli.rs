@@ -88,6 +88,7 @@ pub fn runtime_policy_json(
         "composition_max_kernel_instrs": policy.composition_max_kernel_instrs,
         "decommit_strategy": decommit_strategy_name(policy.decommit_strategy),
         "retained_lde_budget_bytes": policy.retained_lde_budget_bytes,
+        "fixed_image_incremental_lde_budget_bytes": policy.fixed_image_incremental_lde_budget_bytes,
         "unretained_bottom_layers": policy.unretained_bottom_layers,
         "max_fused_tail_levels": policy.max_fused_tail_levels,
         "commit_mode": commit_mode_name(policy.commit_mode),

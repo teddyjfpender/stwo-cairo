@@ -88,6 +88,11 @@ fn replacement_policy_json_reports_the_exact_planned_tuple() {
         value["retained_lde_budget_bytes"],
         64 * 1024 * 1024 * 1024_u64
     );
+    assert_eq!(
+        value["fixed_image_incremental_lde_budget_bytes"],
+        stwo_cairo_gpu_prover::protocol_plan::REPLACEMENT_FIXED_IMAGE_INCREMENTAL_LDE_BUDGET_BYTES
+            as u64
+    );
     assert_eq!(value["commit_mode"], "domain-progressive");
     assert_eq!(value["direct_composition_retention_mode"], "exact-native");
     assert_eq!(
@@ -133,6 +138,7 @@ fn protocol_identity_for(policy: ProtocolPlanPolicy) -> ProtocolIdentity {
         direct_composition_group_rounded_bytes: 7,
         numerator_evaluation_group_rounded_bytes: 8,
         retained_evaluation_union_bytes: 9,
+        fixed_image_incremental_evaluation_bytes: 0,
     }
 }
 

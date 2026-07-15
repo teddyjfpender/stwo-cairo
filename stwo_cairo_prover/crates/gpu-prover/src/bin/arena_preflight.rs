@@ -53,6 +53,8 @@ mod arena_preflight_cli;
 mod arena_preflight_commitment_receipt;
 #[path = "arena_preflight/composition_wave_receipt.rs"]
 mod arena_preflight_composition_wave_receipt;
+#[path = "arena_preflight/fixed_image_receipt.rs"]
+mod arena_preflight_fixed_image_receipt;
 #[path = "../arena_preflight_hybrid.rs"]
 mod arena_preflight_hybrid;
 #[path = "arena_preflight/ntt_lde_receipt.rs"]
@@ -259,6 +261,15 @@ fn validate_preflight_identity(
         return Err(format!(
             "arena retained-evaluation union {} exceeds selected policy budget {}",
             identity.retained_evaluation_union_bytes, policy.retained_lde_budget_bytes
+        ));
+    }
+    if identity.fixed_image_incremental_evaluation_bytes
+        > policy.fixed_image_incremental_lde_budget_bytes
+    {
+        return Err(format!(
+            "arena incremental fixed-image evaluation {} exceeds selected policy budget {}",
+            identity.fixed_image_incremental_evaluation_bytes,
+            policy.fixed_image_incremental_lde_budget_bytes
         ));
     }
     Ok(())
@@ -989,6 +1000,8 @@ fn report_json(
         ),
         "protocol_key": protocol_key_hex(arena.protocol_key),
         "dynamic_commitment_leaf_programs": dynamic_commitment_leaf_programs,
+        "fixed_image_retention": arena_preflight_fixed_image_receipt::json(arena)
+            .expect("validated fixed-image receipt must reconcile"),
         "present_components": report.present_components.len(),
         "capture_safe_components": report.capture_safe_components.len(),
         "capture_safe_coverage_ok": capture_safe_ok,

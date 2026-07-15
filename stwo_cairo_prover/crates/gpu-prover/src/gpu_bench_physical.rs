@@ -102,6 +102,7 @@ pub(crate) fn gpu_native_session_context(
             "gpu_composition_split_fused_d2d_nodes": null,
             "gpu_policy_kernel_manifest_hash": null,
             "gpu_policy_retained_lde_budget_bytes": null,
+            "gpu_policy_fixed_image_incremental_lde_budget_bytes": null,
             "gpu_policy_commit_mode": null,
             "gpu_policy_direct_composition_retention": null,
             "gpu_policy_numerator_source": null,
@@ -305,6 +306,9 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_composition_split_fused_d2d_nodes": composition_traffic.map(|value| value.fused_d2d_nodes),
         "gpu_policy_kernel_manifest_hash": policy.map(|value| value.kernel_manifest_hash),
         "gpu_policy_retained_lde_budget_bytes": policy.map(|value| value.retained_lde_budget_bytes),
+        "gpu_policy_fixed_image_incremental_lde_budget_bytes": policy.map(
+            |value| value.fixed_image_incremental_lde_budget_bytes
+        ),
         "gpu_policy_commit_mode": policy.map(|value| match value.commit_mode {
             stwo_backend_cuda::ProgressiveCommitMode::FullLifting => "full-lifting",
             stwo_backend_cuda::ProgressiveCommitMode::DomainProgressive => "domain-progressive",

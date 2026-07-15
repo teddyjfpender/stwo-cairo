@@ -246,6 +246,10 @@ impl TopologyKey {
         feed_usize(&mut hash, self.policy.composition_max_kernel_instrs);
         hash.update(&[self.policy.decommit_strategy as u8]);
         feed_usize(&mut hash, self.policy.retained_lde_budget_bytes);
+        feed_usize(
+            &mut hash,
+            self.policy.fixed_image_incremental_lde_budget_bytes,
+        );
         hash.update(&self.policy.unretained_bottom_layers.to_le_bytes());
         hash.update(&self.policy.max_fused_tail_levels.to_le_bytes());
         hash.update(&[self.policy.commit_mode as u8]);
