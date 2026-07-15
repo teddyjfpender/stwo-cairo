@@ -15,7 +15,7 @@ pub(super) fn json(arena: &ProofArenaPlan) -> Value {
             "schema": "stwo.oods-pass-collapse-selection.v1",
             "resident_backend": backend.cli_name(),
             "plan_selected": false,
-            "production_constructor": "PreparedOodsGraph::prepare_mixed",
+            "plan_selected_constructor": "PreparedOodsGraph::prepare_mixed",
             "observed_by_preflight": {
                 "runtime_prepared": false,
                 "graph_captured": false,
@@ -30,7 +30,7 @@ pub(super) fn json(arena: &ProofArenaPlan) -> Value {
         "schema": "stwo.oods-pass-collapse-selection.v1",
         "resident_backend": backend.cli_name(),
         "plan_selected": true,
-        "production_constructor": "PreparedOodsGraph::prepare_mixed_pass_collapsed",
+        "plan_selected_constructor": "PreparedOodsGraph::prepare_mixed_pass_collapsed",
         "ordinary_requirements_match_plan": program.ordinary_requirements() == &oods.requirements,
         "observed_by_preflight": {
             "runtime_prepared": false,
