@@ -51,6 +51,8 @@
 mod arena_preflight_cli;
 #[path = "arena_preflight/commitment_receipt.rs"]
 mod arena_preflight_commitment_receipt;
+#[path = "arena_preflight/composition_wave_receipt.rs"]
+mod arena_preflight_composition_wave_receipt;
 #[path = "../arena_preflight_hybrid.rs"]
 mod arena_preflight_hybrid;
 #[path = "arena_preflight/ntt_lde_receipt.rs"]
@@ -601,6 +603,7 @@ fn report_json(
     report: &ResidentPreflightReport,
     selected_backend: ResidentBackend,
     aot_coverage: &AotCoverage,
+    composition_wave_current_plan: serde_json::Value,
     ntt_lde_direct_slab_frontier: serde_json::Value,
     compacted_rows: Vec<serde_json::Value>,
     source: &str,
@@ -803,6 +806,7 @@ fn report_json(
             "hybrid_traffic_model": hybrid_traffic,
         },
         "quotient_numerator_staged_single_write": arena_preflight_staged::json(arena),
+        "composition_wave_current_plan": composition_wave_current_plan,
         "ntt_lde_direct_slab_frontier": ntt_lde_direct_slab_frontier,
         "quotient_combine_pass_byte_model": {
             "rows": quotient_combine.rows,
@@ -927,6 +931,11 @@ fn main() -> ExitCode {
     {
         return fail("dynamic_commitment_leaf_programs", error);
     }
+    let composition_wave_current_plan =
+        match arena_preflight_composition_wave_receipt::json(&report.arena.composition().plan) {
+            Ok(receipt) => receipt,
+            Err(error) => return fail("composition_wave_current_plan", error),
+        };
     let ntt_lde_direct_slab_frontier = match resident_backend {
         ResidentBackend::ReplacementV1 => {
             match arena_preflight_ntt_lde_receipt::json(&report.arena) {
@@ -953,6 +962,7 @@ fn main() -> ExitCode {
         &report,
         resident_backend,
         &aot_coverage,
+        composition_wave_current_plan,
         ntt_lde_direct_slab_frontier,
         compacted_rows,
         &source,
