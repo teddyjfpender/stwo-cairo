@@ -13,6 +13,9 @@ use tracing::{span, Level};
 use super::decode::{Instruction, OpcodeExtension};
 use super::memory::{MemoryBuilder, MemoryValue};
 
+mod recorded_casm;
+pub use recorded_casm::*;
+
 // TODO (Stav): Ensure it stays synced with that opcdode AIR's list.
 /// This struct holds the components used to prove the opcodes in a Cairo program,
 /// and should match the opcode's air used by `stwo-cairo-air`.
@@ -39,6 +42,7 @@ pub struct CasmStatesByOpcode {
     pub blake_compress_opcode: Vec<CasmState>,
     pub qm_31_add_mul_opcode: Vec<CasmState>,
 }
+
 impl CasmStatesByOpcode {
     fn from_iter(
         iter: impl DoubleEndedIterator<Item = RelocatedTraceEntry>,

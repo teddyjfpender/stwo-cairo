@@ -39,6 +39,7 @@ pub mod relation;
 pub mod relation_execution;
 pub mod relation_table;
 mod resident_composition;
+pub mod resident_input;
 mod resident_oods;
 pub mod resident_runtime;
 pub mod resident_session;

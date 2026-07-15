@@ -40,6 +40,7 @@ use stwo::prover::backend::FromSimdColumns;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo_cairo_adapter::memory::Memory;
+use stwo_cairo_adapter::opcodes::{recorded_casm_descriptor, RecordedCasmKind};
 use stwo_cairo_common::prover_types::cpu::CasmState;
 
 use crate::witness::components::{
@@ -1679,34 +1680,6 @@ pub fn is_supported_recorded_input_label(label: &str) -> bool {
     RECORDED_INPUT_LABELS.contains(&label)
 }
 
-/// Replacement-v1 row-major Casm ingress geometry. `Some` means the recorded
-/// lane consumes canonical `[pc, ap, fp]` states; the value records whether the
-/// generated writer also binds an explicit iota input column.
-pub fn recorded_casm_input_includes_iota(label: &str) -> Option<bool> {
-    Some(match label {
-        "add_opcode"
-        | "assert_eq_opcode"
-        | "jnz_opcode_taken"
-        | "add_opcode_small"
-        | "assert_eq_opcode_imm"
-        | "assert_eq_opcode_double_deref"
-        | "call_opcode_abs"
-        | "call_opcode_rel_imm"
-        | "jnz_opcode_non_taken"
-        | "jump_opcode_abs"
-        | "jump_opcode_double_deref"
-        | "jump_opcode_rel"
-        | "jump_opcode_rel_imm"
-        | "ret_opcode"
-        | "add_ap_opcode"
-        | "mul_opcode"
-        | "mul_opcode_small"
-        | "qm_31_add_mul_opcode" => false,
-        "blake_compress_opcode" => true,
-        _ => return None,
-    })
-}
-
 /// Borrow a canonical opcode source without building pc/ap/fp/enabler slabs.
 /// The returned slice aliases its generator and therefore cannot outlive the
 /// generator-owned resident session.
@@ -1714,73 +1687,77 @@ pub fn recorded_casm_input_attempt<'a>(
     generator: &'a crate::witness::cairo_claim_generator::CairoClaimGenerator,
     label: &'static str,
 ) -> Result<Option<RecordedCasmInputAttempt<'a>>, RecordedWitnessInputsError> {
+    let Some(descriptor) = recorded_casm_descriptor(label) else {
+        return Ok(None);
+    };
     macro_rules! op {
         ($field:ident, $lane:ty) => {
             generator
                 .$field
                 .as_ref()
                 .map(|gen| {
+                    debug_assert_eq!(<$lane as OpcodeLaneSpec>::LABEL, descriptor.label);
                     casm_input_attempt(
-                        <$lane as OpcodeLaneSpec>::LABEL,
+                        descriptor.label,
                         <$lane as OpcodeLaneSpec>::record(),
                         <$lane as OpcodeLaneSpec>::N_TRACE,
                         <$lane as OpcodeLaneSpec>::N_LOOKUP_WORDS,
                         <$lane as OpcodeLaneSpec>::N_SUB_WORDS,
                         <$lane as OpcodeLaneSpec>::inputs(gen),
-                        false,
+                        descriptor.include_iota,
                     )
                 })
                 .transpose()?
         };
     }
     macro_rules! direct {
-        ($field:ident, $lane:ty, $include_iota:expr) => {
+        ($field:ident, $lane:ty) => {
             generator
                 .$field
                 .as_ref()
                 .map(|gen| {
+                    debug_assert_eq!(<$lane as BuiltinLaneSpec>::LABEL, descriptor.label);
                     casm_input_attempt(
-                        <$lane as BuiltinLaneSpec>::LABEL,
+                        descriptor.label,
                         <$lane as BuiltinLaneSpec>::record(),
                         <$lane as BuiltinLaneSpec>::N_TRACE,
                         <$lane as BuiltinLaneSpec>::N_LOOKUP_WORDS,
                         <$lane as BuiltinLaneSpec>::N_SUB_WORDS,
                         &gen.inputs,
-                        $include_iota,
+                        descriptor.include_iota,
                     )
                 })
                 .transpose()?
         };
     }
-    Ok(match label {
-        "add_opcode" => op!(add_opcode, AddOpcodeLane),
-        "assert_eq_opcode" => op!(assert_eq_opcode, AssertEqOpcodeLane),
-        "jnz_opcode_taken" => op!(jnz_opcode_taken, JnzOpcodeTakenLane),
-        "add_opcode_small" => op!(add_opcode_small, AddOpcodeSmallLane),
-        "assert_eq_opcode_imm" => op!(assert_eq_opcode_imm, AssertEqOpcodeImmLane),
-        "assert_eq_opcode_double_deref" => {
+    Ok(match descriptor.kind {
+        RecordedCasmKind::Add => op!(add_opcode, AddOpcodeLane),
+        RecordedCasmKind::AssertEq => op!(assert_eq_opcode, AssertEqOpcodeLane),
+        RecordedCasmKind::JnzTaken => op!(jnz_opcode_taken, JnzOpcodeTakenLane),
+        RecordedCasmKind::AddSmall => op!(add_opcode_small, AddOpcodeSmallLane),
+        RecordedCasmKind::AssertEqImm => op!(assert_eq_opcode_imm, AssertEqOpcodeImmLane),
+        RecordedCasmKind::AssertEqDoubleDeref => {
             op!(assert_eq_opcode_double_deref, AssertEqOpcodeDoubleDerefLane)
         }
-        "call_opcode_abs" => op!(call_opcode_abs, CallOpcodeAbsLane),
-        "call_opcode_rel_imm" => op!(call_opcode_rel_imm, CallOpcodeRelImmLane),
-        "jnz_opcode_non_taken" => op!(jnz_opcode_non_taken, JnzOpcodeNonTakenLane),
-        "jump_opcode_abs" => op!(jump_opcode_abs, JumpOpcodeAbsLane),
-        "jump_opcode_double_deref" => {
+        RecordedCasmKind::CallAbs => op!(call_opcode_abs, CallOpcodeAbsLane),
+        RecordedCasmKind::CallRelImm => op!(call_opcode_rel_imm, CallOpcodeRelImmLane),
+        RecordedCasmKind::JnzNonTaken => op!(jnz_opcode_non_taken, JnzOpcodeNonTakenLane),
+        RecordedCasmKind::JumpAbs => op!(jump_opcode_abs, JumpOpcodeAbsLane),
+        RecordedCasmKind::JumpDoubleDeref => {
             op!(jump_opcode_double_deref, JumpOpcodeDoubleDerefLane)
         }
-        "jump_opcode_rel" => op!(jump_opcode_rel, JumpOpcodeRelLane),
-        "jump_opcode_rel_imm" => op!(jump_opcode_rel_imm, JumpOpcodeRelImmLane),
-        "ret_opcode" => op!(ret_opcode, RetOpcodeLane),
-        "add_ap_opcode" => direct!(add_ap_opcode, AddApOpcodeLane, false),
-        "mul_opcode" => direct!(mul_opcode, MulOpcodeLane, false),
-        "mul_opcode_small" => direct!(mul_opcode_small, MulOpcodeSmallLane, false),
-        "blake_compress_opcode" => {
-            direct!(blake_compress_opcode, BlakeCompressOpcodeLane, true)
+        RecordedCasmKind::JumpRel => op!(jump_opcode_rel, JumpOpcodeRelLane),
+        RecordedCasmKind::JumpRelImm => op!(jump_opcode_rel_imm, JumpOpcodeRelImmLane),
+        RecordedCasmKind::Ret => op!(ret_opcode, RetOpcodeLane),
+        RecordedCasmKind::AddAp => direct!(add_ap_opcode, AddApOpcodeLane),
+        RecordedCasmKind::Mul => direct!(mul_opcode, MulOpcodeLane),
+        RecordedCasmKind::MulSmall => direct!(mul_opcode_small, MulOpcodeSmallLane),
+        RecordedCasmKind::BlakeCompress => {
+            direct!(blake_compress_opcode, BlakeCompressOpcodeLane)
         }
-        "qm_31_add_mul_opcode" => {
-            direct!(qm_31_add_mul_opcode, Qm31AddMulOpcodeLane, false)
+        RecordedCasmKind::Qm31AddMul => {
+            direct!(qm_31_add_mul_opcode, Qm31AddMulOpcodeLane)
         }
-        _ => None,
     })
 }
 
@@ -4739,6 +4716,117 @@ mod emitted_lane_tests {
             .iter()
             .all(|label| recorded_input_geometry(label).is_some()));
         assert!(!is_supported_recorded_input_label("not_a_recorded_lane"));
+    }
+
+    #[test]
+    fn canonical_casm_registry_matches_all_19_generator_oracles_in_order() {
+        use stwo_cairo_adapter::opcodes::{CasmStatesByOpcode, RECORDED_CASM_DESCRIPTORS};
+        use stwo_cairo_common::prover_types::cpu::M31;
+
+        let state = |pc| CasmState {
+            pc: M31::from_u32_unchecked(pc),
+            ap: M31::from_u32_unchecked(pc + 100),
+            fp: M31::from_u32_unchecked(pc + 200),
+        };
+        let sources = CasmStatesByOpcode {
+            add_opcode: vec![state(1)],
+            assert_eq_opcode: vec![state(2)],
+            jnz_opcode_taken: vec![state(3)],
+            add_opcode_small: vec![state(4)],
+            assert_eq_opcode_imm: vec![state(5)],
+            assert_eq_opcode_double_deref: vec![state(6)],
+            call_opcode_abs: vec![state(7)],
+            call_opcode_rel_imm: vec![state(8)],
+            jnz_opcode_non_taken: vec![state(9)],
+            jump_opcode_abs: vec![state(10)],
+            jump_opcode_double_deref: vec![state(11)],
+            jump_opcode_rel: vec![state(12)],
+            jump_opcode_rel_imm: vec![state(13)],
+            ret_opcode: vec![state(14)],
+            add_ap_opcode: vec![state(15)],
+            mul_opcode: vec![state(16)],
+            mul_opcode_small: vec![state(17)],
+            blake_compress_opcode: vec![state(18)],
+            qm_31_add_mul_opcode: vec![state(19)],
+            ..Default::default()
+        };
+        let generator = crate::witness::cairo_claim_generator::CairoClaimGenerator {
+            add_opcode: Some(add_opcode::ClaimGenerator::new(sources.add_opcode.clone())),
+            assert_eq_opcode: Some(assert_eq_opcode::ClaimGenerator::new(
+                sources.assert_eq_opcode.clone(),
+            )),
+            jnz_opcode_taken: Some(jnz_opcode_taken::ClaimGenerator::new(
+                sources.jnz_opcode_taken.clone(),
+            )),
+            add_opcode_small: Some(add_opcode_small::ClaimGenerator::new(
+                sources.add_opcode_small.clone(),
+            )),
+            assert_eq_opcode_imm: Some(assert_eq_opcode_imm::ClaimGenerator::new(
+                sources.assert_eq_opcode_imm.clone(),
+            )),
+            assert_eq_opcode_double_deref: Some(
+                assert_eq_opcode_double_deref::ClaimGenerator::new(
+                    sources.assert_eq_opcode_double_deref.clone(),
+                ),
+            ),
+            call_opcode_abs: Some(call_opcode_abs::ClaimGenerator::new(
+                sources.call_opcode_abs.clone(),
+            )),
+            call_opcode_rel_imm: Some(call_opcode_rel_imm::ClaimGenerator::new(
+                sources.call_opcode_rel_imm.clone(),
+            )),
+            jnz_opcode_non_taken: Some(jnz_opcode_non_taken::ClaimGenerator::new(
+                sources.jnz_opcode_non_taken.clone(),
+            )),
+            jump_opcode_abs: Some(jump_opcode_abs::ClaimGenerator::new(
+                sources.jump_opcode_abs.clone(),
+            )),
+            jump_opcode_double_deref: Some(jump_opcode_double_deref::ClaimGenerator::new(
+                sources.jump_opcode_double_deref.clone(),
+            )),
+            jump_opcode_rel: Some(jump_opcode_rel::ClaimGenerator::new(
+                sources.jump_opcode_rel.clone(),
+            )),
+            jump_opcode_rel_imm: Some(jump_opcode_rel_imm::ClaimGenerator::new(
+                sources.jump_opcode_rel_imm.clone(),
+            )),
+            ret_opcode: Some(ret_opcode::ClaimGenerator::new(sources.ret_opcode.clone())),
+            add_ap_opcode: Some(add_ap_opcode::ClaimGenerator::new(
+                sources.add_ap_opcode.clone(),
+            )),
+            mul_opcode: Some(mul_opcode::ClaimGenerator::new(sources.mul_opcode.clone())),
+            mul_opcode_small: Some(mul_opcode_small::ClaimGenerator::new(
+                sources.mul_opcode_small.clone(),
+            )),
+            blake_compress_opcode: Some(blake_compress_opcode::ClaimGenerator::new(
+                sources.blake_compress_opcode.clone(),
+            )),
+            qm_31_add_mul_opcode: Some(qm_31_add_mul_opcode::ClaimGenerator::new(
+                sources.qm_31_add_mul_opcode.clone(),
+            )),
+            ..Default::default()
+        };
+        let oracle_order = RECORDED_INPUT_LABELS
+            .iter()
+            .copied()
+            .filter(|label| recorded_casm_descriptor(label).is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            oracle_order,
+            RECORDED_CASM_DESCRIPTORS
+                .iter()
+                .map(|descriptor| descriptor.label)
+                .collect::<Vec<_>>()
+        );
+
+        for descriptor in &RECORDED_CASM_DESCRIPTORS {
+            let oracle = recorded_casm_input_attempt(&generator, descriptor.label)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing generator oracle for {}", descriptor.label));
+            assert_eq!(oracle.label, descriptor.label);
+            assert_eq!(oracle.inputs, descriptor.states(&sources));
+            assert_eq!(oracle.include_iota, descriptor.include_iota);
+        }
     }
 
     #[test]

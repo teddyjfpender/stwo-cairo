@@ -59,9 +59,8 @@ use stwo_backend_cuda::{
     WitnessWorkspaceRequirements, WitnessWorkspaceSlots, EXECUTION_TABLE_BIG_LIMBS,
     EXECUTION_TABLE_SMALL_LIMBS,
 };
-use stwo_cairo_prover::witness::jit_prove_backend::{
-    recorded_casm_input_includes_iota, BlakeGRecordedLane, BuiltinLaneSpec,
-};
+use stwo_cairo_adapter::opcodes::recorded_casm_descriptor;
+use stwo_cairo_prover::witness::jit_prove_backend::{BlakeGRecordedLane, BuiltinLaneSpec};
 use stwo_cairo_prover::witness::proof_shape::{
     ProofShapeError, RowResolution, TracePartId, TracePartShape,
 };
@@ -4289,7 +4288,7 @@ fn append_witness_buffers(
             .filter(|component| {
                 component.node.facts.witness_writer.kind == WitnessWriterKind::RecordedAot
                     && component.runtime.is_present()
-                    && recorded_casm_input_includes_iota(component.node.id).is_some()
+                    && recorded_casm_descriptor(component.node.id).is_some()
             })
             .map(|component| {
                 let parts = capacity_parts(&component.runtime.rows)?;
@@ -4300,8 +4299,9 @@ fn append_witness_buffers(
                 }
                 let n_real = usize::try_from(parts[0].n_real_rows)
                     .map_err(|_| ArenaPlanError::SizeOverflow)?;
-                let include_iota = recorded_casm_input_includes_iota(component.node.id)
-                    .expect("filtered Casm component");
+                let include_iota = recorded_casm_descriptor(component.node.id)
+                    .expect("filtered Casm component")
+                    .include_iota;
                 witness_casm_input_requirements(n_real, include_iota)
                     .map(|requirements| requirements.staging_words)
                     .map_err(ArenaPlanError::WitnessCasmInput)
@@ -4517,12 +4517,13 @@ fn append_witness_buffers(
             }))
         .then_some("ec_op_builtin");
         let input_casm = if resident_backend == ResidentBackend::ReplacementV1 {
-            recorded_casm_input_includes_iota(component.node.id)
-                .map(|include_iota| {
+            recorded_casm_descriptor(component.node.id)
+                .map(|descriptor| {
                     let n_real = usize::try_from(part.n_real_rows)
                         .map_err(|_| ArenaPlanError::SizeOverflow)?;
-                    let casm_requirements = witness_casm_input_requirements(n_real, include_iota)
-                        .map_err(ArenaPlanError::WitnessCasmInput)?;
+                    let casm_requirements =
+                        witness_casm_input_requirements(n_real, descriptor.include_iota)
+                            .map_err(ArenaPlanError::WitnessCasmInput)?;
                     if casm_requirements.consumer_rows != rows
                         || casm_requirements.consumer_input_column_words
                             != requirements.input_column_words

@@ -19,7 +19,7 @@ fn extract_public_segments(
     memory: &Memory,
     initial_ap: u32,
     final_ap: u32,
-    public_segment_context: PublicSegmentContext,
+    public_segment_context: &PublicSegmentContext,
 ) -> PublicSegmentRanges {
     let n_public_segments = public_segment_context.iter().filter(|&b| *b).count() as u32;
 
@@ -37,7 +37,7 @@ fn extract_public_segments(
             start_ptr,
             stop_ptr,
         });
-    let mut present = public_segment_context.into_iter();
+    let mut present = public_segment_context.iter().copied();
     let mut next = || {
         let present = present.next().unwrap();
         if present {
@@ -67,7 +67,7 @@ fn extract_sections_from_memory(
     initial_pc: u32,
     initial_ap: u32,
     final_ap: u32,
-    public_segment_context: PublicSegmentContext,
+    public_segment_context: &PublicSegmentContext,
 ) -> PublicMemory {
     let public_segments =
         extract_public_segments(memory, initial_ap, final_ap, public_segment_context);
@@ -103,23 +103,44 @@ fn extract_sections_from_memory(
     }
 }
 
+/// Computes the transcript-visible Cairo public data directly from the adapter
+/// input. ReplacementV1 and the legacy generator share this exact function so
+/// generator deletion cannot introduce a second public-memory interpretation.
+pub fn public_data_from_prover_input(input: &ProverInput) -> PublicData {
+    let initial_state = input.state_transitions.initial_state;
+    let final_state = input.state_transitions.final_state;
+    let public_memory = extract_sections_from_memory(
+        &input.memory,
+        initial_state.pc.0,
+        initial_state.ap.0,
+        final_state.ap.0,
+        &input.public_segment_context,
+    );
+
+    PublicData {
+        public_memory,
+        initial_state,
+        final_state,
+    }
+}
+
 /// CairoClaimGenerator responsible for generating the CairoClaim and writing the trace.
 /// NOTE: Order of writing the trace is important, and should be consistent with [`CairoClaim`],
 /// [`CairoInteractionClaim`], [`CairoComponents`].
 pub fn create_cairo_claim_generator(
-    ProverInput {
+    input: ProverInput,
+    preprocessed_trace: Arc<PreProcessedTrace>,
+) -> CairoClaimGenerator {
+    let public_data = public_data_from_prover_input(&input);
+    let ProverInput {
         state_transitions,
         memory,
         pc_count,
         public_memory_addresses,
         builtin_segments,
-        public_segment_context,
+        public_segment_context: _,
         ..
-    }: ProverInput,
-    preprocessed_trace: Arc<PreProcessedTrace>,
-) -> CairoClaimGenerator {
-    let initial_state = state_transitions.initial_state;
-    let final_state = state_transitions.final_state;
+    } = input;
 
     let mut all_components = IndexSet::new();
     for opcode in get_opcodes(&state_transitions.casm_states_by_opcode) {
@@ -135,24 +156,6 @@ pub fn create_cairo_claim_generator(
     all_components.insert("verify_bitwise_xor_8");
     all_components.insert("verify_bitwise_xor_9");
 
-    // Public data.
-    let initial_pc = initial_state.pc.0;
-    let initial_ap = initial_state.ap.0;
-    let final_ap = final_state.ap.0;
-    let public_memory = extract_sections_from_memory(
-        &memory,
-        initial_pc,
-        initial_ap,
-        final_ap,
-        public_segment_context,
-    );
-
-    let public_data = PublicData {
-        public_memory,
-        initial_state,
-        final_state,
-    };
-
     let mut cairo_claim_generator = CairoClaimGenerator {
         public_data,
         adapted_pc_count: Some(pc_count),
@@ -165,7 +168,6 @@ pub fn create_cairo_claim_generator(
         Arc::new(memory),
         preprocessed_trace,
     );
-
     let memory_address_to_id_trace_generator =
         cairo_claim_generator.memory_address_to_id.as_ref().unwrap();
     let memory_id_to_value_trace_generator =
