@@ -1027,6 +1027,7 @@ fn resident_host_witness_inputs<'a>(
                         Ok(ResidentWitnessInputColumn { ordinal, words })
                     }
                     RecordedInputColumnProvenance::DeviceEdge(_)
+                    | RecordedInputColumnProvenance::DeviceCasm(_)
                     | RecordedInputColumnProvenance::DeviceGather(_)
                     | RecordedInputColumnProvenance::DeviceNative(_)
                     | RecordedInputColumnProvenance::Unresolved(_) => {

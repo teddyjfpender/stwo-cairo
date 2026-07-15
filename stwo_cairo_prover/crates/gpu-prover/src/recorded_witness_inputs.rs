@@ -10,8 +10,9 @@ use std::sync::Arc;
 use stwo_cairo_adapter::memory::Memory;
 use stwo_cairo_prover::witness::cairo_claim_generator::CairoClaimGenerator;
 use stwo_cairo_prover::witness::jit_prove_backend::{
-    recorded_input_compaction_geometry, recorded_input_geometry, recorded_witness_input_attempt,
-    ExecutionMemoryIdentity, RecordedInputBuildError, RecordedTableIdentity,
+    recorded_casm_input_attempt, recorded_input_compaction_geometry, recorded_input_geometry,
+    recorded_witness_input_attempt, ExecutionMemoryIdentity, RecordedCasmInputAttempt,
+    RecordedInputBuildError, RecordedTableIdentity, RecordedWitnessInputAttempt,
     RecordedWitnessInputSource, RecordedWitnessInputsError,
 };
 use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId};
@@ -67,12 +68,22 @@ pub struct UnresolvedInputColumn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecordedInputColumnProvenance {
     Host(Vec<u32>),
+    DeviceCasm(DeviceCasmColumn),
     DeviceNative(DeviceNativeColumn),
     DeviceSeed(DeviceSeedColumn),
     DeviceEdge(DeviceEdgeColumn),
     DeviceGather(DeviceGatherColumn),
     DeviceCompact(DeviceCompactColumn),
     Unresolved(UnresolvedInputColumn),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceCasmColumn {
+    Pc,
+    Ap,
+    Fp,
+    Enabler,
+    Iota,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,12 +206,34 @@ struct ExpectedLane {
     row_count: usize,
 }
 
+enum PlannedInputAttempt<'a> {
+    Casm(RecordedCasmInputAttempt<'a>),
+    Standard(RecordedWitnessInputAttempt),
+}
+
 /// Build one provenance-complete entry for every present RecordedAot component.
 /// Host columns are exact recorder slots; direct producer columns are semantic
 /// device-edge aliases; every remaining column is explicitly unresolved.
 pub fn recorded_witness_inputs_for_plan(
     generator: &CairoClaimGenerator,
     proof_plan: &ProofPlan,
+) -> Result<PlannedRecordedWitnessInputs, RecordedWitnessPlanError> {
+    recorded_witness_inputs_for_plan_inner(generator, proof_plan, false)
+}
+
+/// Replacement-v1 planner. Canonical opcode sources remain borrowed row-major
+/// generator data; no padded host input columns are constructed.
+pub fn recorded_witness_inputs_for_replacement_plan(
+    generator: &CairoClaimGenerator,
+    proof_plan: &ProofPlan,
+) -> Result<PlannedRecordedWitnessInputs, RecordedWitnessPlanError> {
+    recorded_witness_inputs_for_plan_inner(generator, proof_plan, true)
+}
+
+fn recorded_witness_inputs_for_plan_inner(
+    generator: &CairoClaimGenerator,
+    proof_plan: &ProofPlan,
+    borrow_casm_inputs: bool,
 ) -> Result<PlannedRecordedWitnessInputs, RecordedWitnessPlanError> {
     // Lanes must be planned in the same topological (producer-before-consumer)
     // order the arena witness workspace and the Graph A launcher use; the
@@ -243,8 +276,14 @@ pub fn recorded_witness_inputs_for_plan(
     let mut attempts = Vec::with_capacity(expected.len());
     let mut unsupported = Vec::new();
     for lane in &expected {
+        if borrow_casm_inputs {
+            if let Some(attempt) = recorded_casm_input_attempt(generator, lane.node.id)? {
+                attempts.push(PlannedInputAttempt::Casm(attempt));
+                continue;
+            }
+        }
         match recorded_witness_input_attempt(generator, lane.node.id)? {
-            Some(attempt) => attempts.push(attempt),
+            Some(attempt) => attempts.push(PlannedInputAttempt::Standard(attempt)),
             None => unsupported.push(lane.node.id),
         }
     }
@@ -254,73 +293,115 @@ pub fn recorded_witness_inputs_for_plan(
 
     let mut lanes = Vec::with_capacity(expected.len());
     for (expected, attempt) in expected.into_iter().zip(attempts) {
-        let program = attempt.program;
-        let (columns, host_build_error) = match attempt.input_source {
-            RecordedWitnessInputSource::Host(Ok(inputs)) => {
-                let actual_padded = inputs.row_count();
-                if inputs.n_real != expected.n_real || actual_padded != expected.row_count {
+        let (program, columns, host_build_error, host_pedersen_points_18) = match attempt {
+            PlannedInputAttempt::Casm(attempt) => {
+                let actual_real = attempt.inputs.len();
+                let actual_padded = match stwo_backend_cuda::witness_casm_input_requirements(
+                    actual_real,
+                    attempt.include_iota,
+                ) {
+                    Ok(requirements) => requirements.consumer_rows,
+                    Err(stwo_backend_cuda::PreparedWitnessCasmInputError::NoRows) => 0,
+                    Err(_) => return Err(RecordedWitnessPlanError::SizeOverflow(expected.node.id)),
+                };
+                if actual_real != expected.n_real || actual_padded != expected.row_count {
                     return Err(RecordedWitnessPlanError::RowGeometryMismatch {
                         component: expected.node.id,
                         expected_real: expected.n_real,
-                        actual_real: inputs.n_real,
+                        actual_real,
                         expected_padded: expected.row_count,
                         actual_padded,
                     });
                 }
-                (
-                    inputs
-                        .columns
-                        .into_iter()
-                        .map(RecordedInputColumnProvenance::Host)
-                        .collect(),
-                    None,
-                )
-            }
-            RecordedWitnessInputSource::Host(Err(
-                error @ RecordedInputBuildError::EmptyInputs(_),
-            ))
-            | RecordedWitnessInputSource::Host(Err(
-                error @ RecordedInputBuildError::ScalarRemainder(_),
-            ))
-            | RecordedWitnessInputSource::Host(Err(
-                error @ RecordedInputBuildError::DeviceSeedOnly(_),
-            )) => (
-                provenance_for_unmaterialized(
-                    expected.node,
-                    program.n_inputs as usize,
-                    expected.n_real,
-                    expected.row_count,
-                    |producer| {
-                        proof_plan.components.iter().any(|component| {
-                            component.node.id == producer && component.runtime.is_present()
-                        })
-                    },
-                )?,
-                Some(error),
-            ),
-            RecordedWitnessInputSource::Host(Err(source)) => {
-                return Err(RecordedWitnessPlanError::InputBuild {
-                    component: expected.node.id,
-                    source,
-                });
-            }
-            RecordedWitnessInputSource::DeviceSeed(seed) => {
-                if seed.n_real != expected.n_real || seed.row_count != expected.row_count {
-                    return Err(RecordedWitnessPlanError::RowGeometryMismatch {
-                        component: expected.node.id,
-                        expected_real: expected.n_real,
-                        actual_real: seed.n_real,
-                        expected_padded: expected.row_count,
-                        actual_padded: seed.row_count,
-                    });
+                let mut columns = vec![
+                    RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Pc),
+                    RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Ap),
+                    RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Fp),
+                    RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Enabler),
+                ];
+                if attempt.include_iota {
+                    columns.push(RecordedInputColumnProvenance::DeviceCasm(
+                        DeviceCasmColumn::Iota,
+                    ));
                 }
+                (attempt.program, columns, None, false)
+            }
+            PlannedInputAttempt::Standard(attempt) => {
+                let program = attempt.program;
+                let (columns, host_build_error) = match attempt.input_source {
+                    RecordedWitnessInputSource::Host(Ok(inputs)) => {
+                        let actual_padded = inputs.row_count();
+                        if inputs.n_real != expected.n_real || actual_padded != expected.row_count {
+                            return Err(RecordedWitnessPlanError::RowGeometryMismatch {
+                                component: expected.node.id,
+                                expected_real: expected.n_real,
+                                actual_real: inputs.n_real,
+                                expected_padded: expected.row_count,
+                                actual_padded,
+                            });
+                        }
+                        (
+                            inputs
+                                .columns
+                                .into_iter()
+                                .map(RecordedInputColumnProvenance::Host)
+                                .collect(),
+                            None,
+                        )
+                    }
+                    RecordedWitnessInputSource::Host(Err(
+                        error @ RecordedInputBuildError::EmptyInputs(_),
+                    ))
+                    | RecordedWitnessInputSource::Host(Err(
+                        error @ RecordedInputBuildError::ScalarRemainder(_),
+                    ))
+                    | RecordedWitnessInputSource::Host(Err(
+                        error @ RecordedInputBuildError::DeviceSeedOnly(_),
+                    )) => (
+                        provenance_for_unmaterialized(
+                            expected.node,
+                            program.n_inputs as usize,
+                            expected.n_real,
+                            expected.row_count,
+                            |producer| {
+                                proof_plan.components.iter().any(|component| {
+                                    component.node.id == producer && component.runtime.is_present()
+                                })
+                            },
+                        )?,
+                        Some(error),
+                    ),
+                    RecordedWitnessInputSource::Host(Err(source)) => {
+                        return Err(RecordedWitnessPlanError::InputBuild {
+                            component: expected.node.id,
+                            source,
+                        });
+                    }
+                    RecordedWitnessInputSource::DeviceSeed(seed) => {
+                        if seed.n_real != expected.n_real || seed.row_count != expected.row_count {
+                            return Err(RecordedWitnessPlanError::RowGeometryMismatch {
+                                component: expected.node.id,
+                                expected_real: expected.n_real,
+                                actual_real: seed.n_real,
+                                expected_padded: expected.row_count,
+                                actual_padded: seed.row_count,
+                            });
+                        }
+                        (
+                            provenance_for_device_seed(
+                                expected.node.id,
+                                program.n_inputs as usize,
+                                &seed.scalar_values,
+                            )?,
+                            None,
+                        )
+                    }
+                };
                 (
-                    provenance_for_device_seed(
-                        expected.node.id,
-                        program.n_inputs as usize,
-                        &seed.scalar_values,
-                    )?,
-                    None,
+                    program,
+                    columns,
+                    host_build_error,
+                    attempt.host_pedersen_points_18,
                 )
             }
         };
@@ -333,7 +414,7 @@ pub fn recorded_witness_inputs_for_plan(
             columns,
             tables: RecordedTableIdentity {
                 execution_memory: execution_memory_identity,
-                host_pedersen_points_18: attempt.host_pedersen_points_18,
+                host_pedersen_points_18,
             },
             host_build_error,
         });
@@ -912,5 +993,20 @@ mod tests {
             unreachable!()
         };
         assert_eq!(&pc[..3], &[1, 4, 7]);
+
+        let replacement = recorded_witness_inputs_for_replacement_plan(&generator, &plan).unwrap();
+        let lane = &replacement.lanes[0];
+        assert_eq!(lane.n_real, 3);
+        assert_eq!(lane.row_count, 16);
+        assert_eq!(
+            lane.columns,
+            [
+                RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Pc),
+                RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Ap),
+                RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Fp),
+                RecordedInputColumnProvenance::DeviceCasm(DeviceCasmColumn::Enabler),
+            ]
+        );
+        replacement.require_resolved().unwrap();
     }
 }
