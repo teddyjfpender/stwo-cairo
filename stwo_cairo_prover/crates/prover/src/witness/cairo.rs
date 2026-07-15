@@ -110,6 +110,7 @@ pub fn create_cairo_claim_generator(
     ProverInput {
         state_transitions,
         memory,
+        pc_count,
         public_memory_addresses,
         builtin_segments,
         public_segment_context,
@@ -154,6 +155,7 @@ pub fn create_cairo_claim_generator(
 
     let mut cairo_claim_generator = CairoClaimGenerator {
         public_data,
+        adapted_pc_count: Some(pc_count),
         ..Default::default()
     };
     cairo_claim_generator.fill_components(

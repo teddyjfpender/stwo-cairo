@@ -48,6 +48,10 @@ use crate::witness::pedersen_witness_backend::{
 #[derive(Default)]
 pub struct CairoClaimGenerator {
     pub public_data: PublicData,
+    /// Exact number of distinct executed instruction PCs already deduplicated
+    /// by the adapter's instruction cache. Hand-built generators leave this
+    /// unset and use the canonical feeder scan at plan time.
+    pub adapted_pc_count: Option<usize>,
     pub add_opcode: Option<add_opcode::ClaimGenerator>,
     /// Adapter memory retained for prepared resident witness planning. This Arc
     /// is also the legacy JIT lane's execution-table source when that lane is on.
@@ -139,6 +143,7 @@ impl CairoClaimGenerator {
         // This is one Arc; SIMD execution is otherwise unchanged.
         self.jit_memory = Some(memory.clone());
         let Self {
+            adapted_pc_count: _,
             jit_memory: _,
             add_opcode: add_opcode_ref,
             add_opcode_small: add_opcode_small_ref,

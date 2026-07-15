@@ -1443,20 +1443,25 @@ pub fn planned_compacted_consumer_shape(
             if generator.verify_instruction.is_none() {
                 return Ok(None);
             }
-            let mut pcs: Vec<u32> = Vec::new();
-            macro_rules! collect_feeder_pcs {
-                ($($field:ident),* $(,)?) => {
-                    $(
-                        if let Some(gen) = &generator.$field {
-                            pcs.extend(gen.inputs.iter().map(|state| state.pc.0));
-                        }
-                    )*
-                };
-            }
-            for_each_verify_instruction_feeder!(collect_feeder_pcs);
-            pcs.sort_unstable();
-            pcs.dedup();
-            let n_real = pcs.len() as u64;
+            let n_real = match generator.adapted_pc_count {
+                Some(count) => count as u64,
+                None => {
+                    let mut pcs: Vec<u32> = Vec::new();
+                    macro_rules! collect_feeder_pcs {
+                        ($($field:ident),* $(,)?) => {
+                            $(
+                                if let Some(gen) = &generator.$field {
+                                    pcs.extend(gen.inputs.iter().map(|state| state.pc.0));
+                                }
+                            )*
+                        };
+                    }
+                    for_each_verify_instruction_feeder!(collect_feeder_pcs);
+                    pcs.sort_unstable();
+                    pcs.dedup();
+                    pcs.len() as u64
+                }
+            };
             let padded = padded_rows("verify_instruction", n_real, N_LANES as u64)
                 .map_err(PlannedCompactedRowsError::Shape)?;
             RuntimeComponentShape::uniform("verify_instruction", n_real, padded)
@@ -4645,6 +4650,29 @@ mod planned_compacted_rows_tests {
         assert_eq!(
             shape,
             RuntimeComponentShape::uniform("verify_instruction", 3, N_LANES as u64).unwrap()
+        );
+    }
+
+    #[test]
+    fn verify_instruction_rows_reuse_the_adapters_exact_pc_count() {
+        let generator = CairoClaimGenerator {
+            adapted_pc_count: Some(2),
+            verify_instruction: Some(verify_instruction::ClaimGenerator::new()),
+            // The adapted count is retained specifically so planning does not
+            // rescan these potentially SN-scale feeder vectors.
+            ret_opcode: Some(ret_opcode::ClaimGenerator::new(vec![
+                casm(5),
+                casm(5),
+                casm(9),
+            ])),
+            ..CairoClaimGenerator::default()
+        };
+        let shape = planned_compacted_consumer_shape(&generator, "verify_instruction")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            shape,
+            RuntimeComponentShape::uniform("verify_instruction", 2, N_LANES as u64).unwrap()
         );
     }
 
