@@ -220,6 +220,21 @@ impl BufferLifetime {
     }
 }
 
+const fn preprocessed_coefficient_lifetime(final_consumer: ProofEpoch) -> BufferLifetime {
+    if matches!(final_consumer, ProofEpoch::Ingest) {
+        BufferLifetime::at(ProofEpoch::Ingest)
+    } else {
+        // The fixed commitment cache-hits after the first proof. Any later
+        // reader therefore needs the cold coefficient contents to survive the
+        // Assemble -> Ingest replay boundary; ending at the nominal reader
+        // epoch would let another arena range overwrite them first.
+        BufferLifetime {
+            first: ProofEpoch::Ingest,
+            last: ProofEpoch::Assemble,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum BufferPurpose {
     /// Persistent fixed-column coefficients, indexed in canonical
@@ -7396,12 +7411,11 @@ fn append_protocol_buffers(
                     BufferPurpose::PreprocessedCoefficients,
                     ordinal,
                     checked_pow2(log_size)?,
-                    BufferLifetime::new(
-                        ProofEpoch::Ingest,
+                    preprocessed_coefficient_lifetime(
                         late_coefficient_ownership
                             .final_consumer(OpenedColumnSource::Preprocessed { ordinal })
                             .map_err(ArenaPlanError::InvalidProtocolGeometry)?,
-                    )?,
+                    ),
                 )?,
             })
         })
@@ -11506,6 +11520,30 @@ mod tests {
                     "mask intersection diverges from overlaps for {a:?} vs {b:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fixed_coefficients_cross_replay_unless_they_have_no_warm_reader() {
+        assert_eq!(
+            preprocessed_coefficient_lifetime(ProofEpoch::Ingest),
+            BufferLifetime::at(ProofEpoch::Ingest),
+            "a zero-warm-reader fixed coefficient may retire after cold setup"
+        );
+        for reader in [
+            ProofEpoch::Composition,
+            ProofEpoch::Oods,
+            ProofEpoch::Quotient,
+            ProofEpoch::Decommit,
+        ] {
+            assert_eq!(
+                preprocessed_coefficient_lifetime(reader),
+                BufferLifetime {
+                    first: ProofEpoch::Ingest,
+                    last: ProofEpoch::Assemble,
+                },
+                "a {reader:?} reader must preserve cold contents across every replay boundary"
+            );
         }
     }
 
