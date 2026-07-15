@@ -16,6 +16,8 @@ use stwo_cairo_gpu_prover::prepared_composition::CompositionOutputMode;
 
 #[path = "ntt_lde_intervals.rs"]
 mod intervals;
+#[path = "ntt_lde_receipt/physical.rs"]
+mod physical;
 use intervals::{
     bytes, bytes_per_second, chunks, current_n2b_intervals, duplicate_first_intervals, pow2,
     tree_name,
@@ -65,6 +67,7 @@ impl Totals {
 
 pub(crate) fn json(arena: &ProofArenaPlan) -> Result<Value, String> {
     validate_late_consumers(arena)?;
+    let (composition_slab_physical, composition_slab_granted_bytes) = physical::json(arena)?;
     let mut totals = Totals::default();
     let mut trees = Vec::new();
     for tree in [
@@ -100,7 +103,7 @@ pub(crate) fn json(arena: &ProofArenaPlan) -> Result<Value, String> {
         ],
         "unqualified_gates": [
             "Composition L24/L25 native output, leaf, retained-layer, and root byte identity",
-            "sealed adapted-SN direct-vs-forced-fallback ProofArenaPlan total_words receipt",
+            "sealed adapted-SN1-SN4 Composition physical receipt test execution",
             "counter-enabled replay timing after byte qualification",
         ],
         "h100_timing_credit_ns": 0,
@@ -113,9 +116,10 @@ pub(crate) fn json(arena: &ProofArenaPlan) -> Result<Value, String> {
             "dynamic_coefficients_die_at_own_commit": true,
             "dynamic_late_consumers_use_retained_evaluations": true,
             "preprocessed_coefficients_remain_owned": true,
-            "physical_arena_reduction_granted_bytes": 0,
-            "physical_rule": "logical coefficient retirement requires allocator recoloring before any VRAM credit",
+            "physical_arena_reduction_granted_bytes": composition_slab_granted_bytes,
+            "physical_rule": "exact same-non-output-plan range recoloring; zero remains zero when reuse masks logical deletion",
         },
+        "composition_slab_physical_counterfactual": composition_slab_physical,
         "trees": trees,
         "totals": {
             "columns": totals.columns,

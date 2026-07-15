@@ -5,6 +5,9 @@
 //! shape reuses immutable planning and executable topology while rebinding all
 //! current statement and execution-memory values.
 
+#[path = "raw_replacement_sn_matrix_tests/composition_slab.rs"]
+mod composition_slab;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;

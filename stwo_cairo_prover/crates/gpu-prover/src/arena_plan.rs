@@ -104,6 +104,12 @@ use crate::schedule::{InputEdge, TraceColumnCount, WitnessWriterKind};
 use crate::source_ownership::LateCoefficientOwnershipPlan;
 use crate::transcript_plan::{CairoTranscriptInput, CairoTranscriptOutput};
 
+#[path = "arena_plan/composition_slab_counterfactual.rs"]
+mod composition_slab_counterfactual;
+pub use composition_slab_counterfactual::{
+    CompositionSlabArenaCounterfactual, CompositionSlabArenaFootprint,
+};
+
 /// Every arena range is at least 128-byte aligned. Kernel code may rely on this.
 pub const ARENA_ALIGNMENT_WORDS: usize = 128 / core::mem::size_of::<u32>();
 const BLAKE2S_HASH_WORDS: usize = 8;
