@@ -44,13 +44,10 @@ use stwo_cairo_gpu_prover::schedule_table::CAIRO_SCHEDULE;
 use stwo_cairo_gpu_prover::{phases, state};
 use stwo_cairo_prover::witness::jit_prove_backend::all_lane_recordings;
 
-fn write_if_changed(path: &Path, content: &str) -> std::io::Result<bool> {
-    if std::fs::read(path).is_ok_and(|bytes| bytes == content.as_bytes()) {
-        return Ok(false);
-    }
-    std::fs::write(path, content)?;
-    Ok(true)
-}
+#[path = "kernel_emit/staged_output.rs"]
+mod staged_output;
+
+use staged_output::StagedOutput;
 
 fn arg(name: &str) -> Option<String> {
     args(name).into_iter().next()
@@ -74,11 +71,6 @@ fn witness_only_incompatibility(cli_args: &[String]) -> Option<&'static str> {
     ]
     .into_iter()
     .find(|option| cli_args.iter().any(|arg| arg == option))
-}
-
-fn generated_file_counts(files: &BTreeMap<String, String>) -> (usize, usize) {
-    let kernels = files.keys().filter(|file| file.ends_with(".cu")).count();
-    (kernels, files.len() - kernels)
 }
 
 fn admit_witness_output_dir(path: &Path) -> Result<(), String> {
@@ -133,10 +125,21 @@ fn admit_witness_output_dir(path: &Path) -> Result<(), String> {
 /// AOT metadata and the pack hash so a stale policy fails runtime admission.
 const DEFAULT_AOT_MAX_INSTRS: usize = 2048;
 
-struct Emitted {
-    kind: &'static str,
+fn stage_kernel(
+    output: &mut StagedOutput,
+    kind: &str,
     label: String,
     kernel: aot::EmittedKernel,
+) -> Result<(), String> {
+    output.stage_kernel(
+        kind,
+        label,
+        kernel.kernel_name,
+        kernel.cache_key,
+        kernel.semantic_hash,
+        kernel.source,
+    )?;
+    Ok(())
 }
 
 fn print_shape_report(input_path: &str) -> ExitCode {
@@ -189,11 +192,11 @@ fn print_shape_report(input_path: &str) -> ExitCode {
 fn run_fixture(
     program: &str,
     variant: PreProcessedTraceVariant,
-    out: &mut Vec<Emitted>,
+    output: &mut StagedOutput,
     covered: &mut BTreeMap<String, bool>,
     max_instrs: usize,
     max_live_u32_lanes: usize,
-) {
+) -> Result<(), String> {
     use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
     use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 
@@ -207,17 +210,24 @@ fn run_fixture(
     )
     .expect("run_and_adapt fixture");
 
-    run_input(input, variant, out, covered, max_instrs, max_live_u32_lanes);
+    run_input(
+        input,
+        variant,
+        output,
+        covered,
+        max_instrs,
+        max_live_u32_lanes,
+    )
 }
 
 fn run_input(
     input: ProverInput,
     variant: PreProcessedTraceVariant,
-    out: &mut Vec<Emitted>,
+    output: &mut StagedOutput,
     covered: &mut BTreeMap<String, bool>,
     max_instrs: usize,
     max_live_u32_lanes: usize,
-) {
+) -> Result<(), String> {
     let state::IngestOutput {
         preprocessed_trace,
         generator,
@@ -255,10 +265,10 @@ fn run_input(
                     emit_component(
                         stringify!($field),
                         c,
-                        out,
+                        output,
                         max_instrs,
                         max_live_u32_lanes,
-                    );
+                    )?;
                 } else {
                     covered.entry(stringify!($field).to_string()).or_insert(false);
                 }
@@ -268,10 +278,10 @@ fn run_input(
     fn emit_component<E: stwo_constraint_framework::FrameworkEval>(
         field: &str,
         component: &stwo_constraint_framework::FrameworkComponent<E>,
-        out: &mut Vec<Emitted>,
+        output: &mut StagedOutput,
         max_instrs: usize,
         max_live_u32_lanes: usize,
-    ) {
+    ) -> Result<(), String> {
         let kernels = aot::constraint_kernel_sources_with_live_cap(
             component.evaluator(),
             3,
@@ -297,12 +307,9 @@ fn run_input(
             );
         }
         for k in kernels {
-            out.push(Emitted {
-                kind: "constraint",
-                label: field.to_string(),
-                kernel: k,
-            });
+            stage_kernel(output, "constraint", field.to_string(), k)?;
         }
+        Ok(())
     }
 
     emit_fields!(
@@ -378,7 +385,13 @@ fn run_input(
     // hash — emit from the first (deduped by cache key on write anyway).
     if let Some(c) = components.memory_id_to_big.first() {
         covered.insert("memory_id_to_big".to_string(), true);
-        emit_component("memory_id_to_big", c, out, max_instrs, max_live_u32_lanes);
+        emit_component(
+            "memory_id_to_big",
+            c,
+            output,
+            max_instrs,
+            max_live_u32_lanes,
+        )?;
     } else {
         covered
             .entry("memory_id_to_big".to_string())
@@ -396,20 +409,22 @@ fn run_input(
             &preprocessed_ids,
             max_instrs,
         )
-        .expect("canonical composition-wave lowering");
+        .map_err(|error| format!("canonical composition-wave lowering: {error}"))?;
         for wave in plan.wave_kernels {
-            out.push(Emitted {
-                kind: "constraint",
-                label: format!("wave_log_{}", wave.evaluation_log_size),
-                kernel: aot::EmittedKernel {
+            stage_kernel(
+                output,
+                "constraint",
+                format!("wave_log_{}", wave.evaluation_log_size),
+                aot::EmittedKernel {
                     kernel_name: wave.kernel_name,
                     cache_key: wave.cache_key,
                     semantic_hash: wave.semantic_hash,
                     source: wave.source,
                 },
-            });
+            )?;
         }
     }
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -455,116 +470,114 @@ fn main() -> ExitCode {
         .map(|v| v.parse::<usize>().expect("--max-live-u32-lanes <N>"))
         .unwrap_or_else(aot::constraint_split_max_live_u32_lanes);
 
-    let mut out: Vec<Emitted> = Vec::new();
+    let mut output = match StagedOutput::new(&out_dir) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("kernel_emit: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let generation = (|| -> Result<(), String> {
+        // Witness kernels are fixture-independent straight-line recordings.
+        for (label, program) in all_lane_recordings() {
+            let kernel = aot::witness_kernel_source(&program)
+                .ok_or_else(|| format!("witness codegen failed for {label}"))?;
+            stage_kernel(&mut output, "witness", label.to_string(), kernel)?;
+        }
 
-    // Witness kernels: fixture-independent (straight-line recorded programs).
-    for (label, program) in all_lane_recordings() {
-        let kernel = aot::witness_kernel_source(&program)
-            .unwrap_or_else(|| panic!("witness codegen failed for {label}"));
-        out.push(Emitted {
-            kind: "witness",
-            label: label.to_string(),
-            kernel,
-        });
-    }
-
-    let mut covered: BTreeMap<String, bool> = BTreeMap::new();
-    if !witness_only {
+        let mut covered: BTreeMap<String, bool> = BTreeMap::new();
+        if witness_only {
+            return Ok(());
+        }
         // Constraint kernels: fixture matrix for union coverage.
         run_fixture(
             "test_prove_verify_all_opcode_components",
             PreProcessedTraceVariant::Canonical,
-            &mut out,
+            &mut output,
             &mut covered,
             max_instrs,
             max_live_u32_lanes,
-        );
+        )?;
         run_fixture(
             "test_prove_verify_all_builtins",
             PreProcessedTraceVariant::Canonical,
-            &mut out,
+            &mut output,
             &mut covered,
             max_instrs,
             max_live_u32_lanes,
-        );
+        )?;
         run_fixture(
             "test_prove_verify_pedersen_builtin",
             PreProcessedTraceVariant::CanonicalSmall,
-            &mut out,
+            &mut output,
             &mut covered,
             max_instrs,
             max_live_u32_lanes,
-        );
-        // The strict resident parity gate proves this exact fixture x variant
-        // combination; its small shapes produce constraint variants the SN-scale
-        // fixtures above do not (observed as a strict AOT rejection on H100).
+        )?;
+        // This strict parity fixture contributes small-shape variants absent at SN scale.
         run_fixture(
             "test_prove_verify_poseidon_builtin",
             PreProcessedTraceVariant::CanonicalWithoutPedersen,
-            &mut out,
+            &mut output,
             &mut covered,
             max_instrs,
             max_live_u32_lanes,
-        );
-        // The staged Step-1.2 gate fixture (SN2 component profile under the
-        // Canonical variant the SN PIE lane uses).
+        )?;
         run_fixture(
             "test_prove_verify_sn2_profile",
             PreProcessedTraceVariant::Canonical,
-            &mut out,
+            &mut output,
             &mut covered,
             max_instrs,
             max_live_u32_lanes,
-        );
+        )?;
         for input_path in args("--input-bincode") {
             eprintln!("kernel_emit: adapted input {input_path} (Canonical)");
             let bytes = std::fs::read(&input_path)
-                .unwrap_or_else(|error| panic!("read adapted input {input_path}: {error}"));
+                .map_err(|error| format!("read adapted input {input_path}: {error}"))?;
             let input = bincode::deserialize(&bytes)
-                .unwrap_or_else(|error| panic!("decode adapted input {input_path}: {error}"));
+                .map_err(|error| format!("decode adapted input {input_path}: {error}"))?;
             run_input(
                 input,
                 PreProcessedTraceVariant::Canonical,
-                &mut out,
+                &mut output,
                 &mut covered,
                 max_instrs,
                 max_live_u32_lanes,
-            );
+            )?;
         }
-        let missing: Vec<&String> = covered
+        let missing = covered
             .iter()
-            .filter(|(_, &c)| !c)
-            .map(|(k, _)| k)
-            .collect();
-        if !missing.is_empty() {
-            eprintln!(
-                "kernel_emit: components NOT covered by any fixture (extend the matrix): \
-                 {missing:?}"
-            );
-            return ExitCode::FAILURE;
+            .filter(|(_, &covered)| !covered)
+            .map(|(component, _)| component.as_str())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "components NOT covered by any fixture (extend the matrix): {missing:?}"
+            ))
         }
+    })();
+    if let Err(error) = generation {
+        eprintln!("kernel_emit: {error}");
+        return ExitCode::FAILURE;
     }
 
-    // Dedup by cache key (split parts share keys across statements/components
-    // never; memory_id_to_big multi-instances and repeated fixture components do).
-    let mut files: BTreeMap<String, String> = BTreeMap::new();
-    let mut manifest: Vec<serde_json::Value> = Vec::new();
-    let mut seen: std::collections::BTreeSet<u64> = Default::default();
-    for e in &out {
-        if !seen.insert(e.kernel.cache_key) {
-            continue;
-        }
-        let file = format!("{}_{}_{:016x}.cu", e.kind, e.label, e.kernel.cache_key);
-        files.insert(file.clone(), e.kernel.source.clone());
-        manifest.push(serde_json::json!({
-            "kind": e.kind,
-            "label": e.label,
-            "kernel_name": e.kernel.kernel_name,
-            "cache_key": format!("{:016x}", e.kernel.cache_key),
-            "semantic_hash": format!("{:016x}", e.kernel.semantic_hash),
-            "file": file,
-        }));
-    }
+    let mut manifest = output
+        .kernels()
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "kind": entry.kind,
+                "label": entry.label,
+                "kernel_name": entry.kernel_name,
+                "cache_key": format!("{:016x}", entry.cache_key),
+                "semantic_hash": format!("{:016x}", entry.semantic_hash),
+                "file": entry.file,
+            })
+        })
+        .collect::<Vec<_>>();
     manifest.sort_by_key(|m| {
         (
             m["kind"].as_str().unwrap().to_string(),
@@ -572,43 +585,41 @@ fn main() -> ExitCode {
             m["cache_key"].as_str().unwrap().to_string(),
         )
     });
-    files.insert(
-        "aot_manifest.json".to_string(),
-        serde_json::to_string_pretty(&manifest).unwrap() + "\n",
-    );
-    if !witness_only {
-        files.insert(
-            "aot_constraint_max_instrs.txt".to_string(),
-            format!("{max_instrs}\n"),
-        );
-        files.insert(
-            "aot_constraint_max_live_u32_lanes.txt".to_string(),
-            format!("{max_live_u32_lanes}\n"),
-        );
+    let metadata = (|| -> Result<(), String> {
+        output.stage_metadata(
+            "aot_manifest.json",
+            serde_json::to_string_pretty(&manifest).unwrap() + "\n",
+        )?;
+        if !witness_only {
+            output.stage_metadata("aot_constraint_max_instrs.txt", format!("{max_instrs}\n"))?;
+            output.stage_metadata(
+                "aot_constraint_max_live_u32_lanes.txt",
+                format!("{max_live_u32_lanes}\n"),
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = metadata {
+        eprintln!("kernel_emit: {error}");
+        return ExitCode::FAILURE;
     }
-
-    let (kernel_count, metadata_count) = generated_file_counts(&files);
+    let (kernel_count, metadata_count) = output.file_counts();
 
     if check {
-        let mut drift = 0;
-        for (name, content) in &files {
-            let on_disk = std::fs::read_to_string(out_dir.join(name)).unwrap_or_default();
-            if on_disk != *content {
-                eprintln!("kernel_emit --check: DRIFT {name}");
-                drift += 1;
+        let diff = match output.diff() {
+            Ok(diff) => diff,
+            Err(error) => {
+                eprintln!("kernel_emit --check: {error}");
+                return ExitCode::FAILURE;
             }
+        };
+        for name in &diff.changed {
+            eprintln!("kernel_emit --check: DRIFT {name}");
         }
-        // Stale extras count as drift too.
-        if let Ok(entries) = std::fs::read_dir(&out_dir) {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if !files.contains_key(&name) {
-                    eprintln!("kernel_emit --check: STALE {name}");
-                    drift += 1;
-                }
-            }
+        for name in &diff.stale {
+            eprintln!("kernel_emit --check: STALE {name}");
         }
-        if drift == 0 {
+        if diff.is_clean() {
             println!(
                 "kernel_emit --check: OK ({kernel_count} kernels + {metadata_count} metadata)"
             );
@@ -617,42 +628,29 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     } else {
-        std::fs::create_dir_all(&out_dir).expect("create generated dir");
-        // Remove stale files so deletions propagate.
-        if let Ok(entries) = std::fs::read_dir(&out_dir) {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if !files.contains_key(&name) {
-                    let _ = std::fs::remove_file(e.path());
-                }
+        match output.promote_if_changed() {
+            Ok(summary) => {
+                println!(
+                    "kernel_emit: {} changed, {} unchanged, {} stale generated files removed \
+                     ({kernel_count} kernels + {metadata_count} metadata) in {}",
+                    summary.changed,
+                    summary.unchanged,
+                    summary.stale,
+                    out_dir.display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("kernel_emit: output promotion failed: {error}");
+                ExitCode::FAILURE
             }
         }
-        let mut written = 0usize;
-        let mut unchanged = 0usize;
-        for (name, content) in &files {
-            if write_if_changed(&out_dir.join(name), content).expect("write generated file") {
-                written += 1;
-            } else {
-                unchanged += 1;
-            }
-        }
-        println!(
-            "kernel_emit: {written} written, {unchanged} unchanged generated files \
-             ({kernel_count} kernels + {metadata_count} metadata) in {}",
-            out_dir.display()
-        );
-        ExitCode::SUCCESS
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use super::{
-        admit_witness_output_dir, generated_file_counts, witness_only_incompatibility,
-        write_if_changed,
-    };
+    use super::{admit_witness_output_dir, witness_only_incompatibility};
 
     #[test]
     fn witness_only_rejects_constraint_and_shape_inputs() {
@@ -688,35 +686,5 @@ mod tests {
         let error = admit_witness_output_dir(&path).unwrap_err();
         assert!(error.contains("not a witness-only manifest"));
         std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn generated_file_counts_distinguish_kernels_from_metadata() {
-        let files = BTreeMap::from([
-            ("a.cu".to_string(), String::new()),
-            ("b.cu".to_string(), String::new()),
-            ("aot_manifest.json".to_string(), String::new()),
-            ("policy.txt".to_string(), String::new()),
-        ]);
-        assert_eq!(generated_file_counts(&files), (2, 2));
-    }
-
-    #[test]
-    fn write_if_changed_skips_identical_bytes() {
-        let path = std::env::temp_dir().join(format!(
-            "stwo-kernel-emit-write-if-changed-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        assert!(write_if_changed(&path, "first\n").unwrap());
-        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert!(!write_if_changed(&path, "first\n").unwrap());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            modified
-        );
-        assert!(write_if_changed(&path, "second\n").unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second\n");
-        std::fs::remove_file(path).unwrap();
     }
 }
