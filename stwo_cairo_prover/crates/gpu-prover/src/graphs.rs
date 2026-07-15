@@ -58,6 +58,10 @@ pub enum GraphError {
     Plan(ArenaPlanError),
     Arena(ArenaError),
     Enqueue(Box<dyn std::error::Error + Send + Sync>),
+    SegmentCapture {
+        segment: GraphSegment,
+        source: Box<GraphError>,
+    },
     MissingSegment(GraphSegment),
     WorkspaceKeyMismatch {
         expected_shape: ProofShapeKey,
@@ -107,6 +111,9 @@ impl std::fmt::Display for GraphError {
             Self::Plan(error) => write!(f, "CUDA graph arena-plan error: {error}"),
             Self::Arena(error) => write!(f, "CUDA graph arena error: {error}"),
             Self::Enqueue(error) => write!(f, "CUDA graph segment enqueue failed: {error}"),
+            Self::SegmentCapture { segment, source } => {
+                write!(f, "CUDA graph segment {segment:?} capture failed: {source}")
+            }
             Self::MissingSegment(segment) => {
                 write!(f, "CUDA graph segment {segment:?} is not captured")
             }
@@ -423,6 +430,10 @@ impl GraphWorkspace {
         E: std::error::Error + Send + Sync + 'static,
     {
         self.capture(self.key(segment), enqueue)
+            .map_err(|source| GraphError::SegmentCapture {
+                segment,
+                source: Box::new(source),
+            })
     }
 
     pub fn replay_segment(&self, segment: GraphSegment) -> Result<(), GraphError> {
@@ -582,5 +593,20 @@ mod tests {
                 launch_base: 0x2000,
             })
         ));
+    }
+
+    #[test]
+    fn segment_capture_error_preserves_the_failing_boundary() {
+        let error = GraphError::SegmentCapture {
+            segment: GraphSegment::CompositionQuotientCommit,
+            source: Box::new(GraphError::MissingSegment(
+                GraphSegment::CompositionQuotientCommit,
+            )),
+        };
+        assert_eq!(
+            error.to_string(),
+            "CUDA graph segment CompositionQuotientCommit capture failed: CUDA graph segment \
+             CompositionQuotientCommit is not captured"
+        );
     }
 }
