@@ -106,7 +106,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         producer_prefix::map_scheduled_base_producers(&image, executable.arena(), &schedule)
             .unwrap();
     if stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
-        assert_eq!(linked.bound.len(), 9);
+        assert_eq!(linked.bound.len(), 15);
         assert_eq!(linked.missing, mapped.missing);
         let linked_native = linked.bound[7].native_ec_op().unwrap();
         assert_eq!(
@@ -147,10 +147,13 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         coefficients.logical,
         schedule.steps().len(),
     );
-    assert_eq!(mapped.bound.len(), 9);
+    assert_eq!(mapped.bound.len(), 15);
     assert_eq!(mapped.scheduled_producers, 23);
     assert_eq!(missing.position.ordinal as usize, mapped.bound.len());
-    assert_eq!(missing.producer.component, "partial_ec_mul_window_bits_18");
+    assert_eq!(
+        missing.producer.component,
+        "pedersen_aggregator_window_bits_18"
+    );
     assert_eq!(
         missing.producer.part,
         Some(stwo_cairo_prover::witness::proof_shape::TracePartId::Main)
@@ -162,7 +165,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
             DeduceKind::PartialEcMulW18
         )
     );
-    assert_eq!(missing.position.ordinal, 9);
+    assert_eq!(missing.position.ordinal, 15);
     let scheduled = schedule
         .witness_levels()
         .iter()
@@ -175,6 +178,73 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
                 .map(move |(lane, producer)| (level, lane, producer))
         })
         .collect::<Vec<_>>();
+    let expected = [
+        (0, 0, "add_ap_opcode", WitnessProducerKind::Recorded),
+        (0, 1, "add_opcode_small", WitnessProducerKind::Recorded),
+        (0, 2, "assert_eq_opcode", WitnessProducerKind::Recorded),
+        (
+            0,
+            3,
+            "assert_eq_opcode_double_deref",
+            WitnessProducerKind::Recorded,
+        ),
+        (0, 4, "assert_eq_opcode_imm", WitnessProducerKind::Recorded),
+        (0, 5, "bitwise_builtin", WitnessProducerKind::Recorded),
+        (0, 6, "call_opcode_rel_imm", WitnessProducerKind::Recorded),
+        (0, 7, "ec_op_builtin", WitnessProducerKind::NativeEcOp),
+        (0, 8, "jnz_opcode_non_taken", WitnessProducerKind::Recorded),
+        (0, 9, "jnz_opcode_taken", WitnessProducerKind::Recorded),
+        (0, 10, "pedersen_builtin", WitnessProducerKind::Recorded),
+        (0, 11, "poseidon_builtin", WitnessProducerKind::Recorded),
+        (0, 12, "range_check_builtin", WitnessProducerKind::Recorded),
+        (0, 13, "ret_opcode", WitnessProducerKind::Recorded),
+        (
+            1,
+            0,
+            "partial_ec_mul_generic",
+            WitnessProducerKind::Recorded,
+        ),
+        (
+            1,
+            1,
+            "pedersen_aggregator_window_bits_18",
+            WitnessProducerKind::Recorded,
+        ),
+        (1, 2, "poseidon_aggregator", WitnessProducerKind::Recorded),
+        (1, 3, "verify_instruction", WitnessProducerKind::Recorded),
+        (
+            2,
+            0,
+            "partial_ec_mul_window_bits_18",
+            WitnessProducerKind::Recorded,
+        ),
+        (
+            2,
+            1,
+            "poseidon_3_partial_rounds_chain",
+            WitnessProducerKind::Recorded,
+        ),
+        (
+            2,
+            2,
+            "poseidon_full_round_chain",
+            WitnessProducerKind::Recorded,
+        ),
+        (3, 0, "cube_252", WitnessProducerKind::Recorded),
+        (
+            3,
+            1,
+            "range_check_252_width_27",
+            WitnessProducerKind::Recorded,
+        ),
+    ];
+    assert_eq!(
+        scheduled
+            .iter()
+            .map(|(level, lane, producer)| (*level, *lane, producer.component, producer.kind))
+            .collect::<Vec<_>>(),
+        expected
+    );
     assert_eq!(mapped.scheduled_producers, scheduled.len());
     for (lowered, &(level, lane, expected)) in mapped.bound.iter().zip(&scheduled) {
         assert_eq!(lowered.producer(), expected);
@@ -190,21 +260,24 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         missing.position.lane as usize,
         scheduled[mapped.bound.len()].1
     );
-    assert!(mapped.bound[..7]
-        .iter()
-        .enumerate()
-        .all(|(ordinal, producer)| {
-            producer.recorded().is_some_and(|producer| {
-                producer.producer.kind == WitnessProducerKind::Recorded
+    assert!(mapped.bound.iter().enumerate().all(|(ordinal, producer)| {
+        if ordinal == 7 {
+            return producer.native_ec_op().is_some_and(|producer| {
+                producer.producer.kind == WitnessProducerKind::NativeEcOp
                     && producer.position.ordinal as usize == ordinal
-                    && producer.source.program_identity != [0; 32]
-                    && producer.source.abi_schema_identity
-                        == AotKernelAbiSchema::RecordedWitnessV1.identity()
-                    && producer.source.source_arguments.len() == 8
-                    && producer.invocation.arguments.len() == 8
-                    && !producer.effect.accesses().is_empty()
-            })
-        }));
+            });
+        }
+        producer.recorded().is_some_and(|producer| {
+            producer.producer.kind == WitnessProducerKind::Recorded
+                && producer.position.ordinal as usize == ordinal
+                && producer.source.program_identity != [0; 32]
+                && producer.source.abi_schema_identity
+                    == AotKernelAbiSchema::RecordedWitnessV1.identity()
+                && producer.source.source_arguments.len() == 8
+                && producer.invocation.arguments.len() == 8
+                && !producer.effect.accesses().is_empty()
+        })
+    }));
     assert_eq!(native_producer.position.ordinal, 7);
     assert_eq!(native_producer.producer.component, "ec_op_builtin");
     assert_eq!(

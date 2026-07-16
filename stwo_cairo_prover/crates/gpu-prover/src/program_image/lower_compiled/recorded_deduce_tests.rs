@@ -9,8 +9,8 @@ pub(super) fn assert_generated_partial_authority(
     image: &ArenaProgramInventory,
     mapped: &producer_prefix::BaseProducerBindingFrontier,
 ) {
-    let partial = mapped.bound[8].recorded().unwrap();
-    assert_eq!(partial.position.ordinal, 8);
+    let partial = mapped.bound[14].recorded().unwrap();
+    assert_eq!(partial.position.ordinal, 14);
     assert_eq!(partial.producer.component, "partial_ec_mul_generic");
     assert_ne!(partial.source.program_identity, [0; 32]);
     assert_ne!(partial.source.semantic_hash, 0);
