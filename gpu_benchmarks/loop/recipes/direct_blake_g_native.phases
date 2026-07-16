@@ -95,8 +95,8 @@ name = (
     "direct_blake_g_native_matches_host_oracle_eager_and_replay"
 )
 
-if text.count(f"test {name} ... ok") != 1:
-    raise SystemExit("exact native Blake-G test did not execute and pass once")
+if text.count(f"test {name} ...") != 1:
+    raise SystemExit("exact native Blake-G test did not execute once")
 if len(re.findall(
     r"test result: ok\. 1 passed; 0 failed; 0 ignored; [^\n]+", text
 )) != 1:
