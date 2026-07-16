@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+export PYTHONPATH="$script_dir${PYTHONPATH:+:$PYTHONPATH}"
+
 if [ -n "${GPUFLEET_PYTHON:-}" ]; then
   "$GPUFLEET_PYTHON" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' \
     || { echo "GPUFLEET_PYTHON must be Python 3.11 or newer" >&2; exit 2; }

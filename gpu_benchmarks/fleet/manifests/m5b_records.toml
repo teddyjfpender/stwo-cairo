@@ -2,7 +2,7 @@
 # merkle-spans must_match regex crashed gpufleet. gpu-native identity already
 # validated (M5B_PROOF_MATCH, A2 engaged) in the prior run.
 #
-#   gpufleet run manifests/m5b_records.toml --pod <ID> --skip-pregate --keep
+#   gpufleet run manifests/m5b_records.toml --pod <ID> --keep
 
 [meta]
 name = "m5b-records"

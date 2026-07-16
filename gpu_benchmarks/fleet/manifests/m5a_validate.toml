@@ -2,7 +2,7 @@
 # default-ON in gpu-native. Byte identity is the gate; the phase ledger
 # re-measures Write Base trace (was 4.08s over ~5.9s of sequential lane spans).
 #
-#   gpufleet run manifests/m5a_validate.toml --pod <ID> --skip-pregate --keep
+#   gpufleet run manifests/m5a_validate.toml --pod <ID> --keep
 
 [meta]
 name = "m5a-validate"

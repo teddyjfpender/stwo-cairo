@@ -21,8 +21,8 @@
 #      the first failure.
 #   7. Grep a standard evidence pattern set from every phase log.
 #   8. Fetch all phase logs (+ an optional divergence dir) to results/<label>/.
-#   9. STOP the pod on EVERY exit path (trap) — failed rounds cost cents, not
-#      an idle-pod bleed.
+#   9. Confirm the configured final lifecycle state on EVERY exit path (trap):
+#      EXITED by default, or provider absence for one-shot termination.
 #
 # Usage:
 #   ./pod_run.sh <phases_file> [label]
@@ -59,6 +59,8 @@
 # starting the pod.
 # POD_RUN_POLL_INTERVAL controls phase-sentinel polling (default 30 seconds;
 # quick_sn2.sh uses 2 seconds so short gates do not add minutes of idle time).
+# POD_RUN_FINAL_ACTION is `stop` by default (warm disk retained) or `terminate`
+# for a one-shot lease whose attached disk must also be released.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,11 +69,17 @@ STWO_LOCAL="${STWO_LOCAL:-${CAIRO_LOCAL}/../stwo}"
 POD_CONF="${POD_CONF:-${SCRIPT_DIR}/pod.conf}"
 RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results}"
 SOURCE_PROJECTION_TOOL="${SCRIPT_DIR}/stage_source_projection.sh"
+FLEET_CTL="${SCRIPT_DIR}/../fleet/gpufleet.sh"
 POD_RUSTUP_HOME="${POD_RUSTUP_HOME:-/workspace/.rustup-persist}"
 POD_CARGO_HOME="${POD_CARGO_HOME:-/workspace/.cargo-persist}"
 POD_RUN_POLL_INTERVAL="${POD_RUN_POLL_INTERVAL:-30}"
 [[ "$POD_RUN_POLL_INTERVAL" =~ ^[1-9][0-9]*$ && "$POD_RUN_POLL_INTERVAL" -le 60 ]] \
   || { echo "POD_RUN_POLL_INTERVAL must be an integer from 1 to 60 seconds" >&2; exit 2; }
+POD_RUN_FINAL_ACTION="${POD_RUN_FINAL_ACTION:-stop}"
+case "$POD_RUN_FINAL_ACTION" in
+  stop|terminate) ;;
+  *) echo "POD_RUN_FINAL_ACTION must be stop or terminate" >&2; exit 2 ;;
+esac
 printf -v POD_RUSTUP_HOME_Q '%q' "$POD_RUSTUP_HOME"
 printf -v POD_CARGO_HOME_Q '%q' "$POD_CARGO_HOME"
 
@@ -121,6 +129,8 @@ valid_source_identity() {
 
 [[ -x "$SOURCE_PROJECTION_TOOL" ]] \
   || { echo "source projection tool is absent or not executable: $SOURCE_PROJECTION_TOOL" >&2; exit 2; }
+[[ -x "$FLEET_CTL" ]] \
+  || { echo "fleet lifecycle tool is absent or not executable: $FLEET_CTL" >&2; exit 2; }
 
 STWO_HEAD="$(source_head "$STWO_LOCAL")" \
   || { echo "cannot resolve stwo source head: $STWO_LOCAL" >&2; exit 2; }
@@ -157,20 +167,22 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   note "DRY_RUN: pod=$POD_ID key=$KEY"
   note "DRY_RUN: RUSTUP_HOME=$POD_RUSTUP_HOME CARGO_HOME=$POD_CARGO_HOME"
   note "DRY_RUN: source stwo=${STWO_HEAD}:${STWO_WORKTREE_HASH} stwo-cairo=${CAIRO_HEAD}:${CAIRO_WORKTREE_HASH}"
-  note "DRY_RUN: would bootstrap, stage and rsync exact source projections from $STWO_LOCAL and $CAIRO_LOCAL, install the pinned toolchain, run the phases above, fetch to $RESULTS_DIR/$LABEL, stop the pod."
+  note "DRY_RUN: would bootstrap, stage and rsync exact source projections from $STWO_LOCAL and $CAIRO_LOCAL, install the pinned toolchain, run the phases above, fetch to $RESULTS_DIR/$LABEL, then confirm pod action=$POD_RUN_FINAL_ACTION."
   exit 0
 fi
 
-POD_STOPPED=0
+POD_FINALIZE_ATTEMPTED=0
+POD_FINALIZE_RC=1
 PROJECTION_ROOT=""
-stop_pod() {
-  [[ "$POD_STOPPED" == 1 ]] && return 0
-  note "stopping pod $POD_ID"
-  if runpodctl pod stop "$POD_ID" 2>/dev/null || runpodctl stop pod "$POD_ID" 2>/dev/null; then
-    POD_STOPPED=1
+finalize_pod() {
+  [[ "$POD_FINALIZE_ATTEMPTED" == 0 ]] || return "$POD_FINALIZE_RC"
+  POD_FINALIZE_ATTEMPTED=1
+  note "requesting and confirming pod action=$POD_RUN_FINAL_ACTION for $POD_ID"
+  if "$FLEET_CTL" "$POD_RUN_FINAL_ACTION" --pod "$POD_ID"; then
+    POD_FINALIZE_RC=0
     return 0
   fi
-  note "ERROR: pod stop FAILED — run 'runpodctl pod stop $POD_ID' manually!"
+  note "ERROR: pod $POD_RUN_FINAL_ACTION was not confirmed"
   return 1
 }
 cleanup() {
@@ -178,12 +190,18 @@ cleanup() {
   trap - EXIT
   [[ -z "$PROJECTION_ROOT" || ! -d "$PROJECTION_ROOT" ]] \
     || rm -rf -- "$PROJECTION_ROOT"
-  if ! stop_pod; then
+  if ! finalize_pod; then
     [[ "$rc" != 0 ]] || rc=1
   fi
   exit "$rc"
 }
 trap cleanup EXIT
+
+# Rebind admission immediately before billing can start. `up` also gates, but
+# this catches any source/input change made between provisioning and execution.
+note "confirming fresh source-bound local pregate"
+"$FLEET_CTL" require-pregate \
+  || { note "PREGATE STALE/FAILED — refusing to start or resume pod"; exit 1; }
 
 # --- 1. start + resolve endpoint (new port on every resume) ---
 note "starting pod $POD_ID"
@@ -400,8 +418,8 @@ done
 pssh "test -d '$RUN/divergence'" 2>/dev/null \
   && scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" -r "root@${HOST}:$RUN/divergence" "$RESULTS_DIR/$LABEL/" 2>/dev/null
 
-# --- 9. stop (also via trap) ---
-stop_pod || RUN_RC=1
+# --- 9. confirmed final lifecycle action (also via trap) ---
+finalize_pod || RUN_RC=1
 if [[ "$RUN_RC" != 0 ]]; then
   note "FAILED (rc=$RUN_RC) — results in $RESULTS_DIR/$LABEL"
   exit "$RUN_RC"

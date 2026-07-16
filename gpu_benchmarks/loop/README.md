@@ -80,14 +80,27 @@ DRY_RUN=1 BENCH_POD_ID=dry-run-placeholder \
   ./pod_run.sh recipes/direct_blake_g_native.phases direct_blake_g_sm86_dry_run
 
 BENCH_POD_ID=<secure-a40-pod-id> POD_RUN_POLL_INTERVAL=2 MAX_WAIT=3600 \
+  POD_RUN_FINAL_ACTION=terminate \
   ./pod_run.sh recipes/direct_blake_g_native.phases direct_blake_g_sm86
 ```
 
 The recipe pins `sm_86`, CUDA 11.8, the Stwo head, test source, lockfile and
 toolchain; it requires one real eager-plus-graph-replay native test with zero
-ignored tests, hashes the resulting executable and evidence, and stops the pod on
-every exit. A pass promotes that exact source projection to the later target-sm90
-gate. It is not an SN-PIE benchmark, an H100 result or a proving-MHz claim.
+ignored tests, hashes the resulting executable and evidence, and confirms provider
+termination on every exit. The A40 lane compiles the real ordinary CUDA archive
+containing the Blake-G witness/relation kernels, but its explicit test-only feature
+skips all unrelated generated AOT cubins and requires the log to attest zero AOT
+entries. A pass promotes that exact source projection to the later target-sm90 gate;
+it is not valid for resident proving, an SN-PIE benchmark, an H100 result, or a
+proving-MHz claim. Other `pod_run.sh` recipes default to confirmed stop and retain
+their warm attached disk; set `POD_RUN_FINAL_ACTION=terminate` only for one-shot
+leases whose disk must be released.
+
+Every non-dry `pod_run.sh` invocation rechecks the fresh, source-bound local
+pregate immediately before starting or resuming compute. Keep
+`STWO_SN_ADAPTED_DIR` pointed at the sealed SN1-SN4 adapted-input directory; a
+source/input change or missing receipt fails before billing can start, and the
+exit trap still confirms the configured final pod state.
 
 | Flag          | Meaning                                                                 |
 |---------------|-------------------------------------------------------------------------|

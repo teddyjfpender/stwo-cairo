@@ -2,8 +2,8 @@
 
 Everything provable on a laptop is proven here: both repos' unit suites (which
 include the prove-accessor parity gate — the local stand-in for the GPU parity
-run), the pie-bench binary compile, and format checks. `gpufleet run` refuses
-to provision unless this passed recently (override with --skip-pregate).
+run), the pie-bench binary compile, and format checks. Spend-bearing commands
+refuse to start or resume compute unless this passed recently for the exact source.
 """
 
 from __future__ import annotations

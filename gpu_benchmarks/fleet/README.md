@@ -11,6 +11,21 @@ That does not qualify a consumer-card rate. This directory measures whether a fl
 independently admitted workers can reach the **10–20 MHz aggregate target**, along with
 total \$/hr and **\$/MHz-hr**; it does not assume that target has already been reached.
 
+The primary deployment matrix is RTX 3090 `sm_86` (24 GB), RTX 4090 `sm_89`
+(24 GB), and RTX 5090 `sm_120` (32 GB), each with a separate native archive,
+AOT pack, image, memory receipt, correctness gate, and performance record. H100
+is a secondary counter/roofline reference. The current SN2 prover is still
+**50.018 GB measured / 43.907 GiB planned**, so it is not admitted on any primary
+worker: exact owned peak must reach **≤21 GiB** on 3090/4090 and **≤29 GiB** on
+5090 before those cards can produce a resident fleet headline.
+
+The current public `fleet.sh` rotate mode is a development precursor, not the
+formal stream benchmark. Promotion requires `SN-STREAM-100`: a hidden-seed,
+balanced 25×SN1/25×SN2/25×SN3/25×SN4 queue, unknown beyond one ingest-overlap
+job, with seed reveal, a complete ordered receipt ledger, no proof-result cache,
+and persistent shape/program/module/allocator caches. The exact contract and
+1×→2×→4/8/16× qualification ladder are in the backend replacement §5.5.
+
 It implements no prover arithmetic, but it does select and launch `gpu_bench`, so the
 backend selection and emitted record are sealed explicitly. Its correctness dependency
 is the standard per-pod correctness gate (the loop's 10-transfer PIE CUDA prove+verify),
@@ -32,7 +47,7 @@ cat fleet_report.json                                                 # the aggr
 | `pod_provision.sh`  | `runpodctl` create/list/terminate/ssh-info helpers, GPU-type arg, and the **CPU-cores-first** procurement note. |
 | `fleet.conf`        | The pod roster: `id \| gpu \| usd_per_hr \| fb_host \| fb_port \| fb_key \| enabled` (one pod per line). |
 
-## What one `fleet.sh` run does
+## What the current development `fleet.sh` run does
 
 ```
 (0) roster       parse fleet.conf -> enabled pods. `--only <id>` or the per-pod
@@ -211,18 +226,25 @@ refresh it); build_and_push.sh and the loop scripts consume it unchanged.
     ./gpufleet.sh check-manifest manifests/jit_witness_gate.toml
     ./gpufleet.sh run manifests/jit_witness_gate.toml --auto 4090 --push \
         --purpose jit-witness-gate             # provision → push → gates → stop, one command
-    ./gpufleet.sh status | ledger              # pods+billing warnings | spend report
+    ./gpufleet.sh status                       # pods + billing warnings
+    ./gpufleet.sh ledger                       # spend report
     ./gpufleet.sh resume --pod ID              # warm restart (disk kept on stop)
 
 Discipline encoded (not advisory):
   * `pregate` hashes the manifest-pinned SN1-SN4 adapted inputs before work, then
     drift-checks their single 373-kernel production AOT union; fixture-only emission
     cannot classify production composition waves as stale.
-  * `run` refuses to provision unless `pregate` passed within 6 h.
-  * `up` refuses above `--max-usd-hr` (default $3.00).
+  * `up`, `run`, and the low-level `pod_run.sh` resume boundary refuse billing
+    unless the exact transported source projection has a fresh green pregate.
+  * `up` admits Secure Cloud only, uses exact `securePrice`, refuses above
+    `--max-usd-hr`, creates once under a unique lease name, then rechecks the
+    returned shape and `costPerHr` against the ceiling.
   * Every pod self-stops at TTL (default 6 h; `--ttl-hours 24` for planned
     overnight loops) or after 45 min idle (no heartbeat AND no
     gpu_bench/cargo/nvcc process — manual tmux benches are auto-covered).
   * A `gpu_bound = true` manifest step with a ~0% device for >3 min raises an
     idle alarm in the step result (the stopped-H100-shaped failure mode).
-  * `run` stops the pod on completion by default (`--keep` bills, says so).
+  * `run` confirms `EXITED` on completion by default; exceptions and push
+    failures do the same. `--keep` applies only after a completed manifest.
+    One-shot recipes use confirmed termination so their attached disk cannot
+    continue billing.

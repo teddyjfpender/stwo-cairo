@@ -7,6 +7,7 @@ schema drift surfaces as a readable error, not a KeyError three layers up.
 from __future__ import annotations
 
 import json
+import math
 import os
 import pathlib
 import time
@@ -177,6 +178,41 @@ def gpu_offers(gpu_type_ids: list[str]) -> list[dict]:
     return out
 
 
+def secure_offer(gpu_type_id: str) -> dict:
+    """Return one exact Secure Cloud list price for a GPU type."""
+    data = gql(
+        """
+        query($id: String!) {
+          gpuTypes(input: {id: $id}) {
+            id displayName secureCloud securePrice
+          }
+        }
+        """,
+        {"id": gpu_type_id},
+    )
+    matches = [
+        offer
+        for offer in data.get("gpuTypes") or []
+        if offer.get("id") == gpu_type_id
+    ]
+    if len(matches) != 1:
+        raise ApiError(f"cannot resolve one exact Secure Cloud offer for {gpu_type_id}")
+    offer = matches[0]
+    if not offer.get("secureCloud"):
+        raise ApiError(f"{gpu_type_id} has no declared Secure Cloud capacity")
+    try:
+        price = float(offer["securePrice"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ApiError(f"Secure Cloud price unavailable for {gpu_type_id}") from error
+    if not math.isfinite(price) or price <= 0:
+        raise ApiError(f"invalid Secure Cloud price for {gpu_type_id}: {price}")
+    return {
+        "display_name": offer.get("displayName") or gpu_type_id,
+        "gpu_type_id": gpu_type_id,
+        "usd_hr": price,
+    }
+
+
 # ------------------------------- lifecycle ------------------------------------------
 
 
@@ -216,19 +252,83 @@ def create_pod(
     }
     if network_volume_id:
         inp["networkVolumeId"] = network_volume_id
-    data = gql(q, {"in": inp})
+    # A transport retry can create a second billable pod after an ambiguous
+    # response. Creation is issued once; the caller reconciles by unique name.
+    data = gql(q, {"in": inp}, retries=1)
     p = data.get("podFindAndDeployOnDemand")
     if not p:
         raise ApiError(f"no capacity for {gpu_type_id} ({cloud})")
     return PodInfo.from_raw(p)
 
 
-def stop_pod(pod_id: str) -> str:
-    data = gql(
-        "mutation($id: String!) { podStop(input: {podId: $id}) { id desiredStatus } }",
-        {"id": pod_id},
+def _observe_pod(pod_id: str) -> tuple[PodInfo | None, PodInfo | None]:
+    exact = get_pod(pod_id)
+    listed = next((pod for pod in list_pods() if pod.id == pod_id), None)
+    return exact, listed
+
+
+def _wait_lifecycle(
+    pod_id: str,
+    *,
+    action: str,
+    mutation_error: Exception | None,
+    timeout_s: float,
+    poll_s: float,
+) -> str:
+    deadline = time.monotonic() + timeout_s
+    clean_observations = 0
+    last = "not observed"
+    while True:
+        try:
+            exact, listed = _observe_pod(pod_id)
+            observed = [pod for pod in (exact, listed) if pod is not None]
+            if action == "terminate":
+                done = not observed
+                terminal = "ABSENT"
+            else:
+                done = not observed or all(pod.status == "EXITED" for pod in observed)
+                terminal = "ABSENT" if not observed else "EXITED"
+            clean_observations = clean_observations + 1 if done else 0
+            last = ", ".join(pod.status for pod in observed) or "absent"
+            # If the mutation response was ambiguous, require two independent
+            # reconciliations so a single stale read cannot declare success.
+            if clean_observations >= (2 if mutation_error else 1):
+                return terminal
+        except Exception as error:
+            clean_observations = 0
+            last = f"observation failed: {error}"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            detail = f"; mutation error: {mutation_error}" if mutation_error else ""
+            raise RuntimeError(
+                f"{action} not confirmed for pod {pod_id} ({last}){detail}"
+            ) from mutation_error
+        time.sleep(min(poll_s, remaining))
+
+
+def stop_pod(
+    pod_id: str, *, timeout_s: float = 120, poll_s: float = 2
+) -> str:
+    mutation_error = None
+    try:
+        data = gql(
+            "mutation($id: String!) { podStop(input: {podId: $id}) "
+            "{ id desiredStatus } }",
+            {"id": pod_id},
+            retries=1,
+        )
+        result = data.get("podStop") or {}
+        if result.get("id") != pod_id:
+            raise ApiError(f"stop returned the wrong pod: {result!r}")
+    except Exception as error:
+        mutation_error = error
+    return _wait_lifecycle(
+        pod_id,
+        action="stop",
+        mutation_error=mutation_error,
+        timeout_s=timeout_s,
+        poll_s=poll_s,
     )
-    return (data.get("podStop") or {}).get("desiredStatus", "?")
 
 
 def resume_pod(pod_id: str) -> str:
@@ -236,12 +336,27 @@ def resume_pod(pod_id: str) -> str:
         "mutation($id: String!) { podResume(input: {podId: $id, gpuCount: 1}) "
         "{ id desiredStatus } }",
         {"id": pod_id},
+        retries=1,
     )
     return (data.get("podResume") or {}).get("desiredStatus", "?")
 
 
-def terminate_pod(pod_id: str) -> None:
-    gql(
-        "mutation($id: String!) { podTerminate(input: {podId: $id}) }",
-        {"id": pod_id},
+def terminate_pod(
+    pod_id: str, *, timeout_s: float = 120, poll_s: float = 2
+) -> None:
+    mutation_error = None
+    try:
+        gql(
+            "mutation($id: String!) { podTerminate(input: {podId: $id}) }",
+            {"id": pod_id},
+            retries=1,
+        )
+    except Exception as error:
+        mutation_error = error
+    _wait_lifecycle(
+        pod_id,
+        action="terminate",
+        mutation_error=mutation_error,
+        timeout_s=timeout_s,
+        poll_s=poll_s,
     )

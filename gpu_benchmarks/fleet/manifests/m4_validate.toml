@@ -3,7 +3,7 @@
 # bit-identical by construction — the whole proof is its gate) and the phase
 # ledger re-measures Merkle (was 4.72s of 10.4s).
 #
-#   gpufleet run manifests/m4_validate.toml --pod <ID> --skip-pregate --keep
+#   gpufleet run manifests/m4_validate.toml --pod <ID> --keep
 
 [meta]
 name = "m4-validate"

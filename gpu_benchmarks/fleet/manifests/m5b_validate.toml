@@ -2,7 +2,7 @@
 # the committer in gpu-native) + batched OODS + word-block Merkle span
 # decomposition. Byte identity gates; records + first sustained-pipeline number.
 #
-#   gpufleet run manifests/m5b_validate.toml --pod <ID> --skip-pregate --keep
+#   gpufleet run manifests/m5b_validate.toml --pod <ID> --keep
 
 [meta]
 name = "m5b-validate"

@@ -6,7 +6,7 @@
 # verifies internally; SN_PIE_2 additionally byte-compares vs the legacy
 # engine's proof from the gate manifest.
 #
-#   gpufleet run manifests/record_runs.toml --pod <ID> --skip-pregate --keep
+#   gpufleet run manifests/record_runs.toml --pod <ID> --keep
 
 [meta]
 name = "record-runs"
