@@ -1,7 +1,7 @@
 use super::{CompiledProofError, IdentityKind, *};
 
 const PROOF_IDENTITY_TAG: &[u8] = b"stwo-cairo.compiled-proof.identity.v2";
-const STRUCTURE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.structure.v2\0";
+const STRUCTURE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.structure.v3\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CanonicalIdentity {
@@ -156,6 +156,7 @@ pub(super) fn compiled_identity(
         out.raw(operation.effect.as_bytes());
         out.stage(operation.stage);
         out.primitive(operation.primitive)?;
+        out.invocation(operation.invocation.as_ref())?;
     }
 
     out.count(input.values.len())?;
@@ -315,6 +316,53 @@ impl Encoder {
             }
         }
         Ok(())
+    }
+
+    fn invocation(&mut self, invocation: Option<&AotInvocation>) -> Result<(), CompiledProofError> {
+        let Some(invocation) = invocation else {
+            self.byte(0);
+            return Ok(());
+        };
+        self.byte(1);
+        self.count(invocation.arguments.len())?;
+        for argument in &invocation.arguments {
+            self.byte(argument.ordinal);
+            match &argument.value {
+                AotArgumentValue::U32(value) => {
+                    self.byte(0);
+                    self.u32(*value);
+                }
+                AotArgumentValue::DevicePointer(binding) => {
+                    self.byte(1);
+                    self.effect_binding(*binding);
+                }
+                AotArgumentValue::DevicePointerTable(entries) => {
+                    self.byte(2);
+                    self.count(entries.len())?;
+                    for &entry in entries {
+                        self.effect_binding(entry);
+                    }
+                }
+                AotArgumentValue::DeviceU32Literals(values) => {
+                    self.byte(3);
+                    self.count(values.len())?;
+                    for value in values {
+                        self.u32(*value);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn effect_binding(&mut self, binding: Option<EffectBindingId>) {
+        match binding {
+            Some(binding) => {
+                self.byte(1);
+                self.u32(binding.0);
+            }
+            None => self.byte(0),
+        }
     }
 
     fn launch(&mut self, launch: LaunchGeometry) {

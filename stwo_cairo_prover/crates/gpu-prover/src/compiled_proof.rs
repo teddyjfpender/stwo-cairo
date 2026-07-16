@@ -147,11 +147,41 @@ pub enum ExecutionPrimitive {
     DeviceMemsetByte { bytes: usize, value: u8 },
 }
 
+/// Exact value carried by one ordinal in an AOT kernel invocation.
+///
+/// Pointer-table order is semantic: swapping two entries can execute a valid
+/// cubin over the wrong columns while leaving its coarse read/write set
+/// unchanged. `None` represents an explicitly unused/dummy pointer whose
+/// absence of dereferences is proven by the generator-owned program authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AotArgumentValue {
+    U32(u32),
+    DevicePointer(Option<EffectBindingId>),
+    DevicePointerTable(Vec<Option<EffectBindingId>>),
+    /// Immutable device-side u32 data installed with the executable.
+    DeviceU32Literals(Vec<u32>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AotArgumentBinding {
+    pub ordinal: u8,
+    pub value: AotArgumentValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AotInvocation {
+    pub arguments: Vec<AotArgumentBinding>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpNode {
     pub id: OpId,
     pub semantic_id: SemanticOpId,
     pub primitive: ExecutionPrimitive,
+    /// Present exactly for [`ExecutionPrimitive::AotKernel`]. Every effect
+    /// binding must occur once in this ABI map; non-kernel primitives have no
+    /// invocation.
+    pub invocation: Option<AotInvocation>,
     pub effect: EffectContractId,
     pub stage: ProofStage,
 }
@@ -418,6 +448,7 @@ pub enum CompiledProofError {
     },
     InvalidLaunchGeometry(OpId),
     PrimitiveEffectMismatch(OpId),
+    InvalidKernelInvocation(OpId),
     TranscriptInputCount {
         expected: usize,
         actual: usize,

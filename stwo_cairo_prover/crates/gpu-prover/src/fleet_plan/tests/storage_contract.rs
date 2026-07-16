@@ -85,6 +85,20 @@ fn alias_fixture(concurrent_consumer: bool) -> Fixture {
     ];
     input.effects = vec![alias_effect, assembly_effect];
     input.effects.sort_by_key(EffectContract::id);
+    let alias_effect = input
+        .effects
+        .iter()
+        .find(|effect| effect.in_place_alias(InPlaceAliasId(0)).is_some())
+        .unwrap();
+    let alias_effect_id = alias_effect.id();
+    let alias_invocation = invocation(alias_effect);
+    let assembly_effect = input
+        .effects
+        .iter()
+        .find(|effect| effect.in_place_alias(InPlaceAliasId(0)).is_none())
+        .unwrap();
+    let assembly_effect_id = assembly_effect.id();
+    let assembly_invocation = invocation(assembly_effect);
     let assembly = input.operations[0].clone();
     input.operations = vec![
         OpNode {
@@ -100,23 +114,15 @@ fn alias_fixture(concurrent_consumer: bool) -> Fixture {
                     cooperative: false,
                 },
             },
-            effect: input
-                .effects
-                .iter()
-                .find(|effect| effect.in_place_alias(InPlaceAliasId(0)).is_some())
-                .unwrap()
-                .id(),
+            invocation: alias_invocation,
+            effect: alias_effect_id,
             stage: ProofStage::AfterTranscript,
         },
         OpNode {
             id: OpId(1),
             semantic_id: SemanticOpId(3),
-            effect: input
-                .effects
-                .iter()
-                .find(|effect| effect.in_place_alias(InPlaceAliasId(0)).is_none())
-                .unwrap()
-                .id(),
+            invocation: assembly_invocation,
+            effect: assembly_effect_id,
             ..assembly
         },
     ];
@@ -228,6 +234,7 @@ fn distinct_output_fixture() -> Fixture {
     }
     let effect = EffectContract::new(accesses, vec![]).unwrap();
     input.effects = vec![effect.clone()];
+    input.operations[0].invocation = invocation(&effect);
     input.operations[0].effect = effect.id();
     input.kernels = vec![kernel(
         AotKernelId(1),
@@ -379,4 +386,23 @@ fn storage_alignment_coverage_and_reuse_fail_closed() {
         compile(uncovered),
         Err(FleetPlanError::StorageCoverage(_))
     ));
+
+    let mut reused = fixture();
+    let spill_storage = StorageId(reused.spill_value.0);
+    let reused_binding = reused
+        .placement
+        .storage_bindings
+        .iter_mut()
+        .find(|binding| {
+            binding.storage != spill_storage
+                && binding.storage != reused.placement.output_storage
+                && binding.value.elements.len() <= 16
+        })
+        .expect("fixture must contain a small concurrently live value");
+    reused_binding.storage = spill_storage;
+    reused_binding.offset_bytes = 0;
+    assert_eq!(
+        compile(reused).unwrap_err(),
+        FleetPlanError::IllegalStorageReuse(spill_storage)
+    );
 }

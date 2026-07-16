@@ -132,6 +132,7 @@ fn raw_d2d_copy_preserves_one_exact_layout_and_memset_is_byte_typed() {
     copy.operations[0].primitive = ExecutionPrimitive::DeviceCopyD2D {
         bytes: words * core::mem::size_of::<u32>(),
     };
+    copy.operations[0].invocation = None;
     copy.effects = vec![contract];
     copy.kernels.clear();
     CompiledProof::compile(copy.clone(), transcript()).unwrap();
@@ -157,6 +158,7 @@ fn raw_d2d_copy_preserves_one_exact_layout_and_memset_is_byte_typed() {
         bytes: words * core::mem::size_of::<u32>(),
         value: 0xa5,
     };
+    memset.operations[0].invocation = None;
     memset.effects = vec![contract];
     memset.kernels.clear();
     CompiledProof::compile(memset, transcript()).unwrap();

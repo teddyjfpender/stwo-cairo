@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 use cairo_air::air::PublicData;
@@ -102,6 +103,25 @@ fn bound(binding: u32, value: ValueRange) -> BoundValueRange {
     }
 }
 
+fn invocation(effect: &EffectContract) -> Option<AotInvocation> {
+    let bindings = effect
+        .accesses()
+        .iter()
+        .flat_map(|access| [access.source(), access.destination()])
+        .flatten()
+        .map(|bound| bound.binding)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(Some)
+        .collect();
+    Some(AotInvocation {
+        arguments: vec![AotArgumentBinding {
+            ordinal: 0,
+            value: AotArgumentValue::DevicePointerTable(bindings),
+        }],
+    })
+}
+
 fn output_ranges(layout: &ResidentProofBundleLayout) -> [std::ops::Range<usize>; 8] {
     [
         layout.commitments.clone(),
@@ -189,6 +209,7 @@ fn compiled_proof() -> (CompiledProof, ValueVersion, ValueVersion) {
     });
     let effect = EffectContract::new(accesses, vec![]).unwrap();
     let effect_id = effect.id();
+    let invocation = invocation(&effect);
     let module = ModuleIdentity::new(b"fleet-test-sm89-cubin-v2".to_vec()).unwrap();
     let kernel = AotKernelAuthority::new(
         AotKernelId(1),
@@ -229,6 +250,7 @@ fn compiled_proof() -> (CompiledProof, ValueVersion, ValueVersion) {
                         cooperative: false,
                     },
                 },
+                invocation,
                 effect: effect_id,
                 stage: ProofStage::AfterTranscript,
             }],

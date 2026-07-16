@@ -270,9 +270,14 @@ fn validate_primitive(
                     operation: operation.id,
                 });
             }
+            validate_invocation(operation, effect)?;
         }
         ExecutionPrimitive::DeviceCopyD2D { bytes } => {
-            if !effect.module_globals().is_empty() || bytes == 0 || effect.accesses().len() != 2 {
+            if operation.invocation.is_some()
+                || !effect.module_globals().is_empty()
+                || bytes == 0
+                || effect.accesses().len() != 2
+            {
                 return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
             }
             let (EffectAccess::Read { source }, EffectAccess::Write { destination }) =
@@ -289,7 +294,11 @@ fn validate_primitive(
             }
         }
         ExecutionPrimitive::DeviceMemsetByte { bytes, .. } => {
-            if !effect.module_globals().is_empty() || bytes == 0 || effect.accesses().len() != 1 {
+            if operation.invocation.is_some()
+                || !effect.module_globals().is_empty()
+                || bytes == 0
+                || effect.accesses().len() != 1
+            {
                 return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
             }
             let EffectAccess::Write { destination } = &effect.accesses()[0] else {
@@ -299,6 +308,59 @@ fn validate_primitive(
                 return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_invocation(
+    operation: &OpNode,
+    effect: &EffectContract,
+) -> Result<(), CompiledProofError> {
+    let invalid = || CompiledProofError::InvalidKernelInvocation(operation.id);
+    let invocation = operation.invocation.as_ref().ok_or_else(invalid)?;
+    if invocation.arguments.is_empty() {
+        return Err(invalid());
+    }
+
+    let expected = effect
+        .accesses()
+        .iter()
+        .flat_map(|access| [access.source(), access.destination()])
+        .flatten()
+        .map(|bound| bound.binding)
+        .collect::<BTreeSet<_>>();
+    let mut actual = BTreeSet::new();
+    for (ordinal, argument) in invocation.arguments.iter().enumerate() {
+        if usize::from(argument.ordinal) != ordinal {
+            return Err(invalid());
+        }
+        let mut insert = |binding| {
+            if actual.insert(binding) {
+                Ok(())
+            } else {
+                Err(invalid())
+            }
+        };
+        match &argument.value {
+            AotArgumentValue::U32(_) | AotArgumentValue::DevicePointer(None) => {}
+            AotArgumentValue::DevicePointer(Some(binding)) => insert(*binding)?,
+            AotArgumentValue::DevicePointerTable(entries) => {
+                if entries.is_empty() {
+                    return Err(invalid());
+                }
+                for &binding in entries.iter().flatten() {
+                    insert(binding)?;
+                }
+            }
+            AotArgumentValue::DeviceU32Literals(values) => {
+                if values.is_empty() {
+                    return Err(invalid());
+                }
+            }
+        }
+    }
+    if actual != expected {
+        return Err(invalid());
     }
     Ok(())
 }

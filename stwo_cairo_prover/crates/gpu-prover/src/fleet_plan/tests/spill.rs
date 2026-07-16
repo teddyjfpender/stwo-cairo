@@ -189,6 +189,7 @@ fn bind_spill_read(fixture: &mut Fixture) {
     });
     let effect = EffectContract::new(accesses, vec![]).unwrap();
     input.effects = vec![effect.clone()];
+    input.operations[0].invocation = invocation(&effect);
     input.operations[0].effect = effect.id();
     input.kernels = vec![AotKernelAuthority::new(
         AotKernelId(1),

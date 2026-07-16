@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use cairo_air::air::PublicData;
@@ -99,6 +100,25 @@ fn kernel(
     .unwrap()
 }
 
+fn invocation(effect: &EffectContract) -> Option<AotInvocation> {
+    let bindings = effect
+        .accesses()
+        .iter()
+        .flat_map(|access| [access.source(), access.destination()])
+        .flatten()
+        .map(|bound| bound.binding)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(Some)
+        .collect();
+    Some(AotInvocation {
+        arguments: vec![AotArgumentBinding {
+            ordinal: 0,
+            value: AotArgumentValue::DevicePointerTable(bindings),
+        }],
+    })
+}
+
 fn layout_ranges(layout: &ResidentProofBundleLayout) -> [std::ops::Range<usize>; 8] {
     [
         layout.commitments.clone(),
@@ -114,6 +134,7 @@ fn layout_ranges(layout: &ResidentProofBundleLayout) -> [std::ops::Range<usize>;
 
 fn install_effect(input: &mut CompiledProofInput, contract: EffectContract) {
     let effect_id = contract.id();
+    input.operations[0].invocation = invocation(&contract);
     input.effects = vec![contract];
     input.operations[0].effect = effect_id;
     input.kernels = vec![kernel(module(), vec![effect_id], b"assembly-build-v1")];
@@ -183,6 +204,7 @@ fn valid_input() -> CompiledProofInput {
     });
     let contract = EffectContract::new(accesses, vec![]).unwrap();
     let effect_id = contract.id();
+    let invocation = invocation(&contract);
 
     let sections = ProofBundleSection::CANONICAL
         .into_iter()
@@ -212,6 +234,7 @@ fn valid_input() -> CompiledProofInput {
                     cooperative: false,
                 },
             },
+            invocation,
             effect: effect_id,
             stage: ProofStage::AfterTranscript,
         }],
@@ -256,6 +279,65 @@ fn complete_authority_compiles_and_retains_exact_bytes() {
     different_build.kernels = vec![kernel(module(), vec![effect_id], b"assembly-build-v2")];
     let different = CompiledProof::compile(different_build, transcript()).unwrap();
     assert_ne!(compiled.identity(), different.identity());
+}
+
+#[test]
+fn aot_invocation_binds_every_effect_range_to_one_exact_abi_ordinal() {
+    let baseline = CompiledProof::compile(valid_input(), transcript()).unwrap();
+
+    let mut permuted = valid_input();
+    let AotArgumentValue::DevicePointerTable(entries) = &mut permuted.operations[0]
+        .invocation
+        .as_mut()
+        .unwrap()
+        .arguments[0]
+        .value
+    else {
+        panic!("fixture must use one pointer table")
+    };
+    entries.swap(0, 1);
+    let permuted = CompiledProof::compile(permuted, transcript()).unwrap();
+    assert_ne!(baseline.identity(), permuted.identity());
+
+    let mut missing = valid_input();
+    let AotArgumentValue::DevicePointerTable(entries) =
+        &mut missing.operations[0].invocation.as_mut().unwrap().arguments[0].value
+    else {
+        panic!("fixture must use one pointer table")
+    };
+    entries.pop();
+    assert!(matches!(
+        CompiledProof::compile(missing, transcript()),
+        Err(CompiledProofError::InvalidKernelInvocation(OpId(0)))
+    ));
+
+    let mut duplicate = valid_input();
+    let AotArgumentValue::DevicePointerTable(entries) = &mut duplicate.operations[0]
+        .invocation
+        .as_mut()
+        .unwrap()
+        .arguments[0]
+        .value
+    else {
+        panic!("fixture must use one pointer table")
+    };
+    entries[1] = entries[0];
+    assert!(matches!(
+        CompiledProof::compile(duplicate, transcript()),
+        Err(CompiledProofError::InvalidKernelInvocation(OpId(0)))
+    ));
+
+    let mut wrong_ordinal = valid_input();
+    wrong_ordinal.operations[0]
+        .invocation
+        .as_mut()
+        .unwrap()
+        .arguments[0]
+        .ordinal = 1;
+    assert!(matches!(
+        CompiledProof::compile(wrong_ordinal, transcript()),
+        Err(CompiledProofError::InvalidKernelInvocation(OpId(0)))
+    ));
 }
 
 #[test]
