@@ -16,17 +16,27 @@ use crate::transcript_plan::{
 };
 
 mod identity;
+mod ipc_cursor;
 mod lower_compiled;
+mod runtime_view;
 mod storage;
 mod validate;
 
 #[cfg(test)]
 mod tests;
 
+pub use ipc_cursor::{
+    FleetIpcAttemptState, FleetIpcCoordinatorCursor, FleetIpcCursorError, FleetIpcCursorProgress,
+    FleetIpcPhase, FleetIpcPhaseBinding, FleetIpcPhaseReceipt,
+};
 pub use lower_compiled::{
     FleetLoweringError, FleetOperationPlacement, FleetOwnerPlacement, FleetPlacementInput,
     FleetPlacementTopology, FleetReplicaPlacement, FleetRuntimeAdmissionError,
     FleetStoragePlacement, FleetTransitionPlacement, InPlaceAliasPlacement,
+};
+pub use runtime_view::{
+    FleetExchangeReserve, FleetRuntimeView, FleetRuntimeViewError, FleetStorageWindow,
+    FleetTransferSpan,
 };
 pub use storage::{StorageDesc, StorageId};
 
