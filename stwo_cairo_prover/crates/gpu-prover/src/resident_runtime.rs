@@ -2140,6 +2140,13 @@ impl<'a> ResidentGraphRuntime<'a> {
             {
                 return Err(ResidentRuntimeError::CommitModeMismatch);
             }
+            let fused_terminal = matches!(
+                planned.direct_compact_terminal.as_ref(),
+                Some(DirectCompactTerminalPlan::Fused(_))
+            );
+            if planned.direct_terminal_expand_absorb.is_some() != fused_terminal {
+                return Err(ResidentRuntimeError::CommitModeMismatch);
+            }
             let direct_inputs = planned
                 .direct_retained_b2n_program
                 .as_ref()
@@ -2337,20 +2344,36 @@ impl<'a> ResidentGraphRuntime<'a> {
                                                     direct_inputs.forward_twiddles,
                                                 )?
                                             }
-                                            DirectCompactTerminalPlan::Fused(program) => compact
-                                                .bind_prepared_direct_terminal_fused(
+                                            DirectCompactTerminalPlan::Fused(terminal) => {
+                                                let successor = planned
+                                                    .direct_terminal_expand_absorb
+                                                    .as_ref()
+                                                    .ok_or(
+                                                        ResidentRuntimeError::CommitModeMismatch,
+                                                    )?;
+                                                successor.program.bind_prepared(
                                                     arena,
                                                     base,
                                                     domain,
+                                                    compact,
+                                                    &successor.fused_compact_domain,
                                                     direct_program,
-                                                    program.clone(),
+                                                    terminal.clone(),
                                                     slots,
                                                     &direct_inputs.columns,
                                                     direct_inputs.inverse_twiddles,
                                                     direct_inputs.forward_twiddles,
-                                                )?,
+                                                )?
+                                            }
                                         };
                                         if terminal.receipt() != graph.terminal_receipt() {
+                                            return Err(ResidentRuntimeError::CommitModeMismatch);
+                                        }
+                                        let expected_expand_absorb = planned
+                                            .direct_terminal_expand_absorb
+                                            .as_ref()
+                                            .map(|successor| successor.program.receipt());
+                                        if expected_expand_absorb != graph.expand_absorb_receipt() {
                                             return Err(ResidentRuntimeError::CommitModeMismatch);
                                         }
                                         if !direct_retained_outputs_match(

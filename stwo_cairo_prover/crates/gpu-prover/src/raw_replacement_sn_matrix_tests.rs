@@ -150,23 +150,39 @@ fn execution_geometry(
 }
 
 fn assert_sn_terminal_fusion(profile: &str, arena: &ProofArenaPlan) {
-    let expected = match profile {
-        "SN1" => [
-            (CommitmentTreeId::Base, 7, 12, 16_922_247_168, -7),
-            (CommitmentTreeId::Interaction, 9, 10, 8_269_332_480, 1),
-        ],
-        "SN2" => [
-            (CommitmentTreeId::Base, 7, 11, 6_820_986_880, -5),
-            (CommitmentTreeId::Interaction, 8, 10, 5_606_735_872, -2),
-        ],
-        "SN3" => [
-            (CommitmentTreeId::Base, 8, 10, 9_969_139_712, -6),
-            (CommitmentTreeId::Interaction, 8, 10, 7_235_436_544, -6),
-        ],
-        "SN4" => [
-            (CommitmentTreeId::Base, 9, 11, 10_019_995_648, -3),
-            (CommitmentTreeId::Interaction, 7, 13, 4_521_197_568, -5),
-        ],
+    let (expected, expected_fused_materialized_rises, expected_fixed16_sinks) = match profile {
+        "SN1" => (
+            [
+                (CommitmentTreeId::Base, 7, 12, 16_922_247_168, -7),
+                (CommitmentTreeId::Interaction, 9, 10, 8_269_332_480, 1),
+            ],
+            20,
+            16,
+        ),
+        "SN2" => (
+            [
+                (CommitmentTreeId::Base, 7, 11, 6_820_986_880, -5),
+                (CommitmentTreeId::Interaction, 8, 10, 5_606_735_872, -2),
+            ],
+            19,
+            15,
+        ),
+        "SN3" => (
+            [
+                (CommitmentTreeId::Base, 8, 10, 9_969_139_712, -6),
+                (CommitmentTreeId::Interaction, 8, 10, 7_235_436_544, -6),
+            ],
+            18,
+            16,
+        ),
+        "SN4" => (
+            [
+                (CommitmentTreeId::Base, 9, 11, 10_019_995_648, -3),
+                (CommitmentTreeId::Interaction, 7, 13, 4_521_197_568, -5),
+            ],
+            22,
+            16,
+        ),
         _ => panic!("unknown sealed SN profile {profile}"),
     };
     for (tree, fixed16_batches, materialized_batches, net_device_bytes, net_cuda_launches) in
@@ -200,6 +216,35 @@ fn assert_sn_terminal_fusion(profile: &str, arena: &ProofArenaPlan) {
             "{profile}/{tree:?}: exact signed launch delta"
         );
     }
+    let composed = [CommitmentTreeId::Base, CommitmentTreeId::Interaction].map(|tree| {
+        arena
+            .commitment(tree)
+            .and_then(|commitment| commitment.direct_terminal_expand_absorb.as_ref())
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: composed terminal plan missing"))
+            .program
+            .receipt()
+    });
+    assert_eq!(
+        composed
+            .iter()
+            .map(|receipt| receipt.fused_materialized_rises)
+            .sum::<u32>(),
+        expected_fused_materialized_rises,
+        "{profile}: exact materialized expand-absorb rises"
+    );
+    assert_eq!(
+        composed
+            .iter()
+            .map(|receipt| receipt.fixed16_batches)
+            .sum::<u32>(),
+        expected_fixed16_sinks,
+        "{profile}: exact preserved fixed16 terminal sinks"
+    );
+    assert!(composed.iter().all(|receipt| {
+        receipt.fixed16_terminal_receipt_unchanged
+            && receipt.final_state_at_slab_zero
+            && !receipt.same_gpu_timing_credit_applied
+    }));
 }
 
 fn assert_current_bindings_match_fresh(

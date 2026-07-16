@@ -18,8 +18,9 @@ use stwo_backend_cuda::{
     blake2s_pow_workspace_requirements, blake_g_fusion_program_is_exact,
     commit_workspace_requirements, compact_domain_arena_slot_requirements,
     decommit_workspace_requirements, direct_compact_domain_arena_slot_requirements,
-    ec_op_workspace_requirements, execution_tables_workspace_requirements,
-    fri_final_workspace_requirements, fri_workspace_requirements, oods_workspace_requirements,
+    direct_terminal_expand_absorb_arena_slot_requirements, ec_op_workspace_requirements,
+    execution_tables_workspace_requirements, fri_final_workspace_requirements,
+    fri_workspace_requirements, oods_workspace_requirements,
     progressive_commit_workspace_requirements_for_mode, quotient_numerator_hybrid_plan,
     quotient_numerator_staged_single_write_plan_with_overflow_capacities,
     quotient_numerator_workspace_requirements, quotient_workspace_requirements,
@@ -35,12 +36,13 @@ use stwo_backend_cuda::{
     DecommitWorkspaceConfig, DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena,
     DeviceTranscriptError, DirectCompactDomainBindingError, DirectCompactTerminalError,
     DirectCompactTerminalFallbackReason, DirectCompactTerminalProgram, DirectRetainedB2nError,
-    DirectRetainedB2nProgram, DomainCooperativeProgram, DomainCooperativeProgramError,
-    EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
-    ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots,
-    FixedTableContiguousWorkspaceSlots, FriDecommitGeometry, FriDecommitSlots,
-    FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriFoldLaunchMode, FriMerkleTreeSlots,
-    FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots, InterpolationLaunchMode,
+    DirectRetainedB2nProgram, DirectTerminalExpandAbsorbError, DirectTerminalExpandAbsorbProgram,
+    DomainCooperativeProgram, DomainCooperativeProgramError, EcOpMultiplicityGeometry,
+    EcOpWorkspaceRequirements, EcOpWorkspaceSlots, ExecutionTablesWorkspaceRequirements,
+    ExecutionTablesWorkspaceSlots, FixedTableContiguousWorkspaceSlots, FriDecommitGeometry,
+    FriDecommitSlots, FriFinalWorkspaceRequirements, FriFinalWorkspaceSlots, FriFoldLaunchMode,
+    FriMerkleTreeSlots, FriWorkspaceConfig, FriWorkspaceRequirements, FriWorkspaceSlots,
+    FusedCompactDomainProgram, FusedCompactDomainProgramError, InterpolationLaunchMode,
     MerkleFromLeavesSlots, ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
     OodsColumnTopology, OodsPassCollapseError, OodsPassCollapseProgram, OodsSourceKind,
     OodsWorkspaceConfig, OodsWorkspaceRequirements, OodsWorkspaceSlots, PreparedBlake2sPowError,
@@ -2594,6 +2596,7 @@ struct LogicalCommitWorkspace {
     compact_domain_program: Option<CompactDomainProgram>,
     direct_retained_b2n_program: Option<DirectRetainedB2nProgram>,
     direct_compact_terminal: Option<DirectCompactTerminalPlan>,
+    direct_terminal_expand_absorb: Option<DirectTerminalExpandAbsorbPlan>,
     interpolation_mode: InterpolationLaunchMode,
     config: CommitWorkspaceConfig,
     grouped_column_log_sizes: Vec<Vec<u32>>,
@@ -3391,6 +3394,9 @@ pub struct PlannedCommitment {
     /// Runtime binding must execute this exact choice and may not probe or
     /// fall back after the arena topology has been sealed.
     pub direct_compact_terminal: Option<DirectCompactTerminalPlan>,
+    /// Exact two-bank materialized-rise successor composed with the fixed16
+    /// terminal plan. Present for every qualified ReplacementV1 fused commit.
+    pub direct_terminal_expand_absorb: Option<DirectTerminalExpandAbsorbPlan>,
     pub config: CommitWorkspaceConfig,
     pub grouped_column_log_sizes: Vec<Vec<u32>>,
     pub grouped_column_sources: Vec<Vec<CommitmentColumnSource>>,
@@ -3417,6 +3423,12 @@ pub enum DirectCompactTerminalPlan {
     /// At least one batch uses the qualified fixed16 terminal path. The
     /// program also seals every mixed-shape materialized batch in order.
     Fused(DirectCompactTerminalProgram),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectTerminalExpandAbsorbPlan {
+    pub fused_compact_domain: FusedCompactDomainProgram,
+    pub program: DirectTerminalExpandAbsorbProgram,
 }
 
 impl DirectCompactTerminalPlan {
@@ -4473,6 +4485,8 @@ pub enum ArenaPlanError {
     CompactDomainBinding(CompactDomainBindingError),
     DirectRetainedB2n(DirectRetainedB2nError),
     DirectCompactTerminal(DirectCompactTerminalError),
+    FusedCompactDomainProgram(FusedCompactDomainProgramError),
+    DirectTerminalExpandAbsorb(DirectTerminalExpandAbsorbError),
     DirectCompactDomainBinding(DirectCompactDomainBindingError),
     DirectCommitCoefficientReaders {
         tree: CommitmentTreeId,
@@ -7256,6 +7270,56 @@ fn direct_compact_terminal_plan(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn direct_terminal_expand_absorb_plan(
+    backend: ResidentBackend,
+    tree: CommitmentTreeId,
+    base: Option<&CommitProgram>,
+    domain: Option<&DomainCooperativeProgram>,
+    compact: Option<&CompactDomainProgram>,
+    direct: Option<&DirectRetainedB2nProgram>,
+    terminal: Option<&DirectCompactTerminalPlan>,
+) -> Result<Option<DirectTerminalExpandAbsorbPlan>, ArenaPlanError> {
+    if backend != ResidentBackend::ReplacementV1
+        || !matches!(tree, CommitmentTreeId::Base | CommitmentTreeId::Interaction)
+    {
+        return Ok(None);
+    }
+    let terminal = terminal.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+        "replacement direct commitment is missing terminal selection",
+    ))?;
+    let DirectCompactTerminalPlan::Fused(terminal) = terminal else {
+        return Ok(None);
+    };
+    let base = base.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+        "replacement fused commitment is missing its base program",
+    ))?;
+    let domain = domain.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+        "replacement fused commitment is missing its domain program",
+    ))?;
+    let compact = compact.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+        "replacement fused commitment is missing its compact program",
+    ))?;
+    let direct = direct.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+        "replacement fused commitment is missing its direct program",
+    ))?;
+    let fused_compact_domain = FusedCompactDomainProgram::compile(base, domain, compact)
+        .map_err(ArenaPlanError::FusedCompactDomainProgram)?;
+    let program = DirectTerminalExpandAbsorbProgram::compile(
+        base,
+        domain,
+        compact,
+        &fused_compact_domain,
+        direct,
+        terminal,
+    )
+    .map_err(ArenaPlanError::DirectTerminalExpandAbsorb)?;
+    Ok(Some(DirectTerminalExpandAbsorbPlan {
+        fused_compact_domain,
+        program,
+    }))
+}
+
 fn composition_output_plan(
     protocol: &ProtocolGeometry,
     requirements: &CompositionWorkspaceRequirements,
@@ -7731,6 +7795,15 @@ fn append_protocol_buffers(
             compact_domain_program.as_ref(),
             direct_retained_b2n_program.as_ref(),
         )?;
+        let direct_terminal_expand_absorb = direct_terminal_expand_absorb_plan(
+            protocol.identity.resident_backend,
+            geometry.id,
+            commit_program.as_ref(),
+            domain_cooperative_program.as_ref(),
+            compact_domain_program.as_ref(),
+            direct_retained_b2n_program.as_ref(),
+            direct_compact_terminal.as_ref(),
+        )?;
         let in_place_slab = match (&requirements, storage_mode) {
             (
                 ModeAwareCommitWorkspaceRequirements::DomainProgressive(requirements),
@@ -8057,6 +8130,7 @@ fn append_protocol_buffers(
             compact_domain_program,
             direct_retained_b2n_program,
             direct_compact_terminal,
+            direct_terminal_expand_absorb,
             interpolation_mode: protocol.identity.interpolation_mode,
             config: geometry.config,
             grouped_column_log_sizes: geometry.grouped_column_log_sizes.clone(),
@@ -9468,10 +9542,35 @@ fn resolve_commitment_slots(
                     ),
                 )?;
                 if let Some(direct) = logical.direct_retained_b2n_program.as_ref() {
-                    direct_compact_domain_arena_slot_requirements(
-                        compact, base, domain, direct, slots,
-                    )
-                    .map_err(ArenaPlanError::DirectCompactDomainBinding)?;
+                    match (
+                        logical.direct_terminal_expand_absorb.as_ref(),
+                        logical.direct_compact_terminal.as_ref(),
+                    ) {
+                        (Some(successor), Some(DirectCompactTerminalPlan::Fused(terminal))) => {
+                            direct_terminal_expand_absorb_arena_slot_requirements(
+                                &successor.program,
+                                base,
+                                domain,
+                                compact,
+                                &successor.fused_compact_domain,
+                                direct,
+                                terminal,
+                                slots,
+                            )
+                            .map_err(ArenaPlanError::DirectCompactDomainBinding)?;
+                        }
+                        (None, _) => {
+                            direct_compact_domain_arena_slot_requirements(
+                                compact, base, domain, direct, slots,
+                            )
+                            .map_err(ArenaPlanError::DirectCompactDomainBinding)?;
+                        }
+                        _ => {
+                            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                                "direct terminal successor does not match its terminal plan",
+                            ));
+                        }
+                    }
                 } else {
                     compact_domain_arena_slot_requirements(compact, base, domain, slots)
                         .map_err(ArenaPlanError::CompactDomainBinding)?;
@@ -9496,6 +9595,7 @@ fn resolve_commitment_slots(
         compact_domain_program: logical.compact_domain_program,
         direct_retained_b2n_program: logical.direct_retained_b2n_program,
         direct_compact_terminal: logical.direct_compact_terminal,
+        direct_terminal_expand_absorb: logical.direct_terminal_expand_absorb,
         config: logical.config,
         grouped_column_log_sizes: logical.grouped_column_log_sizes,
         grouped_column_sources: logical.grouped_column_sources,
