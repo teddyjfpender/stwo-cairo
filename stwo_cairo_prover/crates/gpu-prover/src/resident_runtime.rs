@@ -82,6 +82,10 @@ use crate::transcript_plan::{
 };
 use crate::{PreparedCompositionError, PreparedCompositionGraph};
 
+pub(crate) mod producer_schedule;
+
+use producer_schedule::{BaseProducerSchedule, BaseProducerStep, ProducerScheduleError};
+
 /// One setup drain even through ordinary errors or unwinding. Host buffers
 /// borrowed by asynchronous ingress must never be released while DMA is live.
 struct SetupFence<'context> {
@@ -558,6 +562,7 @@ pub enum ResidentRuntimeError {
     CompactDomainBinding(CompactDomainBindingError),
     DirectCompactDomainBinding(DirectCompactDomainBindingError),
     CommitModeMismatch,
+    ProducerSchedule,
     Interpolation(PreparedInterpolationError),
     SourceStage(ResidentSourceStageError),
     CompositionBinding(ResidentCompositionError),
@@ -809,6 +814,12 @@ impl From<TranscriptPlanError> for ResidentRuntimeError {
     }
 }
 
+impl From<ProducerScheduleError> for ResidentRuntimeError {
+    fn from(_: ProducerScheduleError) -> Self {
+        Self::ProducerSchedule
+    }
+}
+
 #[derive(Debug)]
 enum ResidentLaunchError {
     Commit(PreparedCommitError),
@@ -827,6 +838,7 @@ enum ResidentLaunchError {
     WitnessFeed(PreparedWitnessFeedError),
     FixedTable(PreparedFixedTableError),
     MemoryBaseTrace(PreparedMemoryBaseTraceError),
+    ProducerSchedule(ProducerScheduleError),
     WitnessLanes(WitnessLaneLaunchError),
     Transcript(DeviceTranscriptError),
     Cuda(CudaRuntimeError),
@@ -875,6 +887,9 @@ impl core::fmt::Display for ResidentLaunchError {
             }
             Self::MemoryBaseTrace(error) => {
                 write!(f, "resident memory base trace rejected: {error}")
+            }
+            Self::ProducerSchedule(error) => {
+                write!(f, "resident producer schedule rejected: {error}")
             }
             Self::WitnessLanes(error) => write!(f, "resident witness lanes rejected: {error}"),
             Self::Transcript(error) => write!(f, "resident transcript launch rejected: {error}"),
@@ -962,6 +977,7 @@ fn plan_witness_lane_levels(
     witness: &[PreparedResidentWitness<'_>],
     ec_op: Option<&PreparedEcOpGraph<'_>>,
     lane_count: usize,
+    producer_schedule: &BaseProducerSchedule,
 ) -> Result<Vec<Vec<Vec<usize>>>, ResidentRuntimeError> {
     if witness.is_empty() && ec_op.is_none() {
         return Ok(Vec::new());
@@ -999,19 +1015,20 @@ fn plan_witness_lane_levels(
         });
     }
 
-    let schedule_levels = CAIRO_SCHEDULE.levels().map_err(|_| {
-        ResidentRuntimeError::PreparedWitnessCaptureContract {
-            component: "<schedule>",
-            role: "generated component dependency schedule is invalid",
-        }
-    })?;
     let mut seen = vec![false; task_count];
     let mut result = Vec::new();
-    for level in schedule_levels {
+    for level in producer_schedule.witness_levels() {
         let components = level
-            .into_iter()
-            .filter_map(|component| by_component.get(component).copied())
-            .collect::<Vec<_>>();
+            .iter()
+            .map(|producer| {
+                by_component.get(producer.component).copied().ok_or(
+                    ResidentRuntimeError::PreparedWitnessCaptureContract {
+                        component: producer.component,
+                        role: "typed producer schedule is missing its prepared witness",
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if components.is_empty() {
             continue;
         }
@@ -1544,6 +1561,7 @@ fn prepare_trace_commit_input<'a>(
 
 pub struct ResidentGraphRuntime<'a> {
     execution_config: SealedResidentExecutionConfig,
+    base_producer_schedule: BaseProducerSchedule,
     execution_tables: Option<PreparedExecutionTablesGraph<'a>>,
     execution_tables_ingest: Option<PreparedExecutionTablesIngestTelemetry>,
     ec_op: Option<PreparedEcOpGraph<'a>>,
@@ -1654,6 +1672,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         }
 
         let arena = workspace.arena();
+        let base_producer_schedule = BaseProducerSchedule::compile(workspace.plan())?;
         let (execution_tables, execution_tables_ingest, execution_tables_view) =
             match (workspace.plan().execution_tables(), execution_tables_host) {
                 (Some(planned), Some(host)) => {
@@ -2089,8 +2108,12 @@ impl<'a> ResidentGraphRuntime<'a> {
             (None, None) => (None, None),
         };
         require_execution_feature(execution_config.stream_fanout, "stream_fanout")?;
-        let witness_lane_levels =
-            plan_witness_lane_levels(&witness, ec_op.as_ref(), arena.context().lane_count())?;
+        let witness_lane_levels = plan_witness_lane_levels(
+            &witness,
+            ec_op.as_ref(),
+            arena.context().lane_count(),
+            &base_producer_schedule,
+        )?;
         let planned_transcript = workspace.plan().transcript();
         if planned_transcript.schedule_key != transcript_plan.schedule_key() {
             return Err(ResidentRuntimeError::TranscriptScheduleMismatch {
@@ -2457,6 +2480,39 @@ impl<'a> ResidentGraphRuntime<'a> {
             prepare_trace_commit_input(workspace, &commitments, CommitmentTreeId::Base)?;
         let interaction_commit_input =
             prepare_trace_commit_input(workspace, &commitments, CommitmentTreeId::Interaction)?;
+        let mut prepared_base_steps = Vec::new();
+        if execution_tables.is_some() {
+            prepared_base_steps.push(BaseProducerStep::ExecutionTables);
+        }
+        if let Some(multiplicity) = &multiplicity {
+            prepared_base_steps.push(BaseProducerStep::MultiplicityClear);
+            if multiplicity.public_memory_seed.is_some() {
+                prepared_base_steps.push(BaseProducerStep::PublicMemorySeed);
+            }
+        }
+        if !witness_lane_levels.is_empty() {
+            prepared_base_steps.push(BaseProducerStep::witness(
+                witness_lane_levels.len(),
+                witness.len() + usize::from(ec_op.is_some()),
+            )?);
+        }
+        if let Some(multiplicity) = &multiplicity {
+            if multiplicity.memory_traces.is_some() {
+                prepared_base_steps.push(BaseProducerStep::MemoryBaseTrace);
+            }
+            if !multiplicity.fixed_tables.is_empty() {
+                prepared_base_steps.push(BaseProducerStep::fixed_tables(
+                    multiplicity.fixed_tables.len(),
+                )?);
+            }
+        }
+        if let PreparedTraceCommitInput::Interpolate(interpolation) = &base_commit_input {
+            prepared_base_steps.push(BaseProducerStep::interpolation(
+                interpolation.batch_count(),
+                interpolation.column_count(),
+            )?);
+        }
+        base_producer_schedule.validate_runtime_steps(&prepared_base_steps)?;
         let input_telemetry = trace_commit_input_telemetry(
             &base_commit_input,
             &interaction_commit_input,
@@ -2605,6 +2661,7 @@ impl<'a> ResidentGraphRuntime<'a> {
 
         let runtime = Self {
             execution_config,
+            base_producer_schedule,
             execution_tables,
             execution_tables_ingest,
             ec_op,
@@ -3337,24 +3394,46 @@ impl<'a> ResidentGraphRuntime<'a> {
         let transcript = &self.transcript;
         let interaction_pow = &self.interaction_pow;
         let relation = &self.relation;
+        let producer_schedule = &self.base_producer_schedule;
         let workspace = self.workspace;
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
         let capture = capture_with_cursor_rollback(cursor, |cursor| {
             workspace.capture_segment(GraphSegment::IngestWitnessBaseCommit, |arena| {
+                let mut producer_cursor = producer_schedule.cursor();
                 if let Some(execution_tables) = execution_tables {
+                    producer_cursor
+                        .admit(BaseProducerStep::ExecutionTables)
+                        .map_err(ResidentLaunchError::ProducerSchedule)?;
                     execution_tables
                         .launch()
                         .map_err(ResidentLaunchError::ExecutionTables)?;
                 }
                 if let Some(multiplicity) = multiplicity {
+                    producer_cursor
+                        .admit(BaseProducerStep::MultiplicityClear)
+                        .map_err(ResidentLaunchError::ProducerSchedule)?;
                     multiplicity
                         .clear
                         .launch()
                         .map_err(ResidentLaunchError::WitnessFeed)?;
                     if let Some(seed) = &multiplicity.public_memory_seed {
+                        producer_cursor
+                            .admit(BaseProducerStep::PublicMemorySeed)
+                            .map_err(ResidentLaunchError::ProducerSchedule)?;
                         seed.launch().map_err(ResidentLaunchError::WitnessFeed)?;
                     }
+                }
+                if !witness_lane_levels.is_empty() {
+                    producer_cursor
+                        .admit(
+                            BaseProducerStep::witness(
+                                witness_lane_levels.len(),
+                                witness.len() + usize::from(ec_op.is_some()),
+                            )
+                            .map_err(ResidentLaunchError::ProducerSchedule)?,
+                        )
+                        .map_err(ResidentLaunchError::ProducerSchedule)?;
                 }
                 enqueue_witness_lane_levels(
                     arena,
@@ -3366,20 +3445,45 @@ impl<'a> ResidentGraphRuntime<'a> {
                 .map_err(ResidentLaunchError::WitnessLanes)?;
                 if let Some(multiplicity) = multiplicity {
                     if let Some(memory) = &multiplicity.memory_traces {
+                        producer_cursor
+                            .admit(BaseProducerStep::MemoryBaseTrace)
+                            .map_err(ResidentLaunchError::ProducerSchedule)?;
                         memory
                             .launch()
                             .map_err(ResidentLaunchError::MemoryBaseTrace)?;
+                    }
+                    if !multiplicity.fixed_tables.is_empty() {
+                        producer_cursor
+                            .admit(
+                                BaseProducerStep::fixed_tables(multiplicity.fixed_tables.len())
+                                    .map_err(ResidentLaunchError::ProducerSchedule)?,
+                            )
+                            .map_err(ResidentLaunchError::ProducerSchedule)?;
                     }
                     for fixed in &multiplicity.fixed_tables {
                         fixed.launch().map_err(ResidentLaunchError::FixedTable)?;
                     }
                 }
                 match commit_input {
-                    PreparedTraceCommitInput::Interpolate(interpolation) => interpolation
-                        .launch()
-                        .map_err(ResidentLaunchError::Interpolation)?,
+                    PreparedTraceCommitInput::Interpolate(interpolation) => {
+                        producer_cursor
+                            .admit(
+                                BaseProducerStep::interpolation(
+                                    interpolation.batch_count(),
+                                    interpolation.column_count(),
+                                )
+                                .map_err(ResidentLaunchError::ProducerSchedule)?,
+                            )
+                            .map_err(ResidentLaunchError::ProducerSchedule)?;
+                        interpolation
+                            .launch()
+                            .map_err(ResidentLaunchError::Interpolation)?;
+                    }
                     PreparedTraceCommitInput::DirectEvaluations => {}
                 }
+                producer_cursor
+                    .finish()
+                    .map_err(ResidentLaunchError::ProducerSchedule)?;
                 commitment.launch()?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
                 transcript
@@ -4356,14 +4460,24 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn launch_base_commit_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        let mut producer_cursor = self.base_producer_schedule.cursor();
         if let Some(execution_tables) = &self.execution_tables {
+            producer_cursor.admit(BaseProducerStep::ExecutionTables)?;
             execution_tables.launch()?;
         }
         if let Some(multiplicity) = &self.multiplicity {
+            producer_cursor.admit(BaseProducerStep::MultiplicityClear)?;
             multiplicity.clear.launch()?;
             if let Some(seed) = &multiplicity.public_memory_seed {
+                producer_cursor.admit(BaseProducerStep::PublicMemorySeed)?;
                 seed.launch()?;
             }
+        }
+        if !self.witness_lane_levels.is_empty() {
+            producer_cursor.admit(BaseProducerStep::witness(
+                self.witness_lane_levels.len(),
+                self.witness.len() + usize::from(self.ec_op.is_some()),
+            )?)?;
         }
         enqueue_witness_lane_levels(
             self.workspace.arena(),
@@ -4374,16 +4488,29 @@ impl<'a> ResidentGraphRuntime<'a> {
         )?;
         if let Some(multiplicity) = &self.multiplicity {
             if let Some(memory) = &multiplicity.memory_traces {
+                producer_cursor.admit(BaseProducerStep::MemoryBaseTrace)?;
                 memory.launch()?;
+            }
+            if !multiplicity.fixed_tables.is_empty() {
+                producer_cursor.admit(BaseProducerStep::fixed_tables(
+                    multiplicity.fixed_tables.len(),
+                )?)?;
             }
             for fixed in &multiplicity.fixed_tables {
                 fixed.launch()?;
             }
         }
         match &self.base_commit_input {
-            PreparedTraceCommitInput::Interpolate(interpolation) => interpolation.launch()?,
+            PreparedTraceCommitInput::Interpolate(interpolation) => {
+                producer_cursor.admit(BaseProducerStep::interpolation(
+                    interpolation.batch_count(),
+                    interpolation.column_count(),
+                )?)?;
+                interpolation.launch()?;
+            }
             PreparedTraceCommitInput::DirectEvaluations => {}
         }
+        producer_cursor.finish()?;
         self.commitment(CommitmentTreeId::Base)?.launch()?;
         self.stage_commitment_root_for_transcript(
             CommitmentTreeId::Base,

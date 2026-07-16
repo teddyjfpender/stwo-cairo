@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -18,6 +17,7 @@ use crate::phases;
 use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::prepare_resident_ingest;
 use crate::replacement_host_cache::ReplacementHostCache;
+use crate::resident_runtime::producer_schedule::ProducerScheduleError;
 use crate::resident_session::ResidentPreWitnessInput;
 use crate::resident_witness::planned_cairo_claim;
 use crate::shape_executable::{ShapeCompileRequest, ShapeExecutable, ShapeExecutableCache};
@@ -54,36 +54,6 @@ fn generated_sn2() -> Arc<ShapeExecutable> {
         .executable
 }
 
-fn semantic_values(source: &[SourceArgument]) -> adapter::SemanticValueMap {
-    let mut ids = BTreeSet::new();
-    for argument in source {
-        match argument {
-            SourceArgument::PointerTable { entries, .. } => {
-                ids.extend(
-                    entries
-                        .iter()
-                        .filter(|entry| entry.target.access != InvocationAccess::Inactive)
-                        .map(|entry| entry.target.value),
-                );
-            }
-            SourceArgument::DirectPointer { target, .. }
-                if target.access != InvocationAccess::Inactive =>
-            {
-                ids.insert(target.value);
-            }
-            SourceArgument::ScalarArray { .. }
-            | SourceArgument::U32 { .. }
-            | SourceArgument::DirectPointer { .. } => {}
-        }
-    }
-    adapter::SemanticValueMap::new(
-        ids.into_iter()
-            .enumerate()
-            .map(|(index, id)| (id, ValueVersion(u32::try_from(index).unwrap()))),
-    )
-    .unwrap()
-}
-
 fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     let image = ArenaProgramInventory::from_planned_parts(
         executable.topology(),
@@ -91,20 +61,45 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         executable.arena(),
     )
     .unwrap();
-    let mapped = map_first_recorded_witness(&image, executable.arena()).unwrap();
-    let next = &image.values[usize::try_from(mapped.next_pending_inventory.0).unwrap()];
-    eprintln!(
-        "RECORDED_WITNESS_BINDING_FRONTIER current={:?} next_inventory_id={:?} next_inventory_logical={:?} next_inventory_component={:?} next_inventory_part={:?} next_inventory_purpose={:?} next_inventory_ordinal={}",
-        mapped.current,
-        next.id,
-        next.logical,
-        next.component,
-        next.part,
-        next.purpose,
-        next.ordinal,
+    let schedule = BaseProducerSchedule::compile(executable.arena()).unwrap();
+    schedule.validate_runtime_steps(schedule.steps()).unwrap();
+    let mut cursor = schedule.cursor();
+    for &step in schedule.steps() {
+        cursor.admit(step).unwrap();
+    }
+    cursor.finish().unwrap();
+    let mut incomplete = schedule.steps().to_vec();
+    incomplete.pop();
+    assert_eq!(
+        schedule.validate_runtime_steps(&incomplete),
+        Err(ProducerScheduleError::RuntimeOrderMismatch)
     );
-    assert_ne!(mapped.current, mapped.next_pending_inventory);
-    assert!(mapped.produced.contains(&mapped.current));
+
+    let mapped = map_first_recorded_witness(&image, executable.arena(), &schedule).unwrap();
+    let first_interpolation = mapped.base_interpolation.first().unwrap();
+    let coefficients = &image.values[first_interpolation.coefficients.0 as usize];
+    eprintln!(
+        "RECORDED_WITNESS_BINDING_FRONTIER component={} part={:?} base_outputs={} first_coefficient_id={:?} first_coefficient_logical={:?} runtime_steps={}",
+        mapped.producer.component,
+        mapped.producer.part,
+        mapped.base_interpolation.len(),
+        coefficients.id,
+        coefficients.logical,
+        schedule.steps().len(),
+    );
+    assert_eq!(mapped.producer.kind, WitnessProducerKind::Recorded);
+    assert!(mapped
+        .base_interpolation
+        .iter()
+        .all(|frontier| mapped.produced.contains(&frontier.evaluations)));
+    assert!(mapped.base_interpolation.iter().all(|frontier| {
+        frontier.evaluation_version != frontier.coefficient_version
+            && frontier.missing
+                == [
+                    MissingOperationField::PrimitiveAuthority,
+                    MissingOperationField::EffectContract,
+                ]
+    }));
     assert_eq!(mapped.invocation.source_arguments.len(), 8);
     assert!(matches!(
         adapter::compile(
@@ -116,13 +111,48 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         ),
         Err(InvocationShapeError::MissingSemanticValueMap(_))
     ));
-    let (invocation, effect) = adapter::compile(
-        &mapped.invocation.source_arguments,
-        &semantic_values(&mapped.invocation.source_arguments),
-    )
-    .unwrap();
+    let (invocation, effect) =
+        adapter::compile(&mapped.invocation.source_arguments, &mapped.semantic_values).unwrap();
     assert_eq!(invocation.arguments.len(), 8);
     assert!(!effect.accesses().is_empty());
+    let mut versions = mapped
+        .semantic_values
+        .entries()
+        .map(|(_, version)| version.0)
+        .collect::<Vec<_>>();
+    versions.sort_unstable();
+    assert_eq!(
+        versions,
+        (0..u32::try_from(versions.len()).unwrap()).collect::<Vec<_>>()
+    );
+    let coefficient_start = mapped
+        .base_interpolation
+        .iter()
+        .map(|frontier| frontier.coefficient_version.0)
+        .min()
+        .unwrap();
+    assert!(mapped
+        .base_interpolation
+        .iter()
+        .all(|frontier| frontier.evaluation_version.0 < coefficient_start));
+    assert_eq!(
+        mapped
+            .base_interpolation
+            .iter()
+            .map(|frontier| frontier.coefficient_version.0)
+            .collect::<Vec<_>>(),
+        (coefficient_start
+            ..coefficient_start + u32::try_from(mapped.base_interpolation.len()).unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert!(mapped
+        .base_interpolation
+        .windows(2)
+        .all(|pair| (pair[0].batch, pair[0].column) < (pair[1].batch, pair[1].column)));
+    assert_eq!(
+        schedule_prefix::try_lower_base_interpolation(&mapped.base_interpolation),
+        Err(InvocationShapeError::MissingBaseInterpolationAuthority)
+    );
     match loaded_authority::require(&mapped.invocation, 8, 6) {
         Ok(loaded) => {
             assert_ne!(loaded.manifest_identity, [0; 32]);
@@ -136,20 +166,20 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         }
         Err(error) => panic!("loaded recorded-witness authority drifted: {error:?}"),
     }
-    validate_invocation(&mapped.invocation, &image, executable.arena()).unwrap();
+    validate_invocation(&mapped.invocation, &image, executable.arena(), &schedule).unwrap();
     assert!(image.try_promote_to_compiled_proof().is_err());
 
     let mut mutated = mapped.invocation.clone();
     mutated.program_identity[0] ^= 1;
     assert_eq!(
-        validate_invocation(&mutated, &image, executable.arena()),
+        validate_invocation(&mutated, &image, executable.arena(), &schedule),
         Err(InvocationShapeError::InvocationMismatch)
     );
 
     let mut mutated = mapped.invocation.clone();
     mutated.abi_schema_identity[0] ^= 1;
     assert_eq!(
-        validate_invocation(&mutated, &image, executable.arena()),
+        validate_invocation(&mutated, &image, executable.arena(), &schedule),
         Err(InvocationShapeError::InvocationMismatch)
     );
 
@@ -159,14 +189,14 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     };
     entries[0].target.elements.end -= 1;
     assert_eq!(
-        validate_invocation(&mutated, &image, executable.arena()),
+        validate_invocation(&mutated, &image, executable.arena(), &schedule),
         Err(InvocationShapeError::InvocationMismatch)
     );
 
     let mut mutated = mapped.invocation;
     mutated.launch.block[0] = 128;
     assert_eq!(
-        validate_invocation(&mutated, &image, executable.arena()),
+        validate_invocation(&mutated, &image, executable.arena(), &schedule),
         Err(InvocationShapeError::InvocationMismatch)
     );
 }

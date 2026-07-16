@@ -10,6 +10,7 @@ use crate::compiled_proof::{
 
 /// Explicit semantic authority. Arena catalog IDs are storage inventory and
 /// are never cast or inferred into immutable semantic versions.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SemanticValueMap(BTreeMap<ArenaCatalogValueId, ValueVersion>);
 
 impl SemanticValueMap {
@@ -26,11 +27,35 @@ impl SemanticValueMap {
         Ok(Self(map))
     }
 
-    fn version(&self, catalog: ArenaCatalogValueId) -> Result<ValueVersion, InvocationShapeError> {
+    pub(super) fn allocate_ordered(
+        catalogs: impl IntoIterator<Item = ArenaCatalogValueId>,
+    ) -> Result<Self, InvocationShapeError> {
+        let mut map = BTreeMap::new();
+        for catalog in catalogs {
+            if map.contains_key(&catalog) {
+                continue;
+            }
+            let version = ValueVersion(
+                u32::try_from(map.len()).map_err(|_| InvocationShapeError::SizeOverflow)?,
+            );
+            map.insert(catalog, version);
+        }
+        Self::new(map)
+    }
+
+    pub(super) fn version(
+        &self,
+        catalog: ArenaCatalogValueId,
+    ) -> Result<ValueVersion, InvocationShapeError> {
         self.0
             .get(&catalog)
             .copied()
             .ok_or(InvocationShapeError::MissingSemanticValueMap(catalog))
+    }
+
+    #[cfg(test)]
+    pub(super) fn entries(&self) -> impl Iterator<Item = (ArenaCatalogValueId, ValueVersion)> + '_ {
+        self.0.iter().map(|(&catalog, &version)| (catalog, version))
     }
 }
 
@@ -63,9 +88,6 @@ pub(super) fn compile(
     }
     if let Some(&missing) = required.iter().find(|value| !values.0.contains_key(value)) {
         return Err(InvocationShapeError::MissingSemanticValueMap(missing));
-    }
-    if values.0.keys().copied().collect::<BTreeSet<_>>() != required {
-        return Err(InvocationShapeError::InvalidProgramRole);
     }
     let mut accesses = Vec::new();
     let mut next_binding = 0u32;

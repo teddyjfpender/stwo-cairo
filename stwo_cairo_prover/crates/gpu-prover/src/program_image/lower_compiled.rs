@@ -15,9 +15,17 @@ use stwo_backend_cuda::{
 use super::*;
 use crate::arena_plan::{BlakeGWitnessContract, PlannedWitnessComponent, ProofArenaPlan};
 use crate::compiled_proof::LaunchGeometry;
+use crate::resident_runtime::producer_schedule::{
+    BaseProducerSchedule, WitnessProducer, WitnessProducerKind,
+};
 
 mod adapter;
 mod loaded_authority;
+mod schedule_prefix;
+
+use schedule_prefix::{
+    base_interpolation_frontier, invocation_catalog_order, BaseInterpolationBindingFrontier,
+};
 
 const POINTER_WORDS: usize = core::mem::size_of::<*const u32>().div_ceil(WORD_BYTES);
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -87,9 +95,10 @@ struct RecordedWitnessInvocationShape {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RecordedWitnessBindingFrontier {
-    current: ArenaCatalogValueId,
+    producer: WitnessProducer,
     produced: Vec<ArenaCatalogValueId>,
-    next_pending_inventory: ArenaCatalogValueId,
+    semantic_values: adapter::SemanticValueMap,
+    base_interpolation: Vec<BaseInterpolationBindingFrontier>,
     invocation: RecordedWitnessInvocationShape,
 }
 
@@ -113,32 +122,31 @@ enum InvocationShapeError {
     LoadedAotAuthorityMismatch,
     InvocationMismatch,
     FrontierDidNotAdvance,
+    MissingBaseInterpolationAuthority,
 }
 
 /// Derive one exact real-arena invocation shape without promoting it.
 fn map_first_recorded_witness(
     image: &ArenaProgramInventory,
     arena: &ProofArenaPlan,
+    schedule: &BaseProducerSchedule,
 ) -> Result<RecordedWitnessBindingFrontier, InvocationShapeError> {
-    let planned = frontier_component(image, arena)?;
+    let (producer, planned) = frontier_component(arena, schedule)?;
     let invocation = derive_invocation(image, arena, planned)?;
     let produced = produced_values(image, arena, planned)?;
-    if !produced.contains(&image.frontier.value) {
-        return Err(InvocationShapeError::FrontierDidNotAdvance);
+    let mut ordered_values = invocation_catalog_order(&invocation.source_arguments);
+    let mut base_interpolation =
+        base_interpolation_frontier(image, schedule, planned, &produced, &mut ordered_values)?;
+    let semantic_values = adapter::SemanticValueMap::allocate_ordered(ordered_values)?;
+    for frontier in &mut base_interpolation {
+        frontier.evaluation_version = semantic_values.version(frontier.evaluations)?;
+        frontier.coefficient_version = semantic_values.version(frontier.coefficients)?;
     }
-    let next_pending_inventory = image
-        .values
-        .iter()
-        .find(|value| {
-            value.origin == ProgramValueOrigin::PendingOperationContract
-                && !produced.contains(&value.id)
-        })
-        .map(|value| value.id)
-        .ok_or(InvocationShapeError::FrontierDidNotAdvance)?;
     Ok(RecordedWitnessBindingFrontier {
-        current: image.frontier.value,
+        producer,
         produced,
-        next_pending_inventory,
+        semantic_values,
+        base_interpolation,
         invocation,
     })
 }
@@ -147,8 +155,10 @@ fn validate_invocation(
     supplied: &RecordedWitnessInvocationShape,
     image: &ArenaProgramInventory,
     arena: &ProofArenaPlan,
+    schedule: &BaseProducerSchedule,
 ) -> Result<(), InvocationShapeError> {
-    let expected = derive_invocation(image, arena, frontier_component(image, arena)?)?;
+    let (_, planned) = frontier_component(arena, schedule)?;
+    let expected = derive_invocation(image, arena, planned)?;
     if supplied == &expected {
         Ok(())
     } else {
@@ -157,19 +167,26 @@ fn validate_invocation(
 }
 
 fn frontier_component<'a>(
-    image: &ArenaProgramInventory,
     arena: &'a ProofArenaPlan,
-) -> Result<&'a PlannedWitnessComponent, InvocationShapeError> {
-    arena
+    schedule: &BaseProducerSchedule,
+) -> Result<(WitnessProducer, &'a PlannedWitnessComponent), InvocationShapeError> {
+    let producer = schedule
+        .witness_levels()
+        .iter()
+        .flatten()
+        .copied()
+        .find(|producer| producer.kind == WitnessProducerKind::Recorded)
+        .ok_or(InvocationShapeError::MissingRecordedWitness)?;
+    let planned = arena
         .witness()
         .components
         .iter()
         .find(|planned| {
-            image.frontier.component == Some(planned.component)
-                && image.frontier.part == Some(planned.part)
+            producer.component == planned.component && producer.part == Some(planned.part)
         })
         .filter(|planned| planned.blake_g_contract == BlakeGWitnessContract::Recorded)
-        .ok_or(InvocationShapeError::MissingRecordedWitness)
+        .ok_or(InvocationShapeError::MissingRecordedWitness)?;
+    Ok((producer, planned))
 }
 
 fn derive_invocation(
