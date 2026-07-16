@@ -87,7 +87,7 @@ pub(super) fn validate_fields(
         || fields.semantic_hash != invocation.semantic_hash
         || fields.cache_key != invocation.cache_key
         || fields.target_sm != target_sm
-        || fields.source_identity == [0; 32]
+        || fields.source_identity != invocation.deduce.source_identity
         || fields.cubin_identity == [0; 32]
         || fields.authority_identity == [0; 32]
     {

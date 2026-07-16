@@ -27,6 +27,9 @@ mod ec_op_pair_tests;
 mod ec_op_prefix;
 mod loaded_authority;
 mod producer_prefix;
+mod recorded_deduce_authority;
+#[cfg(test)]
+mod recorded_deduce_tests;
 mod schedule_prefix;
 
 const POINTER_WORDS: usize = core::mem::size_of::<*const u32>().div_ceil(WORD_BYTES);
@@ -91,6 +94,7 @@ struct RecordedWitnessInvocationShape {
     cache_key: u64,
     kernel_symbol: String,
     abi_schema_identity: [u8; 32],
+    deduce: recorded_deduce_authority::SelfContainedDeduceAuthority,
     launch: LaunchGeometry,
     source_arguments: Vec<SourceArgument>,
 }
@@ -159,12 +163,7 @@ fn derive_invocation(
     arena: &ProofArenaPlan,
     planned: &PlannedWitnessComponent,
 ) -> Result<RecordedWitnessInvocationShape, InvocationShapeError> {
-    if planned.program.n_mult_tables != 0
-        || !planned.requirements.multiplicity_column_words.is_empty()
-        || !planned.slots.multiplicity_columns.is_empty()
-    {
-        return Err(InvocationShapeError::MultiplicityNeedsSemanticVersions);
-    }
+    validate_multiplicity_free(planned)?;
     let program_use = validate_program_roles(&planned.program)?;
     validate_recorded_witness_abi()?;
 
@@ -178,9 +177,7 @@ fn derive_invocation(
         .program_identity
         .filter(|identity| identity == &planned.program.semantic_identity())
         .ok_or(InvocationShapeError::InvalidStructuredAbi)?;
-    // The source/program/ABI authority above must exist before a missing
-    // module-global effect is reported as the next honest frontier.
-    validate_module_globals(&planned.program)?;
+    let deduce = recorded_deduce_authority::bind(&planned.program, &emitted.source)?;
 
     let tables = arena
         .execution_tables()
@@ -318,6 +315,7 @@ fn derive_invocation(
         cache_key: emitted.cache_key,
         kernel_symbol: emitted.kernel_name,
         abi_schema_identity: schema.identity(),
+        deduce,
         launch: LaunchGeometry {
             grid: [row_count.div_ceil(256), 1, 1],
             block: [256, 1, 1],
@@ -327,6 +325,24 @@ fn derive_invocation(
         },
         source_arguments,
     })
+}
+
+fn validate_multiplicity_free(
+    planned: &PlannedWitnessComponent,
+) -> Result<(), InvocationShapeError> {
+    if planned.program.n_mult_tables != 0
+        || !planned.requirements.multiplicity_column_words.is_empty()
+        || !planned.slots.multiplicity_columns.is_empty()
+        || planned
+            .program
+            .insts
+            .iter()
+            .any(|instruction| WitnessOp::from_raw(instruction.op) == Some(WitnessOp::MultPush))
+    {
+        Err(InvocationShapeError::MultiplicityNeedsSemanticVersions)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -672,20 +688,6 @@ fn validate_program_roles(program: &WitnessProgram) -> Result<ProgramUse, Invoca
 
 fn dense(values: &BTreeSet<u32>, count: u32) -> bool {
     values.len() == count as usize && values.iter().copied().eq(0..count)
-}
-
-fn validate_module_globals(program: &WitnessProgram) -> Result<(), InvocationShapeError> {
-    for instruction in &program.insts {
-        if WitnessOp::from_raw(instruction.op) != Some(WitnessOp::DeduceCall) {
-            continue;
-        }
-        let kind = DeduceKind::from_raw(instruction.imm)
-            .ok_or(InvocationShapeError::InvalidProgramRole)?;
-        if kind != DeduceKind::BlakeG {
-            return Err(InvocationShapeError::UnsupportedModuleGlobals(kind));
-        }
-    }
-    Ok(())
 }
 
 fn validate_recorded_witness_abi() -> Result<(), InvocationShapeError> {

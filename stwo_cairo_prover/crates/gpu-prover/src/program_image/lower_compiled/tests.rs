@@ -106,7 +106,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         producer_prefix::map_scheduled_base_producers(&image, executable.arena(), &schedule)
             .unwrap();
     if stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
-        assert_eq!(linked.bound.len(), 8);
+        assert_eq!(linked.bound.len(), 9);
         assert_eq!(linked.missing, mapped.missing);
         let linked_native = linked.bound[7].native_ec_op().unwrap();
         assert_eq!(
@@ -147,10 +147,10 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         coefficients.logical,
         schedule.steps().len(),
     );
-    assert_eq!(mapped.bound.len(), 8);
+    assert_eq!(mapped.bound.len(), 9);
     assert_eq!(mapped.scheduled_producers, 23);
     assert_eq!(missing.position.ordinal as usize, mapped.bound.len());
-    assert_eq!(missing.producer.component, "partial_ec_mul_generic");
+    assert_eq!(missing.producer.component, "partial_ec_mul_window_bits_18");
     assert_eq!(
         missing.producer.part,
         Some(stwo_cairo_prover::witness::proof_shape::TracePartId::Main)
@@ -158,9 +158,11 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     assert_eq!(missing.producer.kind, WitnessProducerKind::Recorded);
     assert_eq!(
         missing.missing,
-        producer_prefix::MissingProducerAuthorityKind::MultiplicityTransition
+        producer_prefix::MissingProducerAuthorityKind::ModuleGlobalEffects(
+            DeduceKind::PartialEcMulW18
+        )
     );
-    assert_eq!(missing.position.ordinal, 8);
+    assert_eq!(missing.position.ordinal, 9);
     let scheduled = schedule
         .witness_levels()
         .iter()
@@ -209,6 +211,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         native_producer.producer.kind,
         WitnessProducerKind::NativeEcOp
     );
+    recorded_deduce_tests::assert_generated_partial_authority(executable, &image, &mapped);
     let bitwise = mapped
         .bound
         .iter()
@@ -600,6 +603,7 @@ fn loaded_authority_field_view_rejects_every_mutation() {
         cache_key: 3,
         kernel_symbol: "recorded_witness".into(),
         abi_schema_identity: AotKernelAbiSchema::RecordedWitnessV1.identity(),
+        deduce: recorded_deduce_authority::empty_for_test(),
         launch: LaunchGeometry {
             grid: [1, 1, 1],
             block: [256, 1, 1],
@@ -619,7 +623,7 @@ fn loaded_authority_field_view_rejects_every_mutation() {
         semantic_hash: invocation.semantic_hash,
         cache_key: invocation.cache_key,
         target_sm: 86,
-        source_identity: [5; 32],
+        source_identity: invocation.deduce.source_identity,
         cubin_identity: [6; 32],
         authority_identity: [7; 32],
     };
@@ -654,7 +658,7 @@ fn loaded_authority_field_view_rejects_every_mutation() {
     changed.target_sm = 89;
     mutations.push(changed);
     let mut changed = fields.clone();
-    changed.source_identity = [0; 32];
+    changed.source_identity[0] ^= 1;
     mutations.push(changed);
     let mut changed = fields.clone();
     changed.cubin_identity = [0; 32];
