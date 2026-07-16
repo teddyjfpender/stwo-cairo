@@ -1475,6 +1475,23 @@ impl ProtocolGeometry {
                 "resident backend and dynamic commitment leaf schedule must be selected together",
             ));
         }
+        let expected_commitment_order = [
+            CommitmentTreeId::Preprocessed,
+            CommitmentTreeId::Base,
+            CommitmentTreeId::Interaction,
+            CommitmentTreeId::Composition,
+        ];
+        if self
+            .commitments
+            .iter()
+            .map(|commitment| commitment.id)
+            .collect::<Vec<_>>()
+            != expected_commitment_order
+        {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "commitments are not the canonical four Starknet trees",
+            ));
+        }
         if self.lifting_log_size > self.max_domain_log_size {
             return Err(ArenaPlanError::InvalidProtocolGeometry(
                 "FRI lifting domain exceeds the maximal commitment domain",
@@ -1702,23 +1719,6 @@ impl ProtocolGeometry {
             &self.quotient.partial_numerator_log_sizes,
         )
         .map_err(ArenaPlanError::Quotient)?;
-        let expected_commitment_order = [
-            CommitmentTreeId::Preprocessed,
-            CommitmentTreeId::Base,
-            CommitmentTreeId::Interaction,
-            CommitmentTreeId::Composition,
-        ];
-        if self
-            .commitments
-            .iter()
-            .map(|commitment| commitment.id)
-            .collect::<Vec<_>>()
-            != expected_commitment_order
-        {
-            return Err(ArenaPlanError::InvalidProtocolGeometry(
-                "commitments are not the canonical four Starknet trees",
-            ));
-        }
         // Validated after the canonical-tree-order check so a missing
         // Preprocessed tree reports as the tree-shape error, not as an
         // identity-count mismatch.

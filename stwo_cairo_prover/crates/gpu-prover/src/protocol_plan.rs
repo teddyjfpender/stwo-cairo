@@ -2305,14 +2305,18 @@ mod tests {
         assert_eq!(one_word_short[0].retained_evaluation_groups, [false, false]);
 
         let mut direct_owned = one_word_short;
-        direct_owned[0].direct_composition_evaluation_groups = vec![false, true];
+        let mut direct = direct_plan(CommitmentTreeId::Preprocessed, 1, 0);
+        direct.columns[0].source = OpenedColumnSource::Preprocessed { ordinal: 2 };
+        direct.columns[0].lifetime =
+            crate::arena_plan::BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Composition)
+                .unwrap();
         let selected = select_retained_evaluation_groups(
             &mut direct_owned,
             &oods,
             DecommitStrategy::HybridByGroup,
             group_bytes,
             0,
-            None,
+            Some(&direct),
             QuotientNumeratorSourcePolicy::ReuseRetainedEvaluations,
         )
         .unwrap();
