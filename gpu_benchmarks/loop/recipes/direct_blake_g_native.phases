@@ -1,0 +1,150 @@
+# Cheapest strict hardware gate for the direct Blake-G witness/relation path.
+# Run on one Secure A40 with the pinned CUDA 11.8 image; an A40 pass promotes
+# the exact source projection to the later target-sm90 gate, not to a headline.
+
+DIRECT_TEST='backend::blake_witness::projected_relation::native_tests::direct_blake_g_native_matches_host_oracle_eager_and_replay'
+DIRECT_TARGET=/workspace/.cargo-target/stwo-nightly-2025-07-14-cuda118-sm86
+DIRECT_OBJ_CACHE=/workspace/.cuda_obj_cache/cuda118-sm86
+DIRECT_SOURCE="$STWO/crates/backend-cuda/src/backend/blake_witness/projected_relation_native_tests.rs"
+
+direct_blake_g_hardware_identity() {
+  set -euo pipefail
+  [[ "$(nvidia-smi -L | wc -l | tr -d ' ')" == 1 ]]
+  [[ "$(nvidia-smi --query-gpu=name --format=csv,noheader | xargs)" == 'NVIDIA A40' ]]
+  [[ "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | xargs)" == '8.6' ]]
+  [[ "$(nproc)" -ge 16 ]]
+  /usr/local/cuda/bin/nvcc --version | grep -F 'release 11.8'
+
+  {
+    date -u +'%Y-%m-%dT%H:%M:%SZ'
+    nvidia-smi \
+      --query-gpu=name,uuid,compute_cap,memory.total,driver_version,persistence_mode,ecc.mode.current,power.limit \
+      --format=csv,noheader
+    /usr/local/cuda/bin/nvcc --version
+    /usr/bin/c++ --version | head -1
+    rustc -Vv
+    cargo -V
+    printf 'stwo_head=%s\n' "$STWO_PARITY_REF_STWO_HEAD"
+    printf 'stwo_worktree_sha256=%s\n' "$STWO_PARITY_REF_STWO_WORKTREE_HASH"
+    printf 'stwo_cairo_head=%s\n' "$STWO_PARITY_REF_STWO_CAIRO_HEAD"
+    printf 'stwo_cairo_worktree_sha256=%s\n' "$STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH"
+    printf 'cuda_arch=sm_86\ncargo_target=%s\ncuda_obj_cache=%s\n' \
+      "$DIRECT_TARGET" "$DIRECT_OBJ_CACHE"
+  } | tee "$RUN/direct_blake_g_native.hardware.txt"
+}
+
+run_direct_blake_g_native() {
+  set -euo pipefail
+  cd "$STWO"
+
+  [[ "$STWO_PARITY_REF_STWO_HEAD" == \
+    1dad88f1c3a714ac26c8ad57812429ac58541909 ]]
+  printf '%s  %s\n' \
+    cd6729ddd9c3c502e0dd10d1bee3af57bf5e72264dccc724db8206f1779efecf \
+    "$DIRECT_SOURCE" | sha256sum -c -
+  printf '%s  %s\n' \
+    0680ca05f46f7b5f513bbce57646c57c57085f2f2fa35a8b5423e61f68fd3a23 \
+    "$STWO/Cargo.lock" | sha256sum -c -
+  printf '%s  %s\n' \
+    31abf43b41a5dd914e3adb98761f07eb8d67266bc5e71e7d3f91e48dd230a65f \
+    "$STWO/rust-toolchain.toml" | sha256sum -c -
+
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+    CUDA_VISIBLE_DEVICES=0 \
+    STWO_CUDA_NVCC=/usr/local/cuda/bin/nvcc \
+    STWO_CUDA_HOST_COMPILER=/usr/bin/c++ \
+    STWO_CUDA_ARCH=sm_86 \
+    STWO_CUDA_BUILD_JOBS=16 \
+    STWO_CUDA_NVCC_FLAGS= \
+    STWO_CUDA_OBJ_CACHE="$DIRECT_OBJ_CACHE" \
+    CARGO_TARGET_DIR="$DIRECT_TARGET" \
+    CARGO_BUILD_JOBS=16 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_TEST_DEBUG=0 \
+    cargo test --locked --release -p stwo-backend-cuda --lib \
+      "$DIRECT_TEST" -- --exact --nocapture --test-threads=1
+}
+
+validate_direct_blake_g_native() {
+  python3 - \
+    "$RUN/direct_blake_g_native.log" \
+    "$RUN/direct_blake_g_native.verdict.json" \
+    "$STWO" \
+    "$RUN/direct_blake_g_native.hardware.txt" <<'PY'
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+log_path, output_path, root_path, hardware_path = map(Path, sys.argv[1:])
+text = log_path.read_text(errors="replace")
+name = (
+    "backend::blake_witness::projected_relation::native_tests::"
+    "direct_blake_g_native_matches_host_oracle_eager_and_replay"
+)
+
+if text.count(f"test {name} ... ok") != 1:
+    raise SystemExit("exact native Blake-G test did not execute and pass once")
+if len(re.findall(
+    r"test result: ok\. 1 passed; 0 failed; 0 ignored; [^\n]+", text
+)) != 1:
+    raise SystemExit("native Blake-G summary is not exact 1/0/0")
+if "requires a native CUDA-linked backend" in text:
+    raise SystemExit("native Blake-G test was ignored")
+if "native Blake-G admission cannot run against CUDA stubs" in text:
+    raise SystemExit("native Blake-G test linked CUDA stubs")
+
+executables = re.findall(r"Running unittests src/lib\.rs \(([^)\n]+)\)", text)
+if len(executables) != 1:
+    raise SystemExit(f"cannot bind one test executable: {executables}")
+binary = Path(executables[0])
+if not binary.is_absolute():
+    binary = root_path / binary
+if not binary.is_file() or binary.is_symlink():
+    raise SystemExit(f"invalid test executable: {binary}")
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+record = {
+    "schema": "stwo.direct-blake-g-native-admission.v1",
+    "passed": True,
+    "gpu": "NVIDIA A40",
+    "cuda_arch": "sm_86",
+    "test": name,
+    "source": {
+        "stwo_head": os.environ["STWO_PARITY_REF_STWO_HEAD"],
+        "stwo_worktree_sha256": os.environ["STWO_PARITY_REF_STWO_WORKTREE_HASH"],
+        "stwo_cairo_head": os.environ["STWO_PARITY_REF_STWO_CAIRO_HEAD"],
+        "stwo_cairo_worktree_sha256": os.environ[
+            "STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH"
+        ],
+    },
+    "artifacts": {
+        "combined_log_sha256": digest(log_path),
+        "hardware_sha256": digest(hardware_path),
+        "test_binary": str(binary),
+        "test_binary_sha256": digest(binary),
+        "test_source_sha256": digest(
+            root_path
+            / "crates/backend-cuda/src/backend/blake_witness/"
+              "projected_relation_native_tests.rs"
+        ),
+        "cargo_lock_sha256": digest(root_path / "Cargo.lock"),
+        "rust_toolchain_sha256": digest(root_path / "rust-toolchain.toml"),
+    },
+}
+output_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+print(json.dumps({"direct_blake_g_native": "PASS", **record}, sort_keys=True))
+PY
+}
+
+phase direct_blake_g_hardware_identity direct_blake_g_hardware_identity
+phase direct_blake_g_native run_direct_blake_g_native
+phase direct_blake_g_validate validate_direct_blake_g_native
