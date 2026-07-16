@@ -59,8 +59,8 @@
 # starting the pod.
 # POD_RUN_POLL_INTERVAL controls phase-sentinel polling (default 30 seconds;
 # quick_sn2.sh uses 2 seconds so short gates do not add minutes of idle time).
-# POD_RUN_FINAL_ACTION is `stop` by default (warm disk retained) or `terminate`
-# for a one-shot lease whose attached disk must also be released.
+# The phases file must contain one strict `# pod_run: lease ...` provider
+# contract. Ambient lifecycle settings may not weaken that recipe-bound policy.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,16 +75,44 @@ POD_CARGO_HOME="${POD_CARGO_HOME:-/workspace/.cargo-persist}"
 POD_RUN_POLL_INTERVAL="${POD_RUN_POLL_INTERVAL:-30}"
 [[ "$POD_RUN_POLL_INTERVAL" =~ ^[1-9][0-9]*$ && "$POD_RUN_POLL_INTERVAL" -le 60 ]] \
   || { echo "POD_RUN_POLL_INTERVAL must be an integer from 1 to 60 seconds" >&2; exit 2; }
-POD_RUN_FINAL_ACTION="${POD_RUN_FINAL_ACTION:-stop}"
-case "$POD_RUN_FINAL_ACTION" in
-  stop|terminate) ;;
-  *) echo "POD_RUN_FINAL_ACTION must be stop or terminate" >&2; exit 2 ;;
-esac
 printf -v POD_RUSTUP_HOME_Q '%q' "$POD_RUSTUP_HOME"
 printf -v POD_CARGO_HOME_Q '%q' "$POD_CARGO_HOME"
 
 PHASES_FILE="${1:?usage: pod_run.sh <phases_file> [label]}"
 [[ -f "$PHASES_FILE" ]] || { echo "phases file not found: $PHASES_FILE" >&2; exit 2; }
+[[ -x "$FLEET_CTL" ]] \
+  || { echo "fleet lifecycle tool is absent or not executable: $FLEET_CTL" >&2; exit 2; }
+
+LEASE_ONE_SHOT="" LEASE_FINAL_ACTION="" LEASE_GPU="" LEASE_GPU_COUNT=""
+LEASE_MIN_VCPU="" LEASE_MIN_MEM_GB="" LEASE_MAX_USD_HR=""
+LEASE_NAME_PREFIX="" LEASE_TTL_HOURS="" LEASE_IDLE_MIN=""
+while IFS='=' read -r name value; do
+  case "$name" in
+    ONE_SHOT) LEASE_ONE_SHOT="$value" ;;
+    FINAL_ACTION) LEASE_FINAL_ACTION="$value" ;;
+    GPU) LEASE_GPU="$value" ;;
+    GPU_COUNT) LEASE_GPU_COUNT="$value" ;;
+    MIN_VCPU) LEASE_MIN_VCPU="$value" ;;
+    MIN_MEM_GB) LEASE_MIN_MEM_GB="$value" ;;
+    MAX_USD_HR) LEASE_MAX_USD_HR="$value" ;;
+    NAME_PREFIX) LEASE_NAME_PREFIX="$value" ;;
+    TTL_HOURS) LEASE_TTL_HOURS="$value" ;;
+    IDLE_MIN) LEASE_IDLE_MIN="$value" ;;
+    *) echo "unexpected lease-policy output: $name" >&2; exit 2 ;;
+  esac
+done < <("$FLEET_CTL" lease-policy --recipe "$PHASES_FILE") \
+  || { echo "invalid or missing recipe lease policy" >&2; exit 2; }
+for value in "$LEASE_ONE_SHOT" "$LEASE_FINAL_ACTION" "$LEASE_GPU" \
+  "$LEASE_GPU_COUNT" "$LEASE_MIN_VCPU" "$LEASE_MIN_MEM_GB" \
+  "$LEASE_MAX_USD_HR" "$LEASE_NAME_PREFIX" "$LEASE_TTL_HOURS" "$LEASE_IDLE_MIN"; do
+  [[ -n "$value" ]] || { echo "incomplete recipe lease policy" >&2; exit 2; }
+done
+if [[ -n "${POD_RUN_FINAL_ACTION:-}" &&
+      "$POD_RUN_FINAL_ACTION" != "$LEASE_FINAL_ACTION" ]]; then
+  echo "POD_RUN_FINAL_ACTION conflicts with the recipe lease policy" >&2
+  exit 2
+fi
+POD_RUN_FINAL_ACTION="$LEASE_FINAL_ACTION"
 LABEL="${2:-pod_run_$(date -u +%Y%m%dT%H%M%SZ)}"
 REQUIRE_CLEAN_SOURCES=0
 grep -Fqx '# pod_run: require_clean_sources' "$PHASES_FILE" && REQUIRE_CLEAN_SOURCES=1
@@ -93,8 +121,14 @@ grep -Fqx '# pod_run: require_clean_sources' "$PHASES_FILE" && REQUIRE_CLEAN_SOU
 POD_ID="${BENCH_POD_ID:-}"
 KEY=""
 if [[ -f "$POD_CONF" ]]; then
-  [[ -z "$POD_ID" ]] && POD_ID="$(sed -n 's/^POD_ID=//p' "$POD_CONF" | head -1)"
+  if [[ "$LEASE_ONE_SHOT" != 1 && -z "$POD_ID" ]]; then
+    POD_ID="$(sed -n 's/^POD_ID=//p' "$POD_CONF" | head -1)"
+  fi
   KEY="$(sed -n 's/^FALLBACK_KEY=//p' "$POD_CONF" | head -1)"
+fi
+if [[ "$LEASE_ONE_SHOT" == 1 && -z "$POD_ID" ]]; then
+  echo "one-shot recipes require an explicit BENCH_POD_ID" >&2
+  exit 2
 fi
 : "${POD_ID:?set POD_ID in pod.conf or BENCH_POD_ID=...}"
 KEY="${RUNPOD_SSH_KEY:-$KEY}"
@@ -129,8 +163,6 @@ valid_source_identity() {
 
 [[ -x "$SOURCE_PROJECTION_TOOL" ]] \
   || { echo "source projection tool is absent or not executable: $SOURCE_PROJECTION_TOOL" >&2; exit 2; }
-[[ -x "$FLEET_CTL" ]] \
-  || { echo "fleet lifecycle tool is absent or not executable: $FLEET_CTL" >&2; exit 2; }
 
 STWO_HEAD="$(source_head "$STWO_LOCAL")" \
   || { echo "cannot resolve stwo source head: $STWO_LOCAL" >&2; exit 2; }
@@ -166,6 +198,7 @@ note "label:  $LABEL"
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   note "DRY_RUN: pod=$POD_ID key=$KEY"
   note "DRY_RUN: RUSTUP_HOME=$POD_RUSTUP_HOME CARGO_HOME=$POD_CARGO_HOME"
+  note "DRY_RUN: lease gpu=$LEASE_GPU count=$LEASE_GPU_COUNT name_prefix=$LEASE_NAME_PREFIX max_usd_hr=$LEASE_MAX_USD_HR final_action=$POD_RUN_FINAL_ACTION"
   note "DRY_RUN: source stwo=${STWO_HEAD}:${STWO_WORKTREE_HASH} stwo-cairo=${CAIRO_HEAD}:${CAIRO_WORKTREE_HASH}"
   note "DRY_RUN: would bootstrap, stage and rsync exact source projections from $STWO_LOCAL and $CAIRO_LOCAL, install the pinned toolchain, run the phases above, fetch to $RESULTS_DIR/$LABEL, then confirm pod action=$POD_RUN_FINAL_ACTION."
   exit 0
@@ -173,8 +206,10 @@ fi
 
 POD_FINALIZE_ATTEMPTED=0
 POD_FINALIZE_RC=1
+POD_LIFECYCLE_OWNED=0
 PROJECTION_ROOT=""
 finalize_pod() {
+  [[ "$POD_LIFECYCLE_OWNED" == 1 ]] || return 0
   [[ "$POD_FINALIZE_ATTEMPTED" == 0 ]] || return "$POD_FINALIZE_RC"
   POD_FINALIZE_ATTEMPTED=1
   note "requesting and confirming pod action=$POD_RUN_FINAL_ACTION for $POD_ID"
@@ -197,15 +232,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Rebind admission immediately before billing can start. `up` also gates, but
-# this catches any source/input change made between provisioning and execution.
-note "confirming fresh source-bound local pregate"
-"$FLEET_CTL" require-pregate \
-  || { note "PREGATE STALE/FAILED — refusing to start or resume pod"; exit 1; }
+# --- 1. provider admission + guarded resume/adoption + endpoint resolution ---
+[[ -n "$KEY" && -f "$KEY" ]] \
+  || { note "RUNPOD SSH private key is missing: $KEY"; exit 1; }
+printf -v KEY_Q '%q' "$KEY"
+RESUME_ARGS=(
+  resume --pod "$POD_ID" --gpu "$LEASE_GPU"
+  --name-prefix "$LEASE_NAME_PREFIX"
+  --max-usd-hr "$LEASE_MAX_USD_HR"
+  --min-vcpu "$LEASE_MIN_VCPU" --min-mem-gb "$LEASE_MIN_MEM_GB"
+  --ttl-hours "$LEASE_TTL_HOURS" --idle-min "$LEASE_IDLE_MIN"
+  --failure-action "$POD_RUN_FINAL_ACTION"
+  --purpose "pod-run-$LABEL"
+)
+[[ "$LEASE_ONE_SHOT" == 1 ]] && RESUME_ARGS+=(--one-shot)
+note "admitting provider lease and installing deadman before proof work"
+RUNPOD_SSH_KEY="$KEY" "$FLEET_CTL" "${RESUME_ARGS[@]}" \
+  || { note "PROVIDER ADMISSION/RESUME FAILED"; exit 1; }
+POD_LIFECYCLE_OWNED=1
 
-# --- 1. start + resolve endpoint (new port on every resume) ---
-note "starting pod $POD_ID"
-runpodctl pod start "$POD_ID" 2>/dev/null || runpodctl start pod "$POD_ID" 2>/dev/null || true
 HOST=""; PORT=""
 for _ in $(seq 1 40); do
   info="$(runpodctl ssh info "$POD_ID" 2>/dev/null)"
@@ -242,7 +287,7 @@ note "stage content-hashed source projections"
 note "rsync stwo"
 rsync -azc --delete --partial --no-owner --no-group --perms --no-times \
   --exclude=target --exclude=.git \
-  -e "ssh ${SSH_OPTS[*]} -i $KEY -p $PORT" \
+  -e "ssh ${SSH_OPTS[*]} -i $KEY_Q -p $PORT" \
   "$PROJECTION_ROOT/stwo/" "root@${HOST}:${STWO_POD}/" \
   || { note "SYNC stwo FAILED"; exit 1; }
 note "rsync stwo-cairo"
@@ -250,7 +295,7 @@ rsync -azc --delete --partial --no-owner --no-group --perms --no-times \
   --exclude=target --exclude=.git \
   --exclude='gpu_benchmarks/pie/sn/' --exclude='gpu_benchmarks/pie/*.zip' \
   --exclude='gpu_benchmarks/loop/results' --exclude='gpu_benchmarks/loop/ledger.jsonl' \
-  -e "ssh ${SSH_OPTS[*]} -i $KEY -p $PORT" \
+  -e "ssh ${SSH_OPTS[*]} -i $KEY_Q -p $PORT" \
   "$PROJECTION_ROOT/stwo-cairo/" "root@${HOST}:${CAIRO_POD}/" \
   || { note "SYNC stwo-cairo FAILED"; exit 1; }
 

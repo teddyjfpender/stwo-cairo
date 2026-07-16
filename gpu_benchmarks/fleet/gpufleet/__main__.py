@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
 import secrets
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import (
@@ -34,8 +36,10 @@ from . import (
     VOLUME_MOUNT,
 )
 from . import api, ledger, pregate
+from . import podctl as pod_control
+from .lease_policy import LeasePolicy, load as load_lease_policy
 from .manifest import ManifestRun
-from .podctl import Endpoint, bootstrap, health_check, ssh_run, wait_ready
+from .podctl import Endpoint, bootstrap, deadman_script, health_check, ssh_run, wait_ready
 from .source_projection import projection_identity
 
 FLEET_DIR = Path(__file__).resolve().parent.parent
@@ -46,6 +50,9 @@ RESULTS = GPU_BENCH / "results"
 REPOS = {"stwo": STWO, "stwo-cairo": STWO_CAIRO}
 POD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 LEASE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")
+CREATE_RECONCILE_DISCOVERY_S = 60.0
+CREATE_RECONCILE_TIMEOUT_S = 90.0
+CREATE_RECONCILE_POLL_S = 2.0
 
 
 def _gpu_type(short: str) -> str:
@@ -66,6 +73,12 @@ def cmd_require_pregate(_args) -> int:
 
 def cmd_source_hash(args) -> int:
     print(projection_identity(Path(args.repo))["worktree_sha256"])
+    return 0
+
+
+def cmd_lease_policy(args) -> int:
+    for line in load_lease_policy(Path(args.recipe)).env_lines():
+        print(line)
     return 0
 
 
@@ -128,6 +141,50 @@ def _require_pregate() -> bool:
     return False
 
 
+def _bind_explicit_ssh_key() -> None:
+    configured = os.environ.get("RUNPOD_SSH_KEY", "").strip()
+    if not configured:
+        return
+    candidate = Path(configured).expanduser()
+    if candidate.is_symlink():
+        raise ValueError("RUNPOD_SSH_KEY must name one regular private-key file")
+    key = candidate.resolve(strict=True)
+    if not key.is_file():
+        raise ValueError("RUNPOD_SSH_KEY must name one regular private-key file")
+    existing = iter(pod_control.SSH_OPTS)
+    without_identity = []
+    for option in existing:
+        if option == "-i":
+            next(existing, None)
+        else:
+            without_identity.append(option)
+    pod_control.SSH_OPTS = ["-i", str(key), *without_identity]
+
+
+def _install_deadman_first(
+    ep: Endpoint,
+    *,
+    ttl_hours: float,
+    idle_min: int,
+    log_file: Path,
+) -> None:
+    if ssh_run(
+        ep,
+        deadman_script(ttl_hours, idle_min),
+        timeout=60,
+        log_file=log_file,
+    ):
+        raise RuntimeError("deadman installation failed")
+    if ssh_run(
+        ep,
+        "test -s /var/run/gpufleet-deadman.pid && "
+        "kill -0 \"$(cat /var/run/gpufleet-deadman.pid)\"",
+        timeout=20,
+        log_file=log_file,
+    ):
+        raise RuntimeError("deadman liveness check failed")
+
+
 def _lease_name(args) -> str:
     if args.name:
         name = args.name
@@ -139,32 +196,79 @@ def _lease_name(args) -> str:
     return name
 
 
-def _validate_created_pod(pod: api.PodInfo, name: str, offer: dict, args) -> None:
+def _apply_recipe_lease(args) -> LeasePolicy | None:
+    if not getattr(args, "recipe", None):
+        if not args.gpu:
+            raise ValueError("--gpu is required when --recipe is absent")
+        return None
+    policy = load_lease_policy(Path(args.recipe))
+    if args.gpu and _gpu_type(args.gpu) != _gpu_type(policy.gpu):
+        raise ValueError("--gpu conflicts with the recipe lease policy")
+    args.gpu = policy.gpu
+    args.min_vcpu = policy.min_vcpu
+    args.min_mem_gb = policy.min_mem_gb
+    args.max_usd_hr = policy.max_usd_hr
+    args.ttl_hours = policy.ttl_hours
+    args.idle_min = policy.idle_min
+    if args.name is None:
+        args.name = f"{policy.name_prefix}{secrets.token_hex(4)}"
+    if not args.name.startswith(policy.name_prefix):
+        raise ValueError("--name does not match the recipe lease prefix")
+    if policy.one_shot and args.volume_id:
+        raise ValueError("one-shot leases cannot attach a persistent network volume")
+    return policy
+
+
+def _validate_pod_admission(
+    pod: api.PodInfo,
+    *,
+    expected_gpu: str,
+    max_usd_hr: float,
+    min_vcpu: int,
+    min_mem_gb: int,
+    exact_name: str | None = None,
+    name_prefix: str | None = None,
+) -> None:
     if not POD_ID_RE.fullmatch(pod.id):
-        raise RuntimeError(f"created pod returned an unsafe id: {pod.id!r}")
-    if pod.name != name:
-        raise RuntimeError(f"created pod name mismatch: {pod.name!r} != {name!r}")
-    if pod.gpu != offer["display_name"]:
+        raise RuntimeError(f"pod returned an unsafe id: {pod.id!r}")
+    if exact_name is not None and pod.name != exact_name:
+        raise RuntimeError(f"pod name mismatch: {pod.name!r} != {exact_name!r}")
+    if name_prefix is not None and not pod.name.startswith(name_prefix):
         raise RuntimeError(
-            f"created GPU mismatch: {pod.gpu!r} != {offer['display_name']!r}"
+            f"pod name {pod.name!r} does not start with {name_prefix!r}"
         )
+    if pod.gpu != expected_gpu:
+        raise RuntimeError(f"pod GPU mismatch: {pod.gpu!r} != {expected_gpu!r}")
     gpu_count = pod.raw.get("gpuCount")
     if isinstance(gpu_count, bool) or gpu_count != 1:
-        raise RuntimeError(f"created pod GPU count mismatch: {gpu_count!r}")
-    if pod.vcpu < args.min_vcpu or pod.mem_gb < args.min_mem_gb:
+        raise RuntimeError(f"pod GPU count mismatch: {gpu_count!r}")
+    if pod.vcpu < min_vcpu or pod.mem_gb < min_mem_gb:
         raise RuntimeError(
-            "created pod resource floor mismatch: "
-            f"vcpu={pod.vcpu}/{args.min_vcpu}, memory_gb={pod.mem_gb}/{args.min_mem_gb}"
+            "pod resource floor mismatch: "
+            f"vcpu={pod.vcpu}/{min_vcpu}, memory_gb={pod.mem_gb}/{min_mem_gb}"
         )
     if (
-        not math.isfinite(pod.cost_per_hr)
+        not math.isfinite(max_usd_hr)
+        or max_usd_hr <= 0
+        or not math.isfinite(pod.cost_per_hr)
         or pod.cost_per_hr <= 0
-        or pod.cost_per_hr > args.max_usd_hr
+        or pod.cost_per_hr > max_usd_hr
     ):
         raise RuntimeError(
-            f"created pod rate ${pod.cost_per_hr}/hr exceeds or invalidates "
-            f"the ${args.max_usd_hr:.2f}/hr ceiling"
+            f"pod rate ${pod.cost_per_hr}/hr exceeds or invalidates "
+            f"the ${max_usd_hr:.2f}/hr ceiling"
         )
+
+
+def _validate_created_pod(pod: api.PodInfo, name: str, offer: dict, args) -> None:
+    _validate_pod_admission(
+        pod,
+        expected_gpu=offer["display_name"],
+        max_usd_hr=args.max_usd_hr,
+        min_vcpu=args.min_vcpu,
+        min_mem_gb=args.min_mem_gb,
+        exact_name=name,
+    )
 
 
 def _require_unique_account_pod(name: str, pod_id: str) -> None:
@@ -174,47 +278,208 @@ def _require_unique_account_pod(name: str, pod_id: str) -> None:
         raise RuntimeError(f"lease name {name!r} resolved to unexpected pods: {ids}")
 
 
-def _cleanup_failed_up(name: str, returned: api.PodInfo | None) -> None:
-    candidates = {returned.id: returned} if returned else {}
-    try:
-        for pod in api.list_pods():
-            if pod.name == name:
-                candidates[pod.id] = pod
-    except Exception as error:
-        # The returned id can still be cleaned up, but an ambiguous create must
-        # never be called reconciled without the account-wide name observation.
-        for pod in candidates.values():
-            try:
-                api.terminate_pod(pod.id)
-            except Exception:
-                pass
-        raise RuntimeError(f"cannot reconcile failed lease {name!r}: {error}") from error
+def _prepare_existing_pod(args) -> tuple[api.PodInfo, Endpoint]:
+    """Admit, resume/adopt, and guard one exact existing pod before work."""
+    if not args.gpu or not args.name_prefix:
+        raise ValueError("existing-pod admission requires --gpu and --name-prefix")
+    if not LEASE_NAME_RE.fullmatch(args.name_prefix.rstrip("-")):
+        raise ValueError("--name-prefix must be a safe nonempty lease prefix")
+    if (
+        not math.isfinite(args.ttl_hours)
+        or args.ttl_hours <= 0
+        or args.idle_min <= 0
+        or not math.isfinite(args.ready_timeout)
+        or args.ready_timeout <= 0
+        or args.min_vcpu <= 0
+        or args.min_mem_gb <= 0
+        or not math.isfinite(args.max_usd_hr)
+        or args.max_usd_hr <= 0
+    ):
+        raise ValueError("pod admission limits must be finite and positive")
+    _bind_explicit_ssh_key()
+    if not _require_pregate():
+        raise RuntimeError("fresh pregate required before pod resume or adoption")
+    gpu_type = _gpu_type(args.gpu)
+    offer = api.secure_offer(gpu_type)
+    if offer["usd_hr"] > args.max_usd_hr:
+        raise RuntimeError(
+            f"current Secure price ${offer['usd_hr']:.2f}/hr exceeds "
+            f"the ${args.max_usd_hr:.2f}/hr ceiling"
+        )
+    pod = api.get_pod(args.pod)
+    if pod is None:
+        raise RuntimeError(f"no such pod: {args.pod}")
+    if pod.id != args.pod:
+        raise RuntimeError(f"pod lookup returned {pod.id!r} for {args.pod!r}")
+    _validate_pod_admission(
+        pod,
+        expected_gpu=offer["display_name"],
+        max_usd_hr=args.max_usd_hr,
+        min_vcpu=args.min_vcpu,
+        min_mem_gb=args.min_mem_gb,
+        name_prefix=args.name_prefix,
+    )
+    if pod.status not in {"EXITED", "RUNNING"}:
+        raise RuntimeError(f"pod {pod.id} is not resumable: {pod.status}")
+    if args.one_shot and pod.status != "RUNNING":
+        raise RuntimeError("one-shot leases cannot reuse an exited pod")
+    if args.one_shot and args.failure_action != "terminate":
+        raise ValueError("one-shot admission requires --failure-action terminate")
 
-    failures = []
-    for pod in candidates.values():
+    admitted_pod = pod
+    billing_possible = True
+    try:
+        if admitted_pod.status == "EXITED":
+            print(f"[gpufleet] resuming admitted pod {admitted_pod.id} ...")
+            api.resume_pod(admitted_pod.id)
+            ledger.append(
+                "resume",
+                pod_id=admitted_pod.id,
+                gpu=admitted_pod.gpu,
+                usd_hr=admitted_pod.cost_per_hr,
+                purpose=args.purpose,
+            )
+        pod = wait_ready(admitted_pod.id, timeout_s=args.ready_timeout)
+        if pod.id != admitted_pod.id:
+            raise RuntimeError(
+                f"ready pod id changed: {pod.id!r} != {admitted_pod.id!r}"
+            )
+        _validate_pod_admission(
+            pod,
+            expected_gpu=offer["display_name"],
+            max_usd_hr=args.max_usd_hr,
+            min_vcpu=args.min_vcpu,
+            min_mem_gb=args.min_mem_gb,
+            name_prefix=args.name_prefix,
+        )
+        if pod.status != "RUNNING":
+            raise RuntimeError(f"ready pod {pod.id} is not running: {pod.status}")
+        ep = Endpoint.of(pod)
+        log_file = RESULTS / "bootstrap" / f"{pod.id}.log"
+        _install_deadman_first(
+            ep,
+            ttl_hours=args.ttl_hours,
+            idle_min=args.idle_min,
+            log_file=log_file,
+        )
+        if not bootstrap(
+            ep,
+            ttl_hours=args.ttl_hours,
+            idle_min=args.idle_min,
+            log_file=log_file,
+        ):
+            raise RuntimeError("bootstrap or deadman reinstall failed")
+        if not pregate.is_fresh(STWO, STWO_CAIRO):
+            raise RuntimeError("source-bound pregate changed during pod admission")
+        _sync_pods_conf()
+        return pod, ep
+    except BaseException as error:
+        if billing_possible:
+            try:
+                if args.failure_action == "terminate":
+                    api.terminate_pod(admitted_pod.id)
+                    ledger.append(
+                        "terminate",
+                        pod_id=admitted_pod.id,
+                        gpu=admitted_pod.gpu,
+                        note="admission-failure",
+                    )
+                    print("[gpufleet] failed admission termination confirmed")
+                else:
+                    terminal = api.stop_pod(admitted_pod.id)
+                    ledger.append(
+                        "stop",
+                        pod_id=admitted_pod.id,
+                        gpu=admitted_pod.gpu,
+                        note="admission-failure",
+                    )
+                    print(f"[gpufleet] failed admission stop confirmed ({terminal})")
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    f"URGENT: pod {admitted_pod.id} admission failed and "
+                    f"{args.failure_action} was not confirmed: "
+                    f"{cleanup_error}"
+                ) from error
+        raise
+
+
+def _cleanup_failed_up(name: str, returned: api.PodInfo | None) -> None:
+    """Terminate every exact-name candidate until absence has stayed stable."""
+    started = time.monotonic()
+    discovery_deadline = started + CREATE_RECONCILE_DISCOVERY_S
+    deadline = started + CREATE_RECONCILE_TIMEOUT_S
+    observed_create = returned is not None
+    pending = {returned.id: returned} if returned else {}
+    clean_polls = 0
+    last_error = None
+    while True:
+        now = time.monotonic()
+        observed_this_poll = False
         try:
-            api.terminate_pod(pod.id)
-            ledger.append("terminate", pod_id=pod.id, gpu=pod.gpu, note="up-failure")
+            matches = [pod for pod in api.list_pods() if pod.name == name]
+            last_error = None
+            if matches:
+                observed_create = True
+                observed_this_poll = True
+                pending.update((pod.id, pod) for pod in matches)
         except Exception as error:
-            failures.append(f"{pod.id}: {error}")
-    if failures:
-        raise RuntimeError("failed lease cleanup: " + "; ".join(failures))
-    remaining = [pod.id for pod in api.list_pods() if pod.name == name]
-    if remaining:
-        raise RuntimeError(f"failed lease still present: {','.join(remaining)}")
+            matches = []
+            last_error = error
+
+        attempted = bool(pending)
+        for candidate_id, candidate in list(pending.items()):
+            try:
+                api.terminate_pod(candidate_id)
+                ledger.append(
+                    "terminate",
+                    pod_id=candidate_id,
+                    gpu=candidate.gpu,
+                    note="up-failure",
+                )
+                del pending[candidate_id]
+            except Exception as error:
+                last_error = error
+
+        clean = (
+            last_error is None
+            and not observed_this_poll
+            and not attempted
+            and not matches
+            and not pending
+        )
+        eligible_clean = observed_create or now >= discovery_deadline
+        clean_polls = clean_polls + 1 if clean and eligible_clean else 0
+        if clean_polls >= 2:
+            return
+        if now >= deadline:
+            detail = f": {last_error}" if last_error else ""
+            raise RuntimeError(f"lease absence did not converge for {name!r}{detail}")
+        time.sleep(min(CREATE_RECONCILE_POLL_S, max(0.0, deadline - now)))
 
 
 def do_up(args) -> api.PodInfo | None:
-    if not _require_pregate():
-        return None
     if args.cloud != "SECURE":
         print("REFUSED: bounded gpufleet provisioning requires Secure Cloud")
+        return None
+    _apply_recipe_lease(args)
+    _bind_explicit_ssh_key()
+    if (
+        not math.isfinite(args.ttl_hours)
+        or args.ttl_hours <= 0
+        or args.idle_min <= 0
+        or not math.isfinite(args.ready_timeout)
+        or args.ready_timeout <= 0
+        or args.min_vcpu <= 0
+        or args.min_mem_gb <= 0
+        or not math.isfinite(args.max_usd_hr)
+        or args.max_usd_hr <= 0
+    ):
+        raise ValueError("pod provisioning limits must be finite and positive")
+    if not _require_pregate():
         return None
     gpu_type = _gpu_type(args.gpu)
     offer = api.secure_offer(gpu_type)
     price = offer["usd_hr"]
-    if not math.isfinite(args.max_usd_hr) or args.max_usd_hr <= 0:
-        raise ValueError("--max-usd-hr must be finite and positive")
     if price > args.max_usd_hr:
         print(f"REFUSED: {gpu_type} at ${price:.2f}/hr exceeds ceiling "
               f"${args.max_usd_hr:.2f}/hr")
@@ -224,9 +489,9 @@ def do_up(args) -> api.PodInfo | None:
         raise RuntimeError(f"refusing duplicate lease name already in account: {name}")
     print(f"[gpufleet] creating {gpu_type} (~${price:.2f}/hr, ttl {args.ttl_hours}h, "
           f"idle-stop {args.idle_min}min)")
-    pod = None
+    created_pod = None
     try:
-        pod = api.create_pod(
+        created_pod = api.create_pod(
             name=name,
             gpu_type_id=gpu_type,
             image=args.image,
@@ -238,23 +503,39 @@ def do_up(args) -> api.PodInfo | None:
             min_mem_gb=args.min_mem_gb,
             network_volume_id=args.volume_id,
         )
-        _validate_created_pod(pod, name, offer, args)
-        _require_unique_account_pod(name, pod.id)
+        _validate_created_pod(created_pod, name, offer, args)
+        _require_unique_account_pod(name, created_pod.id)
         ledger.append(
-            "create", pod_id=pod.id, gpu=pod.gpu, usd_hr=pod.cost_per_hr,
+            "create",
+            pod_id=created_pod.id,
+            gpu=created_pod.gpu,
+            usd_hr=created_pod.cost_per_hr,
             purpose=args.purpose,
         )
-        print(f"[gpufleet] pod {pod.id} created; waiting for ssh ...")
-        pod = wait_ready(pod.id, timeout_s=args.ready_timeout)
+        print(f"[gpufleet] pod {created_pod.id} created; waiting for ssh ...")
+        pod = wait_ready(created_pod.id, timeout_s=args.ready_timeout)
+        if pod.id != created_pod.id:
+            raise RuntimeError(
+                f"ready pod id changed: {pod.id!r} != {created_pod.id!r}"
+            )
         _validate_created_pod(pod, name, offer, args)
+        if pod.status != "RUNNING":
+            raise RuntimeError(f"ready pod {pod.id} is not running: {pod.status}")
         _require_unique_account_pod(name, pod.id)
         ep = Endpoint.of(pod)
         print(f"[gpufleet] ssh ready at {ep.host}:{ep.port}; bootstrapping ...")
+        log_file = RESULTS / "bootstrap" / f"{pod.id}.log"
+        _install_deadman_first(
+            ep,
+            ttl_hours=args.ttl_hours,
+            idle_min=args.idle_min,
+            log_file=log_file,
+        )
         if not bootstrap(
             ep,
             ttl_hours=args.ttl_hours,
             idle_min=args.idle_min,
-            log_file=RESULTS / "bootstrap" / f"{pod.id}.log",
+            log_file=log_file,
         ):
             raise RuntimeError("bootstrap failed")
         for key, value in health_check(ep).items():
@@ -264,7 +545,7 @@ def do_up(args) -> api.PodInfo | None:
         return pod
     except BaseException as error:
         try:
-            _cleanup_failed_up(name, pod)
+            _cleanup_failed_up(name, created_pod)
         except Exception as cleanup_error:
             raise RuntimeError(
                 f"URGENT: failed provisioning cleanup for {name!r}: {cleanup_error}"
@@ -292,6 +573,8 @@ def cmd_bootstrap(args) -> int:
 
 
 def cmd_push(args) -> int:
+    if not _require_pregate():
+        return 1
     pod, _ep = _resolve_pod(args.pod)
     # build_and_push.sh drives itself from pods.conf (first line = builder unless
     # --builder): refresh the roster from the live API, then delegate.
@@ -303,23 +586,17 @@ def cmd_push(args) -> int:
 
 
 def cmd_run(args) -> int:
+    if args.keep and (args.terminate or args.one_shot):
+        raise ValueError("--keep conflicts with --terminate and --one-shot")
+    if args.one_shot and args.failure_action != "terminate":
+        raise ValueError("--one-shot requires --failure-action terminate")
     if not _require_pregate():
         return 1
     pod = None
     run_completed = False
     try:
         if args.pod:
-            pod, ep = _resolve_pod(args.pod)
-            if pod.status != "RUNNING":
-                print(f"[gpufleet] resuming {pod.id} ...")
-                api.resume_pod(pod.id)
-                ledger.append(
-                    "resume", pod_id=pod.id, gpu=pod.gpu,
-                    usd_hr=pod.cost_per_hr, purpose=args.purpose,
-                )
-                pod = wait_ready(pod.id)
-                ep = Endpoint.of(pod)
-            _sync_pods_conf()
+            pod, ep = _prepare_existing_pod(args)
         elif args.auto:
             up_args = argparse.Namespace(
                 gpu=args.auto, name=None, image=DEFAULT_IMAGE, cloud="SECURE",
@@ -327,7 +604,7 @@ def cmd_run(args) -> int:
                 volume_id=None, min_vcpu=16, min_mem_gb=62,
                 max_usd_hr=args.max_usd_hr, ttl_hours=args.ttl_hours,
                 idle_min=DEFAULT_IDLE_STOP_MIN, ready_timeout=600,
-                purpose=args.purpose,
+                purpose=args.purpose, recipe=None,
             )
             pod = do_up(up_args)
             if not pod:
@@ -363,7 +640,7 @@ def cmd_run(args) -> int:
         # or execution exception still ends billing through a confirmed action.
         if pod is not None and args.keep and run_completed:
             print(f"[gpufleet] --keep: pod {pod.id} left RUNNING (billing!)")
-        elif pod is not None and args.terminate:
+        elif pod is not None and (args.terminate or args.one_shot):
             api.terminate_pod(pod.id)
             ledger.append("terminate", pod_id=pod.id, gpu=pod.gpu)
             print(f"[gpufleet] pod {pod.id} termination confirmed")
@@ -371,6 +648,12 @@ def cmd_run(args) -> int:
             terminal = api.stop_pod(pod.id)
             ledger.append("stop", pod_id=pod.id, gpu=pod.gpu)
             print(f"[gpufleet] pod {pod.id} stop confirmed ({terminal})")
+
+
+def cmd_resume(args) -> int:
+    pod, ep = _prepare_existing_pod(args)
+    print(f"resume: {pod.id} ({pod.gpu}, guarded at {ep.host}:{ep.port})")
+    return 0
 
 
 def cmd_ssh(args) -> int:
@@ -422,9 +705,6 @@ def _lifecycle(args, action: str) -> int:
                    if action != "stop" or p.status == "RUNNING"]
     elif args.pod:
         pod = api.get_pod(args.pod)
-        if pod is None and action == "resume":
-            print("nothing to do")
-            return 0
         targets = [pod] if pod else []
         # An explicit destructive action must prove the requested id terminal,
         # even when the first read says it is already absent.
@@ -446,17 +726,13 @@ def _lifecycle(args, action: str) -> int:
         try:
             if action == "stop":
                 terminal = api.stop_pod(p.id)
-            elif action == "resume":
-                api.resume_pod(p.id)
             else:
                 api.terminate_pod(p.id)
             ledger.append(action, pod_id=p.id, gpu=p.gpu, usd_hr=p.cost_per_hr)
             if action == "stop":
                 suffix = f", {terminal.lower()} confirmed"
-            elif action == "terminate":
-                suffix = ", absence confirmed"
             else:
-                suffix = ""
+                suffix = ", absence confirmed"
             print(f"{action}: {p.id} ({p.gpu}{suffix})")
         except Exception as error:
             failures.append(f"{p.id}: {error}")
@@ -479,8 +755,12 @@ def main() -> int:
     p = sub.add_parser("source-hash", help=argparse.SUPPRESS)
     p.add_argument("--repo", required=True)
 
+    p = sub.add_parser("lease-policy", help=argparse.SUPPRESS)
+    p.add_argument("--recipe", required=True)
+
     p = sub.add_parser("up")
-    p.add_argument("--gpu", required=True)
+    p.add_argument("--gpu")
+    p.add_argument("--recipe")
     p.add_argument("--name")
     p.add_argument("--image", default=DEFAULT_IMAGE)
     p.add_argument("--cloud", default="SECURE", choices=["SECURE"])
@@ -512,6 +792,14 @@ def main() -> int:
     p.add_argument("--terminate", action="store_true", help="terminate (not stop) after")
     p.add_argument("--max-usd-hr", type=float, default=DEFAULT_MAX_USD_HR)
     p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_HOURS)
+    p.add_argument("--idle-min", type=int, default=DEFAULT_IDLE_STOP_MIN)
+    p.add_argument("--ready-timeout", type=float, default=600)
+    p.add_argument("--gpu", help="exact expected GPU type for --pod")
+    p.add_argument("--name-prefix", help="exact admitted lease-name prefix for --pod")
+    p.add_argument("--min-vcpu", type=int, default=16)
+    p.add_argument("--min-mem-gb", type=int, default=62)
+    p.add_argument("--one-shot", action="store_true")
+    p.add_argument("--failure-action", choices=["stop", "terminate"], default="stop")
     p.add_argument("--purpose", default="")
 
     p = sub.add_parser("ssh")
@@ -521,7 +809,21 @@ def main() -> int:
     p = sub.add_parser("check-manifest")
     p.add_argument("manifest")
 
-    for name in ("stop", "resume", "terminate"):
+    p = sub.add_parser("resume")
+    p.add_argument("--pod", required=True)
+    p.add_argument("--gpu", required=True)
+    p.add_argument("--name-prefix", required=True)
+    p.add_argument("--max-usd-hr", type=float, required=True)
+    p.add_argument("--min-vcpu", type=int, default=16)
+    p.add_argument("--min-mem-gb", type=int, default=62)
+    p.add_argument("--ttl-hours", type=float, default=DEFAULT_TTL_HOURS)
+    p.add_argument("--idle-min", type=int, default=DEFAULT_IDLE_STOP_MIN)
+    p.add_argument("--ready-timeout", type=float, default=600)
+    p.add_argument("--one-shot", action="store_true")
+    p.add_argument("--failure-action", choices=["stop", "terminate"], default="stop")
+    p.add_argument("--purpose", default="")
+
+    for name in ("stop", "terminate"):
         p = sub.add_parser(name)
         p.add_argument("--pod")
         p.add_argument("--all", action="store_true")
@@ -534,6 +836,7 @@ def main() -> int:
         "status": cmd_status,
         "ledger": lambda _a: (print(ledger.report()), 0)[1],
         "source-hash": cmd_source_hash,
+        "lease-policy": cmd_lease_policy,
         "up": cmd_up,
         "bootstrap": cmd_bootstrap,
         "push": cmd_push,
@@ -541,7 +844,7 @@ def main() -> int:
         "ssh": cmd_ssh,
         "check-manifest": cmd_check_manifest,
         "stop": lambda a: _lifecycle(a, "stop"),
-        "resume": lambda a: _lifecycle(a, "resume"),
+        "resume": cmd_resume,
         "terminate": lambda a: _lifecycle(a, "terminate"),
     }[args.cmd](args)
 

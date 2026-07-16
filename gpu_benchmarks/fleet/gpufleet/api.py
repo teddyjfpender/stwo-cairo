@@ -338,7 +338,10 @@ def resume_pod(pod_id: str) -> str:
         {"id": pod_id},
         retries=1,
     )
-    return (data.get("podResume") or {}).get("desiredStatus", "?")
+    result = data.get("podResume") or {}
+    if result.get("id") != pod_id:
+        raise ApiError(f"resume returned the wrong pod: {result!r}")
+    return result.get("desiredStatus", "?")
 
 
 def terminate_pod(

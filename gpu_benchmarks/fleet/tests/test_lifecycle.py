@@ -52,6 +52,7 @@ def up_args(**changes) -> argparse.Namespace:
         "idle_min": 15,
         "ready_timeout": 600,
         "purpose": "test",
+        "recipe": None,
     }
     values.update(changes)
     return argparse.Namespace(**values)
@@ -168,13 +169,12 @@ class FleetCliTests(unittest.TestCase):
             )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
-    def test_pod_run_rechecks_pregate_after_trap_and_before_start(self) -> None:
+    def test_pod_run_uses_guarded_resume_after_trap(self) -> None:
         script = (FLEET_DIR.parent / "loop/pod_run.sh").read_text()
         trap = script.index("trap cleanup EXIT")
-        gate = script.index('"$FLEET_CTL" require-pregate')
-        start = script.index('runpodctl pod start "$POD_ID"')
-        self.assertLess(trap, gate)
-        self.assertLess(gate, start)
+        resume = script.index('"$FLEET_CTL" "${RESUME_ARGS[@]}"')
+        self.assertLess(trap, resume)
+        self.assertNotIn('runpodctl pod start "$POD_ID"', script)
 
     def test_created_pod_validation_covers_shape_and_cost(self) -> None:
         args = up_args()
@@ -206,17 +206,19 @@ class FleetCliTests(unittest.TestCase):
             self.assertIsNone(cli.do_up(up_args()))
         offer.assert_not_called()
 
+    def test_invalid_price_ceiling_blocks_up_before_pregate(self) -> None:
+        with mock.patch.object(cli, "_require_pregate") as gate:
+            with self.assertRaises(ValueError):
+                cli.do_up(up_args(max_usd_hr=math.nan))
+        gate.assert_not_called()
+
     def test_failed_pregate_blocks_run_before_pod_read(self) -> None:
-        args = argparse.Namespace(
-            pod="pod-test", auto=None, push=False, keep=False, terminate=False,
-            max_usd_hr=0.5, ttl_hours=1.5, purpose="test", manifest="test.toml",
-        )
         with (
             mock.patch.object(cli, "_require_pregate", return_value=False),
-            mock.patch.object(cli, "_resolve_pod") as resolve,
+            mock.patch.object(cli, "_prepare_existing_pod") as prepare,
         ):
-            self.assertEqual(cli.cmd_run(args), 1)
-        resolve.assert_not_called()
+            self.assertEqual(cli.cmd_run(self._run_args()), 1)
+        prepare.assert_not_called()
 
     def test_duplicate_name_blocks_create(self) -> None:
         existing = pod()
@@ -245,13 +247,14 @@ class FleetCliTests(unittest.TestCase):
             mock.patch.object(cli.api, "list_pods", side_effect=lists),
             mock.patch.object(cli.api, "create_pod", return_value=created),
             mock.patch.object(cli, "wait_ready", return_value=created),
+            mock.patch.object(cli, "_install_deadman_first"),
             mock.patch.object(cli, "bootstrap", return_value=False),
-            mock.patch.object(cli.api, "terminate_pod") as terminate,
+            mock.patch.object(cli, "_cleanup_failed_up") as cleanup,
             mock.patch.object(cli.ledger, "append"),
         ):
             with self.assertRaisesRegex(RuntimeError, "bootstrap failed"):
                 cli.do_up(up_args())
-        terminate.assert_called_once_with(created.id)
+        cleanup.assert_called_once_with(created.name, created)
 
     def test_ambiguous_create_is_reconciled_by_exact_name(self) -> None:
         accepted = pod()
@@ -264,12 +267,12 @@ class FleetCliTests(unittest.TestCase):
             ),
             mock.patch.object(cli.api, "list_pods", side_effect=lists),
             mock.patch.object(cli.api, "create_pod", side_effect=api.ApiError("timeout")),
-            mock.patch.object(cli.api, "terminate_pod") as terminate,
+            mock.patch.object(cli, "_cleanup_failed_up") as cleanup,
             mock.patch.object(cli.ledger, "append"),
         ):
             with self.assertRaisesRegex(api.ApiError, "timeout"):
                 cli.do_up(up_args())
-        terminate.assert_called_once_with(accepted.id)
+        cleanup.assert_called_once_with(accepted.name, None)
 
     def test_interrupted_wait_still_terminates_returned_pod(self) -> None:
         created = pod()
@@ -283,17 +286,40 @@ class FleetCliTests(unittest.TestCase):
             mock.patch.object(cli.api, "list_pods", side_effect=lists),
             mock.patch.object(cli.api, "create_pod", return_value=created),
             mock.patch.object(cli, "wait_ready", side_effect=KeyboardInterrupt),
-            mock.patch.object(cli.api, "terminate_pod") as terminate,
+            mock.patch.object(cli, "_cleanup_failed_up") as cleanup,
             mock.patch.object(cli.ledger, "append"),
         ):
             with self.assertRaises(KeyboardInterrupt):
                 cli.do_up(up_args())
-        terminate.assert_called_once_with(created.id)
+        cleanup.assert_called_once_with(created.name, created)
+
+    def test_wrong_ready_id_rejects_and_cleans_the_created_pod(self) -> None:
+        created = pod()
+        wrong = replace(created, id="other-pod")
+        lists = [[], [created], [wrong]]
+        with (
+            mock.patch.object(cli, "_require_pregate", return_value=True),
+            mock.patch.object(
+                cli.api, "secure_offer",
+                return_value={"display_name": created.gpu, "usd_hr": 0.44},
+            ),
+            mock.patch.object(cli.api, "list_pods", side_effect=lists),
+            mock.patch.object(cli.api, "create_pod", return_value=created),
+            mock.patch.object(cli, "wait_ready", return_value=wrong),
+            mock.patch.object(cli, "_cleanup_failed_up") as cleanup,
+            mock.patch.object(cli.ledger, "append"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ready pod id changed"):
+                cli.do_up(up_args())
+        cleanup.assert_called_once_with(created.name, created)
 
     def _run_args(self, **changes) -> argparse.Namespace:
         values = {
             "pod": "pod-test", "auto": None, "push": False, "keep": False,
             "terminate": False, "max_usd_hr": 0.5, "ttl_hours": 1.5,
+            "idle_min": 15, "ready_timeout": 600, "gpu": "a40",
+            "name_prefix": "stwo-direct-", "min_vcpu": 16,
+            "min_mem_gb": 62, "one_shot": False, "failure_action": "stop",
             "purpose": "test", "manifest": "test.toml",
         }
         values.update(changes)
@@ -306,7 +332,7 @@ class FleetCliTests(unittest.TestCase):
         run.execute.return_value = {"run_id": "run", "passed": True}
         with (
             mock.patch.object(cli, "_require_pregate", return_value=True),
-            mock.patch.object(cli, "_resolve_pod", return_value=(active, Endpoint.of(active))),
+            mock.patch.object(cli, "_prepare_existing_pod", return_value=(active, Endpoint.of(active))),
             mock.patch.object(cli, "_sync_pods_conf"),
             mock.patch.object(cli, "ManifestRun", return_value=run),
             mock.patch.object(cli.api, "stop_pod", return_value="EXITED") as stop,
@@ -321,7 +347,7 @@ class FleetCliTests(unittest.TestCase):
         run.execute.side_effect = RuntimeError("execution failed")
         with (
             mock.patch.object(cli, "_require_pregate", return_value=True),
-            mock.patch.object(cli, "_resolve_pod", return_value=(active, Endpoint.of(active))),
+            mock.patch.object(cli, "_prepare_existing_pod", return_value=(active, Endpoint.of(active))),
             mock.patch.object(cli, "_sync_pods_conf"),
             mock.patch.object(cli, "ManifestRun", return_value=run),
             mock.patch.object(cli.api, "stop_pod", return_value="EXITED") as stop,
@@ -334,7 +360,7 @@ class FleetCliTests(unittest.TestCase):
         active = pod()
         with (
             mock.patch.object(cli, "_require_pregate", return_value=True),
-            mock.patch.object(cli, "_resolve_pod", return_value=(active, Endpoint.of(active))),
+            mock.patch.object(cli, "_prepare_existing_pod", return_value=(active, Endpoint.of(active))),
             mock.patch.object(cli, "_sync_pods_conf"),
             mock.patch.object(cli, "cmd_push", return_value=1),
             mock.patch.object(cli.api, "stop_pod", return_value="EXITED") as stop,
@@ -350,7 +376,7 @@ class FleetCliTests(unittest.TestCase):
         run.execute.return_value = {"run_id": "run", "passed": True}
         with (
             mock.patch.object(cli, "_require_pregate", return_value=True),
-            mock.patch.object(cli, "_resolve_pod", return_value=(active, Endpoint.of(active))),
+            mock.patch.object(cli, "_prepare_existing_pod", return_value=(active, Endpoint.of(active))),
             mock.patch.object(cli, "_sync_pods_conf"),
             mock.patch.object(cli, "ManifestRun", return_value=run),
             mock.patch.object(cli.api, "stop_pod", side_effect=RuntimeError("still running")),
@@ -365,7 +391,7 @@ class FleetCliTests(unittest.TestCase):
         run.execute.side_effect = RuntimeError("execution failed")
         with (
             mock.patch.object(cli, "_require_pregate", return_value=True),
-            mock.patch.object(cli, "_resolve_pod", return_value=(active, Endpoint.of(active))),
+            mock.patch.object(cli, "_prepare_existing_pod", return_value=(active, Endpoint.of(active))),
             mock.patch.object(cli, "_sync_pods_conf"),
             mock.patch.object(cli, "ManifestRun", return_value=run),
             mock.patch.object(cli.api, "stop_pod", return_value="EXITED") as stop,
@@ -382,7 +408,7 @@ class FleetCliTests(unittest.TestCase):
         run.execute.return_value = {"run_id": "run", "passed": True}
         with (
             mock.patch.object(cli, "_require_pregate", return_value=True),
-            mock.patch.object(cli, "_resolve_pod", return_value=(active, Endpoint.of(active))),
+            mock.patch.object(cli, "_prepare_existing_pod", return_value=(active, Endpoint.of(active))),
             mock.patch.object(cli, "_sync_pods_conf"),
             mock.patch.object(cli, "ManifestRun", return_value=run),
             mock.patch.object(cli.api, "terminate_pod") as terminate,
@@ -390,6 +416,39 @@ class FleetCliTests(unittest.TestCase):
         ):
             self.assertEqual(cli.cmd_run(self._run_args(terminate=True)), 0)
         terminate.assert_called_once_with(active.id)
+
+    def test_successful_one_shot_run_confirms_absence(self) -> None:
+        active = pod()
+        run = mock.Mock()
+        run.dir = Path("results")
+        run.execute.return_value = {"run_id": "run", "passed": True}
+        with (
+            mock.patch.object(cli, "_require_pregate", return_value=True),
+            mock.patch.object(cli, "_prepare_existing_pod", return_value=(active, Endpoint.of(active))),
+            mock.patch.object(cli, "ManifestRun", return_value=run),
+            mock.patch.object(cli.api, "terminate_pod") as terminate,
+            mock.patch.object(cli.ledger, "append"),
+        ):
+            self.assertEqual(
+                cli.cmd_run(
+                    self._run_args(one_shot=True, failure_action="terminate")
+                ),
+                0,
+            )
+        terminate.assert_called_once_with(active.id)
+
+    def test_invalid_run_lifecycle_policy_blocks_before_pregate(self) -> None:
+        cases = [
+            {"keep": True, "terminate": True},
+            {"keep": True, "one_shot": True, "failure_action": "terminate"},
+            {"one_shot": True, "failure_action": "stop"},
+        ]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                with mock.patch.object(cli, "_require_pregate") as gate:
+                    with self.assertRaises(ValueError):
+                        cli.cmd_run(self._run_args(**changes))
+                gate.assert_not_called()
 
     def test_explicit_absent_terminate_is_still_confirmed(self) -> None:
         args = argparse.Namespace(all=False, pod="pod-test")

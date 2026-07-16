@@ -1,6 +1,8 @@
 # Cheapest strict hardware gate for the direct Blake-G witness/relation path.
 # Run on one Secure A40 with the pinned CUDA 11.8 image; an A40 pass promotes
-# the exact source projection to the later target-sm90 gate, not to a headline.
+# the exact source projection to per-SM consumer-fleet qualification. It is only
+# an sm_86 arithmetic proxy; H100 remains a secondary counter/roofline lane.
+# pod_run: lease one_shot=true final_action=terminate gpu=a40 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=0.50 name_prefix=stwo-direct-bg-a40- ttl_hours=1.5 idle_min=15
 
 DIRECT_TEST='backend::blake_witness::projected_relation::native_tests::direct_blake_g_native_matches_host_oracle_eager_and_replay'
 DIRECT_TARGET=/workspace/.cargo-target/stwo-nightly-2025-07-14-cuda118-sm86
