@@ -17,6 +17,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from .source_projection import projection_identity
+
 STAMP = Path(__file__).resolve().parent.parent / ".pregate_ok.json"
 FRESH_S = 6 * 3600
 SN_INPUT_ENV = "STWO_SN_ADAPTED_DIR"
@@ -35,29 +37,14 @@ def _write_stamp(
         "results": results,
     }
     if source_identity is not None:
-        receipt["tracked_source_identity"] = source_identity
+        receipt["source_identity"] = source_identity
     if input_identity is not None:
         receipt["input_identity"] = input_identity
     STAMP.write_text(json.dumps(receipt, indent=2) + "\n")
 
 
 def _repo_identity(repository: Path) -> dict[str, str]:
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repository, capture_output=True, check=False
-    )
-    diff = subprocess.run(
-        ["git", "diff", "--binary", "HEAD", "--", "."],
-        cwd=repository,
-        capture_output=True,
-        check=False,
-    )
-    if head.returncode or diff.returncode:
-        detail = (head.stderr + diff.stderr).decode(errors="replace").strip()
-        raise ValueError(f"cannot identify tracked source in {repository}: {detail}")
-    return {
-        "head": head.stdout.decode().strip(),
-        "tracked_diff_sha256": hashlib.sha256(diff.stdout).hexdigest(),
-    }
+    return projection_identity(repository)
 
 
 def _source_identity(stwo: Path, stwo_cairo: Path) -> dict[str, dict[str, str]]:
@@ -207,7 +194,7 @@ def run(stwo: Path, stwo_cairo: Path) -> bool:
         source_identity = _source_identity(stwo, stwo_cairo)
     except (OSError, ValueError) as error:
         results.append(
-            {"name": "tracked source admission", "ok": False, "error": str(error)}
+            {"name": "source projection admission", "ok": False, "error": str(error)}
         )
         _write_stamp(False, results, input_identity=input_identity)
         print(f"[pregate] FAIL tracked source admission: {error}")
@@ -258,7 +245,7 @@ def run(stwo: Path, stwo_cairo: Path) -> bool:
                 {
                     "name": "pregate identity recheck",
                     "ok": False,
-                    "error": "tracked source or sealed input identity changed during pregate",
+                    "error": "source projection or sealed input identity changed during pregate",
                 }
             )
     else:
@@ -279,7 +266,7 @@ def is_fresh(stwo: Path, stwo_cairo: Path) -> bool:
             return False
         _, input_hashes, manifest_hash = _admit_sn_inputs(stwo_cairo)
         return (
-            data.get("tracked_source_identity") == _source_identity(stwo, stwo_cairo)
+            data.get("source_identity") == _source_identity(stwo, stwo_cairo)
             and data.get("input_identity") == {
                 "manifest_sha256": manifest_hash,
                 "inputs": input_hashes,

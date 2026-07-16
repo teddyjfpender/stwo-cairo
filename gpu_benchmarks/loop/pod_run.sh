@@ -99,18 +99,6 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ConnectTimeou
 note() { echo "[pod_run $(date -u +%H:%M:%S)] $*"; }
 pssh() { ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "root@$HOST" "$@"; }
 
-sha256_stream() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum
-  else shasum -a 256
-  fi
-}
-
-sha256_file() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
-  else shasum -a 256 "$1" | cut -d' ' -f1
-  fi
-}
-
 source_head() {
   git -C "$1" rev-parse HEAD 2>/dev/null
 }
@@ -120,33 +108,10 @@ source_head() {
 # Runtime receipts and large PIE fixtures persist remotely but are not source.
 source_hash() {
   local repo="$1"
-  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || return 1
   (
-    git -C "$repo" diff --binary HEAD -- . \
-      ':(exclude)gpu_benchmarks/loop/results/**' \
-      ':(exclude)gpu_benchmarks/loop/ledger.jsonl' \
-      ':(exclude)gpu_benchmarks/pie/sn/**' \
-      ':(exclude)gpu_benchmarks/pie/*.zip' || exit 1
-    git -C "$repo" ls-files --others --exclude-standard -z |
-      while IFS= read -r -d '' path; do
-        case "$path" in
-          gpu_benchmarks/loop/results/*|gpu_benchmarks/loop/ledger.jsonl|\
-          gpu_benchmarks/pie/sn/*|gpu_benchmarks/pie/*.zip) continue ;;
-        esac
-        if [[ -L "$repo/$path" ]]; then
-          link_hash="$(readlink -n "$repo/$path" | sha256_stream | cut -d' ' -f1)" || exit 1
-          printf 'untracked-symlink\0%s\0%s\0' "$path" "$link_hash"
-        elif [[ -f "$repo/$path" ]]; then
-          file_kind=regular
-          [[ -x "$repo/$path" ]] && file_kind=executable
-          file_hash="$(sha256_file "$repo/$path")" || exit 1
-          printf 'untracked-%s\0%s\0%s\0' "$file_kind" "$path" "$file_hash"
-        else
-          echo "unsupported untracked source path: $repo/$path" >&2
-          exit 1
-        fi
-      done
-  ) | sha256_stream | cut -d' ' -f1
+    cd "${SCRIPT_DIR}/../fleet" || exit 1
+    ./gpufleet.sh source-hash --repo "$repo"
+  )
 }
 
 valid_source_identity() {

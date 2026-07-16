@@ -106,8 +106,8 @@ class PregateInputAdmissionTests(unittest.TestCase):
         stamp = self.root / "pregate.json"
         paths, input_hashes, manifest_hash = self._admit()
         source_identity = {
-            "stwo": {"head": "a", "tracked_diff_sha256": "b"},
-            "stwo_cairo": {"head": "c", "tracked_diff_sha256": "d"},
+            "stwo": {"head": "a", "worktree_sha256": "b"},
+            "stwo_cairo": {"head": "c", "worktree_sha256": "d"},
         }
         input_identity = {
             "manifest_sha256": manifest_hash,

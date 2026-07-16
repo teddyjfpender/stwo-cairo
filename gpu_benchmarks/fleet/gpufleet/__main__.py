@@ -33,6 +33,7 @@ from . import (
 from . import api, ledger, pregate
 from .manifest import ManifestRun
 from .podctl import Endpoint, bootstrap, health_check, ssh_run, wait_ready
+from .source_projection import projection_identity
 
 FLEET_DIR = Path(__file__).resolve().parent.parent
 GPU_BENCH = FLEET_DIR.parent  # gpu_benchmarks/
@@ -48,6 +49,11 @@ def _gpu_type(short: str) -> str:
 
 def cmd_pregate(_args) -> int:
     return 0 if pregate.run(STWO, STWO_CAIRO) else 1
+
+
+def cmd_source_hash(args) -> int:
+    print(projection_identity(Path(args.repo))["worktree_sha256"])
+    return 0
 
 
 def cmd_offers(args) -> int:
@@ -312,6 +318,9 @@ def main() -> int:
     sub.add_parser("status")
     sub.add_parser("ledger")
 
+    p = sub.add_parser("source-hash", help=argparse.SUPPRESS)
+    p.add_argument("--repo", required=True)
+
     p = sub.add_parser("up")
     p.add_argument("--gpu", required=True)
     p.add_argument("--name")
@@ -367,6 +376,7 @@ def main() -> int:
         "offers": cmd_offers,
         "status": cmd_status,
         "ledger": lambda _a: (print(ledger.report()), 0)[1],
+        "source-hash": cmd_source_hash,
         "up": cmd_up,
         "bootstrap": cmd_bootstrap,
         "push": cmd_push,
