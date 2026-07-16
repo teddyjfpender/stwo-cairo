@@ -102,7 +102,8 @@ use crate::range_allocator::RangeAllocationError;
 use crate::range_arena::{plan_range_arena_with_released_commitments, ReleasedCommitmentAlias};
 use crate::relation::RelationTracePart;
 use crate::relation_execution::{
-    RelationExecutionError, RelationExecutionPlan, RelationInstanceSourcePlan, RelationSourcePlane,
+    BlakeGInputsSelection, RelationExecutionError, RelationExecutionPlan,
+    RelationInstanceSourcePlan, RelationSourcePlane,
 };
 use crate::relation_table::CAIRO_RELATION_GRAPH;
 use crate::schedule::{InputEdge, TraceColumnCount, WitnessWriterKind};
@@ -2941,7 +2942,7 @@ struct LogicalWitnessComponent {
     component: &'static str,
     part: TracePartId,
     n_real_rows: usize,
-    blake_g_fused: bool,
+    blake_g_contract: BlakeGWitnessContract,
     native_input_producer: Option<&'static str>,
     program: WitnessProgram,
     requirements: WitnessWorkspaceRequirements,
@@ -3054,6 +3055,7 @@ struct LogicalRelationInstanceSlots {
 #[derive(Clone, Debug)]
 struct LogicalRelationWorkspace {
     execution: RelationExecutionPlan,
+    blake_g_inputs: Option<BlakeGInputsSelection>,
     source_plan: Vec<RelationInstanceSourcePlan>,
     launch_mode: RelationLaunchMode,
     requirements: RelationGraphRequirements,
@@ -3115,7 +3117,7 @@ pub struct PlannedWitnessComponent {
     pub component: &'static str,
     pub part: TracePartId,
     pub n_real_rows: usize,
-    pub blake_g_fused: bool,
+    pub blake_g_contract: BlakeGWitnessContract,
     pub native_input_producer: Option<&'static str>,
     pub program: WitnessProgram,
     pub requirements: WitnessWorkspaceRequirements,
@@ -3124,6 +3126,29 @@ pub struct PlannedWitnessComponent {
     pub input_seed: Option<PlannedWitnessInputSeed>,
     pub input_compact: Option<PlannedWitnessInputCompact>,
     pub input_casm: Option<PlannedWitnessCasmInput>,
+}
+
+/// One fail-closed witness/feed launch contract. `Direct` carries the same
+/// selection receipt consumed by relation ownership; it cannot drift into a
+/// second boolean feature gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlakeGWitnessContract {
+    Recorded,
+    Fused,
+    Direct(BlakeGInputsSelection),
+}
+
+impl BlakeGWitnessContract {
+    pub fn direct(&self) -> Option<&BlakeGInputsSelection> {
+        match self {
+            Self::Direct(selection) => Some(selection),
+            Self::Recorded | Self::Fused => None,
+        }
+    }
+
+    pub const fn uses_fused_feed(&self) -> bool {
+        matches!(self, Self::Fused | Self::Direct(_))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3641,6 +3666,7 @@ pub struct PlannedTranscriptWorkspace {
 #[derive(Clone, Debug)]
 pub struct PlannedRelationWorkspace {
     pub execution: RelationExecutionPlan,
+    pub blake_g_inputs: Option<BlakeGInputsSelection>,
     pub source_plan: Vec<RelationInstanceSourcePlan>,
     pub launch_mode: RelationLaunchMode,
     pub requirements: RelationGraphRequirements,
@@ -3775,19 +3801,9 @@ impl ProofArenaPlan {
             });
         }
 
-        let relation_execution =
+        let mut relation_execution =
             RelationExecutionPlan::from_proof_plan(plan, &CAIRO_RELATION_GRAPH)
                 .map_err(ArenaPlanError::RelationExecution)?;
-        let retained_base_trace = relation_execution
-            .source_plan()
-            .map_err(ArenaPlanError::RelationExecution)?
-            .into_iter()
-            .filter(|source| source.plane == RelationSourcePlane::BaseTrace)
-            .flat_map(|source| {
-                (0..source.column_count)
-                    .map(move |ordinal| (source.batch.component, source.part, ordinal))
-            })
-            .collect::<HashSet<_>>();
         let late_coefficient_ownership = LateCoefficientOwnershipPlan::compile(protocol)
             .map_err(ArenaPlanError::InvalidProtocolGeometry)?;
         let multiplicity_plan = execution_table_geometry
@@ -3811,6 +3827,24 @@ impl ProofArenaPlan {
                 && recording.poison_ops.is_empty()
                 && blake_g_fusion_program_is_exact(&recording.program)
         });
+        let blake_g_inputs = (protocol.identity.resident_backend == ResidentBackend::ReplacementV1
+            && blake_g_fused)
+            .then(|| {
+                relation_execution
+                    .select_blake_g_inputs()
+                    .map_err(ArenaPlanError::RelationExecution)
+            })
+            .transpose()?;
+        let retained_base_trace = relation_execution
+            .source_plan_for_mode(CAIRO_RELATION_LAUNCH_MODE)
+            .map_err(ArenaPlanError::RelationExecution)?
+            .into_iter()
+            .filter(|source| source.plane == RelationSourcePlane::BaseTrace)
+            .flat_map(|source| {
+                (0..source.column_count)
+                    .map(move |ordinal| (source.batch.component, source.part, ordinal))
+            })
+            .collect::<HashSet<_>>();
         let mut logical = Vec::new();
         let mut transition_aliases = Vec::new();
         let mut released_commitment_aliases = Vec::new();
@@ -3868,7 +3902,15 @@ impl ProofArenaPlan {
                         transition_aliases.push((evaluations, coefficients));
                     }
                 }
-                if let Some(words) = component.node.facts.lookup_words {
+                let direct_blake_g_part = blake_g_inputs.as_ref().is_some_and(|selection| {
+                    selection.batch.component == component.node.id && selection.part == part.part
+                });
+                if let Some(words) = component
+                    .node
+                    .facts
+                    .lookup_words
+                    .filter(|_| !direct_blake_g_part)
+                {
                     push_component_flat_buffer(
                         &mut logical,
                         component.node.id,
@@ -3941,11 +3983,13 @@ impl ProofArenaPlan {
             plan,
             logical_execution_tables.is_some(),
             blake_g_fused,
+            blake_g_inputs.as_ref(),
             protocol.identity.resident_backend,
         )?;
         let logical_relation = append_relation_buffers(
             &mut logical,
             relation_execution,
+            blake_g_inputs,
             &late_coefficient_ownership,
             &mut transition_aliases,
         )?;
@@ -4123,6 +4167,21 @@ impl ProofArenaPlan {
             .map(|logical| resolve_ec_op_slots(logical, &bindings))
             .transpose()?;
         let relation = resolve_relation_slots(logical_relation, &bindings)?;
+        let witness_direct = witness
+            .components
+            .iter()
+            .filter_map(|component| component.blake_g_contract.direct())
+            .collect::<Vec<_>>();
+        match (witness_direct.as_slice(), relation.blake_g_inputs.as_ref()) {
+            ([], None) => {}
+            ([witness_selection], Some(relation_selection))
+                if *witness_selection == relation_selection => {}
+            _ => {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "Blake-G witness and relation ownership receipts differ",
+                ))
+            }
+        }
 
         let mut protocol_key = execution_table_geometry.map_or_else(
             || protocol.key(),
@@ -4735,6 +4794,7 @@ fn append_witness_buffers(
     proof: &ProofPlan,
     shared_execution_tables: bool,
     blake_g_fused: bool,
+    blake_g_inputs: Option<&BlakeGInputsSelection>,
     resident_backend: ResidentBackend,
 ) -> Result<LogicalWitnessWorkspace, ArenaPlanError> {
     let mut recordings = BTreeMap::new();
@@ -4748,6 +4808,7 @@ fn append_witness_buffers(
 
     let persistent = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble)?;
     let input_lifetime = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Witness)?;
+    let retained_input_lifetime = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Interaction)?;
     let witness_lifetime = BufferLifetime::at(ProofEpoch::Witness);
     let casm_staging_words = if resident_backend == ResidentBackend::ReplacementV1 {
         topological_component_order(proof)?
@@ -4841,30 +4902,75 @@ fn append_witness_buffers(
         let rows = usize::try_from(part.padded_rows).map_err(|_| ArenaPlanError::SizeOverflow)?;
         let requirements =
             witness_workspace_requirements(&program, rows, &[]).map_err(ArenaPlanError::Witness)?;
+        let component_blake_g_inputs = blake_g_inputs
+            .filter(|selection| {
+                selection.batch.component == component.node.id && selection.part == part.part
+            })
+            .cloned();
+        if let Some(selection) = &component_blake_g_inputs {
+            if component.node.id != "blake_g"
+                || selection.input_ordinals != [0, 1, 2, 3, 4, 5]
+                || selection.enabler_ordinal != 6
+                || requirements.input_column_words.len() != 7
+            {
+                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                    "direct Blake-G recorded input geometry drifted",
+                ));
+            }
+        }
 
         let input_columns = requirements
             .input_column_words
             .iter()
             .enumerate()
+            .filter(|(ordinal, _)| {
+                component_blake_g_inputs.as_ref().is_none_or(|selection| {
+                    u32::try_from(*ordinal)
+                        .ok()
+                        .is_some_and(|ordinal| selection.input_ordinals.contains(&ordinal))
+                })
+            })
             .map(|(ordinal, &words)| {
+                let ordinal = u32::try_from(ordinal).map_err(|_| ArenaPlanError::SizeOverflow)?;
+                let lifetime = if component_blake_g_inputs.is_some() {
+                    retained_input_lifetime
+                } else {
+                    input_lifetime
+                };
                 push_buffer_id(
                     logical,
                     Some(component.node.id),
                     Some(part.part),
                     BufferPurpose::WitnessInput,
-                    u32::try_from(ordinal).map_err(|_| ArenaPlanError::SizeOverflow)?,
+                    ordinal,
                     words,
-                    input_lifetime,
+                    lifetime,
                 )
             })
             .collect::<Result<Vec<_>, ArenaPlanError>>()?;
+        let input_pointer_words = match &component_blake_g_inputs {
+            Some(selection) => requirements
+                .input_pointer_words
+                .checked_div(requirements.input_column_words.len())
+                .and_then(|words_per_pointer| {
+                    (requirements.input_pointer_words % requirements.input_column_words.len() == 0)
+                        .then_some(words_per_pointer)
+                })
+                .and_then(|words_per_pointer| {
+                    words_per_pointer.checked_mul(selection.input_ordinals.len())
+                })
+                .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                    "direct Blake-G input pointer geometry drifted",
+                ))?,
+            None => requirements.input_pointer_words,
+        };
         let input_pointers = push_buffer_id(
             logical,
             Some(component.node.id),
             Some(part.part),
             BufferPurpose::WitnessInputPointers,
             0,
-            requirements.input_pointer_words,
+            input_pointer_words,
             persistent,
         )?;
         let execution_table_pointers = (!shared_execution_tables)
@@ -4936,15 +5042,23 @@ fn append_witness_buffers(
                 )
             })
             .transpose()?;
-        let lookup_words = match component.node.facts.lookup_words {
-            Some(_) => logical_buffer_id(
+        let lookup_words = match (
+            component.node.facts.lookup_words,
+            component_blake_g_inputs.is_some(),
+        ) {
+            (Some(_), true) => {
+                multiplicity_dummy.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                    "direct Blake-G is missing its shared one-word dummy",
+                ))?
+            }
+            (Some(_), false) => logical_buffer_id(
                 logical,
                 component.node.id,
                 part.part,
                 BufferPurpose::LookupInputs,
                 0,
             )?,
-            None => push_buffer_id(
+            (None, _) => push_buffer_id(
                 logical,
                 Some(component.node.id),
                 Some(part.part),
@@ -4955,6 +5069,11 @@ fn append_witness_buffers(
             )?,
         };
         let component_blake_g_fused = blake_g_fused && component.node.id == "blake_g";
+        if component_blake_g_inputs.is_some() && !component_blake_g_fused {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "direct Blake-G requires the exact fused Graph-A feed",
+            ));
+        }
         let sub_words = match (component.node.facts.sub_words, component_blake_g_fused) {
             (Some(_), true) => {
                 multiplicity_dummy.ok_or(ArenaPlanError::InvalidProtocolGeometry(
@@ -5014,7 +5133,10 @@ fn append_witness_buffers(
         } else {
             None
         };
-        let input_compact = if native_input_producer.is_none() && input_casm.is_none() {
+        let input_compact = if component_blake_g_inputs.is_none()
+            && native_input_producer.is_none()
+            && input_casm.is_none()
+        {
             append_witness_input_compact(
                 logical,
                 proof,
@@ -5037,11 +5159,15 @@ fn append_witness_buffers(
                     part,
                     &input_columns,
                     persistent,
+                    component_blake_g_inputs.as_ref(),
                 )?
             } else {
                 None
             };
-        let input_seed = if native_input_producer.is_none() && input_casm.is_none() {
+        let input_seed = if component_blake_g_inputs.is_none()
+            && native_input_producer.is_none()
+            && input_casm.is_none()
+        {
             append_witness_input_seed(
                 logical,
                 component.node,
@@ -5063,12 +5189,23 @@ fn append_witness_buffers(
                 "recorded witness has multiple device input materializers",
             ));
         }
+        if component_blake_g_inputs.is_some() && input_gather.is_none() {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "direct Blake-G requires its exact six-column device gather",
+            ));
+        }
+        let blake_g_contract = match (component_blake_g_fused, component_blake_g_inputs) {
+            (true, Some(selection)) => BlakeGWitnessContract::Direct(selection),
+            (true, None) => BlakeGWitnessContract::Fused,
+            (false, None) => BlakeGWitnessContract::Recorded,
+            (false, Some(_)) => unreachable!("direct Blake-G requires fused feed"),
+        };
         components.push(LogicalWitnessComponent {
             component: component.node.id,
             part: part.part,
             n_real_rows: usize::try_from(part.n_real_rows)
                 .map_err(|_| ArenaPlanError::SizeOverflow)?,
-            blake_g_fused: component_blake_g_fused,
+            blake_g_contract,
             native_input_producer,
             program,
             requirements,
@@ -6022,6 +6159,7 @@ fn append_witness_input_gather(
     part: TracePartShape,
     input_columns: &[LogicalBufferId],
     persistent: BufferLifetime,
+    blake_g_inputs: Option<&BlakeGInputsSelection>,
 ) -> Result<Option<LogicalWitnessInputGather>, ArenaPlanError> {
     let producer_edges =
         node.inputs
@@ -6050,13 +6188,30 @@ fn append_witness_input_gather(
         stwo_cairo_prover::witness::jit_prove_backend::recorded_input_geometry(node.id).ok_or(
             ArenaPlanError::InvalidProtocolGeometry("recorded producer edge has no input geometry"),
         )?;
-    let n_inputs = usize::try_from(program.n_inputs).map_err(|_| ArenaPlanError::SizeOverflow)?;
-    let include_enabler = input_geometry
-        .enabler_slot
-        .is_some_and(|ordinal| ordinal < n_inputs);
-    let include_iota = input_geometry
-        .iota_slot
-        .is_some_and(|ordinal| ordinal < n_inputs);
+    let recorded_inputs =
+        usize::try_from(program.n_inputs).map_err(|_| ArenaPlanError::SizeOverflow)?;
+    let n_inputs =
+        blake_g_inputs.map_or(recorded_inputs, |selection| selection.input_ordinals.len());
+    let include_enabler = blake_g_inputs.is_none()
+        && input_geometry
+            .enabler_slot
+            .is_some_and(|ordinal| ordinal < recorded_inputs);
+    let include_iota = blake_g_inputs.is_none()
+        && input_geometry
+            .iota_slot
+            .is_some_and(|ordinal| ordinal < recorded_inputs);
+    if let Some(selection) = blake_g_inputs {
+        if recorded_inputs != 7
+            || selection.input_ordinals != [0, 1, 2, 3, 4, 5]
+            || selection.enabler_ordinal != 6
+            || input_geometry.enabler_slot != Some(6)
+            || input_geometry.iota_slot != Some(recorded_inputs)
+        {
+            return Err(ArenaPlanError::InvalidProtocolGeometry(
+                "direct Blake-G gather metadata drifted",
+            ));
+        }
+    }
 
     let mut producers = Vec::with_capacity(producer_edges.len());
     let mut sources = Vec::with_capacity(producer_edges.len());
@@ -6112,14 +6267,16 @@ fn append_witness_input_gather(
     }
     if requirements.consumer_input_column_words.len() != n_inputs
         || input_columns.len() != n_inputs
-        || input_geometry
-            .enabler_slot
-            .filter(|&ordinal| ordinal < n_inputs)
-            != include_enabler.then_some(requirements.input_width)
-        || input_geometry
-            .iota_slot
-            .filter(|&ordinal| ordinal < n_inputs)
-            != include_iota.then_some(requirements.input_width + usize::from(include_enabler))
+        || (blake_g_inputs.is_none()
+            && (input_geometry
+                .enabler_slot
+                .filter(|&ordinal| ordinal < n_inputs)
+                != include_enabler.then_some(requirements.input_width)
+                || input_geometry
+                    .iota_slot
+                    .filter(|&ordinal| ordinal < n_inputs)
+                    != include_iota
+                        .then_some(requirements.input_width + usize::from(include_enabler))))
     {
         return Err(ArenaPlanError::WitnessInputGatherProgramWidth {
             component: node.id,
@@ -6180,6 +6337,7 @@ fn append_witness_input_gather(
 fn append_relation_buffers(
     logical: &mut Vec<LogicalBuffer>,
     execution: RelationExecutionPlan,
+    blake_g_inputs: Option<BlakeGInputsSelection>,
     late_coefficient_ownership: &LateCoefficientOwnershipPlan,
     transition_aliases: &mut Vec<(LogicalBufferId, LogicalBufferId)>,
 ) -> Result<LogicalRelationWorkspace, ArenaPlanError> {
@@ -6192,8 +6350,17 @@ fn append_relation_buffers(
                 other => ArenaPlanError::RelationExecution(other),
             })?;
     let source_plan = execution
-        .source_plan()
+        .source_plan_for_mode(launch_mode)
         .map_err(ArenaPlanError::RelationExecution)?;
+    if source_plan
+        .iter()
+        .any(|source| source.plane == RelationSourcePlane::WitnessInput)
+        != blake_g_inputs.is_some()
+    {
+        return Err(ArenaPlanError::InvalidProtocolGeometry(
+            "direct Blake-G relation ownership receipt drifted",
+        ));
+    }
     if source_plan.len() != requirements.instances.len() {
         return Err(ArenaPlanError::InvalidProtocolGeometry(
             "relation source plan count drifted from requirements",
@@ -6522,6 +6689,7 @@ fn append_relation_buffers(
 
     Ok(LogicalRelationWorkspace {
         execution,
+        blake_g_inputs,
         source_plan,
         launch_mode,
         requirements,
@@ -10661,7 +10829,19 @@ fn resolve_witness_slots(
                 lookup_words: physical(component.lookup_words)?,
                 sub_words: physical(component.sub_words)?,
             };
-            if component.blake_g_fused {
+            if component.blake_g_contract.direct().is_some() {
+                if execution_tables.is_none() {
+                    return Err(ArenaPlanError::InvalidProtocolGeometry(
+                        "direct Blake-G requires prepared execution tables",
+                    ));
+                }
+                component
+                    .requirements
+                    .arena_slot_requirements_for_blake_g_direct_with_prepared_execution_tables(
+                        &slots,
+                    )
+                    .map_err(ArenaPlanError::Witness)?;
+            } else if component.blake_g_contract.uses_fused_feed() {
                 if execution_tables.is_none() {
                     return Err(ArenaPlanError::InvalidProtocolGeometry(
                         "fused blake_g requires prepared execution tables",
@@ -10780,7 +10960,7 @@ fn resolve_witness_slots(
                 component: component.component,
                 part: component.part,
                 n_real_rows: component.n_real_rows,
-                blake_g_fused: component.blake_g_fused,
+                blake_g_contract: component.blake_g_contract,
                 native_input_producer: component.native_input_producer,
                 program: component.program,
                 requirements: component.requirements,
@@ -11005,6 +11185,7 @@ fn resolve_relation_slots(
         .map_err(ArenaPlanError::Relation)?;
     Ok(PlannedRelationWorkspace {
         execution: logical.execution,
+        blake_g_inputs: logical.blake_g_inputs,
         source_plan: logical.source_plan,
         launch_mode: logical.launch_mode,
         requirements: logical.requirements,
@@ -11312,6 +11493,17 @@ mod tests {
     use super::*;
     use crate::relation_table::CAIRO_RELATION_GRAPH;
     use crate::schedule_table::CAIRO_SCHEDULE;
+
+    #[test]
+    fn direct_blake_g_recorded_input_metadata_is_exact() {
+        let recording = BlakeGRecordedLane::record();
+        let geometry =
+            stwo_cairo_prover::witness::jit_prove_backend::recorded_input_geometry("blake_g")
+                .unwrap();
+        assert_eq!(recording.program.n_inputs, 7);
+        assert_eq!(geometry.enabler_slot, Some(6));
+        assert_eq!(geometry.iota_slot, Some(7));
+    }
 
     fn retained_commit_program(retain_evaluations: bool) -> CommitProgram {
         CommitProgram::compile(
@@ -11705,6 +11897,7 @@ mod tests {
             &proof,
             true,
             false,
+            None,
             ResidentBackend::ReplacementV1,
         )
         .unwrap();
@@ -11741,6 +11934,7 @@ mod tests {
             &proof,
             true,
             false,
+            None,
             ResidentBackend::LegacyResident,
         )
         .unwrap();

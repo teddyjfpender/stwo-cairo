@@ -47,9 +47,9 @@ use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
 use stwo_cairo_prover::witness::proof_shape::{ProofShapeKey, TracePartId};
 
 use crate::arena_plan::{
-    BufferPurpose, CommitmentColumnSource, CommitmentTreeId, DirectCompactTerminalPlan,
-    DynamicCommitmentLeafSchedule, PlannedFixedTableSource, PlannedRecordedMultiplicityFeedGraph,
-    ResidentBackend,
+    BlakeGWitnessContract, BufferPurpose, CommitmentColumnSource, CommitmentTreeId,
+    DirectCompactTerminalPlan, DynamicCommitmentLeafSchedule, PlannedFixedTableSource,
+    PlannedRecordedMultiplicityFeedGraph, ResidentBackend,
 };
 use crate::composition_plan::CompositionProofBindings;
 use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
@@ -1123,15 +1123,22 @@ fn enqueue_witness_lane_levels(
                                 .find(|feed| feed.producer() == graph.component)
                         });
                         if let Some(PreparedResidentFeed::BlakeGFused { binding, .. }) = feed {
-                            graph
-                                .writer
-                                .launch_blake_g_fused_on(
+                            if graph.writer.is_blake_g_direct() {
+                                graph.writer.launch_blake_g_direct_on(
                                     launch,
                                     graph.n_real_rows,
                                     binding.luts(),
                                     binding.counts(),
                                 )
-                                .map_err(WitnessLaneLaunchError::Writer)?;
+                            } else {
+                                graph.writer.launch_blake_g_fused_on(
+                                    launch,
+                                    graph.n_real_rows,
+                                    binding.luts(),
+                                    binding.counts(),
+                                )
+                            }
+                            .map_err(WitnessLaneLaunchError::Writer)?;
                         } else {
                             graph
                                 .writer
@@ -1749,25 +1756,38 @@ impl<'a> ResidentGraphRuntime<'a> {
                             .map_err(ResidentRuntimeError::from)
                         })
                         .transpose()?;
-                    let writer = if component.blake_g_fused {
-                        PreparedWitnessGraph::prepare_blake_g_fused_with_execution_tables(
-                            arena,
-                            &component.program,
-                            component.requirements.row_count,
-                            tables,
-                            &component.slots,
-                            execution_config.prepared_witness_mode(),
-                        )
-                    } else {
-                        PreparedWitnessGraph::prepare_with_execution_tables(
-                            arena,
-                            &component.program,
-                            component.requirements.row_count,
-                            &component.requirements.multiplicity_column_words,
-                            tables,
-                            &component.slots,
-                            execution_config.prepared_witness_mode(),
-                        )
+                    let writer = match &component.blake_g_contract {
+                        BlakeGWitnessContract::Direct(_) => {
+                            PreparedWitnessGraph::prepare_blake_g_direct_with_execution_tables(
+                                arena,
+                                &component.program,
+                                component.requirements.row_count,
+                                tables,
+                                &component.slots,
+                                execution_config.prepared_witness_mode(),
+                            )
+                        }
+                        BlakeGWitnessContract::Fused => {
+                            PreparedWitnessGraph::prepare_blake_g_fused_with_execution_tables(
+                                arena,
+                                &component.program,
+                                component.requirements.row_count,
+                                tables,
+                                &component.slots,
+                                execution_config.prepared_witness_mode(),
+                            )
+                        }
+                        BlakeGWitnessContract::Recorded => {
+                            PreparedWitnessGraph::prepare_with_execution_tables(
+                                arena,
+                                &component.program,
+                                component.requirements.row_count,
+                                &component.requirements.multiplicity_column_words,
+                                tables,
+                                &component.slots,
+                                execution_config.prepared_witness_mode(),
+                            )
+                        }
                     }
                     .map_err(ResidentRuntimeError::from)?;
                     Ok::<_, ResidentRuntimeError>(PreparedResidentWitness {
@@ -3853,7 +3873,11 @@ impl<'a> ResidentGraphRuntime<'a> {
             {
                 return Err(reject("real-row geometry"));
             }
-            if prepared.writer.is_blake_g_fused() != planned.blake_g_fused {
+            let direct_selection = planned.blake_g_contract.direct();
+            let uses_fused_feed = planned.blake_g_contract.uses_fused_feed();
+            if prepared.writer.is_blake_g_fused() != uses_fused_feed
+                || prepared.writer.is_blake_g_direct() != direct_selection.is_some()
+            {
                 return Err(reject("fused writer ownership"));
             }
             let prepared_feed_is_fused = self
@@ -3866,7 +3890,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                         .find(|feed| feed.producer() == prepared.component)
                 })
                 .is_some_and(|feed| matches!(feed, PreparedResidentFeed::BlakeGFused { .. }));
-            if prepared_feed_is_fused != planned.blake_g_fused {
+            if prepared_feed_is_fused != uses_fused_feed {
                 return Err(reject("fused feed ownership"));
             }
             if prepared.native_input_producer != planned.native_input_producer {
@@ -3884,14 +3908,24 @@ impl<'a> ResidentGraphRuntime<'a> {
             ) {
                 return Err(reject("base trace destinations"));
             }
-            if !slice_matches_slot(
+            if direct_selection.is_some() {
+                if planned.slots.multiplicity_dummy != Some(planned.slots.lookup_words)
+                    || !slice_matches_slot(
+                        prepared.writer.lookup_words(),
+                        planned.slots.lookup_words,
+                        1,
+                    )
+                {
+                    return Err(reject("retired lookup destination"));
+                }
+            } else if !slice_matches_slot(
                 prepared.writer.lookup_words(),
                 planned.slots.lookup_words,
                 planned.requirements.lookup_words,
             ) {
                 return Err(reject("lookup destination"));
             }
-            if planned.blake_g_fused {
+            if uses_fused_feed {
                 if planned.slots.multiplicity_dummy != Some(planned.slots.sub_words)
                     || !slice_matches_slot(prepared.writer.sub_words(), planned.slots.sub_words, 1)
                 {
@@ -3904,6 +3938,21 @@ impl<'a> ResidentGraphRuntime<'a> {
             ) {
                 return Err(reject("subcomponent destination"));
             }
+            let writer_input_words = match direct_selection {
+                Some(selection) => selection
+                    .input_ordinals
+                    .iter()
+                    .map(|&ordinal| {
+                        planned
+                            .requirements
+                            .input_column_words
+                            .get(ordinal as usize)
+                            .copied()
+                            .ok_or_else(|| reject("direct writer input ordinal"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => planned.requirements.input_column_words.clone(),
+            };
             match (
                 &prepared.input_gather,
                 &planned.input_gather,
@@ -3918,7 +3967,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                     if !slices_match_slots(
                         prepared.writer.input_columns(),
                         &planned.slots.input_columns,
-                        &planned.requirements.input_column_words,
+                        &writer_input_words,
                     ) {
                         return Err(reject("ingested input columns"));
                     }
@@ -3926,8 +3975,12 @@ impl<'a> ResidentGraphRuntime<'a> {
                 (Some(gather), Some(planned_gather), None, None, None, None, None, None) => {
                     if !slices_match_slots(
                         gather.consumer_input_columns(),
+                        &planned_gather.slots.consumer_input_columns,
+                        &planned_gather.requirements.consumer_input_column_words,
+                    ) || !slices_match_slots(
+                        prepared.writer.input_columns(),
                         &planned.slots.input_columns,
-                        &planned.requirements.input_column_words,
+                        &writer_input_words,
                     ) || gather
                         .consumer_input_columns()
                         .iter()
@@ -5433,12 +5486,41 @@ fn arena_relation_sources(
     let relation = workspace.plan().relation();
     let mut ordered = Vec::with_capacity(relation.source_plan.len());
     for source_plan in &relation.source_plan {
-        let purpose = match source_plan.plane {
-            RelationSourcePlane::LookupWords => BufferPurpose::LookupInputs,
-            RelationSourcePlane::BaseTrace => BufferPurpose::BaseTrace,
-            RelationSourcePlane::WitnessInput => BufferPurpose::WitnessInput,
+        let (purpose, ordinals) = match source_plan.plane {
+            RelationSourcePlane::LookupWords => (
+                BufferPurpose::LookupInputs,
+                (0..source_plan.column_count).collect::<Vec<_>>(),
+            ),
+            RelationSourcePlane::BaseTrace => (
+                BufferPurpose::BaseTrace,
+                (0..source_plan.column_count).collect::<Vec<_>>(),
+            ),
+            RelationSourcePlane::WitnessInput => {
+                let selection = relation.blake_g_inputs.as_ref().ok_or(
+                    ResidentRuntimeError::PreparedWitnessCaptureContract {
+                        component: source_plan.batch.component,
+                        role: "direct relation source has no ownership receipt",
+                    },
+                )?;
+                if relation.execution.batches.get(selection.batch_index) != Some(&selection.batch)
+                    || source_plan.batch != selection.batch
+                    || source_plan.part != selection.part
+                    || source_plan.instance_index != selection.instance_index
+                    || source_plan.column_count != selection.input_ordinals.len() as u32
+                {
+                    return Err(ResidentRuntimeError::PreparedWitnessCaptureContract {
+                        component: source_plan.batch.component,
+                        role: "direct relation source drifted from ownership receipt",
+                    });
+                }
+                (
+                    BufferPurpose::WitnessInput,
+                    selection.input_ordinals.to_vec(),
+                )
+            }
         };
-        let columns = (0..source_plan.column_count)
+        let columns = ordinals
+            .into_iter()
             .map(|ordinal| {
                 let (_, binding) = workspace
                     .plan()

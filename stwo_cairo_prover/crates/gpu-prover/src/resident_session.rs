@@ -1310,7 +1310,24 @@ fn resident_host_witness_inputs<'a>(
                 });
             }
             if let Some(gather) = &component.input_gather {
-                for (ordinal, source) in lane.columns.iter().enumerate() {
+                let materialized_ordinals = component
+                    .blake_g_contract
+                    .direct()
+                    .map(|selection| {
+                        selection
+                            .input_ordinals
+                            .iter()
+                            .map(|&ordinal| ordinal as usize)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| (0..lane.columns.len()).collect());
+                for ordinal in materialized_ordinals {
+                    let Some(source) = lane.columns.get(ordinal) else {
+                        return Err(ResidentSessionError::RecordedWitnessInputRoute {
+                            component: lane.component,
+                            ordinal,
+                        });
+                    };
                     if !recorded_input_matches_gather(
                         source,
                         ordinal,
@@ -1323,9 +1340,25 @@ fn resident_host_witness_inputs<'a>(
                         });
                     }
                 }
+                if let Some(selection) = component.blake_g_contract.direct() {
+                    let enabler = selection.enabler_ordinal as usize;
+                    if !matches!(
+                        lane.columns.get(enabler),
+                        Some(RecordedInputColumnProvenance::DeviceGather(
+                            DeviceGatherColumn::Enabler
+                        ))
+                    ) || gather.slots.consumer_input_columns.len()
+                        != selection.input_ordinals.len()
+                    {
+                        return Err(ResidentSessionError::RecordedWitnessInputRoute {
+                            component: lane.component,
+                            ordinal: enabler,
+                        });
+                    }
+                }
                 // The gather kernel writes both producer columns and its
-                // mechanically generated enabler/iota tail; no host copy may
-                // race those destinations before capture.
+                // mechanically generated tail when retained; the direct
+                // Blake-G contract verifies but does not materialize ordinal 6.
                 return Ok(ResidentWitnessInputRoute {
                     columns: Vec::new(),
                     seed_scalars: Vec::new(),

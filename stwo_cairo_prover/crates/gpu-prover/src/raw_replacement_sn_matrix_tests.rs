@@ -25,14 +25,15 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
 };
 
 use crate::arena_plan::{
-    BufferPurpose, CommitmentTreeId, DirectCompactTerminalPlan, ExecutionTableGeometry,
-    ProofArenaPlan, ResidentBackend,
+    BlakeGWitnessContract, BufferLifetime, BufferPurpose, CommitmentTreeId,
+    DirectCompactTerminalPlan, ExecutionTableGeometry, ProofArenaPlan, ProofEpoch, ResidentBackend,
 };
 use crate::plan::ProofPlan;
 use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::prepare_resident_ingest;
 use crate::raw_replacement_oracle_tests::assert_cached_recorded_matches_fresh;
 use crate::recorded_witness_inputs::recorded_witness_inputs_for_raw_replacement_plan;
+use crate::relation_execution::RelationSourcePlane;
 use crate::relation_table::CAIRO_RELATION_GRAPH;
 use crate::replacement_host_cache::{
     ReplacementHostCache, ReplacementHostMaterialization, ReplacementHostTemplate,
@@ -315,6 +316,174 @@ fn assert_sn_terminal_fusion(profile: &str, arena: &ProofArenaPlan) {
     }));
 }
 
+fn assert_sn_blake_g_direct(profile: &str, arena: &ProofArenaPlan) {
+    let direct = arena
+        .witness()
+        .components
+        .iter()
+        .filter_map(|component| {
+            component
+                .blake_g_contract
+                .direct()
+                .map(|selection| (component, selection))
+        })
+        .collect::<Vec<_>>();
+    let [(component, selection)] = direct.as_slice() else {
+        panic!("{profile}: expected exactly one direct Blake-G witness contract")
+    };
+    assert_eq!(component.component, "blake_g");
+    assert_eq!(selection.input_ordinals, [0, 1, 2, 3, 4, 5]);
+    assert_eq!(selection.enabler_ordinal, 6);
+    assert_eq!(selection.retired_lookup_words_per_row, 87);
+    assert_eq!(arena.relation().blake_g_inputs.as_ref(), Some(*selection));
+    assert!(matches!(
+        component.blake_g_contract,
+        BlakeGWitnessContract::Direct(_)
+    ));
+
+    let gather = component
+        .input_gather
+        .as_ref()
+        .unwrap_or_else(|| panic!("{profile}: direct Blake-G gather missing"));
+    assert_eq!(component.requirements.input_column_words.len(), 7);
+    assert_eq!(component.slots.input_columns.len(), 6);
+    assert_eq!(gather.requirements.input_width, 6);
+    assert!(!gather.requirements.include_enabler);
+    assert!(!gather.requirements.include_iota);
+    assert_eq!(gather.requirements.consumer_input_column_words.len(), 6);
+    assert_eq!(
+        gather.slots.consumer_input_columns,
+        component.slots.input_columns
+    );
+
+    for (&ordinal, &slot) in selection
+        .input_ordinals
+        .iter()
+        .zip(&component.slots.input_columns)
+    {
+        let (input, binding) = arena
+            .find(
+                Some("blake_g"),
+                Some(selection.part),
+                BufferPurpose::WitnessInput,
+                ordinal,
+            )
+            .unwrap_or_else(|| panic!("{profile}: direct Blake-G input {ordinal} missing"));
+        assert_eq!(binding.physical, slot);
+        assert_eq!(input.len_words, component.requirements.row_count);
+        assert_eq!(
+            input.lifetime,
+            BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Interaction).unwrap()
+        );
+    }
+    assert!(
+        arena
+            .find(
+                Some("blake_g"),
+                Some(selection.part),
+                BufferPurpose::WitnessInput,
+                selection.enabler_ordinal,
+            )
+            .is_none(),
+        "{profile}: retired Blake-G enabler must have no arena owner"
+    );
+    assert!(
+        arena
+            .find(
+                Some("blake_g"),
+                Some(selection.part),
+                BufferPurpose::LookupInputs,
+                0,
+            )
+            .is_none(),
+        "{profile}: retired Blake-G lookup slab must have no arena owner"
+    );
+    assert_eq!(
+        component.slots.multiplicity_dummy,
+        Some(component.slots.lookup_words)
+    );
+    assert_eq!(component.slots.lookup_words, component.slots.sub_words);
+
+    let (input_pointers, _) = arena
+        .find(
+            Some("blake_g"),
+            Some(selection.part),
+            BufferPurpose::WitnessInputPointers,
+            0,
+        )
+        .unwrap();
+    let words_per_pointer = component.requirements.input_pointer_words
+        / component.requirements.input_column_words.len();
+    assert_eq!(
+        input_pointers.len_words,
+        words_per_pointer * selection.input_ordinals.len()
+    );
+
+    let relation_source = arena
+        .relation()
+        .source_plan
+        .iter()
+        .filter(|source| source.plane == RelationSourcePlane::WitnessInput)
+        .collect::<Vec<_>>();
+    assert_eq!(relation_source.len(), 1);
+    assert_eq!(relation_source[0].batch, selection.batch);
+    assert_eq!(relation_source[0].part, selection.part);
+    assert_eq!(relation_source[0].instance_index, selection.instance_index);
+    assert_eq!(relation_source[0].column_count, 6);
+
+    let base_aliases = (0..53)
+        .filter(|&ordinal| {
+            let (_, evaluations) = arena
+                .find(
+                    Some("blake_g"),
+                    Some(selection.part),
+                    BufferPurpose::BaseTrace,
+                    ordinal,
+                )
+                .unwrap();
+            let (_, coefficients) = arena
+                .find(
+                    Some("blake_g"),
+                    Some(selection.part),
+                    BufferPurpose::BaseCoefficients,
+                    ordinal,
+                )
+                .unwrap();
+            evaluations.physical == coefficients.physical
+        })
+        .count();
+    assert_eq!(base_aliases, 53, "{profile}: Blake-G base alias count");
+
+    let rows = component.requirements.row_count;
+    let retired_lookup_words = rows * selection.retired_lookup_words_per_row as usize;
+    let retired_enabler_words = rows;
+    let retained_operand_words = rows * selection.input_ordinals.len();
+    let peak_words = ProofEpoch::ALL
+        .into_iter()
+        .map(|epoch| arena.high_water_words(epoch))
+        .max()
+        .unwrap();
+    eprintln!(
+        "SN_BLAKE_G_DIRECT_RECEIPT {}",
+        serde_json::json!({
+            "schema": "stwo.sn-blake-g-direct.v1",
+            "profile": profile,
+            "rows": rows,
+            "recorded_inputs": component.requirements.input_column_words.len(),
+            "materialized_inputs": component.slots.input_columns.len(),
+            "retired_enabler_ordinal": selection.enabler_ordinal,
+            "retired_lookup_words": retired_lookup_words,
+            "retired_enabler_words": retired_enabler_words,
+            "retained_operand_words": retained_operand_words,
+            "input_pointer_words": input_pointers.len_words,
+            "shared_tail_dummy_words": 1,
+            "base_trace_coefficient_aliases": base_aliases,
+            "arena_total_words": arena.total_words(),
+            "arena_peak_words": peak_words,
+        })
+    );
+}
+
 fn assert_current_bindings_match_fresh(
     case: &str,
     template: &ReplacementHostTemplate,
@@ -576,6 +745,7 @@ fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
     );
     assert!(Arc::ptr_eq(&cold_shape.executable, &warm_shape.executable));
     assert_sn_terminal_fusion(fixture.profile, cold_shape.executable.arena());
+    assert_sn_blake_g_direct(fixture.profile, cold_shape.executable.arena());
     assert_ne!(
         cold_shape.bindings, warm_shape.bindings,
         "{}: warm handle must bind current statement values",
