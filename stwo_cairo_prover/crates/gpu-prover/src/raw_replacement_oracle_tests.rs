@@ -20,14 +20,17 @@ use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::{prepare_resident_ingest, GpuError, PreparedResidentIngest};
 use crate::recorded_witness_inputs::{
     recorded_witness_inputs_for_raw_replacement_plan, recorded_witness_inputs_for_replacement_plan,
-    PlannedRecordedWitnessInputs, RecordedInputColumnProvenance,
+    DeviceGatherColumn, PlannedRecordedWitnessInputs, RecordedInputColumnProvenance,
 };
 use crate::relation_table::CAIRO_RELATION_GRAPH;
 use crate::replacement_host_cache::{
     ReplacementHostCache, ReplacementHostCacheError, ReplacementHostMaterialization,
 };
 use crate::resident_input::ResidentProverInputOwner;
-use crate::resident_session::ResidentPreWitnessInput;
+use crate::resident_session::{
+    direct_blake_g_route_is_exact_for_test, resident_host_witness_input_route_shapes_for_test,
+    ResidentPreWitnessInput, ResidentSessionError,
+};
 use crate::resident_shape::{
     raw_replacement_compacted_geometry, raw_replacement_proof_plan, RawResidentShapeError,
 };
@@ -309,6 +312,238 @@ fn raw_replacement_production_ingest_is_move_only_and_generator_free() {
         assert_eq!(moved.len(), rows, "{label}");
         assert_eq!(moved.as_ptr(), pointer, "{label}");
     }
+}
+
+#[test]
+fn raw_replacement_direct_blake_g_route_admits_tiny_fixture_and_rejects_drift() {
+    let input = run_and_adapt(
+        &get_compiled_cairo_program_path("test_prove_verify_blake_opcode"),
+        ProgramType::Json,
+        LayoutName::all_cairo_stwo,
+        None,
+    )
+    .unwrap();
+    assert!(input
+        .state_transitions
+        .casm_states_by_opcode
+        .generic_opcode
+        .is_empty());
+    assert_eq!(
+        input
+            .state_transitions
+            .casm_states_by_opcode
+            .blake_compress_opcode
+            .len(),
+        2
+    );
+
+    let mut host_cache = ReplacementHostCache::new(1).unwrap();
+    let cold = prepare_resident_ingest(
+        ResidentBackend::ReplacementV1,
+        Some(&mut host_cache),
+        input.clone(),
+        PreProcessedTraceVariant::CanonicalWithoutPedersen,
+        None,
+    )
+    .unwrap();
+    let warm = prepare_resident_ingest(
+        ResidentBackend::ReplacementV1,
+        Some(&mut host_cache),
+        input,
+        PreProcessedTraceVariant::CanonicalWithoutPedersen,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        cold.audit.replacement_host_cache.unwrap().materialization,
+        ReplacementHostMaterialization::Compiled
+    );
+    assert_eq!(
+        warm.audit.replacement_host_cache.unwrap().materialization,
+        ReplacementHostMaterialization::Reused
+    );
+    assert!(Arc::ptr_eq(
+        &cold.preprocessed_trace,
+        &warm.preprocessed_trace
+    ));
+
+    let ResidentPreWitnessInput::ReplacementV1 {
+        input: cold_owner,
+        template: cold_template,
+    } = &cold.input
+    else {
+        panic!("cold replacement dispatch returned legacy input")
+    };
+    let ResidentPreWitnessInput::ReplacementV1 {
+        input: warm_owner,
+        template: warm_template,
+    } = &warm.input
+    else {
+        panic!("warm replacement dispatch returned legacy input")
+    };
+    assert!(Arc::ptr_eq(cold_template, warm_template));
+
+    let cold_claim = cold_template.bind_claim(cold_owner.public_data());
+    let warm_claim = warm_template.bind_claim(warm_owner.public_data());
+    let cold_recorded = cold_template.bind_recorded(cold_owner).unwrap();
+    let warm_recorded = warm_template.bind_recorded(warm_owner).unwrap();
+    let geometry = |owner: &ResidentProverInputOwner, claim: &cairo_air::claims::CairoClaim| {
+        let public_memory_entries = claim
+            .public_data
+            .public_memory
+            .get_entries(
+                claim.public_data.initial_state.pc.0,
+                claim.public_data.initial_state.ap.0,
+                claim.public_data.final_state.ap.0,
+            )
+            .count();
+        ExecutionTableGeometry::new(
+            owner.execution_memory().address_to_id.len(),
+            owner.execution_memory().f252_values.len(),
+            owner.execution_memory().small_values.len(),
+        )
+        .with_public_memory_entries(public_memory_entries)
+    };
+    let policy = ProtocolPlanPolicy::replacement_v1(0x424c_414b_4547, 2048);
+    let mut executable_cache = ShapeExecutableCache::new(1).unwrap();
+    let cold_shape = cold_template
+        .select_shape_executable(
+            &mut executable_cache,
+            &cold_claim,
+            &cold.preprocessed_trace,
+            PcsConfig::default(),
+            false,
+            Some(geometry(cold_owner, &cold_claim)),
+            policy,
+        )
+        .unwrap();
+    let warm_shape = warm_template
+        .select_shape_executable(
+            &mut executable_cache,
+            &warm_claim,
+            &warm.preprocessed_trace,
+            PcsConfig::default(),
+            false,
+            Some(geometry(warm_owner, &warm_claim)),
+            policy,
+        )
+        .unwrap();
+    assert_eq!(
+        cold_shape.materialization,
+        ShapeExecutableMaterialization::Compiled
+    );
+    assert_eq!(
+        warm_shape.materialization,
+        ShapeExecutableMaterialization::Reused
+    );
+    assert!(Arc::ptr_eq(&cold_shape.executable, &warm_shape.executable));
+
+    let arena = cold_shape.executable.arena();
+    let blake_index = arena
+        .witness()
+        .components
+        .iter()
+        .position(|component| component.component == "blake_g")
+        .expect("tiny fixture must plan Blake-G");
+    let blake_component = &arena.witness().components[blake_index];
+    let selection = blake_component
+        .blake_g_contract
+        .direct()
+        .expect("tiny ReplacementV1 fixture must select direct Blake-G");
+    let cold_routes =
+        resident_host_witness_input_route_shapes_for_test(&cold_recorded, arena, &cold.input)
+            .unwrap();
+    let warm_routes =
+        resident_host_witness_input_route_shapes_for_test(&warm_recorded, arena, &warm.input)
+            .unwrap();
+    assert_eq!(cold_routes[blake_index], (0, 0, false));
+    assert_eq!(warm_routes[blake_index], (0, 0, false));
+    assert!(direct_blake_g_route_is_exact_for_test(
+        &cold_recorded.lanes[blake_index],
+        blake_component,
+    ));
+
+    let assert_route_rejected = |recorded: &PlannedRecordedWitnessInputs| {
+        assert!(matches!(
+            resident_host_witness_input_route_shapes_for_test(recorded, arena, &cold.input),
+            Err(ResidentSessionError::RecordedWitnessInputRoute {
+                component: "blake_g",
+                ordinal,
+            }) if ordinal == selection.enabler_ordinal as usize
+        ));
+    };
+    let enabler = selection.enabler_ordinal as usize;
+    let exact_enabler = match &cold_recorded.lanes[blake_index].columns[enabler] {
+        RecordedInputColumnProvenance::StructuralEnabler(words) => words.to_vec(),
+        provenance => panic!("unexpected Blake-G enabler: {provenance:?}"),
+    };
+
+    let mut host_tag = cold_recorded.clone();
+    host_tag.lanes[blake_index].columns[enabler] =
+        RecordedInputColumnProvenance::Host(exact_enabler.clone());
+    assert_route_rejected(&host_tag);
+
+    let mut gather_tag = cold_recorded.clone();
+    gather_tag.lanes[blake_index].columns[enabler] =
+        RecordedInputColumnProvenance::DeviceGather(DeviceGatherColumn::Enabler);
+    assert_route_rejected(&gather_tag);
+
+    let mut wrong_value = cold_recorded.clone();
+    let mut words = exact_enabler.clone();
+    words[0] ^= 1;
+    wrong_value.lanes[blake_index].columns[enabler] =
+        RecordedInputColumnProvenance::StructuralEnabler(Arc::from(words));
+    assert_route_rejected(&wrong_value);
+
+    let mut wrong_length = cold_recorded.clone();
+    wrong_length.lanes[blake_index].columns[enabler] =
+        RecordedInputColumnProvenance::StructuralEnabler(Arc::from(
+            exact_enabler[..exact_enabler.len() - 1].to_vec(),
+        ));
+    assert_route_rejected(&wrong_length);
+
+    let mut extra_column = cold_recorded.lanes[blake_index].clone();
+    extra_column
+        .columns
+        .push(RecordedInputColumnProvenance::StructuralEnabler(Arc::from(
+            exact_enabler.clone(),
+        )));
+    assert!(!direct_blake_g_route_is_exact_for_test(
+        &extra_column,
+        blake_component,
+    ));
+
+    let mut wrong_writer_extent = blake_component.clone();
+    wrong_writer_extent.requirements.input_column_words[0] -= 1;
+    assert!(!direct_blake_g_route_is_exact_for_test(
+        &cold_recorded.lanes[blake_index],
+        &wrong_writer_extent,
+    ));
+
+    let mut wrong_gather_extent = blake_component.clone();
+    wrong_gather_extent
+        .input_gather
+        .as_mut()
+        .unwrap()
+        .requirements
+        .consumer_input_column_words[0] -= 1;
+    assert!(!direct_blake_g_route_is_exact_for_test(
+        &cold_recorded.lanes[blake_index],
+        &wrong_gather_extent,
+    ));
+
+    let mut short_consumer_slots = blake_component.clone();
+    short_consumer_slots
+        .input_gather
+        .as_mut()
+        .unwrap()
+        .slots
+        .consumer_input_columns
+        .pop();
+    assert!(!direct_blake_g_route_is_exact_for_test(
+        &cold_recorded.lanes[blake_index],
+        &short_consumer_slots,
+    ));
 }
 
 #[test]
