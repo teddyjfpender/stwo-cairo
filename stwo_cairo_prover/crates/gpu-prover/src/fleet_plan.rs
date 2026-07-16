@@ -16,9 +16,16 @@ use crate::transcript_plan::{
 };
 
 mod identity;
+mod lower_compiled;
 mod storage;
 mod validate;
 
+pub use lower_compiled::{
+    FleetLoweringError, FleetOperationPlacement, FleetOwnerPlacement, FleetPlacementInput,
+    FleetPlacementTopology, FleetReplicaPlacement, FleetRuntimeAdmissionError,
+    FleetSpillChunkPlacement, FleetSpillPlacement, FleetSpillTransitionPlacement,
+    FleetStoragePlacement, FleetTransitionPlacement, InPlaceAliasPlacement,
+};
 pub use storage::{EffectContractId, InPlaceAlias, StorageBinding, StorageDesc, StorageId};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
