@@ -72,6 +72,23 @@ full-proof integration lane, not the seconds-scale kernel lab. Current SN2 peaks
 at 50.018 decimal GB VRAM, so use an 80 GB GPU here; use cheaper GPUs for the
 kernel/transcript-segment replay lane, not this full proof.
 
+For the direct Blake-G CUDA admission gate, use the much smaller A40 lane instead
+of building or proving an SN PIE:
+
+```bash
+DRY_RUN=1 BENCH_POD_ID=dry-run-placeholder \
+  ./pod_run.sh recipes/direct_blake_g_native.phases direct_blake_g_sm86_dry_run
+
+BENCH_POD_ID=<secure-a40-pod-id> POD_RUN_POLL_INTERVAL=2 MAX_WAIT=3600 \
+  ./pod_run.sh recipes/direct_blake_g_native.phases direct_blake_g_sm86
+```
+
+The recipe pins `sm_86`, CUDA 11.8, the Stwo head, test source, lockfile and
+toolchain; it requires one real eager-plus-graph-replay native test with zero
+ignored tests, hashes the resulting executable and evidence, and stops the pod on
+every exit. A pass promotes that exact source projection to the later target-sm90
+gate. It is not an SN-PIE benchmark, an H100 result or a proving-MHz claim.
+
 | Flag          | Meaning                                                                 |
 |---------------|-------------------------------------------------------------------------|
 | `--pie SEL`   | Which PIE to benchmark: `1..4` = `SN_PIE_<n>.zip`, `10t` = 10-transfer. Default `2`. |
