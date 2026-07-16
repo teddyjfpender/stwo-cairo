@@ -30,10 +30,19 @@ def _ssh_opts() -> list[str]:
         "-o", "ServerAliveCountMax=6",
         "-o", "LogLevel=ERROR",
     ]
-    # The key runpodctl provisions (same one build_and_push.sh uses); fall back to
-    # agent/default keys when absent.
-    key = Path.home() / ".runpod" / "ssh" / "runpodctl-ssh-key"
-    if key.exists():
+    # RunPod has used both the legacy and current key names. Pick the first
+    # installed private key instead of silently falling back to unrelated
+    # default SSH identities.
+    key_root = Path.home() / ".runpod" / "ssh"
+    key = next(
+        (
+            candidate
+            for name in ("runpodctl-ssh-key", "RunPod-Key-Go", "RunPod-Key-Ed25519")
+            if (candidate := key_root / name).is_file()
+        ),
+        None,
+    )
+    if key is not None:
         opts = ["-i", str(key), *opts]
     return opts
 
