@@ -22,9 +22,12 @@ The primary deployment matrix is RTX 3090 `sm_86` (24 GB), RTX 4090 `sm_89`
 (24 GB), and RTX 5090 `sm_120` (32 GB), each with a separate native archive,
 AOT pack, image, memory receipt, correctness gate, and performance record. H100
 is a secondary counter/roofline reference. The current SN2 prover is still
-**50.018 GB measured / 43.907 GiB planned**, so it is not admitted on any primary
-worker: exact owned peak must reach **≤21 GiB** on 3090/4090 and **≤29 GiB** on
-5090 before those cards can produce a resident fleet headline.
+**50.018 GB measured / 43.907 GiB planned**, so the present one-owner layout is not
+admitted on one primary worker. Cooperative admission instead requires every worker's
+assigned live slabs plus transfer/reduction buffers to remain **≤21 GiB** on 3090/4090
+or **≤29 GiB** on 5090, while the fleet-wide ownership proof covers the exact job with
+no unowned duplicate. L1 spill/stream is the one-GPU fit path; L2/L3 may distribute a
+larger proof across several cards.
 
 The current public `fleet.sh` rotate mode is a development precursor, not the formal
 stream benchmark. Promotion requires `SN-STREAM-100`: a fresh hidden-seed, balanced
