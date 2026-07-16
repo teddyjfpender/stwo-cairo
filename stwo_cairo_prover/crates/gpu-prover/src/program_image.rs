@@ -15,16 +15,17 @@
 
 use core::ops::Range;
 
+use stwo_backend_cuda::{TranscriptInputId, TranscriptOutputId};
 use stwo_cairo_prover::witness::proof_shape::TracePartId;
 
 use crate::arena_plan::{BufferLifetime, BufferPurpose, LogicalBufferId, ProofEpoch};
 use crate::compiled_proof::{CompiledProof, ProofBundleSection, ProofCodecIdentity, ValueLayout};
 use crate::proof_bundle::ResidentProofBundleLayout;
 use crate::transcript_plan::{CairoBlake2sTranscriptPlan, CairoTranscriptSegment};
-use stwo_backend_cuda::{TranscriptInputId, TranscriptOutputId};
 
 mod emitter;
 mod identity;
+mod lower_compiled;
 
 use identity::ArenaProgramInventoryIdentity;
 
