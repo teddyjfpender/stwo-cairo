@@ -26,7 +26,7 @@ is a secondary counter/roofline reference. The current SN2 prover is still
 admitted on one primary worker. Cooperative admission instead requires every worker's
 assigned live slabs plus transfer/reduction buffers to remain **≤21 GiB** on 3090/4090
 or **≤29 GiB** on 5090, while the fleet-wide ownership proof covers the exact job with
-no unowned duplicate. L1 spill/stream is the one-GPU fit path; L2/L3 may distribute a
+no unowned or undeclared duplicate. L1 spill/stream is the one-GPU fit path; L2/L3 may distribute a
 larger proof across several cards.
 
 The current public `fleet.sh` rotate mode is a development precursor, not the formal
