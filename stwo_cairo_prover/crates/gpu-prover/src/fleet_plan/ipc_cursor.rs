@@ -2,6 +2,9 @@
 //!
 //! The cursor owns no device address or transport. It admits only the exact
 //! plan-derived edge identity and preserves equal-start-step work as a wave.
+//! Receipts are ordering metadata, not authenticated DMA-completion evidence.
+//! The installed runtime must bind each phase to the exact device, IPC key and
+//! completion event for its plan-derived byte operation before submitting it.
 
 use std::collections::BTreeMap;
 
@@ -255,22 +258,29 @@ impl FleetIpcCoordinatorCursor {
         }
 
         let edge = &self.edges[edge_index];
+        if receipt.binding.transition != edge.span.transition
+            || receipt.binding.span_ordinal != edge.span.span_ordinal
+            || receipt.binding.edge_ordinal != edge.span.edge_ordinal
+            || receipt.binding.owner != edge.span.owner
+            || receipt.binding.peer != edge.span.peer
+        {
+            return self.poison(FleetIpcCursorError::WrongEdgeIdentity(
+                receipt.binding.edge_ordinal,
+            ));
+        }
+        if edge.next != Some(receipt.phase) {
+            return self.poison(FleetIpcCursorError::OutOfOrderPhase {
+                edge: receipt.binding.edge_ordinal,
+                expected: edge.next,
+                actual: receipt.phase,
+            });
+        }
         let expected = FleetIpcPhaseReceipt::for_span(
             self.plan_identity,
             self.proof_generation,
             edge.span,
             receipt.phase,
         )?;
-        if receipt.binding.transition != expected.binding.transition
-            || receipt.binding.span_ordinal != expected.binding.span_ordinal
-            || receipt.binding.edge_ordinal != expected.binding.edge_ordinal
-            || receipt.binding.owner != expected.binding.owner
-            || receipt.binding.peer != expected.binding.peer
-        {
-            return self.poison(FleetIpcCursorError::WrongEdgeIdentity(
-                receipt.binding.edge_ordinal,
-            ));
-        }
         if receipt.binding.generation != expected.binding.generation {
             return self.poison(FleetIpcCursorError::GenerationMismatch {
                 expected: expected.binding.generation,
@@ -281,13 +291,6 @@ impl FleetIpcCoordinatorCursor {
             return self.poison(FleetIpcCursorError::WrongWorker {
                 expected: expected.worker,
                 actual: receipt.worker,
-            });
-        }
-        if edge.next != Some(receipt.phase) {
-            return self.poison(FleetIpcCursorError::OutOfOrderPhase {
-                edge: receipt.binding.edge_ordinal,
-                expected: edge.next,
-                actual: receipt.phase,
             });
         }
 

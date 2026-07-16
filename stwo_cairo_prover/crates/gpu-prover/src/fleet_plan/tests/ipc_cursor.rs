@@ -1,3 +1,5 @@
+use stwo_backend_cuda::IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
+
 use super::runtime_view::transfer_fixture;
 use super::*;
 
@@ -5,6 +7,78 @@ const PROOF_GENERATION: u64 = 41;
 
 fn view() -> FleetRuntimeView {
     compile(transfer_fixture()).unwrap().runtime_view().unwrap()
+}
+
+fn two_wave_view() -> FleetRuntimeView {
+    let mut fixture = transfer_fixture();
+    let second = fixture
+        .placement
+        .owners
+        .iter()
+        .find(|owner| {
+            owner.live.start == ScheduleStep(0) && owner.value.version != fixture.spill_value
+        })
+        .unwrap()
+        .value;
+    let value = fixture.compiled.value(second.version).unwrap();
+    let layout = value.layout.clone();
+    let alignment = value.alignment;
+    let bytes = layout.logical_bytes().unwrap();
+    let storage = StorageId(fixture.placement.storages.len() as u32);
+
+    fixture.placement.topology.links[0].max_transfer_bytes = fixture.placement.topology.links[0]
+        .max_transfer_bytes
+        .max(bytes);
+    fixture.placement.topology.workers[0].exchange_reserve_bytes +=
+        IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
+    fixture.placement.topology.workers[0].capacity_bytes += IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
+    fixture.placement.topology.workers[1].capacity_bytes += bytes;
+    fixture.placement.replicas.push(FleetReplicaPlacement {
+        id: ReplicaId(1),
+        value: second,
+        canonical_worker: WorkerId(0),
+        worker: WorkerId(1),
+        layout: layout.clone(),
+        origin: ReplicaOrigin::Transition(LayoutTransitionId(1)),
+        live: during(3, 50),
+    });
+    fixture
+        .placement
+        .transitions
+        .push(FleetTransitionPlacement {
+            id: LayoutTransitionId(1),
+            value: second,
+            source_worker: WorkerId(0),
+            destination_replica: ReplicaId(1),
+            axes: layout
+                .axes
+                .iter()
+                .map(|axis| AxisMap {
+                    source: axis.tag,
+                    destination: axis.tag,
+                })
+                .collect(),
+            interval: ExecutionInterval::BeforeBarrier(0),
+            during: during(3, 4),
+            scratch_bytes: 8,
+            scratch_worker: WorkerId(1),
+            route: FleetLinkId(0),
+        });
+    fixture.placement.storages.push(StorageDesc {
+        id: storage,
+        worker: WorkerId(1),
+        bytes,
+        alignment_bytes: alignment,
+    });
+    fixture
+        .placement
+        .storage_bindings
+        .push(FleetStoragePlacement {
+            storage,
+            value: second,
+            offset_bytes: 0,
+        });
+    compile(fixture).unwrap().runtime_view().unwrap()
 }
 
 fn receipt(view: &FleetRuntimeView, edge: usize, phase: FleetIpcPhase) -> FleetIpcPhaseReceipt {
@@ -86,12 +160,53 @@ fn same_step_spans_are_one_wave_without_edge_ordering() {
 }
 
 #[test]
+fn future_wave_poisoned_and_next_wave_opens_only_after_current_wave_arms() {
+    let view = two_wave_view();
+    assert_eq!(view.spans().len(), 2);
+
+    let mut future = FleetIpcCoordinatorCursor::new(&view, PROOF_GENERATION).unwrap();
+    assert_eq!(future.active_wave_edges(), [0]);
+    assert_eq!(
+        future
+            .accept(receipt(&view, 1, FleetIpcPhase::Published))
+            .unwrap_err(),
+        FleetIpcCursorError::WrongWave {
+            edge: 1,
+            active_step: ScheduleStep(1),
+        }
+    );
+    assert_eq!(future.state(), FleetIpcAttemptState::Poisoned);
+
+    let mut cursor = FleetIpcCoordinatorCursor::new(&view, PROOF_GENERATION).unwrap();
+    for phase in [
+        FleetIpcPhase::Published,
+        FleetIpcPhase::Consumed,
+        FleetIpcPhase::Reclaimed,
+    ] {
+        cursor.accept(receipt(&view, 0, phase)).unwrap();
+    }
+    assert_eq!(
+        cursor
+            .accept(receipt(&view, 0, FleetIpcPhase::Armed))
+            .unwrap(),
+        FleetIpcCursorProgress::WaveComplete {
+            completed: ScheduleStep(1),
+            next: ScheduleStep(3),
+        }
+    );
+    assert_eq!(cursor.active_wave_edges(), [1]);
+}
+
+#[test]
 fn stale_future_and_duplicate_phases_poison_the_attempt() {
     let view = view();
 
+    let mut future_receipt = receipt(&view, 0, FleetIpcPhase::Consumed);
+    future_receipt.binding.generation += 1;
+    future_receipt.worker = WorkerId(0);
     let mut future = FleetIpcCoordinatorCursor::new(&view, PROOF_GENERATION).unwrap();
     assert!(matches!(
-        future.accept(receipt(&view, 0, FleetIpcPhase::Consumed)),
+        future.accept(future_receipt),
         Err(FleetIpcCursorError::OutOfOrderPhase {
             expected: Some(FleetIpcPhase::Published),
             actual: FleetIpcPhase::Consumed,
@@ -142,6 +257,12 @@ fn wrong_rank_edge_and_attempt_poison_globally() {
     let (error, _) = poisoned_by(|receipt| receipt.binding.proof_generation += 1);
     assert_eq!(error, FleetIpcCursorError::WrongAttempt);
     let (error, _) = poisoned_by(|receipt| receipt.binding.transition = LayoutTransitionId(9));
+    assert!(matches!(error, FleetIpcCursorError::WrongEdgeIdentity(0)));
+    let (error, _) = poisoned_by(|receipt| receipt.binding.span_ordinal += 1);
+    assert!(matches!(error, FleetIpcCursorError::WrongEdgeIdentity(0)));
+    let (error, _) = poisoned_by(|receipt| receipt.binding.owner = WorkerId(1));
+    assert!(matches!(error, FleetIpcCursorError::WrongEdgeIdentity(0)));
+    let (error, _) = poisoned_by(|receipt| receipt.binding.peer = WorkerId(0));
     assert!(matches!(error, FleetIpcCursorError::WrongEdgeIdentity(0)));
     let (error, _) = poisoned_by(|receipt| receipt.binding.edge_ordinal = 9);
     assert_eq!(error, FleetIpcCursorError::UnknownEdge(9));

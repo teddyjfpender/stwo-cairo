@@ -17,6 +17,7 @@ use crate::transcript_plan::{
 };
 
 mod adversarial;
+mod barrier;
 mod ipc_cursor;
 mod pow;
 mod runtime_view;

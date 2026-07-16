@@ -4,7 +4,7 @@
 //! generations. A production controller must bind receipts to its queue-owned
 //! attempt ID, transport identity and exact completion event before admission.
 
-use crate::fleet_plan::{FleetProofPlan, WorkerId};
+use crate::fleet_plan::{FleetProofPlan, ScheduleStep, WorkerId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BarrierReceipt {
@@ -12,6 +12,7 @@ pub struct BarrierReceipt {
     pub proof_generation: u64,
     pub barrier_ordinal: u32,
     pub worker: WorkerId,
+    pub ready_step: ScheduleStep,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +36,7 @@ pub struct CoordinatorBarrierCursor {
     barrier_count: u32,
     next_ordinal: u32,
     arrived: Vec<bool>,
+    ready_steps: Vec<ScheduleStep>,
 }
 
 impl CoordinatorBarrierCursor {
@@ -46,6 +48,13 @@ impl CoordinatorBarrierCursor {
         if barrier_count == 0 || worker_count == 0 {
             return Err(FleetBarrierError::InvalidPlan);
         }
+        let receipt_count = usize::try_from(barrier_count)
+            .map_err(|_| FleetBarrierError::SizeOverflow)?
+            .checked_mul(worker_count)
+            .ok_or(FleetBarrierError::SizeOverflow)?;
+        if plan.placement().barrier_arrivals.len() != receipt_count {
+            return Err(FleetBarrierError::InvalidPlan);
+        }
         Ok(Self {
             plan_identity: plan.identity(),
             proof_generation,
@@ -53,6 +62,12 @@ impl CoordinatorBarrierCursor {
             barrier_count,
             next_ordinal: 0,
             arrived: vec![false; worker_count],
+            ready_steps: plan
+                .placement()
+                .barrier_arrivals
+                .iter()
+                .map(|arrival| arrival.ready_step)
+                .collect(),
         })
     }
 
@@ -67,10 +82,30 @@ impl CoordinatorBarrierCursor {
             return Err(FleetBarrierError::StaleOrFutureReceipt);
         }
         let rank = usize::from(receipt.worker.0);
+        if rank >= self.arrived.len() {
+            return Err(FleetBarrierError::UnknownWorker(receipt.worker));
+        }
+        let ready_step_index = usize::try_from(self.next_ordinal)
+            .map_err(|_| FleetBarrierError::SizeOverflow)?
+            .checked_mul(self.arrived.len())
+            .and_then(|base| base.checked_add(rank))
+            .ok_or(FleetBarrierError::SizeOverflow)?;
+        let expected_ready_step = self
+            .ready_steps
+            .get(ready_step_index)
+            .copied()
+            .ok_or(FleetBarrierError::UnknownWorker(receipt.worker))?;
+        if receipt.ready_step != expected_ready_step {
+            return Err(FleetBarrierError::UnexpectedReadyStep {
+                worker: receipt.worker,
+                expected: expected_ready_step,
+                actual: receipt.ready_step,
+            });
+        }
         let arrived = self
             .arrived
             .get_mut(rank)
-            .ok_or(FleetBarrierError::UnknownWorker(receipt.worker))?;
+            .expect("worker rank was bounds checked");
         if core::mem::replace(arrived, true) {
             return Err(FleetBarrierError::DuplicateWorker(receipt.worker));
         }
@@ -170,6 +205,11 @@ pub enum FleetBarrierError {
     WrongCoordinator(WorkerId),
     StaleOrFutureReceipt,
     StaleOrFutureRelease,
+    UnexpectedReadyStep {
+        worker: WorkerId,
+        expected: ScheduleStep,
+        actual: ScheduleStep,
+    },
     IncompleteBarrier,
     Complete,
     SizeOverflow,
