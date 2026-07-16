@@ -45,7 +45,8 @@ which is ON by default.
 
 ```
 cd gpu_benchmarks/fleet
-./gpufleet.sh up --gpu 4090 --max-usd-hr <ceiling> --purpose fleet-dev # repeat per worker
+./gpufleet.sh up --recipe ../loop/recipes/<sealed-worker>.phases \
+  --gpu 4090 --purpose fleet-dev                              # repeat per worker
 $EDITOR fleet.conf                                                    # add their ids + $/hr
 ./fleet.sh --prep                                                     # sync+build+gate, then benchmark
 cat fleet_report.json                                                 # the aggregate number
@@ -56,7 +57,7 @@ cat fleet_report.json                                                 # the aggr
 | File                | Role                                                                       |
 |---------------------|----------------------------------------------------------------------------|
 | `fleet.sh`          | Launch a rotate-mode stream on every pod concurrently, poll with per-pod stall detection, aggregate useful MHz + \$/hr + \$/MHz-hr, write `fleet_report.json` + a human table. |
-| `pod_provision.sh`  | `runpodctl` create/list/terminate/ssh-info helpers, GPU-type arg, and the **CPU-cores-first** procurement note. |
+| `pod_provision.sh`  | Legacy read-only pod/GPU/SSH helpers plus explicit termination; raw create is retired in favor of recipe-bound `gpufleet up`. |
 | `fleet.conf`        | The pod roster: `id \| gpu \| usd_per_hr \| fb_host \| fb_port \| fb_key \| enabled` (one pod per line). |
 
 ## What the current development `fleet.sh` run does
@@ -218,7 +219,7 @@ correctness gate, and sustained whole-SN-PIE measurement first.
 |---------------------|-----------------------------------------------------------------|
 | `fleet.sh`          | The concurrent orchestrator (steps 0 + a–h above).              |
 | `build_and_push.sh` | Build once; distribute the portable binary, pinned bootloader, and JIT cache. |
-| `pod_provision.sh`  | `runpodctl` create/list/terminate/ssh-info helpers.             |
+| `pod_provision.sh`  | Legacy list/gpus/ssh-info/terminate helpers; `create` fails closed and points to recipe-bound `gpufleet up`. |
 | `fleet.conf`        | Pod roster (edit to add/remove/disable pods).                   |
 | `fleet_report.json` | Latest aggregate report (overwritten each run).                 |
 | `results/`          | Raw per-pod stdout/err + stall evidence + run manifest.         |
@@ -236,14 +237,18 @@ refresh it); build_and_push.sh and the loop scripts consume it unchanged.
       ./gpufleet.sh pregate                    # local no-GPU battery — required before spend
     ./gpufleet.sh offers --gpu 3090 4090 5090  # primary-fleet live $/hr + stock
     ./gpufleet.sh check-manifest manifests/jit_witness_gate.toml
-    ./gpufleet.sh run manifests/jit_witness_gate.toml --auto 4090 --push \
-        --purpose jit-witness-gate             # provision → push → gates → stop, one command
+    ./gpufleet.sh up --recipe ../loop/recipes/<sealed-worker>.phases \
+        --gpu 4090 --purpose jit-witness-gate  # recipe-authorized provisioning
+    ./gpufleet.sh run manifests/jit_witness_gate.toml --pod ID --gpu 4090 \
+        --name-prefix <sealed-prefix-> --max-usd-hr <ceiling> --push
     ./gpufleet.sh status                       # pods + billing warnings
     ./gpufleet.sh ledger                       # spend report
     ./gpufleet.sh resume --pod ID --gpu 4090 --name-prefix stwo-4090- \
         --max-usd-hr <ceiling>                 # guarded warm restart
 
 Discipline encoded (not advisory):
+  * Every create requires one strict recipe lease policy. Legacy raw create and
+    `run --auto` fail closed before pregate or any provider mutation.
   * `pregate` hashes the manifest-pinned SN1-SN4 adapted inputs before work, then
     drift-checks their single 373-kernel production AOT union; fixture-only emission
     cannot classify production composition waves as stale.

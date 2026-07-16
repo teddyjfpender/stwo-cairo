@@ -131,10 +131,31 @@ class CreateReconciliationTests(unittest.TestCase):
         with (
             fake_reconciliation(clock),
             mock.patch.object(cli.api, "list_pods", side_effect=[[], [], []]),
+            mock.patch.object(
+                cli.api, "get_pod", side_effect=[returned, None, None]
+            ),
             mock.patch.object(cli.api, "terminate_pod") as terminate,
         ):
             cli._cleanup_failed_up("lease", returned)
         terminate.assert_called_once_with(returned.id)
+
+    def test_wrong_returned_id_is_never_terminated_without_exact_name_observation(self) -> None:
+        returned = pod("unrelated", name="somebody-elses-lease")
+        owned = pod("owned")
+        clock = FakeClock()
+        with (
+            fake_reconciliation(clock),
+            mock.patch.object(
+                cli.api, "list_pods", side_effect=[[owned], *([[]] * 10)]
+            ),
+            mock.patch.object(cli.api, "get_pod", return_value=returned),
+            mock.patch.object(cli.api, "terminate_pod") as terminate,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                cli._cleanup_failed_up("lease", returned)
+        self.assertEqual(
+            [call.args[0] for call in terminate.call_args_list], [owned.id]
+        )
 
     def test_no_observed_create_waits_the_full_discovery_window(self) -> None:
         clock = FakeClock()

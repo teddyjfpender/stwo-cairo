@@ -80,6 +80,10 @@ of building or proving an SN PIE:
 DRY_RUN=1 BENCH_POD_ID=dry-run-placeholder \
   ./pod_run.sh recipes/direct_blake_g_native.phases direct_blake_g_sm86_dry_run
 
+cd ../fleet
+./gpufleet.sh up --recipe ../loop/recipes/direct_blake_g_native.phases \
+  --gpu a40 --purpose direct-blake-g-native-sm86
+cd ../loop
 BENCH_POD_ID=<secure-a40-pod-id> POD_RUN_POLL_INTERVAL=2 MAX_WAIT=3600 \
   ./pod_run.sh recipes/direct_blake_g_native.phases direct_blake_g_sm86
 ```

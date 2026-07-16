@@ -7,7 +7,7 @@ Commands:
   up --gpu 4090 [...]         create (budget-guarded) + wait + bootstrap(+deadman)
   bootstrap --pod ID          re-run bootstrap/deadman on an existing pod
   push --pod ID               build_and_push.sh to one pod
-  run MANIFEST [--pod ID|--auto ...]   the whole session; stops pod at the end
+  run MANIFEST --pod ID          the whole session; stops pod at the end
   ssh --pod ID [CMD]          interactive/one-shot ssh
   resume --pod ID [...]        guarded adopt/restart + deadman reinstall
   stop|terminate --pod ID|--all
@@ -197,11 +197,9 @@ def _lease_name(args) -> str:
     return name
 
 
-def _apply_recipe_lease(args) -> LeasePolicy | None:
+def _apply_recipe_lease(args) -> LeasePolicy:
     if not getattr(args, "recipe", None):
-        if not args.gpu:
-            raise ValueError("--gpu is required when --recipe is absent")
-        return None
+        raise ValueError("--recipe is required for every provisioning operation")
     policy = load_lease_policy(Path(args.recipe))
     if args.gpu and _gpu_type(args.gpu) != _gpu_type(policy.gpu):
         raise ValueError("--gpu conflicts with the recipe lease policy")
@@ -370,6 +368,14 @@ def _prepare_existing_pod(args) -> tuple[api.PodInfo, Endpoint]:
             log_file=log_file,
         ):
             raise RuntimeError("bootstrap or deadman reinstall failed")
+        # bootstrap replaces the first, verified watchdog. Reinstall and prove
+        # the final daemon live before this admission can escape to proof work.
+        _install_deadman_first(
+            ep,
+            ttl_hours=args.ttl_hours,
+            idle_min=args.idle_min,
+            log_file=log_file,
+        )
         if not pregate.is_fresh(STWO, STWO_CAIRO):
             raise RuntimeError("source-bound pregate changed during pod admission")
         _sync_pods_conf()
@@ -409,8 +415,13 @@ def _cleanup_failed_up(name: str, returned: api.PodInfo | None) -> None:
     started = time.monotonic()
     discovery_deadline = started + CREATE_RECONCILE_DISCOVERY_S
     deadline = started + CREATE_RECONCILE_TIMEOUT_S
-    observed_create = returned is not None
-    pending = {returned.id: returned} if returned else {}
+    observed_create = False
+    returned_id = (
+        returned.id
+        if returned is not None and POD_ID_RE.fullmatch(returned.id)
+        else None
+    )
+    pending: dict[str, api.PodInfo] = {}
     clean_polls = 0
     last_error = None
     while True:
@@ -419,13 +430,31 @@ def _cleanup_failed_up(name: str, returned: api.PodInfo | None) -> None:
         try:
             matches = [pod for pod in api.list_pods() if pod.name == name]
             last_error = None
-            if matches:
-                observed_create = True
-                observed_this_poll = True
-                pending.update((pod.id, pod) for pod in matches)
         except Exception as error:
             matches = []
             last_error = error
+
+        independently_owned = {pod.id: pod for pod in matches}
+        if returned_id is not None:
+            try:
+                exact = api.get_pod(returned_id)
+                if exact is not None and exact.id != returned_id:
+                    raise RuntimeError(
+                        f"pod lookup returned {exact.id!r} for {returned_id!r}"
+                    )
+                if exact is not None and exact.name == name:
+                    independently_owned[exact.id] = exact
+                elif exact is not None:
+                    raise RuntimeError(
+                        f"returned pod identity mismatch: {exact.id!r} owns "
+                        f"{exact.name!r}, not lease {name!r}"
+                    )
+            except Exception as error:
+                last_error = error
+        if independently_owned:
+            observed_create = True
+            observed_this_poll = True
+            pending.update(independently_owned)
 
         attempted = bool(pending)
         for candidate_id, candidate in list(pending.items()):
@@ -539,6 +568,12 @@ def do_up(args) -> api.PodInfo | None:
             log_file=log_file,
         ):
             raise RuntimeError("bootstrap failed")
+        _install_deadman_first(
+            ep,
+            ttl_hours=args.ttl_hours,
+            idle_min=args.idle_min,
+            log_file=log_file,
+        )
         for key, value in health_check(ep).items():
             print(f"  {key}: {value}")
         _sync_pods_conf()
@@ -591,6 +626,11 @@ def cmd_run(args) -> int:
         raise ValueError("--keep conflicts with --terminate and --one-shot")
     if args.one_shot and args.failure_action != "terminate":
         raise ValueError("--one-shot requires --failure-action terminate")
+    if args.auto:
+        raise ValueError(
+            "run --auto is retired; provision with `gpufleet up --recipe ...` "
+            "and pass the admitted pod explicitly"
+        )
     if not _require_pregate():
         return 1
     pod = None
@@ -598,21 +638,8 @@ def cmd_run(args) -> int:
     try:
         if args.pod:
             pod, ep = _prepare_existing_pod(args)
-        elif args.auto:
-            up_args = argparse.Namespace(
-                gpu=args.auto, name=None, image=DEFAULT_IMAGE, cloud="SECURE",
-                disk_gb=DEFAULT_DISK_GB, volume_gb=DEFAULT_VOLUME_GB,
-                volume_id=None, min_vcpu=16, min_mem_gb=62,
-                max_usd_hr=args.max_usd_hr, ttl_hours=args.ttl_hours,
-                idle_min=DEFAULT_IDLE_STOP_MIN, ready_timeout=600,
-                purpose=args.purpose, recipe=None,
-            )
-            pod = do_up(up_args)
-            if not pod:
-                return 1
-            ep = Endpoint.of(pod)
         else:
-            print("need --pod ID or --auto GPU")
+            print("need --pod ID")
             return 1
 
         if args.push:
@@ -761,7 +788,7 @@ def main() -> int:
 
     p = sub.add_parser("up")
     p.add_argument("--gpu")
-    p.add_argument("--recipe")
+    p.add_argument("--recipe", required=True)
     p.add_argument("--name")
     p.add_argument("--image", default=DEFAULT_IMAGE)
     p.add_argument("--cloud", default="SECURE", choices=["SECURE"])
@@ -787,7 +814,7 @@ def main() -> int:
     p = sub.add_parser("run")
     p.add_argument("manifest")
     p.add_argument("--pod")
-    p.add_argument("--auto", metavar="GPU", help="provision this GPU type for the run")
+    p.add_argument("--auto", metavar="GPU", help="retired; use up --recipe, then --pod")
     p.add_argument("--push", action="store_true", help="build_and_push.sh first")
     p.add_argument("--keep", action="store_true", help="leave pod running after")
     p.add_argument("--terminate", action="store_true", help="terminate (not stop) after")

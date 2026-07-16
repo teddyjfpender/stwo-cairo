@@ -2,7 +2,9 @@
 # (ENDGAME_ARCHITECTURE.md §9 run-list, encoded.) Every criterion is machine-checked;
 # the pod stops itself when this completes (gpufleet run default).
 #
-#   gpufleet run manifests/jit_witness_gate.toml --auto 4090 --push --purpose jit-witness-gate
+#   gpufleet up --recipe <sealed-worker.phases> --gpu 4090 --purpose jit-witness-gate
+#   gpufleet run manifests/jit_witness_gate.toml --pod ID --gpu 4090 \
+#     --name-prefix <sealed-prefix-> --max-usd-hr <ceiling> --push
 #
 # Prereqs handled elsewhere: `gpufleet pregate` green locally (enforced by `run`);
 # build_and_push.sh puts gpu_bench + repos under /workspace (--push).

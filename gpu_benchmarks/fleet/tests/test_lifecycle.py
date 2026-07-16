@@ -12,6 +12,7 @@ from unittest import mock
 
 FLEET_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(FLEET_DIR))
+DIRECT_RECIPE = FLEET_DIR.parent / "loop/recipes/direct_blake_g_native.phases"
 
 from gpufleet import api
 from gpufleet import __main__ as cli
@@ -21,7 +22,7 @@ from gpufleet.podctl import Endpoint
 def pod(**changes) -> api.PodInfo:
     values = {
         "id": "pod-test",
-        "name": "stwo-direct-test",
+        "name": "stwo-direct-bg-a40-test",
         "status": "RUNNING",
         "cost_per_hr": 0.44,
         "gpu": "NVIDIA A40",
@@ -39,7 +40,7 @@ def pod(**changes) -> api.PodInfo:
 def up_args(**changes) -> argparse.Namespace:
     values = {
         "gpu": "a40",
-        "name": "stwo-direct-test",
+        "name": "stwo-direct-bg-a40-test",
         "image": "image@sha256:" + "1" * 64,
         "cloud": "SECURE",
         "disk_gb": 80,
@@ -52,7 +53,7 @@ def up_args(**changes) -> argparse.Namespace:
         "idle_min": 15,
         "ready_timeout": 600,
         "purpose": "test",
-        "recipe": None,
+        "recipe": str(DIRECT_RECIPE),
     }
     values.update(changes)
     return argparse.Namespace(**values)
@@ -169,6 +170,20 @@ class FleetCliTests(unittest.TestCase):
             )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
+    def test_legacy_raw_create_is_retired(self) -> None:
+        script = FLEET_DIR / "pod_provision.sh"
+        proc = subprocess.run(
+            [str(script), "create", "--gpu", "NVIDIA A40"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("create is retired", output)
+        self.assertIn("gpufleet.sh up --recipe", output)
+        self.assertNotIn("runpodctl pod create", output)
+
     def test_pod_run_uses_guarded_resume_after_trap(self) -> None:
         script = (FLEET_DIR.parent / "loop/pod_run.sh").read_text()
         trap = script.index("trap cleanup EXIT")
@@ -206,10 +221,10 @@ class FleetCliTests(unittest.TestCase):
             self.assertIsNone(cli.do_up(up_args()))
         offer.assert_not_called()
 
-    def test_invalid_price_ceiling_blocks_up_before_pregate(self) -> None:
+    def test_missing_recipe_blocks_up_before_pregate(self) -> None:
         with mock.patch.object(cli, "_require_pregate") as gate:
-            with self.assertRaises(ValueError):
-                cli.do_up(up_args(max_usd_hr=math.nan))
+            with self.assertRaisesRegex(ValueError, "--recipe is required"):
+                cli.do_up(up_args(recipe=None))
         gate.assert_not_called()
 
     def test_failed_pregate_blocks_run_before_pod_read(self) -> None:
@@ -292,6 +307,28 @@ class FleetCliTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 cli.do_up(up_args())
         cleanup.assert_called_once_with(created.name, created)
+
+    def test_successful_up_rechecks_deadman_after_bootstrap(self) -> None:
+        created = pod()
+        with (
+            mock.patch.object(cli, "_require_pregate", return_value=True),
+            mock.patch.object(
+                cli.api, "secure_offer",
+                return_value={"display_name": created.gpu, "usd_hr": 0.44},
+            ),
+            mock.patch.object(
+                cli.api, "list_pods", side_effect=[[], [created], [created]]
+            ),
+            mock.patch.object(cli.api, "create_pod", return_value=created),
+            mock.patch.object(cli, "wait_ready", return_value=created),
+            mock.patch.object(cli, "_install_deadman_first") as deadman,
+            mock.patch.object(cli, "bootstrap", return_value=True),
+            mock.patch.object(cli, "health_check", return_value={}),
+            mock.patch.object(cli, "_sync_pods_conf"),
+            mock.patch.object(cli.ledger, "append"),
+        ):
+            self.assertEqual(cli.do_up(up_args()), created)
+        self.assertEqual(deadman.call_count, 2)
 
     def test_wrong_ready_id_rejects_and_cleans_the_created_pod(self) -> None:
         created = pod()
@@ -449,6 +486,16 @@ class FleetCliTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         cli.cmd_run(self._run_args(**changes))
                 gate.assert_not_called()
+
+    def test_run_auto_is_retired_before_pregate_or_create(self) -> None:
+        with (
+            mock.patch.object(cli, "_require_pregate") as gate,
+            mock.patch.object(cli.api, "create_pod") as create,
+        ):
+            with self.assertRaisesRegex(ValueError, "--auto is retired"):
+                cli.cmd_run(self._run_args(pod=None, auto="a40"))
+        gate.assert_not_called()
+        create.assert_not_called()
 
     def test_explicit_absent_terminate_is_still_confirmed(self) -> None:
         args = argparse.Namespace(all=False, pod="pod-test")

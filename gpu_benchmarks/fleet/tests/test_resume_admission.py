@@ -146,7 +146,10 @@ class ExistingPodAdmissionTests(unittest.TestCase):
         self.assertEqual(admitted, ready)
         self.assertEqual(
             events,
-            ["key", "gate", "offer", "get", "resume", "wait", "deadman", "bootstrap", "final-gate", "sync"],
+            [
+                "key", "gate", "offer", "get", "resume", "wait",
+                "deadman", "bootstrap", "deadman", "final-gate", "sync",
+            ],
         )
 
     def test_running_pod_is_adopted_without_resume_but_reinstalls_deadman(self) -> None:
@@ -170,7 +173,7 @@ class ExistingPodAdmissionTests(unittest.TestCase):
         ):
             cli._prepare_existing_pod(admission_args())
         resume.assert_not_called()
-        self.assertEqual(events, ["deadman", "bootstrap"])
+        self.assertEqual(events, ["deadman", "bootstrap", "deadman"])
 
     def test_stale_pregate_touches_no_provider_state(self) -> None:
         with (
@@ -308,6 +311,7 @@ class ExistingPodAdmissionTests(unittest.TestCase):
             "ready-state",
             "deadman",
             "bootstrap",
+            "post-deadman",
             "final-gate",
             "sync",
         ):
@@ -338,7 +342,13 @@ class ExistingPodAdmissionTests(unittest.TestCase):
                     mock.patch.object(
                         cli,
                         "_install_deadman_first",
-                        side_effect=RuntimeError("deadman failed") if stage == "deadman" else None,
+                        side_effect=(
+                            RuntimeError("deadman failed")
+                            if stage == "deadman"
+                            else [None, RuntimeError("post-bootstrap deadman failed")]
+                            if stage == "post-deadman"
+                            else None
+                        ),
                     ),
                     mock.patch.object(
                         cli,
