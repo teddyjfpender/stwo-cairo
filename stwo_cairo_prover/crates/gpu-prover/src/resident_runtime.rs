@@ -5436,6 +5436,7 @@ fn arena_relation_sources(
         let purpose = match source_plan.plane {
             RelationSourcePlane::LookupWords => BufferPurpose::LookupInputs,
             RelationSourcePlane::BaseTrace => BufferPurpose::BaseTrace,
+            RelationSourcePlane::WitnessInput => BufferPurpose::WitnessInput,
         };
         let columns = (0..source_plan.column_count)
             .map(|ordinal| {

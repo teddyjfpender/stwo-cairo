@@ -3,9 +3,10 @@
 //! `PreparedRelationGraph`; this pass is deterministic and CUDA-free.
 
 use stwo_backend_cuda::{
-    RelationBatchProgram, RelationColumnDescriptor, RelationGraphError, RelationGraphRequirements,
-    RelationKernelProgram, RelationLaunchMode, RelationMultiplicityKind, RelationRowExtent,
-    RelationSourceLayout, RelationTupleKind, RelationUseDescriptor,
+    blake_g_inputs_batch_is_exact, RelationBatchProgram, RelationColumnDescriptor,
+    RelationGraphError, RelationGraphRequirements, RelationKernelProgram, RelationLaunchMode,
+    RelationMultiplicityKind, RelationRowExtent, RelationSourceLayout, RelationTupleKind,
+    RelationUseDescriptor,
 };
 use stwo_cairo_prover::witness::proof_shape::{RowResolution, TracePartId};
 
@@ -26,6 +27,22 @@ pub struct RelationBatchKey {
 pub enum RelationSourcePlane {
     LookupWords,
     BaseTrace,
+    WitnessInput,
+}
+
+/// Exact production admission receipt for replacing Blake-G's flattened
+/// 87-word lookup slab with its six recorded operand columns.  Arena ownership
+/// and runtime binding consume this value directly; there is no independent
+/// feature boolean that can drift from the rewritten descriptor batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlakeGInputsSelection {
+    pub batch_index: usize,
+    pub batch: RelationBatchKey,
+    pub part: TracePartId,
+    pub input_ordinals: [u32; 6],
+    pub enabler_ordinal: u32,
+    pub instance_index: usize,
+    pub retired_lookup_words_per_row: u32,
 }
 
 /// Canonical source columns for one lowered relation instance.  Arena liveness
@@ -155,6 +172,24 @@ impl RelationExecutionPlan {
     }
 
     pub fn source_plan(&self) -> Result<Vec<RelationInstanceSourcePlan>, RelationExecutionError> {
+        self.source_plan_inner(None)
+    }
+
+    /// Derive source cardinality against the launch mode that will execute the
+    /// program. Blake-G's direct six-input ABI is fused-only, so routing it
+    /// through the legacy default ThreeStage requirement gate would reject a
+    /// valid sealed plan before arena binding.
+    pub fn source_plan_for_mode(
+        &self,
+        mode: RelationLaunchMode,
+    ) -> Result<Vec<RelationInstanceSourcePlan>, RelationExecutionError> {
+        self.source_plan_inner(Some(mode))
+    }
+
+    fn source_plan_inner(
+        &self,
+        mode: Option<RelationLaunchMode>,
+    ) -> Result<Vec<RelationInstanceSourcePlan>, RelationExecutionError> {
         let mut sources = Vec::new();
         for (batch_index, kernel_batch) in self.kernel_program.batches.iter().enumerate() {
             let batch = *self
@@ -179,6 +214,7 @@ impl RelationExecutionPlan {
                 RelationSourceLayout::BitwiseXor12 {
                     multiplicity_columns,
                 } => (RelationSourcePlane::BaseTrace, multiplicity_columns),
+                RelationSourceLayout::BlakeGInputs => (RelationSourcePlane::WitnessInput, 6),
                 RelationSourceLayout::ProjectedColumns { .. } => {
                     return Err(RelationExecutionError::SourcePlanDrift);
                 }
@@ -201,11 +237,119 @@ impl RelationExecutionPlan {
                 });
             }
         }
-        if sources.len() != self.requirements()?.instances.len() {
+        let requirements = match mode {
+            Some(mode) => self.requirements_for_mode(mode)?,
+            None => self.requirements()?,
+        };
+        if sources.len() != requirements.instances.len() {
             return Err(RelationExecutionError::SourcePlanDrift);
         }
         Ok(sources)
     }
+
+    /// Rewrite exactly one canonical Blake-G component batch.  The original
+    /// flattened layout and the resulting six-input layout are both checked,
+    /// and the mutation is committed only after the whole fused program passes
+    /// backend validation.
+    pub fn select_blake_g_inputs(
+        &mut self,
+    ) -> Result<BlakeGInputsSelection, RelationExecutionError> {
+        let matches = self
+            .batches
+            .iter()
+            .enumerate()
+            .filter(|(_, batch)| {
+                batch.component == "blake_g" && batch.trace_part == RelationTracePart::Component
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let batch_index = match matches.as_slice() {
+            [index] => *index,
+            [] => return Err(RelationExecutionError::MissingBlakeGInputsBatch),
+            _ => return Err(RelationExecutionError::DuplicateBlakeGInputsBatch),
+        };
+        let original = self
+            .kernel_program
+            .batches
+            .get(batch_index)
+            .ok_or(RelationExecutionError::SourcePlanDrift)?;
+        if !canonical_flattened_blake_g_batch_is_exact(original) {
+            return Err(RelationExecutionError::InvalidBlakeGInputsBatch);
+        }
+        if original.instances.len() != 1 {
+            return Err(RelationExecutionError::InvalidBlakeGInputsInstanceCount(
+                original.instances.len(),
+            ));
+        }
+
+        let mut kernel_program = self.kernel_program.clone();
+        let direct = kernel_program
+            .batches
+            .get_mut(batch_index)
+            .ok_or(RelationExecutionError::SourcePlanDrift)?;
+        direct.source_layout = RelationSourceLayout::BlakeGInputs;
+        for (index, relation_use) in direct
+            .columns
+            .iter_mut()
+            .flat_map(|column| &mut column.uses)
+            .enumerate()
+        {
+            let final_use = index == 16;
+            relation_use.tuple_kind = RelationTupleKind::BlakeGInputs;
+            relation_use.tuple_arg = index as u32;
+            relation_use.multiplicity_kind = if final_use {
+                RelationMultiplicityKind::Enabler
+            } else {
+                RelationMultiplicityKind::One
+            };
+            relation_use.multiplicity_arg = 0;
+        }
+        if !blake_g_inputs_batch_is_exact(direct) {
+            return Err(RelationExecutionError::InvalidBlakeGInputsBatch);
+        }
+        kernel_program
+            .validate()
+            .map_err(RelationExecutionError::BackendPlan)?;
+        kernel_program
+            .requirements_for_mode(RelationLaunchMode::Fused)
+            .map_err(RelationExecutionError::BackendPlan)?;
+        self.kernel_program = kernel_program;
+
+        Ok(BlakeGInputsSelection {
+            batch_index,
+            batch: self.batches[batch_index],
+            part: TracePartId::Main,
+            input_ordinals: [0, 1, 2, 3, 4, 5],
+            enabler_ordinal: 6,
+            instance_index: 0,
+            retired_lookup_words_per_row: 87,
+        })
+    }
+}
+
+fn canonical_flattened_blake_g_batch_is_exact(batch: &RelationBatchProgram) -> bool {
+    if batch.source_layout != (RelationSourceLayout::LookupWords { words: 87 })
+        || batch.columns.len() != 9
+        || batch.columns[..8]
+            .iter()
+            .any(|column| column.uses.len() != 2)
+        || batch.columns[8].uses.len() != 1
+    {
+        return false;
+    }
+    batch
+        .columns
+        .iter()
+        .flat_map(|column| &column.uses)
+        .enumerate()
+        .all(|(index, relation_use)| {
+            let final_use = index == 16;
+            relation_use.tuple_kind == RelationTupleKind::LookupWords
+                && relation_use.tuple_arg == (index as u32) * 4
+                && relation_use.multiplicity_kind == RelationMultiplicityKind::LookupWord
+                && relation_use.multiplicity_arg == if final_use { 86 } else { 85 }
+                && relation_use.negative == final_use
+        })
 }
 
 fn lower_row_extents(
@@ -480,6 +624,10 @@ pub enum RelationExecutionError {
         actual: usize,
     },
     SourcePlanDrift,
+    MissingBlakeGInputsBatch,
+    DuplicateBlakeGInputsBatch,
+    InvalidBlakeGInputsBatch,
+    InvalidBlakeGInputsInstanceCount(usize),
     SizeOverflow,
     BackendPlan(RelationGraphError),
 }
@@ -809,6 +957,80 @@ mod tests {
                 multiplicity_columns: 16
             }
         );
+    }
+
+    #[test]
+    fn blake_g_direct_selection_is_exact_and_fused_mode_scoped() {
+        let default_shape = CairoClaimGenerator::default().proof_shape(None).unwrap();
+        let mut components = default_shape.components().to_vec();
+        *components
+            .iter_mut()
+            .find(|component| component.id == "blake_g")
+            .unwrap() = RuntimeComponentShape::uniform("blake_g", 9, 16).unwrap();
+        let shape = ProofShape::new(components).unwrap();
+        let proof =
+            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
+        let mut execution =
+            RelationExecutionPlan::from_proof_plan(&proof, &CAIRO_RELATION_GRAPH).unwrap();
+
+        let selection = execution.select_blake_g_inputs().unwrap();
+        assert_eq!(selection.batch.component, "blake_g");
+        assert_eq!(selection.batch.trace_part, RelationTracePart::Component);
+        assert_eq!(selection.part, TracePartId::Main);
+        assert_eq!(selection.input_ordinals, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(selection.enabler_ordinal, 6);
+        assert_eq!(selection.instance_index, 0);
+        assert_eq!(selection.retired_lookup_words_per_row, 87);
+        assert!(blake_g_inputs_batch_is_exact(
+            &execution.kernel_program.batches[selection.batch_index]
+        ));
+
+        let sources = execution
+            .source_plan_for_mode(RelationLaunchMode::Fused)
+            .unwrap();
+        let source = sources
+            .iter()
+            .find(|source| source.batch == selection.batch)
+            .unwrap();
+        assert_eq!(source.instance_index, selection.instance_index);
+        assert_eq!(source.part, selection.part);
+        assert_eq!(source.plane, RelationSourcePlane::WitnessInput);
+        assert_eq!(source.column_count, selection.input_ordinals.len() as u32);
+
+        assert!(matches!(
+            execution.source_plan(),
+            Err(RelationExecutionError::BackendPlan(
+                RelationGraphError::BlakeGInputsRequireFused
+            ))
+        ));
+    }
+
+    #[test]
+    fn blake_g_direct_selection_rejects_flattened_descriptor_drift() {
+        let default_shape = CairoClaimGenerator::default().proof_shape(None).unwrap();
+        let mut components = default_shape.components().to_vec();
+        *components
+            .iter_mut()
+            .find(|component| component.id == "blake_g")
+            .unwrap() = RuntimeComponentShape::uniform("blake_g", 9, 16).unwrap();
+        let shape = ProofShape::new(components).unwrap();
+        let proof =
+            ProofPlan::from_schedule(&CAIRO_SCHEDULE, &CAIRO_RELATION_GRAPH, &shape).unwrap();
+        let mut execution =
+            RelationExecutionPlan::from_proof_plan(&proof, &CAIRO_RELATION_GRAPH).unwrap();
+        let batch_index = execution
+            .batches
+            .iter()
+            .position(|batch| batch.component == "blake_g")
+            .unwrap();
+        execution.kernel_program.batches[batch_index].columns[0].uses[0].tuple_arg = 1;
+        let before = execution.kernel_program.clone();
+
+        assert!(matches!(
+            execution.select_blake_g_inputs(),
+            Err(RelationExecutionError::InvalidBlakeGInputsBatch)
+        ));
+        assert_eq!(execution.kernel_program, before);
     }
 
     #[test]
