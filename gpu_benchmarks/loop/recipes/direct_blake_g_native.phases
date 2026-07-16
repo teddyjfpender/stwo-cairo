@@ -7,8 +7,17 @@ DIRECT_TARGET=/workspace/.cargo-target/stwo-nightly-2025-07-14-cuda118-sm86
 DIRECT_OBJ_CACHE=/workspace/.cuda_obj_cache/cuda118-sm86
 DIRECT_SOURCE="$STWO/crates/backend-cuda/src/backend/blake_witness/projected_relation_native_tests.rs"
 
+install_direct_blake_g_toolchain() {
+  set -euo pipefail
+  cd "$STWO"
+  rustup toolchain install
+  rustc -Vv | grep -F 'commit-hash: e9182f195b8505c87c4bd055b9f6e114ccda0981'
+  cargo -V
+}
+
 direct_blake_g_hardware_identity() {
   set -euo pipefail
+  cd "$STWO"
   [[ "$(nvidia-smi -L | wc -l | tr -d ' ')" == 1 ]]
   [[ "$(nvidia-smi --query-gpu=name --format=csv,noheader | xargs)" == 'NVIDIA A40' ]]
   [[ "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | xargs)" == '8.6' ]]
@@ -38,9 +47,9 @@ run_direct_blake_g_native() {
   cd "$STWO"
 
   [[ "$STWO_PARITY_REF_STWO_HEAD" == \
-    1dad88f1c3a714ac26c8ad57812429ac58541909 ]]
+    015fc5bc3821824a7df6a3b19995c71ace8ae37c ]]
   printf '%s  %s\n' \
-    cd6729ddd9c3c502e0dd10d1bee3af57bf5e72264dccc724db8206f1779efecf \
+    e7a7d1bcce8219d1f4624f7e9bb8b23104193a090cf8ed463fbe129a3202be5b \
     "$DIRECT_SOURCE" | sha256sum -c -
   printf '%s  %s\n' \
     0680ca05f46f7b5f513bbce57646c57c57085f2f2fa35a8b5423e61f68fd3a23 \
@@ -145,6 +154,7 @@ print(json.dumps({"direct_blake_g_native": "PASS", **record}, sort_keys=True))
 PY
 }
 
+phase direct_blake_g_toolchain install_direct_blake_g_toolchain
 phase direct_blake_g_hardware_identity direct_blake_g_hardware_identity
 phase direct_blake_g_native run_direct_blake_g_native
 phase direct_blake_g_validate validate_direct_blake_g_native

@@ -24,8 +24,8 @@ def _init_checks(stwo: Path, stwo_cairo: Path) -> list[tuple[str, list[str], Pat
     prover = stwo_cairo / "stwo_cairo_prover"
     return [
         (
-            "stwo-backend-cuda tests (37: isa/codegen/recording/registry)",
-            ["cargo", "test", "-p", "stwo-backend-cuda"],
+            "stwo-backend-cuda host-safe library tests",
+            ["cargo", "test", "-p", "stwo-backend-cuda", "--lib"],
             stwo,
         ),
         (

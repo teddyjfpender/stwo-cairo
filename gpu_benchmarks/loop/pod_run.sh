@@ -279,15 +279,18 @@ rsync -azc --delete --partial --no-owner --no-group --perms --no-times \
    "$CAIRO_WORKTREE_HASH" == "$(source_hash "$CAIRO_LOCAL")" ]] \
   || { note "LOCAL SOURCES CHANGED DURING SYNC"; exit 1; }
 
-# --- 4. install + verify the repo-pinned Rust toolchain ---
-note "install pinned Rust toolchain"
+# --- 4. install + verify both repo-pinned Rust toolchains ---
+note "install pinned Rust toolchains"
 pssh "set -e
   export RUSTUP_HOME=$POD_RUSTUP_HOME_Q
   export CARGO_HOME=$POD_CARGO_HOME_Q
   export PATH=\"\$CARGO_HOME/bin:\$PATH\"
-  cd '$CAIRO_POD/stwo_cairo_prover'
-  rustup toolchain install
-  rustc --version" || { note "TOOLCHAIN INSTALL FAILED"; exit 1; }
+  for repo in '$STWO_POD' '$CAIRO_POD/stwo_cairo_prover'; do
+    cd \"\$repo\"
+    rustup toolchain install
+    printf 'toolchain[%s]=' \"\$repo\"
+    rustc --version
+  done" || { note "TOOLCHAIN INSTALL FAILED"; exit 1; }
 
 # --- 5. upload + launch the detached session with rc sentinels ---
 note "upload + launch session"
