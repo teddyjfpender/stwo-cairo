@@ -23,6 +23,7 @@ use crate::compiled_proof::{
 pub(super) struct NativeEcOpRangeBinding {
     pub(super) value: ArenaCatalogRange,
     pub(super) binding: Option<EffectBindingId>,
+    pub(super) version: Option<ValueVersion>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +70,10 @@ pub(super) struct PendingNativeEcOpContract {
 }
 
 impl PendingNativeEcOpContract {
+    pub(super) const fn authority(&self) -> &EcOpCompositeContract {
+        &self.authority
+    }
+
     pub(super) fn catalog_order(&self) -> impl Iterator<Item = ArenaCatalogValueId> + '_ {
         self.execution_tables
             .iter()
@@ -325,35 +330,22 @@ pub(super) fn lower(
 ) -> Result<LoweredNativeEcOpContract, InvocationShapeError> {
     values.extend_ordered(pending.catalog_order())?;
     let mut next_binding = 0u32;
-    let mut accesses = Vec::new();
     let execution_tables = pending
         .execution_tables
         .into_iter()
-        .map(|value| bind_range(value, values, &mut next_binding, &mut accesses, false))
+        .map(|value| bind_range(value, values, &mut next_binding))
         .collect::<Result<Vec<_>, _>>()?;
-    let segment_start = bind_range(
-        pending.segment_start,
-        values,
-        &mut next_binding,
-        &mut accesses,
-        false,
-    )?;
+    let segment_start = bind_range(pending.segment_start, values, &mut next_binding)?;
     let trace_columns = pending
         .trace_columns
         .into_iter()
-        .map(|value| bind_range(value, values, &mut next_binding, &mut accesses, true))
+        .map(|value| bind_range(value, values, &mut next_binding))
         .collect::<Result<Vec<_>, _>>()?;
-    let lookup_words = bind_range(
-        pending.lookup_words,
-        values,
-        &mut next_binding,
-        &mut accesses,
-        true,
-    )?;
+    let lookup_words = bind_range(pending.lookup_words, values, &mut next_binding)?;
     let partial_input_columns = pending
         .partial_input_columns
         .into_iter()
-        .map(|value| bind_range(value, values, &mut next_binding, &mut accesses, true))
+        .map(|value| bind_range(value, values, &mut next_binding))
         .collect::<Result<Vec<_>, _>>()?;
     let multiplicities = pending
         .multiplicities
@@ -365,7 +357,6 @@ pub(super) fn lower(
                 .checked_add(1)
                 .ok_or(InvocationShapeError::SizeOverflow)?;
             let (source, destination) = values.transition(value.value)?;
-            let elements = element_range(&value)?;
             let alias = InPlaceAliasAuthority {
                 id: InPlaceAliasId(
                     u32::try_from(index).map_err(|_| InvocationShapeError::SizeOverflow)?,
@@ -373,12 +364,6 @@ pub(super) fn lower(
                 requirement: InPlaceAliasRequirement::Required,
                 discipline: InPlaceDiscipline::ElementWiseReadBeforeWrite,
             };
-            accesses.push(EffectAccess::Atomic {
-                source: bound(binding, source, elements),
-                destination: bound(binding, destination, elements),
-                operation: AtomicOperation::AddU32,
-                in_place: alias,
-            });
             Ok(NativeEcOpAtomicBinding {
                 value,
                 binding,
@@ -388,22 +373,22 @@ pub(super) fn lower(
             })
         })
         .collect::<Result<Vec<_>, InvocationShapeError>>()?;
-    let effect = EffectContract::new(accesses, Vec::new())
-        .map_err(|_| InvocationShapeError::InvalidNativeEcOpBinding)?;
+    let invocation = StaticEcOpInvocation {
+        execution_table_pointers: pending.execution_table_pointers,
+        execution_tables,
+        segment_start,
+        trace_columns,
+        lookup_words,
+        partial_input_columns,
+        multiplicities,
+        row_count: u32::try_from(pending.authority.requirements().row_count)
+            .map_err(|_| InvocationShapeError::SizeOverflow)?,
+        partial_row_count: u32::try_from(pending.authority.requirements().partial_row_count)
+            .map_err(|_| InvocationShapeError::SizeOverflow)?,
+    };
+    let effect = exact_effect(&invocation)?;
     Ok(LoweredNativeEcOpContract {
-        invocation: StaticEcOpInvocation {
-            execution_table_pointers: pending.execution_table_pointers,
-            execution_tables,
-            segment_start,
-            trace_columns,
-            lookup_words,
-            partial_input_columns,
-            multiplicities,
-            row_count: u32::try_from(pending.authority.requirements().row_count)
-                .map_err(|_| InvocationShapeError::SizeOverflow)?,
-            partial_row_count: u32::try_from(pending.authority.requirements().partial_row_count)
-                .map_err(|_| InvocationShapeError::SizeOverflow)?,
-        },
+        invocation,
         authority: pending.authority,
         effect,
     })
@@ -413,33 +398,74 @@ fn bind_range(
     value: ArenaCatalogRange,
     values: &adapter::SemanticValueMap,
     next_binding: &mut u32,
-    accesses: &mut Vec<EffectAccess>,
-    write: bool,
 ) -> Result<NativeEcOpRangeBinding, InvocationShapeError> {
     if value.value_words.is_empty() {
         return Ok(NativeEcOpRangeBinding {
             value,
             binding: None,
+            version: None,
         });
     }
     let binding = EffectBindingId(*next_binding);
     *next_binding = next_binding
         .checked_add(1)
         .ok_or(InvocationShapeError::SizeOverflow)?;
-    let range = bound(
-        binding,
-        values.version(value.value)?,
-        element_range(&value)?,
-    );
-    accesses.push(if write {
-        EffectAccess::Write { destination: range }
-    } else {
-        EffectAccess::Read { source: range }
-    });
+    let version = values.version(value.value)?;
     Ok(NativeEcOpRangeBinding {
         value,
         binding: Some(binding),
+        version: Some(version),
     })
+}
+
+/// Canonical compiled-proof effect for the exact invocation field roles.
+/// Direction is derived here, never supplied as a lowering flag.
+pub(super) fn exact_effect(
+    invocation: &StaticEcOpInvocation,
+) -> Result<EffectContract, InvocationShapeError> {
+    let mut accesses = Vec::new();
+    for binding in invocation
+        .execution_tables
+        .iter()
+        .chain(std::iter::once(&invocation.segment_start))
+    {
+        if let Some(source) = bound_range(binding)? {
+            accesses.push(EffectAccess::Read { source });
+        }
+    }
+    for binding in invocation
+        .trace_columns
+        .iter()
+        .chain(std::iter::once(&invocation.lookup_words))
+        .chain(&invocation.partial_input_columns)
+    {
+        if let Some(destination) = bound_range(binding)? {
+            accesses.push(EffectAccess::Write { destination });
+        }
+    }
+    for binding in &invocation.multiplicities {
+        let elements = element_range(&binding.value)?;
+        accesses.push(EffectAccess::Atomic {
+            source: bound(binding.binding, binding.source, elements),
+            destination: bound(binding.binding, binding.destination, elements),
+            operation: AtomicOperation::AddU32,
+            in_place: binding.alias,
+        });
+    }
+    EffectContract::new(accesses, Vec::new())
+        .map_err(|_| InvocationShapeError::InvalidNativeEcOpBinding)
+}
+
+fn bound_range(
+    binding: &NativeEcOpRangeBinding,
+) -> Result<Option<BoundValueRange>, InvocationShapeError> {
+    match (binding.binding, binding.version) {
+        (None, None) if binding.value.value_words.is_empty() => Ok(None),
+        (Some(binding_id), Some(version)) if !binding.value.value_words.is_empty() => Ok(Some(
+            bound(binding_id, version, element_range(&binding.value)?),
+        )),
+        _ => Err(InvocationShapeError::InvalidNativeEcOpBinding),
+    }
 }
 
 const fn bound(

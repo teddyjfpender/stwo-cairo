@@ -3,12 +3,18 @@
 //! A producer enters `bound` only after its typed source ABI and exact effect
 //! contract both compile. Enumeration stops at the first producer whose real
 //! primitive still lacks authority; later producers are not claimed merely
-//! because their individual source emitter may exist.
+//! because their individual source emitter may exist. This is a semantic
+//! migration frontier, not authority to promote the arena inventory into a
+//! production `CompiledProof`.
 
 use std::collections::BTreeSet;
 
 use stwo_backend_cuda::jit_witness::isa::DeduceKind;
+use stwo_backend_cuda::EcOpCompositeContract;
 
+use super::ec_op_execution_authority::{
+    NativeEcOpCompositeExecutionAuthority, NativeEcOpLinkedModuleAuthority,
+};
 use super::schedule_prefix::{
     append_interpolation_catalog_order, invocation_catalog_order, lower_base_interpolation,
     LoweredBaseInterpolationBatch,
@@ -54,14 +60,57 @@ pub(super) struct LoweredRecordedWitnessProducer {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct LoweredNativeEcOpProducer {
+    pub(super) position: ProducerSchedulePosition,
+    pub(super) producer: WitnessProducer,
+    pub(super) execution: NativeEcOpCompositeExecutionAuthority,
+    pub(super) contract: ec_op_prefix::LoweredNativeEcOpContract,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum LoweredBaseProducer {
+    Recorded(LoweredRecordedWitnessProducer),
+    NativeEcOp(LoweredNativeEcOpProducer),
+}
+
+impl LoweredBaseProducer {
+    pub(super) const fn position(&self) -> ProducerSchedulePosition {
+        match self {
+            Self::Recorded(producer) => producer.position,
+            Self::NativeEcOp(producer) => producer.position,
+        }
+    }
+
+    pub(super) const fn producer(&self) -> WitnessProducer {
+        match self {
+            Self::Recorded(producer) => producer.producer,
+            Self::NativeEcOp(producer) => producer.producer,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn recorded(&self) -> Option<&LoweredRecordedWitnessProducer> {
+        match self {
+            Self::Recorded(producer) => Some(producer),
+            Self::NativeEcOp(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn native_ec_op(&self) -> Option<&LoweredNativeEcOpProducer> {
+        match self {
+            Self::Recorded(_) => None,
+            Self::NativeEcOp(producer) => Some(producer),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct BaseProducerBindingFrontier {
     pub(super) scheduled_producers: usize,
-    pub(super) bound: Vec<LoweredRecordedWitnessProducer>,
+    pub(super) bound: Vec<LoweredBaseProducer>,
     pub(super) missing: Option<MissingProducerAuthority>,
     pub(super) semantic_values: adapter::SemanticValueMap,
-    /// Fully bound semantic contract for native EC-op. It remains outside the
-    /// executable prefix until the linked static module has build identity.
-    pub(super) native_ec_op_contract: Option<ec_op_prefix::LoweredNativeEcOpContract>,
     /// Independently sealed downstream primitive receipts. These are not part
     /// of the contiguous execution prefix while `missing` is present.
     pub(super) base_interpolation: Vec<LoweredBaseInterpolationBatch>,
@@ -76,14 +125,55 @@ struct PendingRecordedWitness {
     source: RecordedWitnessInvocationShape,
 }
 
+#[derive(Clone, Debug)]
+enum PendingBaseProducer {
+    Recorded(PendingRecordedWitness),
+    NativeEcOp {
+        position: ProducerSchedulePosition,
+        producer: WitnessProducer,
+        linked: NativeEcOpLinkedModuleAuthority,
+        contract: ec_op_prefix::PendingNativeEcOpContract,
+    },
+}
+
 pub(super) fn map_scheduled_base_producers(
     image: &ArenaProgramInventory,
     arena: &ProofArenaPlan,
     schedule: &BaseProducerSchedule,
 ) -> Result<BaseProducerBindingFrontier, InvocationShapeError> {
+    map_scheduled_base_producers_using(
+        image,
+        arena,
+        schedule,
+        NativeEcOpLinkedModuleAuthority::bind_linked,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn map_scheduled_base_producers_with_native_authority(
+    image: &ArenaProgramInventory,
+    arena: &ProofArenaPlan,
+    schedule: &BaseProducerSchedule,
+    bind_native: impl FnMut(
+        &EcOpCompositeContract,
+    )
+        -> Result<Option<NativeEcOpLinkedModuleAuthority>, InvocationShapeError>,
+) -> Result<BaseProducerBindingFrontier, InvocationShapeError> {
+    map_scheduled_base_producers_using(image, arena, schedule, bind_native)
+}
+
+fn map_scheduled_base_producers_using(
+    image: &ArenaProgramInventory,
+    arena: &ProofArenaPlan,
+    schedule: &BaseProducerSchedule,
+    mut bind_native: impl FnMut(
+        &EcOpCompositeContract,
+    )
+        -> Result<Option<NativeEcOpLinkedModuleAuthority>, InvocationShapeError>,
+) -> Result<BaseProducerBindingFrontier, InvocationShapeError> {
     let scheduled = scheduled_producers(schedule)?;
     let mut pending = Vec::new();
-    let mut pending_native_ec_op = None;
+    let mut native_ec_op_seen = false;
     let mut missing = None;
     for &(position, producer) in &scheduled {
         let missing_kind = match producer.kind {
@@ -91,14 +181,14 @@ pub(super) fn map_scheduled_base_producers(
                 let planned = planned_recorded_component(arena, producer)?;
                 match derive_invocation(image, arena, planned) {
                     Ok(source) => {
-                        pending.push(PendingRecordedWitness {
+                        pending.push(PendingBaseProducer::Recorded(PendingRecordedWitness {
                             position,
                             producer,
                             produced: produced_values(image, arena, planned)?,
                             expected_trace_outputs: usize::try_from(planned.program.n_cols)
                                 .map_err(|_| InvocationShapeError::SizeOverflow)?,
                             source,
-                        });
+                        }));
                         None
                     }
                     Err(InvocationShapeError::MultiplicityNeedsSemanticVersions) => {
@@ -122,11 +212,23 @@ pub(super) fn map_scheduled_base_producers(
                 Some(MissingProducerAuthorityKind::BlakeGDirectComposite)
             }
             WitnessProducerKind::NativeEcOp => {
-                if pending_native_ec_op.is_some() {
+                if native_ec_op_seen {
                     return Err(InvocationShapeError::InvalidNativeEcOpBinding);
                 }
-                pending_native_ec_op = Some(ec_op_prefix::prepare(image, arena)?);
-                Some(MissingProducerAuthorityKind::NativeEcOpStaticModuleBuildIdentity)
+                native_ec_op_seen = true;
+                let contract = ec_op_prefix::prepare(image, arena)?;
+                match bind_native(contract.authority())? {
+                    Some(linked) => {
+                        pending.push(PendingBaseProducer::NativeEcOp {
+                            position,
+                            producer,
+                            linked,
+                            contract,
+                        });
+                        None
+                    }
+                    None => Some(MissingProducerAuthorityKind::NativeEcOpStaticModuleBuildIdentity),
+                }
             }
         };
         if let Some(missing_kind) = missing_kind {
@@ -140,50 +242,67 @@ pub(super) fn map_scheduled_base_producers(
     }
 
     validate_bound_base_outputs(image, schedule, &pending)?;
-    let ordered_values = pending
-        .iter()
-        .flat_map(|producer| invocation_catalog_order(&producer.source.source_arguments))
-        .collect::<Vec<_>>();
-    let mut semantic_values = adapter::SemanticValueMap::allocate_ordered(ordered_values)?;
-    let native_ec_op_contract = pending_native_ec_op
-        .map(|pending| ec_op_prefix::lower(pending, &mut semantic_values))
-        .transpose()?;
-    if let Some(native_ec_op) = &native_ec_op_contract {
-        validate_native_ec_op_base_outputs(image, schedule, native_ec_op)?;
+    let mut semantic_values =
+        adapter::SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>())?;
+    let mut bound = Vec::with_capacity(pending.len());
+    for pending in pending {
+        match pending {
+            PendingBaseProducer::Recorded(producer) => {
+                semantic_values
+                    .extend_ordered(invocation_catalog_order(&producer.source.source_arguments))?;
+                let (invocation, effect) = adapter::compile(
+                    &producer.source.source_arguments,
+                    &semantic_values,
+                )
+                .map_err(|error| match error {
+                    InvocationShapeError::InvalidProgramRole
+                    | InvocationShapeError::InvalidAdapterEffect => {
+                        InvocationShapeError::ScheduledProducerInvalidEffect(producer.producer)
+                    }
+                    error => error,
+                })?;
+                bound.push(LoweredBaseProducer::Recorded(
+                    LoweredRecordedWitnessProducer {
+                        position: producer.position,
+                        producer: producer.producer,
+                        produced: producer.produced,
+                        source: producer.source,
+                        invocation,
+                        effect,
+                    },
+                ));
+            }
+            PendingBaseProducer::NativeEcOp {
+                position,
+                producer,
+                linked,
+                contract,
+            } => {
+                let contract = ec_op_prefix::lower(contract, &mut semantic_values)?;
+                validate_native_ec_op_base_outputs(image, schedule, &contract)?;
+                let execution = linked.bind_lowered(
+                    &contract.authority,
+                    &contract.invocation,
+                    &contract.effect,
+                )?;
+                bound.push(LoweredBaseProducer::NativeEcOp(LoweredNativeEcOpProducer {
+                    position,
+                    producer,
+                    execution,
+                    contract,
+                }));
+            }
+        }
     }
     let mut interpolation_values = Vec::new();
     append_interpolation_catalog_order(image, schedule, &mut interpolation_values)?;
     semantic_values.extend_ordered(interpolation_values)?;
-    let bound = pending
-        .into_iter()
-        .map(|producer| {
-            let (invocation, effect) =
-                adapter::compile(&producer.source.source_arguments, &semantic_values).map_err(
-                    |error| match error {
-                        InvocationShapeError::InvalidProgramRole
-                        | InvocationShapeError::InvalidAdapterEffect => {
-                            InvocationShapeError::ScheduledProducerInvalidEffect(producer.producer)
-                        }
-                        error => error,
-                    },
-                )?;
-            Ok(LoweredRecordedWitnessProducer {
-                position: producer.position,
-                producer: producer.producer,
-                produced: producer.produced,
-                source: producer.source,
-                invocation,
-                effect,
-            })
-        })
-        .collect::<Result<Vec<_>, InvocationShapeError>>()?;
     let base_interpolation = lower_base_interpolation(image, schedule, &semantic_values)?;
     Ok(BaseProducerBindingFrontier {
         scheduled_producers: scheduled.len(),
         bound,
         missing,
         semantic_values,
-        native_ec_op_contract,
         base_interpolation,
     })
 }
@@ -236,7 +355,7 @@ fn scheduled_producers(
 fn validate_bound_base_outputs(
     image: &ArenaProgramInventory,
     schedule: &BaseProducerSchedule,
-    bound: &[PendingRecordedWitness],
+    bound: &[PendingBaseProducer],
 ) -> Result<(), InvocationShapeError> {
     let interpolation = schedule
         .interpolation()
@@ -248,6 +367,9 @@ fn validate_bound_base_outputs(
         .map(|column| column.evaluations.logical)
         .collect::<BTreeSet<_>>();
     for producer in bound {
+        let PendingBaseProducer::Recorded(producer) = producer else {
+            continue;
+        };
         let mut trace_outputs = 0usize;
         for &produced in &producer.produced {
             let value = image

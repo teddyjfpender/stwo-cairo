@@ -21,6 +21,9 @@ use crate::resident_runtime::producer_schedule::{
 };
 
 mod adapter;
+mod ec_op_execution_authority;
+#[cfg(test)]
+mod ec_op_pair_tests;
 mod ec_op_prefix;
 mod loaded_authority;
 mod producer_prefix;

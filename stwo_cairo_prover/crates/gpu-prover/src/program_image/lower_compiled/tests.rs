@@ -24,7 +24,7 @@ use crate::resident_session::ResidentPreWitnessInput;
 use crate::resident_witness::planned_cairo_claim;
 use crate::shape_executable::{ShapeCompileRequest, ShapeExecutable, ShapeExecutableCache};
 
-fn generated_sn2() -> Arc<ShapeExecutable> {
+pub(super) fn generated_sn2() -> Arc<ShapeExecutable> {
     let input = run_and_adapt(
         &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
         ProgramType::Json,
@@ -77,12 +77,53 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         Err(ProducerScheduleError::RuntimeOrderMismatch)
     );
 
-    let mapped =
+    // The Mac build links the explicit no-CUDA stub. Inject one exact nonzero
+    // module receipt here to exercise the post-link schedule frontier without
+    // weakening the production binder's linked-receipt requirement.
+    let module_identity = [9; 32];
+    let mapped = producer_prefix::map_scheduled_base_producers_with_native_authority(
+        &image,
+        executable.arena(),
+        &schedule,
+        |contract| {
+            ec_op_execution_authority::NativeEcOpLinkedModuleAuthority::bind_exact(
+                contract,
+                module_identity,
+                module_identity,
+                89,
+            )
+            .map(Some)
+        },
+    )
+    .unwrap();
+    let first_producer = mapped.bound.first().unwrap().recorded().unwrap();
+    let missing = mapped.missing.unwrap();
+    let native_producer = mapped.bound[7].native_ec_op().unwrap();
+    let native = &native_producer.contract;
+    let native_execution = &native_producer.execution;
+    let linked_execution = &native_execution.linked;
+    let linked =
         producer_prefix::map_scheduled_base_producers(&image, executable.arena(), &schedule)
             .unwrap();
-    let first_producer = mapped.bound.first().unwrap();
-    let missing = mapped.missing.unwrap();
-    let native = mapped.native_ec_op_contract.as_ref().unwrap();
+    if stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
+        assert_eq!(linked.bound.len(), 8);
+        assert_eq!(linked.missing, mapped.missing);
+        let linked_native = linked.bound[7].native_ec_op().unwrap();
+        assert_eq!(
+            linked_native.execution.linked.static_module_build_identity,
+            stwo_backend_cuda_kernels::expected_static_cuda_module_build_identity()
+        );
+        assert_eq!(
+            stwo_backend_cuda_kernels::static_cuda_module_target_sms(),
+            &[linked_native.execution.linked.consumer_target_sm]
+        );
+    } else {
+        assert_eq!(linked.bound.len(), 7);
+        assert_eq!(
+            linked.missing.unwrap().missing,
+            producer_prefix::MissingProducerAuthorityKind::NativeEcOpStaticModuleBuildIdentity
+        );
+    }
     let first_interpolation = mapped.base_interpolation.first().unwrap();
     let first_column = first_interpolation.invocation.columns.first().unwrap();
     let coefficients = &image.values[first_column.coefficients.0 as usize];
@@ -106,19 +147,20 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         coefficients.logical,
         schedule.steps().len(),
     );
-    assert_eq!(mapped.bound.len(), 7);
+    assert_eq!(mapped.bound.len(), 8);
     assert_eq!(mapped.scheduled_producers, 23);
     assert_eq!(missing.position.ordinal as usize, mapped.bound.len());
-    assert_eq!(missing.producer.component, "ec_op_builtin");
-    assert_eq!(missing.producer.part, None);
-    assert_eq!(missing.producer.kind, WitnessProducerKind::NativeEcOp);
+    assert_eq!(missing.producer.component, "partial_ec_mul_generic");
+    assert_eq!(
+        missing.producer.part,
+        Some(stwo_cairo_prover::witness::proof_shape::TracePartId::Main)
+    );
+    assert_eq!(missing.producer.kind, WitnessProducerKind::Recorded);
     assert_eq!(
         missing.missing,
-        producer_prefix::MissingProducerAuthorityKind::NativeEcOpStaticModuleBuildIdentity
+        producer_prefix::MissingProducerAuthorityKind::MultiplicityTransition
     );
-    assert_eq!(missing.position.level, 0);
-    assert_eq!(missing.position.lane, 7);
-    assert_eq!(missing.position.ordinal, 7);
+    assert_eq!(missing.position.ordinal, 8);
     let scheduled = schedule
         .witness_levels()
         .iter()
@@ -133,9 +175,9 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         .collect::<Vec<_>>();
     assert_eq!(mapped.scheduled_producers, scheduled.len());
     for (lowered, &(level, lane, expected)) in mapped.bound.iter().zip(&scheduled) {
-        assert_eq!(lowered.producer, expected);
-        assert_eq!(lowered.position.level as usize, level);
-        assert_eq!(lowered.position.lane as usize, lane);
+        assert_eq!(lowered.producer(), expected);
+        assert_eq!(lowered.position().level as usize, level);
+        assert_eq!(lowered.position().lane as usize, lane);
     }
     assert_eq!(missing.producer, scheduled[mapped.bound.len()].2);
     assert_eq!(
@@ -146,19 +188,31 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         missing.position.lane as usize,
         scheduled[mapped.bound.len()].1
     );
-    assert!(mapped.bound.iter().enumerate().all(|(ordinal, producer)| {
-        producer.producer.kind == WitnessProducerKind::Recorded
-            && producer.position.ordinal as usize == ordinal
-            && producer.source.program_identity != [0; 32]
-            && producer.source.abi_schema_identity
-                == AotKernelAbiSchema::RecordedWitnessV1.identity()
-            && producer.source.source_arguments.len() == 8
-            && producer.invocation.arguments.len() == 8
-            && !producer.effect.accesses().is_empty()
-    }));
+    assert!(mapped.bound[..7]
+        .iter()
+        .enumerate()
+        .all(|(ordinal, producer)| {
+            producer.recorded().is_some_and(|producer| {
+                producer.producer.kind == WitnessProducerKind::Recorded
+                    && producer.position.ordinal as usize == ordinal
+                    && producer.source.program_identity != [0; 32]
+                    && producer.source.abi_schema_identity
+                        == AotKernelAbiSchema::RecordedWitnessV1.identity()
+                    && producer.source.source_arguments.len() == 8
+                    && producer.invocation.arguments.len() == 8
+                    && !producer.effect.accesses().is_empty()
+            })
+        }));
+    assert_eq!(native_producer.position.ordinal, 7);
+    assert_eq!(native_producer.producer.component, "ec_op_builtin");
+    assert_eq!(
+        native_producer.producer.kind,
+        WitnessProducerKind::NativeEcOp
+    );
     let bitwise = mapped
         .bound
         .iter()
+        .filter_map(producer_prefix::LoweredBaseProducer::recorded)
         .find(|producer| producer.producer.component == "bitwise_builtin")
         .unwrap();
     let SourceArgument::PointerTable { entries, .. } = &bitwise.source.source_arguments[0] else {
@@ -207,6 +261,57 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     ] {
         assert_ne!(identity, [0; 32]);
     }
+    assert_eq!(
+        linked_execution.static_module_build_identity,
+        module_identity
+    );
+    assert_eq!(
+        linked_execution.expected_static_module_build_identity,
+        module_identity
+    );
+    assert_eq!(linked_execution.consumer_target_sm, 89);
+    assert_eq!(linked_execution.abi, native.authority.abi());
+    assert_eq!(linked_execution.effect, native.authority.effect());
+    assert_eq!(
+        linked_execution.source_identity,
+        native.authority.source_identity()
+    );
+    assert_eq!(
+        linked_execution.abi_identity,
+        native.authority.abi_identity()
+    );
+    assert_eq!(
+        linked_execution.effect_identity,
+        native.authority.effect_identity()
+    );
+    assert_eq!(
+        linked_execution.launch_identity,
+        native.authority.launch_identity()
+    );
+    assert_eq!(
+        linked_execution.contract_identity,
+        native.authority.identity()
+    );
+    assert_eq!(linked_execution.entry_symbol, "ec_op_builtin_witness_on");
+    assert_eq!(
+        linked_execution.launches.map(|launch| launch.entry_symbol),
+        [
+            "ec_op_projective_chain_kernel",
+            "ec_op_normalize_round_tiles_kernel",
+            "partial_input_padding_kernel",
+        ]
+    );
+    assert_eq!(
+        linked_execution.launches.map(|launch| launch.launch),
+        *native.authority.launches()
+    );
+    assert_ne!(linked_execution.identity, [0; 32]);
+    assert_ne!(native_execution.invocation_identity, [0; 32]);
+    assert_eq!(
+        native_execution.compiled_effect_identity,
+        native.effect.id()
+    );
+    assert_ne!(native_execution.identity, linked_execution.identity);
     assert_eq!(
         (*native.authority.launches()).map(|launch| launch.stage),
         [
@@ -426,6 +531,8 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         first_producer.producer,
     )
     .unwrap();
+    // This advances only the typed semantic migration frontier. The arena
+    // inventory still cannot claim or emit a real `CompiledProof`.
     assert!(image.try_promote_to_compiled_proof().is_err());
 
     let mut mutated = first_producer.source.clone();
