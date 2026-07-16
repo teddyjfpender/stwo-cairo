@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gpufleet.source_projection import projection_identity
 
+STAGER = Path(__file__).resolve().parents[2] / "loop/stage_source_projection.sh"
+
 
 class SourceProjectionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -49,8 +51,15 @@ class SourceProjectionTests(unittest.TestCase):
             ".",
             ":(exclude)gpu_benchmarks/loop/results/**",
             ":(exclude)gpu_benchmarks/loop/ledger.jsonl",
+            ":(exclude)gpu_benchmarks/loop/pod.conf",
             ":(exclude)gpu_benchmarks/pie/sn/**",
             ":(exclude)gpu_benchmarks/pie/*.zip",
+            ":(exclude)gpu_benchmarks/results/**",
+            ":(exclude)gpu_benchmarks/fleet/results/**",
+            ":(exclude)gpu_benchmarks/fleet/fleet_report.json",
+            ":(exclude)gpu_benchmarks/fleet/fleet.conf",
+            ":(exclude)gpu_benchmarks/fleet/ledger_costs.jsonl",
+            ":(exclude)gpu_benchmarks/fleet/pods.conf*",
         )
         stream = bytearray(diff)
         records = {
@@ -70,12 +79,64 @@ class SourceProjectionTests(unittest.TestCase):
         self.assertEqual(observed["worktree_sha256"], hashlib.sha256(stream).hexdigest())
 
     def test_excluded_runtime_content_does_not_change_hash(self) -> None:
-        path = self.repo / "gpu_benchmarks/pie/sn/input.bin"
-        path.parent.mkdir(parents=True)
-        path.write_bytes(b"one")
+        paths = [
+            self.repo / "gpu_benchmarks/pie/sn/input.bin",
+            self.repo / "gpu_benchmarks/results/bootstrap/pod.log",
+            self.repo / "gpu_benchmarks/fleet/results/run.json",
+        ]
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"one")
         before = projection_identity(self.repo)
-        path.write_bytes(b"two")
+        for path in paths:
+            path.write_bytes(b"two")
         self.assertEqual(projection_identity(self.repo), before)
+
+    def test_tracked_controller_state_does_not_invalidate_projection(self) -> None:
+        paths = [
+            self.repo / "gpu_benchmarks/fleet/ledger_costs.jsonl",
+            self.repo / "gpu_benchmarks/fleet/pods.conf",
+            self.repo / "gpu_benchmarks/loop/pod.conf",
+        ]
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("before\n")
+        self._git("add", *(str(path.relative_to(self.repo)) for path in paths))
+        self._git("commit", "-qm", "controller state")
+        before = projection_identity(self.repo)
+        for path in paths:
+            path.write_text("after\n")
+        self.assertEqual(projection_identity(self.repo), before)
+
+    def test_stager_omits_the_same_controller_runtime_paths(self) -> None:
+        source = self.repo / "source.py"
+        source.write_text("kept = True\n")
+        excluded = [
+            self.repo / "gpu_benchmarks/fleet/ledger_costs.jsonl",
+            self.repo / "gpu_benchmarks/fleet/pods.conf",
+            self.repo / "gpu_benchmarks/loop/pod.conf",
+            self.repo / "gpu_benchmarks/results/bootstrap/pod.log",
+        ]
+        for path in excluded:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("runtime\n")
+        self._git(
+            "add",
+            "source.py",
+            *(str(path.relative_to(self.repo)) for path in excluded),
+        )
+        self._git("commit", "-qm", "projection fixture")
+
+        with tempfile.TemporaryDirectory() as parent:
+            destination = Path(parent) / "projection"
+            subprocess.run(
+                [str(STAGER), str(self.repo), str(destination)],
+                check=True,
+                capture_output=True,
+            )
+            self.assertEqual((destination / "source.py").read_text(), "kept = True\n")
+            for path in excluded:
+                self.assertFalse((destination / path.relative_to(self.repo)).exists())
 
 
 if __name__ == "__main__":

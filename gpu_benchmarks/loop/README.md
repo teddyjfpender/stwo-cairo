@@ -55,7 +55,8 @@ BENCH_POD_ID=<pod-id> ./quick_sn2.sh
 It first runs the CPU-only launcher/provenance tests locally, before starting a paid
 pod. It accepts dirty worktrees only because both benchmark-relevant source
 projections are content-hashed and synced exactly; ignored caches, runtime receipts,
-and persistent PIE fixtures are not source. It reuses the persistent Cargo/CUDA
+provider ledgers/rosters, bootstrap/run results, and persistent PIE fixtures are not
+source. It reuses the persistent Cargo/CUDA
 caches, rebuilds the changed release binary, checks the pinned input and AOT
 identities, then runs six verifier-backed SN2 proofs with fresh SIMD byte equality
 and deterministic mutation rejection. The result is explicitly `iteration_only`

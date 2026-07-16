@@ -11,8 +11,15 @@ trap 'rm -rf -- "$scratch"' EXIT
 git -C "$repo" ls-files --cached --others --exclude-standard -z -- . \
   ':(exclude)gpu_benchmarks/loop/results/**' \
   ':(exclude)gpu_benchmarks/loop/ledger.jsonl' \
+  ':(exclude)gpu_benchmarks/loop/pod.conf' \
   ':(exclude)gpu_benchmarks/pie/sn/**' \
-  ':(exclude)gpu_benchmarks/pie/*.zip' >"$scratch/candidates"
+  ':(exclude)gpu_benchmarks/pie/*.zip' \
+  ':(exclude)gpu_benchmarks/results/**' \
+  ':(exclude)gpu_benchmarks/fleet/results/**' \
+  ':(exclude)gpu_benchmarks/fleet/fleet_report.json' \
+  ':(exclude)gpu_benchmarks/fleet/fleet.conf' \
+  ':(exclude)gpu_benchmarks/fleet/ledger_costs.jsonl' \
+  ':(exclude)gpu_benchmarks/fleet/pods.conf*' >"$scratch/candidates"
 : >"$scratch/files"
 while IFS= read -r -d '' path; do
   if [[ -f "$repo/$path" || -L "$repo/$path" ]]; then

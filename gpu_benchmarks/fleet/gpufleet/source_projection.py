@@ -10,8 +10,15 @@ from pathlib import Path
 _DIFF_EXCLUSIONS = (
     ":(exclude)gpu_benchmarks/loop/results/**",
     ":(exclude)gpu_benchmarks/loop/ledger.jsonl",
+    ":(exclude)gpu_benchmarks/loop/pod.conf",
     ":(exclude)gpu_benchmarks/pie/sn/**",
     ":(exclude)gpu_benchmarks/pie/*.zip",
+    ":(exclude)gpu_benchmarks/results/**",
+    ":(exclude)gpu_benchmarks/fleet/results/**",
+    ":(exclude)gpu_benchmarks/fleet/fleet_report.json",
+    ":(exclude)gpu_benchmarks/fleet/fleet.conf",
+    ":(exclude)gpu_benchmarks/fleet/ledger_costs.jsonl",
+    ":(exclude)gpu_benchmarks/fleet/pods.conf*",
 )
 
 
@@ -19,7 +26,14 @@ def _excluded(path: bytes) -> bool:
     return (
         path.startswith(b"gpu_benchmarks/loop/results/")
         or path == b"gpu_benchmarks/loop/ledger.jsonl"
+        or path == b"gpu_benchmarks/loop/pod.conf"
         or path.startswith(b"gpu_benchmarks/pie/sn/")
+        or path.startswith(b"gpu_benchmarks/results/")
+        or path.startswith(b"gpu_benchmarks/fleet/results/")
+        or path == b"gpu_benchmarks/fleet/fleet_report.json"
+        or path == b"gpu_benchmarks/fleet/fleet.conf"
+        or path == b"gpu_benchmarks/fleet/ledger_costs.jsonl"
+        or path.startswith(b"gpu_benchmarks/fleet/pods.conf")
         or (
             path.startswith(b"gpu_benchmarks/pie/")
             and path.endswith(b".zip")
