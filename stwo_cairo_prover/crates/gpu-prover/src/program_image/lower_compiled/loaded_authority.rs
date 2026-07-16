@@ -4,6 +4,16 @@ use stwo_backend_cuda::aot::{self, AotKernelAbiSchema, AotKernelAuthority, AotKe
 
 use super::{InvocationShapeError, RecordedWitnessInvocationShape};
 
+fn reject_unpublished_module_state(
+    invocation: &RecordedWitnessInvocationShape,
+) -> Result<(), InvocationShapeError> {
+    if invocation.deduce.module_state.is_some() {
+        Err(InvocationShapeError::MissingLoadedModuleStateAuthority)
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct LoadedRecordedWitnessAuthority {
     pub(super) manifest_identity: [u8; 32],
@@ -71,6 +81,10 @@ pub(super) fn validate_fields(
     sm_minor: u32,
     fields: &LoadedAuthorityFields,
 ) -> Result<(), InvocationShapeError> {
+    // A sealed pack entry proves binary/source identity, not that this specific
+    // CUmodule received its process-local Pedersen pointer relocations. Keep the
+    // loaded authority unavailable until that publication has its own receipt.
+    reject_unpublished_module_state(invocation)?;
     if sm_minor >= 10 {
         return Err(InvocationShapeError::LoadedAotAuthorityMismatch);
     }
@@ -94,4 +108,39 @@ pub(super) fn validate_fields(
         return Err(InvocationShapeError::LoadedAotAuthorityMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiled_proof::LaunchGeometry;
+    use crate::program_image::lower_compiled::recorded_deduce_authority::{
+        empty_for_test, PedersenTableColumnsAndRowsV1,
+    };
+
+    #[test]
+    fn stateful_pack_authority_requires_a_separate_module_publication_receipt() {
+        let mut deduce = empty_for_test();
+        deduce.module_state = Some(PedersenTableColumnsAndRowsV1::CANONICAL);
+        let invocation = RecordedWitnessInvocationShape {
+            program_identity: [1; 32],
+            semantic_hash: 1,
+            cache_key: 1,
+            kernel_symbol: "stateful".into(),
+            abi_schema_identity: [1; 32],
+            deduce,
+            launch: LaunchGeometry {
+                grid: [1, 1, 1],
+                block: [1, 1, 1],
+                cluster: None,
+                dynamic_shared_bytes: 0,
+                cooperative: false,
+            },
+            source_arguments: Vec::new(),
+        };
+        assert_eq!(
+            reject_unpublished_module_state(&invocation),
+            Err(InvocationShapeError::MissingLoadedModuleStateAuthority)
+        );
+    }
 }

@@ -98,3 +98,47 @@ pub(super) fn assert_generated_partial_authority(
         Err(InvocationShapeError::SourceEmitterRejected)
     );
 }
+
+pub(super) fn assert_generated_pedersen_state_authority(
+    executable: &ShapeExecutable,
+    image: &ArenaProgramInventory,
+    mapped: &producer_prefix::BaseProducerBindingFrontier,
+) {
+    let stateful = mapped
+        .bound
+        .iter()
+        .filter_map(producer_prefix::LoweredBaseProducer::recorded)
+        .filter(|producer| producer.source.deduce.module_state.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stateful
+            .iter()
+            .map(|producer| (producer.position.ordinal, producer.producer.component))
+            .collect::<Vec<_>>(),
+        [
+            (15, "pedersen_aggregator_window_bits_18"),
+            (18, "partial_ec_mul_window_bits_18"),
+        ]
+    );
+    assert_eq!(
+        stateful[0].source.deduce.module_state,
+        stateful[1].source.deduce.module_state
+    );
+    for producer in stateful {
+        assert_eq!(
+            producer.source.deduce.module_state,
+            Some(recorded_deduce_authority::PedersenTableColumnsAndRowsV1::CANONICAL)
+        );
+        // These private inventory effects cover ordinary values only. The
+        // production compiler must add real module-global authority after the
+        // loaded CUmodule publication receipt is available.
+        assert!(producer.effect.module_globals().is_empty());
+        validate_invocation(
+            &producer.source,
+            image,
+            executable.arena(),
+            producer.producer,
+        )
+        .unwrap();
+    }
+}

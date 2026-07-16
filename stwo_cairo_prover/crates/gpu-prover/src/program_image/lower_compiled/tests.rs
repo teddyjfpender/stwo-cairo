@@ -97,7 +97,6 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     )
     .unwrap();
     let first_producer = mapped.bound.first().unwrap().recorded().unwrap();
-    let missing = mapped.missing.unwrap();
     let native_producer = mapped.bound[7].native_ec_op().unwrap();
     let native = &native_producer.contract;
     let native_execution = &native_producer.execution;
@@ -106,8 +105,8 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         producer_prefix::map_scheduled_base_producers(&image, executable.arena(), &schedule)
             .unwrap();
     if stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
-        assert_eq!(linked.bound.len(), 15);
-        assert_eq!(linked.missing, mapped.missing);
+        assert_eq!(linked.bound.len(), 23);
+        assert_eq!(linked.missing, None);
         let linked_native = linked.bound[7].native_ec_op().unwrap();
         assert_eq!(
             linked_native.execution.linked.static_module_build_identity,
@@ -133,13 +132,10 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         .map(|batch| batch.invocation.columns.len())
         .sum::<usize>();
     eprintln!(
-        "BASE_PRODUCER_BINDING_FRONTIER bound={} scheduled={} first={} missing={} missing_kind={:?} missing_position={:?} ec_op_accesses={} ec_op_launches={} base_outputs={} first_coefficient_id={:?} first_coefficient_logical={:?} runtime_steps={}",
+        "BASE_PRODUCER_SOURCE_RELOCATION_FRONTIER bound={} scheduled={} first={} module_state_ordinals=15,18 ec_op_accesses={} ec_op_launches={} base_outputs={} first_coefficient_id={:?} first_coefficient_logical={:?} runtime_steps={}",
         mapped.bound.len(),
         mapped.scheduled_producers,
         first_producer.producer.component,
-        missing.producer.component,
-        missing.missing,
-        missing.position,
         native.effect.accesses().len(),
         native.authority.launches().len(),
         interpolation_columns,
@@ -147,25 +143,9 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         coefficients.logical,
         schedule.steps().len(),
     );
-    assert_eq!(mapped.bound.len(), 15);
+    assert_eq!(mapped.bound.len(), 23);
     assert_eq!(mapped.scheduled_producers, 23);
-    assert_eq!(missing.position.ordinal as usize, mapped.bound.len());
-    assert_eq!(
-        missing.producer.component,
-        "pedersen_aggregator_window_bits_18"
-    );
-    assert_eq!(
-        missing.producer.part,
-        Some(stwo_cairo_prover::witness::proof_shape::TracePartId::Main)
-    );
-    assert_eq!(missing.producer.kind, WitnessProducerKind::Recorded);
-    assert_eq!(
-        missing.missing,
-        producer_prefix::MissingProducerAuthorityKind::ModuleGlobalEffects(
-            DeduceKind::PartialEcMulW18
-        )
-    );
-    assert_eq!(missing.position.ordinal, 15);
+    assert_eq!(mapped.missing, None);
     let scheduled = schedule
         .witness_levels()
         .iter()
@@ -251,15 +231,6 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         assert_eq!(lowered.position().level as usize, level);
         assert_eq!(lowered.position().lane as usize, lane);
     }
-    assert_eq!(missing.producer, scheduled[mapped.bound.len()].2);
-    assert_eq!(
-        missing.position.level as usize,
-        scheduled[mapped.bound.len()].0
-    );
-    assert_eq!(
-        missing.position.lane as usize,
-        scheduled[mapped.bound.len()].1
-    );
     assert!(mapped.bound.iter().enumerate().all(|(ordinal, producer)| {
         if ordinal == 7 {
             return producer.native_ec_op().is_some_and(|producer| {
@@ -285,6 +256,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         WitnessProducerKind::NativeEcOp
     );
     recorded_deduce_tests::assert_generated_partial_authority(executable, &image, &mapped);
+    recorded_deduce_tests::assert_generated_pedersen_state_authority(executable, &image, &mapped);
     let bitwise = mapped
         .bound
         .iter()
@@ -664,7 +636,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
 }
 
 #[test]
-fn generated_sn2_schedule_prefix_is_exact_and_stops_at_missing_authority() {
+fn generated_sn2_source_relocation_frontier_is_exact_and_promotion_stays_closed() {
     assert_exact_invocation_frontier(&generated_sn2());
 }
 

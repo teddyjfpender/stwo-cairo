@@ -1,15 +1,15 @@
 //! Contiguous schedule-order authority for Base witness producers.
 //!
-//! A producer enters `bound` only after its typed source ABI and exact effect
-//! contract both compile. Enumeration stops at the first producer whose real
-//! primitive still lacks authority; later producers are not claimed merely
-//! because their individual source emitter may exist. This is a semantic
-//! migration frontier, not authority to promote the arena inventory into a
-//! production `CompiledProof`.
+//! A producer enters `bound` only after its typed source ABI and ordinary value
+//! effect compile. A stateful recorded producer additionally carries its exact
+//! address-free resource/relocation recipe, but its value effect deliberately
+//! omits module globals until a loaded-module publication receipt can bind real
+//! addresses and canonical content. This is a source/relocation migration
+//! frontier, not executable authority or permission to promote the arena
+//! inventory into a production `CompiledProof`.
 
 use std::collections::BTreeSet;
 
-use stwo_backend_cuda::jit_witness::isa::DeduceKind;
 use stwo_backend_cuda::EcOpCompositeContract;
 
 use super::ec_op_execution_authority::{
@@ -39,7 +39,6 @@ pub(super) enum MissingProducerAuthorityKind {
     BlakeGDirectComposite,
     NativeEcOpStaticModuleBuildIdentity,
     MultiplicityTransition,
-    ModuleGlobalEffects(DeduceKind),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,9 +192,6 @@ fn map_scheduled_base_producers_using(
                     }
                     Err(InvocationShapeError::MultiplicityNeedsSemanticVersions) => {
                         Some(MissingProducerAuthorityKind::MultiplicityTransition)
-                    }
-                    Err(InvocationShapeError::UnsupportedModuleGlobals(kind)) => {
-                        Some(MissingProducerAuthorityKind::ModuleGlobalEffects(kind))
                     }
                     Err(InvocationShapeError::InvalidProgramRole) => {
                         return Err(InvocationShapeError::ScheduledProducerInvalidProgram(

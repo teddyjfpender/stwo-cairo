@@ -1,14 +1,15 @@
 //! Exact schedule-order invocation frontier for Base witness producers.
 //!
 //! Ordinary recorded witnesses lower through the source-emitter-owned typed
-//! AOT ABI. Enumeration stops before the first native/composite or module-
-//! global effect whose authority is not yet represented in `CompiledProof`.
+//! AOT ABI. Stateful deduces also carry an address-free resource/relocation
+//! recipe; a loaded-module publication receipt remains a separate requirement
+//! before any production `CompiledProof` promotion.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
 
 use stwo_backend_cuda::aot::{self, AotKernelAbiAccess, AotKernelAbiKind, AotKernelAbiSchema};
-use stwo_backend_cuda::jit_witness::isa::{DeduceKind, WitnessOp, WitnessProgram};
+use stwo_backend_cuda::jit_witness::isa::{WitnessOp, WitnessProgram};
 use stwo_backend_cuda::{
     ArenaSlotId, EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_POINTERS, EXECUTION_TABLE_STRIDES,
 };
@@ -94,7 +95,7 @@ struct RecordedWitnessInvocationShape {
     cache_key: u64,
     kernel_symbol: String,
     abi_schema_identity: [u8; 32],
-    deduce: recorded_deduce_authority::SelfContainedDeduceAuthority,
+    deduce: recorded_deduce_authority::RecordedDeduceAuthority,
     launch: LaunchGeometry,
     source_arguments: Vec<SourceArgument>,
 }
@@ -105,7 +106,6 @@ enum InvocationShapeError {
     MissingPreparedExecutionTables,
     LegacyExecutionTables,
     MultiplicityNeedsSemanticVersions,
-    UnsupportedModuleGlobals(DeduceKind),
     InvalidProgramRole,
     InvalidStructuredAbi,
     MissingCatalogValue(ArenaSlotId),
@@ -116,6 +116,7 @@ enum InvocationShapeError {
     SizeOverflow,
     SourceEmitterRejected,
     MissingLoadedAotAuthority,
+    MissingLoadedModuleStateAuthority,
     LoadedAotAuthorityMismatch,
     InvocationMismatch,
     FrontierDidNotAdvance,
