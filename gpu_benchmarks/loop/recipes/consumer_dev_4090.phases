@@ -1,5 +1,0 @@
-# Persistent RTX 4090 development lane for Linux compilation, focused native
-# CUDA correctness, replay fixtures, and short profiler runs. This is not a
-# qualification or headline-benchmark recipe. The attached network volume keeps
-# compiler caches and fixtures across idle stops.
-# pod_run: lease one_shot=false final_action=stop gpu=4090 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=0.40 name_prefix=stwo-consumer-dev-4090- ttl_hours=6 idle_min=30
