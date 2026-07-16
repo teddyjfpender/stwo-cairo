@@ -149,6 +149,11 @@ class ProviderTests(unittest.TestCase):
 
 
 class FleetCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        identity = mock.patch.object(cli, "_bind_explicit_ssh_key")
+        identity.start()
+        self.addCleanup(identity.stop)
+
     def test_require_pregate_is_freshness_only(self) -> None:
         with mock.patch.object(cli.pregate, "is_fresh", return_value=True):
             self.assertEqual(cli.cmd_require_pregate(None), 0)

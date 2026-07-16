@@ -34,7 +34,14 @@ ambiguous, or mismatched REST fields abort before useful work.
 
 ## Fast development use
 
+Bind one exact local private key before invoking any command that constructs SSH transport. The
+controller rejects symlinks, keys not owned by the current user, group/world permissions, missing
+keys, and ambiguous automatic discovery; it never reads key contents. This machine has multiple
+RunPod keys, so set the path explicitly rather than relying on discovery:
+
 ```bash
+export RUNPOD_SSH_KEY="$HOME/.runpod/ssh/RunPod-Key-Go" # path only; never key contents
+chmod 0600 "$RUNPOD_SSH_KEY"
 gpu_benchmarks/lab/pod/labctl self-test
 gpu_benchmarks/lab/pod/labctl open --image IMAGE@sha256:DIGEST \
   --volume-id ID --volume-dc DC
@@ -112,9 +119,19 @@ every source path, local destination, byte count, and SHA-256. Durable objects l
 Acceptance requires the image's pinned
 `nsight-systems-2026.1.3=2026.1.3.425-261338342291v0`, executes
 `nsys --version`, and records that package identity. Profile acceptance additionally executes one
-real Nsight Compute counter collection; neither check launches the prover.
+real Nsight Compute counter collection through the authenticated `dev` SSH endpoint at UID/GID
+`1000:1000`. The root control plane records the exact dev receipt and its SHA-256; neither check
+launches the prover.
+
+Known hardening follow-ups are explicit: replace disabled SSH host-key checking with a provider-bound
+host identity when RunPod exposes one; make `GPU_LAB_LOCAL_ROOT` available to non-login IDE command
+sessions without relying on `/etc/profile.d` (source that file explicitly today); and replace the
+fixed first-install heartbeat/active-root temporary names with securely created root-owned files.
+These are P2 defense-in-depth items, not accepted profile or benchmark evidence.
 
 Tests are stdlib-only and prohibit provider, REST, SSH, rsync transport, and GPU calls. Keep
 `labctl` as the tiny stable entrypoint, place behavior in its owning `labctl_lib` module, keep every
 handwritten file below 500 lines, and follow the lab's canonical
 [`CONTRIBUTING.md`](../CONTRIBUTING.md) for taste, evidence, GPU work, and feedback-loop budgets.
+The `labctl` shebang and local test contract are Python 3.11; use `python3.11`, not the macOS
+`/usr/bin/python3` 3.9, for direct fleet test invocations.

@@ -124,6 +124,10 @@ def cmd_open(args: argparse.Namespace) -> int:
         print(f"NO POD LAUNCHED. Re-run with: --confirm {token}")
         return 2
 
+    # Resolve and validate the one exact private key before watchdog state or a
+    # billable provider mutation. SSH transport itself resolves the same lazy
+    # option object again for every root, dev, and rsync invocation.
+    tuple(c.SSH_OPTS)
     created = time.time()
     pod = None
     lease_name = f"{plan['name_prefix']}-{token[-8:].lower()}"

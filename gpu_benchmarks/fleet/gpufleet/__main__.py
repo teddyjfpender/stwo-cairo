@@ -143,23 +143,7 @@ def _require_pregate() -> bool:
 
 
 def _bind_explicit_ssh_key() -> None:
-    configured = os.environ.get("RUNPOD_SSH_KEY", "").strip()
-    if not configured:
-        return
-    candidate = Path(configured).expanduser()
-    if candidate.is_symlink():
-        raise ValueError("RUNPOD_SSH_KEY must name one regular private-key file")
-    key = candidate.resolve(strict=True)
-    if not key.is_file():
-        raise ValueError("RUNPOD_SSH_KEY must name one regular private-key file")
-    existing = iter(pod_control.SSH_OPTS)
-    without_identity = []
-    for option in existing:
-        if option == "-i":
-            next(existing, None)
-        else:
-            without_identity.append(option)
-    pod_control.SSH_OPTS = ["-i", str(key), *without_identity]
+    pod_control._ssh_opts()
 
 
 def _install_deadman_first(

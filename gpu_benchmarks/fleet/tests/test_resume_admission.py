@@ -177,6 +177,7 @@ class ExistingPodAdmissionTests(unittest.TestCase):
 
     def test_stale_pregate_touches_no_provider_state(self) -> None:
         with (
+            mock.patch.object(cli, "_bind_explicit_ssh_key"),
             mock.patch.object(cli, "_require_pregate", return_value=False),
             mock.patch.object(cli.api, "secure_offer") as offer,
             mock.patch.object(cli.api, "get_pod") as get,

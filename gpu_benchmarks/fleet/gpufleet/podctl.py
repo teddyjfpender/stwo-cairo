@@ -11,7 +11,9 @@ The manifest runner touches the heartbeat before every step; long steps hold a
 
 from __future__ import annotations
 
+import os
 import shlex
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
@@ -20,34 +22,71 @@ from pathlib import Path
 from . import DEFAULT_IDLE_STOP_MIN, DEFAULT_TTL_HOURS, HEARTBEAT_PATH
 from .api import PodInfo, get_pod
 
+
+SSH_KEY_NAMES = ("runpodctl-ssh-key", "RunPod-Key-Go", "RunPod-Key-Ed25519")
+SSH_BASE_OPTS = (
+    "-o", "BatchMode=yes",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "ConnectTimeout=15",
+    "-o", "ServerAliveInterval=20",
+    "-o", "ServerAliveCountMax=6",
+    "-o", "LogLevel=ERROR",
+)
+
+
+def _private_key() -> Path:
+    configured = os.environ.get("RUNPOD_SSH_KEY", "").strip()
+    if configured:
+        candidates = [Path(configured).expanduser()]
+    else:
+        root = Path.home() / ".runpod" / "ssh"
+        candidates = [
+            root / name for name in SSH_KEY_NAMES if os.path.lexists(root / name)
+        ]
+        if not candidates:
+            raise ValueError(
+                "no SSH private key found; set RUNPOD_SSH_KEY to one exact file"
+            )
+        if len(candidates) != 1:
+            raise ValueError(
+                "multiple SSH private keys found; set RUNPOD_SSH_KEY to one exact file"
+            )
+
+    key = Path(os.path.abspath(candidates[0]))
+    try:
+        identity = key.lstat()
+    except OSError as error:
+        raise ValueError(f"SSH private key is unavailable: {key}") from error
+    if stat.S_ISLNK(identity.st_mode) or not stat.S_ISREG(identity.st_mode):
+        raise ValueError("SSH key must name one regular private-key file, not a symlink")
+    if identity.st_uid != os.getuid():
+        raise ValueError("SSH private key must be owned by the current user")
+    mode = stat.S_IMODE(identity.st_mode)
+    if mode & 0o077:
+        raise ValueError("SSH private key must have no group or world permissions")
+    if not mode & stat.S_IRUSR:
+        raise ValueError("SSH private key must be readable by its owner")
+    return key
+
+
 def _ssh_opts() -> list[str]:
-    opts = [
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=15",
-        "-o", "ServerAliveInterval=20",
-        "-o", "ServerAliveCountMax=6",
-        "-o", "LogLevel=ERROR",
+    key = _private_key()
+    return [
+        "-i", str(key),
+        "-o", "IdentitiesOnly=yes",
+        *SSH_BASE_OPTS,
     ]
-    # RunPod has used both the legacy and current key names. Pick the first
-    # installed private key instead of silently falling back to unrelated
-    # default SSH identities.
-    key_root = Path.home() / ".runpod" / "ssh"
-    key = next(
-        (
-            candidate
-            for name in ("runpodctl-ssh-key", "RunPod-Key-Go", "RunPod-Key-Ed25519")
-            if (candidate := key_root / name).is_file()
-        ),
-        None,
-    )
-    if key is not None:
-        opts = ["-i", str(key), *opts]
-    return opts
 
 
-SSH_OPTS = _ssh_opts()
+class _LazySSHOptions:
+    """Resolve the exact identity only when a transport is actually constructed."""
+
+    def __iter__(self):
+        return iter(_ssh_opts())
+
+
+SSH_OPTS = _LazySSHOptions()
 
 
 @dataclass
@@ -73,7 +112,7 @@ def ssh_run(
     log_file: Path | None = None,
 ) -> int:
     """Run one remote command; stream combined output to log_file (and return rc)."""
-    argv = ["ssh", *SSH_OPTS, "-p", str(ep.port), f"{ep.user}@{ep.host}", cmd]
+    argv = ["ssh", *_ssh_opts(), "-p", str(ep.port), f"{ep.user}@{ep.host}", cmd]
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with open(log_file, "ab") as f:
@@ -91,7 +130,7 @@ def ssh_run(
 
 
 def ssh_capture(ep: Endpoint, cmd: str, *, timeout: float = 120) -> tuple[int, str]:
-    argv = ["ssh", *SSH_OPTS, "-p", str(ep.port), f"{ep.user}@{ep.host}", cmd]
+    argv = ["ssh", *_ssh_opts(), "-p", str(ep.port), f"{ep.user}@{ep.host}", cmd]
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
@@ -99,12 +138,13 @@ def ssh_capture(ep: Endpoint, cmd: str, *, timeout: float = 120) -> tuple[int, s
 def rsync(
     ep: Endpoint, src: str, dst: str, *, pull: bool = False, timeout: float = 1800
 ) -> int:
+    ssh_opts = _ssh_opts()
     remote = f"{ep.user}@{ep.host}:"
     a, b = (remote + src, dst) if pull else (src, remote + dst)
     # No --info/--append-verify: macOS ships rsync 2.6.9 (learned lesson).
     argv = [
         "rsync", "-az", "--partial", "--stats",
-        "-e", "ssh " + " ".join(shlex.quote(o) for o in SSH_OPTS) + f" -p {ep.port}",
+        "-e", "ssh " + " ".join(shlex.quote(o) for o in ssh_opts) + f" -p {ep.port}",
         a, b,
     ]
     return subprocess.run(argv, timeout=timeout, check=False).returncode

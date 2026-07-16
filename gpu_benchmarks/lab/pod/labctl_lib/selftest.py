@@ -13,7 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import acceptance, generation_tests, lifecycle, lifecycle_tests, persistence_tests
+from . import acceptance_tests, generation_tests, lifecycle, lifecycle_tests, persistence_tests
 from . import provider, runtime, sync
 from . import common as c
 def _rejected(call, label: str) -> None:
@@ -183,9 +183,6 @@ def _check_provider(offer) -> None:
         c.api.get_pod = old_get_pod
         c.api.list_pods = old_list_pods
 def _check_generated_commands(valid_image: str) -> None:
-    shell_argv = acceptance._shell_argv(c.Endpoint("host", 22))
-    assert shell_argv[-1] == "dev@host" and "root@host" not in shell_argv
-
     guard = runtime._guard_command("pod-test", "volume-test", 60, 300)
     assert "SEAL.sha256" in guard and "sleep 60" in guard
     assert "RUNPOD_API_KEY" not in guard and "mountpoint -q /workspace" in guard
@@ -200,43 +197,7 @@ def _check_generated_commands(valid_image: str) -> None:
     assert 'marker: (0, 0, 0o444)' in guard
     assert "refusing unsealed TTL exit" in guard and "LABCTL_PERSIST_SHA256" in guard
     assert runtime._elapsed_spend({"created_at": 0, "usd_hr": 2}, 7200) == 4
-
-    accept_output = "\n".join(
-        (
-            "LABCTL_KERNEL_RESULT=1",
-            "LABCTL_NCU_METRIC=123.5",
-            "LABCTL_NSYS_PACKAGE=" + acceptance.NSYS_IDENTITY,
-            "LABCTL_DEV_LAYOUT=" + acceptance.DEV_LAYOUT_IDENTITY,
-            "LABCTL_RECORD=/tmp/stwo-gpu-lab/pod-test/records/accept-profile-abc.txt",
-            "LABCTL_RECORD_SHA256=" + "b" * 64,
-            "LABCTL_PERSIST_MANIFEST=/workspace/gpu-lab/leases/pod-test/persists/" + "c" * 64 + ".json",
-            "LABCTL_PERSIST_SHA256=" + "c" * 64,
-            "LABCTL_PERSIST_ENTRIES=1",
-            "LABCTL_SEALED=0",
-        )
-    )
-    record, digest, metric, persisted = acceptance._parse_acceptance(accept_output, profile=True)
-    assert record.endswith("abc.txt") and digest == "b" * 64 and metric == 123.5
-    assert persisted["manifest_sha256"] == "c" * 64 and persisted["entries"] == 1
-    _rejected(lambda: acceptance._parse_acceptance(
-        accept_output.replace("LABCTL_NCU_METRIC=123.5\n", ""), profile=True
-    ), "missing ncu metric")
-    _rejected(lambda: acceptance._parse_acceptance(
-        accept_output.replace(acceptance.NSYS_IDENTITY, "wrong=0"), profile=True
-    ), "wrong Nsight Systems package")
-    _rejected(lambda: acceptance._parse_acceptance(
-        accept_output.replace(acceptance.DEV_LAYOUT_IDENTITY, "wrong-layout"), profile=True
-    ), "wrong dev layout")
-    command = acceptance._accept_command({
-        "image": valid_image, "pod_id": "pod-test", "volume_id": "volume-test",
-    }, profile=True)
-    assert "mktemp" in command and "LABCTL_KERNEL_RESULT=1" in command
-    assert "findmnt" in command and "NETWORK_VOLUME_ID" in command
-    assert "LABCTL_DEV_LAYOUT=uid1000-gid1000-root0710-build0700-fixtures0700" in command
-    assert "DEV_LAYOUT.json" in command and "1000:1000:700" in command
-    assert acceptance.NSYS_IDENTITY in command and "nsys --version" in command
-    for generated in (guard, command):
-        subprocess.run(["bash", "-n"], input=generated, text=True, check=True)
+    subprocess.run(["bash", "-n"], input=guard, text=True, check=True)
 
     old_capture, old_run = c.ssh_capture, c.ssh_run
     try:
@@ -248,24 +209,7 @@ def _check_generated_commands(valid_image: str) -> None:
         runtime._touch_heartbeat(c.Endpoint("host", 22))
     finally:
         c.ssh_capture, c.ssh_run = old_capture, old_run
-    parser = acceptance.COUNTER_CMD.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-    with tempfile.NamedTemporaryFile("w", delete=False) as ncu_csv:
-        ncu_csv.write(
-            '"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"\n'
-            '"1","labctl_counter(int *)","sm__cycles_elapsed.avg",'
-            '"cycle","12,345.5"\n'
-        )
-        path = Path(ncu_csv.name)
-    try:
-        parsed = subprocess.run(
-            [sys.executable, "-c", parser, str(path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        assert parsed == "LABCTL_NCU_METRIC=12345.5"
-    finally:
-        path.unlink()
+    acceptance_tests.acceptance_self_test(valid_image)
 def _check_tree_identity() -> None:
     with tempfile.TemporaryDirectory() as directory:
         repo = Path(directory) / "repo"
@@ -454,6 +398,12 @@ def cmd_self_test(_args) -> int:
         c.wait_ready,
         provider._rest_get,
     )
+    original_ssh_opts = c.SSH_OPTS
+    c.SSH_OPTS = [
+        "-i", "/offline/labctl-private-key",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes",
+    ]
     try:
         c.api.gql = forbidden_remote
         c.api.get_pod = forbidden_remote
@@ -471,8 +421,10 @@ def cmd_self_test(_args) -> int:
         _check_tree_identity()
         generation_tests.generation_self_test()
         lifecycle_tests.failed_open_cleanup_self_test()
+        lifecycle_tests.ssh_preflight_self_test()
         _check_state_machine(args, offer, plan, canonical)
     finally:
+        c.SSH_OPTS = original_ssh_opts
         (
             c.api.gql,
             c.api.get_pod,
