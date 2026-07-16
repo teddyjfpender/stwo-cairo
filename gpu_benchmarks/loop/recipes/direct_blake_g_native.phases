@@ -47,9 +47,9 @@ run_direct_blake_g_native() {
   cd "$STWO"
 
   [[ "$STWO_PARITY_REF_STWO_HEAD" == \
-    015fc5bc3821824a7df6a3b19995c71ace8ae37c ]]
+    d5ee09ff13b5cb45000f59a67870304bc17263c9 ]]
   printf '%s  %s\n' \
-    e7a7d1bcce8219d1f4624f7e9bb8b23104193a090cf8ed463fbe129a3202be5b \
+    4c5524d635dd73f00c97e190e5553301e079933ee5f6779cc388034f2d616f2d \
     "$DIRECT_SOURCE" | sha256sum -c -
   printf '%s  %s\n' \
     0680ca05f46f7b5f513bbce57646c57c57085f2f2fa35a8b5423e61f68fd3a23 \
@@ -70,7 +70,8 @@ run_direct_blake_g_native() {
     CARGO_BUILD_JOBS=16 \
     CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_TEST_DEBUG=0 \
-    cargo test --locked --release -p stwo-backend-cuda --lib \
+    cargo test --locked --release -p stwo-backend-cuda \
+      --features test-only-empty-aot-pack --lib \
       "$DIRECT_TEST" -- --exact --nocapture --test-threads=1
 }
 
@@ -104,6 +105,8 @@ if "requires a native CUDA-linked backend" in text:
     raise SystemExit("native Blake-G test was ignored")
 if "native Blake-G admission cannot run against CUDA stubs" in text:
     raise SystemExit("native Blake-G test linked CUDA stubs")
+if text.count("direct_blake_g_native_aot_entries=0") != 1:
+    raise SystemExit("native Blake-G test did not attest the empty test-only AOT pack")
 
 executables = re.findall(r"Running unittests src/lib\.rs \(([^)\n]+)\)", text)
 if len(executables) != 1:
@@ -126,6 +129,7 @@ record = {
     "passed": True,
     "gpu": "NVIDIA A40",
     "cuda_arch": "sm_86",
+    "aot_pack": {"entries": 0, "mode": "test-only-empty"},
     "test": name,
     "source": {
         "stwo_head": os.environ["STWO_PARITY_REF_STWO_HEAD"],
