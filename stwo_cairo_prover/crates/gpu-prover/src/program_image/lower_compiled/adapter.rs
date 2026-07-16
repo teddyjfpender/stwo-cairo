@@ -11,43 +11,83 @@ use crate::compiled_proof::{
 /// Explicit semantic authority. Arena catalog IDs are storage inventory and
 /// are never cast or inferred into immutable semantic versions.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct SemanticValueMap(BTreeMap<ArenaCatalogValueId, ValueVersion>);
+pub(super) struct SemanticValueMap {
+    current: BTreeMap<ArenaCatalogValueId, ValueVersion>,
+    allocations: Vec<(ArenaCatalogValueId, ValueVersion)>,
+}
 
 impl SemanticValueMap {
     pub(super) fn new(
         entries: impl IntoIterator<Item = (ArenaCatalogValueId, ValueVersion)>,
     ) -> Result<Self, InvocationShapeError> {
-        let mut map = BTreeMap::new();
+        let mut current = BTreeMap::new();
         let mut versions = BTreeSet::new();
+        let mut allocations = Vec::new();
         for (catalog, version) in entries {
-            if map.insert(catalog, version).is_some() || !versions.insert(version) {
+            if current.insert(catalog, version).is_some() || !versions.insert(version) {
                 return Err(InvocationShapeError::InvalidProgramRole);
             }
+            allocations.push((catalog, version));
         }
-        Ok(Self(map))
+        if versions
+            .iter()
+            .enumerate()
+            .any(|(index, version)| version.0 as usize != index)
+        {
+            return Err(InvocationShapeError::InvalidProgramRole);
+        }
+        Ok(Self {
+            current,
+            allocations,
+        })
     }
 
     pub(super) fn allocate_ordered(
         catalogs: impl IntoIterator<Item = ArenaCatalogValueId>,
     ) -> Result<Self, InvocationShapeError> {
-        let mut map = BTreeMap::new();
+        let mut values = Self::new(std::iter::empty::<(ArenaCatalogValueId, ValueVersion)>())?;
+        values.extend_ordered(catalogs)?;
+        Ok(values)
+    }
+
+    pub(super) fn extend_ordered(
+        &mut self,
+        catalogs: impl IntoIterator<Item = ArenaCatalogValueId>,
+    ) -> Result<(), InvocationShapeError> {
         for catalog in catalogs {
-            if map.contains_key(&catalog) {
+            if self.current.contains_key(&catalog) {
                 continue;
             }
-            let version = ValueVersion(
-                u32::try_from(map.len()).map_err(|_| InvocationShapeError::SizeOverflow)?,
-            );
-            map.insert(catalog, version);
+            let version = self.next_version()?;
+            self.current.insert(catalog, version);
+            self.allocations.push((catalog, version));
         }
-        Self::new(map)
+        Ok(())
+    }
+
+    pub(super) fn transition(
+        &mut self,
+        catalog: ArenaCatalogValueId,
+    ) -> Result<(ValueVersion, ValueVersion), InvocationShapeError> {
+        let source = self.version(catalog)?;
+        let destination = self.next_version()?;
+        self.current.insert(catalog, destination);
+        self.allocations.push((catalog, destination));
+        Ok((source, destination))
+    }
+
+    fn next_version(&self) -> Result<ValueVersion, InvocationShapeError> {
+        Ok(ValueVersion(
+            u32::try_from(self.allocations.len())
+                .map_err(|_| InvocationShapeError::SizeOverflow)?,
+        ))
     }
 
     pub(super) fn version(
         &self,
         catalog: ArenaCatalogValueId,
     ) -> Result<ValueVersion, InvocationShapeError> {
-        self.0
+        self.current
             .get(&catalog)
             .copied()
             .ok_or(InvocationShapeError::MissingSemanticValueMap(catalog))
@@ -55,7 +95,7 @@ impl SemanticValueMap {
 
     #[cfg(test)]
     pub(super) fn entries(&self) -> impl Iterator<Item = (ArenaCatalogValueId, ValueVersion)> + '_ {
-        self.0.iter().map(|(&catalog, &version)| (catalog, version))
+        self.allocations.iter().copied()
     }
 }
 
@@ -86,7 +126,10 @@ pub(super) fn compile(
             | SourceArgument::DirectPointer { .. } => {}
         }
     }
-    if let Some(&missing) = required.iter().find(|value| !values.0.contains_key(value)) {
+    if let Some(&missing) = required
+        .iter()
+        .find(|value| !values.current.contains_key(value))
+    {
         return Err(InvocationShapeError::MissingSemanticValueMap(missing));
     }
     let mut accesses = Vec::new();

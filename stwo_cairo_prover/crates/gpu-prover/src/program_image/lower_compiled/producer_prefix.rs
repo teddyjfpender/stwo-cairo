@@ -31,7 +31,7 @@ pub(super) struct ProducerSchedulePosition {
 pub(super) enum MissingProducerAuthorityKind {
     BlakeGFusedComposite,
     BlakeGDirectComposite,
-    NativeEcOpComposite,
+    NativeEcOpStaticModuleBuildIdentity,
     MultiplicityTransition,
     ModuleGlobalEffects(DeduceKind),
 }
@@ -59,6 +59,9 @@ pub(super) struct BaseProducerBindingFrontier {
     pub(super) bound: Vec<LoweredRecordedWitnessProducer>,
     pub(super) missing: Option<MissingProducerAuthority>,
     pub(super) semantic_values: adapter::SemanticValueMap,
+    /// Fully bound semantic contract for native EC-op. It remains outside the
+    /// executable prefix until the linked static module has build identity.
+    pub(super) native_ec_op_contract: Option<ec_op_prefix::LoweredNativeEcOpContract>,
     /// Independently sealed downstream primitive receipts. These are not part
     /// of the contiguous execution prefix while `missing` is present.
     pub(super) base_interpolation: Vec<LoweredBaseInterpolationBatch>,
@@ -80,6 +83,7 @@ pub(super) fn map_scheduled_base_producers(
 ) -> Result<BaseProducerBindingFrontier, InvocationShapeError> {
     let scheduled = scheduled_producers(schedule)?;
     let mut pending = Vec::new();
+    let mut pending_native_ec_op = None;
     let mut missing = None;
     for &(position, producer) in &scheduled {
         let missing_kind = match producer.kind {
@@ -118,7 +122,11 @@ pub(super) fn map_scheduled_base_producers(
                 Some(MissingProducerAuthorityKind::BlakeGDirectComposite)
             }
             WitnessProducerKind::NativeEcOp => {
-                Some(MissingProducerAuthorityKind::NativeEcOpComposite)
+                if pending_native_ec_op.is_some() {
+                    return Err(InvocationShapeError::InvalidNativeEcOpBinding);
+                }
+                pending_native_ec_op = Some(ec_op_prefix::prepare(image, arena)?);
+                Some(MissingProducerAuthorityKind::NativeEcOpStaticModuleBuildIdentity)
             }
         };
         if let Some(missing_kind) = missing_kind {
@@ -132,12 +140,20 @@ pub(super) fn map_scheduled_base_producers(
     }
 
     validate_bound_base_outputs(image, schedule, &pending)?;
-    let mut ordered_values = pending
+    let ordered_values = pending
         .iter()
         .flat_map(|producer| invocation_catalog_order(&producer.source.source_arguments))
         .collect::<Vec<_>>();
-    append_interpolation_catalog_order(image, schedule, &mut ordered_values)?;
-    let semantic_values = adapter::SemanticValueMap::allocate_ordered(ordered_values)?;
+    let mut semantic_values = adapter::SemanticValueMap::allocate_ordered(ordered_values)?;
+    let native_ec_op_contract = pending_native_ec_op
+        .map(|pending| ec_op_prefix::lower(pending, &mut semantic_values))
+        .transpose()?;
+    if let Some(native_ec_op) = &native_ec_op_contract {
+        validate_native_ec_op_base_outputs(image, schedule, native_ec_op)?;
+    }
+    let mut interpolation_values = Vec::new();
+    append_interpolation_catalog_order(image, schedule, &mut interpolation_values)?;
+    semantic_values.extend_ordered(interpolation_values)?;
     let bound = pending
         .into_iter()
         .map(|producer| {
@@ -167,8 +183,34 @@ pub(super) fn map_scheduled_base_producers(
         bound,
         missing,
         semantic_values,
+        native_ec_op_contract,
         base_interpolation,
     })
+}
+
+fn validate_native_ec_op_base_outputs(
+    image: &ArenaProgramInventory,
+    schedule: &BaseProducerSchedule,
+    native: &ec_op_prefix::LoweredNativeEcOpContract,
+) -> Result<(), InvocationShapeError> {
+    let scheduled = schedule
+        .interpolation()
+        .ok_or(InvocationShapeError::FrontierDidNotAdvance)?
+        .batches
+        .iter()
+        .flat_map(|batch| &batch.columns)
+        .map(|column| column.evaluations.logical)
+        .collect::<BTreeSet<_>>();
+    if native.invocation.trace_columns.len()
+        != native.authority.requirements().trace_column_words.len()
+        || native.invocation.trace_columns.iter().any(|binding| {
+            let value = &image.values[binding.value.value.0 as usize];
+            value.id != binding.value.value || !scheduled.contains(&value.logical)
+        })
+    {
+        return Err(InvocationShapeError::InvalidNativeEcOpBinding);
+    }
+    Ok(())
 }
 
 fn scheduled_producers(

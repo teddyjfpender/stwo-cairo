@@ -13,7 +13,7 @@ use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 use super::*;
 use crate::arena_plan::{ExecutionTableGeometry, ResidentBackend};
 use crate::compiled_proof::{
-    AotArgumentValue, EffectAccess, InPlaceAliasRequirement, ValueVersion,
+    AotArgumentValue, AtomicOperation, EffectAccess, InPlaceAliasRequirement, ValueVersion,
 };
 use crate::phases;
 use crate::protocol_plan::ProtocolPlanPolicy;
@@ -82,6 +82,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
             .unwrap();
     let first_producer = mapped.bound.first().unwrap();
     let missing = mapped.missing.unwrap();
+    let native = mapped.native_ec_op_contract.as_ref().unwrap();
     let first_interpolation = mapped.base_interpolation.first().unwrap();
     let first_column = first_interpolation.invocation.columns.first().unwrap();
     let coefficients = &image.values[first_column.coefficients.0 as usize];
@@ -91,13 +92,15 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         .map(|batch| batch.invocation.columns.len())
         .sum::<usize>();
     eprintln!(
-        "BASE_PRODUCER_BINDING_FRONTIER bound={} scheduled={} first={} missing={} missing_kind={:?} missing_position={:?} base_outputs={} first_coefficient_id={:?} first_coefficient_logical={:?} runtime_steps={}",
+        "BASE_PRODUCER_BINDING_FRONTIER bound={} scheduled={} first={} missing={} missing_kind={:?} missing_position={:?} ec_op_accesses={} ec_op_launches={} base_outputs={} first_coefficient_id={:?} first_coefficient_logical={:?} runtime_steps={}",
         mapped.bound.len(),
         mapped.scheduled_producers,
         first_producer.producer.component,
         missing.producer.component,
         missing.missing,
         missing.position,
+        native.effect.accesses().len(),
+        native.authority.launches().len(),
         interpolation_columns,
         coefficients.id,
         coefficients.logical,
@@ -111,7 +114,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     assert_eq!(missing.producer.kind, WitnessProducerKind::NativeEcOp);
     assert_eq!(
         missing.missing,
-        producer_prefix::MissingProducerAuthorityKind::NativeEcOpComposite
+        producer_prefix::MissingProducerAuthorityKind::NativeEcOpStaticModuleBuildIdentity
     );
     assert_eq!(missing.position.level, 0);
     assert_eq!(missing.position.lane, 7);
@@ -181,6 +184,128 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     assert!(entries[0].is_some());
     assert_eq!(entries[1], None);
     assert!(entries[2].is_some());
+    assert_eq!(
+        native.authority.abi(),
+        stwo_backend_cuda::EcOpCompositeAbi::ProjectiveChainNormalizePaddingV1
+    );
+    assert_eq!(native.authority.abi().arguments().len(), 19);
+    assert_eq!(
+        native.authority.abi().entry_symbol(),
+        "ec_op_builtin_witness_on"
+    );
+    assert_eq!(native.authority.launches().len(), 3);
+    assert_eq!(
+        native.authority.effect(),
+        stwo_backend_cuda::EcOpEffectAbi::FullTraceLookupPartialAndAtomicMultiplicitiesV1
+    );
+    for identity in [
+        native.authority.source_identity(),
+        native.authority.abi_identity(),
+        native.authority.effect_identity(),
+        native.authority.launch_identity(),
+        native.authority.identity(),
+    ] {
+        assert_ne!(identity, [0; 32]);
+    }
+    assert_eq!(
+        (*native.authority.launches()).map(|launch| launch.stage),
+        [
+            stwo_backend_cuda::EcOpKernelStage::ProjectiveChain,
+            stwo_backend_cuda::EcOpKernelStage::NormalizeRoundTiles,
+            stwo_backend_cuda::EcOpKernelStage::PartialInputPadding,
+        ]
+    );
+    assert_eq!(native.invocation.execution_tables.len(), 37);
+    assert_eq!(native.invocation.trace_columns.len(), 273);
+    assert_eq!(native.invocation.partial_input_columns.len(), 127);
+    assert_eq!(native.invocation.multiplicities.len(), 4);
+    let row_count = native.invocation.row_count;
+    assert_eq!(
+        native.authority.launches()[0].grid,
+        [row_count.div_ceil(16), 1, 1]
+    );
+    assert_eq!(native.authority.launches()[0].block, [16, 1, 1]);
+    assert_eq!(
+        native.authority.launches()[1].grid,
+        [row_count.div_ceil(64), 63, 1]
+    );
+    assert_eq!(native.authority.launches()[1].block, [64, 1, 1]);
+    assert_eq!(
+        native.authority.launches()[2].grid,
+        [(row_count * 4).div_ceil(64), 1, 1]
+    );
+    assert_eq!(native.authority.launches()[2].block, [64, 1, 1]);
+    assert_eq!(
+        native.invocation.execution_table_pointers.value_words.len(),
+        37 * POINTER_WORDS
+    );
+    assert_eq!(
+        native.invocation.lookup_words.value.value_words.len(),
+        usize::try_from(native.invocation.row_count).unwrap() * 488
+    );
+    assert_eq!(
+        native.invocation.partial_row_count,
+        native.invocation.row_count * 256
+    );
+    assert!(native
+        .invocation
+        .execution_tables
+        .iter()
+        .all(|binding| { binding.value.value_words.is_empty() == binding.binding.is_none() }));
+    assert!(native
+        .invocation
+        .trace_columns
+        .iter()
+        .all(|binding| binding.binding.is_some()
+            && binding.value.value_words.len()
+                == usize::try_from(native.invocation.row_count).unwrap()));
+    for (index, binding) in native.invocation.partial_input_columns.iter().enumerate() {
+        let value = &image.values[binding.value.value.0 as usize];
+        assert!(binding.binding.is_some());
+        assert_eq!(
+            binding.value.value_words.len(),
+            usize::try_from(native.invocation.partial_row_count).unwrap()
+        );
+        if index + 1 == native.invocation.partial_input_columns.len() {
+            assert_eq!(value.component, Some("ec_op_builtin"));
+            assert_eq!(value.purpose, BufferPurpose::EcOpPartialIota);
+        } else {
+            assert_eq!(value.component, Some("partial_ec_mul_generic"));
+            assert_eq!(value.purpose, BufferPurpose::WitnessInput);
+            assert_eq!(value.ordinal as usize, index);
+        }
+    }
+    assert_eq!(native.effect.accesses().len(), 37 + 1 + 273 + 1 + 127 + 4);
+    let atomic = native
+        .effect
+        .accesses()
+        .iter()
+        .filter_map(|access| match access {
+            EffectAccess::Atomic {
+                source,
+                destination,
+                operation,
+                in_place,
+            } => Some((source, destination, operation, in_place)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(atomic.len(), 4);
+    for (index, ((source, destination, operation, in_place), receipt)) in atomic
+        .into_iter()
+        .zip(&native.invocation.multiplicities)
+        .enumerate()
+    {
+        assert_eq!(*operation, AtomicOperation::AddU32);
+        assert_eq!(source.binding, destination.binding);
+        assert_eq!(source.binding, receipt.binding);
+        assert_eq!(source.value.version, receipt.source);
+        assert_eq!(destination.value.version, receipt.destination);
+        assert_ne!(receipt.source, receipt.destination);
+        assert_eq!(in_place, &receipt.alias);
+        assert_eq!(in_place.id.0 as usize, index);
+        assert_eq!(in_place.requirement, InPlaceAliasRequirement::Required);
+    }
     let interpolation = schedule.interpolation().unwrap();
     assert_eq!(mapped.base_interpolation.len(), interpolation.batches.len());
     assert_eq!(

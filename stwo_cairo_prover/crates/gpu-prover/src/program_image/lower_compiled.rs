@@ -21,6 +21,7 @@ use crate::resident_runtime::producer_schedule::{
 };
 
 mod adapter;
+mod ec_op_prefix;
 mod loaded_authority;
 mod producer_prefix;
 mod schedule_prefix;
@@ -114,6 +115,8 @@ enum InvocationShapeError {
     ScheduledProducerInvalidProgram(WitnessProducer),
     ScheduledProducerInvalidEffect(WitnessProducer),
     InvalidScheduledProducerBinding,
+    InvalidNativeEcOpAuthority,
+    InvalidNativeEcOpBinding,
     InvalidBaseInterpolationAuthority,
     InvalidBaseInterpolationBinding,
 }

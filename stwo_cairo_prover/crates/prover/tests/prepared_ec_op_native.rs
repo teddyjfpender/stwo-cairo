@@ -396,7 +396,7 @@ fn prepared_ec_op_eager_capture_and_mutated_replay_match_generated_simd() {
     clear_multiplicities(&arena, &ec_op);
     arena.context().reset_telemetry();
     let launch = ec_op.launch().unwrap();
-    assert_eq!(launch.kernel_launches, 2);
+    assert_eq!(launch.kernel_launches, 3);
     assert_eq!(launch.allocations, 0);
     assert_eq!(launch.h2d_bytes, 0);
     assert_eq!(launch.d2h_bytes, 0);
@@ -410,7 +410,7 @@ fn prepared_ec_op_eager_capture_and_mutated_replay_match_generated_simd() {
     let capture = arena.context().capture().unwrap();
     ec_op.launch().unwrap();
     let captured = capture.finish().unwrap();
-    assert_eq!(captured.kernel_nodes(), 2);
+    assert_eq!(captured.kernel_nodes(), 3);
     clear_multiplicities(&arena, &ec_op);
     captured.launch(arena.context()).unwrap();
     assert_eq!(
