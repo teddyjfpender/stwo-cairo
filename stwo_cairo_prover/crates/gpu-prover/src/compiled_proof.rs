@@ -192,6 +192,10 @@ impl CompiledProof {
         &self.identity
     }
 
+    pub fn transcript_encoding(&self) -> &[u8] {
+        self.identity.transcript_encoding()
+    }
+
     pub const fn program_identity(&self) -> &ProofIdentity {
         &self.input.identity
     }

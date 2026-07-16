@@ -116,6 +116,7 @@ impl ProofCodecIdentity {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CompiledProofIdentity {
     canonical_encoding: Box<[u8]>,
+    transcript_encoding: Box<[u8]>,
     digest: [u8; 32],
 }
 
@@ -126,6 +127,10 @@ impl CompiledProofIdentity {
 
     pub fn canonical_encoding(&self) -> &[u8] {
         &self.canonical_encoding
+    }
+
+    pub fn transcript_encoding(&self) -> &[u8] {
+        &self.transcript_encoding
     }
 }
 
@@ -225,22 +230,15 @@ pub(super) fn compiled_identity(
         out.range(&section.value_words)?;
     }
 
-    encode_transcript(&mut out, transcript)?;
+    let transcript_encoding = transcript.canonical_encoding()?;
+    out.count(transcript_encoding.len())?;
+    out.raw(&transcript_encoding);
     let canonical_encoding = out.finish();
     Ok(CompiledProofIdentity {
         digest: *blake3::hash(&canonical_encoding).as_bytes(),
         canonical_encoding: canonical_encoding.into_boxed_slice(),
+        transcript_encoding: transcript_encoding.into_boxed_slice(),
     })
-}
-
-fn encode_transcript(
-    out: &mut Encoder,
-    transcript: &CairoBlake2sTranscriptPlan,
-) -> Result<(), CompiledProofError> {
-    let canonical = transcript.canonical_encoding()?;
-    out.count(canonical.len())?;
-    out.raw(&canonical);
-    Ok(())
 }
 
 struct Encoder(Vec<u8>);

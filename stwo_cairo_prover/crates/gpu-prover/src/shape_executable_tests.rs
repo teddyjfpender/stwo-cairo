@@ -269,7 +269,7 @@ fn admission_rejects_forced_digest_and_layout_collisions() {
 
     let mut variant_only = (*exact.topology).clone();
     variant_only.preprocessed_trace_variant = PreProcessedTraceVariant::CanonicalWithoutPedersen;
-    variant_only.digest = variant_only.compute_digest();
+    variant_only.refresh_identity().unwrap();
     assert_ne!(variant_only.digest(), exact.topology.digest());
     assert_ne!(&variant_only, exact.topology.as_ref());
 
@@ -282,6 +282,96 @@ fn admission_rejects_forced_digest_and_layout_collisions() {
     };
     assert_ne!(layout_collision, exact);
     assert!(!layout_collision.matches_plan(executable.arena()));
+}
+
+#[test]
+fn shape_identity_binds_full_topology_layout_transcript_and_compiled_bytes() {
+    let executable = sn2_executable();
+    let topology = executable.topology();
+    let workspace = &executable.workspace_admission().layout;
+    let workspace_bytes = identity::encode_workspace(workspace).unwrap();
+    assert_eq!(
+        workspace_bytes,
+        executable.workspace_admission().workspace_layout_encoding()
+    );
+    assert_eq!(
+        blake3::hash(&workspace_bytes).as_bytes(),
+        executable.workspace_admission().workspace_layout_digest()
+    );
+    let transcript_bytes = executable.transcript().canonical_encoding().unwrap();
+    let compiled_bytes = b"compiled-proof-canonical-v1";
+    let base = identity::compose_shape_identity(
+        topology.canonical_encoding(),
+        &workspace_bytes,
+        &transcript_bytes,
+        compiled_bytes,
+    )
+    .unwrap();
+    let repeated = identity::compose_shape_identity(
+        topology.canonical_encoding(),
+        &workspace_bytes,
+        &transcript_bytes,
+        compiled_bytes,
+    )
+    .unwrap();
+    assert_eq!(base, repeated);
+    assert_eq!(base.compiled_proof_encoding(), compiled_bytes);
+    assert_eq!(base.transcript_encoding(), transcript_bytes);
+    assert!(!base.canonical_encoding().is_empty());
+
+    let mut changed_topology = topology.clone();
+    changed_topology.include_all_preprocessed_columns =
+        !changed_topology.include_all_preprocessed_columns;
+    changed_topology.refresh_identity().unwrap();
+    let topology_mutation = identity::compose_shape_identity(
+        changed_topology.canonical_encoding(),
+        &workspace_bytes,
+        &transcript_bytes,
+        compiled_bytes,
+    )
+    .unwrap();
+    assert_ne!(base, topology_mutation);
+
+    let mut changed_layout = (**workspace).clone();
+    changed_layout.total_words += 1;
+    let changed_layout = identity::encode_workspace(&changed_layout).unwrap();
+    let layout_mutation = identity::compose_shape_identity(
+        topology.canonical_encoding(),
+        &changed_layout,
+        &transcript_bytes,
+        compiled_bytes,
+    )
+    .unwrap();
+    assert_ne!(base, layout_mutation);
+
+    let mut changed_transcript = transcript_bytes.clone();
+    changed_transcript.push(1);
+    let transcript_mutation = identity::compose_shape_identity(
+        topology.canonical_encoding(),
+        &workspace_bytes,
+        &changed_transcript,
+        compiled_bytes,
+    )
+    .unwrap();
+    assert_ne!(base, transcript_mutation);
+
+    let compiled_mutation = identity::compose_shape_identity(
+        topology.canonical_encoding(),
+        &workspace_bytes,
+        &transcript_bytes,
+        b"compiled-proof-canonical-v2",
+    )
+    .unwrap();
+    assert_ne!(base, compiled_mutation);
+    assert!(matches!(
+        identity::compose_shape_identity(
+            topology.canonical_encoding(),
+            &workspace_bytes,
+            &transcript_bytes,
+            &[],
+        ),
+        Err(ShapeExecutableError::MissingCompiledProofIdentity)
+    ));
 }
 
 #[test]

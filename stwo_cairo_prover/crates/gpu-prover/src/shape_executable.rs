@@ -36,6 +36,12 @@ use crate::transcript_plan::{
 };
 use crate::workspace_cache::WorkspaceKey;
 
+mod identity;
+
+#[cfg(test)]
+pub(crate) use identity::compose_shape_identity as shape_identity_for_test;
+pub use identity::ShapeExecutableIdentity;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PcsTopology {
     pow_bits: u32,
@@ -105,6 +111,7 @@ pub struct TopologyKey {
     include_all_preprocessed_columns: bool,
     execution_tables: Option<ExecutionTableGeometry>,
     policy: ProtocolPlanPolicy,
+    canonical_encoding: Box<[u8]>,
     digest: [u8; 32],
 }
 
@@ -140,9 +147,10 @@ impl TopologyKey {
             include_all_preprocessed_columns: dynamic.include_all_preprocessed_columns,
             execution_tables: dynamic.execution_tables,
             policy: dynamic.policy,
+            canonical_encoding: Box::new([]),
             digest: [0; 32],
         };
-        key.digest = key.compute_digest();
+        key.refresh_identity()?;
         Ok(key)
     }
 
@@ -150,120 +158,15 @@ impl TopologyKey {
         self.digest
     }
 
-    fn compute_digest(&self) -> [u8; 32] {
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"stwo-cairo-shape-executable-v5\0");
-        feed_u64(&mut hash, self.relation_graph_hash);
-        for component in self.shape.components() {
-            feed_bytes(&mut hash, component.id.as_bytes());
-            match &component.rows {
-                RowResolution::Absent => {
-                    hash.update(&[0]);
-                }
-                RowResolution::Resolved(parts) => {
-                    hash.update(&[1]);
-                    feed_usize(&mut hash, parts.len());
-                    for part in parts {
-                        match part.part {
-                            TracePartId::Main => {
-                                hash.update(&[0]);
-                            }
-                            TracePartId::MemoryBig(index) => {
-                                hash.update(&[1]);
-                                hash.update(&index.to_le_bytes());
-                            }
-                            TracePartId::MemorySmall => {
-                                hash.update(&[2]);
-                            }
-                        };
-                        feed_u64(&mut hash, part.n_real_rows);
-                        feed_u64(&mut hash, part.padded_rows);
-                    }
-                }
-                // A shape executable is capture-ready by construction. Keep
-                // these encodings total so a malformed caller still has a
-                // deterministic identity before planning rejects it.
-                RowResolution::Pending {
-                    observed_n_real_rows,
-                    ..
-                } => {
-                    hash.update(&[2]);
-                    feed_u64(&mut hash, *observed_n_real_rows);
-                }
-                RowResolution::Bounded { bound, .. } => {
-                    hash.update(&[3]);
-                    feed_u64(&mut hash, bound.observed_rows);
-                    feed_u64(&mut hash, bound.max_rows);
-                    feed_u64(&mut hash, bound.padded_capacity);
-                }
-            }
-        }
-        feed_usize(&mut hash, self.component_enable_bits.len());
-        for &enabled in &self.component_enable_bits {
-            hash.update(&[u8::from(enabled)]);
-        }
-        feed_usize(&mut hash, self.component_log_sizes.len());
-        for &log_size in &self.component_log_sizes {
-            hash.update(&log_size.to_le_bytes());
-        }
-        for tree in &self.claim_log_sizes {
-            feed_usize(&mut hash, tree.len());
-            for &log_size in tree {
-                hash.update(&log_size.to_le_bytes());
-            }
-        }
-        hash.update(&self.claim_public_data_felts.to_le_bytes());
-        hash.update(&[preprocessed_variant_tag(self.preprocessed_trace_variant)]);
-        for (id, log_size) in &self.preprocessed_columns {
-            feed_bytes(&mut hash, id.as_bytes());
-            hash.update(&log_size.to_le_bytes());
-        }
-        hash.update(&self.pcs.pow_bits.to_le_bytes());
-        hash.update(&self.pcs.log_blowup_factor.to_le_bytes());
-        hash.update(&self.pcs.log_last_layer_degree_bound.to_le_bytes());
-        feed_usize(&mut hash, self.pcs.n_queries);
-        hash.update(&self.pcs.fold_step.to_le_bytes());
-        hash.update(&self.pcs.lifting_log_size.unwrap_or(u32::MAX).to_le_bytes());
-        hash.update(&[u8::from(self.include_all_preprocessed_columns)]);
-        match self.execution_tables {
-            Some(geometry) => {
-                hash.update(&[1]);
-                for value in [
-                    geometry.n_addrs,
-                    geometry.n_big,
-                    geometry.n_small,
-                    geometry.public_memory_entries,
-                ] {
-                    feed_usize(&mut hash, value);
-                }
-            }
-            None => {
-                hash.update(&[0]);
-            }
-        }
-        feed_u64(&mut hash, self.policy.channel_tag);
-        feed_u64(&mut hash, self.policy.kernel_manifest_hash);
-        feed_usize(&mut hash, self.policy.composition_max_kernel_instrs);
-        hash.update(&[self.policy.decommit_strategy as u8]);
-        feed_usize(&mut hash, self.policy.retained_lde_budget_bytes);
-        feed_usize(
-            &mut hash,
-            self.policy.fixed_image_incremental_lde_budget_bytes,
-        );
-        hash.update(&self.policy.unretained_bottom_layers.to_le_bytes());
-        hash.update(&self.policy.max_fused_tail_levels.to_le_bytes());
-        hash.update(&[self.policy.commit_mode as u8]);
-        hash.update(&[self.policy.direct_composition_retention_mode as u8]);
-        hash.update(&[self.policy.quotient_numerator_source_policy as u8]);
-        hash.update(&[self.policy.interpolation_mode as u8]);
-        hash.update(&[u8::from(self.policy.blake2s_interior_fused)]);
-        hash.update(&[self.policy.composition_launch_mode as u8]);
-        hash.update(&[self.policy.relation_tail_mode as u8]);
-        hash.update(&[self.policy.fri_fold_launch_mode as u8]);
-        hash.update(&[self.policy.witness_feed_launch_mode as u8]);
-        hash.update(&[self.policy.resident_backend as u8]);
-        hash.update(&[self.policy.quotient_numerator_schedule as u8]);
-        *hash.finalize().as_bytes()
+    pub fn canonical_encoding(&self) -> &[u8] {
+        &self.canonical_encoding
+    }
+
+    fn refresh_identity(&mut self) -> Result<(), ShapeExecutableError> {
+        let canonical_encoding = identity::encode_topology(self)?;
+        self.digest = *blake3::hash(&canonical_encoding).as_bytes();
+        self.canonical_encoding = canonical_encoding.into_boxed_slice();
+        Ok(())
     }
 }
 
@@ -318,6 +221,8 @@ struct WorkspaceLayoutIdentity {
     logical: Vec<LogicalBuffer>,
     bindings: Vec<ArenaBinding>,
     slots: Vec<ArenaSlotSpec>,
+    canonical_encoding: Box<[u8]>,
+    digest: [u8; 32],
 }
 
 impl WorkspaceLayoutIdentity {
@@ -341,12 +246,18 @@ impl WorkspaceLayoutIdentity {
                 planned: plan.range_view_count(),
             });
         }
-        Ok(Self {
+        let mut layout = Self {
             total_words: plan.total_words(),
             logical: plan.logical_buffers().to_vec(),
             bindings: plan.bindings().to_vec(),
             slots,
-        })
+            canonical_encoding: Box::new([]),
+            digest: [0; 32],
+        };
+        let canonical_encoding = identity::encode_workspace(&layout)?;
+        layout.digest = *blake3::hash(&canonical_encoding).as_bytes();
+        layout.canonical_encoding = canonical_encoding.into_boxed_slice();
+        Ok(layout)
     }
 
     fn matches_plan(&self, plan: &ProofArenaPlan) -> bool {
@@ -387,22 +298,17 @@ impl WorkspaceAdmission {
         self.key
     }
 
+    pub fn workspace_layout_encoding(&self) -> &[u8] {
+        &self.layout.canonical_encoding
+    }
+
+    pub fn workspace_layout_digest(&self) -> &[u8; 32] {
+        &self.layout.digest
+    }
+
     pub(crate) fn matches_plan(&self, plan: &ProofArenaPlan) -> bool {
         self.key == WorkspaceKey::from_plan(plan) && self.layout.matches_plan(plan)
     }
-}
-
-fn feed_bytes(hash: &mut blake3::Hasher, bytes: &[u8]) {
-    feed_usize(hash, bytes.len());
-    hash.update(bytes);
-}
-
-fn feed_usize(hash: &mut blake3::Hasher, value: usize) {
-    feed_u64(hash, value as u64);
-}
-
-fn feed_u64(hash: &mut blake3::Hasher, value: u64) {
-    hash.update(&value.to_le_bytes());
 }
 
 /// Host half of the durable shape executable. CUDA workspace ownership remains
@@ -699,6 +605,7 @@ pub enum ShapeExecutableError {
     },
     EmptyTraceGeometry,
     SizeOverflow,
+    MissingCompiledProofIdentity,
     InvalidLiftingLogSize {
         lifting: u32,
         required: u32,

@@ -175,6 +175,10 @@ fn complete_authority_compiles_and_identities_are_domain_separated() {
     assert_eq!(compiled.input(), &input);
     assert_eq!(compiled.identity(), repeated.identity());
     assert!(!compiled.identity().canonical_encoding().is_empty());
+    assert_eq!(
+        compiled.transcript_encoding(),
+        transcript().canonical_encoding().unwrap()
+    );
     assert_eq!(compiled.output().layout.total_words, 57);
 
     let mut different_kernel = valid_input();
