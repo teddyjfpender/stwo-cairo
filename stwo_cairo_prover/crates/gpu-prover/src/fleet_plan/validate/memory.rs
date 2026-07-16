@@ -120,11 +120,11 @@ pub(super) fn validate_spill(
 
 pub(super) fn measure_workers(
     plan: &FleetProofPlan,
-    values: &BTreeMap<ValueId, &ValueDesc>,
     workers: &BTreeMap<WorkerId, &WorkerSpec>,
 ) -> Result<Vec<FleetWorkerPlan>, FleetPlanError> {
     let mut result = Vec::with_capacity(workers.len());
     for worker in workers.values() {
+        let reserved_storage = super::super::storage::reserved_bytes(plan, worker.id)?;
         let mut steps = BTreeSet::from([ScheduleStep(0)]);
         steps.extend(
             plan.input
@@ -164,26 +164,10 @@ pub(super) fn measure_workers(
                 start: step,
                 end: ScheduleStep(step.0.checked_add(1).ok_or(FleetPlanError::SizeOverflow)?),
             };
-            let mut live = worker.exchange_reserve_bytes;
-            for owner in plan
-                .input
-                .owners
-                .iter()
-                .filter(|x| x.worker == worker.id && x.live.overlaps(point))
-            {
-                let resident = resident_owner_bytes(plan, owner, point, values)?;
-                live = live
-                    .checked_add(resident)
-                    .ok_or(FleetPlanError::SizeOverflow)?;
-            }
-            for replica in plan
-                .input
-                .replicas
-                .iter()
-                .filter(|x| x.worker == worker.id && x.live.overlaps(point))
-            {
-                live = checked_add_value_bytes(live, replica.value, replica.elements, values)?;
-            }
+            let mut live = worker
+                .exchange_reserve_bytes
+                .checked_add(reserved_storage)
+                .ok_or(FleetPlanError::SizeOverflow)?;
             for transition in plan
                 .input
                 .transitions
@@ -212,54 +196,6 @@ pub(super) fn measure_workers(
         });
     }
     Ok(result)
-}
-
-fn resident_owner_bytes(
-    plan: &FleetProofPlan,
-    owner: &OwnedValueRange,
-    point: ScheduleRange,
-    values: &BTreeMap<ValueId, &ValueDesc>,
-) -> Result<usize, FleetPlanError> {
-    let mut bytes = owner
-        .elements
-        .len()
-        .checked_mul(values[&owner.value].layout.element.bytes)
-        .ok_or(FleetPlanError::SizeOverflow)?;
-    for spill in plan
-        .input
-        .spills
-        .iter()
-        .filter(|spill| spill.store.worker == owner.worker)
-    {
-        for chunk in spill
-            .chunks
-            .iter()
-            .filter(|chunk| chunk.value == owner.value && owner.elements.contains(chunk.elements))
-        {
-            let [d2h, _, _, h2d] = spill.chain(chunk.id)?;
-            let off_device = ScheduleRange::new(d2h.during.end, h2d.during.start)
-                .ok_or(FleetPlanError::InvalidSchedule)?;
-            if off_device.overlaps(point) {
-                bytes = bytes
-                    .checked_sub(chunk.bytes)
-                    .ok_or(FleetPlanError::SizeOverflow)?;
-            }
-        }
-    }
-    Ok(bytes)
-}
-
-fn checked_add_value_bytes(
-    total: usize,
-    value: ValueId,
-    range: ElementRange,
-    values: &BTreeMap<ValueId, &ValueDesc>,
-) -> Result<usize, FleetPlanError> {
-    let bytes = range
-        .len()
-        .checked_mul(values[&value].layout.element.bytes)
-        .ok_or(FleetPlanError::SizeOverflow)?;
-    total.checked_add(bytes).ok_or(FleetPlanError::SizeOverflow)
 }
 
 fn spill_value_error(id: SpillChunkId) -> FleetPlanError {

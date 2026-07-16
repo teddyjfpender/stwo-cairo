@@ -22,6 +22,8 @@ use stwo_backend_cuda::{
     TranscriptOperation, TranscriptOutputId, TranscriptStart,
 };
 
+mod identity;
+
 pub const CAIRO_BLAKE2S_TRANSCRIPT_SCHEDULE_TAG: &str = "stwo-cairo.blake2s.transcript.schedule.v1";
 const MAX_REJECTION_ROUNDS: u32 = 64;
 const FRI_ID_BASE: u32 = 0x1_0000;
@@ -375,6 +377,12 @@ impl CairoBlake2sTranscriptPlan {
 
     pub fn segments(&self) -> &[TranscriptSegmentPlan] {
         &self.segments
+    }
+
+    /// Complete canonical protocol identity encoding shared by every compiled
+    /// proof and fleet cache key.
+    pub fn canonical_encoding(&self) -> Result<Vec<u8>, TranscriptPlanError> {
+        identity::encode(self)
     }
 }
 

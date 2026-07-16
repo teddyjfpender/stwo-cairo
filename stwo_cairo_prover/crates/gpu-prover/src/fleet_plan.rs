@@ -7,6 +7,8 @@
 
 use core::ops::Range;
 
+pub use stwo_backend_cuda::{TranscriptInputId, TranscriptOutputId};
+
 use crate::fleet_pow::{FleetPowError, FleetPowSchedule, FleetPowSite, PowRankReceipt};
 use crate::fleet_spill::{SpillPlan, SpillPlanError};
 use crate::transcript_plan::{
@@ -14,7 +16,10 @@ use crate::transcript_plan::{
 };
 
 mod identity;
+mod storage;
 mod validate;
+
+pub use storage::{EffectContractId, InPlaceAlias, StorageBinding, StorageDesc, StorageId};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct WorkerId(pub u16);
@@ -22,6 +27,7 @@ pub struct WorkerId(pub u16);
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct OperationId(pub u32);
 
+/// Immutable semantic value version; physical storage is declared separately.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ValueId(pub u32);
 
@@ -130,6 +136,7 @@ impl ValueLayout {
 pub struct ValueDesc {
     pub id: ValueId,
     pub layout: ValueLayout,
+    pub alignment_bytes: usize,
     pub origin: ValueOrigin,
 }
 
@@ -142,6 +149,22 @@ pub enum ValueOrigin {
     FixedImage(u32),
     /// Value produced by one or more explicitly declared operation shards.
     Operation,
+    /// Challenge/query words released by one exact transcript barrier.
+    TranscriptOutput(TranscriptOutputId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptInputValueBinding {
+    pub id: TranscriptInputId,
+    pub value: ValueId,
+    pub elements: ElementRange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptOutputValueBinding {
+    pub id: TranscriptOutputId,
+    pub value: ValueId,
+    pub elements: ElementRange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,6 +179,8 @@ pub struct OperationDesc {
     pub id: OperationId,
     /// Canonical address-free operation encoding emitted by the future ProgramImage compiler.
     pub semantic: Vec<u8>,
+    /// Opaque effect authority from the sealed AOT/CompiledProof manifest.
+    pub effect_identity: EffectContractId,
     pub interval: ExecutionInterval,
     pub during: ScheduleRange,
     pub reads: Vec<ValueUse>,
@@ -333,6 +358,10 @@ pub struct FleetPlanInput {
     pub terminal_step: ScheduleStep,
     /// Includes one arrival per worker for every transcript barrier and the terminal fence.
     pub barrier_arrivals: Vec<BarrierArrival>,
+    /// Exact requirement order from the canonical transcript plan.
+    pub transcript_inputs: Vec<TranscriptInputValueBinding>,
+    /// Exact requirement order from the canonical transcript plan.
+    pub transcript_outputs: Vec<TranscriptOutputValueBinding>,
     pub values: Vec<ValueDesc>,
     pub operations: Vec<OperationDesc>,
     pub assignments: Vec<OperationAssignment>,
@@ -340,6 +369,9 @@ pub struct FleetPlanInput {
     pub replicas: Vec<DeclaredReplica>,
     pub transitions: Vec<LayoutTransition>,
     pub spills: Vec<SpillPlan>,
+    pub storages: Vec<StorageDesc>,
+    pub storage_bindings: Vec<StorageBinding>,
+    pub in_place_aliases: Vec<InPlaceAlias>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -501,6 +533,30 @@ fn canonicalize(input: &mut FleetPlanInput) {
     for spill in &mut input.spills {
         spill.canonicalize();
     }
+    input.storages.sort_unstable_by_key(|storage| storage.id);
+    input.storage_bindings.sort_unstable_by_key(|binding| {
+        (
+            binding.storage,
+            binding.offset_bytes,
+            binding.value,
+            binding.elements.start,
+            binding.elements.end,
+        )
+    });
+    input.in_place_aliases.sort_unstable_by_key(|alias| {
+        (
+            alias.operation,
+            alias.source,
+            alias.source_elements.start,
+            alias.source_elements.end,
+            alias.destination,
+            alias.destination_elements.start,
+            alias.destination_elements.end,
+            alias.storage,
+            alias.offset_bytes,
+            alias.bytes,
+        )
+    });
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -534,6 +590,18 @@ pub enum FleetPlanError {
     },
     InvalidReplica(ReplicaId),
     InvalidTransition(LayoutTransitionId),
+    InvalidEffectContract(OperationId),
+    InvalidStorage(StorageId),
+    InvalidStorageBinding {
+        value: ValueId,
+        storage: StorageId,
+    },
+    StorageCoverage(ValueId),
+    IllegalStorageReuse(StorageId),
+    InvalidInPlaceAlias(OperationId),
+    InvalidTranscriptInput(TranscriptInputId),
+    InvalidTranscriptOutput(TranscriptOutputId),
+    TranscriptValueCausality(ValueId),
     CapacityExceeded {
         worker: WorkerId,
         required: usize,

@@ -8,12 +8,13 @@ use stwo_cairo_gpu_prover::fleet_barrier::{
     ArrivalState, BarrierReceipt, CoordinatorBarrierCursor, FleetBarrierError, WorkerBarrierCursor,
 };
 use stwo_cairo_gpu_prover::fleet_plan::{
-    AxisMap, BarrierArrival, ConsumerGpuClass, DeclaredReplica, ElementRange, ElementType,
-    ExecutionInterval, FleetLink, FleetLinkId, FleetPlanError, FleetPlanInput, FleetProofPlan,
-    FleetTopology, HostNumaCapacity, LayoutAxis, LayoutTransition, LayoutTransitionId,
-    OperationAssignment, OperationDesc, OperationId, OwnedValueRange, ReplicaId, ReplicaOrigin,
-    ScheduleRange, ScheduleStep, ValueDesc, ValueId, ValueLayout, ValueOrigin, ValueUse, WorkerId,
-    WorkerSpec,
+    AxisMap, BarrierArrival, ConsumerGpuClass, DeclaredReplica, EffectContractId, ElementRange,
+    ElementType, ExecutionInterval, FleetLink, FleetLinkId, FleetPlanError, FleetPlanInput,
+    FleetProofPlan, FleetTopology, HostNumaCapacity, InPlaceAlias, LayoutAxis, LayoutTransition,
+    LayoutTransitionId, OperationAssignment, OperationDesc, OperationId, OwnedValueRange,
+    ReplicaId, ReplicaOrigin, ScheduleRange, ScheduleStep, StorageBinding, StorageDesc, StorageId,
+    TranscriptInputValueBinding, TranscriptOutputValueBinding, ValueDesc, ValueId, ValueLayout,
+    ValueOrigin, ValueUse, WorkerId, WorkerSpec,
 };
 use stwo_cairo_gpu_prover::fleet_pow::{
     FleetPowError, FleetPowPlan, FleetPowSchedule, FleetPowSite, PowRankReceipt,
@@ -33,6 +34,10 @@ mod adversarial;
 mod matrix;
 #[path = "fleet_plan_host/pow_bounds.rs"]
 mod pow_bounds;
+#[path = "fleet_plan_host/storage_alias.rs"]
+mod storage_alias;
+#[path = "fleet_plan_host/transcript_causality.rs"]
+mod transcript_causality;
 
 const V_INPUT: ValueId = ValueId(0);
 const V_OUTPUT: ValueId = ValueId(1);
@@ -147,11 +152,13 @@ fn values() -> Vec<ValueDesc> {
         ValueDesc {
             id: V_INPUT,
             layout: canonical_layout(),
+            alignment_bytes: 16,
             origin: ValueOrigin::ExternalInput(0),
         },
         ValueDesc {
             id: V_OUTPUT,
             layout: canonical_layout(),
+            alignment_bytes: 16,
             origin: ValueOrigin::Operation,
         },
     ]
@@ -217,7 +224,8 @@ fn spill(worker: WorkerId, value: ValueId, base: u32) -> SpillPlan {
 
 fn one_worker_input() -> FleetPlanInput {
     let layout = canonical_layout();
-    FleetPlanInput {
+    let (storages, storage_bindings) = storage_alias::one_worker_storage();
+    let mut input = FleetPlanInput {
         topology: FleetTopology {
             gpu_class: ConsumerGpuClass::Rtx4090Sm89,
             module_pack_identity: [7; 32],
@@ -241,10 +249,13 @@ fn one_worker_input() -> FleetPlanInput {
         barrier_steps: barrier_steps(),
         terminal_step: terminal_step(),
         barrier_arrivals: barrier_arrivals(1),
+        transcript_inputs: vec![],
+        transcript_outputs: vec![],
         values: values(),
         operations: vec![OperationDesc {
             id: OP_COPY,
             semantic: b"copy".to_vec(),
+            effect_identity: storage_alias::effect(1),
             interval: ExecutionInterval::BeforeBarrier(0),
             during: during(1, 2),
             reads: vec![ValueUse {
@@ -283,13 +294,19 @@ fn one_worker_input() -> FleetPlanInput {
         replicas: vec![],
         transitions: vec![],
         spills: vec![SpillPlan::empty(WorkerId(0))],
-    }
+        storages,
+        storage_bindings,
+        in_place_aliases: vec![],
+    };
+    transcript_causality::bind_transcript_values(&mut input);
+    input
 }
 
 fn two_worker_input() -> FleetPlanInput {
     let source = canonical_layout();
     let destination = transposed_layout();
-    FleetPlanInput {
+    let (storages, storage_bindings) = storage_alias::two_worker_storage();
+    let mut input = FleetPlanInput {
         topology: FleetTopology {
             gpu_class: ConsumerGpuClass::Rtx4090Sm89,
             module_pack_identity: [7; 32],
@@ -329,10 +346,13 @@ fn two_worker_input() -> FleetPlanInput {
         barrier_steps: barrier_steps(),
         terminal_step: terminal_step(),
         barrier_arrivals: barrier_arrivals(2),
+        transcript_inputs: vec![],
+        transcript_outputs: vec![],
         values: values(),
         operations: vec![OperationDesc {
             id: OP_COPY,
             semantic: b"remote-copy".to_vec(),
+            effect_identity: storage_alias::effect(2),
             interval: ExecutionInterval::BeforeBarrier(0),
             during: during(5, 6),
             reads: vec![ValueUse {
@@ -408,7 +428,12 @@ fn two_worker_input() -> FleetPlanInput {
             spill(WorkerId(0), V_INPUT, 20),
             spill(WorkerId(1), V_OUTPUT, 30),
         ],
-    }
+        storages,
+        storage_bindings,
+        in_place_aliases: vec![],
+    };
+    transcript_causality::bind_transcript_values(&mut input);
+    input
 }
 
 fn compile(input: FleetPlanInput) -> Result<FleetProofPlan, FleetPlanError> {
@@ -417,13 +442,17 @@ fn compile(input: FleetPlanInput) -> Result<FleetProofPlan, FleetPlanError> {
 
 #[test]
 fn real_transcript_accepts_explicit_one_and_two_worker_plans() {
-    let one = compile(one_worker_input()).unwrap();
-    let two = compile(two_worker_input()).unwrap();
+    let one_input = one_worker_input();
+    let two_input = two_worker_input();
+    let two_worker_0 = storage_alias::reserved(&two_input, WorkerId(0));
+    let two_worker_1 = storage_alias::reserved(&two_input, WorkerId(1)) + 8;
+    let one = compile(one_input).unwrap();
+    let two = compile(two_input).unwrap();
     assert_eq!(one.workers().len(), 1);
     assert_eq!(two.workers().len(), 2);
     assert_eq!(two.barriers().len(), transcript().segments().len());
-    assert_eq!(two.workers()[0].peak_live_bytes, 40);
-    assert_eq!(two.workers()[1].peak_live_bytes, 72);
+    assert_eq!(two.workers()[0].peak_live_bytes, two_worker_0);
+    assert_eq!(two.workers()[1].peak_live_bytes, two_worker_1);
 }
 
 #[test]
@@ -515,7 +544,7 @@ fn transition_replica_and_capacity_fail_closed() {
         compile(broken).unwrap_err(),
         FleetPlanError::CapacityExceeded {
             worker: WorkerId(1),
-            required: 72,
+            required: 80,
             capacity: 71,
         }
     );
@@ -665,6 +694,8 @@ fn identity_is_order_independent_but_semantics_bound() {
     reordered.values.reverse();
     reordered.owners.reverse();
     reordered.spills.reverse();
+    reordered.storages.reverse();
+    reordered.storage_bindings.reverse();
     for spill in &mut reordered.spills {
         spill.transitions.reverse();
     }

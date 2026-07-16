@@ -16,6 +16,7 @@
 //! M4 (commit fusion), M5 (graphs + device channel), M6 (pipelining).
 
 pub mod arena_plan;
+pub mod compiled_proof;
 pub mod composition_plan;
 pub mod composition_wave;
 pub mod direct_composition_retention;

@@ -110,6 +110,30 @@ impl ResidentProofBundleLayout {
             len_words: self.decommitment.len(),
         }
     }
+
+    /// Revalidate a publicly transported layout against the one canonical
+    /// Track-A constructor. Contiguity alone is insufficient: commitment and
+    /// nonce widths, extension-field multiples and FRI hash widths are ABI.
+    pub fn validate(&self) -> Result<(), ResidentProofBundleError> {
+        if self.fri_commitments.len() % HASH_WORDS != 0 {
+            return Err(ResidentProofBundleError::InvalidSectionWidth(
+                "FRI commitments",
+            ));
+        }
+        let rebuilt = Self::new(
+            self.interaction_claim.len(),
+            self.sampled_values.len(),
+            self.fri_commitments.len() / HASH_WORDS,
+            self.final_line_poly.len(),
+            self.decommitment.len(),
+        )?;
+        if &rebuilt != self {
+            return Err(ResidentProofBundleError::ProofShape(
+                "non-canonical resident proof bundle layout",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -182,7 +182,7 @@ fn transition_scratch_requires_a_real_worker_and_owned_capacity() {
         compile(oversized).unwrap_err(),
         FleetPlanError::CapacityExceeded {
             worker: WorkerId(1),
-            required: 105,
+            required: 137,
             capacity: 96,
         }
     );

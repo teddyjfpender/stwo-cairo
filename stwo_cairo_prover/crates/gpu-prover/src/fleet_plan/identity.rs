@@ -1,10 +1,8 @@
+use super::*;
 use crate::fleet_spill::{SpillPlan, SpillTransitionKind};
 use crate::transcript_plan::{CairoTranscriptBoundary, CairoTranscriptSegment};
-use stwo_backend_cuda::{TranscriptOperation, TranscriptStart};
 
-use super::*;
-
-const DOMAIN: &[u8] = b"stwo-cairo.track-a.fleet-proof-plan.structural-v0\0";
+const DOMAIN: &[u8] = b"stwo-cairo.track-a.fleet-proof-plan.structural-v2\0";
 
 pub(super) fn compute(plan: &FleetProofPlan) -> Result<[u8; 32], FleetPlanError> {
     Ok(*blake3::hash(&encode(plan)?).as_bytes())
@@ -57,11 +55,24 @@ pub(super) fn encode(plan: &FleetProofPlan) -> Result<Vec<u8>, FleetPlanError> {
         out.worker(arrival.worker);
         out.u32(arrival.ready_step.0);
     }
+    out.count(plan.input.transcript_inputs.len())?;
+    for binding in &plan.input.transcript_inputs {
+        out.u32(binding.id.0);
+        out.value(binding.value);
+        out.elements(binding.elements)?;
+    }
+    out.count(plan.input.transcript_outputs.len())?;
+    for binding in &plan.input.transcript_outputs {
+        out.u32(binding.id.0);
+        out.value(binding.value);
+        out.elements(binding.elements)?;
+    }
 
     out.count(plan.input.values.len())?;
     for value in &plan.input.values {
         out.value(value.id);
         out.layout(&value.layout)?;
+        out.size(value.alignment_bytes)?;
         match value.origin {
             ValueOrigin::ExternalInput(binding) => {
                 out.byte(0);
@@ -72,6 +83,10 @@ pub(super) fn encode(plan: &FleetProofPlan) -> Result<Vec<u8>, FleetPlanError> {
                 out.u32(constant);
             }
             ValueOrigin::Operation => out.byte(2),
+            ValueOrigin::TranscriptOutput(output) => {
+                out.byte(3);
+                out.u32(output.0);
+            }
         }
     }
     out.count(plan.input.operations.len())?;
@@ -79,6 +94,7 @@ pub(super) fn encode(plan: &FleetProofPlan) -> Result<Vec<u8>, FleetPlanError> {
         out.operation(operation.id);
         out.count(operation.semantic.len())?;
         out.raw(&operation.semantic);
+        out.raw(&operation.effect_identity.0);
         out.interval(operation.interval);
         out.schedule(operation.during);
         out.count(operation.reads.len())?;
@@ -157,6 +173,34 @@ pub(super) fn encode(plan: &FleetProofPlan) -> Result<Vec<u8>, FleetPlanError> {
     for spill in &plan.input.spills {
         out.spill(spill)?;
     }
+    out.count(plan.input.storages.len())?;
+    for storage in &plan.input.storages {
+        out.u32(storage.id.0);
+        out.worker(storage.worker);
+        out.size(storage.bytes)?;
+        out.size(storage.alignment_bytes)?;
+    }
+    out.count(plan.input.storage_bindings.len())?;
+    for binding in &plan.input.storage_bindings {
+        out.u32(binding.storage.0);
+        out.value(binding.value);
+        out.elements(binding.elements)?;
+        out.worker(binding.worker);
+        out.size(binding.offset_bytes)?;
+        out.size(binding.bytes)?;
+    }
+    out.count(plan.input.in_place_aliases.len())?;
+    for alias in &plan.input.in_place_aliases {
+        out.operation(alias.operation);
+        out.raw(&alias.effect.0);
+        out.value(alias.source);
+        out.elements(alias.source_elements)?;
+        out.value(alias.destination);
+        out.elements(alias.destination_elements)?;
+        out.u32(alias.storage.0);
+        out.size(alias.offset_bytes)?;
+        out.size(alias.bytes)?;
+    }
 
     out.u64(plan.schedule_key);
     out.count(plan.transcript_encoding.len())?;
@@ -190,158 +234,8 @@ pub(super) fn encode(plan: &FleetProofPlan) -> Result<Vec<u8>, FleetPlanError> {
 pub(super) fn encode_transcript(
     plan: &crate::transcript_plan::CairoBlake2sTranscriptPlan,
 ) -> Result<Vec<u8>, FleetPlanError> {
-    let schedule = plan.schedule();
-    let mut out = Encoder::default();
-    out.raw(b"stwo-cairo.track-a.transcript-operations-v0\0");
-    out.count(crate::transcript_plan::CAIRO_BLAKE2S_TRANSCRIPT_SCHEDULE_TAG.len())?;
-    out.raw(crate::transcript_plan::CAIRO_BLAKE2S_TRANSCRIPT_SCHEDULE_TAG.as_bytes());
-    out.count(schedule.protocol_tag().len())?;
-    out.raw(schedule.protocol_tag().as_bytes());
-    out.u32(schedule.max_rejection_rounds());
-    match schedule.start() {
-        TranscriptStart::Default => out.byte(0),
-        TranscriptStart::DeviceState(input) => {
-            out.byte(1);
-            out.u32(input.0);
-        }
-    }
-    out.count(schedule.operations().len())?;
-    for operation in schedule.operations() {
-        match *operation {
-            TranscriptOperation::MixFelts {
-                boundary,
-                source,
-                n_felts,
-            } => {
-                out.byte(0);
-                out.u32(boundary.0);
-                out.u32(source.0);
-                out.u32(n_felts);
-            }
-            TranscriptOperation::MixU32s {
-                boundary,
-                source,
-                n_words,
-            } => {
-                out.byte(1);
-                out.u32(boundary.0);
-                out.u32(source.0);
-                out.u32(n_words);
-            }
-            TranscriptOperation::MixU64 { boundary, source } => {
-                out.byte(2);
-                out.u32(boundary.0);
-                out.u32(source.0);
-            }
-            TranscriptOperation::AbsorbRoot { boundary, source } => {
-                out.byte(3);
-                out.u32(boundary.0);
-                out.u32(source.0);
-            }
-            TranscriptOperation::AbsorbPowNonce {
-                boundary,
-                source,
-                pow_bits,
-            } => {
-                out.byte(4);
-                out.u32(boundary.0);
-                out.u32(source.0);
-                out.u32(pow_bits);
-            }
-            TranscriptOperation::DrawSecureFelt { boundary, output } => {
-                out.byte(5);
-                out.u32(boundary.0);
-                out.u32(output.0);
-            }
-            TranscriptOperation::DrawSecureFelts {
-                boundary,
-                output,
-                n_felts,
-            } => {
-                out.byte(6);
-                out.u32(boundary.0);
-                out.u32(output.0);
-                out.u32(n_felts);
-            }
-            TranscriptOperation::DrawU32s { boundary, output } => {
-                out.byte(7);
-                out.u32(boundary.0);
-                out.u32(output.0);
-            }
-            TranscriptOperation::DrawQueries {
-                boundary,
-                output,
-                log_domain_size,
-                n_queries,
-            } => {
-                out.byte(8);
-                out.u32(boundary.0);
-                out.u32(output.0);
-                out.u32(log_domain_size);
-                out.u32(n_queries);
-            }
-        }
-    }
-    let requirements = schedule.requirements();
-    out.size(requirements.state_words)?;
-    out.size(requirements.boundary_snapshot_words)?;
-    out.size(requirements.input_snapshot_words)?;
-    out.size(requirements.input_snapshot_used_words)?;
-    out.size(requirements.output_snapshot_words)?;
-    out.size(requirements.output_snapshot_used_words)?;
-    out.count(requirements.inputs.len())?;
-    for input in &requirements.inputs {
-        out.u32(input.id.0);
-        out.size(input.min_words)?;
-    }
-    out.count(requirements.outputs.len())?;
-    for output in &requirements.outputs {
-        out.u32(output.id.0);
-        out.size(output.min_words)?;
-    }
-    out.count(plan.inputs().len())?;
-    for input in plan.inputs() {
-        out.u32(
-            input
-                .semantic
-                .id()
-                .map_err(|_| FleetPlanError::TranscriptMismatch)?
-                .0,
-        );
-        out.size(input.min_words)?;
-    }
-    out.count(plan.outputs().len())?;
-    for output in plan.outputs() {
-        out.u32(
-            output
-                .semantic
-                .id()
-                .map_err(|_| FleetPlanError::TranscriptMismatch)?
-                .0,
-        );
-        out.size(output.min_words)?;
-    }
-    out.count(plan.boundaries().len())?;
-    for boundary in plan.boundaries() {
-        out.boundary(boundary.semantic)?;
-        out.size(boundary.operation_index)?;
-        out.segment(boundary.segment);
-    }
-    out.count(plan.segments().len())?;
-    for segment in plan.segments() {
-        out.segment(segment.segment);
-        out.size(segment.operation_range.start)?;
-        out.size(segment.operation_range.end)?;
-        match segment.starts_after {
-            Some(boundary) => {
-                out.byte(1);
-                out.boundary(boundary)?;
-            }
-            None => out.byte(0),
-        }
-        out.boundary(segment.ends_at)?;
-    }
-    Ok(out.bytes)
+    plan.canonical_encoding()
+        .map_err(|_| FleetPlanError::TranscriptMismatch)
 }
 
 #[derive(Default)]

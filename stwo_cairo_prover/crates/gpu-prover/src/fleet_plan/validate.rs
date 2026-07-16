@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 mod memory;
+mod transcript_values;
 
 use memory::{measure_workers, validate_spill};
+use transcript_values::validate_transcript_values;
 
 use super::*;
 use crate::transcript_plan::CairoBlake2sTranscriptPlan;
@@ -131,12 +133,14 @@ pub(super) fn validate_and_measure(
         };
         return Err(FleetPlanError::UnknownOperation(unexpected));
     }
+    validate_transcript_values(plan, transcript, &values, &operations)?;
     validate_owners(plan, &values, &operations, &assignments, &workers)?;
     validate_replicas_and_transitions(plan, &values, &workers)?;
     validate_reads(plan, &values, &operations, &assignments)?;
     validate_spill(plan, &values, &operations, &assignments, &workers)?;
+    super::storage::validate(plan, &values, &operations, &assignments, &workers)?;
     validate_barrier_arrivals(plan, &assignments, &workers)?;
-    measure_workers(plan, &values, &workers)
+    measure_workers(plan, &workers)
 }
 
 fn validate_barrier_arrivals(
@@ -455,6 +459,7 @@ fn validate_owners(
                         return Err(FleetPlanError::InvalidProducer(value.id));
                     }
                 }
+                (ValueOrigin::TranscriptOutput(_), None) => {}
                 _ => return Err(FleetPlanError::InvalidProducer(value.id)),
             }
         }
