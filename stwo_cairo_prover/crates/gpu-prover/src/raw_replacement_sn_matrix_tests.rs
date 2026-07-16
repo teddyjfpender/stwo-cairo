@@ -16,8 +16,8 @@ use cairo_air::claims::CairoClaim;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo_backend_cuda::{
-    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
-    PreparedProgressiveCommitError, ProgressiveCommitStorageMode,
+    direct_terminal_expand_absorb_arena_slot_requirements, ModeAwareCommitWorkspaceRequirements,
+    ModeAwareCommitWorkspaceSlots, PreparedProgressiveCommitError, ProgressiveCommitStorageMode,
 };
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
@@ -25,7 +25,8 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
 };
 
 use crate::arena_plan::{
-    CommitmentTreeId, ExecutionTableGeometry, ProofArenaPlan, ResidentBackend,
+    BufferPurpose, CommitmentTreeId, DirectCompactTerminalPlan, ExecutionTableGeometry,
+    ProofArenaPlan, ResidentBackend,
 };
 use crate::plan::ProofPlan;
 use crate::protocol_plan::ProtocolPlanPolicy;
@@ -214,6 +215,73 @@ fn assert_sn_terminal_fusion(profile: &str, arena: &ProofArenaPlan) {
         assert_eq!(
             receipt.net_cuda_launches_removed, net_cuda_launches,
             "{profile}/{tree:?}: exact signed launch delta"
+        );
+
+        let successor = commitment
+            .direct_terminal_expand_absorb
+            .as_ref()
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: composed terminal plan missing"));
+        let domain = commitment
+            .domain_cooperative_program
+            .as_ref()
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: domain program missing"));
+        let compact = commitment
+            .compact_domain_program
+            .as_ref()
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: compact program missing"));
+        let DirectCompactTerminalPlan::Fused(terminal) = selection else {
+            panic!("{profile}/{tree:?}: composed successor requires fused terminal");
+        };
+        let ModeAwareCommitWorkspaceSlots::DomainProgressive(slots) = &commitment.slots else {
+            panic!("{profile}/{tree:?}: composed successor requires progressive slots");
+        };
+        let qualified = successor.program.receipt().qualified_slab_capacity_words;
+        assert_eq!(
+            qualified,
+            domain.slab_words(),
+            "{profile}/{tree:?}: exact qualified domain slab"
+        );
+        assert!(
+            qualified > compact.slab_words(),
+            "{profile}/{tree:?}: materialized rises require the second state bank"
+        );
+        let workspace = direct_terminal_expand_absorb_arena_slot_requirements(
+            &successor.program,
+            commitment.commit_program.as_ref().unwrap(),
+            domain,
+            compact,
+            &successor.fused_compact_domain,
+            commitment.direct_retained_b2n_program.as_ref().unwrap(),
+            terminal,
+            slots,
+        )
+        .unwrap_or_else(|error| panic!("{profile}/{tree:?}: successor slots: {error}"));
+        let required_slab = workspace
+            .iter()
+            .find(|requirement| requirement.id == slots.leaves.state_ping)
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: successor slab requirement missing"));
+        assert_eq!(required_slab.len_words, qualified);
+        let physical_slab = arena
+            .layout()
+            .slot(slots.leaves.state_ping)
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: physical successor slab missing"));
+        assert!(
+            physical_slab.len_words >= qualified,
+            "{profile}/{tree:?}: physical successor slab was undersized"
+        );
+        assert!(
+            arena
+                .logical_buffers()
+                .iter()
+                .filter(|buffer| buffer.purpose == BufferPurpose::CommitProgressiveStatePing)
+                .any(|buffer| {
+                    buffer.len_words == qualified
+                        && arena.binding(buffer.id).is_some_and(|binding| {
+                            binding.physical == slots.leaves.state_ping
+                                && binding.len_words == qualified
+                        })
+                }),
+            "{profile}/{tree:?}: exact qualified logical slab owner missing"
         );
     }
     let composed = [CommitmentTreeId::Base, CommitmentTreeId::Interaction].map(|tree| {

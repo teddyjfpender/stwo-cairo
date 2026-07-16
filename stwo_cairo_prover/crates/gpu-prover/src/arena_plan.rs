@@ -4034,7 +4034,7 @@ impl ProofArenaPlan {
         }
         let commitments: Vec<PlannedCommitment> = logical_commitments
             .into_iter()
-            .map(|commitment| resolve_commitment_slots(commitment, &bindings))
+            .map(|commitment| resolve_commitment_slots(commitment, &bindings, &layout))
             .collect::<Result<Vec<_>, _>>()?;
         let preprocessed = resolve_preprocessed_slots(logical_preprocessed, &bindings)?;
         let composition = resolve_composition_slots(logical_composition, &bindings)?;
@@ -7814,12 +7814,20 @@ fn append_protocol_buffers(
                         "in-place commitment requires an unretained Merkle prefix",
                     ));
                 }
-                Some(push_buffer_id(
-                    logical,
-                    None,
-                    None,
-                    BufferPurpose::CommitProgressiveStatePing,
-                    ordinal()?,
+                let slab_words = if let Some(successor) = &direct_terminal_expand_absorb {
+                    let domain = domain_cooperative_program.as_ref().ok_or(
+                        ArenaPlanError::InvalidProtocolGeometry(
+                            "direct terminal successor is missing its domain program",
+                        ),
+                    )?;
+                    let qualified = successor.program.receipt().qualified_slab_capacity_words;
+                    if qualified != domain.slab_words() {
+                        return Err(ArenaPlanError::InvalidProtocolGeometry(
+                            "direct terminal successor slab capacity drifted",
+                        ));
+                    }
+                    qualified
+                } else {
                     compact_domain_program.as_ref().map_or_else(
                         || {
                             requirements
@@ -7828,7 +7836,15 @@ fn append_protocol_buffers(
                                 .map_err(ArenaPlanError::ProgressiveCommit)
                         },
                         |compact| Ok(compact.slab_words()),
-                    )?,
+                    )?
+                };
+                Some(push_buffer_id(
+                    logical,
+                    None,
+                    None,
+                    BufferPurpose::CommitProgressiveStatePing,
+                    ordinal()?,
+                    slab_words,
                     at,
                 )?)
             }
@@ -9394,6 +9410,7 @@ fn resolve_commit_batches(
 fn resolve_commitment_slots(
     logical: LogicalCommitWorkspace,
     bindings: &[ArenaBinding],
+    layout: &ArenaLayout,
 ) -> Result<PlannedCommitment, ArenaPlanError> {
     let binding = |id: LogicalBufferId| find_binding(bindings, id);
     let physical = |id| Ok::<_, ArenaPlanError>(binding(id)?.physical);
@@ -9547,7 +9564,7 @@ fn resolve_commitment_slots(
                         logical.direct_compact_terminal.as_ref(),
                     ) {
                         (Some(successor), Some(DirectCompactTerminalPlan::Fused(terminal))) => {
-                            direct_terminal_expand_absorb_arena_slot_requirements(
+                            let workspace = direct_terminal_expand_absorb_arena_slot_requirements(
                                 &successor.program,
                                 base,
                                 domain,
@@ -9558,6 +9575,30 @@ fn resolve_commitment_slots(
                                 slots,
                             )
                             .map_err(ArenaPlanError::DirectCompactDomainBinding)?;
+                            let slab = workspace
+                                .iter()
+                                .find(|requirement| requirement.id == slots.leaves.state_ping)
+                                .ok_or(ArenaPlanError::InvalidProtocolGeometry(
+                                    "direct terminal successor slab requirement is missing",
+                                ))?;
+                            if leaf_state.physical != slab.id
+                                || leaf_state.len_words != slab.len_words
+                            {
+                                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                                    "direct terminal successor logical slab is undersized",
+                                ));
+                            }
+                            if workspace.iter().any(|requirement| {
+                                layout.slot(requirement.id).is_none_or(|physical| {
+                                    physical.len_words < requirement.len_words
+                                        || physical.alignment_words < requirement.alignment_words
+                                        || physical.offset_words % requirement.alignment_words != 0
+                                })
+                            }) {
+                                return Err(ArenaPlanError::InvalidProtocolGeometry(
+                                    "direct terminal successor workspace exceeds the physical arena",
+                                ));
+                            }
                         }
                         (None, _) => {
                             direct_compact_domain_arena_slot_requirements(
