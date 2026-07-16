@@ -12,7 +12,7 @@ use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 
 use super::*;
 use crate::arena_plan::{ExecutionTableGeometry, ResidentBackend};
-use crate::compiled_proof::ValueVersion;
+use crate::compiled_proof::{EffectAccess, InPlaceAliasRequirement, ValueVersion};
 use crate::phases;
 use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::prepare_resident_ingest;
@@ -77,29 +77,89 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
 
     let mapped = map_first_recorded_witness(&image, executable.arena(), &schedule).unwrap();
     let first_interpolation = mapped.base_interpolation.first().unwrap();
-    let coefficients = &image.values[first_interpolation.coefficients.0 as usize];
+    let first_column = first_interpolation.invocation.columns.first().unwrap();
+    let coefficients = &image.values[first_column.coefficients.0 as usize];
+    let interpolation_columns = mapped
+        .base_interpolation
+        .iter()
+        .map(|batch| batch.invocation.columns.len())
+        .sum::<usize>();
     eprintln!(
         "RECORDED_WITNESS_BINDING_FRONTIER component={} part={:?} base_outputs={} first_coefficient_id={:?} first_coefficient_logical={:?} runtime_steps={}",
         mapped.producer.component,
         mapped.producer.part,
-        mapped.base_interpolation.len(),
+        interpolation_columns,
         coefficients.id,
         coefficients.logical,
         schedule.steps().len(),
     );
     assert_eq!(mapped.producer.kind, WitnessProducerKind::Recorded);
-    assert!(mapped
+    let interpolation = schedule.interpolation().unwrap();
+    assert_eq!(mapped.base_interpolation.len(), interpolation.batches.len());
+    assert_eq!(
+        interpolation_columns,
+        interpolation
+            .batches
+            .iter()
+            .map(|batch| batch.columns.len())
+            .sum::<usize>()
+    );
+    for (batch_index, (lowered, scheduled)) in mapped
         .base_interpolation
         .iter()
-        .all(|frontier| mapped.produced.contains(&frontier.evaluations)));
-    assert!(mapped.base_interpolation.iter().all(|frontier| {
-        frontier.evaluation_version != frontier.coefficient_version
-            && frontier.missing
-                == [
-                    MissingOperationField::PrimitiveAuthority,
-                    MissingOperationField::EffectContract,
-                ]
-    }));
+        .zip(&interpolation.batches)
+        .enumerate()
+    {
+        assert_eq!(lowered.batch as usize, batch_index);
+        assert_eq!(lowered.authority, scheduled.authority);
+        assert_ne!(lowered.authority.identity(), [0; 32]);
+        assert_eq!(lowered.invocation.log_size, scheduled.log_size);
+        assert_eq!(
+            lowered.invocation.column_count as usize,
+            scheduled.columns.len()
+        );
+        assert_eq!(
+            lowered.invocation.evaluation_domain_size,
+            scheduled.authority.evaluation_domain_size()
+        );
+        assert_eq!(
+            lowered.effect.accesses().len(),
+            lowered.invocation.columns.len() + 1
+        );
+        for (column, access) in lowered
+            .invocation
+            .columns
+            .iter()
+            .zip(lowered.effect.accesses())
+        {
+            let EffectAccess::ReadWrite {
+                source,
+                destination,
+                in_place,
+            } = access
+            else {
+                panic!("interpolation column must be one exact transition")
+            };
+            assert_eq!(source.binding, column.source);
+            assert_eq!(destination.binding, column.destination);
+            assert_eq!(
+                in_place.is_some_and(|authority| {
+                    authority.requirement == InPlaceAliasRequirement::Required
+                }),
+                column.exact_in_place
+            );
+            let evaluations = &image.values[column.evaluations.0 as usize];
+            if evaluations.component == Some(mapped.producer.component)
+                && evaluations.part == mapped.producer.part
+            {
+                assert!(mapped.produced.contains(&column.evaluations));
+            }
+        }
+        let EffectAccess::Read { source } = lowered.effect.accesses().last().unwrap() else {
+            panic!("interpolation must read the exact inverse-twiddle suffix")
+        };
+        assert_eq!(source.binding, lowered.invocation.inverse_twiddles);
+    }
     assert_eq!(mapped.invocation.source_arguments.len(), 8);
     assert!(matches!(
         adapter::compile(
@@ -125,34 +185,10 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         versions,
         (0..u32::try_from(versions.len()).unwrap()).collect::<Vec<_>>()
     );
-    let coefficient_start = mapped
-        .base_interpolation
-        .iter()
-        .map(|frontier| frontier.coefficient_version.0)
-        .min()
-        .unwrap();
-    assert!(mapped
-        .base_interpolation
-        .iter()
-        .all(|frontier| frontier.evaluation_version.0 < coefficient_start));
-    assert_eq!(
-        mapped
-            .base_interpolation
-            .iter()
-            .map(|frontier| frontier.coefficient_version.0)
-            .collect::<Vec<_>>(),
-        (coefficient_start
-            ..coefficient_start + u32::try_from(mapped.base_interpolation.len()).unwrap())
-            .collect::<Vec<_>>()
-    );
     assert!(mapped
         .base_interpolation
         .windows(2)
-        .all(|pair| (pair[0].batch, pair[0].column) < (pair[1].batch, pair[1].column)));
-    assert_eq!(
-        schedule_prefix::try_lower_base_interpolation(&mapped.base_interpolation),
-        Err(InvocationShapeError::MissingBaseInterpolationAuthority)
-    );
+        .all(|pair| pair[0].batch < pair[1].batch));
     match loaded_authority::require(&mapped.invocation, 8, 6) {
         Ok(loaded) => {
             assert_ne!(loaded.manifest_identity, [0; 32]);

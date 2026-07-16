@@ -5,7 +5,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use stwo_backend_cuda::{ArenaSlotId, InterpolationLaunchMode};
+use stwo_backend_cuda::{
+    ArenaSlotId, InterpolationAuthorityError, InterpolationBatchAuthority, InterpolationLaunchMode,
+};
 use stwo_cairo_prover::witness::proof_shape::TracePartId;
 
 use crate::arena_plan::{
@@ -32,8 +34,18 @@ pub(crate) struct WitnessProducer {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScheduledValue {
     pub(crate) logical: LogicalBufferId,
+    pub(crate) physical: ArenaSlotId,
     pub(crate) component: &'static str,
     pub(crate) part: TracePartId,
+    pub(crate) purpose: BufferPurpose,
+    pub(crate) ordinal: u32,
+    pub(crate) words: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScheduledGlobalValue {
+    pub(crate) logical: LogicalBufferId,
+    pub(crate) physical: ArenaSlotId,
     pub(crate) purpose: BufferPurpose,
     pub(crate) ordinal: u32,
     pub(crate) words: usize,
@@ -48,14 +60,16 @@ pub(crate) struct BaseInterpolationColumn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BaseInterpolationBatch {
     pub(crate) log_size: u32,
-    pub(crate) input_pointers: ArenaSlotId,
-    pub(crate) output_pointers: ArenaSlotId,
+    pub(crate) authority: InterpolationBatchAuthority,
+    pub(crate) input_pointers: ScheduledGlobalValue,
+    pub(crate) output_pointers: ScheduledGlobalValue,
     pub(crate) columns: Vec<BaseInterpolationColumn>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BaseInterpolationSchedule {
     pub(crate) mode: InterpolationLaunchMode,
+    pub(crate) inverse_twiddles: ScheduledGlobalValue,
     pub(crate) batches: Vec<BaseInterpolationBatch>,
 }
 
@@ -220,6 +234,24 @@ pub(crate) enum ProducerScheduleError {
     },
     BaseValueShapeMismatch(CommitmentColumnSource),
     DuplicateBaseInterpolationValue(LogicalBufferId),
+    MissingGlobalValueByOrdinal {
+        purpose: BufferPurpose,
+        ordinal: u32,
+    },
+    MissingGlobalValue {
+        physical: ArenaSlotId,
+        purpose: BufferPurpose,
+    },
+    AmbiguousGlobalValue {
+        physical: ArenaSlotId,
+        purpose: BufferPurpose,
+    },
+    GlobalValueShapeMismatch(LogicalBufferId),
+    InverseTwiddlesTooSmall {
+        required_words: usize,
+        actual_words: usize,
+    },
+    InterpolationAuthority(InterpolationAuthorityError),
     RuntimeOrderMismatch,
     SizeOverflow,
 }
@@ -306,6 +338,7 @@ fn base_interpolation(
         return Err(ProducerScheduleError::MissingBaseInterpolation);
     }
 
+    let inverse_twiddles = scheduled_global(arena, BufferPurpose::InverseTwiddles, 0, None)?;
     let mut seen_evaluations = BTreeSet::new();
     let mut seen_coefficients = BTreeSet::new();
     let batches = base
@@ -362,16 +395,48 @@ fn base_interpolation(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let pointer_words = columns
+                .len()
+                .checked_mul(
+                    core::mem::size_of::<*const u32>().div_ceil(core::mem::size_of::<u32>()),
+                )
+                .ok_or(ProducerScheduleError::SizeOverflow)?;
+            let authority = InterpolationBatchAuthority::compile(
+                base.interpolation_mode,
+                batch.log_size,
+                columns.len(),
+            )
+            .map_err(ProducerScheduleError::InterpolationAuthority)?;
+            let required_twiddle_words = usize::try_from(authority.evaluation_domain_size())
+                .map_err(|_| ProducerScheduleError::SizeOverflow)?;
+            if inverse_twiddles.words < required_twiddle_words {
+                return Err(ProducerScheduleError::InverseTwiddlesTooSmall {
+                    required_words: required_twiddle_words,
+                    actual_words: inverse_twiddles.words,
+                });
+            }
             Ok(BaseInterpolationBatch {
                 log_size: batch.log_size,
-                input_pointers: batch.input_pointers,
-                output_pointers: batch.output_pointers,
+                authority,
+                input_pointers: scheduled_global_for_physical(
+                    arena,
+                    batch.input_pointers,
+                    BufferPurpose::InterpolationInputPointers,
+                    pointer_words,
+                )?,
+                output_pointers: scheduled_global_for_physical(
+                    arena,
+                    batch.output_pointers,
+                    BufferPurpose::InterpolationOutputPointers,
+                    pointer_words,
+                )?,
                 columns,
             })
         })
         .collect::<Result<Vec<_>, ProducerScheduleError>>()?;
     Ok(Some(BaseInterpolationSchedule {
         mode: base.interpolation_mode,
+        inverse_twiddles,
         batches,
     }))
 }
@@ -404,11 +469,70 @@ fn scheduled_value(
     }
     Ok(ScheduledValue {
         logical: logical.id,
+        physical: binding.physical,
         component,
         part,
         purpose,
         ordinal,
         words,
+    })
+}
+
+fn scheduled_global(
+    arena: &ProofArenaPlan,
+    purpose: BufferPurpose,
+    ordinal: u32,
+    expected_words: Option<usize>,
+) -> Result<ScheduledGlobalValue, ProducerScheduleError> {
+    let (logical, binding) = arena.find(None, None, purpose, ordinal).ok_or(
+        ProducerScheduleError::MissingGlobalValueByOrdinal { purpose, ordinal },
+    )?;
+    scheduled_global_from_binding(logical, binding, purpose, expected_words)
+}
+
+fn scheduled_global_for_physical(
+    arena: &ProofArenaPlan,
+    physical: ArenaSlotId,
+    purpose: BufferPurpose,
+    expected_words: usize,
+) -> Result<ScheduledGlobalValue, ProducerScheduleError> {
+    let mut matches = arena.logical_buffers().iter().filter_map(|logical| {
+        if logical.component.is_some() || logical.part.is_some() || logical.purpose != purpose {
+            return None;
+        }
+        arena
+            .binding(logical.id)
+            .filter(|binding| binding.physical == physical)
+            .map(|binding| (logical, binding))
+    });
+    let (logical, binding) = matches
+        .next()
+        .ok_or(ProducerScheduleError::MissingGlobalValue { physical, purpose })?;
+    if matches.next().is_some() {
+        return Err(ProducerScheduleError::AmbiguousGlobalValue { physical, purpose });
+    }
+    scheduled_global_from_binding(logical, binding, purpose, Some(expected_words))
+}
+
+fn scheduled_global_from_binding(
+    logical: &crate::arena_plan::LogicalBuffer,
+    binding: crate::arena_plan::ArenaBinding,
+    purpose: BufferPurpose,
+    expected_words: Option<usize>,
+) -> Result<ScheduledGlobalValue, ProducerScheduleError> {
+    if logical.purpose != purpose
+        || binding.logical != logical.id
+        || binding.len_words != logical.len_words
+        || expected_words.is_some_and(|words| words != logical.len_words)
+    {
+        return Err(ProducerScheduleError::GlobalValueShapeMismatch(logical.id));
+    }
+    Ok(ScheduledGlobalValue {
+        logical: logical.id,
+        physical: binding.physical,
+        purpose,
+        ordinal: logical.ordinal,
+        words: logical.len_words,
     })
 }
 

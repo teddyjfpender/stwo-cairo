@@ -24,7 +24,8 @@ mod loaded_authority;
 mod schedule_prefix;
 
 use schedule_prefix::{
-    base_interpolation_frontier, invocation_catalog_order, BaseInterpolationBindingFrontier,
+    append_interpolation_catalog_order, invocation_catalog_order, lower_base_interpolation,
+    LoweredBaseInterpolationBatch,
 };
 
 const POINTER_WORDS: usize = core::mem::size_of::<*const u32>().div_ceil(WORD_BYTES);
@@ -98,7 +99,7 @@ struct RecordedWitnessBindingFrontier {
     producer: WitnessProducer,
     produced: Vec<ArenaCatalogValueId>,
     semantic_values: adapter::SemanticValueMap,
-    base_interpolation: Vec<BaseInterpolationBindingFrontier>,
+    base_interpolation: Vec<LoweredBaseInterpolationBatch>,
     invocation: RecordedWitnessInvocationShape,
 }
 
@@ -122,7 +123,8 @@ enum InvocationShapeError {
     LoadedAotAuthorityMismatch,
     InvocationMismatch,
     FrontierDidNotAdvance,
-    MissingBaseInterpolationAuthority,
+    InvalidBaseInterpolationAuthority,
+    InvalidBaseInterpolationBinding,
 }
 
 /// Derive one exact real-arena invocation shape without promoting it.
@@ -135,13 +137,10 @@ fn map_first_recorded_witness(
     let invocation = derive_invocation(image, arena, planned)?;
     let produced = produced_values(image, arena, planned)?;
     let mut ordered_values = invocation_catalog_order(&invocation.source_arguments);
-    let mut base_interpolation =
-        base_interpolation_frontier(image, schedule, planned, &produced, &mut ordered_values)?;
+    append_interpolation_catalog_order(image, schedule, &mut ordered_values)?;
     let semantic_values = adapter::SemanticValueMap::allocate_ordered(ordered_values)?;
-    for frontier in &mut base_interpolation {
-        frontier.evaluation_version = semantic_values.version(frontier.evaluations)?;
-        frontier.coefficient_version = semantic_values.version(frontier.coefficients)?;
-    }
+    let base_interpolation =
+        lower_base_interpolation(image, schedule, planned, &produced, &semantic_values)?;
     Ok(RecordedWitnessBindingFrontier {
         producer,
         produced,
