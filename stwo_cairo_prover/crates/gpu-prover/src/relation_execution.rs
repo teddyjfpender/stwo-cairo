@@ -179,6 +179,9 @@ impl RelationExecutionPlan {
                 RelationSourceLayout::BitwiseXor12 {
                     multiplicity_columns,
                 } => (RelationSourcePlane::BaseTrace, multiplicity_columns),
+                RelationSourceLayout::ProjectedColumns { .. } => {
+                    return Err(RelationExecutionError::SourcePlanDrift);
+                }
             };
             for instance_index in 0..kernel_batch.instances.len() {
                 let part = match batch.trace_part {
