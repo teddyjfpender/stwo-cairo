@@ -10,6 +10,8 @@ use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use stwo_backend_cuda::aot::AotKernelAbiSchema;
+
 const COMPARE_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,6 +22,8 @@ pub struct KernelEntry {
     pub cache_key: u64,
     pub semantic_hash: u64,
     pub file: String,
+    pub abi_schema: Option<AotKernelAbiSchema>,
+    pub program_identity: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,6 +33,8 @@ struct SeenKernel {
     source_len: usize,
     source_digest: u64,
     file: String,
+    abi_schema: Option<AotKernelAbiSchema>,
+    program_identity: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -90,8 +96,17 @@ impl StagedOutput {
         kernel_name: String,
         cache_key: u64,
         semantic_hash: u64,
+        abi_schema: Option<AotKernelAbiSchema>,
+        program_identity: Option<[u8; 32]>,
         source: String,
     ) -> Result<bool, String> {
+        if abi_schema.is_some() != program_identity.is_some()
+            || program_identity.is_some_and(|identity| identity == [0; 32])
+        {
+            return Err(
+                "structured ABI and nonzero program identity must be emitted together".to_owned(),
+            );
+        }
         let source_len = source.len();
         let source_digest = fnv1a64(source.as_bytes());
         if let Some(existing) = self.seen.get(&cache_key) {
@@ -103,6 +118,8 @@ impl StagedOutput {
                     })?;
             if existing.kernel_name != kernel_name
                 || existing.semantic_hash != semantic_hash
+                || existing.abi_schema != abi_schema
+                || existing.program_identity != program_identity
                 || !exact_source
             {
                 return Err(format!(
@@ -130,6 +147,8 @@ impl StagedOutput {
                 source_len,
                 source_digest,
                 file: file.clone(),
+                abi_schema,
+                program_identity,
             },
         );
         self.kernels.push(KernelEntry {
@@ -139,6 +158,8 @@ impl StagedOutput {
             cache_key,
             semantic_hash,
             file: file.clone(),
+            abi_schema,
+            program_identity,
         });
         self.files.insert(file);
         Ok(true)
@@ -356,7 +377,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::StagedOutput;
+    use super::{AotKernelAbiSchema, StagedOutput};
 
     fn temp_path(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -381,6 +402,8 @@ mod tests {
                 "kernel".to_owned(),
                 7,
                 11,
+                None,
+                None,
                 "source".to_owned(),
             )
             .unwrap());
@@ -391,6 +414,8 @@ mod tests {
                 "kernel".to_owned(),
                 7,
                 11,
+                None,
+                None,
                 "source".to_owned(),
             )
             .unwrap());
@@ -415,6 +440,8 @@ mod tests {
                 "kernel".to_owned(),
                 7,
                 11,
+                None,
+                None,
                 "source".to_owned(),
             )
             .unwrap();
@@ -425,12 +452,46 @@ mod tests {
                 "other_kernel".to_owned(),
                 7,
                 11,
+                None,
+                None,
                 "different source".to_owned(),
             )
             .unwrap_err();
         assert!(error.contains("cache-key collision"));
         drop(staged);
         assert_eq!(fs::read_to_string(output.join("sentinel")).unwrap(), "live");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_key_collision_cannot_change_typed_abi() {
+        let root = temp_path("abi-collision");
+        let output = root.join("generated");
+        let mut staged = StagedOutput::new(&output).unwrap();
+        staged
+            .stage_kernel(
+                "witness",
+                "first".to_owned(),
+                "kernel".to_owned(),
+                7,
+                11,
+                Some(AotKernelAbiSchema::RecordedWitnessV1),
+                Some([1; 32]),
+                "source".to_owned(),
+            )
+            .unwrap();
+        assert!(staged
+            .stage_kernel(
+                "witness",
+                "later".to_owned(),
+                "kernel".to_owned(),
+                7,
+                11,
+                None,
+                None,
+                "source".to_owned(),
+            )
+            .is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -446,6 +507,8 @@ mod tests {
                 "kernel".to_owned(),
                 7,
                 11,
+                None,
+                None,
                 "source".to_owned(),
             )
             .unwrap();
@@ -460,6 +523,8 @@ mod tests {
                 "kernel".to_owned(),
                 7,
                 11,
+                None,
+                None,
                 "source".to_owned(),
             )
             .unwrap_err();
@@ -533,6 +598,8 @@ mod tests {
                 "kernel".to_owned(),
                 9,
                 13,
+                None,
+                None,
                 "new source".to_owned(),
             )
             .unwrap();

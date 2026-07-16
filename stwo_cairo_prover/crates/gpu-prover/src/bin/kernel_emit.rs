@@ -3,8 +3,8 @@
 //! Emits every lane witness kernel and every component's fused constraint
 //! kernel(s) as `.cu` files into the stwo repo's
 //! `crates/backend-cuda-kernels/cuda/generated/`, plus `aot_manifest.json`
-//! (kind, label, kernel name, cache key). The source text and cache keys are
-//! BYTE-IDENTICAL to what the NVRTC lane compiles at prove time (same codegen)
+//! (identity plus generator-owned ABI where supported). The source text and
+//! cache keys are BYTE-IDENTICAL to what the NVRTC lane compiles at prove time
 //! — build.rs compiles these offline (nvcc -O3, per-arch cubins) and the
 //! runtime consults the embedded table before NVRTC, so a cache-key miss IS
 //! the drift check.
@@ -137,6 +137,8 @@ fn stage_kernel(
         kernel.kernel_name,
         kernel.cache_key,
         kernel.semantic_hash,
+        kernel.abi_schema,
+        kernel.program_identity,
         kernel.source,
     )?;
     Ok(())
@@ -433,6 +435,8 @@ fn run_input(
                     cache_key: wave.cache_key,
                     semantic_hash: wave.semantic_hash,
                     source: wave.source,
+                    abi_schema: None,
+                    program_identity: None,
                 },
             )?;
         }
@@ -581,14 +585,24 @@ fn main() -> ExitCode {
         .kernels()
         .iter()
         .map(|entry| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "kind": entry.kind,
                 "label": entry.label,
                 "kernel_name": entry.kernel_name,
                 "cache_key": format!("{:016x}", entry.cache_key),
                 "semantic_hash": format!("{:016x}", entry.semantic_hash),
                 "file": entry.file,
-            })
+            });
+            if let Some(schema) = entry.abi_schema {
+                value["abi_schema"] = serde_json::json!(schema.manifest_tag());
+            }
+            if let Some(identity) = entry.program_identity {
+                value["program_identity"] = serde_json::json!(identity
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>());
+            }
+            value
         })
         .collect::<Vec<_>>();
     manifest.sort_by_key(|m| {
