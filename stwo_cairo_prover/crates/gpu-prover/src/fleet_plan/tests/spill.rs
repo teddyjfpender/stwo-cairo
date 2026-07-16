@@ -24,6 +24,10 @@ fn spill_plan(
     .map(|(ordinal, kind)| SpillTransition {
         id: SpillTransitionId(ordinal as u32),
         chunk: SpillChunkId(0),
+        tile_ordinal: 0,
+        chunk_offset_bytes: 0,
+        len_bytes: bytes,
+        ring_slot: RingSlotId(0),
         kind,
         interval,
         during: during(times[ordinal * 2], times[ordinal * 2 + 1]),
@@ -57,8 +61,9 @@ fn spill_plan(
             id: SpillChunkId(0),
             value,
             worker: WorkerId(0),
+            storage,
             store_extent: StoreExtentId(0),
-            ring_slot: RingSlotId(0),
+            len_bytes: bytes,
         }],
         transitions,
         vmm_reclaims: reclaim
@@ -97,6 +102,43 @@ fn with_spill(reclaim: bool) -> Fixture {
         store_capacity_bytes: 64,
         memlock_limit_bytes: 64,
     }];
+    fixture
+}
+
+fn with_tiled_spill() -> Fixture {
+    let mut fixture = with_spill(true);
+    let spill = &mut fixture.placement.spills[0];
+    spill.ring.capacity_bytes = 16;
+    spill.ring.memlock_limit_bytes = 16;
+    spill.ring.alignment_bytes = 16;
+    spill.ring.slots[0].len_bytes = 16;
+    spill.transitions = (0..4_u32)
+        .flat_map(|tile| {
+            let spill_start = 10 + tile * 2;
+            let restore_start = 30 + tile * 2;
+            [
+                (SpillTransitionKind::DeviceToRing, spill_start),
+                (SpillTransitionKind::RingToStore, spill_start + 1),
+                (SpillTransitionKind::StoreToRing, restore_start),
+                (SpillTransitionKind::RingToDevice, restore_start + 1),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(move |(phase, (kind, start))| SpillTransition {
+                id: SpillTransitionId(tile * 4 + phase as u32),
+                chunk: SpillChunkId(0),
+                tile_ordinal: tile,
+                chunk_offset_bytes: tile as usize * 16,
+                len_bytes: 16,
+                ring_slot: RingSlotId(0),
+                kind,
+                interval: ExecutionInterval::BeforeBarrier(0),
+                during: during(start, start + 1),
+            })
+        })
+        .collect();
+    spill.vmm_reclaims[0].unmap.during = during(19, 20);
+    fixture.placement.topology.host_numa[0].memlock_limit_bytes = 16;
     fixture
 }
 
@@ -233,11 +275,122 @@ fn ordinary_spill_and_whole_storage_vmm_reclaim_are_valid() {
 }
 
 #[test]
+fn vmm_reclaim_streams_whole_storage_through_a_bounded_pinned_tile() {
+    let full_ring = compile(with_spill(true)).unwrap();
+    let tiled = compile(with_tiled_spill()).unwrap();
+    assert_ne!(tiled.identity(), full_ring.identity());
+    assert_eq!(tiled.workers(), full_ring.workers());
+    assert_eq!(tiled.placement().spills[0].ring.slots[0].len_bytes, 16);
+    assert_eq!(tiled.placement().spills[0].store.extents[0].len_bytes, 64);
+    assert!(tiled.placement().spills[0]
+        .transitions
+        .windows(2)
+        .all(|pair| pair[0].during.start <= pair[1].during.start));
+}
+
+#[test]
+fn tiled_spill_rejects_range_stage_and_slot_schedule_drift() {
+    let expected = |error| FleetPlanError::Spill(error);
+
+    let mut gap = with_tiled_spill();
+    for transition in gap.placement.spills[0]
+        .transitions
+        .iter_mut()
+        .filter(|transition| transition.tile_ordinal == 1)
+    {
+        transition.chunk_offset_bytes += 1;
+    }
+    assert_eq!(
+        compile(gap).unwrap_err(),
+        expected(SpillPlanError::IncompleteChain(SpillChunkId(0)))
+    );
+
+    let mut mismatched_stage = with_tiled_spill();
+    mismatched_stage.placement.spills[0]
+        .transitions
+        .iter_mut()
+        .find(|transition| {
+            transition.tile_ordinal == 2 && transition.kind == SpillTransitionKind::RingToStore
+        })
+        .unwrap()
+        .len_bytes = 15;
+    assert_eq!(
+        compile(mismatched_stage).unwrap_err(),
+        expected(SpillPlanError::IncompleteChain(SpillChunkId(0)))
+    );
+
+    let mut overlapping_slot = with_tiled_spill();
+    for transition in overlapping_slot.placement.spills[0]
+        .transitions
+        .iter_mut()
+        .filter(|transition| transition.tile_ordinal == 1)
+    {
+        transition.during.start.0 -= 1;
+        transition.during.end.0 -= 1;
+    }
+    assert_eq!(
+        compile(overlapping_slot).unwrap_err(),
+        expected(SpillPlanError::RingSlotOverlap)
+    );
+}
+
+#[test]
+fn spill_chunk_rejects_split_device_storage_even_when_coverage_is_complete() {
+    let mut split = with_tiled_spill();
+    let storage = split.placement.spills[0].chunks[0].storage;
+    let binding = split
+        .placement
+        .storage_bindings
+        .iter_mut()
+        .find(|binding| binding.storage == storage)
+        .unwrap();
+    let mut second = binding.clone();
+    binding.value.elements.end = 8;
+    second.value.elements.start = 8;
+    second.offset_bytes = 32;
+    split.placement.storage_bindings.push(second);
+
+    assert_eq!(
+        compile(split).unwrap_err(),
+        FleetPlanError::SpillValue(SpillChunkId(0))
+    );
+}
+
+#[test]
 fn vmm_reclaim_requires_one_exact_whole_storage_generation() {
     let storage = StorageId(fixture().spill_value.0);
 
     let mut partial = with_spill(true);
     partial.placement.spills[0].chunks[0].value.elements.end = 8;
+    partial.placement.spills[0].chunks[0].len_bytes = 32;
+    for transition in &mut partial.placement.spills[0].transitions {
+        transition.len_bytes = 32;
+    }
+    let binding = partial
+        .placement
+        .storage_bindings
+        .iter_mut()
+        .find(|binding| binding.storage == storage)
+        .unwrap();
+    binding.value.elements.end = 8;
+    let remainder_storage = StorageId(partial.placement.storages.len() as u32);
+    partial.placement.storages.push(StorageDesc {
+        id: remainder_storage,
+        worker: WorkerId(0),
+        bytes: 32,
+        alignment_bytes: 64,
+    });
+    partial
+        .placement
+        .storage_bindings
+        .push(FleetStoragePlacement {
+            storage: remainder_storage,
+            value: ValueRange {
+                version: partial.spill_value,
+                elements: range(8, 16),
+            },
+            offset_bytes: 0,
+        });
     assert_eq!(
         compile(partial).unwrap_err(),
         FleetPlanError::InvalidVmmReclaim(storage)
@@ -254,7 +407,7 @@ fn vmm_reclaim_requires_one_exact_whole_storage_generation() {
     extra_binding.placement.storage_bindings.push(binding);
     assert_eq!(
         compile(extra_binding).unwrap_err(),
-        FleetPlanError::InvalidVmmReclaim(storage)
+        FleetPlanError::SpillValue(SpillChunkId(0))
     );
 
     let mut aliased = with_spill(true);
@@ -352,8 +505,9 @@ fn vmm_transition_order_and_unmapped_access_fail_closed() {
         id: SpillChunkId(1),
         value: value_range(other_spill.spill_value, 16),
         worker: WorkerId(0),
+        storage,
         store_extent: StoreExtentId(1),
-        ring_slot: RingSlotId(1),
+        len_bytes: 64,
     });
     spill.transitions.extend(
         [
@@ -368,6 +522,10 @@ fn vmm_transition_order_and_unmapped_access_fail_closed() {
         .map(|(ordinal, (kind, (start, end)))| SpillTransition {
             id: SpillTransitionId(4 + ordinal as u32),
             chunk: SpillChunkId(1),
+            tile_ordinal: 0,
+            chunk_offset_bytes: 0,
+            len_bytes: 64,
+            ring_slot: RingSlotId(1),
             kind,
             interval: ExecutionInterval::BeforeBarrier(0),
             during: during(start, end),

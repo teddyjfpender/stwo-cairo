@@ -57,11 +57,23 @@ fn validate_chunk(
         .iter()
         .find(|extent| extent.id == chunk.store_extent)
         .ok_or(FleetPlanError::SpillValue(chunk.id))?;
-    let slot = spill
-        .ring
-        .slots
+    let storage = super::super::storage::storage(plan, chunk.storage)
+        .ok_or(FleetPlanError::SpillValue(chunk.id))?;
+    let bindings = plan
+        .placement
+        .storage_bindings
         .iter()
-        .find(|slot| slot.id == chunk.ring_slot)
+        .filter(|binding| {
+            super::super::storage::storage(plan, binding.storage).is_some_and(|candidate| {
+                candidate.worker == chunk.worker && ranges_overlap(binding.value, chunk.value)
+            })
+        })
+        .collect::<Vec<_>>();
+    let exact_binding = plan
+        .placement
+        .storage_bindings
+        .iter()
+        .find(|binding| binding.storage == chunk.storage && binding.value == chunk.value)
         .ok_or(FleetPlanError::SpillValue(chunk.id))?;
     let owner = plan.placement.owners.iter().find(|owner| {
         owner.worker == chunk.worker
@@ -71,12 +83,17 @@ fn validate_chunk(
     let Some(owner) = owner else {
         return Err(FleetPlanError::SpillValue(chunk.id));
     };
-    let chain = spill.chain(chunk.id)?;
-    if chain
+    let chain = spill.bounds(chunk.id)?;
+    if spill
+        .transitions
         .iter()
+        .filter(|stage| stage.chunk == chunk.id)
         .any(|stage| !execution_interval_contains(plan, stage.interval, stage.during))
+        || storage.worker != chunk.worker
+        || bindings.len() != 1
+        || bindings[0] != exact_binding
+        || chunk.len_bytes != bytes
         || extent.len_bytes < bytes
-        || slot.len_bytes < bytes
     {
         return Err(FleetPlanError::SpillValue(chunk.id));
     }
@@ -111,16 +128,17 @@ fn validate_vmm_reclaim(
         .find(|chunk| chunk.id == reclaim.chunk)
         .ok_or_else(invalid)?;
     let storage = super::super::storage::storage(plan, reclaim.storage).ok_or_else(invalid)?;
-    let chain = spill.chain(chunk.id)?;
-    let [d2h, _, _, h2d] = chain;
+    let chain = spill.bounds(chunk.id)?;
+    let [_, retire, prefetch, _] = chain;
     if storage.worker != chunk.worker
+        || chunk.storage != reclaim.storage
         || storage.alignment_bytes < reclaim.allocation_granularity_bytes
         || storage.bytes % reclaim.allocation_granularity_bytes != 0
         || !execution_interval_contains(plan, reclaim.unmap.interval, reclaim.unmap.during)
         || !execution_interval_contains(plan, reclaim.remap.interval, reclaim.remap.during)
-        || d2h.during.end > reclaim.unmap.during.start
+        || retire.during.end > reclaim.unmap.during.start
         || reclaim.unmap.during.end > reclaim.remap.during.start
-        || reclaim.remap.during.end > h2d.during.start
+        || reclaim.remap.during.end > prefetch.during.start
     {
         return Err(invalid());
     }
@@ -254,8 +272,10 @@ fn other_spill_access_during(
         .iter()
         .filter(|chunk| chunk.id != reclaimed.id && ranges_overlap(chunk.value, reclaimed.value))
     {
-        let [d2h, _, _, h2d] = spill.chain(chunk.id)?;
-        if d2h.during.overlaps(window) || h2d.during.overlaps(window) {
+        let [d2h, _, _, h2d] = spill.bounds(chunk.id)?;
+        let cycle = ScheduleRange::new(d2h.during.start, h2d.during.end)
+            .ok_or(FleetPlanError::InvalidSchedule)?;
+        if cycle.overlaps(window) {
             return Ok(true);
         }
     }
@@ -264,11 +284,11 @@ fn other_spill_access_during(
 
 fn reject_overlapping_spill_cycles(spill: &SpillPlan) -> Result<(), FleetPlanError> {
     for (index, left) in spill.chunks.iter().enumerate() {
-        let [left_d2h, _, _, left_h2d] = spill.chain(left.id)?;
+        let [left_d2h, _, _, left_h2d] = spill.bounds(left.id)?;
         let left_cycle = ScheduleRange::new(left_d2h.during.start, left_h2d.during.end)
             .ok_or(FleetPlanError::InvalidSchedule)?;
         for right in &spill.chunks[index + 1..] {
-            let [right_d2h, _, _, right_h2d] = spill.chain(right.id)?;
+            let [right_d2h, _, _, right_h2d] = spill.bounds(right.id)?;
             let right_cycle = ScheduleRange::new(right_d2h.during.start, right_h2d.during.end)
                 .ok_or(FleetPlanError::InvalidSchedule)?;
             if ranges_overlap(left.value, right.value) && left_cycle.overlaps(right_cycle) {

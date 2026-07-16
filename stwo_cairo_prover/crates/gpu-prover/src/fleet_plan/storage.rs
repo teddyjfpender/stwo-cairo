@@ -345,8 +345,10 @@ fn has_concurrent_source_consumer(
             .iter()
             .filter(|chunk| ranges_overlap(chunk.value, source))
         {
-            let [d2h, _, _, _] = spill.chain(chunk.id)?;
-            if d2h.during.overlaps(aliased_placement.during) {
+            let [d2h, _, _, h2d] = spill.bounds(chunk.id)?;
+            let cycle = ScheduleRange::new(d2h.during.start, h2d.during.end)
+                .ok_or(FleetPlanError::InvalidSchedule)?;
+            if cycle.overlaps(aliased_placement.during) {
                 return Ok(true);
             }
         }

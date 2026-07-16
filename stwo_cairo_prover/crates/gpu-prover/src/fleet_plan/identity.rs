@@ -2,7 +2,7 @@ use super::*;
 use crate::compiled_proof::{OpId, ValueLayout, ValueRange, ValueVersion};
 use crate::fleet_spill::{SpillPlan, SpillTransitionKind};
 
-const DOMAIN: &[u8] = b"stwo-cairo.track-a.fleet-proof-plan.structural-v3\0";
+const DOMAIN: &[u8] = b"stwo-cairo.track-a.fleet-proof-plan.structural-v4\0";
 
 pub(super) fn compute(plan: &FleetProofPlan) -> Result<[u8; 32], FleetPlanError> {
     Ok(*blake3::hash(&encode(plan)?).as_bytes())
@@ -270,13 +270,18 @@ impl Encoder {
             self.u32(chunk.id.0);
             self.value_range(chunk.value)?;
             self.worker(chunk.worker);
+            self.u32(chunk.storage.0);
             self.u32(chunk.store_extent.0);
-            self.u16(chunk.ring_slot.0);
+            self.size(chunk.len_bytes)?;
         }
         self.count(spill.transitions.len())?;
         for transition in &spill.transitions {
             self.u32(transition.id.0);
             self.u32(transition.chunk.0);
+            self.u32(transition.tile_ordinal);
+            self.size(transition.chunk_offset_bytes)?;
+            self.size(transition.len_bytes)?;
+            self.u16(transition.ring_slot.0);
             self.byte(match transition.kind {
                 SpillTransitionKind::DeviceToRing => 0,
                 SpillTransitionKind::RingToStore => 1,

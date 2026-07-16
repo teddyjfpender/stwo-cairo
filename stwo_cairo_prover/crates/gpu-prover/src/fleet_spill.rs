@@ -42,6 +42,9 @@ pub struct HostSpillStore {
 pub struct RingSlot {
     pub id: RingSlotId,
     pub offset_bytes: usize,
+    /// Maximum bytes transferred per DMA tile. A spill chunk may be larger;
+    /// its transition windows cover the contiguous tile sequence through this
+    /// bounded pinned slot.
     pub len_bytes: usize,
 }
 
@@ -60,8 +63,13 @@ pub struct SpillChunk {
     pub id: SpillChunkId,
     pub value: ValueRange,
     pub worker: WorkerId,
+    /// One exact contiguous worker-local device allocation binding. A chunk
+    /// may not straddle or reorder several storages.
+    pub storage: StorageId,
     pub store_extent: StoreExtentId,
-    pub ring_slot: RingSlotId,
+    /// Exact logical bytes covered by `value`. Fleet admission re-derives and
+    /// checks this from the compiled value type before runtime installation.
+    pub len_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -76,6 +84,13 @@ pub enum SpillTransitionKind {
 pub struct SpillTransition {
     pub id: SpillTransitionId,
     pub chunk: SpillChunkId,
+    /// Dense tile ordinal within the chunk.
+    pub tile_ordinal: u32,
+    /// Offset in the chunk's exact device binding and host-store extent. The
+    /// pinned destination/source starts at `RingSlot::offset_bytes`.
+    pub chunk_offset_bytes: usize,
+    pub len_bytes: usize,
+    pub ring_slot: RingSlotId,
     pub kind: SpillTransitionKind,
     pub interval: ExecutionInterval,
     pub during: ScheduleRange,
@@ -137,8 +152,16 @@ impl SpillPlan {
         self.store.extents.sort_unstable_by_key(|extent| extent.id);
         self.ring.slots.sort_unstable_by_key(|slot| slot.id);
         self.chunks.sort_unstable_by_key(|chunk| chunk.id);
-        self.transitions
-            .sort_unstable_by_key(|transition| (transition.chunk, transition.kind, transition.id));
+        self.transitions.sort_unstable_by_key(|transition| {
+            (
+                transition.during.start,
+                transition.during.end,
+                transition.chunk,
+                transition.tile_ordinal,
+                transition.kind,
+                transition.id,
+            )
+        });
         self.vmm_reclaims
             .sort_unstable_by_key(|reclaim| (reclaim.storage, reclaim.chunk));
     }
@@ -185,20 +208,16 @@ impl SpillPlan {
             if chunk.worker != self.store.worker {
                 return Err(SpillPlanError::WrongOwner);
             }
-            if chunk.value.elements.is_empty() {
+            if chunk.value.elements.is_empty() || chunk.len_bytes == 0 {
                 return Err(SpillPlanError::InvalidChunk(chunk.id));
             }
-            let _extent = extents
+            let extent = extents
                 .get(&chunk.store_extent)
                 .ok_or(SpillPlanError::MissingStoreExtent(chunk.store_extent))?;
-            let _slot = slots
-                .get(&chunk.ring_slot)
-                .ok_or(SpillPlanError::MissingRingSlot(chunk.ring_slot))?;
+            if extent.len_bytes < chunk.len_bytes {
+                return Err(SpillPlanError::InvalidChunk(chunk.id));
+            }
             claimed_extents.insert(chunk.store_extent);
-            claimed_slots.insert(chunk.ring_slot);
-        }
-        if claimed_extents.len() != extents.len() || claimed_slots.len() != slots.len() {
-            return Err(SpillPlanError::OrphanedResource);
         }
 
         let mut transition_ids = BTreeSet::new();
@@ -210,9 +229,22 @@ impl SpillPlan {
             if !chunks.contains_key(&transition.chunk) {
                 return Err(SpillPlanError::MissingChunk(transition.chunk));
             }
-            if !transition.during.is_valid() {
+            let chunk = chunks[&transition.chunk];
+            let end = transition
+                .chunk_offset_bytes
+                .checked_add(transition.len_bytes)
+                .ok_or(SpillPlanError::SizeOverflow)?;
+            let slot = slots
+                .get(&transition.ring_slot)
+                .ok_or(SpillPlanError::MissingRingSlot(transition.ring_slot))?;
+            if !transition.during.is_valid()
+                || transition.len_bytes == 0
+                || end > chunk.len_bytes
+                || transition.len_bytes > slot.len_bytes
+            {
                 return Err(SpillPlanError::InvalidSchedule);
             }
+            claimed_slots.insert(transition.ring_slot);
             by_chunk
                 .entry(transition.chunk)
                 .or_default()
@@ -225,25 +257,33 @@ impl SpillPlan {
             let stages = by_chunk
                 .get(&chunk.id)
                 .ok_or(SpillPlanError::IncompleteChain(chunk.id))?;
-            let [d2h, retire, prefetch, h2d] = exact_stages(chunk, stages)?;
-            if d2h.during.end > retire.during.start
-                || retire.during.end > prefetch.during.start
-                || prefetch.during.end > h2d.during.start
-            {
+            let tiles = exact_tiles(chunk, stages)?;
+            for [d2h, retire, prefetch, h2d] in &tiles {
+                if d2h.during.end > retire.during.start || prefetch.during.end > h2d.during.start {
+                    return Err(SpillPlanError::OutOfOrderChain(chunk.id));
+                }
+                slot_windows.entry(d2h.ring_slot).or_default().extend([
+                    ScheduleRange::new(d2h.during.start, retire.during.end)
+                        .ok_or(SpillPlanError::InvalidSchedule)?,
+                    ScheduleRange::new(prefetch.during.start, h2d.during.end)
+                        .ok_or(SpillPlanError::InvalidSchedule)?,
+                ]);
+            }
+            let [_, last_retire, first_prefetch, _] = tile_bounds(&tiles);
+            if last_retire.during.end > first_prefetch.during.start {
                 return Err(SpillPlanError::OutOfOrderChain(chunk.id));
             }
-            slot_windows.entry(chunk.ring_slot).or_default().extend([
-                ScheduleRange::new(d2h.during.start, retire.during.end)
-                    .ok_or(SpillPlanError::InvalidSchedule)?,
-                ScheduleRange::new(prefetch.during.start, h2d.during.end)
-                    .ok_or(SpillPlanError::InvalidSchedule)?,
-            ]);
+            let first_retire = tiles[0][1];
+            let last_prefetch = tiles[tiles.len() - 1][2];
             extent_windows.entry(chunk.store_extent).or_default().push(
-                ScheduleRange::new(retire.during.start, prefetch.during.end)
+                ScheduleRange::new(first_retire.during.start, last_prefetch.during.end)
                     .ok_or(SpillPlanError::OutOfOrderChain(chunk.id))?,
             );
         }
-        if by_chunk.len() != self.chunks.len() {
+        if by_chunk.len() != self.chunks.len()
+            || claimed_extents.len() != extents.len()
+            || claimed_slots.len() != slots.len()
+        {
             return Err(SpillPlanError::OrphanedResource);
         }
         validate_vmm_reclaims(&self.vmm_reclaims, &chunks)?;
@@ -262,7 +302,7 @@ impl SpillPlan {
         Ok(())
     }
 
-    pub(crate) fn chain(
+    pub(crate) fn bounds(
         &self,
         chunk: SpillChunkId,
     ) -> Result<[&SpillTransition; 4], SpillPlanError> {
@@ -276,7 +316,8 @@ impl SpillPlan {
             .iter()
             .find(|candidate| candidate.id == chunk)
             .ok_or(SpillPlanError::MissingChunk(chunk))?;
-        exact_stages(chunk, &stages)
+        let tiles = exact_tiles(chunk, &stages)?;
+        Ok(tile_bounds(&tiles))
     }
 }
 
@@ -375,6 +416,67 @@ fn exact_stages<'a>(
         .collect::<Option<Vec<_>>>()
         .and_then(|values| values.try_into().ok())
         .ok_or(SpillPlanError::IncompleteChain(chunk.id))
+}
+
+fn exact_tiles<'a>(
+    chunk: &SpillChunk,
+    stages: &[&'a SpillTransition],
+) -> Result<Vec<[&'a SpillTransition; 4]>, SpillPlanError> {
+    let mut grouped = BTreeMap::<u32, Vec<&SpillTransition>>::new();
+    for stage in stages {
+        grouped.entry(stage.tile_ordinal).or_default().push(stage);
+    }
+    let mut cursor = 0usize;
+    let mut previous = None::<[ScheduleRange; 4]>;
+    let mut tiles = Vec::with_capacity(grouped.len());
+    for (expected, (ordinal, tile_stages)) in grouped.into_iter().enumerate() {
+        if ordinal as usize != expected {
+            return Err(SpillPlanError::IncompleteChain(chunk.id));
+        }
+        let tile = exact_stages(chunk, &tile_stages)?;
+        let first = tile[0];
+        if first.chunk_offset_bytes != cursor
+            || tile.iter().any(|stage| {
+                stage.tile_ordinal != ordinal
+                    || stage.chunk_offset_bytes != first.chunk_offset_bytes
+                    || stage.len_bytes != first.len_bytes
+                    || stage.ring_slot != first.ring_slot
+            })
+        {
+            return Err(SpillPlanError::IncompleteChain(chunk.id));
+        }
+        let end = cursor
+            .checked_add(first.len_bytes)
+            .ok_or(SpillPlanError::SizeOverflow)?;
+        if end > chunk.len_bytes {
+            return Err(SpillPlanError::InvalidChunk(chunk.id));
+        }
+        let ranges = tile.map(|stage| stage.during);
+        if previous.is_some_and(|previous| {
+            previous
+                .into_iter()
+                .zip(ranges.iter().copied())
+                .any(|(left, right)| left.start > right.start || left.end > right.end)
+        }) {
+            return Err(SpillPlanError::OutOfOrderChain(chunk.id));
+        }
+        previous = Some(ranges);
+        cursor = end;
+        tiles.push(tile);
+    }
+    if tiles.is_empty() || cursor != chunk.len_bytes {
+        return Err(SpillPlanError::IncompleteChain(chunk.id));
+    }
+    Ok(tiles)
+}
+
+fn tile_bounds<'a>(tiles: &[[&'a SpillTransition; 4]]) -> [&'a SpillTransition; 4] {
+    [
+        tiles[0][0],
+        tiles[tiles.len() - 1][1],
+        tiles[0][2],
+        tiles[tiles.len() - 1][3],
+    ]
 }
 
 fn validate_vmm_reclaims(

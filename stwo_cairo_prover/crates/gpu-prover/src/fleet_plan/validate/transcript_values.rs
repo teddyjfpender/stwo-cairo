@@ -128,7 +128,7 @@ fn validate_output_consumers(
             .iter()
             .filter(|chunk| ranges_overlap(chunk.value, range))
         {
-            let [d2h, _, _, _] = spill.chain(chunk.id)?;
+            let [d2h, _, _, _] = spill.bounds(chunk.id)?;
             if d2h.during.start < release {
                 return Err(FleetPlanError::TranscriptValueCausality(range.version));
             }
