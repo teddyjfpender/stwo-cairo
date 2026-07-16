@@ -1,0 +1,1 @@
+gpu-lab-cohesion-review: local and remote worktree identity acquisition stays beside sync ordering so one content contract governs seed checks, overlays, publication, and evidence without a second identity API

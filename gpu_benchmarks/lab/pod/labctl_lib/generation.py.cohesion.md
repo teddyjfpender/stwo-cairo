@@ -1,0 +1,1 @@
+gpu-lab-cohesion-review: source transaction estimation, transfer, publication receipts, and cleanup wrappers remain one controller API while each remote invariant program lives in its owning script module
