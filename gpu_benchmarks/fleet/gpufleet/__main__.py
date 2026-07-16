@@ -172,7 +172,7 @@ def cmd_push(args) -> int:
 
 
 def cmd_run(args) -> int:
-    if not args.skip_pregate and not pregate.is_fresh():
+    if not args.skip_pregate and not pregate.is_fresh(STWO, STWO_CAIRO):
         print("[gpufleet] pregate not green/fresh — running it first "
               "(--skip-pregate to override)")
         if not pregate.run(STWO, STWO_CAIRO):

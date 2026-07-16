@@ -205,7 +205,8 @@ alarms during runs, declarative manifests with machine-checked criteria, and a
 cost ledger. `pods.conf` is now GENERATED from the live roster (`status`/`up`
 refresh it); build_and_push.sh and the loop scripts consume it unchanged.
 
-    ./gpufleet.sh pregate                      # local no-GPU battery — required before spend
+    STWO_SN_ADAPTED_DIR=/path/to/sealed/adapted_inputs \
+      ./gpufleet.sh pregate                    # local no-GPU battery — required before spend
     ./gpufleet.sh offers --gpu 4090 h100       # live $/hr + stock
     ./gpufleet.sh check-manifest manifests/jit_witness_gate.toml
     ./gpufleet.sh run manifests/jit_witness_gate.toml --auto 4090 --push \
@@ -214,6 +215,9 @@ refresh it); build_and_push.sh and the loop scripts consume it unchanged.
     ./gpufleet.sh resume --pod ID              # warm restart (disk kept on stop)
 
 Discipline encoded (not advisory):
+  * `pregate` hashes the manifest-pinned SN1-SN4 adapted inputs before work, then
+    drift-checks their single 373-kernel production AOT union; fixture-only emission
+    cannot classify production composition waves as stale.
   * `run` refuses to provision unless `pregate` passed within 6 h.
   * `up` refuses above `--max-usd-hr` (default $3.00).
   * Every pod self-stops at TTL (default 6 h; `--ttl-hours 24` for planned
