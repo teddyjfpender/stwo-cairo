@@ -1,15 +1,22 @@
-# Fleet orchestrator — the 10–20 MHz aggregate target
+# Fleet orchestrator — independent-worker precursor
 
-This fleet proves **whole, independent SN PIEs** on each worker. It scales block-stream
-throughput by assigning complete proofs to separate GPUs; it does not split one proof
-across cards, and aggregate useful MHz is not a single-proof latency claim. ZisK,
-Airbender, and other EVM-prover fleets are architectural reference points only: their
-workloads and published results are not evidence about this SN PIE prover.
+The current `fleet.sh` proves **whole, independent SN PIEs** on separate workers and
+measures aggregate service throughput. That is useful as an orchestration diagnostic,
+but it is not the replacement backend's primary architecture and cannot produce its
+headline number.
+
+The target fleet makes RTX 3090/4090/5090 GPUs cooperate on **one SN PIE from one block**:
+first with byte-preserving stage/column/row/subtree partitioning under one transcript
+coordinator, then—after separate soundness approval—with execution shards whose proofs
+are recursively merged into one block proof. The headline is one verified block's
+end-to-end latency and useful MHz, plus 1→2→4→8→16 GPU speedup and efficiency. ZisK,
+Airbender, and other EVM-prover fleets are architectural references only; their
+workloads and results are not evidence about this SN PIE prover.
 
 The latest replacement-v1 SN2 diagnostic measured **3.962227 useful MHz on one H100**.
-That does not qualify a consumer-card rate. This directory measures whether a fleet of
-independently admitted workers can reach the **10–20 MHz aggregate target**, along with
-total \$/hr and **\$/MHz-hr**; it does not assume that target has already been reached.
+That does not qualify a consumer-card or cooperative-fleet rate. The existing aggregate
+report remains a legacy diagnostic; the replacement qualification must measure the same
+job on admitted 1/2/4/8/16-GPU configurations.
 
 The primary deployment matrix is RTX 3090 `sm_86` (24 GB), RTX 4090 `sm_89`
 (24 GB), and RTX 5090 `sm_120` (32 GB), each with a separate native archive,
@@ -19,12 +26,14 @@ is a secondary counter/roofline reference. The current SN2 prover is still
 worker: exact owned peak must reach **≤21 GiB** on 3090/4090 and **≤29 GiB** on
 5090 before those cards can produce a resident fleet headline.
 
-The current public `fleet.sh` rotate mode is a development precursor, not the
-formal stream benchmark. Promotion requires `SN-STREAM-100`: a hidden-seed,
-balanced 25×SN1/25×SN2/25×SN3/25×SN4 queue, unknown beyond one ingest-overlap
-job, with seed reveal, a complete ordered receipt ledger, no proof-result cache,
-and persistent shape/program/module/allocator caches. The exact contract and
-1×→2×→4/8/16× qualification ladder are in the backend replacement §5.5.
+The current public `fleet.sh` rotate mode is a development precursor, not the formal
+stream benchmark. Promotion requires `SN-STREAM-100`: a fresh hidden-seed, balanced
+25×SN1/25×SN2/25×SN3/25×SN4 sequence. Every job fans out across the admitted fleet and
+must yield one verified proof before proof work starts on the next job; only bounded
+next-input ingest/prewarm may overlap and is timed separately. The run retains a complete
+ordered shard/attempt/barrier ledger, forbids proof-result caching, and permits only the
+sealed shape/program/module/allocator caches. The exact cooperative contract and
+1×→2×→4×→8×→16× ladder are in the backend replacement §5.5.
 
 It implements no prover arithmetic, but it does select and launch `gpu_bench`, so the
 backend selection and emitted record are sealed explicitly. Its correctness dependency
@@ -33,7 +42,7 @@ which is ON by default.
 
 ```
 cd gpu_benchmarks/fleet
-./pod_provision.sh create --gpu "NVIDIA GeForce RTX 4090" --count 6   # stand up pods
+./gpufleet.sh up --gpu 4090 --max-usd-hr <ceiling> --purpose fleet-dev # repeat per worker
 $EDITOR fleet.conf                                                    # add their ids + $/hr
 ./fleet.sh --prep                                                     # sync+build+gate, then benchmark
 cat fleet_report.json                                                 # the aggregate number
@@ -222,13 +231,14 @@ refresh it); build_and_push.sh and the loop scripts consume it unchanged.
 
     STWO_SN_ADAPTED_DIR=/path/to/sealed/adapted_inputs \
       ./gpufleet.sh pregate                    # local no-GPU battery — required before spend
-    ./gpufleet.sh offers --gpu 4090 h100       # live $/hr + stock
+    ./gpufleet.sh offers --gpu 3090 4090 5090  # primary-fleet live $/hr + stock
     ./gpufleet.sh check-manifest manifests/jit_witness_gate.toml
     ./gpufleet.sh run manifests/jit_witness_gate.toml --auto 4090 --push \
         --purpose jit-witness-gate             # provision → push → gates → stop, one command
     ./gpufleet.sh status                       # pods + billing warnings
     ./gpufleet.sh ledger                       # spend report
-    ./gpufleet.sh resume --pod ID              # warm restart (disk kept on stop)
+    ./gpufleet.sh resume --pod ID --gpu 4090 --name-prefix stwo-4090- \
+        --max-usd-hr <ceiling>                 # guarded warm restart
 
 Discipline encoded (not advisory):
   * `pregate` hashes the manifest-pinned SN1-SN4 adapted inputs before work, then

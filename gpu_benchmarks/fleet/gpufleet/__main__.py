@@ -9,7 +9,8 @@ Commands:
   push --pod ID               build_and_push.sh to one pod
   run MANIFEST [--pod ID|--auto ...]   the whole session; stops pod at the end
   ssh --pod ID [CMD]          interactive/one-shot ssh
-  stop|resume|terminate --pod ID|--all
+  resume --pod ID [...]        guarded adopt/restart + deadman reinstall
+  stop|terminate --pod ID|--all
   ledger                      spend report
 """
 

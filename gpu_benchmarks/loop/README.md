@@ -81,7 +81,6 @@ DRY_RUN=1 BENCH_POD_ID=dry-run-placeholder \
   ./pod_run.sh recipes/direct_blake_g_native.phases direct_blake_g_sm86_dry_run
 
 BENCH_POD_ID=<secure-a40-pod-id> POD_RUN_POLL_INTERVAL=2 MAX_WAIT=3600 \
-  POD_RUN_FINAL_ACTION=terminate \
   ./pod_run.sh recipes/direct_blake_g_native.phases direct_blake_g_sm86
 ```
 
@@ -91,11 +90,11 @@ ignored tests, hashes the resulting executable and evidence, and confirms provid
 termination on every exit. The A40 lane compiles the real ordinary CUDA archive
 containing the Blake-G witness/relation kernels, but its explicit test-only feature
 skips all unrelated generated AOT cubins and requires the log to attest zero AOT
-entries. A pass promotes that exact source projection to the later target-sm90 gate;
-it is not valid for resident proving, an SN-PIE benchmark, an H100 result, or a
-proving-MHz claim. Other `pod_run.sh` recipes default to confirmed stop and retain
-their warm attached disk; set `POD_RUN_FINAL_ACTION=terminate` only for one-shot
-leases whose disk must be released.
+entries. A pass promotes that exact source projection toward separate consumer-fleet
+qualification on `sm_86`, `sm_89`, and `sm_120`; it is not valid for resident proving,
+an SN-PIE benchmark, an H100 result, or a proving-MHz claim. Every `pod_run.sh` recipe
+declares its GPU, resource/price bounds, TTL, and final `stop` or `terminate` action in
+one strict lease line. Ambient settings cannot weaken that recipe-bound action.
 
 Every non-dry `pod_run.sh` invocation rechecks the fresh, source-bound local
 pregate immediately before starting or resuming compute. Keep
