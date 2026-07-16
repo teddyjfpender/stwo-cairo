@@ -12,7 +12,9 @@ use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 
 use super::*;
 use crate::arena_plan::{ExecutionTableGeometry, ResidentBackend};
-use crate::compiled_proof::{EffectAccess, InPlaceAliasRequirement, ValueVersion};
+use crate::compiled_proof::{
+    AotArgumentValue, EffectAccess, InPlaceAliasRequirement, ValueVersion,
+};
 use crate::phases;
 use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::prepare_resident_ingest;
@@ -75,7 +77,11 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         Err(ProducerScheduleError::RuntimeOrderMismatch)
     );
 
-    let mapped = map_first_recorded_witness(&image, executable.arena(), &schedule).unwrap();
+    let mapped =
+        producer_prefix::map_scheduled_base_producers(&image, executable.arena(), &schedule)
+            .unwrap();
+    let first_producer = mapped.bound.first().unwrap();
+    let missing = mapped.missing.unwrap();
     let first_interpolation = mapped.base_interpolation.first().unwrap();
     let first_column = first_interpolation.invocation.columns.first().unwrap();
     let coefficients = &image.values[first_column.coefficients.0 as usize];
@@ -85,15 +91,96 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         .map(|batch| batch.invocation.columns.len())
         .sum::<usize>();
     eprintln!(
-        "RECORDED_WITNESS_BINDING_FRONTIER component={} part={:?} base_outputs={} first_coefficient_id={:?} first_coefficient_logical={:?} runtime_steps={}",
-        mapped.producer.component,
-        mapped.producer.part,
+        "BASE_PRODUCER_BINDING_FRONTIER bound={} scheduled={} first={} missing={} missing_kind={:?} missing_position={:?} base_outputs={} first_coefficient_id={:?} first_coefficient_logical={:?} runtime_steps={}",
+        mapped.bound.len(),
+        mapped.scheduled_producers,
+        first_producer.producer.component,
+        missing.producer.component,
+        missing.missing,
+        missing.position,
         interpolation_columns,
         coefficients.id,
         coefficients.logical,
         schedule.steps().len(),
     );
-    assert_eq!(mapped.producer.kind, WitnessProducerKind::Recorded);
+    assert_eq!(mapped.bound.len(), 7);
+    assert_eq!(mapped.scheduled_producers, 23);
+    assert_eq!(missing.position.ordinal as usize, mapped.bound.len());
+    assert_eq!(missing.producer.component, "ec_op_builtin");
+    assert_eq!(missing.producer.part, None);
+    assert_eq!(missing.producer.kind, WitnessProducerKind::NativeEcOp);
+    assert_eq!(
+        missing.missing,
+        producer_prefix::MissingProducerAuthorityKind::NativeEcOpComposite
+    );
+    assert_eq!(missing.position.level, 0);
+    assert_eq!(missing.position.lane, 7);
+    assert_eq!(missing.position.ordinal, 7);
+    let scheduled = schedule
+        .witness_levels()
+        .iter()
+        .enumerate()
+        .flat_map(|(level, producers)| {
+            producers
+                .iter()
+                .copied()
+                .enumerate()
+                .map(move |(lane, producer)| (level, lane, producer))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(mapped.scheduled_producers, scheduled.len());
+    for (lowered, &(level, lane, expected)) in mapped.bound.iter().zip(&scheduled) {
+        assert_eq!(lowered.producer, expected);
+        assert_eq!(lowered.position.level as usize, level);
+        assert_eq!(lowered.position.lane as usize, lane);
+    }
+    assert_eq!(missing.producer, scheduled[mapped.bound.len()].2);
+    assert_eq!(
+        missing.position.level as usize,
+        scheduled[mapped.bound.len()].0
+    );
+    assert_eq!(
+        missing.position.lane as usize,
+        scheduled[mapped.bound.len()].1
+    );
+    assert!(mapped.bound.iter().enumerate().all(|(ordinal, producer)| {
+        producer.producer.kind == WitnessProducerKind::Recorded
+            && producer.position.ordinal as usize == ordinal
+            && producer.source.program_identity != [0; 32]
+            && producer.source.abi_schema_identity
+                == AotKernelAbiSchema::RecordedWitnessV1.identity()
+            && producer.source.source_arguments.len() == 8
+            && producer.invocation.arguments.len() == 8
+            && !producer.effect.accesses().is_empty()
+    }));
+    let bitwise = mapped
+        .bound
+        .iter()
+        .find(|producer| producer.producer.component == "bitwise_builtin")
+        .unwrap();
+    let SourceArgument::PointerTable { entries, .. } = &bitwise.source.source_arguments[0] else {
+        panic!("bitwise argument zero must be its input pointer table")
+    };
+    assert_eq!(entries.len(), 3);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.target.access)
+            .collect::<Vec<_>>(),
+        [
+            InvocationAccess::Read,
+            InvocationAccess::Inactive,
+            InvocationAccess::Read,
+        ]
+    );
+    let AotArgumentValue::DevicePointerTable(entries) = &bitwise.invocation.arguments[0].value
+    else {
+        panic!("bitwise argument zero must lower to its input pointer table")
+    };
+    assert_eq!(entries.len(), 3);
+    assert!(entries[0].is_some());
+    assert_eq!(entries[1], None);
+    assert!(entries[2].is_some());
     let interpolation = schedule.interpolation().unwrap();
     assert_eq!(mapped.base_interpolation.len(), interpolation.batches.len());
     assert_eq!(
@@ -149,10 +236,10 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
                 column.exact_in_place
             );
             let evaluations = &image.values[column.evaluations.0 as usize];
-            if evaluations.component == Some(mapped.producer.component)
-                && evaluations.part == mapped.producer.part
+            if evaluations.component == Some(first_producer.producer.component)
+                && evaluations.part == first_producer.producer.part
             {
-                assert!(mapped.produced.contains(&column.evaluations));
+                assert!(first_producer.produced.contains(&column.evaluations));
             }
         }
         let EffectAccess::Read { source } = lowered.effect.accesses().last().unwrap() else {
@@ -160,10 +247,10 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         };
         assert_eq!(source.binding, lowered.invocation.inverse_twiddles);
     }
-    assert_eq!(mapped.invocation.source_arguments.len(), 8);
+    assert_eq!(first_producer.source.source_arguments.len(), 8);
     assert!(matches!(
         adapter::compile(
-            &mapped.invocation.source_arguments,
+            &first_producer.source.source_arguments,
             &adapter::SemanticValueMap::new(
                 std::iter::empty::<(ArenaCatalogValueId, ValueVersion,)>()
             )
@@ -171,10 +258,15 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         ),
         Err(InvocationShapeError::MissingSemanticValueMap(_))
     ));
-    let (invocation, effect) =
-        adapter::compile(&mapped.invocation.source_arguments, &mapped.semantic_values).unwrap();
+    let (invocation, effect) = adapter::compile(
+        &first_producer.source.source_arguments,
+        &mapped.semantic_values,
+    )
+    .unwrap();
     assert_eq!(invocation.arguments.len(), 8);
     assert!(!effect.accesses().is_empty());
+    assert_eq!(invocation, first_producer.invocation);
+    assert_eq!(effect, first_producer.effect);
     let mut versions = mapped
         .semantic_values
         .entries()
@@ -189,56 +281,82 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         .base_interpolation
         .windows(2)
         .all(|pair| pair[0].batch < pair[1].batch));
-    match loaded_authority::require(&mapped.invocation, 8, 6) {
+    match loaded_authority::require(&first_producer.source, 8, 6) {
         Ok(loaded) => {
             assert_ne!(loaded.manifest_identity, [0; 32]);
             assert_eq!(
                 loaded.kernel.program_identity(),
-                mapped.invocation.program_identity
+                first_producer.source.program_identity
             );
         }
         Err(InvocationShapeError::MissingLoadedAotAuthority) => {
-            assert!(aot::loaded_kernel_authority(mapped.invocation.cache_key, 8, 6).is_none());
+            assert!(aot::loaded_kernel_authority(first_producer.source.cache_key, 8, 6).is_none());
         }
         Err(error) => panic!("loaded recorded-witness authority drifted: {error:?}"),
     }
-    validate_invocation(&mapped.invocation, &image, executable.arena(), &schedule).unwrap();
+    validate_invocation(
+        &first_producer.source,
+        &image,
+        executable.arena(),
+        first_producer.producer,
+    )
+    .unwrap();
     assert!(image.try_promote_to_compiled_proof().is_err());
 
-    let mut mutated = mapped.invocation.clone();
+    let mut mutated = first_producer.source.clone();
     mutated.program_identity[0] ^= 1;
     assert_eq!(
-        validate_invocation(&mutated, &image, executable.arena(), &schedule),
+        validate_invocation(
+            &mutated,
+            &image,
+            executable.arena(),
+            first_producer.producer
+        ),
         Err(InvocationShapeError::InvocationMismatch)
     );
 
-    let mut mutated = mapped.invocation.clone();
+    let mut mutated = first_producer.source.clone();
     mutated.abi_schema_identity[0] ^= 1;
     assert_eq!(
-        validate_invocation(&mutated, &image, executable.arena(), &schedule),
+        validate_invocation(
+            &mutated,
+            &image,
+            executable.arena(),
+            first_producer.producer
+        ),
         Err(InvocationShapeError::InvocationMismatch)
     );
 
-    let mut mutated = mapped.invocation.clone();
+    let mut mutated = first_producer.source.clone();
     let SourceArgument::PointerTable { entries, .. } = &mut mutated.source_arguments[0] else {
         panic!("argument zero must be a pointer table")
     };
     entries[0].target.elements.end -= 1;
     assert_eq!(
-        validate_invocation(&mutated, &image, executable.arena(), &schedule),
+        validate_invocation(
+            &mutated,
+            &image,
+            executable.arena(),
+            first_producer.producer
+        ),
         Err(InvocationShapeError::InvocationMismatch)
     );
 
-    let mut mutated = mapped.invocation;
+    let mut mutated = first_producer.source.clone();
     mutated.launch.block[0] = 128;
     assert_eq!(
-        validate_invocation(&mutated, &image, executable.arena(), &schedule),
+        validate_invocation(
+            &mutated,
+            &image,
+            executable.arena(),
+            first_producer.producer
+        ),
         Err(InvocationShapeError::InvocationMismatch)
     );
 }
 
 #[test]
-fn generated_sn2_recorded_witness_invocation_is_exact_but_not_promoted() {
+fn generated_sn2_schedule_prefix_is_exact_and_stops_at_missing_authority() {
     assert_exact_invocation_frontier(&generated_sn2());
 }
 

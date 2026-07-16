@@ -1,6 +1,5 @@
 //! Schedule-driven lowering at the witness-to-Base-interpolation boundary.
 
-use std::collections::BTreeSet;
 use std::ops::Range;
 
 use stwo_backend_cuda::{
@@ -9,7 +8,6 @@ use stwo_backend_cuda::{
 };
 
 use super::*;
-use crate::arena_plan::{BufferPurpose, PlannedWitnessComponent};
 use crate::compiled_proof::{
     BoundValueRange, EffectAccess, EffectBindingId, EffectContract, ElementRange,
     InPlaceAliasAuthority, InPlaceAliasId, InPlaceAliasRequirement, InPlaceDiscipline, ValueRange,
@@ -101,30 +99,16 @@ pub(super) fn append_interpolation_catalog_order(
 pub(super) fn lower_base_interpolation(
     image: &ArenaProgramInventory,
     schedule: &BaseProducerSchedule,
-    planned: &PlannedWitnessComponent,
-    produced: &[ArenaCatalogValueId],
     values: &adapter::SemanticValueMap,
 ) -> Result<Vec<LoweredBaseInterpolationBatch>, InvocationShapeError> {
     let interpolation = schedule
         .interpolation()
         .ok_or(InvocationShapeError::FrontierDidNotAdvance)?;
-    let produced_evaluations = produced
-        .iter()
-        .copied()
-        .filter(|&id| {
-            image
-                .values
-                .get(id.0 as usize)
-                .is_some_and(|value| value.purpose == BufferPurpose::BaseTrace)
-        })
-        .collect::<BTreeSet<_>>();
-    let mut frontier_columns = 0usize;
     let mut lowered = Vec::with_capacity(interpolation.batches.len());
     for (batch_index, batch) in interpolation.batches.iter().enumerate() {
         validate_batch_authority(interpolation.mode, batch)?;
         let input_pointers = whole_catalog_range(catalog_global(image, &batch.input_pointers)?)?;
-        let output_pointers =
-            whole_catalog_range(catalog_global(image, &batch.output_pointers)?)?;
+        let output_pointers = whole_catalog_range(catalog_global(image, &batch.output_pointers)?)?;
         let pointer_words = batch
             .columns
             .len()
@@ -143,16 +127,6 @@ pub(super) fn lower_base_interpolation(
         for (column_index, column) in batch.columns.iter().enumerate() {
             let evaluations = catalog_scheduled(image, &column.evaluations)?;
             let coefficients = catalog_scheduled(image, &column.coefficients)?;
-            if column.evaluations.component == planned.component
-                && column.evaluations.part == planned.part
-            {
-                frontier_columns = frontier_columns
-                    .checked_add(1)
-                    .ok_or(InvocationShapeError::SizeOverflow)?;
-                if !produced_evaluations.contains(&evaluations.id) {
-                    return Err(InvocationShapeError::FrontierDidNotAdvance);
-                }
-            }
             let source = EffectBindingId(next_binding);
             next_binding = next_binding
                 .checked_add(1)
@@ -229,11 +203,8 @@ pub(super) fn lower_base_interpolation(
                 binding: inverse_twiddles,
                 value: ValueRange {
                     version: values.version(twiddles.id)?,
-                    elements: ElementRange::new(
-                        suffix_start,
-                        interpolation.inverse_twiddles.words,
-                    )
-                    .ok_or(InvocationShapeError::InvalidBaseInterpolationBinding)?,
+                    elements: ElementRange::new(suffix_start, interpolation.inverse_twiddles.words)
+                        .ok_or(InvocationShapeError::InvalidBaseInterpolationBinding)?,
                 },
             },
         });
@@ -256,11 +227,6 @@ pub(super) fn lower_base_interpolation(
             },
             effect,
         });
-    }
-    if frontier_columns
-        != usize::try_from(planned.program.n_cols).map_err(|_| InvocationShapeError::SizeOverflow)?
-    {
-        return Err(InvocationShapeError::FrontierDidNotAdvance);
     }
     Ok(lowered)
 }

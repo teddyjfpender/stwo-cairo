@@ -1,7 +1,8 @@
-//! Exact source-level invocation frontier for ordinary recorded witnesses.
+//! Exact schedule-order invocation frontier for Base witness producers.
 //!
-//! This maps the real arena into exact first-class AOT adapter input, but cannot create a
-//! `CompiledProof` until semantic ValueVersions and matching loaded AOT authority exist.
+//! Ordinary recorded witnesses lower through the source-emitter-owned typed
+//! AOT ABI. Enumeration stops before the first native/composite or module-
+//! global effect whose authority is not yet represented in `CompiledProof`.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -21,12 +22,8 @@ use crate::resident_runtime::producer_schedule::{
 
 mod adapter;
 mod loaded_authority;
+mod producer_prefix;
 mod schedule_prefix;
-
-use schedule_prefix::{
-    append_interpolation_catalog_order, invocation_catalog_order, lower_base_interpolation,
-    LoweredBaseInterpolationBatch,
-};
 
 const POINTER_WORDS: usize = core::mem::size_of::<*const u32>().div_ceil(WORD_BYTES);
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
@@ -94,15 +91,6 @@ struct RecordedWitnessInvocationShape {
     source_arguments: Vec<SourceArgument>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RecordedWitnessBindingFrontier {
-    producer: WitnessProducer,
-    produced: Vec<ArenaCatalogValueId>,
-    semantic_values: adapter::SemanticValueMap,
-    base_interpolation: Vec<LoweredBaseInterpolationBatch>,
-    invocation: RecordedWitnessInvocationShape,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InvocationShapeError {
     MissingRecordedWitness,
@@ -123,40 +111,20 @@ enum InvocationShapeError {
     LoadedAotAuthorityMismatch,
     InvocationMismatch,
     FrontierDidNotAdvance,
+    ScheduledProducerInvalidProgram(WitnessProducer),
+    ScheduledProducerInvalidEffect(WitnessProducer),
+    InvalidScheduledProducerBinding,
     InvalidBaseInterpolationAuthority,
     InvalidBaseInterpolationBinding,
-}
-
-/// Derive one exact real-arena invocation shape without promoting it.
-fn map_first_recorded_witness(
-    image: &ArenaProgramInventory,
-    arena: &ProofArenaPlan,
-    schedule: &BaseProducerSchedule,
-) -> Result<RecordedWitnessBindingFrontier, InvocationShapeError> {
-    let (producer, planned) = frontier_component(arena, schedule)?;
-    let invocation = derive_invocation(image, arena, planned)?;
-    let produced = produced_values(image, arena, planned)?;
-    let mut ordered_values = invocation_catalog_order(&invocation.source_arguments);
-    append_interpolation_catalog_order(image, schedule, &mut ordered_values)?;
-    let semantic_values = adapter::SemanticValueMap::allocate_ordered(ordered_values)?;
-    let base_interpolation =
-        lower_base_interpolation(image, schedule, planned, &produced, &semantic_values)?;
-    Ok(RecordedWitnessBindingFrontier {
-        producer,
-        produced,
-        semantic_values,
-        base_interpolation,
-        invocation,
-    })
 }
 
 fn validate_invocation(
     supplied: &RecordedWitnessInvocationShape,
     image: &ArenaProgramInventory,
     arena: &ProofArenaPlan,
-    schedule: &BaseProducerSchedule,
+    producer: WitnessProducer,
 ) -> Result<(), InvocationShapeError> {
-    let (_, planned) = frontier_component(arena, schedule)?;
+    let planned = planned_recorded_component(arena, producer)?;
     let expected = derive_invocation(image, arena, planned)?;
     if supplied == &expected {
         Ok(())
@@ -165,18 +133,11 @@ fn validate_invocation(
     }
 }
 
-fn frontier_component<'a>(
+fn planned_recorded_component<'a>(
     arena: &'a ProofArenaPlan,
-    schedule: &BaseProducerSchedule,
-) -> Result<(WitnessProducer, &'a PlannedWitnessComponent), InvocationShapeError> {
-    let producer = schedule
-        .witness_levels()
-        .iter()
-        .flatten()
-        .copied()
-        .find(|producer| producer.kind == WitnessProducerKind::Recorded)
-        .ok_or(InvocationShapeError::MissingRecordedWitness)?;
-    let planned = arena
+    producer: WitnessProducer,
+) -> Result<&'a PlannedWitnessComponent, InvocationShapeError> {
+    arena
         .witness()
         .components
         .iter()
@@ -184,8 +145,7 @@ fn frontier_component<'a>(
             producer.component == planned.component && producer.part == Some(planned.part)
         })
         .filter(|planned| planned.blake_g_contract == BlakeGWitnessContract::Recorded)
-        .ok_or(InvocationShapeError::MissingRecordedWitness)?;
-    Ok((producer, planned))
+        .ok_or(InvocationShapeError::MissingRecordedWitness)
 }
 
 fn derive_invocation(
@@ -199,8 +159,7 @@ fn derive_invocation(
     {
         return Err(InvocationShapeError::MultiplicityNeedsSemanticVersions);
     }
-    validate_program_roles(&planned.program)?;
-    validate_module_globals(&planned.program)?;
+    let program_use = validate_program_roles(&planned.program)?;
     validate_recorded_witness_abi()?;
 
     let emitted = aot::witness_kernel_source(&planned.program)
@@ -213,6 +172,9 @@ fn derive_invocation(
         .program_identity
         .filter(|identity| identity == &planned.program.semantic_identity())
         .ok_or(InvocationShapeError::InvalidStructuredAbi)?;
+    // The source/program/ABI authority above must exist before a missing
+    // module-global effect is reported as the next honest frontier.
+    validate_module_globals(&planned.program)?;
 
     let tables = arena
         .execution_tables()
@@ -221,6 +183,13 @@ fn derive_invocation(
         || planned.slots.execution_table_strides != tables.slots.table_strides
     {
         return Err(InvocationShapeError::LegacyExecutionTables);
+    }
+    let input_columns = usize::try_from(planned.program.n_inputs)
+        .map_err(|_| InvocationShapeError::SizeOverflow)?;
+    if planned.slots.input_columns.len() != input_columns
+        || planned.requirements.input_column_words.len() != input_columns
+    {
+        return Err(InvocationShapeError::InvalidStructuredAbi);
     }
     let table_use = table_use(&planned.program)?;
     let mut source_arguments = Vec::with_capacity(8);
@@ -237,14 +206,21 @@ fn derive_invocation(
             .input_columns
             .iter()
             .copied()
-            .map(|slot| {
+            .enumerate()
+            .map(|(ordinal, slot)| {
                 target(
                     image,
                     arena,
                     slot,
                     BufferPurpose::WitnessInput,
                     0..planned.requirements.row_count,
-                    InvocationAccess::Read,
+                    if program_use.inputs.contains(
+                        &u32::try_from(ordinal).map_err(|_| InvocationShapeError::SizeOverflow)?,
+                    ) {
+                        InvocationAccess::Read
+                    } else {
+                        InvocationAccess::Inactive
+                    },
                 )
             })
             .collect::<Result<Vec<_>, _>>()?,
@@ -474,6 +450,13 @@ fn pointer_table(
     targets: Vec<InvocationTarget>,
 ) -> Result<SourceArgument, InvocationShapeError> {
     let descriptor = whole_catalog_range(descriptor)?;
+    let required_words = targets
+        .len()
+        .checked_mul(POINTER_WORDS)
+        .ok_or(InvocationShapeError::SizeOverflow)?;
+    if descriptor.value_words != (0..required_words) {
+        return Err(InvocationShapeError::InvalidCatalogRange(descriptor.value));
+    }
     let entries = targets
         .into_iter()
         .enumerate()
@@ -642,7 +625,11 @@ fn produced_values(
     Ok(produced)
 }
 
-fn validate_program_roles(program: &WitnessProgram) -> Result<(), InvocationShapeError> {
+struct ProgramUse {
+    inputs: BTreeSet<u32>,
+}
+
+fn validate_program_roles(program: &WitnessProgram) -> Result<ProgramUse, InvocationShapeError> {
     let mut inputs = BTreeSet::new();
     let mut outputs = BTreeSet::new();
     let mut lookups = BTreeSet::new();
@@ -667,14 +654,14 @@ fn validate_program_roles(program: &WitnessProgram) -> Result<(), InvocationShap
             _ => {}
         }
     }
-    if !dense(&inputs, program.n_inputs)
+    if inputs.iter().any(|&ordinal| ordinal >= program.n_inputs)
         || !dense(&outputs, program.n_cols)
         || !dense(&lookups, program.n_lookup_words)
         || !dense(&subs, program.n_sub_words)
     {
         return Err(InvocationShapeError::InvalidProgramRole);
     }
-    Ok(())
+    Ok(ProgramUse { inputs })
 }
 
 fn dense(values: &BTreeSet<u32>, count: u32) -> bool {
