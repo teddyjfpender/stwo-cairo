@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -73,7 +74,11 @@ def run(stwo: Path, stwo_cairo: Path) -> bool:
         t0 = time.time()
         proc = subprocess.run(
             argv, cwd=cwd, capture_output=True, text=True,
-            env={"RUST_MIN_STACK": "4194304", **__import__("os").environ},
+            env={
+                **os.environ,
+                "RUST_MIN_STACK": "33554432",
+                "CARGO_PROFILE_WITNESS_OPT_1_DEBUG": "0",
+            },
             check=False,
         )
         ok = proc.returncode == 0
