@@ -2,12 +2,13 @@
 //!
 //! `HostSpillStore` is ordinary pageable/hugepage capacity. `DmaRing` is the
 //! separately bounded pinned staging window. This module plans neither CUDA
-//! allocations nor copies; it rejects schedules that a later runtime could not
-//! execute without overwriting live staging data.
+//! allocations nor copies. Optional VMM records describe only sound whole-
+//! storage reclaim windows; a later runtime must attest and execute them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::fleet_plan::{ElementRange, ExecutionInterval, ScheduleRange, ValueId, WorkerId};
+use crate::compiled_proof::ValueRange;
+use crate::fleet_plan::{ExecutionInterval, ScheduleRange, StorageId, WorkerId};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct StoreExtentId(pub u32);
@@ -57,10 +58,8 @@ pub struct DmaRing {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpillChunk {
     pub id: SpillChunkId,
-    pub value: ValueId,
-    pub elements: ElementRange,
+    pub value: ValueRange,
     pub worker: WorkerId,
-    pub bytes: usize,
     pub store_extent: StoreExtentId,
     pub ring_slot: RingSlotId,
 }
@@ -80,7 +79,25 @@ pub struct SpillTransition {
     pub kind: SpillTransitionKind,
     pub interval: ExecutionInterval,
     pub during: ScheduleRange,
-    pub bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmmTransition {
+    pub interval: ExecutionInterval,
+    pub during: ScheduleRange,
+}
+
+/// Whole-allocation physical reclaim while the canonical bytes live in host
+/// spill storage. The allocation starts mapped; stable virtual addressing is
+/// retained across this one generation-1 remap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmmReclaim {
+    pub chunk: SpillChunkId,
+    pub storage: StorageId,
+    pub allocation_granularity_bytes: usize,
+    pub unmap: VmmTransition,
+    pub remap: VmmTransition,
+    pub remap_generation: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +106,7 @@ pub struct SpillPlan {
     pub ring: DmaRing,
     pub chunks: Vec<SpillChunk>,
     pub transitions: Vec<SpillTransition>,
+    pub vmm_reclaims: Vec<VmmReclaim>,
 }
 
 impl SpillPlan {
@@ -111,6 +129,7 @@ impl SpillPlan {
             },
             chunks: Vec::new(),
             transitions: Vec::new(),
+            vmm_reclaims: Vec::new(),
         }
     }
 
@@ -120,6 +139,8 @@ impl SpillPlan {
         self.chunks.sort_unstable_by_key(|chunk| chunk.id);
         self.transitions
             .sort_unstable_by_key(|transition| (transition.chunk, transition.kind, transition.id));
+        self.vmm_reclaims
+            .sort_unstable_by_key(|reclaim| (reclaim.storage, reclaim.chunk));
     }
 
     pub fn validate(&self) -> Result<(), SpillPlanError> {
@@ -132,6 +153,7 @@ impl SpillPlan {
             return if self.transitions.is_empty()
                 && self.store.extents.is_empty()
                 && self.ring.slots.is_empty()
+                && self.vmm_reclaims.is_empty()
                 && self.store.capacity_bytes == 0
                 && self.ring.capacity_bytes == 0
                 && self.ring.memlock_limit_bytes == 0
@@ -163,18 +185,15 @@ impl SpillPlan {
             if chunk.worker != self.store.worker {
                 return Err(SpillPlanError::WrongOwner);
             }
-            if chunk.bytes == 0 || chunk.elements.is_empty() {
+            if chunk.value.elements.is_empty() {
                 return Err(SpillPlanError::InvalidChunk(chunk.id));
             }
-            let extent = extents
+            let _extent = extents
                 .get(&chunk.store_extent)
                 .ok_or(SpillPlanError::MissingStoreExtent(chunk.store_extent))?;
-            let slot = slots
+            let _slot = slots
                 .get(&chunk.ring_slot)
                 .ok_or(SpillPlanError::MissingRingSlot(chunk.ring_slot))?;
-            if extent.len_bytes < chunk.bytes || slot.len_bytes < chunk.bytes {
-                return Err(SpillPlanError::ChunkCapacity(chunk.id));
-            }
             claimed_extents.insert(chunk.store_extent);
             claimed_slots.insert(chunk.ring_slot);
         }
@@ -227,6 +246,7 @@ impl SpillPlan {
         if by_chunk.len() != self.chunks.len() {
             return Err(SpillPlanError::OrphanedResource);
         }
+        validate_vmm_reclaims(&self.vmm_reclaims, &chunks)?;
         for windows in slot_windows.values_mut() {
             windows.sort_unstable_by_key(|window| (window.start, window.end));
             if windows.windows(2).any(|pair| pair[0].overlaps(pair[1])) {
@@ -340,9 +360,6 @@ fn exact_stages<'a>(
     }
     let mut exact = [None, None, None, None];
     for stage in stages {
-        if stage.bytes != chunk.bytes {
-            return Err(SpillPlanError::TransitionBytes(stage.id));
-        }
         let index = match stage.kind {
             SpillTransitionKind::DeviceToRing => 0,
             SpillTransitionKind::RingToStore => 1,
@@ -360,6 +377,32 @@ fn exact_stages<'a>(
         .ok_or(SpillPlanError::IncompleteChain(chunk.id))
 }
 
+fn validate_vmm_reclaims(
+    reclaims: &[VmmReclaim],
+    chunks: &BTreeMap<SpillChunkId, &SpillChunk>,
+) -> Result<(), SpillPlanError> {
+    let mut reclaimed_chunks = BTreeSet::new();
+    let mut reclaimed_storages = BTreeSet::new();
+    for reclaim in reclaims {
+        if !chunks.contains_key(&reclaim.chunk) {
+            return Err(SpillPlanError::MissingChunk(reclaim.chunk));
+        }
+        if !reclaimed_chunks.insert(reclaim.chunk) || !reclaimed_storages.insert(reclaim.storage) {
+            return Err(SpillPlanError::DuplicateVmmReclaim(reclaim.chunk));
+        }
+        if reclaim.allocation_granularity_bytes == 0
+            || !reclaim.allocation_granularity_bytes.is_power_of_two()
+            || reclaim.remap_generation != 1
+            || !reclaim.unmap.during.is_valid()
+            || !reclaim.remap.during.is_valid()
+            || reclaim.unmap.during.end > reclaim.remap.during.start
+        {
+            return Err(SpillPlanError::InvalidVmmReclaim(reclaim.chunk));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SpillPlanError {
     InvalidAlignment(usize),
@@ -374,10 +417,10 @@ pub enum SpillPlanError {
     MissingRingSlot(RingSlotId),
     MissingChunk(SpillChunkId),
     InvalidChunk(SpillChunkId),
-    ChunkCapacity(SpillChunkId),
     IncompleteChain(SpillChunkId),
     OutOfOrderChain(SpillChunkId),
-    TransitionBytes(SpillTransitionId),
+    DuplicateVmmReclaim(SpillChunkId),
+    InvalidVmmReclaim(SpillChunkId),
     RingSlotOverlap,
     StoreExtentOverlap,
     OrphanedResource,

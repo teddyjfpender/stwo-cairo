@@ -1,6 +1,7 @@
 use super::{CompiledProofError, IdentityKind, *};
 
-const PROOF_IDENTITY_TAG: &[u8] = b"stwo-cairo.compiled-proof.identity.v1";
+const PROOF_IDENTITY_TAG: &[u8] = b"stwo-cairo.compiled-proof.identity.v2";
+const STRUCTURE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.structure.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CanonicalIdentity {
@@ -13,9 +14,10 @@ impl CanonicalIdentity {
         if bytes.is_empty() {
             return Err(CompiledProofError::EmptyIdentity(kind));
         }
+        let len = u64::try_from(bytes.len()).map_err(|_| CompiledProofError::SizeOverflow)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(tag);
-        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&len.to_le_bytes());
         hasher.update(&bytes);
         Ok(Self {
             encoding: bytes.into_boxed_slice(),
@@ -35,8 +37,6 @@ impl CanonicalIdentity {
     }
 }
 
-/// Separate semantic and execution-build identities. The program-image digest
-/// is domain-separated and explicitly includes the semantic digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProofIdentity {
     semantics: CanonicalIdentity,
@@ -51,12 +51,12 @@ impl ProofIdentity {
     ) -> Result<Self, CompiledProofError> {
         let semantics = CanonicalIdentity::new(
             IdentityKind::ProofSemantics,
-            b"stwo-cairo.proof-semantics.v1",
+            b"stwo-cairo.proof-semantics.v2",
             semantic_encoding,
         )?;
         let execution_build = CanonicalIdentity::new(
             IdentityKind::ExecutionBuild,
-            b"stwo-cairo.execution-build.v1",
+            b"stwo-cairo.execution-build.v2",
             execution_build_encoding,
         )?;
         let mut hasher = blake3::Hasher::new();
@@ -91,12 +91,9 @@ impl ProofIdentity {
 pub struct ProofCodecIdentity(CanonicalIdentity);
 
 impl ProofCodecIdentity {
-    /// The only Track-A codec admitted by this module. Protocol-shape and
-    /// decommitment-size agreement are supplied by the real ShapeExecutable
-    /// emitter; this identity fixes the section ABI and word encoding.
     pub fn track_a_resident_bundle() -> Self {
         Self(CanonicalIdentity::from_static(
-            b"stwo-cairo.proof-codec.v1",
+            b"stwo-cairo.proof-codec.v2",
             b"stwo-cairo.resident-proof-bundle.u32-le.v1",
         ))
     }
@@ -110,9 +107,6 @@ impl ProofCodecIdentity {
     }
 }
 
-/// Full structural identity of one validated compiled proof. It has no public
-/// constructor: only `CompiledProof::compile` can derive it from the complete
-/// canonical DAG, transcript and proof-output authority.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CompiledProofIdentity {
     canonical_encoding: Box<[u8]>,
@@ -138,83 +132,52 @@ pub(super) fn compiled_identity(
     input: &CompiledProofInput,
     transcript: &CairoBlake2sTranscriptPlan,
 ) -> Result<CompiledProofIdentity, CompiledProofError> {
-    let mut out = Encoder::new(b"stwo-cairo.compiled-proof.structure.v1");
+    let mut out = Encoder::new(STRUCTURE_DOMAIN);
     out.bytes(input.identity.semantic_encoding())?;
     out.bytes(input.identity.execution_build_encoding())?;
     out.raw(input.identity.proof_semantic_digest());
     out.raw(input.identity.program_image_digest());
 
-    out.count(input.authority.operations.len())?;
-    for id in &input.authority.operations {
-        out.u32(id.0);
+    out.count(input.kernels.len())?;
+    for kernel in &input.kernels {
+        out.bytes(kernel.canonical_encoding())?;
+        out.raw(kernel.digest());
     }
-    out.count(input.authority.kernels.len())?;
-    for id in &input.authority.kernels {
-        out.u32(id.0);
-    }
-    out.count(input.authority.effects.len())?;
-    for id in &input.authority.effects {
-        out.raw(&id.0);
+    out.count(input.effects.len())?;
+    for effect in &input.effects {
+        out.bytes(effect.canonical_encoding())?;
+        out.raw(effect.id().as_bytes());
     }
 
     out.count(input.operations.len())?;
     for operation in &input.operations {
         out.u32(operation.id.0);
         out.u32(operation.semantic_id.0);
-        out.u32(operation.kernel_id.0);
-        out.raw(&operation.effects.0);
+        out.raw(operation.effect.as_bytes());
         out.stage(operation.stage);
-        out.ids(&operation.inputs)?;
-        out.ids(&operation.outputs)?;
+        out.primitive(operation.primitive)?;
     }
 
     out.count(input.values.len())?;
     for value in &input.values {
-        out.u32(value.id.0);
-        out.u32(value.layout.element.tag);
-        out.usize(value.layout.element.bytes)?;
-        out.count(value.layout.axes.len())?;
-        for axis in &value.layout.axes {
-            out.u32(u32::from(axis.tag));
-            out.usize(axis.extent)?;
-            out.usize(axis.stride_bytes)?;
-        }
-        out.usize(value.alignment)?;
-        match value.origin {
-            ValueOrigin::ExternalInput(id) => {
-                out.byte(0);
-                out.u32(id.0);
-            }
-            ValueOrigin::Constant(id) => {
-                out.byte(1);
-                out.u32(id.0);
-            }
-            ValueOrigin::OpOutput(id) => {
-                out.byte(2);
-                out.u32(id.0);
-            }
-            ValueOrigin::TranscriptOutput(id) => {
-                out.byte(3);
-                out.u32(id.0);
-            }
-        }
-        out.count(value.consumers.len())?;
-        for consumer in &value.consumers {
-            out.u32(consumer.0);
-        }
+        out.u32(value.version.0);
+        out.layout(&value.layout)?;
+        out.size(value.alignment)?;
+        out.origin(value.origin);
+        out.region(value.region);
     }
 
     out.count(input.transcript_inputs.len())?;
     for binding in &input.transcript_inputs {
         out.u32(binding.id.0);
         out.u32(binding.value.0);
-        out.range(&binding.value_words)?;
+        out.elements(binding.elements)?;
     }
     out.count(input.transcript_outputs.len())?;
     for binding in &input.transcript_outputs {
         out.u32(binding.id.0);
         out.u32(binding.value.0);
-        out.range(&binding.value_words)?;
+        out.elements(binding.elements)?;
     }
 
     out.bytes(input.output.codec.canonical_encoding())?;
@@ -222,17 +185,16 @@ pub(super) fn compiled_identity(
     for range in output_ranges(&input.output.layout) {
         out.range(&range)?;
     }
-    out.usize(input.output.layout.total_words)?;
+    out.size(input.output.layout.total_words)?;
     out.count(input.output.sections.len())?;
     for section in &input.output.sections {
         out.byte(section_tag(section.section));
         out.u32(section.value.0);
-        out.range(&section.value_words)?;
+        out.elements(section.elements)?;
     }
 
     let transcript_encoding = transcript.canonical_encoding()?;
-    out.count(transcript_encoding.len())?;
-    out.raw(&transcript_encoding);
+    out.bytes(&transcript_encoding)?;
     let canonical_encoding = out.finish();
     Ok(CompiledProofIdentity {
         digest: *blake3::hash(&canonical_encoding).as_bytes(),
@@ -244,30 +206,37 @@ pub(super) fn compiled_identity(
 struct Encoder(Vec<u8>);
 
 impl Encoder {
-    fn new(tag: &[u8]) -> Self {
-        Self(tag.to_vec())
+    fn new(domain: &[u8]) -> Self {
+        Self(domain.to_vec())
     }
 
-    fn byte(&mut self, value: u8) {
-        self.0.push(value);
+    fn finish(self) -> Vec<u8> {
+        self.0
     }
 
     fn raw(&mut self, bytes: &[u8]) {
         self.0.extend_from_slice(bytes);
     }
 
+    fn byte(&mut self, value: u8) {
+        self.0.push(value);
+    }
+
     fn u32(&mut self, value: u32) {
         self.raw(&value.to_le_bytes());
     }
 
-    fn usize(&mut self, value: usize) -> Result<(), CompiledProofError> {
-        let value = u64::try_from(value).map_err(|_| CompiledProofError::SizeOverflow)?;
-        self.raw(&value.to_le_bytes());
+    fn size(&mut self, value: usize) -> Result<(), CompiledProofError> {
+        self.raw(
+            &u64::try_from(value)
+                .map_err(|_| CompiledProofError::SizeOverflow)?
+                .to_le_bytes(),
+        );
         Ok(())
     }
 
     fn count(&mut self, value: usize) -> Result<(), CompiledProofError> {
-        self.usize(value)
+        self.size(value)
     }
 
     fn bytes(&mut self, bytes: &[u8]) -> Result<(), CompiledProofError> {
@@ -276,17 +245,96 @@ impl Encoder {
         Ok(())
     }
 
-    fn range(&mut self, range: &core::ops::Range<usize>) -> Result<(), CompiledProofError> {
-        self.usize(range.start)?;
-        self.usize(range.end)
+    fn range(&mut self, range: &std::ops::Range<usize>) -> Result<(), CompiledProofError> {
+        self.size(range.start)?;
+        self.size(range.end)
     }
 
-    fn ids(&mut self, ids: &[ValueId]) -> Result<(), CompiledProofError> {
-        self.count(ids.len())?;
-        for id in ids {
-            self.u32(id.0);
+    fn elements(&mut self, range: ElementRange) -> Result<(), CompiledProofError> {
+        self.size(range.start)?;
+        self.size(range.end)
+    }
+
+    fn layout(&mut self, layout: &ValueLayout) -> Result<(), CompiledProofError> {
+        self.u32(layout.element.tag);
+        self.size(layout.element.bytes)?;
+        self.count(layout.axes.len())?;
+        for axis in &layout.axes {
+            self.u32(u32::from(axis.tag));
+            self.size(axis.extent)?;
+            self.size(axis.stride_bytes)?;
         }
         Ok(())
+    }
+
+    fn origin(&mut self, origin: ValueOrigin) {
+        match origin {
+            ValueOrigin::ExternalInput(id) => {
+                self.byte(0);
+                self.u32(id.0);
+            }
+            ValueOrigin::Constant(id) => {
+                self.byte(1);
+                self.u32(id.0);
+            }
+            ValueOrigin::OpOutput(id) => {
+                self.byte(2);
+                self.u32(id.0);
+            }
+            ValueOrigin::TranscriptOutput(id) => {
+                self.byte(3);
+                self.u32(id.0);
+            }
+        }
+    }
+
+    fn region(&mut self, region: Region) {
+        self.byte(match region {
+            Region::FixedData => 0,
+            Region::Input => 1,
+            Region::Dynamic => 2,
+            Region::Output => 3,
+        });
+    }
+
+    fn primitive(&mut self, primitive: ExecutionPrimitive) -> Result<(), CompiledProofError> {
+        match primitive {
+            ExecutionPrimitive::AotKernel { kernel, launch } => {
+                self.byte(0);
+                self.u32(kernel.0);
+                self.launch(launch);
+            }
+            ExecutionPrimitive::DeviceCopyD2D { bytes } => {
+                self.byte(1);
+                self.size(bytes)?;
+            }
+            ExecutionPrimitive::DeviceMemsetByte { bytes, value } => {
+                self.byte(2);
+                self.size(bytes)?;
+                self.byte(value);
+            }
+        }
+        Ok(())
+    }
+
+    fn launch(&mut self, launch: LaunchGeometry) {
+        for value in launch.grid {
+            self.u32(value);
+        }
+        for value in launch.block {
+            self.u32(value);
+        }
+        match launch.cluster {
+            Some(cluster) => {
+                self.byte(1);
+                for value in cluster {
+                    self.u32(value);
+                }
+            }
+            None => self.byte(0),
+        }
+        self.u32(launch.dynamic_shared_bytes);
+        self.byte(u8::from(launch.cooperative));
     }
 
     fn stage(&mut self, stage: ProofStage) {
@@ -313,10 +361,6 @@ impl Encoder {
         self.byte(tag);
         self.u32(index);
     }
-
-    fn finish(self) -> Vec<u8> {
-        self.0
-    }
 }
 
 fn section_tag(section: ProofBundleSection) -> u8 {
@@ -332,7 +376,9 @@ fn section_tag(section: ProofBundleSection) -> u8 {
     }
 }
 
-fn output_ranges(layout: &ResidentProofBundleLayout) -> [core::ops::Range<usize>; 8] {
+fn output_ranges(
+    layout: &crate::proof_bundle::ResidentProofBundleLayout,
+) -> [std::ops::Range<usize>; 8] {
     [
         layout.commitments.clone(),
         layout.interaction_claim.clone(),

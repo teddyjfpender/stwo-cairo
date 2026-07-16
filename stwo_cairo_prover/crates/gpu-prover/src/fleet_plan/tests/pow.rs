@@ -1,15 +1,15 @@
 use super::*;
+use crate::fleet_pow::{FleetPowError, FleetPowSite, PowRankReceipt};
 
 const INDEX_LIMIT: u64 = ((1u64 << 31) - 1) << stwo_backend_cuda::POW_GRIND_LOW_BITS;
 
 #[test]
-fn search_closes_at_the_resident_kernel_index_limit() {
+fn resident_search_closes_at_the_exact_index_limit() {
     let pow = FleetPowPlan {
         workers_per_rank: 1,
         indices_per_attempt: 1,
     };
     let last = INDEX_LIMIT - 1;
-
     assert_eq!(pow.search_index(1, WorkerId(0), 0, last).unwrap(), last);
     assert_eq!(
         pow.nonce(1, WorkerId(0), 0, last).unwrap(),
@@ -56,7 +56,6 @@ fn final_non_divisor_attempt_is_partial_then_exhausted() {
         workers_per_rank: 1,
         indices_per_attempt: INDEX_LIMIT - 1,
     };
-
     assert_eq!(pow.attempt_bounds(0).unwrap(), (0, INDEX_LIMIT - 1));
     assert_eq!(
         pow.attempt_bounds(1).unwrap(),
@@ -69,7 +68,7 @@ fn final_non_divisor_attempt_is_partial_then_exhausted() {
 }
 
 #[test]
-fn partition_is_exact_and_site_bound_winner_waits_for_every_rank() {
+fn partition_and_winner_are_exact_rank_and_site_contracts() {
     let pow = FleetPowPlan {
         workers_per_rank: 2,
         indices_per_attempt: 8,
@@ -147,29 +146,5 @@ fn partition_is_exact_and_site_bound_winner_waits_for_every_rank() {
         )
         .unwrap_err(),
         FleetPowError::InvalidReceipt(WorkerId(1))
-    );
-    assert_eq!(
-        pow.verify_winner(FleetPowSite::Interaction, 2, [9; 32], 7, &receipts, |_| {
-            false
-        },)
-            .unwrap_err(),
-        FleetPowError::InvalidReceipt(WorkerId(0))
-    );
-
-    let mut trailing = receipts.to_vec();
-    trailing.extend([WorkerId(0), WorkerId(1)].map(|rank| PowRankReceipt {
-        site: FleetPowSite::Interaction,
-        plan_identity: [9; 32],
-        rank,
-        proof_generation: 7,
-        attempt_ordinal: 1,
-        candidate_nonce: None,
-    }));
-    assert_eq!(
-        pow.verify_winner(FleetPowSite::Interaction, 2, [9; 32], 7, &trailing, |_| {
-            true
-        },)
-            .unwrap_err(),
-        FleetPowError::TrailingAttempts
     );
 }

@@ -7,9 +7,12 @@ use stwo::core::pcs::PcsConfig;
 use stwo_cairo_gpu_prover::compiled_proof::*;
 use stwo_cairo_gpu_prover::proof_bundle::ResidentProofBundleLayout;
 use stwo_cairo_gpu_prover::transcript_plan::{
-    plan_cairo_blake2s_transcript, CairoBlake2sTranscriptPlan, CairoTranscriptInput,
-    CairoTranscriptOutput, CairoTranscriptSegment, DynamicTranscriptShape,
+    plan_cairo_blake2s_transcript, CairoBlake2sTranscriptPlan, CairoTranscriptSegment,
+    DynamicTranscriptShape,
 };
+
+#[path = "compiled_proof_host/primitive.rs"]
+mod primitive;
 
 fn transcript() -> &'static CairoBlake2sTranscriptPlan {
     static PLAN: OnceLock<CairoBlake2sTranscriptPlan> = OnceLock::new();
@@ -37,9 +40,18 @@ fn transcript() -> &'static CairoBlake2sTranscriptPlan {
     })
 }
 
-fn u32_value(id: ValueId, words: usize, origin: ValueOrigin, consumers: Vec<OpId>) -> ValueDesc {
+fn range(start: usize, end: usize) -> ElementRange {
+    ElementRange::new(start, end).unwrap()
+}
+
+fn u32_value(
+    version: ValueVersion,
+    words: usize,
+    origin: ValueOrigin,
+    region: Region,
+) -> ValueDesc {
     ValueDesc {
-        id,
+        version,
         layout: ValueLayout {
             element: ElementType { tag: 1, bytes: 4 },
             axes: vec![LayoutAxis {
@@ -50,8 +62,41 @@ fn u32_value(id: ValueId, words: usize, origin: ValueOrigin, consumers: Vec<OpId
         },
         alignment: 4,
         origin,
-        consumers,
+        region,
     }
+}
+
+fn bound(binding: u32, value: ValueRange) -> BoundValueRange {
+    BoundValueRange {
+        binding: EffectBindingId(binding),
+        value,
+    }
+}
+
+fn value_range(version: ValueVersion, words: usize) -> ValueRange {
+    ValueRange {
+        version,
+        elements: range(0, words),
+    }
+}
+
+fn module() -> ModuleIdentity {
+    ModuleIdentity::new(b"sm_86:resident-proof-test-cubin-v1".to_vec()).unwrap()
+}
+
+fn kernel(
+    module: ModuleIdentity,
+    accepted_effects: Vec<EffectContractId>,
+    build: &[u8],
+) -> AotKernelAuthority {
+    AotKernelAuthority::new(
+        AotKernelId(1),
+        module,
+        b"terminal-proof-assembly-semantics-v1".to_vec(),
+        build.to_vec(),
+        accepted_effects,
+    )
+    .unwrap()
 }
 
 fn layout_ranges(layout: &ResidentProofBundleLayout) -> [std::ops::Range<usize>; 8] {
@@ -67,87 +112,109 @@ fn layout_ranges(layout: &ResidentProofBundleLayout) -> [std::ops::Range<usize>;
     ]
 }
 
+fn install_effect(input: &mut CompiledProofInput, contract: EffectContract) {
+    let effect_id = contract.id();
+    input.effects = vec![contract];
+    input.operations[0].effect = effect_id;
+    input.kernels = vec![kernel(module(), vec![effect_id], b"assembly-build-v1")];
+}
+
 fn valid_input() -> CompiledProofInput {
     let transcript = transcript();
     let mut values = Vec::new();
     let mut transcript_inputs = Vec::new();
     for requirement in transcript.inputs() {
         let id = requirement.semantic.id().unwrap();
-        let value = ValueId(values.len() as u32);
+        let version = ValueVersion(values.len() as u32);
         values.push(u32_value(
-            value,
+            version,
             requirement.min_words,
             ValueOrigin::ExternalInput(ExternalInputId(id.0)),
-            vec![],
+            Region::Input,
         ));
         transcript_inputs.push(TranscriptInputBinding {
             id,
-            value,
-            value_words: 0..requirement.min_words,
+            value: version,
+            elements: range(0, requirement.min_words),
         });
     }
 
     let mut transcript_outputs = Vec::new();
     let mut challenge_values = Vec::new();
     for requirement in transcript.outputs() {
-        let value = ValueId(values.len() as u32);
+        let version = ValueVersion(values.len() as u32);
         let id = requirement.semantic.id().unwrap();
         values.push(u32_value(
-            value,
+            version,
             requirement.min_words,
             ValueOrigin::TranscriptOutput(id),
-            vec![],
+            Region::Dynamic,
         ));
         transcript_outputs.push(TranscriptOutputBinding {
             id,
-            value,
-            value_words: 0..requirement.min_words,
+            value: version,
+            elements: range(0, requirement.min_words),
         });
-        challenge_values.push(value);
+        challenge_values.push((version, requirement.min_words));
     }
 
     let layout = ResidentProofBundleLayout::new(4, 4, 1, 4, 1).unwrap();
-    let assembly_op = OpId(0);
-    for &value in &challenge_values {
-        values[value.0 as usize].consumers.push(assembly_op);
-    }
-    let bundle = ValueId(values.len() as u32);
+    let assembly = OpId(0);
+    let bundle = ValueVersion(values.len() as u32);
     values.push(u32_value(
         bundle,
         layout.total_words,
-        ValueOrigin::OpOutput(assembly_op),
-        vec![],
+        ValueOrigin::OpOutput(assembly),
+        Region::Output,
     ));
-    let operations = vec![OpNode {
-        id: assembly_op,
-        semantic_id: SemanticOpId(1),
-        kernel_id: AotKernelId(2),
-        effects: EffectContractId([2; 32]),
-        inputs: challenge_values,
-        outputs: vec![bundle],
-        stage: ProofStage::AfterTranscript,
-    }];
+
+    let mut accesses = challenge_values
+        .iter()
+        .enumerate()
+        .map(|(binding, &(version, words))| EffectAccess::Read {
+            source: bound(binding as u32, value_range(version, words)),
+        })
+        .collect::<Vec<_>>();
+    accesses.push(EffectAccess::Write {
+        destination: bound(
+            accesses.len() as u32,
+            value_range(bundle, layout.total_words),
+        ),
+    });
+    let contract = EffectContract::new(accesses, vec![]).unwrap();
+    let effect_id = contract.id();
 
     let sections = ProofBundleSection::CANONICAL
         .into_iter()
         .zip(layout_ranges(&layout))
-        .map(|(section, value_words)| ProofOutputSection {
+        .map(|(section, words)| ProofOutputSection {
             section,
             value: bundle,
-            value_words,
+            elements: range(words.start, words.end),
         })
         .collect();
+
     CompiledProofInput {
-        identity: ProofIdentity::new(b"semantic-v1".to_vec(), b"aot-build-v1".to_vec()).unwrap(),
-        authority: SemanticAuthority {
-            operations: operations
-                .iter()
-                .map(|operation| operation.semantic_id)
-                .collect(),
-            kernels: vec![AotKernelId(2)],
-            effects: vec![EffectContractId([2; 32])],
-        },
-        operations,
+        identity: ProofIdentity::new(b"semantic-v2".to_vec(), b"program-image-v2".to_vec())
+            .unwrap(),
+        kernels: vec![kernel(module(), vec![effect_id], b"assembly-build-v1")],
+        effects: vec![contract],
+        operations: vec![OpNode {
+            id: assembly,
+            semantic_id: SemanticOpId(1),
+            primitive: ExecutionPrimitive::AotKernel {
+                kernel: AotKernelId(1),
+                launch: LaunchGeometry {
+                    grid: [1, 1, 1],
+                    block: [128, 1, 1],
+                    cluster: None,
+                    dynamic_shared_bytes: 0,
+                    cooperative: false,
+                },
+            },
+            effect: effect_id,
+            stage: ProofStage::AfterTranscript,
+        }],
         values,
         transcript_inputs,
         transcript_outputs,
@@ -160,85 +227,362 @@ fn valid_input() -> CompiledProofInput {
 }
 
 #[test]
-fn complete_authority_compiles_and_identities_are_domain_separated() {
+fn complete_authority_compiles_and_retains_exact_bytes() {
     let input = valid_input();
-    assert_ne!(
-        input.identity.proof_semantic_digest(),
-        input.identity.program_image_digest()
-    );
-    assert_ne!(
-        input.identity.program_image_digest(),
-        input.output.codec.digest()
-    );
     let compiled = CompiledProof::compile(input.clone(), transcript()).unwrap();
     let repeated = CompiledProof::compile(input.clone(), transcript()).unwrap();
     assert_eq!(compiled.input(), &input);
     assert_eq!(compiled.identity(), repeated.identity());
-    assert!(!compiled.identity().canonical_encoding().is_empty());
+    assert_eq!(
+        compiled.effect_for(OpId(0)).unwrap().id(),
+        input.effects[0].id()
+    );
+    assert_eq!(compiled.kernel(AotKernelId(1)).unwrap(), &input.kernels[0]);
+    assert_eq!(
+        compiled
+            .value(ValueVersion((input.values.len() - 1) as u32))
+            .unwrap()
+            .region,
+        Region::Output
+    );
     assert_eq!(
         compiled.transcript_encoding(),
         transcript().canonical_encoding().unwrap()
     );
-    assert_eq!(compiled.output().layout.total_words, 57);
+    assert!(!compiled.identity().canonical_encoding().is_empty());
 
-    let mut different_kernel = valid_input();
-    different_kernel.operations.last_mut().unwrap().kernel_id = AotKernelId(3);
-    different_kernel.authority.kernels = vec![AotKernelId(3)];
-    let different = CompiledProof::compile(different_kernel, transcript()).unwrap();
+    let mut different_build = valid_input();
+    let effect_id = different_build.effects[0].id();
+    different_build.kernels = vec![kernel(module(), vec![effect_id], b"assembly-build-v2")];
+    let different = CompiledProof::compile(different_build, transcript()).unwrap();
     assert_ne!(compiled.identity(), different.identity());
 }
 
 #[test]
-fn rejects_authority_and_graph_omissions_or_duplicates() {
-    let mut missing_authority = valid_input();
-    missing_authority.authority.effects.pop();
+fn effect_and_kernel_authorities_are_body_derived_and_canonical() {
     assert!(matches!(
-        CompiledProof::compile(missing_authority, transcript()),
-        Err(CompiledProofError::NonCanonicalAuthority(
-            AuthorityKind::EffectContract
-        ))
+        ModuleIdentity::new(vec![]),
+        Err(CompiledProofError::EmptyModuleIdentity)
     ));
+    let source = ValueRange {
+        version: ValueVersion(0),
+        elements: range(0, 4),
+    };
+    let canonical = EffectContract::new(
+        vec![EffectAccess::Read {
+            source: bound(0, source),
+        }],
+        vec![],
+    )
+    .unwrap();
+    let repeated = EffectContract::new(
+        vec![EffectAccess::Read {
+            source: bound(0, source),
+        }],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(canonical.id(), repeated.id());
+    assert_eq!(
+        canonical.canonical_encoding(),
+        repeated.canonical_encoding()
+    );
 
-    let mut duplicate_edge = valid_input();
-    let assembly = duplicate_edge.operations.last_mut().unwrap();
-    assembly.inputs.push(assembly.inputs[0]);
     assert!(matches!(
-        CompiledProof::compile(duplicate_edge, transcript()),
-        Err(CompiledProofError::DuplicateOperationEdge { .. })
+        EffectContract::new(
+            vec![EffectAccess::Read {
+                source: bound(1, source),
+            }],
+            vec![],
+        ),
+        Err(CompiledProofError::NonCanonicalEffectBindings)
     ));
-
-    let mut missing_consumer = valid_input();
-    let challenge = missing_consumer.transcript_outputs[0].value;
-    missing_consumer.values[challenge.0 as usize]
-        .consumers
-        .clear();
     assert!(matches!(
-        CompiledProof::compile(missing_consumer, transcript()),
-        Err(CompiledProofError::ConsumerMismatch { .. })
+        EffectContract::new(
+            vec![
+                EffectAccess::Read {
+                    source: bound(0, source),
+                },
+                EffectAccess::Write {
+                    destination: bound(
+                        0,
+                        ValueRange {
+                            version: ValueVersion(1),
+                            elements: source.elements,
+                        },
+                    ),
+                },
+            ],
+            vec![],
+        ),
+        Err(CompiledProofError::NonCanonicalEffectBindings)
     ));
-
-    let mut wrong_producer = valid_input();
-    let produced = wrong_producer.operations[0].outputs[0];
-    wrong_producer.values[produced.0 as usize].origin =
-        ValueOrigin::ExternalInput(ExternalInputId(99));
     assert!(matches!(
-        CompiledProof::compile(wrong_producer, transcript()),
-        Err(CompiledProofError::ProducerMismatch { .. })
-    ));
-
-    let mut zero_effect = valid_input();
-    zero_effect.operations[0].effects = EffectContractId([0; 32]);
-    zero_effect.authority.effects = vec![EffectContractId([0; 32])];
-    assert!(matches!(
-        CompiledProof::compile(zero_effect, transcript()),
-        Err(CompiledProofError::NonCanonicalAuthority(
-            AuthorityKind::EffectContract
-        ))
+        AotKernelAuthority::new(
+            AotKernelId(1),
+            module(),
+            b"semantics".to_vec(),
+            b"build".to_vec(),
+            vec![],
+        ),
+        Err(CompiledProofError::EmptyKernelEffectAuthority(AotKernelId(
+            1
+        )))
     ));
 }
 
 #[test]
-fn rejects_transcript_omissions_order_ranges_and_early_consumers() {
+fn module_global_effects_bind_module_symbol_range_and_access() {
+    let mut input = valid_input();
+    let mut accesses = input.effects[0].accesses().to_vec();
+    let global = ModuleGlobalEffect {
+        module: module(),
+        symbol: b"ROUND_CONSTANTS".to_vec().into_boxed_slice(),
+        bytes: ByteRange::new(0, 256).unwrap(),
+    };
+    let with_global = EffectContract::new(accesses.clone(), vec![global]).unwrap();
+    install_effect(&mut input, with_global);
+    let compiled = CompiledProof::compile(input, transcript()).unwrap();
+    assert_eq!(compiled.effects()[0].module_globals().len(), 1);
+
+    let mut mismatched = valid_input();
+    let global = ModuleGlobalEffect {
+        module: ModuleIdentity::new(b"different-module".to_vec()).unwrap(),
+        symbol: b"ROUND_CONSTANTS".to_vec().into_boxed_slice(),
+        bytes: ByteRange::new(0, 256).unwrap(),
+    };
+    let contract =
+        EffectContract::new(mismatched.effects[0].accesses().to_vec(), vec![global]).unwrap();
+    install_effect(&mut mismatched, contract);
+    assert!(matches!(
+        CompiledProof::compile(mismatched, transcript()),
+        Err(CompiledProofError::ModuleGlobalAuthorityMismatch { .. })
+    ));
+
+    let source = accesses[0].source().unwrap().value;
+    *accesses[0].source_mut().unwrap() = bound(9, source);
+    assert!(matches!(
+        EffectContract::new(accesses, vec![]),
+        Err(CompiledProofError::NonCanonicalEffectBindings)
+    ));
+
+    let invalid_global = ModuleGlobalEffect {
+        module: module(),
+        symbol: Box::new([]),
+        bytes: ByteRange::new(0, 1).unwrap(),
+    };
+    assert!(matches!(
+        EffectContract::new(
+            vec![EffectAccess::Read {
+                source: bound(
+                    0,
+                    ValueRange {
+                        version: ValueVersion(0),
+                        elements: range(0, 1),
+                    },
+                ),
+            }],
+            vec![invalid_global],
+        ),
+        Err(CompiledProofError::InvalidModuleGlobalEffect)
+    ));
+
+    let nul_global = ModuleGlobalEffect {
+        module: module(),
+        symbol: b"ROUND\0CONSTANTS".to_vec().into_boxed_slice(),
+        bytes: ByteRange::new(0, 1).unwrap(),
+    };
+    assert!(matches!(
+        EffectContract::new(
+            vec![EffectAccess::Read {
+                source: bound(
+                    0,
+                    ValueRange {
+                        version: ValueVersion(0),
+                        elements: range(0, 1),
+                    },
+                ),
+            }],
+            vec![nul_global],
+        ),
+        Err(CompiledProofError::InvalidModuleGlobalEffect)
+    ));
+}
+
+#[test]
+fn paired_read_write_and_atomic_accesses_require_distinct_versions() {
+    for atomic in [false, true] {
+        let mut input = valid_input();
+        let bundle = input.output.sections[0].value;
+        let words = input.output.layout.total_words;
+        let source = ValueVersion(input.values.len() as u32);
+        input.values.push(u32_value(
+            source,
+            words,
+            ValueOrigin::ExternalInput(ExternalInputId(10_000)),
+            Region::Input,
+        ));
+        let mut accesses =
+            input.effects[0].accesses()[..input.effects[0].accesses().len() - 1].to_vec();
+        let binding = accesses.len() as u32;
+        let access = if atomic {
+            EffectAccess::Atomic {
+                source: bound(binding, value_range(source, words)),
+                destination: bound(binding, value_range(bundle, words)),
+                operation: AtomicOperation::AddU32,
+                in_place: InPlaceAliasAuthority {
+                    id: InPlaceAliasId(0),
+                    requirement: InPlaceAliasRequirement::Required,
+                    discipline: InPlaceDiscipline::ElementWiseReadBeforeWrite,
+                },
+            }
+        } else {
+            EffectAccess::ReadWrite {
+                source: bound(binding, value_range(source, words)),
+                destination: bound(binding + 1, value_range(bundle, words)),
+                in_place: Some(InPlaceAliasAuthority {
+                    id: InPlaceAliasId(0),
+                    requirement: InPlaceAliasRequirement::Permitted,
+                    discipline: InPlaceDiscipline::ElementWiseReadBeforeWrite,
+                }),
+            }
+        };
+        accesses.push(access);
+        let contract = EffectContract::new(accesses, vec![]).unwrap();
+        install_effect(&mut input, contract);
+        let compiled = CompiledProof::compile(input, transcript()).unwrap();
+        assert!(compiled.effects()[0]
+            .in_place_alias(InPlaceAliasId(0))
+            .is_some());
+    }
+
+    let same = value_range(ValueVersion(0), 1);
+    assert!(matches!(
+        EffectContract::new(
+            vec![EffectAccess::ReadWrite {
+                source: bound(0, same),
+                destination: bound(1, same),
+                in_place: None,
+            }],
+            vec![],
+        ),
+        Err(CompiledProofError::InvalidValueTransition)
+    ));
+
+    let mut wide = valid_input();
+    let bundle = wide.output.sections[0].value;
+    let words = wide.output.layout.total_words;
+    let source = ValueVersion(wide.values.len() as u32);
+    wide.values.push(u32_value(
+        source,
+        words,
+        ValueOrigin::ExternalInput(ExternalInputId(10_001)),
+        Region::Input,
+    ));
+    for version in [source, bundle] {
+        wide.values[version.0 as usize].layout.element = ElementType { tag: 2, bytes: 8 };
+        wide.values[version.0 as usize].layout.axes[0].stride_bytes = 8;
+    }
+    let mut accesses = wide.effects[0].accesses()[..wide.effects[0].accesses().len() - 1].to_vec();
+    let binding = accesses.len() as u32;
+    accesses.push(EffectAccess::Atomic {
+        source: bound(binding, value_range(source, words)),
+        destination: bound(binding, value_range(bundle, words)),
+        operation: AtomicOperation::AddU32,
+        in_place: InPlaceAliasAuthority {
+            id: InPlaceAliasId(0),
+            requirement: InPlaceAliasRequirement::Required,
+            discipline: InPlaceDiscipline::ElementWiseReadBeforeWrite,
+        },
+    });
+    let contract = EffectContract::new(accesses, vec![]).unwrap();
+    install_effect(&mut wide, contract);
+    assert!(matches!(
+        CompiledProof::compile(wide, transcript()),
+        Err(CompiledProofError::InvalidValueTransition)
+    ));
+}
+
+#[test]
+fn rejects_unknown_reads_incomplete_writes_and_unaccepted_effects() {
+    let mut unknown = valid_input();
+    let mut accesses = unknown.effects[0].accesses().to_vec();
+    accesses[0] = EffectAccess::Read {
+        source: bound(0, value_range(ValueVersion(u32::MAX), 1)),
+    };
+    let contract = EffectContract::new(accesses, vec![]).unwrap();
+    install_effect(&mut unknown, contract);
+    assert!(matches!(
+        CompiledProof::compile(unknown, transcript()),
+        Err(CompiledProofError::UnknownValue { .. })
+    ));
+
+    let mut incomplete = valid_input();
+    let bundle = incomplete.output.sections[0].value;
+    let words = incomplete.output.layout.total_words;
+    let mut accesses = incomplete.effects[0].accesses().to_vec();
+    *accesses.last_mut().unwrap() = EffectAccess::Write {
+        destination: bound(
+            accesses.len() as u32 - 1,
+            ValueRange {
+                version: bundle,
+                elements: range(0, words - 1),
+            },
+        ),
+    };
+    let contract = EffectContract::new(accesses, vec![]).unwrap();
+    install_effect(&mut incomplete, contract);
+    assert!(matches!(
+        CompiledProof::compile(incomplete, transcript()),
+        Err(CompiledProofError::IncompleteWrite { value }) if value == bundle
+    ));
+
+    let mut unaccepted = valid_input();
+    let other = EffectContract::new(
+        unaccepted.effects[0].accesses().to_vec(),
+        vec![ModuleGlobalEffect {
+            module: module(),
+            symbol: b"X".to_vec().into_boxed_slice(),
+            bytes: ByteRange::new(0, 4).unwrap(),
+        }],
+    )
+    .unwrap();
+    unaccepted.operations[0].effect = other.id();
+    unaccepted.effects.push(other);
+    unaccepted.effects.sort_by_key(EffectContract::id);
+    assert!(matches!(
+        CompiledProof::compile(unaccepted, transcript()),
+        Err(CompiledProofError::KernelEffectNotAccepted { .. })
+    ));
+}
+
+#[test]
+fn duplicate_external_origin_identity_is_rejected() {
+    let mut input = valid_input();
+    let mut duplicate = input.values[0].clone();
+    duplicate.version = ValueVersion(input.values.len() as u32);
+    let duplicate_version = duplicate.version;
+    input.values.push(duplicate);
+    assert!(matches!(
+        CompiledProof::compile(input, transcript()),
+        Err(CompiledProofError::InvalidValue { value }) if value == duplicate_version
+    ));
+}
+
+#[test]
+fn value_origin_and_region_must_be_compatible() {
+    let mut input = valid_input();
+    input.values[0].region = Region::Dynamic;
+    assert!(matches!(
+        CompiledProof::compile(input, transcript()),
+        Err(CompiledProofError::InvalidValue {
+            value: ValueVersion(0)
+        })
+    ));
+}
+
+#[test]
+fn rejects_transcript_omissions_ranges_and_early_consumers() {
     let mut omitted = valid_input();
     omitted.transcript_inputs.pop();
     assert!(matches!(
@@ -252,39 +596,24 @@ fn rejects_transcript_omissions_order_ranges_and_early_consumers() {
         CompiledProof::compile(reordered, transcript()),
         Err(CompiledProofError::TranscriptBindingOrder {
             kind: BindingKind::TranscriptInput,
-            ..
+            index: 0,
         })
     ));
 
     let mut truncated = valid_input();
-    truncated.transcript_outputs[0].value_words.end -= 1;
+    truncated.transcript_inputs[0].elements.end -= 1;
     assert!(matches!(
         CompiledProof::compile(truncated, transcript()),
-        Err(CompiledProofError::BindingRange {
-            kind: BindingKind::TranscriptOutput,
-            ..
-        })
-    ));
-
-    let mut byte_elements = valid_input();
-    let input_value = byte_elements.transcript_inputs[0].value;
-    let value = &mut byte_elements.values[input_value.0 as usize];
-    value.layout.element.bytes = 1;
-    value.layout.axes[0].stride_bytes = 1;
-    value.layout.axes[0].extent *= 4;
-    assert!(matches!(
-        CompiledProof::compile(byte_elements, transcript()),
         Err(CompiledProofError::BindingRange {
             kind: BindingKind::TranscriptInput,
             ..
         })
     ));
 
-    let mut under_aligned = valid_input();
-    let input_value = under_aligned.transcript_inputs[0].value;
-    under_aligned.values[input_value.0 as usize].alignment = 1;
+    let mut wrong_word_tag = valid_input();
+    wrong_word_tag.values[0].layout.element.tag = 7;
     assert!(matches!(
-        CompiledProof::compile(under_aligned, transcript()),
+        CompiledProof::compile(wrong_word_tag, transcript()),
         Err(CompiledProofError::BindingRange {
             kind: BindingKind::TranscriptInput,
             ..
@@ -292,68 +621,11 @@ fn rejects_transcript_omissions_order_ranges_and_early_consumers() {
     ));
 
     let mut early = valid_input();
-    let assembly = early.operations.last_mut().unwrap();
-    assembly.stage = ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase);
+    early.operations[0].stage =
+        ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase);
     assert!(matches!(
         CompiledProof::compile(early, transcript()),
-        Err(CompiledProofError::TranscriptCausality {
-            kind: BindingKind::TranscriptOutput,
-            ..
-        })
-    ));
-
-    let mut same_segment = valid_input();
-    let pow_input = CairoTranscriptInput::InteractionPowNonce.id().unwrap();
-    let lookup_output = CairoTranscriptOutput::CommonLookupElements.id().unwrap();
-    let challenge = same_segment
-        .transcript_outputs
-        .iter()
-        .find(|binding| binding.id == lookup_output)
-        .unwrap()
-        .value;
-    let binding = same_segment
-        .transcript_inputs
-        .iter_mut()
-        .find(|binding| binding.id == pow_input)
-        .unwrap();
-    binding.value = challenge;
-    binding.value_words = 0..2;
-    assert!(matches!(
-        CompiledProof::compile(same_segment, transcript()),
-        Err(CompiledProofError::TranscriptCausality {
-            kind: BindingKind::TranscriptInput,
-            ..
-        })
-    ));
-
-    let mut unwritten_tail = valid_input();
-    let oods_output = CairoTranscriptOutput::OodsPointParameter.id().unwrap();
-    let output = unwritten_tail
-        .transcript_outputs
-        .iter()
-        .find(|binding| binding.id == oods_output)
-        .unwrap()
-        .value;
-    unwritten_tail.values[output.0 as usize].layout.axes[0].extent += 8;
-    assert!(matches!(
-        CompiledProof::compile(unwritten_tail, transcript()),
-        Err(CompiledProofError::BindingRange {
-            kind: BindingKind::TranscriptOutput,
-            ..
-        })
-    ));
-
-    let mut orphan = valid_input();
-    let value = ValueId(orphan.values.len() as u32);
-    orphan.values.push(u32_value(
-        value,
-        4,
-        ValueOrigin::TranscriptOutput(oods_output),
-        vec![],
-    ));
-    assert!(matches!(
-        CompiledProof::compile(orphan, transcript()),
-        Err(CompiledProofError::OrphanTranscriptOutput { value: actual }) if actual == value
+        Err(CompiledProofError::TranscriptCausality { .. })
     ));
 }
 
@@ -363,67 +635,21 @@ fn rejects_noncanonical_or_overlapping_proof_output() {
     reordered.output.sections.swap(0, 1);
     assert!(matches!(
         CompiledProof::compile(reordered, transcript()),
-        Err(CompiledProofError::ProofSectionOrder { .. })
+        Err(CompiledProofError::ProofSectionOrder { index: 0 })
     ));
 
     let mut gap = valid_input();
-    gap.output.layout.sampled_values.start += 1;
+    gap.output.sections[1].elements.start += 1;
+    gap.output.sections[1].elements.end += 1;
     assert!(matches!(
         CompiledProof::compile(gap, transcript()),
-        Err(CompiledProofError::NonCanonicalProofLayout)
-    ));
-
-    let mut wrong_width = valid_input();
-    wrong_width.output.layout.commitments = 0..31;
-    wrong_width.output.layout.interaction_claim = 31..36;
-    wrong_width.output.sections[0].value_words = 0..31;
-    wrong_width.output.sections[1].value_words = 31..36;
-    assert!(matches!(
-        CompiledProof::compile(wrong_width, transcript()),
-        Err(CompiledProofError::NonCanonicalProofLayout)
+        Err(CompiledProofError::InvalidProofAssembly)
     ));
 
     let mut overlap = valid_input();
-    let interaction = overlap.output.sections[1].value_words.clone();
-    overlap.output.sections[3].value_words = interaction;
+    overlap.output.sections[3].elements = overlap.output.sections[1].elements;
     assert!(matches!(
         CompiledProof::compile(overlap, transcript()),
-        Err(CompiledProofError::BindingRange {
-            kind: BindingKind::ProofOutput,
-            ..
-        })
-    ));
-
-    let mut external = valid_input();
-    let external_value = external.transcript_inputs[0].value;
-    external.values[external_value.0 as usize].layout.axes[0].extent =
-        external.output.layout.total_words;
-    for section in &mut external.output.sections {
-        section.value = external_value;
-    }
-    assert!(matches!(
-        CompiledProof::compile(external, transcript()),
-        Err(CompiledProofError::ProofSectionOrigin { index: 0 })
-    ));
-
-    let mut extra_assembly_output = valid_input();
-    let extra = ValueId(extra_assembly_output.values.len() as u32);
-    extra_assembly_output
-        .values
-        .push(u32_value(extra, 1, ValueOrigin::OpOutput(OpId(0)), vec![]));
-    extra_assembly_output.operations[0].outputs.push(extra);
-    assert!(matches!(
-        CompiledProof::compile(extra_assembly_output, transcript()),
         Err(CompiledProofError::InvalidProofAssembly)
-    ));
-}
-
-#[test]
-fn empty_identity_components_fail_before_compilation() {
-    assert!(matches!(
-        ProofIdentity::new(vec![], b"build".to_vec()),
-        Err(CompiledProofError::EmptyIdentity(
-            IdentityKind::ProofSemantics
-        ))
     ));
 }

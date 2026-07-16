@@ -42,14 +42,14 @@ impl CoordinatorBarrierCursor {
         let barrier_count = plan
             .fence_count()
             .map_err(|_| FleetBarrierError::SizeOverflow)?;
-        let worker_count = plan.input().topology.workers.len();
+        let worker_count = plan.placement().topology.workers.len();
         if barrier_count == 0 || worker_count == 0 {
             return Err(FleetBarrierError::InvalidPlan);
         }
         Ok(Self {
             plan_identity: plan.identity(),
             proof_generation,
-            coordinator: plan.input().topology.coordinator,
+            coordinator: plan.placement().topology.coordinator,
             barrier_count,
             next_ordinal: 0,
             arrived: vec![false; worker_count],
@@ -126,7 +126,7 @@ impl WorkerBarrierCursor {
         Ok(Self {
             plan_identity: plan.identity(),
             proof_generation,
-            coordinator: plan.input().topology.coordinator,
+            coordinator: plan.placement().topology.coordinator,
             barrier_count: plan
                 .fence_count()
                 .map_err(|_| FleetBarrierError::SizeOverflow)?,

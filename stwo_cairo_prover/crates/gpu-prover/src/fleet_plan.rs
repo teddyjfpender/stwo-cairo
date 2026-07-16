@@ -1,16 +1,16 @@
-//! Pure, address-free contract for one proof cooperatively executed by a GPU fleet.
+//! Address-free contract for one proof cooperatively executed by a GPU fleet.
 //!
-//! This is deliberately a validation boundary, not a runtime. Callers must
-//! provide typed values and producer/consumer edges explicitly; today's arena
-//! metadata is too coarse to infer them soundly. No constructor accepts a
-//! `ProofArenaPlan`, and no method allocates a GPU, opens IPC, or installs work.
+//! [`CompiledProof`] is the sole semantic authority. This module owns only
+//! worker placement, schedule, storage, transfer and spill facts. Passing this
+//! host validator is not runtime admission or benchmark evidence.
 
 use core::ops::Range;
+use std::sync::Arc;
 
-pub use stwo_backend_cuda::{TranscriptInputId, TranscriptOutputId};
-
-use crate::fleet_pow::{FleetPowError, FleetPowSchedule, FleetPowSite, PowRankReceipt};
-use crate::fleet_spill::{SpillPlan, SpillPlanError};
+use crate::compiled_proof::{CompiledProof, InPlaceAliasId, OpId, ValueVersion};
+pub use crate::compiled_proof::{ElementRange, ElementType, LayoutAxis, ValueLayout};
+use crate::fleet_pow::{FleetPowError, FleetPowSite, PowRankReceipt};
+use crate::fleet_spill::{SpillChunkId, SpillPlanError};
 use crate::transcript_plan::{
     CairoBlake2sTranscriptPlan, CairoTranscriptSegment, TranscriptSegmentPlan,
 };
@@ -20,23 +20,18 @@ mod lower_compiled;
 mod storage;
 mod validate;
 
+#[cfg(test)]
+mod tests;
+
 pub use lower_compiled::{
     FleetLoweringError, FleetOperationPlacement, FleetOwnerPlacement, FleetPlacementInput,
     FleetPlacementTopology, FleetReplicaPlacement, FleetRuntimeAdmissionError,
-    FleetSpillChunkPlacement, FleetSpillPlacement, FleetSpillTransitionPlacement,
     FleetStoragePlacement, FleetTransitionPlacement, InPlaceAliasPlacement,
 };
-pub use storage::{EffectContractId, InPlaceAlias, StorageBinding, StorageDesc, StorageId};
+pub use storage::{StorageDesc, StorageId};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct WorkerId(pub u16);
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct OperationId(pub u32);
-
-/// Immutable semantic value version; physical storage is declared separately.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ValueId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ReplicaId(pub u32);
@@ -44,7 +39,7 @@ pub struct ReplicaId(pub u32);
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct LayoutTransitionId(pub u32);
 
-/// A deterministic event ordinal in the address-free schedule.
+/// Deterministic event ordinal in the address-free schedule.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ScheduleStep(pub u32);
 
@@ -55,8 +50,12 @@ pub struct ScheduleRange {
 }
 
 impl ScheduleRange {
-    pub fn new(start: ScheduleStep, end: ScheduleStep) -> Option<Self> {
-        (start < end).then_some(Self { start, end })
+    pub const fn new(start: ScheduleStep, end: ScheduleStep) -> Option<Self> {
+        if start.0 < end.0 {
+            Some(Self { start, end })
+        } else {
+            None
+        }
     }
 
     pub const fn is_valid(self) -> bool {
@@ -72,131 +71,7 @@ impl ScheduleRange {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ElementRange {
-    pub start: usize,
-    pub end: usize,
-}
-
-impl ElementRange {
-    pub fn new(start: usize, end: usize) -> Option<Self> {
-        (start < end).then_some(Self { start, end })
-    }
-
-    pub const fn len(self) -> usize {
-        self.end.saturating_sub(self.start)
-    }
-
-    pub const fn is_empty(self) -> bool {
-        self.start >= self.end
-    }
-
-    pub const fn contains(self, other: Self) -> bool {
-        self.start <= other.start && other.end <= self.end
-    }
-
-    pub const fn overlaps(self, other: Self) -> bool {
-        self.start < other.end && other.start < self.end
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ElementType {
-    /// Stable semantic ABI tag chosen by the future ProgramImage emitter.
-    pub tag: u32,
-    pub bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LayoutAxis {
-    /// Stable semantic axis tag; order in `axes` is the physical nesting order.
-    pub tag: u16,
-    pub extent: usize,
-    pub stride_bytes: usize,
-}
-
-/// A dense, non-aliasing physical layout. Arbitrary padded/aliased views are
-/// intentionally rejected by the MVP contract.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValueLayout {
-    pub element: ElementType,
-    pub axes: Vec<LayoutAxis>,
-}
-
-impl ValueLayout {
-    pub fn element_count(&self) -> Result<usize, FleetPlanError> {
-        self.axes.iter().try_fold(1usize, |count, axis| {
-            count
-                .checked_mul(axis.extent)
-                .ok_or(FleetPlanError::SizeOverflow)
-        })
-    }
-
-    pub fn logical_bytes(&self) -> Result<usize, FleetPlanError> {
-        self.element_count()?
-            .checked_mul(self.element.bytes)
-            .ok_or(FleetPlanError::SizeOverflow)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValueDesc {
-    pub id: ValueId,
-    pub layout: ValueLayout,
-    pub alignment_bytes: usize,
-    pub origin: ValueOrigin,
-}
-
-/// Semantic source of one logical value version.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ValueOrigin {
-    /// Proof-varying input slot in the ProgramImage input codec.
-    ExternalInput(u32),
-    /// Immutable constant slot in the content-addressed FixedImage.
-    FixedImage(u32),
-    /// Value produced by one or more explicitly declared operation shards.
-    Operation,
-    /// Challenge/query words released by one exact transcript barrier.
-    TranscriptOutput(TranscriptOutputId),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TranscriptInputValueBinding {
-    pub id: TranscriptInputId,
-    pub value: ValueId,
-    pub elements: ElementRange,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TranscriptOutputValueBinding {
-    pub id: TranscriptOutputId,
-    pub value: ValueId,
-    pub elements: ElementRange,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValueUse {
-    pub value: ValueId,
-    pub elements: ElementRange,
-    pub layout: ValueLayout,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OperationDesc {
-    pub id: OperationId,
-    /// Canonical address-free operation encoding emitted by the future ProgramImage compiler.
-    pub semantic: Vec<u8>,
-    /// Opaque effect authority from the sealed AOT/CompiledProof manifest.
-    pub effect_identity: EffectContractId,
-    pub interval: ExecutionInterval,
-    pub during: ScheduleRange,
-    pub reads: Vec<ValueUse>,
-    pub writes: Vec<ValueUse>,
-}
-
-/// Causal interval containing an operation. The final interval is explicit so
-/// query decommitment and proof assembly cannot be hidden inside the last
-/// Fiat-Shamir segment.
+/// Causal transcript interval containing physical work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionInterval {
     BeforeBarrier(u32),
@@ -204,39 +79,8 @@ pub enum ExecutionInterval {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OperationAssignment {
-    pub operation: OperationId,
-    pub worker: WorkerId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OwnedValueRange {
-    pub value: ValueId,
-    pub elements: ElementRange,
-    pub worker: WorkerId,
-    pub producer: Option<OperationId>,
-    pub ready_at: ScheduleStep,
-    pub live: ScheduleRange,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeclaredReplica {
-    pub id: ReplicaId,
-    pub value: ValueId,
-    pub elements: ElementRange,
-    pub canonical_worker: WorkerId,
-    pub worker: WorkerId,
-    pub layout: ValueLayout,
-    pub origin: ReplicaOrigin,
-    pub ready_at: ScheduleStep,
-    pub live: ScheduleRange,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicaOrigin {
-    /// FixedImage bytes installed independently under the topology identity.
     InstalledFixed,
-    /// Proof-varying bytes materialized by this declared transfer/transpose.
     Transition(LayoutTransitionId),
 }
 
@@ -246,30 +90,11 @@ pub struct AxisMap {
     pub destination: u16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LayoutTransition {
-    pub id: LayoutTransitionId,
-    pub value: ValueId,
-    pub elements: ElementRange,
-    pub source_worker: WorkerId,
-    pub destination_replica: ReplicaId,
-    pub source_layout: ValueLayout,
-    pub destination_layout: ValueLayout,
-    pub axes: Vec<AxisMap>,
-    pub interval: ExecutionInterval,
-    pub during: ScheduleRange,
-    pub bytes: usize,
-    pub scratch_bytes: usize,
-    pub scratch_worker: WorkerId,
-    pub route: FleetLinkId,
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FleetLinkId(pub u16);
 
+/// Directed P2P route. Host bounce is represented only by an explicit spill.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Declared directed P2P link. Host-bounce transport is intentionally absent
-/// until it owns bounded pinned slots and exact NUMA copy lifetimes.
 pub struct FleetLink {
     pub id: FleetLinkId,
     pub source: WorkerId,
@@ -299,24 +124,6 @@ pub struct HostNumaCapacity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FleetTopology {
-    /// Declared logical identity only. Hardware probes must independently
-    /// attest every rank and directed link before a runtime may install it.
-    /// One exact card/SM class for every rank; mixed fleets are not admitted.
-    pub gpu_class: ConsumerGpuClass,
-    /// Hash of the complete ordered module, ABI and initializer pack on every rank.
-    pub module_pack_identity: [u8; 32],
-    /// Content identity of the immutable twiddle/table/preprocessed FixedImage.
-    pub fixed_image_identity: [u8; 32],
-    /// Full canonical address-free ShapeExecutable identity, not a short digest.
-    pub executable_identity: Vec<u8>,
-    pub coordinator: WorkerId,
-    pub workers: Vec<WorkerSpec>,
-    pub links: Vec<FleetLink>,
-    pub host_numa: Vec<HostNumaCapacity>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptBarrier {
     pub ordinal: u32,
     pub coordinator: WorkerId,
@@ -324,16 +131,7 @@ pub struct TranscriptBarrier {
     pub operation_range: Range<usize>,
     pub starts_after: Option<crate::transcript_plan::CairoTranscriptBoundary>,
     pub ends_at: crate::transcript_plan::CairoTranscriptBoundary,
-    /// Coordinator broadcast completion for this exact transcript segment.
     pub release_step: ScheduleStep,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BarrierArrival {
-    pub barrier_ordinal: u32,
-    pub worker: WorkerId,
-    /// Rank completion receipt consumed before the coordinator release step.
-    pub ready_step: ScheduleStep,
 }
 
 impl TranscriptBarrier {
@@ -355,86 +153,66 @@ impl TranscriptBarrier {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FleetPlanInput {
-    pub topology: FleetTopology,
-    pub pow: FleetPowSchedule,
-    /// One coordinator-broadcast completion step per canonical transcript segment.
-    pub barrier_steps: Vec<ScheduleStep>,
-    /// Wait-all completion fence after query decommitment and proof assembly.
-    pub terminal_step: ScheduleStep,
-    /// Includes one arrival per worker for every transcript barrier and the terminal fence.
-    pub barrier_arrivals: Vec<BarrierArrival>,
-    /// Exact requirement order from the canonical transcript plan.
-    pub transcript_inputs: Vec<TranscriptInputValueBinding>,
-    /// Exact requirement order from the canonical transcript plan.
-    pub transcript_outputs: Vec<TranscriptOutputValueBinding>,
-    pub values: Vec<ValueDesc>,
-    pub operations: Vec<OperationDesc>,
-    pub assignments: Vec<OperationAssignment>,
-    pub owners: Vec<OwnedValueRange>,
-    pub replicas: Vec<DeclaredReplica>,
-    pub transitions: Vec<LayoutTransition>,
-    pub spills: Vec<SpillPlan>,
-    pub storages: Vec<StorageDesc>,
-    pub storage_bindings: Vec<StorageBinding>,
-    pub in_place_aliases: Vec<InPlaceAlias>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BarrierArrival {
+    pub barrier_ordinal: u32,
+    pub worker: WorkerId,
+    pub ready_step: ScheduleStep,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FleetWorkerPlan {
     pub worker: WorkerId,
-    pub peak_live_bytes: usize,
+    pub peak_resident_bytes: usize,
     pub capacity_bytes: usize,
 }
 
-/// Validated host contract only. Absence of a runtime/install method is a
-/// deliberate admission fence until a real typed ProgramImage emitter exists.
+/// Validated immutable host contract. Runtime installation remains fail closed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FleetProofPlan {
-    input: FleetPlanInput,
-    schedule_key: u64,
-    transcript_encoding: Vec<u8>,
+    compiled: Arc<CompiledProof>,
+    shape_encoding: Box<[u8]>,
+    placement: FleetPlacementInput,
     barriers: Vec<TranscriptBarrier>,
     workers: Vec<FleetWorkerPlan>,
     identity: [u8; 32],
 }
 
 impl FleetProofPlan {
-    pub fn compile_explicit(
-        mut input: FleetPlanInput,
+    pub(super) fn assemble(
+        compiled: Arc<CompiledProof>,
+        shape_encoding: Box<[u8]>,
+        mut placement: FleetPlacementInput,
         transcript: &CairoBlake2sTranscriptPlan,
     ) -> Result<Self, FleetPlanError> {
-        canonicalize(&mut input);
-        if input.barrier_steps.len() != transcript.segments().len() {
+        canonicalize(&mut placement);
+        if placement.barrier_steps.len() != transcript.segments().len() {
             return Err(FleetPlanError::TranscriptMismatch);
         }
         let barriers = transcript
             .segments()
             .iter()
-            .zip(&input.barrier_steps)
+            .zip(&placement.barrier_steps)
             .enumerate()
-            .map(|(ordinal, (segment, &release_step))| {
+            .map(|(ordinal, (segment, &release))| {
                 TranscriptBarrier::from_segment(
                     ordinal,
-                    input.topology.coordinator,
+                    placement.topology.coordinator,
                     segment,
-                    release_step,
+                    release,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let transcript_encoding = identity::encode_transcript(transcript)?;
         let mut plan = Self {
-            input,
-            schedule_key: transcript.schedule_key(),
-            transcript_encoding,
+            compiled,
+            shape_encoding,
+            placement,
             barriers,
             workers: Vec::new(),
             identity: [0; 32],
         };
         plan.workers = validate::validate_and_measure(&plan, transcript)?;
         plan.identity = identity::compute(&plan)?;
-        plan.validate(transcript)?;
         Ok(plan)
     }
 
@@ -454,8 +232,16 @@ impl FleetProofPlan {
         identity::encode(self)
     }
 
-    pub fn input(&self) -> &FleetPlanInput {
-        &self.input
+    pub fn compiled(&self) -> &CompiledProof {
+        &self.compiled
+    }
+
+    pub fn placement(&self) -> &FleetPlacementInput {
+        &self.placement
+    }
+
+    pub fn shape_encoding(&self) -> &[u8] {
+        &self.shape_encoding
     }
 
     pub fn barriers(&self) -> &[TranscriptBarrier] {
@@ -463,7 +249,7 @@ impl FleetProofPlan {
     }
 
     pub const fn terminal_step(&self) -> ScheduleStep {
-        self.input.terminal_step
+        self.placement.terminal_step
     }
 
     pub fn fence_count(&self) -> Result<u32, FleetPlanError> {
@@ -486,9 +272,9 @@ impl FleetProofPlan {
         receipts: &[PowRankReceipt],
         is_valid_nonce: impl Fn(u64) -> bool,
     ) -> Result<u64, FleetPowError> {
-        self.input.pow.plan(site).verify_winner(
+        self.placement.pow.plan(site).verify_winner(
             site,
-            self.input.topology.workers.len(),
+            self.placement.topology.workers.len(),
             self.identity,
             proof_generation,
             receipts,
@@ -497,7 +283,7 @@ impl FleetProofPlan {
     }
 }
 
-fn canonicalize(input: &mut FleetPlanInput) {
+fn canonicalize(input: &mut FleetPlacementInput) {
     input
         .topology
         .workers
@@ -507,21 +293,17 @@ fn canonicalize(input: &mut FleetPlanInput) {
         .topology
         .host_numa
         .sort_unstable_by_key(|capacity| capacity.numa_node);
-    input.values.sort_unstable_by_key(|value| value.id);
     input
         .barrier_arrivals
         .sort_unstable_by_key(|arrival| (arrival.barrier_ordinal, arrival.worker));
     input
         .operations
-        .sort_unstable_by_key(|operation| operation.id);
-    input
-        .assignments
-        .sort_unstable_by_key(|assignment| assignment.operation);
+        .sort_unstable_by_key(|operation| operation.operation);
     input.owners.sort_unstable_by_key(|owner| {
         (
-            owner.value,
-            owner.elements.start,
-            owner.elements.end,
+            owner.value.version,
+            owner.value.elements.start,
+            owner.value.elements.end,
             owner.worker,
         )
     });
@@ -545,23 +327,17 @@ fn canonicalize(input: &mut FleetPlanInput) {
         (
             binding.storage,
             binding.offset_bytes,
-            binding.value,
-            binding.elements.start,
-            binding.elements.end,
+            binding.value.version,
+            binding.value.elements.start,
+            binding.value.elements.end,
         )
     });
     input.in_place_aliases.sort_unstable_by_key(|alias| {
         (
             alias.operation,
-            alias.source,
-            alias.source_elements.start,
-            alias.source_elements.end,
-            alias.destination,
-            alias.destination_elements.start,
-            alias.destination_elements.end,
+            alias.alias,
             alias.storage,
             alias.offset_bytes,
-            alias.bytes,
         )
     });
 }
@@ -577,58 +353,54 @@ pub enum FleetPlanError {
     InvalidLink(FleetLinkId),
     UnknownNuma(u32),
     HostCapacityExceeded(u32),
-    DuplicateValue(ValueId),
-    DuplicateOperation(OperationId),
-    DuplicateAssignment(OperationId),
-    MissingAssignment(OperationId),
+    DuplicateOperation(OpId),
+    MissingOperation(OpId),
     UnknownWorker(WorkerId),
-    UnknownValue(ValueId),
-    UnknownOperation(OperationId),
-    InvalidOperation(OperationId),
-    InvalidLayout(ValueId),
-    InvalidRange(ValueId),
+    UnknownValue(ValueVersion),
+    UnknownOperation(OpId),
+    InvalidOperation(OpId),
+    InvalidRange(ValueVersion),
     InvalidSchedule,
-    InvalidSegment(OperationId),
-    OwnershipCoverage(ValueId),
-    InvalidProducer(ValueId),
+    InvalidSegment(OpId),
+    OwnershipCoverage(ValueVersion),
+    InvalidProducer(ValueVersion),
     UndeclaredRead {
-        operation: OperationId,
-        value: ValueId,
+        operation: OpId,
+        value: ValueVersion,
     },
     InvalidReplica(ReplicaId),
     InvalidTransition(LayoutTransitionId),
-    InvalidEffectContract(OperationId),
     InvalidStorage(StorageId),
     InvalidStorageBinding {
-        value: ValueId,
+        value: ValueVersion,
         storage: StorageId,
     },
-    StorageCoverage(ValueId),
+    StorageCoverage(ValueVersion),
     IllegalStorageReuse(StorageId),
-    InvalidInPlaceAlias(OperationId),
-    InvalidTranscriptInput(TranscriptInputId),
-    InvalidTranscriptOutput(TranscriptOutputId),
-    TranscriptValueCausality(ValueId),
+    InvalidInPlaceAlias {
+        operation: OpId,
+        alias: InPlaceAliasId,
+    },
+    InvalidProofOutput(StorageId),
+    TranscriptValueCausality(ValueVersion),
     CapacityExceeded {
         worker: WorkerId,
         required: usize,
         capacity: usize,
     },
     TranscriptMismatch,
-    SpillValue(SpillChunkIdForError),
+    SpillValue(SpillChunkId),
+    InvalidVmmReclaim(StorageId),
+    UnmappedStorageAccess(StorageId),
     Spill(SpillPlanError),
     Pow(FleetPowError),
     SizeOverflow,
     IdentityMismatch,
 }
 
-/// Keeps the public error independent of the spill module's internal lookup maps.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SpillChunkIdForError(pub u32);
-
 impl core::fmt::Display for FleetPlanError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "invalid explicit fleet proof plan: {self:?}")
+        write!(f, "invalid fleet proof plan: {self:?}")
     }
 }
 

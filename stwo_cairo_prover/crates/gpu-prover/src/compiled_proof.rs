@@ -1,25 +1,24 @@
 //! Validated, address-free semantic proof program.
 //!
-//! This is the authority consumed before fleet placement. It binds the exact
-//! operation/value DAG, transcript bindings, AOT/effect authorities and
-//! canonical proof output without assigning storage, addresses or workers.
-
-use core::ops::Range;
+//! A value is an immutable semantic version, never a physical allocation.
+//! Every operation names one real execution primitive and one exact, body-
+//! derived effect contract. Fleet placement and storage reuse are later
+//! authorities and may not invent or weaken these ranges.
 
 use crate::proof_bundle::ResidentProofBundleLayout;
 use crate::transcript_plan::{CairoBlake2sTranscriptPlan, CairoTranscriptSegment};
 
+mod effect;
 mod identity;
 mod validate;
 
+pub use effect::*;
 pub use identity::{CompiledProofIdentity, ProofCodecIdentity, ProofIdentity};
 pub use stwo_backend_cuda::{TranscriptInputId, TranscriptOutputId};
 
-pub use crate::fleet_plan::{ElementType, LayoutAxis, ValueLayout};
-
 macro_rules! numeric_id {
     ($name:ident, $raw:ty) => {
-        #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name(pub $raw);
 
         impl $name {
@@ -33,49 +32,127 @@ macro_rules! numeric_id {
 numeric_id!(OpId, u32);
 numeric_id!(SemanticOpId, u32);
 numeric_id!(AotKernelId, u32);
-numeric_id!(ValueId, u32);
+numeric_id!(ValueVersion, u32);
 numeric_id!(ExternalInputId, u32);
 numeric_id!(ConstantId, u32);
+numeric_id!(EffectBindingId, u32);
+numeric_id!(InPlaceAliasId, u32);
 
-/// Opaque content identity of one externally audited kernel effect contract.
-/// The contract body belongs to the sealed AOT authority; this digest is the
-/// exact token shared with storage alias validation.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct EffectContractId(pub [u8; 32]);
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ElementRange {
+    pub start: usize,
+    pub end: usize,
+}
 
-impl EffectContractId {
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+impl ElementRange {
+    pub const fn new(start: usize, end: usize) -> Option<Self> {
+        if start < end {
+            Some(Self { start, end })
+        } else {
+            None
+        }
+    }
+
+    pub const fn len(self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
+
+    pub const fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
     }
 }
 
-/// Exact externally supplied semantic/AOT/effect authority used by this proof.
-/// Lists are canonical sorted sets; the validator never derives an authority
-/// identifier from caller-declared edges.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SemanticAuthority {
-    pub operations: Vec<SemanticOpId>,
-    pub kernels: Vec<AotKernelId>,
-    pub effects: Vec<EffectContractId>,
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ElementType {
+    pub tag: u32,
+    pub bytes: usize,
+}
+
+impl ElementType {
+    /// Canonical resident ABI element for proof words and `AddU32` atomics.
+    pub const U32: Self = Self { tag: 1, bytes: 4 };
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LayoutAxis {
+    pub tag: u16,
+    pub extent: usize,
+    pub stride_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ValueLayout {
+    pub element: ElementType,
+    pub axes: Vec<LayoutAxis>,
+}
+
+impl ValueLayout {
+    pub fn element_count(&self) -> Result<usize, CompiledProofError> {
+        self.axes.iter().try_fold(1usize, |count, axis| {
+            count
+                .checked_mul(axis.extent)
+                .ok_or(CompiledProofError::SizeOverflow)
+        })
+    }
+
+    pub fn logical_bytes(&self) -> Result<usize, CompiledProofError> {
+        self.element_count()?
+            .checked_mul(self.element.bytes)
+            .ok_or(CompiledProofError::SizeOverflow)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Region {
+    FixedData,
+    Input,
+    Dynamic,
+    Output,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProofStage {
-    /// Work whose completion happens-before the named segment's transcript
-    /// operations. A root produced here may therefore be absorbed by that
-    /// segment; a challenge drawn by it is available only to later stages.
+    /// Work completed before the named transcript segment executes.
     BeforeTranscript(CairoTranscriptSegment),
     AfterTranscript,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LaunchGeometry {
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub cluster: Option<[u32; 3]>,
+    pub dynamic_shared_bytes: u32,
+    pub cooperative: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionPrimitive {
+    AotKernel {
+        kernel: AotKernelId,
+        launch: LaunchGeometry,
+    },
+    /// Device-to-device contiguous byte copy. Host ingress/egress is outside
+    /// the semantic proof program and cannot be disguised as this primitive.
+    DeviceCopyD2D { bytes: usize },
+    /// CUDA byte-pattern memset; `value` is one repeated byte, not a word.
+    DeviceMemsetByte { bytes: usize, value: u8 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpNode {
     pub id: OpId,
     pub semantic_id: SemanticOpId,
-    pub kernel_id: AotKernelId,
-    pub effects: EffectContractId,
-    pub inputs: Vec<ValueId>,
-    pub outputs: Vec<ValueId>,
+    pub primitive: ExecutionPrimitive,
+    pub effect: EffectContractId,
     pub stage: ProofStage,
 }
 
@@ -84,34 +161,30 @@ pub enum ValueOrigin {
     ExternalInput(ExternalInputId),
     Constant(ConstantId),
     OpOutput(OpId),
-    /// Challenge/query words produced by the canonical transcript schedule,
-    /// not by an AOT semantic operation.
     TranscriptOutput(TranscriptOutputId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValueDesc {
-    pub id: ValueId,
+    pub version: ValueVersion,
     pub layout: ValueLayout,
     pub alignment: usize,
     pub origin: ValueOrigin,
-    /// Canonical ascending operation IDs. The validator checks this is the
-    /// exact reciprocal set of operation input edges.
-    pub consumers: Vec<OpId>,
+    pub region: Region,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TranscriptInputBinding {
     pub id: TranscriptInputId,
-    pub value: ValueId,
-    pub value_words: Range<usize>,
+    pub value: ValueVersion,
+    pub elements: ElementRange,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TranscriptOutputBinding {
     pub id: TranscriptOutputId,
-    pub value: ValueId,
-    pub value_words: Range<usize>,
+    pub value: ValueVersion,
+    pub elements: ElementRange,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,14 +212,11 @@ impl ProofBundleSection {
     ];
 }
 
-/// Source range for one exact canonical bundle section. Destination ranges are
-/// supplied by `ResidentProofBundleLayout` and must cover `0..total_words`
-/// exactly once in `ProofBundleSection::CANONICAL` order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProofOutputSection {
     pub section: ProofBundleSection,
-    pub value: ValueId,
-    pub value_words: Range<usize>,
+    pub value: ValueVersion,
+    pub elements: ElementRange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,11 +226,11 @@ pub struct ProofOutputLayout {
     pub sections: Vec<ProofOutputSection>,
 }
 
-/// Complete input to the all-or-nothing semantic validation boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledProofInput {
     pub identity: ProofIdentity,
-    pub authority: SemanticAuthority,
+    pub kernels: Vec<AotKernelAuthority>,
+    pub effects: Vec<EffectContract>,
     pub operations: Vec<OpNode>,
     pub values: Vec<ValueDesc>,
     pub transcript_inputs: Vec<TranscriptInputBinding>,
@@ -200,6 +270,14 @@ impl CompiledProof {
         &self.input.identity
     }
 
+    pub fn kernels(&self) -> &[AotKernelAuthority] {
+        &self.input.kernels
+    }
+
+    pub fn effects(&self) -> &[EffectContract] {
+        &self.input.effects
+    }
+
     pub fn operations(&self) -> &[OpNode] {
         &self.input.operations
     }
@@ -208,8 +286,51 @@ impl CompiledProof {
         &self.input.values
     }
 
+    pub fn transcript_inputs(&self) -> &[TranscriptInputBinding] {
+        &self.input.transcript_inputs
+    }
+
+    pub fn transcript_outputs(&self) -> &[TranscriptOutputBinding] {
+        &self.input.transcript_outputs
+    }
+
     pub const fn output(&self) -> &ProofOutputLayout {
         &self.input.output
+    }
+
+    pub fn kernel(&self, id: AotKernelId) -> Option<&AotKernelAuthority> {
+        self.input.kernels.iter().find(|kernel| kernel.id() == id)
+    }
+
+    pub fn effect(&self, id: EffectContractId) -> Option<&EffectContract> {
+        self.input.effects.iter().find(|effect| effect.id() == id)
+    }
+
+    pub fn operation(&self, id: OpId) -> Option<&OpNode> {
+        self.input
+            .operations
+            .get(id.0 as usize)
+            .filter(|operation| operation.id == id)
+    }
+
+    pub fn effect_for(&self, operation: OpId) -> Option<&EffectContract> {
+        self.operation(operation)
+            .and_then(|operation| self.effect(operation.effect))
+    }
+
+    pub fn in_place_alias(
+        &self,
+        effect: EffectContractId,
+        alias: InPlaceAliasId,
+    ) -> Option<&EffectAccess> {
+        self.effect(effect)?.in_place_alias(alias)
+    }
+
+    pub fn value(&self, version: ValueVersion) -> Option<&ValueDesc> {
+        self.input
+            .values
+            .get(version.0 as usize)
+            .filter(|value| value.version == version)
     }
 }
 
@@ -217,13 +338,6 @@ impl CompiledProof {
 pub enum IdentityKind {
     ProofSemantics,
     ExecutionBuild,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AuthorityKind {
-    SemanticOperation,
-    AotKernel,
-    EffectContract,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,33 +351,114 @@ pub enum BindingKind {
 pub enum CompiledProofError {
     SizeOverflow,
     EmptyIdentity(IdentityKind),
-    NonCanonicalAuthority(AuthorityKind),
-    AuthorityMismatch(AuthorityKind),
-    NonDenseOperation { expected: OpId, actual: OpId },
-    NonDenseValue { expected: ValueId, actual: ValueId },
-    UnknownStage { operation: OpId },
-    StageOrder { previous: OpId, current: OpId },
-    DuplicateOperationEdge { operation: OpId, value: ValueId },
-    InputOutputAlias { operation: OpId, value: ValueId },
-    InvalidValue { value: ValueId },
-    UnknownValue { operation: OpId, value: ValueId },
-    UnknownProducer { value: ValueId, producer: OpId },
-    ProducerMismatch { value: ValueId },
-    ProducerAfterConsumer { value: ValueId, consumer: OpId },
-    ConsumerOrder { value: ValueId },
-    ConsumerMismatch { value: ValueId },
-    TranscriptInputCount { expected: usize, actual: usize },
-    TranscriptOutputCount { expected: usize, actual: usize },
-    TranscriptBindingOrder { kind: BindingKind, index: usize },
-    TranscriptBindingOrigin { output: TranscriptOutputId },
-    OrphanTranscriptOutput { value: ValueId },
-    TranscriptCausality { kind: BindingKind, id: u32 },
-    BindingRange { kind: BindingKind, id: u32 },
-    BindingOverlap { kind: BindingKind, value: ValueId },
+    EmptyModuleIdentity,
+    EmptyKernelIdentity(AotKernelId),
+    EmptyKernelEffectAuthority(AotKernelId),
+    NonCanonicalKernelEffects(AotKernelId),
+    NonCanonicalEffectBindings,
+    NonCanonicalEffectAliases,
+    InvalidEffectRange,
+    InvalidValueTransition,
+    InvalidModuleGlobalEffect,
+    NonCanonicalModuleGlobals,
+    NonCanonicalKernelAuthority,
+    NonCanonicalEffectAuthority,
+    DuplicateSemanticOperation(SemanticOpId),
+    NonDenseOperation {
+        expected: OpId,
+        actual: OpId,
+    },
+    NonDenseValue {
+        expected: ValueVersion,
+        actual: ValueVersion,
+    },
+    UnknownStage {
+        operation: OpId,
+    },
+    StageOrder {
+        previous: OpId,
+        current: OpId,
+    },
+    UnknownValue {
+        operation: OpId,
+        value: ValueVersion,
+    },
+    InvalidValue {
+        value: ValueVersion,
+    },
+    UnknownProducer {
+        value: ValueVersion,
+        producer: OpId,
+    },
+    ProducerMismatch {
+        value: ValueVersion,
+    },
+    ProducerAfterConsumer {
+        value: ValueVersion,
+        consumer: OpId,
+    },
+    OverlappingWrite {
+        value: ValueVersion,
+    },
+    IncompleteWrite {
+        value: ValueVersion,
+    },
+    UnknownEffect {
+        operation: OpId,
+    },
+    InvalidEffectContract(EffectContractId),
+    UnknownKernel {
+        operation: OpId,
+    },
+    KernelEffectNotAccepted {
+        operation: OpId,
+    },
+    ModuleGlobalAuthorityMismatch {
+        operation: OpId,
+    },
+    InvalidLaunchGeometry(OpId),
+    PrimitiveEffectMismatch(OpId),
+    TranscriptInputCount {
+        expected: usize,
+        actual: usize,
+    },
+    TranscriptOutputCount {
+        expected: usize,
+        actual: usize,
+    },
+    TranscriptBindingOrder {
+        kind: BindingKind,
+        index: usize,
+    },
+    TranscriptBindingOrigin {
+        output: TranscriptOutputId,
+    },
+    OrphanTranscriptOutput {
+        value: ValueVersion,
+    },
+    TranscriptCausality {
+        kind: BindingKind,
+        id: u32,
+    },
+    BindingRange {
+        kind: BindingKind,
+        id: u32,
+    },
+    BindingOverlap {
+        kind: BindingKind,
+        value: ValueVersion,
+    },
     NonCanonicalProofLayout,
-    ProofSectionCount { expected: usize, actual: usize },
-    ProofSectionOrder { index: usize },
-    ProofSectionOrigin { index: usize },
+    ProofSectionCount {
+        expected: usize,
+        actual: usize,
+    },
+    ProofSectionOrder {
+        index: usize,
+    },
+    ProofSectionOrigin {
+        index: usize,
+    },
     InvalidProofAssembly,
     TranscriptPlan(crate::transcript_plan::TranscriptPlanError),
 }

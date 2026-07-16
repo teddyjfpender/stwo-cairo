@@ -7,57 +7,157 @@ use memory::{measure_workers, validate_spill};
 use transcript_values::validate_transcript_values;
 
 use super::*;
+use crate::compiled_proof::{OpNode, ProofStage, ValueDesc, ValueOrigin, ValueRange};
 use crate::transcript_plan::CairoBlake2sTranscriptPlan;
 
 pub(super) fn validate_and_measure(
     plan: &FleetProofPlan,
     transcript: &CairoBlake2sTranscriptPlan,
 ) -> Result<Vec<FleetWorkerPlan>, FleetPlanError> {
-    let workers = validate_topology(&plan.input.topology)?;
-    plan.input.pow.validate(workers.len())?;
+    let workers = validate_topology(&plan.placement.topology)?;
+    plan.placement.pow.validate(workers.len())?;
     validate_transcript(plan, transcript)?;
-    if plan.input.values.is_empty() || plan.input.operations.is_empty() {
+    if plan.compiled.operations().is_empty() || plan.compiled.values().is_empty() {
         return Err(FleetPlanError::EmptyProgram);
     }
+    validate_operations(plan, &workers)?;
+    validate_owners(plan, &workers)?;
+    validate_replicas_and_transitions(plan, &workers)?;
+    validate_effect_locations(plan)?;
+    validate_transcript_values(plan, transcript)?;
+    validate_spill(plan, transcript, &workers)?;
+    super::storage::validate(plan, &workers)?;
+    validate_barrier_arrivals(plan, &workers)?;
+    measure_workers(plan, &workers)
+}
 
-    let values = index_unique(
-        &plan.input.values,
-        |value| value.id,
-        FleetPlanError::DuplicateValue,
-    )?;
-    for value in &plan.input.values {
-        validate_layout(value.id, &value.layout)?;
+fn validate_operations(
+    plan: &FleetProofPlan,
+    workers: &BTreeMap<WorkerId, &WorkerSpec>,
+) -> Result<(), FleetPlanError> {
+    if plan.placement.operations.len() != plan.compiled.operations().len() {
+        let missing = plan
+            .compiled
+            .operations()
+            .iter()
+            .find(|operation| operation_placement(plan, operation.id).is_err())
+            .map_or(OpId(u32::MAX), |operation| operation.id);
+        return Err(FleetPlanError::MissingOperation(missing));
     }
-    let operations = index_unique(
-        &plan.input.operations,
-        |operation| operation.id,
-        FleetPlanError::DuplicateOperation,
-    )?;
-    let assignments = index_unique(
-        &plan.input.assignments,
-        |assignment| assignment.operation,
-        FleetPlanError::DuplicateAssignment,
-    )?;
+    for (index, placement) in plan.placement.operations.iter().enumerate() {
+        let expected = OpId(u32::try_from(index).map_err(|_| FleetPlanError::SizeOverflow)?);
+        if placement.operation != expected {
+            return Err(FleetPlanError::DuplicateOperation(placement.operation));
+        }
+        let operation = operation(plan, placement.operation)?;
+        require_worker(workers, placement.worker)?;
+        let interval = operation_interval(plan, operation)?;
+        if !execution_interval_contains(plan, interval, placement.during) {
+            return Err(FleetPlanError::InvalidSchedule);
+        }
+    }
+    Ok(())
+}
+
+fn validate_owners(
+    plan: &FleetProofPlan,
+    workers: &BTreeMap<WorkerId, &WorkerSpec>,
+) -> Result<(), FleetPlanError> {
+    for value in plan.compiled.values() {
+        let total = value
+            .layout
+            .element_count()
+            .map_err(|_| FleetPlanError::SizeOverflow)?;
+        let mut owners = plan
+            .placement
+            .owners
+            .iter()
+            .filter(|owner| owner.value.version == value.version)
+            .collect::<Vec<_>>();
+        owners.sort_unstable_by_key(|owner| {
+            (
+                owner.value.elements.start,
+                owner.value.elements.end,
+                owner.worker,
+            )
+        });
+        let mut cursor = 0usize;
+        for owner in owners {
+            require_worker(workers, owner.worker)?;
+            validate_value_range(plan, owner.value)?;
+            if owner.value.elements.start != cursor
+                || !owner.live.is_valid()
+                || owner.live.end > plan.placement.terminal_step
+                || owner_ready_at(plan, owner)? >= owner.live.end
+            {
+                return Err(FleetPlanError::OwnershipCoverage(value.version));
+            }
+            validate_owner_origin(plan, owner, value)?;
+            cursor = owner.value.elements.end;
+        }
+        if cursor != total {
+            return Err(FleetPlanError::OwnershipCoverage(value.version));
+        }
+    }
+    if let Some(owner) = plan
+        .placement
+        .owners
+        .iter()
+        .find(|owner| plan.compiled.value(owner.value.version).is_none())
+    {
+        return Err(FleetPlanError::UnknownValue(owner.value.version));
+    }
+    Ok(())
+}
+
+fn validate_owner_origin(
+    plan: &FleetProofPlan,
+    owner: &FleetOwnerPlacement,
+    value: &ValueDesc,
+) -> Result<(), FleetPlanError> {
+    let valid = match value.origin {
+        ValueOrigin::ExternalInput(_) => owner.live.start == ScheduleStep(0),
+        ValueOrigin::Constant(_) => {
+            owner.live.start == ScheduleStep(0) && owner.live.end == plan.placement.terminal_step
+        }
+        ValueOrigin::TranscriptOutput(_) => owner.worker == plan.placement.topology.coordinator,
+        ValueOrigin::OpOutput(producer) => {
+            let placement = operation_placement(plan, producer)?;
+            let effect = plan
+                .compiled
+                .effect_for(producer)
+                .ok_or(FleetPlanError::InvalidOperation(producer))?;
+            let destinations = effect
+                .accesses()
+                .iter()
+                .filter_map(|access| access.destination().map(|range| range.value))
+                .filter(|range| range.version == value.version)
+                .collect::<Vec<_>>();
+            placement.worker == owner.worker
+                && owner.live.start == placement.during.start
+                && owner.live.contains(placement.during)
+                && range_covered(owner.value.elements, &destinations)
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(FleetPlanError::InvalidProducer(value.version))
+    }
+}
+
+fn validate_replicas_and_transitions(
+    plan: &FleetProofPlan,
+    workers: &BTreeMap<WorkerId, &WorkerSpec>,
+) -> Result<(), FleetPlanError> {
     if plan
-        .input
-        .values
+        .placement
+        .replicas
         .iter()
         .enumerate()
-        .any(|(index, value)| value.id.0 as usize != index)
+        .any(|(index, replica)| replica.id.0 as usize != index)
         || plan
-            .input
-            .operations
-            .iter()
-            .enumerate()
-            .any(|(index, operation)| operation.id.0 as usize != index)
-        || plan
-            .input
-            .replicas
-            .iter()
-            .enumerate()
-            .any(|(index, replica)| replica.id.0 as usize != index)
-        || plan
-            .input
+            .placement
             .transitions
             .iter()
             .enumerate()
@@ -65,104 +165,191 @@ pub(super) fn validate_and_measure(
     {
         return Err(FleetPlanError::NonDenseIds);
     }
-    for operation in &plan.input.operations {
-        if !operation.during.is_valid() || operation.semantic.is_empty() {
-            return Err(FleetPlanError::InvalidOperation(operation.id));
+    for transition in &plan.placement.transitions {
+        validate_transition(plan, transition, workers)?;
+    }
+    for replica in &plan.placement.replicas {
+        validate_replica(plan, replica, workers)?;
+    }
+    for (index, left) in plan.placement.replicas.iter().enumerate() {
+        if let Some(right) = plan.placement.replicas[index + 1..].iter().find(|right| {
+            left.worker == right.worker
+                && ranges_overlap(left.value, right.value)
+                && left.live.overlaps(right.live)
+        }) {
+            return Err(FleetPlanError::InvalidReplica(right.id));
         }
-        let (released_after, release_before) = match operation.interval {
-            ExecutionInterval::BeforeBarrier(segment) => {
-                let segment = usize::try_from(segment)
-                    .map_err(|_| FleetPlanError::InvalidSegment(operation.id))?;
-                let barrier = plan
-                    .barriers
-                    .get(segment)
-                    .ok_or(FleetPlanError::InvalidSegment(operation.id))?;
-                let released_after = segment.checked_sub(1).map_or(ScheduleStep(0), |previous| {
-                    plan.barriers[previous].release_step
-                });
-                (released_after, barrier.release_step)
+    }
+    Ok(())
+}
+
+fn validate_transition(
+    plan: &FleetProofPlan,
+    transition: &FleetTransitionPlacement,
+    workers: &BTreeMap<WorkerId, &WorkerSpec>,
+) -> Result<(), FleetPlanError> {
+    let value = validate_value_range(plan, transition.value)?;
+    require_worker(workers, transition.source_worker)?;
+    require_worker(workers, transition.scratch_worker)?;
+    let replica = replica(plan, transition.destination_replica)?;
+    let link = plan
+        .placement
+        .topology
+        .links
+        .iter()
+        .find(|link| link.id == transition.route)
+        .ok_or(FleetPlanError::InvalidLink(transition.route))?;
+    let owner = plan.placement.owners.iter().find(|owner| {
+        owner.worker == transition.source_worker
+            && owner.value.version == transition.value.version
+            && owner.value.elements.contains(transition.value.elements)
+    });
+    let Some(owner) = owner else {
+        return Err(FleetPlanError::InvalidTransition(transition.id));
+    };
+    let bytes = super::storage::range_bytes(value, transition.value.elements)?;
+    if !execution_interval_contains(plan, transition.interval, transition.during)
+        || link.source != transition.source_worker
+        || link.destination != replica.worker
+        || bytes > link.max_transfer_bytes
+        || transition.scratch_worker != transition.source_worker
+            && transition.scratch_worker != replica.worker
+        || replica.value != transition.value
+        || replica.canonical_worker != transition.source_worker
+        || replica.origin != ReplicaOrigin::Transition(transition.id)
+        || replica.live.start != transition.during.start
+        || !replica.live.contains(transition.during)
+        || transition.during.end >= replica.live.end
+        || owner_ready_at(plan, owner)? > transition.during.start
+        || !owner.live.contains(transition.during)
+    {
+        return Err(FleetPlanError::InvalidTransition(transition.id));
+    }
+    validate_axis_map(value, &replica.layout, &transition.axes)
+        .map_err(|_| FleetPlanError::InvalidTransition(transition.id))
+}
+
+fn validate_replica(
+    plan: &FleetProofPlan,
+    replica: &FleetReplicaPlacement,
+    workers: &BTreeMap<WorkerId, &WorkerSpec>,
+) -> Result<(), FleetPlanError> {
+    let value = validate_value_range(plan, replica.value)?;
+    require_worker(workers, replica.worker)?;
+    require_worker(workers, replica.canonical_worker)?;
+    validate_layout(replica.value.version, &replica.layout)?;
+    let origin_valid = match replica.origin {
+        ReplicaOrigin::InstalledFixed => {
+            let canonical_owner = plan.placement.owners.iter().any(|owner| {
+                owner.worker == replica.canonical_worker
+                    && owner.value.version == replica.value.version
+                    && owner.value.elements.contains(replica.value.elements)
+            });
+            matches!(value.origin, ValueOrigin::Constant(_))
+                && canonical_owner
+                && replica.layout == value.layout
+                && replica.live.start == ScheduleStep(0)
+                && replica.live.end == plan.placement.terminal_step
+        }
+        ReplicaOrigin::Transition(id) => plan
+            .placement
+            .transitions
+            .get(id.0 as usize)
+            .is_some_and(|transition| transition.destination_replica == replica.id),
+    };
+    if replica.worker == replica.canonical_worker
+        || !replica.live.is_valid()
+        || replica.live.end > plan.placement.terminal_step
+        || !origin_valid
+    {
+        return Err(FleetPlanError::InvalidReplica(replica.id));
+    }
+    Ok(())
+}
+
+fn validate_effect_locations(plan: &FleetProofPlan) -> Result<(), FleetPlanError> {
+    for operation in plan.compiled.operations() {
+        let placement = operation_placement(plan, operation.id)?;
+        let effect = plan
+            .compiled
+            .effect_for(operation.id)
+            .ok_or(FleetPlanError::InvalidOperation(operation.id))?;
+        for access in effect.accesses() {
+            if let Some(read) = access.source() {
+                if !read_available(plan, read.value, placement) {
+                    return Err(FleetPlanError::UndeclaredRead {
+                        operation: operation.id,
+                        value: read.value.version,
+                    });
+                }
             }
-            ExecutionInterval::AfterFinalBarrier => {
-                let released_after = plan
-                    .barriers
-                    .last()
-                    .ok_or(FleetPlanError::TranscriptMismatch)?
-                    .release_step;
-                (released_after, plan.input.terminal_step)
-            }
-        };
-        if operation.during.start < released_after || operation.during.end >= release_before {
-            return Err(FleetPlanError::InvalidSchedule);
-        }
-        let assignment = assignments
-            .get(&operation.id)
-            .ok_or(FleetPlanError::MissingAssignment(operation.id))?;
-        require_worker(&workers, assignment.worker)?;
-        for read in &operation.reads {
-            let value = values
-                .get(&read.value)
-                .ok_or(FleetPlanError::UnknownValue(read.value))?;
-            validate_element_range(read.value, read.elements, value.layout.element_count()?)?;
-            validate_layout(read.value, &read.layout)?;
-        }
-        for write in &operation.writes {
-            let value = values
-                .get(&write.value)
-                .ok_or(FleetPlanError::UnknownValue(write.value))?;
-            validate_element_range(write.value, write.elements, value.layout.element_count()?)?;
-            if write.layout != value.layout {
-                return Err(FleetPlanError::InvalidProducer(write.value));
-            }
-        }
-        for (index, left) in operation.writes.iter().enumerate() {
-            if operation.writes[index + 1..]
-                .iter()
-                .any(|right| left.value == right.value && left.elements.overlaps(right.elements))
-            {
-                return Err(FleetPlanError::InvalidProducer(left.value));
+            if let Some(write) = access.destination() {
+                if !write_available(plan, write.value, placement)? {
+                    return Err(FleetPlanError::InvalidProducer(write.value.version));
+                }
             }
         }
     }
-    if assignments.len() != operations.len() {
-        let Some(unexpected) = assignments
-            .keys()
-            .find(|id| !operations.contains_key(id))
-            .copied()
-        else {
-            return Err(FleetPlanError::NonDenseIds);
-        };
-        return Err(FleetPlanError::UnknownOperation(unexpected));
-    }
-    validate_transcript_values(plan, transcript, &values, &operations)?;
-    validate_owners(plan, &values, &operations, &assignments, &workers)?;
-    validate_replicas_and_transitions(plan, &values, &workers)?;
-    validate_reads(plan, &values, &operations, &assignments)?;
-    validate_spill(plan, &values, &operations, &assignments, &workers)?;
-    super::storage::validate(plan, &values, &operations, &assignments, &workers)?;
-    validate_barrier_arrivals(plan, &assignments, &workers)?;
-    measure_workers(plan, &workers)
+    Ok(())
+}
+
+fn read_available(
+    plan: &FleetProofPlan,
+    range: ValueRange,
+    operation: &FleetOperationPlacement,
+) -> bool {
+    let canonical = plan.placement.owners.iter().any(|owner| {
+        owner.worker == operation.worker
+            && owner.value.version == range.version
+            && owner.value.elements.contains(range.elements)
+            && owner.live.contains(operation.during)
+            && owner_ready_at(plan, owner).is_ok_and(|ready| ready <= operation.during.start)
+    });
+    let replica = plan.placement.replicas.iter().any(|replica| {
+        replica.worker == operation.worker
+            && replica.value.version == range.version
+            && replica.value.elements.contains(range.elements)
+            && replica.live.contains(operation.during)
+            && replica_ready_at(plan, replica).is_ok_and(|ready| ready <= operation.during.start)
+            && plan
+                .compiled
+                .value(range.version)
+                .is_some_and(|value| replica.layout == value.layout)
+    });
+    canonical || replica
+}
+
+fn write_available(
+    plan: &FleetProofPlan,
+    range: ValueRange,
+    operation: &FleetOperationPlacement,
+) -> Result<bool, FleetPlanError> {
+    Ok(plan.placement.owners.iter().any(|owner| {
+        owner.worker == operation.worker
+            && owner.value.version == range.version
+            && owner.value.elements.contains(range.elements)
+            && owner.live.contains(operation.during)
+            && owner_ready_at(plan, owner) == Ok(operation.during.end)
+    }))
 }
 
 fn validate_barrier_arrivals(
     plan: &FleetProofPlan,
-    assignments: &BTreeMap<OperationId, &OperationAssignment>,
     workers: &BTreeMap<WorkerId, &WorkerSpec>,
 ) -> Result<(), FleetPlanError> {
     let expected = plan
         .barriers
         .len()
         .checked_add(1)
-        .ok_or(FleetPlanError::SizeOverflow)?
-        .checked_mul(workers.len())
+        .and_then(|count| count.checked_mul(workers.len()))
         .ok_or(FleetPlanError::SizeOverflow)?;
-    if plan.input.barrier_arrivals.len() != expected {
+    if plan.placement.barrier_arrivals.len() != expected {
         return Err(FleetPlanError::TranscriptMismatch);
     }
-    let arrivals = index_unique(
-        &plan.input.barrier_arrivals,
-        |arrival| (arrival.barrier_ordinal, arrival.worker),
-        |_| FleetPlanError::TranscriptMismatch,
-    )?;
+    let arrivals = index_unique(&plan.placement.barrier_arrivals, |arrival| {
+        (arrival.barrier_ordinal, arrival.worker)
+    })
+    .ok_or(FleetPlanError::TranscriptMismatch)?;
     for barrier in &plan.barriers {
         let released_after = barrier
             .ordinal
@@ -174,14 +361,13 @@ fn validate_barrier_arrivals(
             let arrival = arrivals
                 .get(&(barrier.ordinal, *worker))
                 .ok_or(FleetPlanError::TranscriptMismatch)?;
-            let work_completed = worker_interval_completion(
+            let completed = worker_interval_completion(
                 plan,
-                assignments,
                 *worker,
                 ExecutionInterval::BeforeBarrier(barrier.ordinal),
                 released_after,
             );
-            if arrival.ready_step < work_completed
+            if arrival.ready_step < completed
                 || arrival.ready_step < released_after
                 || arrival.ready_step >= barrier.release_step
             {
@@ -189,8 +375,7 @@ fn validate_barrier_arrivals(
             }
         }
     }
-    let terminal_ordinal =
-        u32::try_from(plan.barriers.len()).map_err(|_| FleetPlanError::SizeOverflow)?;
+    let terminal = u32::try_from(plan.barriers.len()).map_err(|_| FleetPlanError::SizeOverflow)?;
     let final_release = plan
         .barriers
         .last()
@@ -198,18 +383,17 @@ fn validate_barrier_arrivals(
         .release_step;
     for worker in workers.keys() {
         let arrival = arrivals
-            .get(&(terminal_ordinal, *worker))
+            .get(&(terminal, *worker))
             .ok_or(FleetPlanError::TranscriptMismatch)?;
-        let work_completed = worker_interval_completion(
+        let completed = worker_interval_completion(
             plan,
-            assignments,
             *worker,
             ExecutionInterval::AfterFinalBarrier,
             final_release,
         );
-        if arrival.ready_step < work_completed
+        if arrival.ready_step < completed
             || arrival.ready_step < final_release
-            || arrival.ready_step >= plan.input.terminal_step
+            || arrival.ready_step >= plan.placement.terminal_step
         {
             return Err(FleetPlanError::TranscriptMismatch);
         }
@@ -219,61 +403,55 @@ fn validate_barrier_arrivals(
 
 fn worker_interval_completion(
     plan: &FleetProofPlan,
-    assignments: &BTreeMap<OperationId, &OperationAssignment>,
     worker: WorkerId,
     interval: ExecutionInterval,
     released_after: ScheduleStep,
 ) -> ScheduleStep {
-    let operations = plan
-        .input
-        .operations
-        .iter()
-        .filter(|operation| {
-            operation.interval == interval && assignments[&operation.id].worker == worker
-        })
-        .map(|operation| operation.during.end);
-    let transitions = plan
-        .input
-        .transitions
-        .iter()
-        .filter(|transition| {
-            let destination = plan
-                .input
-                .replicas
-                .iter()
-                .find(|replica| replica.id == transition.destination_replica)
-                .map(|replica| replica.worker);
-            transition.interval == interval
-                && (transition.source_worker == worker
-                    || transition.scratch_worker == worker
-                    || destination == Some(worker))
-        })
-        .map(|transition| transition.during.end);
-    let spills = plan
-        .input
+    let operations = plan.placement.operations.iter().filter_map(|placement| {
+        let operation = operation(plan, placement.operation).ok()?;
+        (placement.worker == worker && operation_interval(plan, operation).ok()? == interval)
+            .then_some(placement.during.end)
+    });
+    let transitions = plan.placement.transitions.iter().filter_map(|transition| {
+        let destination = replica(plan, transition.destination_replica).ok()?.worker;
+        (transition.interval == interval
+            && (transition.source_worker == worker
+                || transition.scratch_worker == worker
+                || destination == worker))
+            .then_some(transition.during.end)
+    });
+    let spill = plan
+        .placement
         .spills
         .iter()
         .filter(|spill| spill.store.worker == worker)
-        .flat_map(|spill| &spill.transitions)
-        .filter(|transition| transition.interval == interval)
-        .map(|transition| transition.during.end);
+        .flat_map(|spill| {
+            spill
+                .transitions
+                .iter()
+                .filter(move |transition| transition.interval == interval)
+                .map(|transition| transition.during.end)
+                .chain(spill.vmm_reclaims.iter().flat_map(move |reclaim| {
+                    [reclaim.unmap, reclaim.remap]
+                        .into_iter()
+                        .filter(move |transition| transition.interval == interval)
+                        .map(|transition| transition.during.end)
+                }))
+        });
     operations
         .chain(transitions)
-        .chain(spills)
+        .chain(spill)
         .max()
         .unwrap_or(released_after)
 }
 
 fn validate_topology(
-    topology: &FleetTopology,
+    topology: &FleetPlacementTopology,
 ) -> Result<BTreeMap<WorkerId, &WorkerSpec>, FleetPlanError> {
     if !matches!(topology.workers.len(), 1 | 2 | 4 | 8 | 16) {
         return Err(FleetPlanError::EmptyTopology);
     }
-    if topology.module_pack_identity == [0; 32]
-        || topology.fixed_image_identity == [0; 32]
-        || topology.executable_identity.is_empty()
-    {
+    if topology.module_pack_identity == [0; 32] || topology.fixed_image_identity == [0; 32] {
         return Err(FleetPlanError::InvalidHomogeneousTopology);
     }
     let capacity_limit = match topology.gpu_class {
@@ -306,9 +484,9 @@ fn validate_topology(
             return Err(FleetPlanError::InvalidLink(link.id));
         }
     }
-    let mut numa_nodes = BTreeSet::new();
+    let mut numa = BTreeSet::new();
     for capacity in &topology.host_numa {
-        if !numa_nodes.insert(capacity.numa_node)
+        if !numa.insert(capacity.numa_node)
             || capacity.store_capacity_bytes == 0 && capacity.memlock_limit_bytes == 0
         {
             return Err(FleetPlanError::InvalidHomogeneousTopology);
@@ -321,35 +499,37 @@ fn validate_transcript(
     plan: &FleetProofPlan,
     transcript: &CairoBlake2sTranscriptPlan,
 ) -> Result<(), FleetPlanError> {
-    if plan.schedule_key != transcript.schedule_key()
-        || plan.transcript_encoding != super::identity::encode_transcript(transcript)?
+    if plan.compiled.transcript_encoding()
+        != transcript
+            .canonical_encoding()
+            .map_err(|_| FleetPlanError::TranscriptMismatch)?
         || plan.barriers.len() != transcript.segments().len()
-        || plan.input.barrier_steps.len() != transcript.segments().len()
+        || plan.placement.barrier_steps.len() != transcript.segments().len()
     {
         return Err(FleetPlanError::TranscriptMismatch);
     }
-    let mut previous_release = None;
-    for (ordinal, ((barrier, segment), release_step)) in plan
+    let mut previous = None;
+    for (ordinal, ((barrier, segment), release)) in plan
         .barriers
         .iter()
         .zip(transcript.segments())
-        .zip(&plan.input.barrier_steps)
+        .zip(&plan.placement.barrier_steps)
         .enumerate()
     {
         if barrier.ordinal as usize != ordinal
-            || barrier.coordinator != plan.input.topology.coordinator
+            || barrier.coordinator != plan.placement.topology.coordinator
             || barrier.segment != segment.segment
             || barrier.operation_range != segment.operation_range
             || barrier.starts_after != segment.starts_after
             || barrier.ends_at != segment.ends_at
-            || barrier.release_step != *release_step
-            || previous_release.is_some_and(|previous| previous >= barrier.release_step)
+            || barrier.release_step != *release
+            || previous.is_some_and(|step| step >= barrier.release_step)
         {
             return Err(FleetPlanError::TranscriptMismatch);
         }
-        previous_release = Some(barrier.release_step);
+        previous = Some(barrier.release_step);
     }
-    if previous_release.is_none_or(|release| release >= plan.input.terminal_step) {
+    if previous.is_none_or(|release| release >= plan.placement.terminal_step) {
         return Err(FleetPlanError::TranscriptMismatch);
     }
     Ok(())
@@ -361,370 +541,90 @@ pub(super) fn execution_interval_contains(
     during: ScheduleRange,
 ) -> bool {
     let bounds = match interval {
-        ExecutionInterval::BeforeBarrier(segment) => {
-            let segment = segment as usize;
-            plan.barriers.get(segment).map(|barrier| {
-                let released_after = segment.checked_sub(1).map_or(ScheduleStep(0), |previous| {
-                    plan.barriers[previous].release_step
+        ExecutionInterval::BeforeBarrier(ordinal) => {
+            plan.barriers.get(ordinal as usize).map(|barrier| {
+                let start = ordinal.checked_sub(1).map_or(ScheduleStep(0), |previous| {
+                    plan.barriers[previous as usize].release_step
                 });
-                (released_after, barrier.release_step)
+                (start, barrier.release_step)
             })
         }
         ExecutionInterval::AfterFinalBarrier => plan
             .barriers
             .last()
-            .map(|barrier| (barrier.release_step, plan.input.terminal_step)),
+            .map(|barrier| (barrier.release_step, plan.placement.terminal_step)),
     };
-    bounds.is_some_and(|(released_after, release_before)| {
-        during.is_valid() && during.start >= released_after && during.end < release_before
-    })
+    bounds
+        .is_some_and(|(start, end)| during.is_valid() && during.start >= start && during.end < end)
 }
 
-fn validate_layout(value: ValueId, layout: &ValueLayout) -> Result<(), FleetPlanError> {
-    if layout.element.bytes == 0 {
-        return Err(FleetPlanError::InvalidLayout(value));
-    }
-    let mut tags = BTreeSet::new();
-    let mut expected_stride = layout.element.bytes;
-    for axis in &layout.axes {
-        if axis.extent == 0
-            || axis.stride_bytes == 0
-            || axis.stride_bytes % layout.element.bytes != 0
-            || !tags.insert(axis.tag)
-            || axis.stride_bytes != expected_stride
-        {
-            return Err(FleetPlanError::InvalidLayout(value));
-        }
-        expected_stride = expected_stride
-            .checked_mul(axis.extent)
-            .ok_or(FleetPlanError::SizeOverflow)?;
-    }
-    if expected_stride != layout.logical_bytes()? {
-        return Err(FleetPlanError::InvalidLayout(value));
-    }
-    Ok(())
-}
-
-fn validate_owners(
+pub(super) fn operation_interval(
     plan: &FleetProofPlan,
-    values: &BTreeMap<ValueId, &ValueDesc>,
-    operations: &BTreeMap<OperationId, &OperationDesc>,
-    assignments: &BTreeMap<OperationId, &OperationAssignment>,
-    workers: &BTreeMap<WorkerId, &WorkerSpec>,
-) -> Result<(), FleetPlanError> {
-    for value in values.values() {
-        let total = value.layout.element_count()?;
-        let mut owners = plan
-            .input
-            .owners
+    operation: &OpNode,
+) -> Result<ExecutionInterval, FleetPlanError> {
+    match operation.stage {
+        ProofStage::BeforeTranscript(segment) => plan
+            .barriers
             .iter()
-            .filter(|owner| owner.value == value.id)
-            .collect::<Vec<_>>();
-        owners.sort_unstable_by_key(|owner| (owner.elements.start, owner.elements.end));
-        let mut cursor = 0usize;
-        for owner in owners {
-            require_worker(workers, owner.worker)?;
-            validate_element_range(value.id, owner.elements, total)?;
-            if !owner.live.is_valid()
-                || owner.live.end > plan.input.terminal_step
-                || owner.elements.start != cursor
-                || owner.elements.end > total
-            {
-                return Err(FleetPlanError::OwnershipCoverage(value.id));
-            }
-            cursor = owner.elements.end;
-            match (value.origin, owner.producer) {
-                (ValueOrigin::ExternalInput(_), None)
-                    if owner.live.start == ScheduleStep(0) && owner.ready_at == ScheduleStep(0) => {
-                }
-                (ValueOrigin::FixedImage(_), None)
-                    if owner.live.start == ScheduleStep(0)
-                        && owner.live.end == plan.input.terminal_step
-                        && owner.ready_at == ScheduleStep(0) => {}
-                (ValueOrigin::Operation, Some(producer)) => {
-                    let operation = operations
-                        .get(&producer)
-                        .ok_or(FleetPlanError::UnknownOperation(producer))?;
-                    let assignment = assignments
-                        .get(&producer)
-                        .ok_or(FleetPlanError::MissingAssignment(producer))?;
-                    let declares_write = operation.writes.iter().any(|write| {
-                        write.value == owner.value && write.elements == owner.elements
-                    });
-                    if assignment.worker != owner.worker
-                        || owner.ready_at != operation.during.end
-                        || !owner.live.contains(operation.during)
-                        || !declares_write
-                    {
-                        return Err(FleetPlanError::InvalidProducer(value.id));
-                    }
-                }
-                (ValueOrigin::TranscriptOutput(_), None) => {}
-                _ => return Err(FleetPlanError::InvalidProducer(value.id)),
-            }
-        }
-        if cursor != total {
-            return Err(FleetPlanError::OwnershipCoverage(value.id));
-        }
+            .position(|barrier| barrier.segment == segment)
+            .and_then(|ordinal| u32::try_from(ordinal).ok())
+            .map(ExecutionInterval::BeforeBarrier)
+            .ok_or(FleetPlanError::InvalidSegment(operation.id)),
+        ProofStage::AfterTranscript => Ok(ExecutionInterval::AfterFinalBarrier),
     }
-    for operation in operations.values() {
-        let worker = assignments[&operation.id].worker;
-        for write in &operation.writes {
-            let matches = plan
-                .input
-                .owners
-                .iter()
-                .filter(|owner| {
-                    owner.value == write.value
-                        && owner.elements == write.elements
-                        && owner.worker == worker
-                        && owner.producer == Some(operation.id)
-                })
-                .count();
-            if matches != 1 {
-                return Err(FleetPlanError::InvalidProducer(write.value));
-            }
-        }
-    }
-    if let Some(owner) = plan
-        .input
-        .owners
-        .iter()
-        .find(|owner| !values.contains_key(&owner.value))
-    {
-        return Err(FleetPlanError::UnknownValue(owner.value));
-    }
-    Ok(())
 }
 
-fn validate_replicas_and_transitions(
+pub(super) fn owner_ready_at(
     plan: &FleetProofPlan,
-    values: &BTreeMap<ValueId, &ValueDesc>,
-    workers: &BTreeMap<WorkerId, &WorkerSpec>,
-) -> Result<(), FleetPlanError> {
-    let replicas = index_unique(
-        &plan.input.replicas,
-        |replica| replica.id,
-        FleetPlanError::InvalidReplica,
-    )?;
-    let transitions = index_unique(
-        &plan.input.transitions,
-        |transition| transition.id,
-        FleetPlanError::InvalidTransition,
-    )?;
-    for transition in &plan.input.transitions {
-        let value = values
-            .get(&transition.value)
-            .ok_or(FleetPlanError::UnknownValue(transition.value))?;
-        require_worker(workers, transition.source_worker)?;
-        require_worker(workers, transition.scratch_worker)?;
-        let replica = replicas
-            .get(&transition.destination_replica)
-            .ok_or(FleetPlanError::InvalidTransition(transition.id))?;
-        let link = plan
-            .input
-            .topology
-            .links
-            .iter()
-            .find(|link| link.id == transition.route)
-            .ok_or(FleetPlanError::InvalidLink(transition.route))?;
-        validate_element_range(
-            transition.value,
-            transition.elements,
-            value.layout.element_count()?,
-        )?;
-        let owner = plan.input.owners.iter().find(|owner| {
-            owner.value == transition.value
-                && owner.worker == transition.source_worker
-                && owner.elements.contains(transition.elements)
-        });
-        let Some(owner) = owner else {
-            return Err(FleetPlanError::InvalidTransition(transition.id));
-        };
-        let expected_bytes = transition
-            .elements
-            .len()
-            .checked_mul(value.layout.element.bytes)
-            .ok_or(FleetPlanError::SizeOverflow)?;
-        let changes_layout = transition.source_layout != transition.destination_layout;
-        let covers_full_value = transition.elements.start == 0
-            && transition.elements.end == value.layout.element_count()?;
-        if !transition.during.is_valid()
-            || !execution_interval_contains(plan, transition.interval, transition.during)
-            || transition.elements.is_empty()
-            || transition.bytes != expected_bytes
-            || link.source != transition.source_worker
-            || link.destination != replica.worker
-            || transition.bytes > link.max_transfer_bytes
-            || transition.scratch_worker != transition.source_worker
-                && transition.scratch_worker != replica.worker
-            || transition.source_layout != value.layout
-            || replica.value != transition.value
-            || replica.elements != transition.elements
-            || replica.canonical_worker != transition.source_worker
-            || replica.origin != ReplicaOrigin::Transition(transition.id)
-            || replica.layout != transition.destination_layout
-            || replica.live.start != transition.during.start
-            || replica.ready_at != transition.during.end
-            || !replica.live.contains(transition.during)
-            || replica.ready_at >= replica.live.end
-            || !owner.live.contains(transition.during)
-            || owner.ready_at > transition.during.start
-            || changes_layout && !covers_full_value
-        {
-            return Err(FleetPlanError::InvalidTransition(transition.id));
-        }
-        validate_axis_map(transition)?;
+    owner: &FleetOwnerPlacement,
+) -> Result<ScheduleStep, FleetPlanError> {
+    let value = plan
+        .compiled
+        .value(owner.value.version)
+        .ok_or(FleetPlanError::UnknownValue(owner.value.version))?;
+    match value.origin {
+        ValueOrigin::ExternalInput(_) | ValueOrigin::Constant(_) => Ok(ScheduleStep(0)),
+        ValueOrigin::TranscriptOutput(_) => Ok(owner.live.start),
+        ValueOrigin::OpOutput(producer) => Ok(operation_placement(plan, producer)?.during.end),
     }
-    for replica in &plan.input.replicas {
-        require_worker(workers, replica.worker)?;
-        require_worker(workers, replica.canonical_worker)?;
-        let value = values
-            .get(&replica.value)
-            .ok_or(FleetPlanError::UnknownValue(replica.value))?;
-        validate_element_range(
-            replica.value,
-            replica.elements,
-            value.layout.element_count()?,
-        )?;
-        validate_layout(replica.value, &replica.layout)?;
-        let origin_is_valid = match replica.origin {
-            ReplicaOrigin::Transition(transition) => transitions
-                .get(&transition)
-                .is_some_and(|transition| transition.destination_replica == replica.id),
-            ReplicaOrigin::InstalledFixed => {
-                let owner = plan.input.owners.iter().any(|owner| {
-                    owner.value == replica.value
-                        && owner.worker == replica.canonical_worker
-                        && owner.elements.contains(replica.elements)
-                });
-                matches!(value.origin, ValueOrigin::FixedImage(_))
-                    && owner
-                    && replica.layout == value.layout
-                    && replica.ready_at == ScheduleStep(0)
-                    && replica.live.start == ScheduleStep(0)
-                    && replica.live.end == plan.input.terminal_step
-            }
-        };
-        if !replica.live.is_valid()
-            || replica.live.end > plan.input.terminal_step
-            || replica.worker == replica.canonical_worker
-            || !origin_is_valid
-        {
-            return Err(FleetPlanError::InvalidReplica(replica.id));
-        }
-    }
-    for pair in plan
-        .input
-        .replicas
-        .iter()
-        .enumerate()
-        .flat_map(|(index, left)| {
-            plan.input.replicas[index + 1..]
-                .iter()
-                .map(move |right| (left, right))
-        })
-    {
-        if pair.0.value == pair.1.value
-            && pair.0.worker == pair.1.worker
-            && pair.0.elements.overlaps(pair.1.elements)
-            && pair.0.live.overlaps(pair.1.live)
-        {
-            return Err(FleetPlanError::InvalidReplica(pair.1.id));
-        }
-    }
-    Ok(())
 }
 
-fn validate_axis_map(transition: &LayoutTransition) -> Result<(), FleetPlanError> {
-    validate_layout(transition.value, &transition.source_layout)?;
-    validate_layout(transition.value, &transition.destination_layout)?;
-    if transition.source_layout.element != transition.destination_layout.element
-        || transition.axes.len() != transition.source_layout.axes.len()
-    {
-        return Err(FleetPlanError::InvalidTransition(transition.id));
-    }
-    let source = transition
-        .source_layout
-        .axes
-        .iter()
-        .map(|axis| (axis.tag, axis.extent))
-        .collect::<BTreeMap<_, _>>();
-    let destination = transition
-        .destination_layout
-        .axes
-        .iter()
-        .map(|axis| (axis.tag, axis.extent))
-        .collect::<BTreeMap<_, _>>();
-    let mut used_source = BTreeSet::new();
-    let mut used_destination = BTreeSet::new();
-    for axis in &transition.axes {
-        let extents_match = matches!(
-            (source.get(&axis.source), destination.get(&axis.destination)),
-            (Some(source_extent), Some(destination_extent)) if source_extent == destination_extent
-        );
-        if axis.source != axis.destination
-            || !extents_match
-            || !used_source.insert(axis.source)
-            || !used_destination.insert(axis.destination)
-        {
-            return Err(FleetPlanError::InvalidTransition(transition.id));
-        }
-    }
-    if used_source.len() != source.len() || used_destination.len() != destination.len() {
-        return Err(FleetPlanError::InvalidTransition(transition.id));
-    }
-    Ok(())
-}
-
-fn validate_reads(
+pub(super) fn replica_ready_at(
     plan: &FleetProofPlan,
-    values: &BTreeMap<ValueId, &ValueDesc>,
-    operations: &BTreeMap<OperationId, &OperationDesc>,
-    assignments: &BTreeMap<OperationId, &OperationAssignment>,
-) -> Result<(), FleetPlanError> {
-    for operation in operations.values() {
-        let worker = assignments[&operation.id].worker;
-        for read in &operation.reads {
-            let canonical = plan.input.owners.iter().any(|owner| {
-                owner.value == read.value
-                    && owner.worker == worker
-                    && owner.elements.contains(read.elements)
-                    && owner.live.contains(operation.during)
-                    && owner.ready_at <= operation.during.start
-                    && read.layout == values[&read.value].layout
-            });
-            let replica = plan.input.replicas.iter().any(|replica| {
-                replica.value == read.value
-                    && replica.worker == worker
-                    && replica.elements.contains(read.elements)
-                    && replica.live.contains(operation.during)
-                    && replica.ready_at <= operation.during.start
-                    && replica.layout == read.layout
-            });
-            if !canonical && !replica {
-                return Err(FleetPlanError::UndeclaredRead {
-                    operation: operation.id,
-                    value: read.value,
-                });
-            }
-        }
+    replica: &FleetReplicaPlacement,
+) -> Result<ScheduleStep, FleetPlanError> {
+    match replica.origin {
+        ReplicaOrigin::InstalledFixed => Ok(ScheduleStep(0)),
+        ReplicaOrigin::Transition(id) => Ok(plan
+            .placement
+            .transitions
+            .get(id.0 as usize)
+            .filter(|transition| transition.id == id)
+            .ok_or(FleetPlanError::InvalidReplica(replica.id))?
+            .during
+            .end),
     }
-    Ok(())
 }
 
-fn validate_element_range(
-    value: ValueId,
-    range: ElementRange,
-    total: usize,
-) -> Result<(), FleetPlanError> {
-    if range.is_empty() || range.end > total {
-        return Err(FleetPlanError::InvalidRange(value));
+pub(super) fn validate_value_range(
+    plan: &FleetProofPlan,
+    range: ValueRange,
+) -> Result<&ValueDesc, FleetPlanError> {
+    let value = plan
+        .compiled
+        .value(range.version)
+        .ok_or(FleetPlanError::UnknownValue(range.version))?;
+    let total = value
+        .layout
+        .element_count()
+        .map_err(|_| FleetPlanError::SizeOverflow)?;
+    if range.elements.is_empty() || range.elements.end > total {
+        return Err(FleetPlanError::InvalidRange(range.version));
     }
-    Ok(())
+    Ok(value)
 }
 
-fn require_worker<T>(
+pub(super) fn require_worker<T>(
     workers: &BTreeMap<WorkerId, T>,
     worker: WorkerId,
 ) -> Result<(), FleetPlanError> {
@@ -734,17 +634,104 @@ fn require_worker<T>(
         .ok_or(FleetPlanError::UnknownWorker(worker))
 }
 
-fn index_unique<'a, T, K: Ord + Copy>(
-    values: &'a [T],
-    key: impl Fn(&T) -> K,
-    duplicate: impl Fn(K) -> FleetPlanError,
-) -> Result<BTreeMap<K, &'a T>, FleetPlanError> {
+fn operation(plan: &FleetProofPlan, id: OpId) -> Result<&OpNode, FleetPlanError> {
+    plan.compiled
+        .operations()
+        .get(id.0 as usize)
+        .filter(|operation| operation.id == id)
+        .ok_or(FleetPlanError::UnknownOperation(id))
+}
+
+pub(super) fn operation_placement(
+    plan: &FleetProofPlan,
+    id: OpId,
+) -> Result<&FleetOperationPlacement, FleetPlanError> {
+    plan.placement
+        .operations
+        .get(id.0 as usize)
+        .filter(|placement| placement.operation == id)
+        .ok_or(FleetPlanError::MissingOperation(id))
+}
+
+fn replica(plan: &FleetProofPlan, id: ReplicaId) -> Result<&FleetReplicaPlacement, FleetPlanError> {
+    plan.placement
+        .replicas
+        .get(id.0 as usize)
+        .filter(|replica| replica.id == id)
+        .ok_or(FleetPlanError::InvalidReplica(id))
+}
+
+fn validate_layout(version: ValueVersion, layout: &ValueLayout) -> Result<(), FleetPlanError> {
+    if layout.element.bytes == 0 {
+        return Err(FleetPlanError::InvalidRange(version));
+    }
+    let mut tags = BTreeSet::new();
+    let mut stride = layout.element.bytes;
+    for axis in &layout.axes {
+        if axis.extent == 0 || axis.stride_bytes != stride || !tags.insert(axis.tag) {
+            return Err(FleetPlanError::InvalidRange(version));
+        }
+        stride = stride
+            .checked_mul(axis.extent)
+            .ok_or(FleetPlanError::SizeOverflow)?;
+    }
+    Ok(())
+}
+
+fn validate_axis_map(
+    value: &ValueDesc,
+    destination: &ValueLayout,
+    axes: &[AxisMap],
+) -> Result<(), FleetPlanError> {
+    if destination != &value.layout || axes.len() != value.layout.axes.len() {
+        return Err(FleetPlanError::InvalidRange(value.version));
+    }
+    let expected = value
+        .layout
+        .axes
+        .iter()
+        .map(|axis| axis.tag)
+        .collect::<BTreeSet<_>>();
+    let actual = axes
+        .iter()
+        .filter(|axis| axis.source == axis.destination)
+        .map(|axis| axis.source)
+        .collect::<BTreeSet<_>>();
+    if actual.len() != axes.len() || actual != expected {
+        return Err(FleetPlanError::InvalidRange(value.version));
+    }
+    Ok(())
+}
+
+fn range_covered(target: ElementRange, ranges: &[ValueRange]) -> bool {
+    let mut ranges = ranges
+        .iter()
+        .map(|range| range.elements)
+        .filter(|range| target.overlaps(*range))
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut cursor = target.start;
+    for range in ranges {
+        let start = range.start.max(target.start);
+        let end = range.end.min(target.end);
+        if start != cursor {
+            return false;
+        }
+        cursor = end;
+    }
+    cursor == target.end
+}
+
+fn ranges_overlap(left: ValueRange, right: ValueRange) -> bool {
+    left.version == right.version && left.elements.overlaps(right.elements)
+}
+
+fn index_unique<T, K: Ord + Copy>(values: &[T], key: impl Fn(&T) -> K) -> Option<BTreeMap<K, &T>> {
     let mut indexed = BTreeMap::new();
     for value in values {
-        let key = key(value);
-        if indexed.insert(key, value).is_some() {
-            return Err(duplicate(key));
+        if indexed.insert(key(value), value).is_some() {
+            return None;
         }
     }
-    Ok(indexed)
+    Some(indexed)
 }

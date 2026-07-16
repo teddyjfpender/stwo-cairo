@@ -1,18 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{
-    DeclaredReplica, ElementRange, FleetPlanError, FleetProofPlan, OperationAssignment,
-    OperationDesc, OperationId, OwnedValueRange, ScheduleRange, ValueDesc, ValueId, WorkerId,
-    WorkerSpec,
-};
-pub use crate::compiled_proof::EffectContractId;
+use super::*;
+use crate::compiled_proof::{InPlaceAliasRequirement, ValueDesc, ValueRange, ValueVersion};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct StorageId(pub u32);
 
-/// One worker-local physical allocation retained for the installed graph.
-/// Logical values may share it only through disjoint byte ranges, disjoint
-/// lifetimes, or a verified alias. No spill or logical death releases VRAM.
+/// One stable worker-local virtual allocation. Physical backing remains mapped
+/// for the installed graph unless an exact whole-storage VMM reclaim says when
+/// it is safely unmapped and remapped at the same address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StorageDesc {
     pub id: StorageId,
@@ -21,51 +17,15 @@ pub struct StorageDesc {
     pub alignment_bytes: usize,
 }
 
-/// Exact placement of one canonical owner or declared replica in storage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StorageBinding {
-    pub storage: StorageId,
-    pub value: ValueId,
-    pub elements: ElementRange,
-    pub worker: WorkerId,
-    pub offset_bytes: usize,
-    pub bytes: usize,
-}
-
-/// Explicit permission for one operation to consume an old ValueId and
-/// produce a distinct ValueId in the exact same physical byte range.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InPlaceAlias {
-    pub operation: OperationId,
-    pub effect: EffectContractId,
-    pub source: ValueId,
-    pub source_elements: ElementRange,
-    pub destination: ValueId,
-    pub destination_elements: ElementRange,
-    pub storage: StorageId,
-    pub offset_bytes: usize,
-    pub bytes: usize,
-}
-
 pub(super) fn validate(
     plan: &FleetProofPlan,
-    values: &BTreeMap<ValueId, &ValueDesc>,
-    operations: &BTreeMap<OperationId, &OperationDesc>,
-    assignments: &BTreeMap<OperationId, &OperationAssignment>,
     workers: &BTreeMap<WorkerId, &WorkerSpec>,
 ) -> Result<(), FleetPlanError> {
-    for operation in operations.values() {
-        if operation.effect_identity.0 == [0; 32] {
-            return Err(FleetPlanError::InvalidEffectContract(operation.id));
-        }
-    }
-
     let mut storages = BTreeMap::new();
-    for (ordinal, storage) in plan.input.storages.iter().enumerate() {
-        if storage.id.0 as usize != ordinal || storages.insert(storage.id, storage).is_some() {
-            return Err(FleetPlanError::InvalidStorage(storage.id));
-        }
-        if !workers.contains_key(&storage.worker)
+    for (ordinal, storage) in plan.placement.storages.iter().enumerate() {
+        if storage.id.0 as usize != ordinal
+            || storages.insert(storage.id, storage).is_some()
+            || !workers.contains_key(&storage.worker)
             || storage.bytes == 0
             || storage.alignment_bytes == 0
             || !storage.alignment_bytes.is_power_of_two()
@@ -74,51 +34,17 @@ pub(super) fn validate(
         }
     }
 
-    for binding in &plan.input.storage_bindings {
-        validate_binding(plan, binding, values, &storages)?;
+    for binding in &plan.placement.storage_bindings {
+        validate_binding(plan, binding, &storages)?;
     }
-    validate_exact_location_coverage(plan)?;
-
-    let mut alias_keys = BTreeSet::new();
-    for alias in &plan.input.in_place_aliases {
-        let key = (
-            alias.operation,
-            alias.source,
-            alias.source_elements.start,
-            alias.source_elements.end,
-            alias.destination,
-            alias.destination_elements.start,
-            alias.destination_elements.end,
-        );
-        if !alias_keys.insert(key) {
-            return Err(FleetPlanError::InvalidInPlaceAlias(alias.operation));
-        }
-        validate_alias(plan, alias, operations, assignments, &storages)?;
-    }
-
-    for (index, left) in plan.input.storage_bindings.iter().enumerate() {
-        let left_live = binding_live(plan, left)?;
-        for right in &plan.input.storage_bindings[index + 1..] {
-            if left.storage != right.storage
-                || !byte_range(left)?.overlaps(byte_range(right)?)
-                || !left_live.overlaps(binding_live(plan, right)?)
-            {
-                continue;
-            }
-            if !plan
-                .input
-                .in_place_aliases
-                .iter()
-                .any(|alias| alias_matches_pair(alias, left, right))
-            {
-                return Err(FleetPlanError::IllegalStorageReuse(left.storage));
-            }
-        }
-    }
+    validate_location_coverage(plan)?;
+    validate_aliases(plan, &storages)?;
+    validate_reuse(plan)?;
+    validate_proof_output(plan, &storages)?;
 
     for storage in storages.keys() {
         if !plan
-            .input
+            .placement
             .storage_bindings
             .iter()
             .any(|binding| binding.storage == *storage)
@@ -131,65 +57,109 @@ pub(super) fn validate(
 
 fn validate_binding(
     plan: &FleetProofPlan,
-    binding: &StorageBinding,
-    values: &BTreeMap<ValueId, &ValueDesc>,
+    binding: &FleetStoragePlacement,
     storages: &BTreeMap<StorageId, &StorageDesc>,
 ) -> Result<(), FleetPlanError> {
     let storage = storages
         .get(&binding.storage)
         .ok_or(FleetPlanError::InvalidStorage(binding.storage))?;
-    let value = values
-        .get(&binding.value)
-        .ok_or(FleetPlanError::UnknownValue(binding.value))?;
-    let expected = binding
-        .elements
-        .len()
-        .checked_mul(value.layout.element.bytes)
-        .ok_or(FleetPlanError::SizeOverflow)?;
+    let value = value(plan, binding.value.version)?;
+    let bytes = range_bytes(value, binding.value.elements)?;
     let end = binding
         .offset_bytes
-        .checked_add(binding.bytes)
+        .checked_add(bytes)
         .ok_or(FleetPlanError::SizeOverflow)?;
-    if binding.elements.is_empty()
-        || binding.elements.end > value.layout.element_count()?
-        || binding.worker != storage.worker
-        || binding.bytes != expected
-        || value.alignment_bytes == 0
-        || !value.alignment_bytes.is_power_of_two()
-        || storage.alignment_bytes < value.alignment_bytes
-        || binding.offset_bytes % value.alignment_bytes != 0
+    if value.alignment == 0
+        || !value.alignment.is_power_of_two()
+        || storage.alignment_bytes < value.alignment
+        || binding.offset_bytes % value.alignment != 0
         || end > storage.bytes
         || matching_locations(plan, binding) != 1
     {
-        return Err(FleetPlanError::InvalidStorageBinding {
-            value: binding.value,
-            storage: binding.storage,
-        });
+        return Err(invalid_binding(binding));
     }
     Ok(())
 }
 
-fn validate_exact_location_coverage(plan: &FleetProofPlan) -> Result<(), FleetPlanError> {
-    for owner in &plan.input.owners {
-        let count = plan
-            .input
-            .storage_bindings
-            .iter()
-            .filter(|binding| binding_matches_owner(binding, owner))
-            .count();
-        if count != 1 {
-            return Err(FleetPlanError::StorageCoverage(owner.value));
+fn validate_location_coverage(plan: &FleetProofPlan) -> Result<(), FleetPlanError> {
+    for owner in &plan.placement.owners {
+        validate_one_location_coverage(plan, owner.value, owner.worker)?;
+    }
+    for replica in &plan.placement.replicas {
+        validate_one_location_coverage(plan, replica.value, replica.worker)?;
+    }
+    for binding in &plan.placement.storage_bindings {
+        if matching_locations(plan, binding) != 1 {
+            return Err(invalid_binding(binding));
         }
     }
-    for replica in &plan.input.replicas {
-        let count = plan
-            .input
-            .storage_bindings
-            .iter()
-            .filter(|binding| binding_matches_replica(binding, replica))
-            .count();
-        if count != 1 {
-            return Err(FleetPlanError::StorageCoverage(replica.value));
+    Ok(())
+}
+
+fn validate_one_location_coverage(
+    plan: &FleetProofPlan,
+    location: ValueRange,
+    worker: WorkerId,
+) -> Result<(), FleetPlanError> {
+    let mut ranges = plan
+        .placement
+        .storage_bindings
+        .iter()
+        .filter_map(|binding| {
+            let storage = storage(plan, binding.storage)?;
+            (storage.worker == worker
+                && binding.value.version == location.version
+                && location.elements.contains(binding.value.elements))
+            .then_some(binding.value.elements)
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut cursor = location.elements.start;
+    for range in ranges {
+        if range.start != cursor || range.end > location.elements.end {
+            return Err(FleetPlanError::StorageCoverage(location.version));
+        }
+        cursor = range.end;
+    }
+    if cursor != location.elements.end {
+        return Err(FleetPlanError::StorageCoverage(location.version));
+    }
+    Ok(())
+}
+
+fn validate_aliases(
+    plan: &FleetProofPlan,
+    storages: &BTreeMap<StorageId, &StorageDesc>,
+) -> Result<(), FleetPlanError> {
+    let mut keys = BTreeSet::new();
+    for alias in &plan.placement.in_place_aliases {
+        if !keys.insert((alias.operation, alias.alias)) {
+            return Err(invalid_alias(alias.operation, alias.alias));
+        }
+        validate_alias(plan, alias, storages)?;
+    }
+
+    for operation in plan.compiled.operations() {
+        let effect = plan
+            .compiled
+            .effect_for(operation.id)
+            .ok_or(FleetPlanError::InvalidOperation(operation.id))?;
+        for access in effect.accesses() {
+            let Some(authority) = access.in_place() else {
+                continue;
+            };
+            let count = plan
+                .placement
+                .in_place_aliases
+                .iter()
+                .filter(|placement| {
+                    placement.operation == operation.id && placement.alias == authority.id
+                })
+                .count();
+            if count > 1 || authority.requirement == InPlaceAliasRequirement::Required && count != 1
+            {
+                return Err(invalid_alias(operation.id, authority.id));
+            }
         }
     }
     Ok(())
@@ -197,234 +167,406 @@ fn validate_exact_location_coverage(plan: &FleetProofPlan) -> Result<(), FleetPl
 
 fn validate_alias(
     plan: &FleetProofPlan,
-    alias: &InPlaceAlias,
-    operations: &BTreeMap<OperationId, &OperationDesc>,
-    assignments: &BTreeMap<OperationId, &OperationAssignment>,
+    alias: &InPlaceAliasPlacement,
     storages: &BTreeMap<StorageId, &StorageDesc>,
 ) -> Result<(), FleetPlanError> {
-    let operation = operations
-        .get(&alias.operation)
+    let operation = plan
+        .compiled
+        .operations()
+        .get(alias.operation.0 as usize)
+        .filter(|operation| operation.id == alias.operation)
         .ok_or(FleetPlanError::UnknownOperation(alias.operation))?;
-    let assignment = assignments
-        .get(&alias.operation)
-        .ok_or(FleetPlanError::MissingAssignment(alias.operation))?;
+    let operation_placement = operation_placement(plan, operation.id)?;
+    let effect = plan
+        .compiled
+        .effect_for(operation.id)
+        .ok_or(FleetPlanError::InvalidOperation(operation.id))?;
+    let bound = effect
+        .in_place_alias(alias.alias)
+        .ok_or_else(|| invalid_alias(operation.id, alias.alias))?;
+    let source = bound
+        .source()
+        .ok_or_else(|| invalid_alias(operation.id, alias.alias))?
+        .value;
+    let destination = bound
+        .destination()
+        .ok_or_else(|| invalid_alias(operation.id, alias.alias))?
+        .value;
     let storage = storages
         .get(&alias.storage)
         .ok_or(FleetPlanError::InvalidStorage(alias.storage))?;
-    let source = unique_binding(
-        plan,
-        alias.storage,
-        alias.source,
-        alias.source_elements,
-        alias.offset_bytes,
-        alias.bytes,
-    )?;
-    let destination = unique_binding(
-        plan,
-        alias.storage,
-        alias.destination,
-        alias.destination_elements,
-        alias.offset_bytes,
-        alias.bytes,
-    )?;
-    let source_live = binding_live(plan, source)?;
-    let destination_live = binding_live(plan, destination)?;
-    let overlapping_reads = operation
-        .reads
-        .iter()
-        .filter(|read| read.value == alias.source && read.elements.overlaps(alias.source_elements))
-        .collect::<Vec<_>>();
-    let overlapping_writes = operation
-        .writes
-        .iter()
-        .filter(|write| {
-            write.value == alias.destination && write.elements.overlaps(alias.destination_elements)
-        })
-        .collect::<Vec<_>>();
-    let exact_read =
-        overlapping_reads.len() == 1 && overlapping_reads[0].elements == alias.source_elements;
-    let exact_write = overlapping_writes.len() == 1
-        && overlapping_writes[0].elements == alias.destination_elements;
-    if alias.source == alias.destination
-        || alias.effect.0 == [0; 32]
-        || alias.effect != operation.effect_identity
-        || assignment.worker != storage.worker
-        || source.worker != storage.worker
-        || destination.worker != storage.worker
-        || !exact_read
-        || !exact_write
-        || source_live.end != operation.during.end
-        || destination_live.start != operation.during.start
-        || has_concurrent_source_consumer(plan, alias, source, operation, assignments)?
+    let source_binding = exact_binding(plan, alias.storage, source)?;
+    let destination_binding = exact_binding(plan, alias.storage, destination)?;
+    let source_bytes = range_bytes(value(plan, source.version)?, source.elements)?;
+    let destination_bytes = range_bytes(value(plan, destination.version)?, destination.elements)?;
+    let source_live = binding_live(plan, source_binding)?;
+    let destination_live = binding_live(plan, destination_binding)?;
+    if source.version == destination.version
+        || source_bytes != destination_bytes
+        || storage.worker != operation_placement.worker
+        || source_binding.offset_bytes != alias.offset_bytes
+        || destination_binding.offset_bytes != alias.offset_bytes
+        || source_live.end != operation_placement.during.end
+        || destination_live.start != operation_placement.during.start
+        || has_concurrent_source_consumer(plan, operation.id, source, operation_placement)?
     {
-        return Err(FleetPlanError::InvalidInPlaceAlias(alias.operation));
+        return Err(invalid_alias(operation.id, alias.alias));
+    }
+    Ok(())
+}
+
+fn validate_reuse(plan: &FleetProofPlan) -> Result<(), FleetPlanError> {
+    for (index, left) in plan.placement.storage_bindings.iter().enumerate() {
+        let left_live = binding_live(plan, left)?;
+        for right in &plan.placement.storage_bindings[index + 1..] {
+            if left.storage != right.storage
+                || !binding_bytes(plan, left)?.overlaps(binding_bytes(plan, right)?)
+                || !left_live.overlaps(binding_live(plan, right)?)
+            {
+                continue;
+            }
+            if !plan
+                .placement
+                .in_place_aliases
+                .iter()
+                .any(|alias| alias_matches_pair(plan, alias, left, right))
+            {
+                return Err(FleetPlanError::IllegalStorageReuse(left.storage));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_proof_output(
+    plan: &FleetProofPlan,
+    storages: &BTreeMap<StorageId, &StorageDesc>,
+) -> Result<(), FleetPlanError> {
+    let id = plan.placement.output_storage;
+    let storage = storages
+        .get(&id)
+        .ok_or(FleetPlanError::InvalidProofOutput(id))?;
+    let output = plan.compiled.output();
+    let expected_bytes = output
+        .layout
+        .total_words
+        .checked_mul(size_of::<u32>())
+        .ok_or(FleetPlanError::SizeOverflow)?;
+    if storage.worker != plan.placement.topology.coordinator
+        || storage.bytes != expected_bytes
+        || storage.alignment_bytes < align_of::<u32>()
+    {
+        return Err(FleetPlanError::InvalidProofOutput(id));
+    }
+    let destinations = output_ranges(&output.layout);
+    if output.sections.len() != destinations.len() {
+        return Err(FleetPlanError::InvalidProofOutput(id));
+    }
+    let bindings = plan
+        .placement
+        .storage_bindings
+        .iter()
+        .filter(|binding| binding.storage == id)
+        .collect::<Vec<_>>();
+    if bindings.len() != output.sections.len() {
+        return Err(FleetPlanError::InvalidProofOutput(id));
+    }
+    for (section, destination) in output.sections.iter().zip(destinations) {
+        let offset = destination
+            .start
+            .checked_mul(size_of::<u32>())
+            .ok_or(FleetPlanError::SizeOverflow)?;
+        let bytes = destination
+            .len()
+            .checked_mul(size_of::<u32>())
+            .ok_or(FleetPlanError::SizeOverflow)?;
+        let source_bytes = range_bytes(value(plan, section.value)?, section.elements)?;
+        if source_bytes != bytes {
+            return Err(FleetPlanError::InvalidProofOutput(id));
+        }
+        let mut exact = bindings.iter().filter(|binding| {
+            binding.value.version == section.value
+                && binding.value.elements == section.elements
+                && binding.offset_bytes == offset
+        });
+        let Some(binding) = exact.next() else {
+            return Err(FleetPlanError::InvalidProofOutput(id));
+        };
+        if exact.next().is_some()
+            || binding_live(plan, binding)?.end != plan.placement.terminal_step
+        {
+            return Err(FleetPlanError::InvalidProofOutput(id));
+        }
     }
     Ok(())
 }
 
 fn has_concurrent_source_consumer(
     plan: &FleetProofPlan,
-    alias: &InPlaceAlias,
-    source: &StorageBinding,
-    operation: &OperationDesc,
-    assignments: &BTreeMap<OperationId, &OperationAssignment>,
+    aliased_operation: OpId,
+    source: ValueRange,
+    aliased_placement: &FleetOperationPlacement,
 ) -> Result<bool, FleetPlanError> {
-    let operation_consumer = plan.input.operations.iter().any(|other| {
-        other.id != alias.operation
-            && assignments
-                .get(&other.id)
-                .is_some_and(|assignment| assignment.worker == source.worker)
-            && other.during.overlaps(operation.during)
-            && other.reads.iter().any(|read| {
-                read.value == alias.source && read.elements.overlaps(alias.source_elements)
-            })
-    });
-    let transition_consumer = plan.input.transitions.iter().any(|transition| {
-        transition.source_worker == source.worker
-            && transition.value == alias.source
-            && transition.elements.overlaps(alias.source_elements)
-            && transition.during.overlaps(operation.during)
-    });
-    let mut spill_consumer = false;
-    for spill in plan
-        .input
-        .spills
-        .iter()
-        .filter(|spill| spill.store.worker == source.worker)
-    {
-        for chunk in spill.chunks.iter().filter(|chunk| {
-            chunk.value == alias.source && chunk.elements.overlaps(alias.source_elements)
+    for placement in &plan.placement.operations {
+        if placement.operation == aliased_operation
+            || placement.worker != aliased_placement.worker
+            || !placement.during.overlaps(aliased_placement.during)
+        {
+            continue;
+        }
+        let operation = operation(plan, placement.operation)?;
+        let effect = plan
+            .compiled
+            .effect_for(operation.id)
+            .ok_or(FleetPlanError::InvalidOperation(operation.id))?;
+        if effect.accesses().iter().any(|effect| {
+            effect
+                .source()
+                .is_some_and(|read| ranges_overlap(read.value, source))
         }) {
-            let [d2h, _, _, _] = spill.chain(chunk.id)?;
-            spill_consumer |= d2h.during.overlaps(operation.during);
+            return Ok(true);
         }
     }
-    Ok(operation_consumer || transition_consumer || spill_consumer)
-}
-
-fn unique_binding(
-    plan: &FleetProofPlan,
-    storage: StorageId,
-    value: ValueId,
-    elements: ElementRange,
-    offset_bytes: usize,
-    bytes: usize,
-) -> Result<&StorageBinding, FleetPlanError> {
-    let mut matches = plan.input.storage_bindings.iter().filter(|binding| {
-        binding.storage == storage
-            && binding.value == value
-            && binding.elements == elements
-            && binding.offset_bytes == offset_bytes
-            && binding.bytes == bytes
-    });
-    let first = matches
-        .next()
-        .ok_or(FleetPlanError::InvalidStorageBinding { value, storage })?;
-    if matches.next().is_some() {
-        return Err(FleetPlanError::InvalidStorageBinding { value, storage });
+    if plan.placement.transitions.iter().any(|transition| {
+        transition.source_worker == aliased_placement.worker
+            && ranges_overlap(transition.value, source)
+            && transition.during.overlaps(aliased_placement.during)
+    }) {
+        return Ok(true);
     }
-    Ok(first)
+    for spill in plan
+        .placement
+        .spills
+        .iter()
+        .filter(|spill| spill.store.worker == aliased_placement.worker)
+    {
+        for chunk in spill
+            .chunks
+            .iter()
+            .filter(|chunk| ranges_overlap(chunk.value, source))
+        {
+            let [d2h, _, _, _] = spill.chain(chunk.id)?;
+            if d2h.during.overlaps(aliased_placement.during) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
-fn alias_matches_pair(alias: &InPlaceAlias, left: &StorageBinding, right: &StorageBinding) -> bool {
-    let matches = |source: &StorageBinding, destination: &StorageBinding| {
-        alias.storage == source.storage
-            && source.storage == destination.storage
-            && alias.source == source.value
-            && alias.source_elements == source.elements
-            && alias.destination == destination.value
-            && alias.destination_elements == destination.elements
-            && alias.offset_bytes == source.offset_bytes
-            && source.offset_bytes == destination.offset_bytes
-            && alias.bytes == source.bytes
-            && source.bytes == destination.bytes
+fn alias_matches_pair(
+    plan: &FleetProofPlan,
+    alias: &InPlaceAliasPlacement,
+    left: &FleetStoragePlacement,
+    right: &FleetStoragePlacement,
+) -> bool {
+    let Some(operation) = plan.compiled.operations().get(alias.operation.0 as usize) else {
+        return false;
+    };
+    let Some(effect) = plan.compiled.effect_for(operation.id) else {
+        return false;
+    };
+    let Some(bound) = effect.in_place_alias(alias.alias) else {
+        return false;
+    };
+    let (Some(source), Some(destination)) = (bound.source(), bound.destination()) else {
+        return false;
+    };
+    let matches = |source_binding: &FleetStoragePlacement,
+                   destination_binding: &FleetStoragePlacement| {
+        alias.storage == source_binding.storage
+            && source_binding.storage == destination_binding.storage
+            && source_binding.value == source.value
+            && destination_binding.value == destination.value
+            && source_binding.offset_bytes == alias.offset_bytes
+            && destination_binding.offset_bytes == alias.offset_bytes
     };
     matches(left, right) || matches(right, left)
 }
 
-#[derive(Clone, Copy)]
-struct ByteRange {
-    start: usize,
-    end: usize,
+fn exact_binding(
+    plan: &FleetProofPlan,
+    storage: StorageId,
+    value: ValueRange,
+) -> Result<&FleetStoragePlacement, FleetPlanError> {
+    let mut matches = plan
+        .placement
+        .storage_bindings
+        .iter()
+        .filter(|binding| binding.storage == storage && binding.value == value);
+    let binding = matches
+        .next()
+        .ok_or(FleetPlanError::InvalidStorageBinding {
+            value: value.version,
+            storage,
+        })?;
+    if matches.next().is_some() {
+        return Err(invalid_binding(binding));
+    }
+    Ok(binding)
 }
 
-impl ByteRange {
-    fn overlaps(self, other: Self) -> bool {
+pub(super) fn binding_live(
+    plan: &FleetProofPlan,
+    binding: &FleetStoragePlacement,
+) -> Result<ScheduleRange, FleetPlanError> {
+    let worker = storage(plan, binding.storage)
+        .ok_or(FleetPlanError::InvalidStorage(binding.storage))?
+        .worker;
+    let mut lives = plan
+        .placement
+        .owners
+        .iter()
+        .filter(|owner| {
+            owner.worker == worker
+                && owner.value.version == binding.value.version
+                && owner.value.elements.contains(binding.value.elements)
+        })
+        .map(|owner| owner.live)
+        .chain(
+            plan.placement
+                .replicas
+                .iter()
+                .filter(|replica| {
+                    replica.worker == worker
+                        && replica.value.version == binding.value.version
+                        && replica.value.elements.contains(binding.value.elements)
+                })
+                .map(|replica| replica.live),
+        );
+    let live = lives.next().ok_or_else(|| invalid_binding(binding))?;
+    if lives.next().is_some() {
+        return Err(invalid_binding(binding));
+    }
+    Ok(live)
+}
+
+pub(super) fn storage(plan: &FleetProofPlan, id: StorageId) -> Option<&StorageDesc> {
+    plan.placement
+        .storages
+        .get(id.0 as usize)
+        .filter(|storage| storage.id == id)
+}
+
+pub(super) fn range_bytes(value: &ValueDesc, range: ElementRange) -> Result<usize, FleetPlanError> {
+    let total = value
+        .layout
+        .element_count()
+        .map_err(|_| FleetPlanError::SizeOverflow)?;
+    if range.is_empty() || range.end > total {
+        return Err(FleetPlanError::InvalidRange(value.version));
+    }
+    range
+        .len()
+        .checked_mul(value.layout.element.bytes)
+        .ok_or(FleetPlanError::SizeOverflow)
+}
+
+fn value(plan: &FleetProofPlan, version: ValueVersion) -> Result<&ValueDesc, FleetPlanError> {
+    plan.compiled
+        .value(version)
+        .ok_or(FleetPlanError::UnknownValue(version))
+}
+
+fn operation(
+    plan: &FleetProofPlan,
+    id: OpId,
+) -> Result<&crate::compiled_proof::OpNode, FleetPlanError> {
+    plan.compiled
+        .operations()
+        .get(id.0 as usize)
+        .filter(|operation| operation.id == id)
+        .ok_or(FleetPlanError::UnknownOperation(id))
+}
+
+fn operation_placement(
+    plan: &FleetProofPlan,
+    id: OpId,
+) -> Result<&FleetOperationPlacement, FleetPlanError> {
+    plan.placement
+        .operations
+        .get(id.0 as usize)
+        .filter(|placement| placement.operation == id)
+        .ok_or(FleetPlanError::MissingOperation(id))
+}
+
+fn matching_locations(plan: &FleetProofPlan, binding: &FleetStoragePlacement) -> usize {
+    let Some(storage) = storage(plan, binding.storage) else {
+        return 0;
+    };
+    plan.placement
+        .owners
+        .iter()
+        .filter(|owner| {
+            owner.worker == storage.worker
+                && owner.value.version == binding.value.version
+                && owner.value.elements.contains(binding.value.elements)
+        })
+        .count()
+        + plan
+            .placement
+            .replicas
+            .iter()
+            .filter(|replica| {
+                replica.worker == storage.worker
+                    && replica.value.version == binding.value.version
+                    && replica.value.elements.contains(binding.value.elements)
+            })
+            .count()
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ByteWindow {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl ByteWindow {
+    pub const fn overlaps(self, other: Self) -> bool {
         self.start < other.end && other.start < self.end
     }
 }
 
-fn byte_range(binding: &StorageBinding) -> Result<ByteRange, FleetPlanError> {
-    Ok(ByteRange {
+pub(super) fn binding_bytes(
+    plan: &FleetProofPlan,
+    binding: &FleetStoragePlacement,
+) -> Result<ByteWindow, FleetPlanError> {
+    let bytes = range_bytes(value(plan, binding.value.version)?, binding.value.elements)?;
+    Ok(ByteWindow {
         start: binding.offset_bytes,
         end: binding
             .offset_bytes
-            .checked_add(binding.bytes)
+            .checked_add(bytes)
             .ok_or(FleetPlanError::SizeOverflow)?,
     })
 }
 
-fn matching_locations(plan: &FleetProofPlan, binding: &StorageBinding) -> usize {
-    plan.input
-        .owners
-        .iter()
-        .filter(|owner| binding_matches_owner(binding, owner))
-        .count()
-        + plan
-            .input
-            .replicas
-            .iter()
-            .filter(|replica| binding_matches_replica(binding, replica))
-            .count()
+fn ranges_overlap(left: ValueRange, right: ValueRange) -> bool {
+    left.version == right.version && left.elements.overlaps(right.elements)
 }
 
-fn binding_matches_owner(binding: &StorageBinding, owner: &OwnedValueRange) -> bool {
-    binding.value == owner.value
-        && binding.elements == owner.elements
-        && binding.worker == owner.worker
-}
-
-fn binding_matches_replica(binding: &StorageBinding, replica: &DeclaredReplica) -> bool {
-    binding.value == replica.value
-        && binding.elements == replica.elements
-        && binding.worker == replica.worker
-}
-
-fn binding_live(
-    plan: &FleetProofPlan,
-    binding: &StorageBinding,
-) -> Result<ScheduleRange, FleetPlanError> {
-    let owner = plan
-        .input
-        .owners
-        .iter()
-        .find(|owner| binding_matches_owner(binding, owner));
-    let replica = plan
-        .input
-        .replicas
-        .iter()
-        .find(|replica| binding_matches_replica(binding, replica));
-    match (owner, replica) {
-        (Some(owner), None) => Ok(owner.live),
-        (None, Some(replica)) => Ok(replica.live),
-        _ => Err(FleetPlanError::InvalidStorageBinding {
-            value: binding.value,
-            storage: binding.storage,
-        }),
+fn invalid_binding(binding: &FleetStoragePlacement) -> FleetPlanError {
+    FleetPlanError::InvalidStorageBinding {
+        value: binding.value.version,
+        storage: binding.storage,
     }
 }
 
-pub(super) fn reserved_bytes(
-    plan: &FleetProofPlan,
-    worker: WorkerId,
-) -> Result<usize, FleetPlanError> {
-    plan.input
-        .storages
-        .iter()
-        .filter(|storage| storage.worker == worker)
-        .try_fold(0usize, |total, storage| {
-            total
-                .checked_add(storage.bytes)
-                .ok_or(FleetPlanError::SizeOverflow)
-        })
+fn invalid_alias(operation: OpId, alias: crate::compiled_proof::InPlaceAliasId) -> FleetPlanError {
+    FleetPlanError::InvalidInPlaceAlias { operation, alias }
+}
+
+fn output_ranges(
+    layout: &crate::proof_bundle::ResidentProofBundleLayout,
+) -> [core::ops::Range<usize>; 8] {
+    [
+        layout.commitments.clone(),
+        layout.interaction_claim.clone(),
+        layout.interaction_pow.clone(),
+        layout.sampled_values.clone(),
+        layout.fri_commitments.clone(),
+        layout.final_line_poly.clone(),
+        layout.query_pow.clone(),
+        layout.decommitment.clone(),
+    ]
 }

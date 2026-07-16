@@ -4,15 +4,168 @@ use stwo_backend_cuda::TranscriptOperation;
 
 use super::*;
 
+mod output;
+
 pub(super) fn validate(
     input: &CompiledProofInput,
     transcript: &CairoBlake2sTranscriptPlan,
 ) -> Result<(), CompiledProofError> {
-    validate_operations(input, transcript)?;
     validate_values(input)?;
-    validate_authority(input)?;
+    validate_authorities(input)?;
+    validate_operations(input, transcript)?;
     validate_transcript(input, transcript)?;
-    validate_output(input)?;
+    output::validate(input)
+}
+
+fn validate_values(input: &CompiledProofInput) -> Result<(), CompiledProofError> {
+    let mut external_inputs = BTreeSet::new();
+    let mut constants = BTreeSet::new();
+    let mut transcript_outputs = BTreeSet::new();
+    for (index, value) in input.values.iter().enumerate() {
+        let expected =
+            ValueVersion(u32::try_from(index).map_err(|_| CompiledProofError::SizeOverflow)?);
+        if value.version != expected {
+            return Err(CompiledProofError::NonDenseValue {
+                expected,
+                actual: value.version,
+            });
+        }
+        validate_value_layout(value)?;
+        if value.alignment == 0
+            || !value.alignment.is_power_of_two()
+            || !origin_region_compatible(value.origin, value.region)
+            || match value.origin {
+                ValueOrigin::ExternalInput(id) => !external_inputs.insert(id),
+                ValueOrigin::Constant(id) => !constants.insert(id),
+                ValueOrigin::TranscriptOutput(id) => !transcript_outputs.insert(id),
+                ValueOrigin::OpOutput(_) => false,
+            }
+        {
+            return Err(CompiledProofError::InvalidValue {
+                value: value.version,
+            });
+        }
+        if let ValueOrigin::OpOutput(producer) = value.origin {
+            if input
+                .operations
+                .get(producer.0 as usize)
+                .is_none_or(|operation| operation.id != producer)
+            {
+                return Err(CompiledProofError::UnknownProducer {
+                    value: value.version,
+                    producer,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn origin_region_compatible(origin: ValueOrigin, region: Region) -> bool {
+    match origin {
+        ValueOrigin::ExternalInput(_) => region == Region::Input,
+        ValueOrigin::Constant(_) => region == Region::FixedData,
+        ValueOrigin::TranscriptOutput(_) => region == Region::Dynamic,
+        ValueOrigin::OpOutput(_) => matches!(region, Region::Dynamic | Region::Output),
+    }
+}
+
+fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofError> {
+    let mut semantics = BTreeSet::new();
+    for operation in &input.operations {
+        if operation.semantic_id.0 == 0 || !semantics.insert(operation.semantic_id) {
+            return Err(CompiledProofError::DuplicateSemanticOperation(
+                operation.semantic_id,
+            ));
+        }
+    }
+
+    if input
+        .effects
+        .windows(2)
+        .any(|pair| pair[0].id() >= pair[1].id())
+    {
+        return Err(CompiledProofError::NonCanonicalEffectAuthority);
+    }
+    for effect in &input.effects {
+        if !effect.has_valid_identity()? {
+            return Err(CompiledProofError::InvalidEffectContract(effect.id()));
+        }
+    }
+
+    if input
+        .kernels
+        .windows(2)
+        .any(|pair| pair[0].id() >= pair[1].id())
+    {
+        return Err(CompiledProofError::NonCanonicalKernelAuthority);
+    }
+    for kernel in &input.kernels {
+        if !kernel.has_valid_identity()? {
+            return Err(CompiledProofError::NonCanonicalKernelAuthority);
+        }
+        let mut used = BTreeSet::new();
+        for operation in &input.operations {
+            if matches!(
+                operation.primitive,
+                ExecutionPrimitive::AotKernel { kernel: id, .. } if id == kernel.id()
+            ) {
+                if kernel
+                    .accepted_effects()
+                    .binary_search(&operation.effect)
+                    .is_err()
+                {
+                    return Err(CompiledProofError::KernelEffectNotAccepted {
+                        operation: operation.id,
+                    });
+                }
+                used.insert(operation.effect);
+            }
+        }
+        if kernel.accepted_effects().iter().copied().ne(used) {
+            return Err(CompiledProofError::NonCanonicalKernelEffects(kernel.id()));
+        }
+    }
+
+    let declared_effects = input
+        .effects
+        .iter()
+        .map(EffectContract::id)
+        .collect::<Vec<_>>();
+    let used_effects = input
+        .operations
+        .iter()
+        .map(|operation| operation.effect)
+        .collect::<BTreeSet<_>>();
+    if declared_effects
+        .iter()
+        .copied()
+        .ne(used_effects.iter().copied())
+    {
+        return Err(CompiledProofError::NonCanonicalEffectAuthority);
+    }
+
+    let declared_kernels = input
+        .kernels
+        .iter()
+        .map(AotKernelAuthority::id)
+        .collect::<Vec<_>>();
+    let used_kernels = input
+        .operations
+        .iter()
+        .filter_map(|operation| match operation.primitive {
+            ExecutionPrimitive::AotKernel { kernel, .. } => Some(kernel),
+            ExecutionPrimitive::DeviceCopyD2D { .. }
+            | ExecutionPrimitive::DeviceMemsetByte { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if declared_kernels
+        .iter()
+        .copied()
+        .ne(used_kernels.iter().copied())
+    {
+        return Err(CompiledProofError::NonCanonicalKernelAuthority);
+    }
     Ok(())
 }
 
@@ -21,6 +174,7 @@ fn validate_operations(
     transcript: &CairoBlake2sTranscriptPlan,
 ) -> Result<(), CompiledProofError> {
     let mut previous_stage = None;
+    let mut writes = vec![Vec::<(OpId, ElementRange)>::new(); input.values.len()];
     for (index, operation) in input.operations.iter().enumerate() {
         let expected = OpId(u32::try_from(index).map_err(|_| CompiledProofError::SizeOverflow)?);
         if operation.id != expected {
@@ -41,166 +195,212 @@ fn validate_operations(
         }
         previous_stage = Some(stage);
 
-        let inputs = unique_edges(operation.id, &operation.inputs)?;
-        let outputs = unique_edges(operation.id, &operation.outputs)?;
-        if let Some(value) = inputs.intersection(&outputs).next() {
-            return Err(CompiledProofError::InputOutputAlias {
-                operation: operation.id,
-                value: **value,
-            });
-        }
-        for &value in inputs.union(&outputs) {
-            if value.0 as usize >= input.values.len() {
-                return Err(CompiledProofError::UnknownValue {
-                    operation: operation.id,
-                    value: *value,
-                });
+        let effect = effect(input, operation.effect).ok_or(CompiledProofError::UnknownEffect {
+            operation: operation.id,
+        })?;
+        validate_primitive(input, operation, effect)?;
+        for access in effect.accesses() {
+            if let Some(source) = access.source() {
+                validate_bound_range(input, operation.id, *source)?;
+                validate_source(input, transcript, operation, source.value.version)?;
             }
-        }
-    }
-    Ok(())
-}
-
-fn unique_edges<'a>(
-    operation: OpId,
-    values: &'a [ValueId],
-) -> Result<BTreeSet<&'a ValueId>, CompiledProofError> {
-    let set = values.iter().collect::<BTreeSet<_>>();
-    if set.len() != values.len() {
-        let mut seen = BTreeSet::new();
-        let value = values
-            .iter()
-            .copied()
-            .find(|value| !seen.insert(*value))
-            .ok_or(CompiledProofError::SizeOverflow)?;
-        return Err(CompiledProofError::DuplicateOperationEdge { operation, value });
-    }
-    Ok(set)
-}
-
-fn validate_values(input: &CompiledProofInput) -> Result<(), CompiledProofError> {
-    let mut actual_consumers = vec![Vec::new(); input.values.len()];
-    for operation in &input.operations {
-        for &value in &operation.inputs {
-            actual_consumers[value.0 as usize].push(operation.id);
-        }
-        for &value in &operation.outputs {
-            if input.values[value.0 as usize].origin != ValueOrigin::OpOutput(operation.id) {
-                return Err(CompiledProofError::ProducerMismatch { value });
-            }
-        }
-    }
-
-    for (index, value) in input.values.iter().enumerate() {
-        let expected = ValueId(u32::try_from(index).map_err(|_| CompiledProofError::SizeOverflow)?);
-        if value.id != expected {
-            return Err(CompiledProofError::NonDenseValue {
-                expected,
-                actual: value.id,
-            });
-        }
-        if validate_value_layout(value).is_err()
-            || value.alignment == 0
-            || !value.alignment.is_power_of_two()
-        {
-            return Err(CompiledProofError::InvalidValue { value: value.id });
-        }
-        if value.consumers.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(CompiledProofError::ConsumerOrder { value: value.id });
-        }
-        for &consumer in &value.consumers {
-            if consumer.0 as usize >= input.operations.len() {
-                return Err(CompiledProofError::ConsumerMismatch { value: value.id });
-            }
-            if let ValueOrigin::OpOutput(producer) = value.origin {
-                if producer >= consumer {
-                    return Err(CompiledProofError::ProducerAfterConsumer {
-                        value: value.id,
-                        consumer,
+            if let Some(destination) = access.destination() {
+                validate_bound_range(input, operation.id, *destination)?;
+                let value = value(input, destination.value.version)?;
+                if value.origin != ValueOrigin::OpOutput(operation.id) {
+                    return Err(CompiledProofError::ProducerMismatch {
+                        value: value.version,
                     });
+                }
+                writes[value.version.0 as usize].push((operation.id, destination.value.elements));
+            }
+            if let (Some(source), Some(destination)) = (access.source(), access.destination()) {
+                let source_value = value(input, source.value.version)?;
+                let destination_value = value(input, destination.value.version)?;
+                if source_value.layout != destination_value.layout
+                    || source_value.layout.element != destination_value.layout.element
+                    || matches!(
+                        access,
+                        EffectAccess::Atomic {
+                            operation: AtomicOperation::AddU32,
+                            ..
+                        }
+                    ) && source_value.layout.element != ElementType::U32
+                {
+                    return Err(CompiledProofError::InvalidValueTransition);
                 }
             }
         }
-        if value.consumers != actual_consumers[index] {
-            return Err(CompiledProofError::ConsumerMismatch { value: value.id });
-        }
-        if let ValueOrigin::OpOutput(producer) = value.origin {
-            let operation = input.operations.get(producer.0 as usize).ok_or(
-                CompiledProofError::UnknownProducer {
-                    value: value.id,
-                    producer,
-                },
-            )?;
-            if operation.id != producer
-                || operation
-                    .outputs
-                    .iter()
-                    .filter(|&&output| output == value.id)
-                    .count()
-                    != 1
+    }
+    validate_write_coverage(input, &mut writes)
+}
+
+fn validate_primitive(
+    input: &CompiledProofInput,
+    operation: &OpNode,
+    effect: &EffectContract,
+) -> Result<(), CompiledProofError> {
+    match operation.primitive {
+        ExecutionPrimitive::AotKernel { kernel, launch } => {
+            if !valid_launch(launch) {
+                return Err(CompiledProofError::InvalidLaunchGeometry(operation.id));
+            }
+            let authority = input
+                .kernels
+                .iter()
+                .find(|authority| authority.id() == kernel)
+                .ok_or(CompiledProofError::UnknownKernel {
+                    operation: operation.id,
+                })?;
+            if authority
+                .accepted_effects()
+                .binary_search(&operation.effect)
+                .is_err()
             {
-                return Err(CompiledProofError::ProducerMismatch { value: value.id });
+                return Err(CompiledProofError::KernelEffectNotAccepted {
+                    operation: operation.id,
+                });
+            }
+            if effect
+                .module_globals()
+                .iter()
+                .any(|global| &global.module != authority.module())
+            {
+                return Err(CompiledProofError::ModuleGlobalAuthorityMismatch {
+                    operation: operation.id,
+                });
+            }
+        }
+        ExecutionPrimitive::DeviceCopyD2D { bytes } => {
+            if !effect.module_globals().is_empty() || bytes == 0 || effect.accesses().len() != 2 {
+                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
+            }
+            let (EffectAccess::Read { source }, EffectAccess::Write { destination }) =
+                (&effect.accesses()[0], &effect.accesses()[1])
+            else {
+                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
+            };
+            if range_bytes(input, source.value)? != bytes
+                || range_bytes(input, destination.value)? != bytes
+                || value(input, source.value.version)?.layout
+                    != value(input, destination.value.version)?.layout
+            {
+                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
+            }
+        }
+        ExecutionPrimitive::DeviceMemsetByte { bytes, .. } => {
+            if !effect.module_globals().is_empty() || bytes == 0 || effect.accesses().len() != 1 {
+                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
+            }
+            let EffectAccess::Write { destination } = &effect.accesses()[0] else {
+                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
+            };
+            if range_bytes(input, destination.value)? != bytes {
+                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
             }
         }
     }
     Ok(())
 }
 
-fn validate_authority(input: &CompiledProofInput) -> Result<(), CompiledProofError> {
-    let semantic = input
-        .operations
-        .iter()
-        .map(|operation| operation.semantic_id)
-        .collect::<BTreeSet<_>>();
-    if semantic.len() != input.operations.len() {
-        return Err(CompiledProofError::AuthorityMismatch(
-            AuthorityKind::SemanticOperation,
-        ));
-    }
-    let kernels = input
-        .operations
-        .iter()
-        .map(|operation| operation.kernel_id)
-        .collect::<BTreeSet<_>>();
-    let effects = input
-        .operations
-        .iter()
-        .map(|operation| operation.effects)
-        .collect::<BTreeSet<_>>();
-    exact_authority(
-        AuthorityKind::SemanticOperation,
-        &input.authority.operations,
-        semantic,
-        |id| id.0,
-    )?;
-    exact_authority(
-        AuthorityKind::AotKernel,
-        &input.authority.kernels,
-        kernels,
-        |id| id.0,
-    )?;
-    exact_authority(
-        AuthorityKind::EffectContract,
-        &input.authority.effects,
-        effects,
-        |id| u32::from(id.0 != [0; 32]),
-    )
+fn valid_launch(launch: LaunchGeometry) -> bool {
+    let block_threads = launch
+        .block
+        .into_iter()
+        .try_fold(1u64, |product, value| product.checked_mul(u64::from(value)));
+    launch.grid[0] != 0
+        && launch.grid[0] <= i32::MAX as u32
+        && launch.grid[1] != 0
+        && launch.grid[1] <= u16::MAX as u32
+        && launch.grid[2] != 0
+        && launch.grid[2] <= u16::MAX as u32
+        && launch.block[0] != 0
+        && launch.block[0] <= 1024
+        && launch.block[1] != 0
+        && launch.block[1] <= 1024
+        && launch.block[2] != 0
+        && launch.block[2] <= 64
+        // Cluster limits depend on the installed target. This target-neutral
+        // authority cannot truthfully admit one.
+        && launch.cluster.is_none()
+        && block_threads.is_some_and(|threads| threads <= 1024)
 }
 
-fn exact_authority<T: Copy + Ord>(
-    kind: AuthorityKind,
-    declared: &[T],
-    used: BTreeSet<T>,
-    raw: impl Fn(T) -> u32,
+fn validate_source(
+    input: &CompiledProofInput,
+    transcript: &CairoBlake2sTranscriptPlan,
+    consumer: &OpNode,
+    version: ValueVersion,
 ) -> Result<(), CompiledProofError> {
-    if declared.is_empty()
-        || declared.iter().copied().any(|id| raw(id) == 0)
-        || declared.windows(2).any(|pair| pair[0] >= pair[1])
-    {
-        return Err(CompiledProofError::NonCanonicalAuthority(kind));
+    match value(input, version)?.origin {
+        ValueOrigin::ExternalInput(_) | ValueOrigin::Constant(_) => Ok(()),
+        ValueOrigin::OpOutput(producer) if producer < consumer.id => Ok(()),
+        ValueOrigin::OpOutput(_) => Err(CompiledProofError::ProducerAfterConsumer {
+            value: version,
+            consumer: consumer.id,
+        }),
+        ValueOrigin::TranscriptOutput(output) => {
+            let drawn = transcript_output_stage(transcript, output).ok_or(
+                CompiledProofError::TranscriptCausality {
+                    kind: BindingKind::TranscriptOutput,
+                    id: output.0,
+                },
+            )?;
+            let consumed = stage_index(consumer.stage, transcript).ok_or(
+                CompiledProofError::UnknownStage {
+                    operation: consumer.id,
+                },
+            )?;
+            if consumed <= drawn {
+                return Err(CompiledProofError::TranscriptCausality {
+                    kind: BindingKind::TranscriptOutput,
+                    id: output.0,
+                });
+            }
+            Ok(())
+        }
     }
-    if declared.iter().copied().ne(used) {
-        return Err(CompiledProofError::AuthorityMismatch(kind));
+}
+
+fn validate_write_coverage(
+    input: &CompiledProofInput,
+    writes: &mut [Vec<(OpId, ElementRange)>],
+) -> Result<(), CompiledProofError> {
+    for value in &input.values {
+        let ranges = &mut writes[value.version.0 as usize];
+        let ValueOrigin::OpOutput(producer) = value.origin else {
+            if !ranges.is_empty() {
+                return Err(CompiledProofError::ProducerMismatch {
+                    value: value.version,
+                });
+            }
+            continue;
+        };
+        if ranges.iter().any(|(writer, _)| *writer != producer) {
+            return Err(CompiledProofError::ProducerMismatch {
+                value: value.version,
+            });
+        }
+        ranges.sort_unstable_by_key(|(_, range)| (range.start, range.end));
+        let mut cursor = 0;
+        for &(_, range) in ranges.iter() {
+            if range.start < cursor {
+                return Err(CompiledProofError::OverlappingWrite {
+                    value: value.version,
+                });
+            }
+            if range.start != cursor {
+                return Err(CompiledProofError::IncompleteWrite {
+                    value: value.version,
+                });
+            }
+            cursor = range.end;
+        }
+        if cursor != value.layout.element_count()? {
+            return Err(CompiledProofError::IncompleteWrite {
+                value: value.version,
+            });
+        }
     }
     Ok(())
 }
@@ -228,50 +428,43 @@ fn validate_transcript(
                 index,
             });
         }
-        let value = value(input, binding.value)?;
+        let source = value(input, binding.value)?;
         validate_words(
             BindingKind::TranscriptInput,
             binding.id.0,
-            value,
-            &binding.value_words,
+            source,
+            binding.elements,
             requirement.min_words,
         )?;
-        if let ValueOrigin::OpOutput(producer) = value.origin {
-            let produced = stage_index(input.operations[producer.0 as usize].stage, transcript)
-                .ok_or(CompiledProofError::UnknownStage {
-                    operation: producer,
-                })?;
-            let consumed = transcript_input_stage(transcript, binding.id).ok_or(
-                CompiledProofError::TranscriptCausality {
-                    kind: BindingKind::TranscriptInput,
-                    id: binding.id.0,
-                },
-            )?;
-            if produced > consumed {
-                return Err(CompiledProofError::TranscriptCausality {
-                    kind: BindingKind::TranscriptInput,
-                    id: binding.id.0,
-                });
+        let consumed = transcript_input_stage(transcript, binding.id).ok_or(
+            CompiledProofError::TranscriptCausality {
+                kind: BindingKind::TranscriptInput,
+                id: binding.id.0,
+            },
+        )?;
+        match source.origin {
+            ValueOrigin::OpOutput(producer) => {
+                let produced = stage_index(input.operations[producer.0 as usize].stage, transcript)
+                    .ok_or(CompiledProofError::UnknownStage {
+                        operation: producer,
+                    })?;
+                if produced > consumed {
+                    return Err(CompiledProofError::TranscriptCausality {
+                        kind: BindingKind::TranscriptInput,
+                        id: binding.id.0,
+                    });
+                }
             }
-        } else if let ValueOrigin::TranscriptOutput(output) = value.origin {
-            let drawn = transcript_output_stage(transcript, output).ok_or(
-                CompiledProofError::TranscriptCausality {
-                    kind: BindingKind::TranscriptInput,
-                    id: binding.id.0,
-                },
-            )?;
-            let consumed = transcript_input_stage(transcript, binding.id).ok_or(
-                CompiledProofError::TranscriptCausality {
-                    kind: BindingKind::TranscriptInput,
-                    id: binding.id.0,
-                },
-            )?;
-            if drawn >= consumed {
-                return Err(CompiledProofError::TranscriptCausality {
-                    kind: BindingKind::TranscriptInput,
-                    id: binding.id.0,
-                });
+            ValueOrigin::TranscriptOutput(output) => {
+                if transcript_output_stage(transcript, output).is_none_or(|drawn| drawn >= consumed)
+                {
+                    return Err(CompiledProofError::TranscriptCausality {
+                        kind: BindingKind::TranscriptInput,
+                        id: binding.id.0,
+                    });
+                }
             }
+            ValueOrigin::ExternalInput(_) | ValueOrigin::Constant(_) => {}
         }
     }
     reject_overlaps(
@@ -279,7 +472,7 @@ fn validate_transcript(
         input
             .transcript_inputs
             .iter()
-            .map(|binding| (binding.value, &binding.value_words)),
+            .map(|binding| (binding.value, binding.elements)),
     )?;
 
     if input.transcript_outputs.len() != transcript.outputs().len() {
@@ -301,22 +494,17 @@ fn validate_transcript(
                 index,
             });
         }
-        let value = value(input, binding.value)?;
+        let output = value(input, binding.value)?;
         validate_words(
             BindingKind::TranscriptOutput,
             binding.id.0,
-            value,
-            &binding.value_words,
+            output,
+            binding.elements,
             requirement.min_words,
         )?;
-        let value_words = validate_value_layout(value)? / core::mem::size_of::<u32>();
-        if binding.value_words != (0..value_words) {
-            return Err(CompiledProofError::BindingRange {
-                kind: BindingKind::TranscriptOutput,
-                id: binding.id.0,
-            });
-        }
-        if value.origin != ValueOrigin::TranscriptOutput(binding.id) {
+        if output.origin != ValueOrigin::TranscriptOutput(binding.id)
+            || binding.elements != ElementRange::new(0, output.layout.element_count()?).unwrap()
+        {
             return Err(CompiledProofError::TranscriptBindingOrigin { output: binding.id });
         }
         let drawn = transcript_output_stage(transcript, binding.id).ok_or(
@@ -325,9 +513,8 @@ fn validate_transcript(
                 id: binding.id.0,
             },
         )?;
-        if value.consumers.iter().any(|consumer| {
-            stage_index(input.operations[consumer.0 as usize].stage, transcript)
-                .is_none_or(|stage| stage <= drawn)
+        if consumers(input, output.version).any(|operation| {
+            stage_index(operation.stage, transcript).is_none_or(|stage| stage <= drawn)
         }) {
             return Err(CompiledProofError::TranscriptCausality {
                 kind: BindingKind::TranscriptOutput,
@@ -337,13 +524,15 @@ fn validate_transcript(
     }
     for value in &input.values {
         if let ValueOrigin::TranscriptOutput(id) = value.origin {
-            let bindings = input
+            let count = input
                 .transcript_outputs
                 .iter()
-                .filter(|binding| binding.id == id && binding.value == value.id)
+                .filter(|binding| binding.id == id && binding.value == value.version)
                 .count();
-            if bindings != 1 {
-                return Err(CompiledProofError::OrphanTranscriptOutput { value: value.id });
+            if count != 1 {
+                return Err(CompiledProofError::OrphanTranscriptOutput {
+                    value: value.version,
+                });
             }
         }
     }
@@ -352,117 +541,79 @@ fn validate_transcript(
         input
             .transcript_outputs
             .iter()
-            .map(|binding| (binding.value, &binding.value_words)),
+            .map(|binding| (binding.value, binding.elements)),
     )
 }
 
-fn validate_output(input: &CompiledProofInput) -> Result<(), CompiledProofError> {
-    input
-        .output
-        .layout
-        .validate()
-        .map_err(|_| CompiledProofError::NonCanonicalProofLayout)?;
-    let ranges = layout_ranges(&input.output.layout);
-    let mut cursor = 0usize;
-    for range in &ranges {
-        if range.start != cursor || range.is_empty() {
-            return Err(CompiledProofError::NonCanonicalProofLayout);
-        }
-        cursor = range.end;
-    }
-    if cursor != input.output.layout.total_words {
-        return Err(CompiledProofError::NonCanonicalProofLayout);
-    }
-    if input.output.sections.len() != ProofBundleSection::CANONICAL.len() {
-        return Err(CompiledProofError::ProofSectionCount {
-            expected: ProofBundleSection::CANONICAL.len(),
-            actual: input.output.sections.len(),
-        });
-    }
-    let bundle = input.output.sections[0].value;
-    for (index, ((binding, section), destination)) in input
-        .output
-        .sections
-        .iter()
-        .zip(ProofBundleSection::CANONICAL)
-        .zip(&ranges)
-        .enumerate()
-    {
-        if binding.section != section || binding.value != bundle {
-            return Err(CompiledProofError::ProofSectionOrder { index });
-        }
-        let source = value(input, binding.value)?;
-        if !matches!(source.origin, ValueOrigin::OpOutput(_)) {
-            return Err(CompiledProofError::ProofSectionOrigin { index });
-        }
-        validate_words(
-            BindingKind::ProofOutput,
-            index as u32,
-            source,
-            &binding.value_words,
-            destination.len(),
-        )?;
-        if binding.value_words != *destination {
-            return Err(CompiledProofError::BindingRange {
-                kind: BindingKind::ProofOutput,
-                id: index as u32,
-            });
-        }
-    }
-    let bundle_value = value(input, bundle)?;
-    let expected_bytes = input
-        .output
-        .layout
-        .total_words
-        .checked_mul(core::mem::size_of::<u32>())
-        .ok_or(CompiledProofError::SizeOverflow)?;
-    let ValueOrigin::OpOutput(assembly) = bundle_value.origin else {
-        return Err(CompiledProofError::InvalidProofAssembly);
-    };
-    let assembly = input
-        .operations
-        .get(assembly.0 as usize)
-        .ok_or(CompiledProofError::InvalidProofAssembly)?;
-    if bundle_value.layout.element.bytes != core::mem::size_of::<u32>()
-        || bundle_value.alignment < core::mem::align_of::<u32>()
-        || validate_value_layout(bundle_value)? != expected_bytes
-        || assembly.stage != ProofStage::AfterTranscript
-        || assembly.outputs.as_slice() != [bundle]
-    {
-        return Err(CompiledProofError::InvalidProofAssembly);
-    }
-    reject_overlaps(
-        BindingKind::ProofOutput,
-        input
-            .output
-            .sections
-            .iter()
-            .map(|binding| (binding.value, &binding.value_words)),
-    )
+fn consumers<'a>(
+    input: &'a CompiledProofInput,
+    version: ValueVersion,
+) -> impl Iterator<Item = &'a OpNode> {
+    input.operations.iter().filter(move |operation| {
+        effect(input, operation.effect).is_some_and(|effect| {
+            effect.accesses().iter().any(|access| {
+                access
+                    .source()
+                    .is_some_and(|source| source.value.version == version)
+            })
+        })
+    })
 }
 
-fn value(input: &CompiledProofInput, id: ValueId) -> Result<&ValueDesc, CompiledProofError> {
+fn effect(input: &CompiledProofInput, id: EffectContractId) -> Option<&EffectContract> {
+    input.effects.iter().find(|effect| effect.id() == id)
+}
+
+pub(super) fn value(
+    input: &CompiledProofInput,
+    version: ValueVersion,
+) -> Result<&ValueDesc, CompiledProofError> {
     input
         .values
-        .get(id.0 as usize)
-        .filter(|value| value.id == id)
-        .ok_or(CompiledProofError::InvalidValue { value: id })
+        .get(version.0 as usize)
+        .filter(|value| value.version == version)
+        .ok_or(CompiledProofError::InvalidValue { value: version })
 }
 
-fn validate_words(
+fn validate_bound_range(
+    input: &CompiledProofInput,
+    operation: OpId,
+    range: BoundValueRange,
+) -> Result<(), CompiledProofError> {
+    let value = input
+        .values
+        .get(range.value.version.0 as usize)
+        .filter(|value| value.version == range.value.version)
+        .ok_or(CompiledProofError::UnknownValue {
+            operation,
+            value: range.value.version,
+        })?;
+    if range.value.elements.is_empty() || range.value.elements.end > value.layout.element_count()? {
+        return Err(CompiledProofError::InvalidEffectRange);
+    }
+    Ok(())
+}
+
+fn range_bytes(input: &CompiledProofInput, range: ValueRange) -> Result<usize, CompiledProofError> {
+    range
+        .elements
+        .len()
+        .checked_mul(value(input, range.version)?.layout.element.bytes)
+        .ok_or(CompiledProofError::SizeOverflow)
+}
+
+pub(super) fn validate_words(
     kind: BindingKind,
     id: u32,
     value: &ValueDesc,
-    words: &Range<usize>,
+    elements: ElementRange,
     expected_words: usize,
 ) -> Result<(), CompiledProofError> {
-    let bytes = validate_value_layout(value)?;
-    if value.layout.element.bytes != core::mem::size_of::<u32>()
+    if value.layout.element != ElementType::U32
         || value.alignment < core::mem::align_of::<u32>()
-        || bytes % core::mem::size_of::<u32>() != 0
-        || words.start >= words.end
-        || words.end > bytes / core::mem::size_of::<u32>()
-        || words.len() != expected_words
+        || elements.is_empty()
+        || elements.end > value.layout.element_count()?
+        || elements.len() != expected_words
     {
         return Err(CompiledProofError::BindingRange { kind, id });
     }
@@ -471,41 +622,38 @@ fn validate_words(
 
 fn validate_value_layout(value: &ValueDesc) -> Result<usize, CompiledProofError> {
     if value.layout.element.bytes == 0 {
-        return Err(CompiledProofError::InvalidValue { value: value.id });
+        return Err(CompiledProofError::InvalidValue {
+            value: value.version,
+        });
     }
     let mut tags = BTreeSet::new();
     let mut expected_stride = value.layout.element.bytes;
     for axis in &value.layout.axes {
-        if axis.extent == 0
-            || axis.stride_bytes == 0
-            || axis.stride_bytes % value.layout.element.bytes != 0
-            || axis.stride_bytes != expected_stride
-            || !tags.insert(axis.tag)
-        {
-            return Err(CompiledProofError::InvalidValue { value: value.id });
+        if axis.extent == 0 || axis.stride_bytes != expected_stride || !tags.insert(axis.tag) {
+            return Err(CompiledProofError::InvalidValue {
+                value: value.version,
+            });
         }
         expected_stride = expected_stride
             .checked_mul(axis.extent)
             .ok_or(CompiledProofError::SizeOverflow)?;
     }
-    let logical_bytes = value
-        .layout
-        .logical_bytes()
-        .map_err(|_| CompiledProofError::InvalidValue { value: value.id })?;
-    if expected_stride != logical_bytes {
-        return Err(CompiledProofError::InvalidValue { value: value.id });
+    if expected_stride != value.layout.logical_bytes()? {
+        return Err(CompiledProofError::InvalidValue {
+            value: value.version,
+        });
     }
-    Ok(logical_bytes)
+    Ok(expected_stride)
 }
 
-fn reject_overlaps<'a>(
+pub(super) fn reject_overlaps(
     kind: BindingKind,
-    bindings: impl Iterator<Item = (ValueId, &'a Range<usize>)>,
+    bindings: impl Iterator<Item = (ValueVersion, ElementRange)>,
 ) -> Result<(), CompiledProofError> {
     let bindings = bindings.collect::<Vec<_>>();
     for (index, (left_value, left)) in bindings.iter().enumerate() {
         for (right_value, right) in &bindings[index + 1..] {
-            if left_value == right_value && left.start < right.end && right.start < left.end {
+            if left_value == right_value && left.overlaps(*right) {
                 return Err(CompiledProofError::BindingOverlap {
                     kind,
                     value: *left_value,
@@ -585,17 +733,4 @@ fn operation_output(operation: TranscriptOperation) -> Option<TranscriptOutputId
         | TranscriptOperation::AbsorbRoot { .. }
         | TranscriptOperation::AbsorbPowNonce { .. } => None,
     }
-}
-
-fn layout_ranges(layout: &ResidentProofBundleLayout) -> [Range<usize>; 8] {
-    [
-        layout.commitments.clone(),
-        layout.interaction_claim.clone(),
-        layout.interaction_pow.clone(),
-        layout.sampled_values.clone(),
-        layout.fri_commitments.clone(),
-        layout.final_line_poly.clone(),
-        layout.query_pow.clone(),
-        layout.decommitment.clone(),
-    ]
 }
