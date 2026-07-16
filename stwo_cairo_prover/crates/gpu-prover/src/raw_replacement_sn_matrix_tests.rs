@@ -32,14 +32,20 @@ use crate::plan::ProofPlan;
 use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::prepare_resident_ingest;
 use crate::raw_replacement_oracle_tests::assert_cached_recorded_matches_fresh;
-use crate::recorded_witness_inputs::recorded_witness_inputs_for_raw_replacement_plan;
+use crate::recorded_witness_inputs::{
+    recorded_witness_inputs_for_raw_replacement_plan, DeviceGatherColumn,
+    PlannedRecordedWitnessInputs, RecordedInputColumnProvenance,
+};
 use crate::relation_execution::RelationSourcePlane;
 use crate::relation_table::CAIRO_RELATION_GRAPH;
 use crate::replacement_host_cache::{
     ReplacementHostCache, ReplacementHostMaterialization, ReplacementHostTemplate,
 };
 use crate::resident_input::ResidentProverInputOwner;
-use crate::resident_session::ResidentPreWitnessInput;
+use crate::resident_session::{
+    direct_blake_g_route_is_exact_for_test, resident_host_witness_input_route_shapes_for_test,
+    ResidentPreWitnessInput, ResidentSessionError,
+};
 use crate::resident_shape::raw_replacement_proof_plan;
 use crate::resident_sources::{
     preprocessed_commit_binding, PreprocessedCommitBinding, PreprocessedCommitSelector,
@@ -702,6 +708,8 @@ fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
         "{}: current statement must be rebound",
         fixture.profile
     );
+    let cold_recorded = cold_template.bind_recorded(&cold_owner).unwrap();
+    let warm_recorded = warm_template.bind_recorded(&warm_owner).unwrap();
 
     let cold_geometry = execution_geometry(&cold_owner, &cold_claim);
     let warm_geometry = execution_geometry(&warm_owner, &warm_claim);
@@ -758,6 +766,182 @@ fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
     assert_eq!(shape_telemetry.source_generation_passes, 1);
     assert_eq!(shape_telemetry.binding_recipe_compilations, 1);
     assert_eq!(shape_telemetry.replacement_handle_lock_ops, 3);
+
+    let arena = cold_shape.executable.arena();
+    let blake_index = arena
+        .witness()
+        .components
+        .iter()
+        .position(|component| component.component == "blake_g")
+        .unwrap_or_else(|| panic!("{}: Blake-G witness missing", fixture.profile));
+    let blake_component = &arena.witness().components[blake_index];
+    let selection = blake_component
+        .blake_g_contract
+        .direct()
+        .unwrap_or_else(|| panic!("{}: direct Blake-G missing", fixture.profile));
+    let cold_session_input = ResidentPreWitnessInput::ReplacementV1 {
+        input: cold_owner,
+        template: cold_template,
+    };
+    let warm_session_input = ResidentPreWitnessInput::ReplacementV1 {
+        input: warm_owner,
+        template: warm_template,
+    };
+    let cold_routes = resident_host_witness_input_route_shapes_for_test(
+        &cold_recorded,
+        arena,
+        &cold_session_input,
+    )
+    .unwrap_or_else(|error| panic!("{}/cold route: {error}", fixture.profile));
+    let warm_routes = resident_host_witness_input_route_shapes_for_test(
+        &warm_recorded,
+        arena,
+        &warm_session_input,
+    )
+    .unwrap_or_else(|error| panic!("{}/warm route: {error}", fixture.profile));
+    assert_eq!(cold_routes[blake_index], (0, 0, false));
+    assert_eq!(warm_routes[blake_index], (0, 0, false));
+    assert!(direct_blake_g_route_is_exact_for_test(
+        &cold_recorded.lanes[blake_index],
+        blake_component,
+    ));
+
+    if fixture.profile == "SN2" {
+        let assert_rejected = |recorded: &PlannedRecordedWitnessInputs, expected_ordinal: usize| {
+            assert!(matches!(
+                resident_host_witness_input_route_shapes_for_test(
+                    recorded,
+                    arena,
+                    &cold_session_input,
+                ),
+                Err(ResidentSessionError::RecordedWitnessInputRoute {
+                    component: "blake_g",
+                    ordinal,
+                }) if ordinal == expected_ordinal
+            ));
+        };
+        let enabler = selection.enabler_ordinal as usize;
+        let exact_enabler = match &cold_recorded.lanes[blake_index].columns[enabler] {
+            RecordedInputColumnProvenance::StructuralEnabler(words) => words.to_vec(),
+            provenance => panic!("SN2: unexpected Blake-G enabler: {provenance:?}"),
+        };
+        let n_real = cold_recorded.lanes[blake_index].n_real;
+        assert!(n_real > 1 && n_real <= exact_enabler.len());
+
+        let mut wrong_length = cold_recorded.clone();
+        wrong_length.lanes[blake_index].columns[enabler] =
+            RecordedInputColumnProvenance::StructuralEnabler(Arc::from(
+                exact_enabler[..exact_enabler.len() - 1].to_vec(),
+            ));
+        assert_rejected(&wrong_length, enabler);
+
+        for row in [0, n_real - 1] {
+            let mut bit_flip = cold_recorded.clone();
+            let mut words = exact_enabler.clone();
+            words[row] ^= 1;
+            bit_flip.lanes[blake_index].columns[enabler] =
+                RecordedInputColumnProvenance::StructuralEnabler(Arc::from(words));
+            assert_rejected(&bit_flip, enabler);
+        }
+
+        let partial_n_real = n_real - 1;
+        let mut partial_lane = cold_recorded.lanes[blake_index].clone();
+        partial_lane.n_real = partial_n_real;
+        let mut partial_words = exact_enabler.clone();
+        partial_words[partial_n_real] = 0;
+        partial_lane.columns[enabler] =
+            RecordedInputColumnProvenance::StructuralEnabler(Arc::from(partial_words.clone()));
+        let mut partial_component = blake_component.clone();
+        partial_component.n_real_rows = partial_n_real;
+        partial_component
+            .input_gather
+            .as_mut()
+            .unwrap()
+            .requirements
+            .total_real_rows = partial_n_real;
+        assert!(direct_blake_g_route_is_exact_for_test(
+            &partial_lane,
+            &partial_component,
+        ));
+        for row in [partial_n_real - 1, partial_n_real] {
+            let mut boundary_flip = partial_lane.clone();
+            let mut words = partial_words.clone();
+            words[row] ^= 1;
+            boundary_flip.columns[enabler] =
+                RecordedInputColumnProvenance::StructuralEnabler(Arc::from(words));
+            assert!(!direct_blake_g_route_is_exact_for_test(
+                &boundary_flip,
+                &partial_component,
+            ));
+        }
+
+        let mut host_tag = cold_recorded.clone();
+        host_tag.lanes[blake_index].columns[enabler] =
+            RecordedInputColumnProvenance::Host(exact_enabler.clone());
+        assert_rejected(&host_tag, enabler);
+
+        let mut gathered_tag = cold_recorded.clone();
+        gathered_tag.lanes[blake_index].columns[enabler] =
+            RecordedInputColumnProvenance::DeviceGather(DeviceGatherColumn::Enabler);
+        assert_rejected(&gathered_tag, enabler);
+
+        let mut wrong_edge = cold_recorded.clone();
+        match &mut wrong_edge.lanes[blake_index].columns[0] {
+            RecordedInputColumnProvenance::DeviceEdge(edge) => edge.source_word ^= 1,
+            provenance => panic!("SN2: unexpected Blake-G operand: {provenance:?}"),
+        }
+        assert_rejected(&wrong_edge, 0);
+
+        let mut short_pointer_component = blake_component.clone();
+        short_pointer_component
+            .input_gather
+            .as_mut()
+            .unwrap()
+            .slots
+            .consumer_input_columns
+            .pop();
+        assert!(!direct_blake_g_route_is_exact_for_test(
+            &cold_recorded.lanes[blake_index],
+            &short_pointer_component,
+        ));
+
+        let mut extra_column = cold_recorded.lanes[blake_index].clone();
+        extra_column
+            .columns
+            .push(RecordedInputColumnProvenance::StructuralEnabler(Arc::from(
+                exact_enabler.clone(),
+            )));
+        assert!(!direct_blake_g_route_is_exact_for_test(
+            &extra_column,
+            blake_component,
+        ));
+
+        let mut wrong_program_width = blake_component.clone();
+        wrong_program_width.program.n_inputs += 1;
+        assert!(!direct_blake_g_route_is_exact_for_test(
+            &cold_recorded.lanes[blake_index],
+            &wrong_program_width,
+        ));
+
+        let mut wrong_writer_extent = blake_component.clone();
+        wrong_writer_extent.requirements.input_column_words[0] -= 1;
+        assert!(!direct_blake_g_route_is_exact_for_test(
+            &cold_recorded.lanes[blake_index],
+            &wrong_writer_extent,
+        ));
+
+        let mut wrong_gather_extent = blake_component.clone();
+        wrong_gather_extent
+            .input_gather
+            .as_mut()
+            .unwrap()
+            .requirements
+            .consumer_input_column_words[0] -= 1;
+        assert!(!direct_blake_g_route_is_exact_for_test(
+            &cold_recorded.lanes[blake_index],
+            &wrong_gather_extent,
+        ));
+    }
 
     eprintln!(
         "SN_WARM_HANDLE_METRIC {}",

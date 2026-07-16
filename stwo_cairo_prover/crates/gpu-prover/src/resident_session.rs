@@ -30,7 +30,8 @@ use stwo_cairo_prover::witness::jit_prove_backend::recorded_casm_input_attempt;
 use stwo_cairo_prover::witness::relation_sources::RelationSourceError;
 
 use crate::arena_plan::{
-    ArenaPlanError, CompositionSlabArenaCounterfactual, ExecutionTableGeometry, ProofArenaPlan,
+    ArenaPlanError, CompositionSlabArenaCounterfactual, ExecutionTableGeometry,
+    PlannedWitnessComponent, PlannedWitnessInputGather, ProofArenaPlan,
     QuotientProducerB2nSelectionReceipt, ResidentBackend,
 };
 use crate::composition_plan::{CompositionPlan, CompositionPlanError, CompositionProofBindings};
@@ -46,9 +47,10 @@ use crate::protocol_plan::{plan_protocol_geometry, ProtocolPlanError, ProtocolPl
 use crate::recorded_witness_inputs::{
     recorded_witness_inputs_for_plan, recorded_witness_inputs_for_raw_replacement_plan,
     DeviceCasmColumn, DeviceCompactColumn, DeviceEdgeColumn, DeviceEdgeSourceKind,
-    DeviceGatherColumn, DeviceNativeColumn, DeviceSeedColumn, PlannedRecordedWitnessInputs,
-    RecordedInputColumnProvenance, RecordedWitnessPlanError,
+    DeviceGatherColumn, DeviceNativeColumn, DeviceSeedColumn, PlannedRecordedWitnessInput,
+    PlannedRecordedWitnessInputs, RecordedInputColumnProvenance, RecordedWitnessPlanError,
 };
+use crate::relation_execution::BlakeGInputsSelection;
 use crate::replacement_host_cache::{
     ReplacementHostCacheProofAudit, ReplacementHostMaterialization, ReplacementHostTemplate,
 };
@@ -1197,6 +1199,55 @@ fn recorded_input_matches_gather(
     false
 }
 
+fn direct_blake_g_route_is_exact(
+    lane: &PlannedRecordedWitnessInput,
+    component: &PlannedWitnessComponent,
+    gather: &PlannedWitnessInputGather,
+    selection: &BlakeGInputsSelection,
+) -> bool {
+    if lane.component != "blake_g"
+        || component.component != lane.component
+        || selection.input_ordinals != [0, 1, 2, 3, 4, 5]
+        || selection.enabler_ordinal != 6
+        || selection.retired_lookup_words_per_row != 87
+        || lane.columns.len() != 7
+        || component.program.n_inputs != 7
+        || lane.row_count != component.requirements.row_count
+        || lane.row_count != gather.requirements.consumer_rows
+        || lane.n_real != component.n_real_rows
+        || lane.n_real != gather.requirements.total_real_rows
+        || lane.n_real > lane.row_count
+        || component.requirements.input_column_words.len() != 7
+        || component
+            .requirements
+            .input_column_words
+            .iter()
+            .any(|&words| words != lane.row_count)
+        || component.slots.input_columns.len() != selection.input_ordinals.len()
+        || gather.requirements.input_width != selection.input_ordinals.len()
+        || gather.requirements.include_enabler
+        || gather.requirements.include_iota
+        || gather.requirements.consumer_input_column_words.len() != selection.input_ordinals.len()
+        || gather
+            .requirements
+            .consumer_input_column_words
+            .iter()
+            .any(|&words| words != lane.row_count)
+        || gather.slots.consumer_input_columns != component.slots.input_columns
+    {
+        return false;
+    }
+    matches!(
+        lane.columns.get(selection.enabler_ordinal as usize),
+        Some(RecordedInputColumnProvenance::StructuralEnabler(words))
+            if words.len() == lane.row_count
+                && words
+                    .iter()
+                    .enumerate()
+                    .all(|(row, &value)| value == u32::from(row < lane.n_real))
+    )
+}
+
 fn resident_host_witness_inputs<'a>(
     recorded: &'a PlannedRecordedWitnessInputs,
     arena: &ProofArenaPlan,
@@ -1342,14 +1393,7 @@ fn resident_host_witness_inputs<'a>(
                 }
                 if let Some(selection) = component.blake_g_contract.direct() {
                     let enabler = selection.enabler_ordinal as usize;
-                    if !matches!(
-                        lane.columns.get(enabler),
-                        Some(RecordedInputColumnProvenance::DeviceGather(
-                            DeviceGatherColumn::Enabler
-                        ))
-                    ) || gather.slots.consumer_input_columns.len()
-                        != selection.input_ordinals.len()
-                    {
+                    if !direct_blake_g_route_is_exact(lane, component, gather, selection) {
                         return Err(ResidentSessionError::RecordedWitnessInputRoute {
                             component: lane.component,
                             ordinal: enabler,
@@ -1498,6 +1542,40 @@ fn resident_host_witness_inputs<'a>(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn resident_host_witness_input_route_shapes_for_test(
+    recorded: &PlannedRecordedWitnessInputs,
+    arena: &ProofArenaPlan,
+    input: &ResidentPreWitnessInput,
+) -> Result<Vec<(usize, usize, bool)>, ResidentSessionError> {
+    resident_host_witness_inputs(recorded, arena, input).map(|routes| {
+        routes
+            .into_iter()
+            .map(|route| {
+                (
+                    route.columns.len(),
+                    route.seed_scalars.len(),
+                    route.casm_words.is_some(),
+                )
+            })
+            .collect()
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn direct_blake_g_route_is_exact_for_test(
+    lane: &PlannedRecordedWitnessInput,
+    component: &PlannedWitnessComponent,
+) -> bool {
+    component
+        .input_gather
+        .as_ref()
+        .zip(component.blake_g_contract.direct())
+        .is_some_and(|(gather, selection)| {
+            direct_blake_g_route_is_exact(lane, component, gather, selection)
+        })
 }
 
 /// Strict Graph-A hand-off. The backend-tagged input owns either the legacy
