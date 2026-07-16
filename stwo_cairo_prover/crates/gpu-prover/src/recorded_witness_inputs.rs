@@ -79,6 +79,13 @@ pub enum RecordedInputColumnProvenance {
     /// are immutable for an exact shape and may be shared by the warm host
     /// template without retaining proof-varying statement data.
     StructuralEnabler(Arc<[u32]>),
+    /// Exact geometry for Blake-G's retired input ordinal 6. The direct writer
+    /// and relation derive this predicate from row geometry, so retaining the
+    /// materialized `row < n_real` column would only add host memory and scans.
+    RetiredBlakeGEnabler {
+        n_real: usize,
+        row_count: usize,
+    },
     DeviceCasm(DeviceCasmColumn),
     DeviceNative(DeviceNativeColumn),
     DeviceSeed(DeviceSeedColumn),
@@ -185,6 +192,13 @@ impl RawRecordedWitnessTemplate {
             .lanes
             .into_iter()
             .map(|lane| {
+                validate_retired_blake_g_enabler_lane(
+                    lane.component,
+                    lane.program.n_inputs as usize,
+                    lane.n_real,
+                    lane.row_count,
+                    &lane.columns,
+                )?;
                 let columns = lane
                     .columns
                     .into_iter()
@@ -278,6 +292,13 @@ impl RawRecordedWitnessTemplate {
                         ),
                     })
                     .collect::<Result<Vec<_>, RecordedWitnessPlanError>>()?;
+                validate_retired_blake_g_enabler_lane(
+                    lane.component,
+                    lane.program.n_inputs as usize,
+                    lane.n_real,
+                    lane.row_count,
+                    &columns,
+                )?;
                 Ok(PlannedRecordedWitnessInput {
                     component: lane.component,
                     program: Arc::clone(&lane.program),
@@ -469,6 +490,7 @@ pub fn recorded_witness_inputs_for_raw_replacement_plan(
                 program.n_inputs as usize,
                 expected.n_real,
                 expected.row_count,
+                true,
                 |producer| {
                     proof_plan.components.iter().any(|component| {
                         component.node.id == producer && component.runtime.is_present()
@@ -737,6 +759,7 @@ fn recorded_witness_inputs_for_plan_inner(
                             program.n_inputs as usize,
                             expected.n_real,
                             expected.row_count,
+                            false,
                             |producer| {
                                 proof_plan.components.iter().any(|component| {
                                     component.node.id == producer && component.runtime.is_present()
@@ -841,6 +864,7 @@ fn provenance_for_unmaterialized(
     n_inputs: usize,
     n_real: usize,
     row_count: usize,
+    retire_blake_g_enabler: bool,
     producer_is_active: impl Fn(ComponentId) -> bool,
 ) -> Result<Vec<RecordedInputColumnProvenance>, RecordedWitnessPlanError> {
     let geometry = recorded_input_geometry(node.id)
@@ -950,6 +974,14 @@ fn provenance_for_unmaterialized(
         && producer_edges
             .iter()
             .all(|edge| edge.2 as usize == data_ordinals.len());
+    let exact_retired_blake_g_enabler = retire_blake_g_enabler
+        && node.id == "blake_g"
+        && n_inputs == 7
+        && n_real <= row_count
+        && geometry.enabler_slot == Some(6)
+        && geometry.iota_slot == Some(7)
+        && data_ordinals == [0, 1, 2, 3, 4, 5]
+        && matches!(producer_edges.as_slice(), [("blake_round", 81, 6, 8)]);
     if let [(producer, word_base, words_per_instance, n_instances)] = producer_edges.as_slice() {
         if *words_per_instance as usize == data_ordinals.len() {
             for (source_offset, &ordinal) in data_ordinals.iter().enumerate() {
@@ -984,6 +1016,8 @@ fn provenance_for_unmaterialized(
     if let Some(ordinal) = geometry.enabler_slot.filter(|&ordinal| ordinal < n_inputs) {
         columns[ordinal] = if multi_gather {
             RecordedInputColumnProvenance::DeviceGather(DeviceGatherColumn::Enabler)
+        } else if exact_retired_blake_g_enabler {
+            RecordedInputColumnProvenance::RetiredBlakeGEnabler { n_real, row_count }
         } else {
             RecordedInputColumnProvenance::Host(
                 (0..row_count).map(|row| u32::from(row < n_real)).collect(),
@@ -1002,6 +1036,58 @@ fn provenance_for_unmaterialized(
         };
     }
     Ok(columns)
+}
+
+fn validate_retired_blake_g_enabler_lane(
+    component: ComponentId,
+    program_inputs: usize,
+    n_real: usize,
+    row_count: usize,
+    columns: &[RecordedInputColumnProvenance],
+) -> Result<(), RecordedWitnessPlanError> {
+    let Some(symbolic_ordinal) = columns.iter().position(|column| {
+        matches!(
+            column,
+            RecordedInputColumnProvenance::RetiredBlakeGEnabler { .. }
+        )
+    }) else {
+        return Ok(());
+    };
+    let geometry = recorded_input_geometry(component)
+        .ok_or(RecordedWitnessPlanError::MissingInputGeometry(component))?;
+    let exact = component == "blake_g"
+        && program_inputs == 7
+        && columns.len() == 7
+        && symbolic_ordinal == 6
+        && n_real <= row_count
+        && geometry.enabler_slot == Some(6)
+        && geometry.iota_slot == Some(7)
+        && columns[..6].iter().enumerate().all(|(ordinal, column)| {
+            matches!(
+                column,
+                RecordedInputColumnProvenance::DeviceEdge(DeviceEdgeColumn {
+                    producer: "blake_round",
+                    source_kind: DeviceEdgeSourceKind::SubcomponentWords,
+                    source_word,
+                    words_per_instance: 6,
+                    n_instances: 8,
+                }) if *source_word == 81 + ordinal as u32
+            )
+        })
+        && matches!(
+            columns.get(6),
+            Some(RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+                n_real: symbolic_n_real,
+                row_count: symbolic_row_count,
+            }) if *symbolic_n_real == n_real && *symbolic_row_count == row_count
+        );
+    if !exact {
+        return Err(RecordedWitnessPlanError::CachedHostColumn {
+            component,
+            ordinal: symbolic_ordinal,
+        });
+    }
+    Ok(())
 }
 
 fn validate_structural_enabler(
@@ -1061,8 +1147,10 @@ mod tests {
     fn direct_w18_edge_and_host_enabler_have_exact_column_provenance() {
         let component = node("partial_ec_mul_window_bits_18");
         let columns =
-            provenance_for_unmaterialized(component, n_inputs(component.id), 56, 64, |_| true)
-                .unwrap();
+            provenance_for_unmaterialized(component, n_inputs(component.id), 56, 64, false, |_| {
+                true
+            })
+            .unwrap();
         assert_eq!(columns.len(), 73);
         for (ordinal, source) in columns[..72].iter().enumerate() {
             assert!(matches!(
@@ -1094,6 +1182,77 @@ mod tests {
     }
 
     #[test]
+    fn raw_direct_blake_g_retires_only_the_exact_structural_enabler() {
+        let component = node("blake_g");
+        let symbolic = provenance_for_unmaterialized(
+            component,
+            n_inputs(component.id),
+            96,
+            128,
+            true,
+            |producer| producer == "blake_round",
+        )
+        .unwrap();
+        validate_retired_blake_g_enabler_lane(
+            component.id,
+            n_inputs(component.id),
+            96,
+            128,
+            &symbolic,
+        )
+        .unwrap();
+        assert!(matches!(
+            symbolic.get(6),
+            Some(RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+                n_real: 96,
+                row_count: 128,
+            })
+        ));
+
+        let mut wrong_edge = symbolic.clone();
+        let RecordedInputColumnProvenance::DeviceEdge(edge) = &mut wrong_edge[0] else {
+            unreachable!()
+        };
+        edge.source_word += 1;
+        assert!(validate_retired_blake_g_enabler_lane(
+            component.id,
+            n_inputs(component.id),
+            96,
+            128,
+            &wrong_edge,
+        )
+        .is_err());
+
+        let mut wrong_geometry = symbolic;
+        wrong_geometry[6] = RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+            n_real: 95,
+            row_count: 128,
+        };
+        assert!(validate_retired_blake_g_enabler_lane(
+            component.id,
+            n_inputs(component.id),
+            96,
+            128,
+            &wrong_geometry,
+        )
+        .is_err());
+
+        let materialized = provenance_for_unmaterialized(
+            component,
+            n_inputs(component.id),
+            96,
+            128,
+            false,
+            |producer| producer == "blake_round",
+        )
+        .unwrap();
+        assert!(matches!(
+            materialized.get(6),
+            Some(RecordedInputColumnProvenance::Host(_))
+        ));
+    }
+
+    #[test]
     fn poseidon_vec_consumers_use_ordered_multi_edge_gathers_without_host_columns() {
         for (component, expected) in [
             (
@@ -1117,6 +1276,7 @@ mod tests {
                 n_inputs(component),
                 80,
                 128,
+                false,
                 |_| true,
             )
             .unwrap();
@@ -1153,6 +1313,7 @@ mod tests {
                 source,
                 RecordedInputColumnProvenance::Host(_)
                     | RecordedInputColumnProvenance::StructuralEnabler(_)
+                    | RecordedInputColumnProvenance::RetiredBlakeGEnabler { .. }
                     | RecordedInputColumnProvenance::Unresolved(_)
             )));
         }
@@ -1162,8 +1323,10 @@ mod tests {
     fn multiset_consumer_edges_are_device_compacted() {
         let component = node("verify_instruction");
         let columns =
-            provenance_for_unmaterialized(component, n_inputs(component.id), 16, 16, |_| true)
-                .unwrap();
+            provenance_for_unmaterialized(component, n_inputs(component.id), 16, 16, false, |_| {
+                true
+            })
+            .unwrap();
         assert_eq!(columns.len(), 10);
         for (word, column) in columns[..7].iter().enumerate() {
             assert_eq!(
@@ -1193,6 +1356,7 @@ mod tests {
             n_inputs(component.id),
             16 * 252,
             16 * 256,
+            false,
             |producer| producer == "ec_op_builtin",
         )
         .unwrap();
@@ -1214,11 +1378,15 @@ mod tests {
     #[test]
     fn poseidon_aggregator_uses_the_exact_device_compact_writer_abi() {
         let component = node("poseidon_aggregator");
-        let columns =
-            provenance_for_unmaterialized(component, n_inputs(component.id), 16, 16, |producer| {
-                producer == "poseidon_builtin"
-            })
-            .unwrap();
+        let columns = provenance_for_unmaterialized(
+            component,
+            n_inputs(component.id),
+            16,
+            16,
+            false,
+            |producer| producer == "poseidon_builtin",
+        )
+        .unwrap();
         assert_eq!(columns.len(), 9);
         for (word, column) in columns[..6].iter().enumerate() {
             assert_eq!(

@@ -805,6 +805,26 @@ fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
         &cold_recorded.lanes[blake_index],
         blake_component,
     ));
+    let enabler = selection.enabler_ordinal as usize;
+    let (blake_n_real, blake_row_count) = match &cold_recorded.lanes[blake_index].columns[enabler] {
+        RecordedInputColumnProvenance::RetiredBlakeGEnabler { n_real, row_count } => {
+            (*n_real, *row_count)
+        }
+        provenance => panic!(
+            "{}: unexpected Blake-G enabler: {provenance:?}",
+            fixture.profile
+        ),
+    };
+    assert_eq!(
+        (blake_n_real, blake_row_count),
+        (
+            cold_recorded.lanes[blake_index].n_real,
+            cold_recorded.lanes[blake_index].row_count,
+        )
+    );
+    let retired_blake_g_enabler_host_payload_bytes = blake_row_count
+        .checked_mul(core::mem::size_of::<u32>())
+        .expect("Blake-G enabler payload bytes");
 
     if fixture.profile == "SN2" {
         let assert_rejected = |recorded: &PlannedRecordedWitnessInputs, expected_ordinal: usize| {
@@ -820,37 +840,31 @@ fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
                 }) if ordinal == expected_ordinal
             ));
         };
-        let enabler = selection.enabler_ordinal as usize;
-        let exact_enabler = match &cold_recorded.lanes[blake_index].columns[enabler] {
-            RecordedInputColumnProvenance::StructuralEnabler(words) => words.to_vec(),
-            provenance => panic!("SN2: unexpected Blake-G enabler: {provenance:?}"),
-        };
-        let n_real = cold_recorded.lanes[blake_index].n_real;
-        assert!(n_real > 1 && n_real <= exact_enabler.len());
+        assert!(blake_n_real > 1 && blake_n_real <= blake_row_count);
 
-        let mut wrong_length = cold_recorded.clone();
-        wrong_length.lanes[blake_index].columns[enabler] =
-            RecordedInputColumnProvenance::StructuralEnabler(Arc::from(
-                exact_enabler[..exact_enabler.len() - 1].to_vec(),
-            ));
-        assert_rejected(&wrong_length, enabler);
+        let mut wrong_real = cold_recorded.clone();
+        wrong_real.lanes[blake_index].columns[enabler] =
+            RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+                n_real: blake_n_real - 1,
+                row_count: blake_row_count,
+            };
+        assert_rejected(&wrong_real, enabler);
 
-        for row in [0, n_real - 1] {
-            let mut bit_flip = cold_recorded.clone();
-            let mut words = exact_enabler.clone();
-            words[row] ^= 1;
-            bit_flip.lanes[blake_index].columns[enabler] =
-                RecordedInputColumnProvenance::StructuralEnabler(Arc::from(words));
-            assert_rejected(&bit_flip, enabler);
-        }
+        let mut wrong_rows = cold_recorded.clone();
+        wrong_rows.lanes[blake_index].columns[enabler] =
+            RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+                n_real: blake_n_real,
+                row_count: blake_row_count - 1,
+            };
+        assert_rejected(&wrong_rows, enabler);
 
-        let partial_n_real = n_real - 1;
+        let partial_n_real = blake_n_real - 1;
         let mut partial_lane = cold_recorded.lanes[blake_index].clone();
         partial_lane.n_real = partial_n_real;
-        let mut partial_words = exact_enabler.clone();
-        partial_words[partial_n_real] = 0;
-        partial_lane.columns[enabler] =
-            RecordedInputColumnProvenance::StructuralEnabler(Arc::from(partial_words.clone()));
+        partial_lane.columns[enabler] = RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+            n_real: partial_n_real,
+            row_count: blake_row_count,
+        };
         let mut partial_component = blake_component.clone();
         partial_component.n_real_rows = partial_n_real;
         partial_component
@@ -863,27 +877,32 @@ fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
             &partial_lane,
             &partial_component,
         ));
-        for row in [partial_n_real - 1, partial_n_real] {
-            let mut boundary_flip = partial_lane.clone();
-            let mut words = partial_words.clone();
-            words[row] ^= 1;
-            boundary_flip.columns[enabler] =
-                RecordedInputColumnProvenance::StructuralEnabler(Arc::from(words));
+        for symbolic_n_real in [partial_n_real - 1, partial_n_real + 1] {
+            let mut boundary_drift = partial_lane.clone();
+            boundary_drift.columns[enabler] = RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+                n_real: symbolic_n_real,
+                row_count: blake_row_count,
+            };
             assert!(!direct_blake_g_route_is_exact_for_test(
-                &boundary_flip,
+                &boundary_drift,
                 &partial_component,
             ));
         }
 
         let mut host_tag = cold_recorded.clone();
         host_tag.lanes[blake_index].columns[enabler] =
-            RecordedInputColumnProvenance::Host(exact_enabler.clone());
+            RecordedInputColumnProvenance::Host(Vec::new());
         assert_rejected(&host_tag, enabler);
 
         let mut gathered_tag = cold_recorded.clone();
         gathered_tag.lanes[blake_index].columns[enabler] =
             RecordedInputColumnProvenance::DeviceGather(DeviceGatherColumn::Enabler);
         assert_rejected(&gathered_tag, enabler);
+
+        let mut materialized_tag = cold_recorded.clone();
+        materialized_tag.lanes[blake_index].columns[enabler] =
+            RecordedInputColumnProvenance::StructuralEnabler(Arc::from([]));
+        assert_rejected(&materialized_tag, enabler);
 
         let mut wrong_edge = cold_recorded.clone();
         match &mut wrong_edge.lanes[blake_index].columns[0] {
@@ -908,9 +927,10 @@ fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
         let mut extra_column = cold_recorded.lanes[blake_index].clone();
         extra_column
             .columns
-            .push(RecordedInputColumnProvenance::StructuralEnabler(Arc::from(
-                exact_enabler.clone(),
-            )));
+            .push(RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+                n_real: blake_n_real,
+                row_count: blake_row_count,
+            });
         assert!(!direct_blake_g_route_is_exact_for_test(
             &extra_column,
             blake_component,
@@ -962,6 +982,9 @@ fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
             "warm_host_select_ns": warm_audit.select_ns,
             "cold_shape_wall_ns": cold_shape_wall_ns,
             "warm_shape_wall_ns": warm_shape_wall_ns,
+            "retired_blake_g_enabler_host_payload_bytes": retired_blake_g_enabler_host_payload_bytes,
+            "retired_blake_g_enabler_former_route_words_scanned": blake_row_count,
+            "retired_blake_g_enabler_current_route_words_scanned": 0,
             "topology_key_constructions": shape_telemetry.topology_key_constructions,
             "replacement_handle_lock_ns": shape_telemetry.replacement_handle_lock_ns,
             "replacement_handle_lock_ops": shape_telemetry.replacement_handle_lock_ops,

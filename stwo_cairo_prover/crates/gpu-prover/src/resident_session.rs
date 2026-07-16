@@ -1239,12 +1239,10 @@ fn direct_blake_g_route_is_exact(
     }
     matches!(
         lane.columns.get(selection.enabler_ordinal as usize),
-        Some(RecordedInputColumnProvenance::StructuralEnabler(words))
-            if words.len() == lane.row_count
-                && words
-                    .iter()
-                    .enumerate()
-                    .all(|(row, &value)| value == u32::from(row < lane.n_real))
+        Some(RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+            n_real,
+            row_count,
+        }) if *n_real == lane.n_real && *row_count == lane.row_count
     )
 }
 
@@ -1515,6 +1513,7 @@ fn resident_host_witness_inputs<'a>(
                     | RecordedInputColumnProvenance::DeviceCasm(_)
                     | RecordedInputColumnProvenance::DeviceGather(_)
                     | RecordedInputColumnProvenance::DeviceNative(_)
+                    | RecordedInputColumnProvenance::RetiredBlakeGEnabler { .. }
                     | RecordedInputColumnProvenance::Unresolved(_) => {
                         Err(ResidentSessionError::RecordedWitnessInputRoute {
                             component: lane.component,

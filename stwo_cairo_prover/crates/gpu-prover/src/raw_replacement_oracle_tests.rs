@@ -38,6 +38,38 @@ use crate::resident_witness::{planned_cairo_claim, planned_cairo_claim_from_publ
 use crate::schedule_table::CAIRO_SCHEDULE;
 use crate::shape_executable::{ShapeExecutableCache, ShapeExecutableMaterialization};
 
+fn assert_recorded_column_semantics(
+    actual: &RecordedInputColumnProvenance,
+    expected: &RecordedInputColumnProvenance,
+    n_real: usize,
+    row_count: usize,
+) {
+    let exact_words = |words: &[u32]| {
+        words.len() == row_count
+            && words
+                .iter()
+                .enumerate()
+                .all(|(row, &value)| value == u32::from(row < n_real))
+    };
+    match (actual, expected) {
+        (
+            RecordedInputColumnProvenance::StructuralEnabler(actual),
+            RecordedInputColumnProvenance::Host(expected),
+        ) => assert_eq!(actual.as_ref(), expected.as_slice()),
+        (
+            RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+                n_real: actual_real,
+                row_count: actual_rows,
+            },
+            RecordedInputColumnProvenance::Host(expected),
+        ) => {
+            assert_eq!((*actual_real, *actual_rows), (n_real, row_count));
+            assert!(exact_words(expected));
+        }
+        _ => assert_eq!(actual, expected),
+    }
+}
+
 pub(super) fn assert_cached_recorded_matches_fresh(
     cached: &PlannedRecordedWitnessInputs,
     fresh: &PlannedRecordedWitnessInputs,
@@ -57,14 +89,13 @@ pub(super) fn assert_cached_recorded_matches_fresh(
         assert_eq!(cached.tables, fresh.tables);
         assert_eq!(cached.host_build_error, fresh.host_build_error);
         assert_eq!(cached.columns.len(), fresh.columns.len());
-        for (cached, fresh) in cached.columns.iter().zip(&fresh.columns) {
-            match (cached, fresh) {
-                (
-                    RecordedInputColumnProvenance::StructuralEnabler(cached),
-                    RecordedInputColumnProvenance::Host(fresh),
-                ) => assert_eq!(cached.as_ref(), fresh.as_slice()),
-                _ => assert_eq!(cached, fresh),
-            }
+        for (cached_column, fresh_column) in cached.columns.iter().zip(&fresh.columns) {
+            assert_recorded_column_semantics(
+                cached_column,
+                fresh_column,
+                cached.n_real,
+                cached.row_count,
+            );
         }
     }
 }
@@ -157,11 +188,15 @@ fn assert_raw_replacement_matches_generator(input: ProverInput, case: &str) {
             "{case}/{}: row geometry",
             raw_lane.component,
         );
-        assert_eq!(
-            raw_lane.columns, oracle_lane.columns,
-            "{case}/{}: provenance and seed scalars",
-            raw_lane.component,
-        );
+        assert_eq!(raw_lane.columns.len(), oracle_lane.columns.len());
+        for (raw_column, oracle_column) in raw_lane.columns.iter().zip(&oracle_lane.columns) {
+            assert_recorded_column_semantics(
+                raw_column,
+                oracle_column,
+                raw_lane.n_real,
+                raw_lane.row_count,
+            );
+        }
         assert_eq!(
             raw_lane.tables.host_pedersen_points_18, oracle_lane.tables.host_pedersen_points_18,
             "{case}/{}: static table binding",
@@ -192,10 +227,11 @@ fn assert_raw_replacement_matches_generator(input: ProverInput, case: &str) {
 }
 
 #[test]
-fn raw_replacement_planner_matches_generator_on_two_changed_statements() {
+fn raw_replacement_planner_matches_generator_on_representative_statements() {
     for fixture in [
         "test_prove_verify_sn2_profile",
         "test_prove_verify_poseidon_builtin",
+        "test_prove_verify_blake_opcode",
     ] {
         let input = run_and_adapt(
             &get_compiled_cairo_program_path(fixture),
@@ -473,10 +509,22 @@ fn raw_replacement_direct_blake_g_route_admits_tiny_fixture_and_rejects_drift() 
         ));
     };
     let enabler = selection.enabler_ordinal as usize;
-    let exact_enabler = match &cold_recorded.lanes[blake_index].columns[enabler] {
-        RecordedInputColumnProvenance::StructuralEnabler(words) => words.to_vec(),
+    let (n_real, row_count) = match &cold_recorded.lanes[blake_index].columns[enabler] {
+        RecordedInputColumnProvenance::RetiredBlakeGEnabler { n_real, row_count } => {
+            (*n_real, *row_count)
+        }
         provenance => panic!("unexpected Blake-G enabler: {provenance:?}"),
     };
+    assert_eq!(
+        (n_real, row_count),
+        (
+            cold_recorded.lanes[blake_index].n_real,
+            cold_recorded.lanes[blake_index].row_count,
+        )
+    );
+    let exact_enabler = (0..row_count)
+        .map(|row| u32::from(row < n_real))
+        .collect::<Vec<_>>();
 
     let mut host_tag = cold_recorded.clone();
     host_tag.lanes[blake_index].columns[enabler] =
@@ -488,26 +536,31 @@ fn raw_replacement_direct_blake_g_route_admits_tiny_fixture_and_rejects_drift() 
         RecordedInputColumnProvenance::DeviceGather(DeviceGatherColumn::Enabler);
     assert_route_rejected(&gather_tag);
 
-    let mut wrong_value = cold_recorded.clone();
-    let mut words = exact_enabler.clone();
-    words[0] ^= 1;
-    wrong_value.lanes[blake_index].columns[enabler] =
-        RecordedInputColumnProvenance::StructuralEnabler(Arc::from(words));
-    assert_route_rejected(&wrong_value);
+    let mut materialized_tag = cold_recorded.clone();
+    materialized_tag.lanes[blake_index].columns[enabler] =
+        RecordedInputColumnProvenance::StructuralEnabler(Arc::from(exact_enabler.clone()));
+    assert_route_rejected(&materialized_tag);
 
-    let mut wrong_length = cold_recorded.clone();
-    wrong_length.lanes[blake_index].columns[enabler] =
-        RecordedInputColumnProvenance::StructuralEnabler(Arc::from(
-            exact_enabler[..exact_enabler.len() - 1].to_vec(),
-        ));
-    assert_route_rejected(&wrong_length);
+    let mut wrong_real = cold_recorded.clone();
+    wrong_real.lanes[blake_index].columns[enabler] =
+        RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+            n_real: n_real - 1,
+            row_count,
+        };
+    assert_route_rejected(&wrong_real);
+
+    let mut wrong_rows = cold_recorded.clone();
+    wrong_rows.lanes[blake_index].columns[enabler] =
+        RecordedInputColumnProvenance::RetiredBlakeGEnabler {
+            n_real,
+            row_count: row_count - 1,
+        };
+    assert_route_rejected(&wrong_rows);
 
     let mut extra_column = cold_recorded.lanes[blake_index].clone();
     extra_column
         .columns
-        .push(RecordedInputColumnProvenance::StructuralEnabler(Arc::from(
-            exact_enabler.clone(),
-        )));
+        .push(RecordedInputColumnProvenance::RetiredBlakeGEnabler { n_real, row_count });
     assert!(!direct_blake_g_route_is_exact_for_test(
         &extra_column,
         blake_component,
