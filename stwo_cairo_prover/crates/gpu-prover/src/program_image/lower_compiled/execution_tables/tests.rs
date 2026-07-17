@@ -1,6 +1,5 @@
 use std::sync::{Arc, OnceLock};
 
-use super::super::producer_prefix::BaseProducerAuthority;
 use super::*;
 use crate::arena_plan::ExecutionTableGeometry;
 use crate::compiled_proof::{AotArgumentValue, EffectAccess};
@@ -17,10 +16,9 @@ fn fixture() -> &'static Fixture {
     static FIXTURE: OnceLock<Fixture> = OnceLock::new();
     FIXTURE.get_or_init(|| {
         let executable = super::super::tests::generated_sn2_replacement();
-        let mut initial =
+        let initial =
             adapter::SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>())
                 .unwrap();
-        BaseProducerAuthority::compile_replacement_into(executable.arena(), &mut initial).unwrap();
         let mut values = initial.clone();
         let lowered = lower_stage(executable.arena(), &mut values).unwrap();
         Fixture {
@@ -139,7 +137,7 @@ fn host_ingress_and_outputs_are_catalog_first_but_relocations_are_not_values() {
     }
     assert_eq!(
         fixture.values.allocated_versions().count(),
-        fixture.initial.allocated_versions().count() + 2
+        fixture.initial.allocated_versions().count() + semantic_versions.len()
     );
 }
 

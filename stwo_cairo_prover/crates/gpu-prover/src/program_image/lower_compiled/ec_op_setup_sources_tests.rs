@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+
 use super::*;
 use crate::compiled_proof::ValueVersion;
 
@@ -13,6 +15,7 @@ fn generated() -> (
         SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>()).unwrap();
     let authority = super::super::producer_prefix::BaseProducerAuthority::compile_replacement_into(
         executable.arena(),
+        PreProcessedTraceVariant::Canonical,
         &mut values,
     )
     .unwrap();

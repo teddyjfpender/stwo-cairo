@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 
 use stwo_backend_cuda::{DeviceArena, EcOpCompositeContract, PreparedWitnessGraph};
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
 pub(crate) use super::blake_g_direct_execution_authority::PreparedBlakeGDirectKernel;
 use super::blake_g_direct_execution_authority::{
@@ -127,8 +128,11 @@ pub(super) struct BaseProducerBindingFrontier {
 /// the real `CompiledProof` emitter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BaseProducerAuthority {
+    pub(super) execution_tables: Option<execution_tables::LoweredExecutionTables>,
+    pub(super) multiplicity: multiplicity_coordinator::LoweredBaseMultiplicity,
     pub(super) producers: Vec<SemanticBaseProducer>,
     pub(super) direct_retained_b2n: stwo_backend_cuda::DirectRetainedB2nProgram,
+    pub(super) preprocessed_trace_variant: PreProcessedTraceVariant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,16 +196,34 @@ pub(crate) struct PreparedRecordedKernel<'prepared, 'arena> {
 impl BaseProducerAuthority {
     pub(super) fn compile_replacement(
         arena: &ProofArenaPlan,
+        preprocessed_trace_variant: PreProcessedTraceVariant,
     ) -> Result<Self, InvocationShapeError> {
         let mut values =
             adapter::SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>())?;
-        Self::compile_replacement_into(arena, &mut values)
+        Self::compile_replacement_into(arena, preprocessed_trace_variant, &mut values)
     }
 
     /// Lower Base into the caller-owned proof-wide semantic-version stream.
-    /// The caller must retain this exact map for every later proof stage.
+    /// The caller must retain this exact map for every later proof stage. The
+    /// map is replaced only after the complete lowering succeeds.
     pub(super) fn compile_replacement_into(
         arena: &ProofArenaPlan,
+        preprocessed_trace_variant: PreProcessedTraceVariant,
+        values: &mut adapter::SemanticValueMap,
+    ) -> Result<Self, InvocationShapeError> {
+        let mut next_values = values.clone();
+        let authority = Self::compile_replacement_uncommitted(
+            arena,
+            preprocessed_trace_variant,
+            &mut next_values,
+        )?;
+        *values = next_values;
+        Ok(authority)
+    }
+
+    fn compile_replacement_uncommitted(
+        arena: &ProofArenaPlan,
+        preprocessed_trace_variant: PreProcessedTraceVariant,
         values: &mut adapter::SemanticValueMap,
     ) -> Result<Self, InvocationShapeError> {
         let catalog = BaseProducerCatalog::compile(arena)?;
@@ -276,25 +298,33 @@ impl BaseProducerAuthority {
             }
         }
 
+        let execution_tables = arena
+            .execution_tables()
+            .map(|_| execution_tables::lower_stage(arena, values))
+            .transpose()?;
+        let mut multiplicity = multiplicity_coordinator::BaseMultiplicityCoordinator::begin(
+            arena,
+            &schedule,
+            preprocessed_trace_variant,
+            values,
+        )?;
         let mut producers = Vec::with_capacity(pending.len());
         for pending in pending {
-            match pending {
+            let semantic = match pending {
                 PendingSemanticProducer::Recorded(recorded) => {
                     values.extend_ordered(invocation_catalog_order(
                         &recorded.source.source_arguments,
                     ))?;
                     let (invocation, effect) =
                         adapter::compile(&recorded.source.source_arguments, values)?;
-                    producers.push(SemanticBaseProducer::Recorded(
-                        LoweredRecordedWitnessProducer {
-                            position: recorded.position,
-                            producer: recorded.producer,
-                            produced: recorded.produced,
-                            source: recorded.source,
-                            invocation,
-                            effect,
-                        },
-                    ));
+                    SemanticBaseProducer::Recorded(LoweredRecordedWitnessProducer {
+                        position: recorded.position,
+                        producer: recorded.producer,
+                        produced: recorded.produced,
+                        source: recorded.source,
+                        invocation,
+                        effect,
+                    })
                 }
                 PendingSemanticProducer::NativeEcOp {
                     position,
@@ -303,11 +333,11 @@ impl BaseProducerAuthority {
                 } => {
                     let contract = ec_op_prefix::lower(contract, values)?;
                     validate_direct_native_outputs(&catalog, &contract, &direct_outputs)?;
-                    producers.push(SemanticBaseProducer::NativeEcOp {
+                    SemanticBaseProducer::NativeEcOp {
                         position,
                         producer,
                         contract,
-                    });
+                    }
                 }
                 PendingSemanticProducer::NativeBlakeGDirect {
                     position,
@@ -316,20 +346,26 @@ impl BaseProducerAuthority {
                 } => {
                     let contract = super::blake_g_direct_prefix::lower(contract, values)?;
                     validate_direct_blake_g_outputs(&catalog, &contract, &direct_outputs)?;
-                    producers.push(SemanticBaseProducer::NativeBlakeGDirect {
+                    SemanticBaseProducer::NativeBlakeGDirect {
                         position,
                         producer,
                         contract,
-                    });
+                    }
                 }
-            }
+            };
+            multiplicity.after_producer(&semantic, values)?;
+            producers.push(semantic);
         }
         if producers.len() != scheduled.len() {
             return Err(InvocationShapeError::InvalidProductionBaseAuthority);
         }
+        let multiplicity = multiplicity.finish_witness(values)?;
         Ok(Self {
+            execution_tables,
+            multiplicity,
             producers,
             direct_retained_b2n,
+            preprocessed_trace_variant,
         })
     }
 
@@ -352,7 +388,7 @@ impl BaseProducerAuthority {
         sm_major: u32,
         sm_minor: u32,
     ) -> Result<LoadedBaseProducerAuthority, InvocationShapeError> {
-        if self != &Self::compile_replacement(arena)? {
+        if self != &Self::compile_replacement(arena, self.preprocessed_trace_variant)? {
             return Err(InvocationShapeError::InvalidProductionBaseAuthority);
         }
         let catalog = BaseProducerCatalog::compile(arena)?;

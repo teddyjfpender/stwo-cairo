@@ -611,7 +611,7 @@ fn compile_shape_executable(
             BaseProducerAuthoritySelection::LegacyResidentMigrationOnly
         }
         ResidentBackend::ReplacementV1 => BaseProducerAuthoritySelection::ReplacementV1(
-            compile_replacement_base_authority(&arena)?,
+            compile_replacement_base_authority(&arena, request.preprocessed_trace.variant)?,
         ),
     };
     Ok(ShapeExecutable {

@@ -4,6 +4,7 @@ use std::sync::{Arc, OnceLock};
 use stwo_backend_cuda::{
     WitnessInputGatherAbiAccess, WitnessInputGatherAbiArgumentKind, WitnessInputGatherContract,
 };
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_prover::witness::proof_shape::TracePartId;
 
 use super::producer_prefix::{BaseProducerAuthority, SemanticBaseProducer};
@@ -38,9 +39,12 @@ fn build_fixture() -> Fixture {
     let mut initial_values =
         adapter::SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>())
             .unwrap();
-    let authority =
-        BaseProducerAuthority::compile_replacement_into(executable.arena(), &mut initial_values)
-            .unwrap();
+    let authority = BaseProducerAuthority::compile_replacement_into(
+        executable.arena(),
+        PreProcessedTraceVariant::Canonical,
+        &mut initial_values,
+    )
+    .unwrap();
     let required_preproducers = compiled_base_prefix::validate_witness_writer_transitions_for_test(
         &authority,
         &initial_values,

@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 use stwo_backend_cuda::{WitnessCasmInputColumnValue, WitnessCasmInputRowDomain};
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
 use super::super::compiled_base_prefix;
 use super::super::producer_prefix::{BaseProducerAuthority, SemanticBaseProducer};
@@ -35,6 +36,7 @@ fn fixture() -> &'static Fixture {
                 .unwrap();
         let authority = BaseProducerAuthority::compile_replacement_into(
             executable.arena(),
+            PreProcessedTraceVariant::Canonical,
             &mut initial_values,
         )
         .unwrap();
@@ -262,7 +264,12 @@ fn real_blake_casm_lane_owns_a_distinct_iota_output_and_linkable_effect() {
     let mut values =
         adapter::SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>())
             .unwrap();
-    BaseProducerAuthority::compile_replacement_into(executable.arena(), &mut values).unwrap();
+    BaseProducerAuthority::compile_replacement_into(
+        executable.arena(),
+        PreProcessedTraceVariant::Canonical,
+        &mut values,
+    )
+    .unwrap();
     let lowered = lower_stage(executable.arena(), &mut values).unwrap();
     let blake = lowered
         .iter()

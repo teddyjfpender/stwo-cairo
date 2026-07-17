@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use stwo_backend_cuda::aot::{self, AotKernelModuleGlobals};
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
 use super::producer_prefix::{BaseProducerAuthority, SemanticBaseProducer};
 use super::resolved_recorded_build_authority::ResolvedRecordedBuildAuthority;
@@ -123,21 +124,29 @@ pub(super) enum CompiledWitnessWriterPrefixError {
 /// preceding recorded witness writer, then fail at the first native wrapper.
 pub(super) fn emit_recorded_witness_writer_prefix(
     arena: &ProofArenaPlan,
+    preprocessed_trace_variant: PreProcessedTraceVariant,
     target_sm: u32,
 ) -> Result<CompiledWitnessWriterPrefix, CompiledWitnessWriterPrefixError> {
     let manifest = aot::loaded_manifest_identity();
-    emit_recorded_witness_writer_prefix_using(arena, manifest, target_sm, |source| {
-        let (major, minor) = split_sm(target_sm)?;
-        let kernel = aot::loaded_kernel_authority(source.cache_key, major, minor)
-            .ok_or(ResolveRecordedAuthorityError::Missing)?;
-        Ok(ResolvedRecordedBuildAuthority::from_embedded(
-            manifest, kernel,
-        ))
-    })
+    emit_recorded_witness_writer_prefix_using(
+        arena,
+        preprocessed_trace_variant,
+        manifest,
+        target_sm,
+        |source| {
+            let (major, minor) = split_sm(target_sm)?;
+            let kernel = aot::loaded_kernel_authority(source.cache_key, major, minor)
+                .ok_or(ResolveRecordedAuthorityError::Missing)?;
+            Ok(ResolvedRecordedBuildAuthority::from_embedded(
+                manifest, kernel,
+            ))
+        },
+    )
 }
 
 fn emit_recorded_witness_writer_prefix_using(
     arena: &ProofArenaPlan,
+    preprocessed_trace_variant: PreProcessedTraceVariant,
     manifest: [u8; 32],
     target_sm: u32,
     mut resolve: impl FnMut(
@@ -157,8 +166,12 @@ fn emit_recorded_witness_writer_prefix_using(
     let mut values =
         adapter::SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>())
             .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
-    let authority = BaseProducerAuthority::compile_replacement_into(arena, &mut values)
-        .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
+    let authority = BaseProducerAuthority::compile_replacement_into(
+        arena,
+        preprocessed_trace_variant,
+        &mut values,
+    )
+    .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
     let mut kernels = Vec::new();
     let mut effects = BTreeMap::<EffectContractId, EffectContract>::new();
     let mut operations = Vec::new();
@@ -398,18 +411,16 @@ fn validate_witness_writer_transitions(
     }
     let mut destination_producer = BTreeMap::<ValueVersion, usize>::new();
     let mut sources = Vec::new();
-    for (producer_index, producer) in authority.producers.iter().enumerate() {
-        if producer.position().ordinal as usize != producer_index {
-            return Err(());
-        }
-        for access in producer.effect().accesses() {
+    let effects = ordered_base_effects(authority)?;
+    for (operation_index, effect) in effects.iter().enumerate() {
+        for access in effect.accesses() {
             if let Some(destination) = access.destination() {
                 let version = destination.value.version;
                 if !allocated.contains(&version) {
                     return Err(());
                 }
-                match destination_producer.insert(version, producer_index) {
-                    Some(previous) if previous != producer_index => return Err(()),
+                match destination_producer.insert(version, operation_index) {
+                    Some(previous) if previous != operation_index => return Err(()),
                     _ => {}
                 }
             }
@@ -417,7 +428,7 @@ fn validate_witness_writer_transitions(
                 if !allocated.contains(&source.value.version) {
                     return Err(());
                 }
-                sources.push((producer_index, source.value.version));
+                sources.push((operation_index, source.value.version));
             }
         }
     }
@@ -458,6 +469,41 @@ fn validate_witness_writer_transitions(
         }
     }
     Ok(required_preproducer_versions)
+}
+
+/// Derive the exact lowered effect order without introducing a second
+/// schedule: execution-table splits, clear, optional seed, then each witness
+/// producer immediately followed by its generic feed.
+fn ordered_base_effects(authority: &BaseProducerAuthority) -> Result<Vec<&EffectContract>, ()> {
+    if authority.multiplicity.after_producer.len() != authority.producers.len() {
+        return Err(());
+    }
+    let mut effects = Vec::with_capacity(
+        authority
+            .producers
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(4))
+            .ok_or(())?,
+    );
+    if let Some(execution_tables) = &authority.execution_tables {
+        effects.extend(execution_tables.stages.iter().map(|stage| &stage.effect));
+    }
+    effects.push(&authority.multiplicity.clear.effect);
+    if let Some(seed) = &authority.multiplicity.public_memory_seed {
+        effects.push(&seed.effect);
+    }
+    for (producer, feed) in authority
+        .producers
+        .iter()
+        .zip(&authority.multiplicity.after_producer)
+    {
+        effects.push(producer.effect());
+        if let Some(feed) = feed {
+            effects.push(&feed.effect);
+        }
+    }
+    Ok(effects)
 }
 
 fn validate_sealed_prefix(
@@ -734,11 +780,18 @@ pub(super) enum ResolveRecordedAuthorityError {
 #[cfg(test)]
 pub(super) fn emit_recorded_witness_writer_prefix_for_test(
     arena: &ProofArenaPlan,
+    preprocessed_trace_variant: PreProcessedTraceVariant,
     manifest: [u8; 32],
     target_sm: u32,
     resolve: impl FnMut(
         &RecordedWitnessInvocationShape,
     ) -> Result<ResolvedRecordedBuildAuthority, ResolveRecordedAuthorityError>,
 ) -> Result<CompiledWitnessWriterPrefix, CompiledWitnessWriterPrefixError> {
-    emit_recorded_witness_writer_prefix_using(arena, manifest, target_sm, resolve)
+    emit_recorded_witness_writer_prefix_using(
+        arena,
+        preprocessed_trace_variant,
+        manifest,
+        target_sm,
+        resolve,
+    )
 }

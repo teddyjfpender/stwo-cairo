@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use stwo_backend_cuda::aot::{AotKernelAbiSchema, AotKernelModuleGlobals, AotKernelSchemaScope};
 use stwo_backend_cuda::TraceTreeRole;
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
 use super::compiled_base_prefix::{
     emit_recorded_witness_writer_prefix_for_test, CompiledWitnessWriterPrefixError,
@@ -21,7 +22,11 @@ const TARGET_SM: u32 = 89;
 #[test]
 fn resolved_recorded_build_authority_rejects_every_offline_identity_mutation() {
     let executable = super::tests::generated_sn2_replacement();
-    let authority = BaseProducerAuthority::compile_replacement(executable.arena()).unwrap();
+    let authority = BaseProducerAuthority::compile_replacement(
+        executable.arena(),
+        PreProcessedTraceVariant::Canonical,
+    )
+    .unwrap();
     let recorded = authority
         .producers
         .iter()
@@ -66,7 +71,11 @@ fn resolved_recorded_build_authority_rejects_every_offline_identity_mutation() {
 #[test]
 fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapper() {
     let executable = super::tests::generated_sn2_replacement();
-    let authority = BaseProducerAuthority::compile_replacement(executable.arena()).unwrap();
+    let authority = BaseProducerAuthority::compile_replacement(
+        executable.arena(),
+        PreProcessedTraceVariant::Canonical,
+    )
+    .unwrap();
     let ec_op = authority
         .producers
         .iter()
@@ -206,6 +215,7 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
 
     let error = emit_recorded_witness_writer_prefix_for_test(
         executable.arena(),
+        PreProcessedTraceVariant::Canonical,
         MANIFEST,
         TARGET_SM,
         |source| Ok(exact_fields(source)),

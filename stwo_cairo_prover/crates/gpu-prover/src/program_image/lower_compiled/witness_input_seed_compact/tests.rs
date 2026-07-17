@@ -4,6 +4,7 @@ use std::sync::{Arc, OnceLock};
 use stwo_backend_cuda::{
     WitnessInputCompactCubStage, WitnessInputCompactExecution, WitnessInputCompactKernelStage,
 };
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
 use super::super::compiled_base_prefix;
 use super::super::producer_prefix::{BaseProducerAuthority, SemanticBaseProducer};
@@ -40,6 +41,7 @@ pub(super) fn fixture() -> &'static Fixture {
                 .unwrap();
         let authority = BaseProducerAuthority::compile_replacement_into(
             executable.arena(),
+            PreProcessedTraceVariant::Canonical,
             &mut initial_values,
         )
         .unwrap();

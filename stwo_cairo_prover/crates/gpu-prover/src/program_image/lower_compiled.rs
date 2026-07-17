@@ -15,6 +15,7 @@ use stwo_backend_cuda::jit_witness::isa::{WitnessOp, WitnessProgram};
 use stwo_backend_cuda::{
     ArenaSlotId, EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_POINTERS, EXECUTION_TABLE_STRIDES,
 };
+use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
 use super::*;
 use crate::arena_plan::{
@@ -42,6 +43,8 @@ mod execution_tables;
 mod loaded_authority;
 mod loaded_writer_binding;
 mod multiplicity_clear;
+mod multiplicity_coordinator;
+mod multiplicity_feed;
 mod producer_prefix;
 mod recorded_deduce_authority;
 #[cfg(test)]
@@ -68,8 +71,9 @@ pub(crate) struct BaseProducerAuthorityError;
 
 pub(crate) fn compile_replacement_base_authority(
     arena: &ProofArenaPlan,
+    preprocessed_trace_variant: PreProcessedTraceVariant,
 ) -> Result<BaseProducerAuthority, BaseProducerAuthorityError> {
-    producer_prefix::BaseProducerAuthority::compile_replacement(arena)
+    producer_prefix::BaseProducerAuthority::compile_replacement(arena, preprocessed_trace_variant)
         .map_err(|_| BaseProducerAuthorityError)
 }
 
