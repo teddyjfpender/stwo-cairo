@@ -52,6 +52,7 @@ mod static_wrapper_projection_tests;
 mod witness_input_gather;
 #[cfg(test)]
 mod witness_input_gather_tests;
+mod witness_input_seed_compact;
 
 pub(crate) use producer_prefix::{
     BaseProducerAuthority, LoadedBaseProducerAuthority, PreparedBlakeGDirectKernel,
