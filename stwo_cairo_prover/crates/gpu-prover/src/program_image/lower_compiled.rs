@@ -38,10 +38,12 @@ mod ec_op_execution_authority;
 mod ec_op_pair_tests;
 mod ec_op_prefix;
 mod loaded_authority;
+mod loaded_writer_binding;
 mod producer_prefix;
 mod recorded_deduce_authority;
 #[cfg(test)]
 mod recorded_deduce_tests;
+mod resolved_recorded_build_authority;
 mod schedule_prefix;
 mod static_wrapper_invocation;
 mod static_wrapper_projection;
@@ -66,7 +68,7 @@ pub(crate) fn compile_replacement_base_authority(
 pub(crate) fn bind_replacement_base_authority(
     authority: &BaseProducerAuthority,
     arena: &ProofArenaPlan,
-    prepared: &[PreparedRecordedKernel<'_>],
+    prepared: &[PreparedRecordedKernel<'_, '_>],
     prepared_blake_g_direct: Option<PreparedBlakeGDirectKernel<'_, '_>>,
     device_ordinal: u32,
     sm_major: u32,

@@ -2147,11 +2147,12 @@ impl<'a> ResidentGraphRuntime<'a> {
             Some(authority) => {
                 let recorded = witness
                     .iter()
-                    .filter(|prepared| !prepared.writer.is_blake_g_direct())
+                    .filter(|prepared| !prepared.writer.is_blake_g_fused())
                     .map(|prepared| PreparedRecordedKernel {
                         component: prepared.component,
                         part: prepared.part,
-                        identity: prepared.writer.kernel_identity(),
+                        arena,
+                        writer: &prepared.writer,
                     })
                     .collect::<Vec<_>>();
                 let direct_writers = witness

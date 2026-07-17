@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use stwo_backend_cuda::aot::{self, AotKernelModuleGlobals};
 
-use super::loaded_authority::LoadedAuthorityFields;
 use super::producer_prefix::{BaseProducerAuthority, SemanticBaseProducer};
+use super::resolved_recorded_build_authority::ResolvedRecordedBuildAuthority;
 use super::*;
 use crate::compiled_proof::{
     AotKernelAuthority, AotKernelId, EffectContract, EffectContractId, ExecutionPrimitive,
@@ -57,7 +57,7 @@ pub(super) struct CompiledWitnessWriterPrefix {
     base_authority: BaseProducerAuthority,
     next_producer: usize,
     required_preproducer_versions: BTreeSet<ValueVersion>,
-    kernel_by_loaded_authority: BTreeMap<[u8; 32], usize>,
+    kernel_by_build_authority: BTreeMap<[u8; 32], usize>,
     pub(super) kernels: Vec<AotKernelAuthority>,
     pub(super) effects: Vec<EffectContract>,
     pub(super) partitions: Vec<PartitionAuthority>,
@@ -103,7 +103,7 @@ impl CompiledWitnessWriterPrefix {
 
     #[cfg(test)]
     pub(super) const fn recorded_kernel_authorities(&self) -> &BTreeMap<[u8; 32], usize> {
-        &self.kernel_by_loaded_authority
+        &self.kernel_by_build_authority
     }
 }
 
@@ -130,7 +130,9 @@ pub(super) fn emit_recorded_witness_writer_prefix(
         let (major, minor) = split_sm(target_sm)?;
         let kernel = aot::loaded_kernel_authority(source.cache_key, major, minor)
             .ok_or(ResolveRecordedAuthorityError::Missing)?;
-        Ok(LoadedAuthorityFields::from_loaded(manifest, kernel))
+        Ok(ResolvedRecordedBuildAuthority::from_embedded(
+            manifest, kernel,
+        ))
     })
 }
 
@@ -140,10 +142,10 @@ fn emit_recorded_witness_writer_prefix_using(
     target_sm: u32,
     mut resolve: impl FnMut(
         &RecordedWitnessInvocationShape,
-    ) -> Result<LoadedAuthorityFields, ResolveRecordedAuthorityError>,
+    )
+        -> Result<ResolvedRecordedBuildAuthority, ResolveRecordedAuthorityError>,
 ) -> Result<CompiledWitnessWriterPrefix, CompiledWitnessWriterPrefixError> {
-    let (sm_major, sm_minor) =
-        split_sm(target_sm).map_err(|_| CompiledWitnessWriterPrefixError::InvalidTargetSm)?;
+    split_sm(target_sm).map_err(|_| CompiledWitnessWriterPrefixError::InvalidTargetSm)?;
     if manifest == [0; 32] {
         return Err(
             CompiledWitnessWriterPrefixError::MissingRecordedAotAuthority(
@@ -160,7 +162,7 @@ fn emit_recorded_witness_writer_prefix_using(
     let mut kernels = Vec::new();
     let mut effects = BTreeMap::<EffectContractId, EffectContract>::new();
     let mut operations = Vec::new();
-    let mut kernel_by_loaded_authority = BTreeMap::<[u8; 32], usize>::new();
+    let mut kernel_by_build_authority = BTreeMap::<[u8; 32], usize>::new();
     let monolithic = PartitionAuthority::monolithic();
 
     for producer_index in 0..authority.producers.len() {
@@ -180,7 +182,7 @@ fn emit_recorded_witness_writer_prefix_using(
                     target_sm,
                     values,
                     kernels,
-                    kernel_by_loaded_authority,
+                    kernel_by_build_authority,
                     effects,
                     operations,
                     monolithic,
@@ -199,7 +201,7 @@ fn emit_recorded_witness_writer_prefix_using(
                     target_sm,
                     values,
                     kernels,
-                    kernel_by_loaded_authority,
+                    kernel_by_build_authority,
                     effects,
                     operations,
                     monolithic,
@@ -224,7 +226,7 @@ fn emit_recorded_witness_writer_prefix_using(
                 target_sm,
                 values,
                 kernels,
-                kernel_by_loaded_authority,
+                kernel_by_build_authority,
                 effects,
                 operations,
                 monolithic,
@@ -241,14 +243,8 @@ fn emit_recorded_witness_writer_prefix_using(
                 CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer)
             }
         })?;
-        if fields.manifest_identity != manifest
-            || fields.module_globals != AotKernelModuleGlobals::None
-            || super::loaded_authority::validate_fields(
-                &recorded.source,
-                sm_major,
-                sm_minor,
-                &fields,
-            )
+        if fields
+            .validate(&recorded.source, manifest, target_sm)
             .is_err()
         {
             return Err(CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer));
@@ -257,7 +253,7 @@ fn emit_recorded_witness_writer_prefix_using(
             .map_err(|_| CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer))?;
         let kernel_id = install_recorded_kernel(
             &mut kernels,
-            &mut kernel_by_loaded_authority,
+            &mut kernel_by_build_authority,
             &recorded.source,
             &fields,
             recorded.effect.id(),
@@ -290,7 +286,7 @@ fn emit_recorded_witness_writer_prefix_using(
         target_sm,
         values,
         kernels,
-        kernel_by_loaded_authority,
+        kernel_by_build_authority,
         effects,
         operations,
         monolithic,
@@ -308,7 +304,7 @@ fn missing_adapter(
     target_sm: u32,
     values: adapter::SemanticValueMap,
     kernels: Vec<AotKernelAuthority>,
-    kernel_by_loaded_authority: BTreeMap<[u8; 32], usize>,
+    kernel_by_build_authority: BTreeMap<[u8; 32], usize>,
     effects: BTreeMap<EffectContractId, EffectContract>,
     operations: Vec<OpNode>,
     monolithic: PartitionAuthority,
@@ -326,7 +322,7 @@ fn missing_adapter(
             target_sm,
             values,
             kernels,
-            kernel_by_loaded_authority,
+            kernel_by_build_authority,
             effects,
             operations,
             monolithic,
@@ -341,7 +337,7 @@ fn finish_prefix(
     target_sm: u32,
     values: adapter::SemanticValueMap,
     kernels: Vec<AotKernelAuthority>,
-    kernel_by_loaded_authority: BTreeMap<[u8; 32], usize>,
+    kernel_by_build_authority: BTreeMap<[u8; 32], usize>,
     effects: BTreeMap<EffectContractId, EffectContract>,
     operations: Vec<OpNode>,
     monolithic: PartitionAuthority,
@@ -359,7 +355,7 @@ fn finish_prefix(
     validate_sealed_prefix(
         &base_authority,
         next_producer,
-        &kernel_by_loaded_authority,
+        &kernel_by_build_authority,
         &kernels,
         &effects,
         &partitions,
@@ -374,7 +370,7 @@ fn finish_prefix(
         base_authority,
         next_producer,
         required_preproducer_versions,
-        kernel_by_loaded_authority,
+        kernel_by_build_authority,
         kernels,
         effects,
         partitions,
@@ -467,7 +463,7 @@ fn validate_witness_writer_transitions(
 fn validate_sealed_prefix(
     authority: &BaseProducerAuthority,
     next_producer: usize,
-    kernel_by_loaded_authority: &BTreeMap<[u8; 32], usize>,
+    kernel_by_build_authority: &BTreeMap<[u8; 32], usize>,
     kernels: &[AotKernelAuthority],
     effects: &[EffectContract],
     partitions: &[PartitionAuthority],
@@ -481,8 +477,8 @@ fn validate_sealed_prefix(
     if next_producer != operations.len()
         || next_producer > authority.producers.len()
         || partitions != expected_partitions
-        || kernel_by_loaded_authority.len() != kernels.len()
-        || kernel_by_loaded_authority
+        || kernel_by_build_authority.len() != kernels.len()
+        || kernel_by_build_authority
             .values()
             .copied()
             .collect::<BTreeSet<_>>()
@@ -537,7 +533,7 @@ fn validate_sealed_prefix(
 fn compiled_kernel(
     id: AotKernelId,
     source: &RecordedWitnessInvocationShape,
-    fields: &LoadedAuthorityFields,
+    fields: &ResolvedRecordedBuildAuthority,
     effect: EffectContractId,
 ) -> Result<AotKernelAuthority, ()> {
     let module_encoding = encode_module(fields)?;
@@ -545,7 +541,7 @@ fn compiled_kernel(
     AotKernelAuthority::new(
         id,
         module,
-        encode_semantic(source, fields)?,
+        encode_semantic(source)?,
         encode_execution_build(fields)?,
         vec![effect],
     )
@@ -554,15 +550,15 @@ fn compiled_kernel(
 
 fn install_recorded_kernel(
     kernels: &mut Vec<AotKernelAuthority>,
-    kernel_by_loaded_authority: &mut BTreeMap<[u8; 32], usize>,
+    kernel_by_build_authority: &mut BTreeMap<[u8; 32], usize>,
     source: &RecordedWitnessInvocationShape,
-    fields: &LoadedAuthorityFields,
+    fields: &ResolvedRecordedBuildAuthority,
     effect: EffectContractId,
 ) -> Result<AotKernelId, ()> {
-    let Some(&index) = kernel_by_loaded_authority.get(&fields.authority_identity) else {
+    let Some(&index) = kernel_by_build_authority.get(&fields.authority_identity) else {
         let id = AotKernelId(u32::try_from(kernels.len() + 1).map_err(|_| ())?);
         let kernel = compiled_kernel(id, source, fields, effect)?;
-        kernel_by_loaded_authority.insert(fields.authority_identity, kernels.len());
+        kernel_by_build_authority.insert(fields.authority_identity, kernels.len());
         kernels.push(kernel);
         return Ok(id);
     };
@@ -604,10 +600,10 @@ fn install_recorded_kernel(
 #[cfg(test)]
 pub(super) fn install_recorded_kernel_pair_for_test(
     first_source: &RecordedWitnessInvocationShape,
-    first_fields: &LoadedAuthorityFields,
+    first_fields: &ResolvedRecordedBuildAuthority,
     first_effect: EffectContractId,
     second_source: &RecordedWitnessInvocationShape,
-    second_fields: &LoadedAuthorityFields,
+    second_fields: &ResolvedRecordedBuildAuthority,
     second_effect: EffectContractId,
 ) -> Result<(Vec<AotKernelAuthority>, AotKernelId, AotKernelId), ()> {
     let mut kernels = Vec::new();
@@ -646,7 +642,7 @@ pub(super) fn validate_sealed_prefix_for_test(
     validate_sealed_prefix(
         &prefix.base_authority,
         next_producer,
-        &prefix.kernel_by_loaded_authority,
+        &prefix.kernel_by_build_authority,
         &prefix.kernels,
         &prefix.effects,
         &prefix.partitions,
@@ -661,7 +657,7 @@ fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
-fn encode_module(fields: &LoadedAuthorityFields) -> Result<Vec<u8>, ()> {
+fn encode_module(fields: &ResolvedRecordedBuildAuthority) -> Result<Vec<u8>, ()> {
     let mut out = Vec::from(MODULE_DOMAIN);
     out.extend_from_slice(&fields.manifest_identity);
     out.extend_from_slice(&fields.cubin_identity);
@@ -671,10 +667,7 @@ fn encode_module(fields: &LoadedAuthorityFields) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-fn encode_semantic(
-    source: &RecordedWitnessInvocationShape,
-    fields: &LoadedAuthorityFields,
-) -> Result<Vec<u8>, ()> {
+fn encode_semantic(source: &RecordedWitnessInvocationShape) -> Result<Vec<u8>, ()> {
     let mut out = Vec::from(SEMANTIC_DOMAIN);
     out.extend_from_slice(&source.program_identity);
     out.extend_from_slice(&source.deduce.source_identity);
@@ -685,7 +678,7 @@ fn encode_semantic(
     Ok(out)
 }
 
-fn encode_execution_build(fields: &LoadedAuthorityFields) -> Result<Vec<u8>, ()> {
+fn encode_execution_build(fields: &ResolvedRecordedBuildAuthority) -> Result<Vec<u8>, ()> {
     let mut out = Vec::from(BUILD_DOMAIN);
     out.extend_from_slice(&fields.manifest_identity);
     out.extend_from_slice(&fields.source_identity);
@@ -745,7 +738,7 @@ pub(super) fn emit_recorded_witness_writer_prefix_for_test(
     target_sm: u32,
     resolve: impl FnMut(
         &RecordedWitnessInvocationShape,
-    ) -> Result<LoadedAuthorityFields, ResolveRecordedAuthorityError>,
+    ) -> Result<ResolvedRecordedBuildAuthority, ResolveRecordedAuthorityError>,
 ) -> Result<CompiledWitnessWriterPrefix, CompiledWitnessWriterPrefixError> {
     emit_recorded_witness_writer_prefix_using(arena, manifest, target_sm, resolve)
 }

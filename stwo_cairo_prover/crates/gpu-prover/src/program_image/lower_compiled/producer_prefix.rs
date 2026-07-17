@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use stwo_backend_cuda::{EcOpCompositeContract, PreparedWitnessMode, WitnessKernelIdentity};
+use stwo_backend_cuda::{DeviceArena, EcOpCompositeContract, PreparedWitnessGraph};
 
 pub(crate) use super::blake_g_direct_execution_authority::PreparedBlakeGDirectKernel;
 use super::blake_g_direct_execution_authority::{
@@ -182,10 +182,11 @@ pub(crate) struct LoadedBaseProducerAuthority {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PreparedRecordedKernel<'a> {
+pub(crate) struct PreparedRecordedKernel<'prepared, 'arena> {
     pub(crate) component: &'static str,
     pub(crate) part: stwo_cairo_prover::witness::proof_shape::TracePartId,
-    pub(crate) identity: &'a WitnessKernelIdentity,
+    pub(crate) arena: &'arena DeviceArena,
+    pub(crate) writer: &'prepared PreparedWitnessGraph<'arena>,
 }
 
 impl BaseProducerAuthority {
@@ -345,7 +346,7 @@ impl BaseProducerAuthority {
     pub(super) fn bind_loaded(
         &self,
         arena: &ProofArenaPlan,
-        prepared: &[PreparedRecordedKernel<'_>],
+        prepared: &[PreparedRecordedKernel<'_, '_>],
         prepared_blake_g_direct: Option<PreparedBlakeGDirectKernel<'_, '_>>,
         device_ordinal: u32,
         sm_major: u32,
@@ -354,6 +355,7 @@ impl BaseProducerAuthority {
         if self != &Self::compile_replacement(arena)? {
             return Err(InvocationShapeError::InvalidProductionBaseAuthority);
         }
+        let catalog = BaseProducerCatalog::compile(arena)?;
         let mut remaining = prepared.iter().collect::<Vec<_>>();
         let mut prepared_blake_g_direct = prepared_blake_g_direct;
         let mut recorded = Vec::new();
@@ -377,22 +379,17 @@ impl BaseProducerAuthority {
                         })
                         .ok_or(InvocationShapeError::InvalidProductionBaseAuthority)?;
                     let prepared = remaining.swap_remove(index);
-                    if prepared.identity.kernel_name != producer.source.kernel_symbol
-                        || prepared.identity.semantic_hash != producer.source.semantic_hash
-                        || prepared.identity.cache_key != producer.source.cache_key
-                        || prepared.identity.mode != PreparedWitnessMode::RequireEmbeddedAot
-                    {
-                        return Err(InvocationShapeError::InvalidProductionBaseAuthority);
-                    }
-                    let loaded = super::loaded_authority::require(
+                    let planned = planned_recorded_component(arena, producer.producer)?;
+                    let loaded = super::loaded_authority::require_prepared(
                         &producer.source,
+                        &catalog,
+                        planned,
+                        prepared.arena,
+                        prepared.writer,
                         device_ordinal,
                         sm_major,
                         sm_minor,
                     )?;
-                    if loaded.manifest_identity != prepared.identity.aot_manifest_identity {
-                        return Err(InvocationShapeError::LoadedAotAuthorityMismatch);
-                    }
                     recorded.push(loaded);
                 }
                 SemanticBaseProducer::NativeBlakeGDirect { contract, .. } => {

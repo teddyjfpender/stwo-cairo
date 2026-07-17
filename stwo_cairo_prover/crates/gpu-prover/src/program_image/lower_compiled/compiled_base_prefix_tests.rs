@@ -7,8 +7,8 @@ use super::compiled_base_prefix::{
     emit_recorded_witness_writer_prefix_for_test, CompiledWitnessWriterPrefixError,
     MissingBaseAdapter,
 };
-use super::loaded_authority::LoadedAuthorityFields;
 use super::producer_prefix::SemanticBaseProducer;
+use super::resolved_recorded_build_authority::ResolvedRecordedBuildAuthority;
 use super::*;
 use crate::compiled_proof::{
     AotArgumentValue, EffectAccess, EffectBindingId, EffectContract, ExecutionPrimitive,
@@ -17,6 +17,51 @@ use crate::compiled_proof::{
 
 const MANIFEST: [u8; 32] = [0x4d; 32];
 const TARGET_SM: u32 = 89;
+
+#[test]
+fn resolved_recorded_build_authority_rejects_every_offline_identity_mutation() {
+    let executable = super::tests::generated_sn2_replacement();
+    let authority = BaseProducerAuthority::compile_replacement(executable.arena()).unwrap();
+    let recorded = authority
+        .producers
+        .iter()
+        .find_map(|producer| match producer {
+            SemanticBaseProducer::Recorded(recorded) => Some(recorded),
+            _ => None,
+        })
+        .unwrap();
+    let exact = exact_fields(&recorded.source);
+    exact
+        .validate(&recorded.source, MANIFEST, TARGET_SM)
+        .unwrap();
+
+    let mutations: [fn(&mut ResolvedRecordedBuildAuthority); 13] = [
+        |fields| fields.manifest_identity = [0; 32],
+        |fields| fields.program_identity[0] ^= 1,
+        |fields| fields.abi_schema = None,
+        |fields| fields.abi_schema_identity[0] ^= 1,
+        |fields| fields.schema_scope = AotKernelSchemaScope::ExportedSymbolOnly,
+        |fields| fields.kernel_symbol.push('x'),
+        |fields| fields.semantic_hash ^= 1,
+        |fields| fields.cache_key ^= 1,
+        |fields| fields.target_sm += 1,
+        |fields| fields.source_identity[0] ^= 1,
+        |fields| fields.cubin_identity = [0; 32],
+        |fields| fields.authority_identity = [0; 32],
+        |fields| fields.module_globals = AotKernelModuleGlobals::WitnessPedersenV1,
+    ];
+    for mutate in mutations {
+        let mut changed = exact.clone();
+        mutate(&mut changed);
+        assert!(changed
+            .validate(&recorded.source, MANIFEST, TARGET_SM)
+            .is_err());
+    }
+    assert!(exact
+        .validate(&recorded.source, [0; 32], TARGET_SM)
+        .is_err());
+    assert!(exact.validate(&recorded.source, MANIFEST, 0).is_err());
+}
 
 #[test]
 fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapper() {
@@ -412,8 +457,8 @@ fn assert_witness_writer_def_use_is_ordered(
     }
 }
 
-fn exact_fields(source: &RecordedWitnessInvocationShape) -> LoadedAuthorityFields {
-    LoadedAuthorityFields {
+fn exact_fields(source: &RecordedWitnessInvocationShape) -> ResolvedRecordedBuildAuthority {
+    ResolvedRecordedBuildAuthority {
         manifest_identity: MANIFEST,
         program_identity: source.program_identity,
         abi_schema: Some(AotKernelAbiSchema::RecordedWitnessV1),
