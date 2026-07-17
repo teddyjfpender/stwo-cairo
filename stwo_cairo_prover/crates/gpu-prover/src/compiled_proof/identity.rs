@@ -1,7 +1,7 @@
 use super::{CompiledProofError, IdentityKind, *};
 
 const PROOF_IDENTITY_TAG: &[u8] = b"stwo-cairo.compiled-proof.identity.v2";
-const STRUCTURE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.structure.v4\0";
+const STRUCTURE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.structure.v5\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CanonicalIdentity {
@@ -188,7 +188,7 @@ pub(super) fn compiled_identity(
         out.raw(operation.effect.as_bytes());
         out.raw(operation.partition.as_bytes());
         out.stage(operation.stage);
-        out.primitive(operation.primitive)?;
+        out.primitive(&operation.primitive)?;
         out.invocation(operation.invocation.as_ref())?;
     }
 
@@ -342,21 +342,30 @@ impl Encoder {
         });
     }
 
-    fn primitive(&mut self, primitive: ExecutionPrimitive) -> Result<(), CompiledProofError> {
+    fn primitive(&mut self, primitive: &ExecutionPrimitive) -> Result<(), CompiledProofError> {
         match primitive {
             ExecutionPrimitive::AotKernel { kernel, launch } => {
                 self.byte(0);
                 self.u32(kernel.0);
-                self.launch(launch);
+                self.launch(*launch);
             }
             ExecutionPrimitive::DeviceCopyD2D { bytes } => {
                 self.byte(1);
-                self.size(bytes)?;
+                self.size(*bytes)?;
             }
             ExecutionPrimitive::DeviceMemsetByte { bytes, value } => {
                 self.byte(2);
-                self.size(bytes)?;
-                self.byte(value);
+                self.size(*bytes)?;
+                self.byte(*value);
+            }
+            ExecutionPrimitive::OrderedComposite { children } => {
+                self.byte(3);
+                self.count(children.len())?;
+                for child in children {
+                    self.raw(child.effect.as_bytes());
+                    self.primitive(&child.primitive)?;
+                    self.invocation(child.invocation.as_ref())?;
+                }
             }
         }
         Ok(())

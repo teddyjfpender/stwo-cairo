@@ -12,6 +12,8 @@ use stwo_cairo_gpu_prover::transcript_plan::{
 
 #[path = "compiled_proof_host/fixture.rs"]
 mod fixture;
+#[path = "compiled_proof_host/ordered_composite.rs"]
+mod ordered_composite;
 #[path = "compiled_proof_host/primitive.rs"]
 mod primitive;
 #[path = "compiled_proof_host/structural_authority.rs"]
@@ -699,10 +701,11 @@ fn rejects_noncanonical_or_overlapping_proof_output() {
     ));
 
     let mut overlap = valid_input();
-    overlap.output.sections[3].elements = overlap.output.sections[1].elements;
-    overlap.output.fragments[3].source.elements = overlap.output.sections[3].elements;
-    assert!(matches!(
-        CompiledProof::compile(overlap, transcript()),
-        Err(CompiledProofError::InvalidProofAssembly)
-    ));
+    overlap.output.sections[4].elements = overlap.output.sections[0].elements;
+    overlap.output.fragments[4].source.elements = overlap.output.sections[4].elements;
+    let result = CompiledProof::compile(overlap, transcript());
+    assert!(
+        matches!(result, Err(CompiledProofError::InvalidProofAssembly)),
+        "{result:?}"
+    );
 }

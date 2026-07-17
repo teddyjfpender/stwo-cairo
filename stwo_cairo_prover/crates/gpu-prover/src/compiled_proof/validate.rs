@@ -113,21 +113,20 @@ fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofE
         }
         let mut used = BTreeSet::new();
         for operation in &input.operations {
-            if matches!(
-                operation.primitive,
-                ExecutionPrimitive::AotKernel { kernel: id, .. } if id == kernel.id()
-            ) {
-                if kernel
-                    .accepted_effects()
-                    .binary_search(&operation.effect)
-                    .is_err()
-                {
-                    return Err(CompiledProofError::KernelEffectNotAccepted {
-                        operation: operation.id,
-                    });
+            for_each_leaf_step(operation, |primitive, effect| {
+                if matches!(
+                    primitive,
+                    ExecutionPrimitive::AotKernel { kernel: id, .. } if *id == kernel.id()
+                ) {
+                    if kernel.accepted_effects().binary_search(&effect).is_err() {
+                        return Err(CompiledProofError::KernelEffectNotAccepted {
+                            operation: operation.id,
+                        });
+                    }
+                    used.insert(effect);
                 }
-                used.insert(operation.effect);
-            }
+                Ok(())
+            })?;
         }
         if kernel.accepted_effects().iter().copied().ne(used) {
             return Err(CompiledProofError::NonCanonicalKernelEffects(kernel.id()));
@@ -139,11 +138,14 @@ fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofE
         .iter()
         .map(EffectContract::id)
         .collect::<Vec<_>>();
-    let used_effects = input
-        .operations
-        .iter()
-        .map(|operation| operation.effect)
-        .collect::<BTreeSet<_>>();
+    let mut used_effects = BTreeSet::new();
+    for operation in &input.operations {
+        used_effects.insert(operation.effect);
+        for_each_leaf_step(operation, |_, effect| {
+            used_effects.insert(effect);
+            Ok(())
+        })?;
+    }
     if declared_effects
         .iter()
         .copied()
@@ -157,21 +159,36 @@ fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofE
         .iter()
         .map(AotKernelAuthority::id)
         .collect::<Vec<_>>();
-    let used_kernels = input
-        .operations
-        .iter()
-        .filter_map(|operation| match operation.primitive {
-            ExecutionPrimitive::AotKernel { kernel, .. } => Some(kernel),
-            ExecutionPrimitive::DeviceCopyD2D { .. }
-            | ExecutionPrimitive::DeviceMemsetByte { .. } => None,
-        })
-        .collect::<BTreeSet<_>>();
+    let mut used_kernels = BTreeSet::new();
+    for operation in &input.operations {
+        for_each_leaf_step(operation, |primitive, _| {
+            if let ExecutionPrimitive::AotKernel { kernel, .. } = primitive {
+                used_kernels.insert(*kernel);
+            }
+            Ok(())
+        })?;
+    }
     if declared_kernels
         .iter()
         .copied()
         .ne(used_kernels.iter().copied())
     {
         return Err(CompiledProofError::NonCanonicalKernelAuthority);
+    }
+    Ok(())
+}
+
+fn for_each_leaf_step(
+    operation: &OpNode,
+    mut visit: impl FnMut(&ExecutionPrimitive, EffectContractId) -> Result<(), CompiledProofError>,
+) -> Result<(), CompiledProofError> {
+    match &operation.primitive {
+        ExecutionPrimitive::OrderedComposite { children } => {
+            for child in children {
+                visit(&child.primitive, child.effect)?;
+            }
+        }
+        primitive => visit(primitive, operation.effect)?,
     }
     Ok(())
 }
@@ -209,7 +226,14 @@ fn validate_operations(
         for access in effect.accesses() {
             if let Some(source) = access.source() {
                 validate_bound_range(input, operation.id, *source)?;
-                validate_source(input, transcript, operation, source.value.version)?;
+                let internal_composite_read = matches!(
+                    &operation.primitive,
+                    ExecutionPrimitive::OrderedComposite { .. }
+                ) && value(input, source.value.version)?.origin
+                    == ValueOrigin::OpOutput(operation.id);
+                if !internal_composite_read {
+                    validate_source(input, transcript, operation, source.value.version)?;
+                }
             }
             if let Some(destination) = access.destination() {
                 validate_bound_range(input, operation.id, *destination)?;
@@ -476,7 +500,7 @@ fn consumers<'a>(
     })
 }
 
-fn effect(input: &CompiledProofInput, id: EffectContractId) -> Option<&EffectContract> {
+pub(super) fn effect(input: &CompiledProofInput, id: EffectContractId) -> Option<&EffectContract> {
     input.effects.iter().find(|effect| effect.id() == id)
 }
 
@@ -491,7 +515,7 @@ pub(super) fn value(
         .ok_or(CompiledProofError::InvalidValue { value: version })
 }
 
-fn validate_bound_range(
+pub(super) fn validate_bound_range(
     input: &CompiledProofInput,
     operation: OpId,
     range: BoundValueRange,

@@ -140,7 +140,7 @@ pub struct LaunchGeometry {
     pub cooperative: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionPrimitive {
     AotKernel {
         kernel: AotKernelId,
@@ -151,6 +151,10 @@ pub enum ExecutionPrimitive {
     DeviceCopyD2D { bytes: usize },
     /// CUDA byte-pattern memset; `value` is one repeated byte, not a word.
     DeviceMemsetByte { bytes: usize, value: u8 },
+    /// One transcript-free, monolithic operation whose children execute in
+    /// this exact order. Children reuse the same typed execution authority as
+    /// ordinary operations but do not introduce stages or partitions.
+    OrderedComposite { children: Box<[ExecutableStep]> },
 }
 
 /// Exact value carried by one ordinal in an AOT kernel invocation.
@@ -196,6 +200,15 @@ pub struct AotArgumentBinding {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AotInvocation {
     pub arguments: Vec<AotArgumentBinding>,
+}
+
+/// Exact executable authority shared by an ordinary operation and every
+/// child of an [`ExecutionPrimitive::OrderedComposite`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutableStep {
+    pub primitive: ExecutionPrimitive,
+    pub invocation: Option<AotInvocation>,
+    pub effect: EffectContractId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -523,6 +536,16 @@ pub enum CompiledProofError {
     InvalidLaunchGeometry(OpId),
     PrimitiveEffectMismatch(OpId),
     InvalidKernelInvocation(OpId),
+    InvalidOrderedComposite {
+        operation: OpId,
+        child: Option<usize>,
+    },
+    CompositeBoundaryEffectMismatch(OpId),
+    CompositeUninitializedRead {
+        operation: OpId,
+        child: usize,
+        value: ValueVersion,
+    },
     TranscriptInputCount {
         expected: usize,
         actual: usize,
