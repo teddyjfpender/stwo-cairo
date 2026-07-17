@@ -4,7 +4,7 @@ use super::*;
 
 const MODULE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.module.v2\0";
 const EFFECT_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.effect.v2\0";
-const KERNEL_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.kernel.v2\0";
+const KERNEL_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.kernel.v3\0";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ModuleIdentity {
@@ -239,7 +239,7 @@ pub struct AotKernelAuthority {
     module: ModuleIdentity,
     semantic_encoding: Box<[u8]>,
     execution_build_encoding: Box<[u8]>,
-    accepted_effects: Box<[EffectContractId]>,
+    accepted_executions: Box<[(EffectContractId, PartitionAuthorityId)]>,
     canonical_encoding: Box<[u8]>,
     digest: [u8; 32],
 }
@@ -252,13 +252,36 @@ impl AotKernelAuthority {
         execution_build_encoding: Vec<u8>,
         accepted_effects: Vec<EffectContractId>,
     ) -> Result<Self, CompiledProofError> {
+        let monolithic = PartitionAuthority::monolithic().id();
+        Self::new_with_accepted_executions(
+            id,
+            module,
+            semantic_encoding,
+            execution_build_encoding,
+            accepted_effects
+                .into_iter()
+                .map(|effect| (effect, monolithic))
+                .collect(),
+        )
+    }
+
+    pub fn new_with_accepted_executions(
+        id: AotKernelId,
+        module: ModuleIdentity,
+        semantic_encoding: Vec<u8>,
+        execution_build_encoding: Vec<u8>,
+        accepted_executions: Vec<(EffectContractId, PartitionAuthorityId)>,
+    ) -> Result<Self, CompiledProofError> {
         if id.0 == 0 || semantic_encoding.is_empty() || execution_build_encoding.is_empty() {
             return Err(CompiledProofError::EmptyKernelIdentity(id));
         }
-        if accepted_effects.is_empty() {
+        if accepted_executions.is_empty() {
             return Err(CompiledProofError::EmptyKernelEffectAuthority(id));
         }
-        if accepted_effects.windows(2).any(|pair| pair[0] >= pair[1]) {
+        if accepted_executions
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
             return Err(CompiledProofError::NonCanonicalKernelEffects(id));
         }
         let canonical_encoding = encode_kernel(
@@ -266,7 +289,7 @@ impl AotKernelAuthority {
             &module,
             &semantic_encoding,
             &execution_build_encoding,
-            &accepted_effects,
+            &accepted_executions,
         )?;
         let digest = digest(KERNEL_DOMAIN, &canonical_encoding)?;
         Ok(Self {
@@ -274,7 +297,7 @@ impl AotKernelAuthority {
             module,
             semantic_encoding: semantic_encoding.into_boxed_slice(),
             execution_build_encoding: execution_build_encoding.into_boxed_slice(),
-            accepted_effects: accepted_effects.into_boxed_slice(),
+            accepted_executions: accepted_executions.into_boxed_slice(),
             canonical_encoding: canonical_encoding.into_boxed_slice(),
             digest,
         })
@@ -296,8 +319,8 @@ impl AotKernelAuthority {
         &self.execution_build_encoding
     }
 
-    pub fn accepted_effects(&self) -> &[EffectContractId] {
-        &self.accepted_effects
+    pub fn accepted_executions(&self) -> &[(EffectContractId, PartitionAuthorityId)] {
+        &self.accepted_executions
     }
 
     pub fn canonical_encoding(&self) -> &[u8] {
@@ -314,7 +337,7 @@ impl AotKernelAuthority {
             &self.module,
             &self.semantic_encoding,
             &self.execution_build_encoding,
-            &self.accepted_effects,
+            &self.accepted_executions,
         )?;
         Ok(canonical == self.canonical_encoding.as_ref()
             && self.digest == digest(KERNEL_DOMAIN, &canonical)?)
@@ -454,7 +477,7 @@ fn encode_kernel(
     module: &ModuleIdentity,
     semantics: &[u8],
     build: &[u8],
-    effects: &[EffectContractId],
+    executions: &[(EffectContractId, PartitionAuthorityId)],
 ) -> Result<Vec<u8>, CompiledProofError> {
     let mut out = Encoder::new(KERNEL_DOMAIN);
     out.u32(id.0);
@@ -462,9 +485,10 @@ fn encode_kernel(
     out.raw(module.digest());
     out.bytes(semantics)?;
     out.bytes(build)?;
-    out.count(effects.len())?;
-    for effect in effects {
+    out.count(executions.len())?;
+    for (effect, partition) in executions {
         out.raw(effect.as_bytes());
+        out.raw(partition.as_bytes());
     }
     Ok(out.finish())
 }

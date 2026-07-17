@@ -17,6 +17,7 @@ pub(super) fn validate(
             primitive,
             operation.invocation.as_ref(),
             operation.effect,
+            operation.partition,
             effect,
         ),
     }
@@ -28,6 +29,7 @@ fn validate_step(
     primitive: &ExecutionPrimitive,
     invocation: Option<&AotInvocation>,
     effect_id: EffectContractId,
+    partition: PartitionAuthorityId,
     effect: &EffectContract,
 ) -> Result<(), CompiledProofError> {
     match primitive {
@@ -41,8 +43,8 @@ fn validate_step(
                 .find(|authority| authority.id() == *kernel)
                 .ok_or(CompiledProofError::UnknownKernel { operation })?;
             if authority
-                .accepted_effects()
-                .binary_search(&effect_id)
+                .accepted_executions()
+                .binary_search(&(effect_id, partition))
                 .is_err()
             {
                 return Err(CompiledProofError::KernelEffectNotAccepted { operation });
@@ -162,10 +164,15 @@ fn validate_composite(
             &child.primitive,
             child.invocation.as_ref(),
             child.effect,
+            operation.partition,
             child_effect,
         )?;
         expected_globals.extend_from_slice(child_effect.module_globals());
 
+        // Effect accesses are an unordered memory contract, not an execution
+        // sequence. A write made by this child cannot initialize a separate
+        // read in the same child; only an earlier child can do that.
+        let mut child_destinations = Vec::new();
         for access in child_effect.accesses() {
             if let Some(source) = access.source() {
                 super::validate_bound_range(input, operation.id, *source)?;
@@ -194,18 +201,16 @@ fn validate_composite(
                         value: value.version,
                     });
                 }
-                let ranges = initialized.entry(value.version).or_default();
-                if ranges
-                    .iter()
-                    .any(|range| range.overlaps(destination.value.elements))
-                {
-                    return Err(CompiledProofError::OverlappingWrite {
-                        value: value.version,
-                    });
-                }
-                ranges.push(destination.value.elements);
-                ranges.sort_unstable_by_key(|range| (range.start, range.end));
+                child_destinations.push((value.version, destination.value.elements));
             }
+        }
+        for (version, elements) in child_destinations {
+            let ranges = initialized.entry(version).or_default();
+            if ranges.iter().any(|range| range.overlaps(elements)) {
+                return Err(CompiledProofError::OverlappingWrite { value: version });
+            }
+            ranges.push(elements);
+            ranges.sort_unstable_by_key(|range| (range.start, range.end));
         }
     }
     canonicalize_globals(&mut expected_globals);

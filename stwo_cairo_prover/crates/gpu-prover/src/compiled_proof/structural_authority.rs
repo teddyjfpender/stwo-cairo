@@ -4,7 +4,7 @@ use super::*;
 
 const FIXED_CONTENT_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.fixed-content.v1\0";
 const MODULE_INITIALIZER_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.module-initializer.v1\0";
-const PARTITION_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.partition.v1\0";
+const PARTITION_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.partition.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FixedValueInitializer {
@@ -228,9 +228,8 @@ impl PartitionAuthorityId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PartitionAuthorityKind {
-    /// v4 is deliberately fail-closed. Typed, executable shard projections
-    /// arrive with the v5 fleet compiler; opaque byte recipes are not proof.
     Monolithic,
+    Exact(ExactPartitionAuthority),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,6 +248,17 @@ impl PartitionAuthority {
             kind: PartitionAuthorityKind::Monolithic,
             canonical_encoding: canonical_encoding.into_boxed_slice(),
         }
+    }
+
+    pub fn exact(authority: ExactPartitionAuthority) -> Result<Self, CompiledProofError> {
+        authority.validate_structure()?;
+        let kind = PartitionAuthorityKind::Exact(authority);
+        let canonical_encoding = encode_partition(&kind)?;
+        Ok(Self {
+            id: PartitionAuthorityId(partition_digest(&canonical_encoding)),
+            kind,
+            canonical_encoding: canonical_encoding.into_boxed_slice(),
+        })
     }
 
     pub const fn id(&self) -> PartitionAuthorityId {
@@ -421,6 +431,10 @@ fn encode_partition(kind: &PartitionAuthorityKind) -> Result<Vec<u8>, CompiledPr
     let mut out = Vec::from(PARTITION_DOMAIN);
     match kind {
         PartitionAuthorityKind::Monolithic => out.push(0),
+        PartitionAuthorityKind::Exact(authority) => {
+            out.push(1);
+            encode_exact_partition(&mut out, authority)?;
+        }
     }
     Ok(out)
 }

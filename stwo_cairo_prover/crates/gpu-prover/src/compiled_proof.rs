@@ -11,12 +11,14 @@ use crate::transcript_plan::{CairoBlake2sTranscriptPlan, CairoTranscriptSegment}
 mod effect;
 mod finalizer;
 mod identity;
+mod partition_authority;
 mod structural_authority;
 mod validate;
 
 pub use effect::*;
 pub use finalizer::*;
 pub use identity::{CompiledProofIdentity, ProofCodecIdentity, ProofIdentity};
+pub use partition_authority::*;
 pub use structural_authority::*;
 pub use stwo_backend_cuda::{TranscriptInputId, TranscriptOutputId};
 

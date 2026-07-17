@@ -118,17 +118,22 @@ fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofE
                     primitive,
                     ExecutionPrimitive::AotKernel { kernel: id, .. } if *id == kernel.id()
                 ) {
-                    if kernel.accepted_effects().binary_search(&effect).is_err() {
+                    let execution = (effect, operation.partition);
+                    if kernel
+                        .accepted_executions()
+                        .binary_search(&execution)
+                        .is_err()
+                    {
                         return Err(CompiledProofError::KernelEffectNotAccepted {
                             operation: operation.id,
                         });
                     }
-                    used.insert(effect);
+                    used.insert(execution);
                 }
                 Ok(())
             })?;
         }
-        if kernel.accepted_effects().iter().copied().ne(used) {
+        if kernel.accepted_executions().iter().copied().ne(used) {
             return Err(CompiledProofError::NonCanonicalKernelEffects(kernel.id()));
         }
     }

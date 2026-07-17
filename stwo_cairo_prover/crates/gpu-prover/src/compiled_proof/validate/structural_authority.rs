@@ -153,14 +153,21 @@ fn validate_partitions(input: &CompiledProofInput) -> Result<(), CompiledProofEr
         return Err(CompiledProofError::NonCanonicalPartitionAuthority);
     }
     for operation in &input.operations {
-        if input
+        let partition = input
             .partitions
             .binary_search_by_key(&operation.partition, PartitionAuthority::id)
-            .is_err()
-        {
-            return Err(CompiledProofError::UnknownPartitionAuthority {
+            .ok()
+            .and_then(|index| input.partitions.get(index))
+            .ok_or(CompiledProofError::UnknownPartitionAuthority {
                 operation: operation.id,
-            });
+            })?;
+        if let PartitionAuthorityKind::Exact(authority) = partition.kind() {
+            let effect = super::effect(input, operation.effect).ok_or(
+                CompiledProofError::UnknownEffect {
+                    operation: operation.id,
+                },
+            )?;
+            validate_exact_partition(input, operation, effect, authority)?;
         }
     }
     Ok(())

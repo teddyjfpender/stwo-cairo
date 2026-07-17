@@ -308,6 +308,67 @@ fn ordered_composite_rejects_boundary_drift_and_bad_child_order() {
 }
 
 #[test]
+fn ordered_composite_does_not_infer_order_between_one_childs_effect_accesses() {
+    let mut input = composite_input();
+    let old_effect = children(&input)[0].effect;
+    let scratch = input
+        .effects
+        .iter()
+        .find(|effect| effect.id() == old_effect)
+        .and_then(|effect| effect.accesses()[0].destination())
+        .unwrap()
+        .value;
+    let same_child = EffectContract::new(
+        vec![
+            EffectAccess::Write {
+                destination: bound(0, scratch),
+            },
+            EffectAccess::Read {
+                source: bound(1, scratch),
+            },
+        ],
+        vec![],
+    )
+    .unwrap();
+    let launch = match &children(&input)[2].primitive {
+        ExecutionPrimitive::AotKernel { launch, .. } => *launch,
+        _ => unreachable!("fixture child 2 is AOT"),
+    };
+    children_mut(&mut input)[0] = ExecutableStep {
+        primitive: ExecutionPrimitive::AotKernel {
+            kernel: AotKernelId(1),
+            launch,
+        },
+        invocation: invocation(&same_child),
+        effect: same_child.id(),
+    };
+    input.effects.retain(|effect| effect.id() != old_effect);
+    input.effects.push(same_child);
+    input.effects.sort_by_key(EffectContract::id);
+    let mut accepted = children(&input)
+        .iter()
+        .filter_map(|child| {
+            matches!(&child.primitive, ExecutionPrimitive::AotKernel { .. }).then_some(child.effect)
+        })
+        .collect::<Vec<_>>();
+    accepted.sort_unstable();
+    input.kernels = vec![kernel(
+        module(),
+        accepted,
+        b"ordered-composite-same-child-effects",
+    )];
+
+    assert!(matches!(
+        CompiledProof::compile(input, transcript()),
+        Err(CompiledProofError::CompositeUninitializedRead {
+            operation: OpId(0),
+            child: 0,
+            value,
+        }) if value == scratch.version
+    ));
+}
+
+#[test]
 fn ordered_composite_rejects_nested_steps_hidden_globals_and_stage_bypass() {
     let mut empty = composite_input();
     let outer_effect = empty.operations[0].effect;
