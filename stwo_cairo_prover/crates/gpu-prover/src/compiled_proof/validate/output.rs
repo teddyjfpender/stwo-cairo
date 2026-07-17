@@ -19,26 +19,42 @@ pub(super) fn validate(input: &CompiledProofInput) -> Result<(), CompiledProofEr
     if cursor != input.output.layout.total_words {
         return Err(CompiledProofError::NonCanonicalProofLayout);
     }
-    if input.output.sections.len() != ProofBundleSection::CANONICAL.len() {
+    if input.output.fragments.len() != ProofBundleSection::CANONICAL.len()
+        || input.output.sections.len() != ProofBundleSection::CANONICAL.len()
+    {
         return Err(CompiledProofError::ProofSectionCount {
             expected: ProofBundleSection::CANONICAL.len(),
-            actual: input.output.sections.len(),
+            actual: input.output.fragments.len(),
         });
     }
 
     let mut source_ranges = BTreeMap::<ValueVersion, Vec<ElementRange>>::new();
-    for (index, ((binding, section), destination)) in input
-        .output
-        .sections
-        .iter()
-        .zip(ProofBundleSection::CANONICAL)
-        .zip(destinations)
-        .enumerate()
-    {
-        if binding.section != section {
+    let mut destination_cursor = 0;
+    for (index, fragment) in input.output.fragments.iter().enumerate() {
+        if usize::try_from(fragment.ordinal).ok() != Some(index) {
+            return Err(CompiledProofError::ProofFragmentOrdinal { index });
+        }
+        let section_index = ProofBundleSection::CANONICAL
+            .iter()
+            .position(|section| *section == fragment.section)
+            .ok_or(CompiledProofError::ProofSectionOrder { index })?;
+        let section_destination = &destinations[section_index];
+        let compatibility = &input.output.sections[index];
+        if fragment.destination.start != destination_cursor
+            || fragment.destination.is_empty()
+            || fragment.destination.start < section_destination.start
+            || fragment.destination.end > section_destination.end
+            || fragment.section != ProofBundleSection::CANONICAL[index]
+            || fragment.destination.start != section_destination.start
+            || fragment.destination.end != section_destination.end
+            || compatibility.section != fragment.section
+            || compatibility.value != fragment.source.version
+            || compatibility.elements != fragment.source.elements
+        {
             return Err(CompiledProofError::ProofSectionOrder { index });
         }
-        let source = super::value(input, binding.value)?;
+        destination_cursor = fragment.destination.end;
+        let source = super::value(input, fragment.source.version)?;
         let ValueOrigin::OpOutput(_) = source.origin else {
             return Err(CompiledProofError::ProofSectionOrigin { index });
         };
@@ -49,13 +65,16 @@ pub(super) fn validate(input: &CompiledProofInput) -> Result<(), CompiledProofEr
             BindingKind::ProofOutput,
             index as u32,
             source,
-            binding.elements,
-            destination.len(),
+            fragment.source.elements,
+            fragment.destination.len(),
         )?;
         source_ranges
-            .entry(binding.value)
+            .entry(fragment.source.version)
             .or_default()
-            .push(binding.elements);
+            .push(fragment.source.elements);
+    }
+    if destination_cursor != input.output.layout.total_words {
+        return Err(CompiledProofError::InvalidProofAssembly);
     }
     for value in input
         .values
@@ -84,9 +103,9 @@ pub(super) fn validate(input: &CompiledProofInput) -> Result<(), CompiledProofEr
         BindingKind::ProofOutput,
         input
             .output
-            .sections
+            .fragments
             .iter()
-            .map(|binding| (binding.value, binding.elements)),
+            .map(|fragment| (fragment.source.version, fragment.source.elements)),
     )
 }
 

@@ -5,7 +5,10 @@ use cairo_air::air::PublicData;
 use cairo_air::claims::CairoClaim;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
-use stwo_backend_cuda::TranscriptOperation;
+use stwo_backend_cuda::{
+    Blake2sFriAssemblyShape, Blake2sProofAssemblyShape, Blake2sTraceAssemblyShape, TraceTreeRole,
+    TranscriptOperation,
+};
 
 use super::*;
 use crate::compiled_proof::*;
@@ -46,11 +49,7 @@ fn transcript() -> &'static CairoBlake2sTranscriptPlan {
         .unwrap();
         plan_cairo_blake2s_transcript(
             &claim,
-            PcsConfig {
-                pow_bits: 0,
-                fri_config: FriConfig::new(2, 1, 13, 2),
-                lifting_log_size: Some(10),
-            },
+            pcs_config(),
             10,
             DynamicTranscriptShape {
                 interaction_claim_felts: Some(5),
@@ -58,6 +57,81 @@ fn transcript() -> &'static CairoBlake2sTranscriptPlan {
             },
         )
         .unwrap()
+    })
+}
+
+fn pcs_config() -> PcsConfig {
+    PcsConfig {
+        pow_bits: 0,
+        fri_config: FriConfig::new(2, 1, 13, 2),
+        lifting_log_size: Some(10),
+    }
+}
+
+fn proof_assembly_shape() -> Blake2sProofAssemblyShape {
+    let trace = |role, log_size, samples| Blake2sTraceAssemblyShape {
+        role,
+        leaf_log_size: log_size,
+        query_log_size: log_size,
+        oods_samples_per_column: vec![samples],
+        commit_to_proof_column: vec![0],
+    };
+    Blake2sProofAssemblyShape {
+        query_log_size: 10,
+        n_queries: 13,
+        trace_trees: vec![
+            trace(TraceTreeRole::Preprocessed, 8, 2),
+            trace(TraceTreeRole::Base, 10, 2),
+            trace(TraceTreeRole::Interaction, 10, 2),
+            trace(TraceTreeRole::Composition, 10, 1),
+        ],
+        fri_trees: vec![
+            Blake2sFriAssemblyShape {
+                evaluation_log_size: 10,
+                cumulative_fold: 0,
+                outgoing_fold_step: 2,
+                log_rows_per_leaf: 2,
+            },
+            Blake2sFriAssemblyShape {
+                evaluation_log_size: 8,
+                cumulative_fold: 2,
+                outgoing_fold_step: 2,
+                log_rows_per_leaf: 2,
+            },
+            Blake2sFriAssemblyShape {
+                evaluation_log_size: 6,
+                cumulative_fold: 4,
+                outgoing_fold_step: 2,
+                log_rows_per_leaf: 2,
+            },
+            Blake2sFriAssemblyShape {
+                evaluation_log_size: 4,
+                cumulative_fold: 6,
+                outgoing_fold_step: 1,
+                log_rows_per_leaf: 0,
+            },
+        ],
+    }
+}
+
+fn host_finalizer(identity: &ProofIdentity, codec: ProofCodecIdentity) -> HostFinalizerAuthority {
+    HostFinalizerAuthority::new(HostFinalizerAuthorityInput {
+        bundle_codec: codec,
+        assembly_shape: proof_assembly_shape(),
+        pcs: pcs_config(),
+        claim_codec: ClaimCodecIdentity::new(b"fleet-claim-codec-v1".to_vec()).unwrap(),
+        interaction_claim_codec: InteractionClaimCodecIdentity::new(
+            b"fleet-interaction-claim-codec-v1".to_vec(),
+        )
+        .unwrap(),
+        channel_schema: ChannelSchemaIdentity::new(b"fleet-blake2s-channel-v1".to_vec()).unwrap(),
+        preprocessed_schema: PreprocessedSchemaIdentity::new(b"fleet-preprocessed-v1".to_vec())
+            .unwrap(),
+        decoder: DirectProofDecoder::ResidentBlake2sV1,
+        oods_recipe: OodsConsistencyRecipe::CairoComponentsV1,
+        envelope: CairoProofEnvelope::CairoProofV1,
+        proof_semantic_digest: *identity.proof_semantic_digest(),
+        execution_build_digest: *identity.execution_build_digest(),
     })
 }
 
@@ -187,7 +261,7 @@ fn compiled_proof() -> (CompiledProof, ValueVersion, ValueVersion) {
         Region::Input,
     ));
 
-    let output_layout = ResidentProofBundleLayout::new(4, 4, 1, 4, 1).unwrap();
+    let output_layout = ResidentProofBundleLayout::new(20, 28, 4, 16, 1).unwrap();
     let output_value = ValueVersion(values.len() as u32);
     values.push(u32_value(
         output_value,
@@ -230,16 +304,40 @@ fn compiled_proof() -> (CompiledProof, ValueVersion, ValueVersion) {
             value: output_value,
             elements: range(words.start, words.end),
         })
+        .collect::<Vec<_>>();
+    let fragments = sections
+        .iter()
+        .zip(output_ranges(&output_layout))
+        .enumerate()
+        .map(|(ordinal, (section, destination))| ProofOutputFragment {
+            section: section.section,
+            ordinal: ordinal as u32,
+            source: ValueRange {
+                version: section.value,
+                elements: section.elements,
+            },
+            destination: range(destination.start, destination.end),
+        })
         .collect();
+    let identity = ProofIdentity::new(
+        b"fleet-test-semantics-v2".to_vec(),
+        b"fleet-test-program-v2".to_vec(),
+    )
+    .unwrap();
+    let codec = ProofCodecIdentity::track_a_resident_bundle();
+    let transcript_segments =
+        CompiledTranscriptSegment::bind_plan(transcript(), &transcript_inputs, &transcript_outputs)
+            .unwrap();
+    let partition = PartitionAuthority::monolithic();
     let compiled = CompiledProof::compile(
         CompiledProofInput {
-            identity: ProofIdentity::new(
-                b"fleet-test-semantics-v2".to_vec(),
-                b"fleet-test-program-v2".to_vec(),
-            )
-            .unwrap(),
+            host_finalizer: host_finalizer(&identity, codec.clone()),
+            identity,
+            fixed_values: vec![],
+            module_global_initializers: vec![],
             kernels: vec![kernel],
             effects: vec![effect],
+            partitions: vec![partition.clone()],
             operations: vec![OpNode {
                 id: OP_ASSEMBLE,
                 semantic_id: SemanticOpId(1),
@@ -255,15 +353,18 @@ fn compiled_proof() -> (CompiledProof, ValueVersion, ValueVersion) {
                 },
                 invocation,
                 effect: effect_id,
+                partition: partition.id(),
                 stage: ProofStage::AfterTranscript,
             }],
             values,
             transcript_inputs,
             transcript_outputs,
+            transcript_segments,
             output: ProofOutputLayout {
-                codec: ProofCodecIdentity::track_a_resident_bundle(),
+                codec,
                 layout: output_layout,
                 sections,
+                fragments,
             },
         },
         transcript(),

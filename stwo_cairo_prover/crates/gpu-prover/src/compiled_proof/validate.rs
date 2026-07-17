@@ -4,17 +4,24 @@ use stwo_backend_cuda::TranscriptOperation;
 
 use super::*;
 
+mod finalizer;
 mod output;
+mod primitive;
+mod structural_authority;
+mod transcript_segments;
 
 pub(super) fn validate(
     input: &CompiledProofInput,
     transcript: &CairoBlake2sTranscriptPlan,
 ) -> Result<(), CompiledProofError> {
     validate_values(input)?;
+    structural_authority::validate(input)?;
     validate_authorities(input)?;
     validate_operations(input, transcript)?;
     validate_transcript(input, transcript)?;
-    output::validate(input)
+    transcript_segments::validate(input, transcript)?;
+    output::validate(input)?;
+    finalizer::validate(input, transcript)
 }
 
 fn validate_values(input: &CompiledProofInput) -> Result<(), CompiledProofError> {
@@ -198,7 +205,7 @@ fn validate_operations(
         let effect = effect(input, operation.effect).ok_or(CompiledProofError::UnknownEffect {
             operation: operation.id,
         })?;
-        validate_primitive(input, operation, effect)?;
+        primitive::validate(input, operation, effect)?;
         for access in effect.accesses() {
             if let Some(source) = access.source() {
                 validate_bound_range(input, operation.id, *source)?;
@@ -233,159 +240,6 @@ fn validate_operations(
         }
     }
     validate_write_coverage(input, &mut writes)
-}
-
-fn validate_primitive(
-    input: &CompiledProofInput,
-    operation: &OpNode,
-    effect: &EffectContract,
-) -> Result<(), CompiledProofError> {
-    match operation.primitive {
-        ExecutionPrimitive::AotKernel { kernel, launch } => {
-            if !valid_launch(launch) {
-                return Err(CompiledProofError::InvalidLaunchGeometry(operation.id));
-            }
-            let authority = input
-                .kernels
-                .iter()
-                .find(|authority| authority.id() == kernel)
-                .ok_or(CompiledProofError::UnknownKernel {
-                    operation: operation.id,
-                })?;
-            if authority
-                .accepted_effects()
-                .binary_search(&operation.effect)
-                .is_err()
-            {
-                return Err(CompiledProofError::KernelEffectNotAccepted {
-                    operation: operation.id,
-                });
-            }
-            if effect
-                .module_globals()
-                .iter()
-                .any(|global| &global.module != authority.module())
-            {
-                return Err(CompiledProofError::ModuleGlobalAuthorityMismatch {
-                    operation: operation.id,
-                });
-            }
-            validate_invocation(operation, effect)?;
-        }
-        ExecutionPrimitive::DeviceCopyD2D { bytes } => {
-            if operation.invocation.is_some()
-                || !effect.module_globals().is_empty()
-                || bytes == 0
-                || effect.accesses().len() != 2
-            {
-                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
-            }
-            let (EffectAccess::Read { source }, EffectAccess::Write { destination }) =
-                (&effect.accesses()[0], &effect.accesses()[1])
-            else {
-                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
-            };
-            if range_bytes(input, source.value)? != bytes
-                || range_bytes(input, destination.value)? != bytes
-                || value(input, source.value.version)?.layout
-                    != value(input, destination.value.version)?.layout
-            {
-                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
-            }
-        }
-        ExecutionPrimitive::DeviceMemsetByte { bytes, .. } => {
-            if operation.invocation.is_some()
-                || !effect.module_globals().is_empty()
-                || bytes == 0
-                || effect.accesses().len() != 1
-            {
-                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
-            }
-            let EffectAccess::Write { destination } = &effect.accesses()[0] else {
-                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
-            };
-            if range_bytes(input, destination.value)? != bytes {
-                return Err(CompiledProofError::PrimitiveEffectMismatch(operation.id));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_invocation(
-    operation: &OpNode,
-    effect: &EffectContract,
-) -> Result<(), CompiledProofError> {
-    let invalid = || CompiledProofError::InvalidKernelInvocation(operation.id);
-    let invocation = operation.invocation.as_ref().ok_or_else(invalid)?;
-    if invocation.arguments.is_empty() {
-        return Err(invalid());
-    }
-
-    let expected = effect
-        .accesses()
-        .iter()
-        .flat_map(|access| [access.source(), access.destination()])
-        .flatten()
-        .map(|bound| bound.binding)
-        .collect::<BTreeSet<_>>();
-    let mut actual = BTreeSet::new();
-    for (ordinal, argument) in invocation.arguments.iter().enumerate() {
-        if usize::from(argument.ordinal) != ordinal {
-            return Err(invalid());
-        }
-        let mut insert = |binding| {
-            if actual.insert(binding) {
-                Ok(())
-            } else {
-                Err(invalid())
-            }
-        };
-        match &argument.value {
-            AotArgumentValue::U32(_) | AotArgumentValue::DevicePointer(None) => {}
-            AotArgumentValue::DevicePointer(Some(binding)) => insert(*binding)?,
-            AotArgumentValue::DevicePointerTable(entries) => {
-                if entries.is_empty() {
-                    return Err(invalid());
-                }
-                for &binding in entries.iter().flatten() {
-                    insert(binding)?;
-                }
-            }
-            AotArgumentValue::DeviceU32Literals(values) => {
-                if values.is_empty() {
-                    return Err(invalid());
-                }
-            }
-        }
-    }
-    if actual != expected {
-        return Err(invalid());
-    }
-    Ok(())
-}
-
-fn valid_launch(launch: LaunchGeometry) -> bool {
-    let block_threads = launch
-        .block
-        .into_iter()
-        .try_fold(1u64, |product, value| product.checked_mul(u64::from(value)));
-    launch.grid[0] != 0
-        && launch.grid[0] <= i32::MAX as u32
-        && launch.grid[1] != 0
-        && launch.grid[1] <= u16::MAX as u32
-        && launch.grid[2] != 0
-        && launch.grid[2] <= u16::MAX as u32
-        && launch.block[0] != 0
-        && launch.block[0] <= 1024
-        && launch.block[1] != 0
-        && launch.block[1] <= 1024
-        && launch.block[2] != 0
-        && launch.block[2] <= 64
-        // Cluster limits depend on the installed target. This target-neutral
-        // authority cannot truthfully admit one.
-        && launch.cluster.is_none()
-        && block_threads.is_some_and(|threads| threads <= 1024)
 }
 
 fn validate_source(

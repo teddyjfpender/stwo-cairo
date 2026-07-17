@@ -9,11 +9,15 @@ use crate::proof_bundle::ResidentProofBundleLayout;
 use crate::transcript_plan::{CairoBlake2sTranscriptPlan, CairoTranscriptSegment};
 
 mod effect;
+mod finalizer;
 mod identity;
+mod structural_authority;
 mod validate;
 
 pub use effect::*;
+pub use finalizer::*;
 pub use identity::{CompiledProofIdentity, ProofCodecIdentity, ProofIdentity};
+pub use structural_authority::*;
 pub use stwo_backend_cuda::{TranscriptInputId, TranscriptOutputId};
 
 macro_rules! numeric_id {
@@ -35,8 +39,10 @@ numeric_id!(AotKernelId, u32);
 numeric_id!(ValueVersion, u32);
 numeric_id!(ExternalInputId, u32);
 numeric_id!(ConstantId, u32);
+numeric_id!(ModuleGlobalInitializerId, u32);
 numeric_id!(EffectBindingId, u32);
 numeric_id!(InPlaceAliasId, u32);
+numeric_id!(TranscriptStateVersion, u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ElementRange {
@@ -158,8 +164,27 @@ pub enum AotArgumentValue {
     U32(u32),
     DevicePointer(Option<EffectBindingId>),
     DevicePointerTable(Vec<Option<EffectBindingId>>),
-    /// Immutable device-side u32 data installed with the executable.
-    DeviceU32Literals(Vec<u32>),
+    /// Full immutable u32 value installed with the executable. Literal bytes
+    /// live only in its [`FixedValueInitializer`]; the invocation carries no
+    /// second allocation or content channel.
+    DeviceFixedU32 {
+        value: ValueVersion,
+        binding: EffectBindingId,
+    },
+}
+
+impl AotArgumentValue {
+    /// Temporary fail-closed bridge for the non-promotable source inventory.
+    /// It discards the old duplicate payload and produces an unbound reference
+    /// that [`CompiledProof::compile`] necessarily rejects. A real emitter must
+    /// first install a `FixedValueDesc` and construct `DeviceFixedU32`.
+    #[doc(hidden)]
+    pub fn legacy_unbound_fixed_u32(_words: Vec<u32>) -> Self {
+        Self::DeviceFixedU32 {
+            value: ValueVersion(u32::MAX),
+            binding: EffectBindingId(u32::MAX),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +208,7 @@ pub struct OpNode {
     /// invocation.
     pub invocation: Option<AotInvocation>,
     pub effect: EffectContractId,
+    pub partition: PartitionAuthorityId,
     pub stage: ProofStage,
 }
 
@@ -217,7 +243,7 @@ pub struct TranscriptOutputBinding {
     pub elements: ElementRange,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ProofBundleSection {
     Commitments,
     InteractionClaim,
@@ -243,6 +269,18 @@ impl ProofBundleSection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProofOutputFragment {
+    pub section: ProofBundleSection,
+    pub ordinal: u32,
+    pub source: ValueRange,
+    /// Canonical destination words in the complete resident proof bundle.
+    pub destination: ElementRange,
+}
+
+/// Compatibility projection consumed by the current fleet storage lowering.
+/// It is validated as an exact, one-fragment-per-section view and is not an
+/// independent proof-layout authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProofOutputSection {
     pub section: ProofBundleSection,
     pub value: ValueVersion,
@@ -254,18 +292,24 @@ pub struct ProofOutputLayout {
     pub codec: ProofCodecIdentity,
     pub layout: ResidentProofBundleLayout,
     pub sections: Vec<ProofOutputSection>,
+    pub fragments: Vec<ProofOutputFragment>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledProofInput {
     pub identity: ProofIdentity,
+    pub fixed_values: Vec<FixedValueDesc>,
+    pub module_global_initializers: Vec<ModuleGlobalInitializer>,
     pub kernels: Vec<AotKernelAuthority>,
     pub effects: Vec<EffectContract>,
+    pub partitions: Vec<PartitionAuthority>,
     pub operations: Vec<OpNode>,
     pub values: Vec<ValueDesc>,
     pub transcript_inputs: Vec<TranscriptInputBinding>,
     pub transcript_outputs: Vec<TranscriptOutputBinding>,
+    pub transcript_segments: Vec<CompiledTranscriptSegment>,
     pub output: ProofOutputLayout,
+    pub host_finalizer: HostFinalizerAuthority,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,8 +348,20 @@ impl CompiledProof {
         &self.input.kernels
     }
 
+    pub fn fixed_values(&self) -> &[FixedValueDesc] {
+        &self.input.fixed_values
+    }
+
+    pub fn module_global_initializers(&self) -> &[ModuleGlobalInitializer] {
+        &self.input.module_global_initializers
+    }
+
     pub fn effects(&self) -> &[EffectContract] {
         &self.input.effects
+    }
+
+    pub fn partitions(&self) -> &[PartitionAuthority] {
+        &self.input.partitions
     }
 
     pub fn operations(&self) -> &[OpNode] {
@@ -324,8 +380,16 @@ impl CompiledProof {
         &self.input.transcript_outputs
     }
 
+    pub fn transcript_segments(&self) -> &[CompiledTranscriptSegment] {
+        &self.input.transcript_segments
+    }
+
     pub const fn output(&self) -> &ProofOutputLayout {
         &self.input.output
+    }
+
+    pub const fn host_finalizer(&self) -> &HostFinalizerAuthority {
+        &self.input.host_finalizer
     }
 
     pub fn kernel(&self, id: AotKernelId) -> Option<&AotKernelAuthority> {
@@ -390,6 +454,16 @@ pub enum CompiledProofError {
     InvalidEffectRange,
     InvalidValueTransition,
     InvalidModuleGlobalEffect,
+    InvalidFixedValue,
+    NonCanonicalFixedValues,
+    InvalidModuleGlobalInitializer,
+    NonCanonicalModuleGlobalInitializers,
+    UnknownModuleGlobalInitializer(ModuleGlobalInitializerId),
+    InvalidPartitionAuthority,
+    NonCanonicalPartitionAuthority,
+    UnknownPartitionAuthority {
+        operation: OpId,
+    },
     NonCanonicalModuleGlobals,
     NonCanonicalKernelAuthority,
     NonCanonicalEffectAuthority,
@@ -471,6 +545,13 @@ pub enum CompiledProofError {
         kind: BindingKind,
         id: u32,
     },
+    TranscriptSegmentCount {
+        expected: usize,
+        actual: usize,
+    },
+    TranscriptSegmentBinding {
+        index: usize,
+    },
     BindingRange {
         kind: BindingKind,
         id: u32,
@@ -487,10 +568,14 @@ pub enum CompiledProofError {
     ProofSectionOrder {
         index: usize,
     },
+    ProofFragmentOrdinal {
+        index: usize,
+    },
     ProofSectionOrigin {
         index: usize,
     },
     InvalidProofAssembly,
+    InvalidHostFinalizer,
     TranscriptPlan(crate::transcript_plan::TranscriptPlanError),
 }
 

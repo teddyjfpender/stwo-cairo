@@ -175,8 +175,7 @@ impl EffectAccess {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ModuleGlobalEffect {
-    pub module: ModuleIdentity,
-    pub symbol: Box<[u8]>,
+    pub initializer: ModuleGlobalInitializerId,
     pub bytes: ByteRange,
 }
 
@@ -416,14 +415,17 @@ fn validate_transition(
 
 fn validate_module_globals(globals: &[ModuleGlobalEffect]) -> Result<(), CompiledProofError> {
     for global in globals {
-        if global.symbol.is_empty()
-            || global.symbol.contains(&0)
-            || global.bytes.start >= global.bytes.end
-        {
+        if global.bytes.start >= global.bytes.end {
             return Err(CompiledProofError::InvalidModuleGlobalEffect);
         }
     }
-    if globals.windows(2).any(|pair| pair[0] >= pair[1]) {
+    // One initializer has one canonical range cover: overlap is duplicate
+    // authority and adjacent ranges must be merged.
+    if globals.windows(2).any(|pair| {
+        pair[0] >= pair[1]
+            || (pair[0].initializer == pair[1].initializer
+                && pair[0].bytes.end >= pair[1].bytes.start)
+    }) {
         return Err(CompiledProofError::NonCanonicalModuleGlobals);
     }
     Ok(())
@@ -440,9 +442,7 @@ fn encode_effect(
     }
     out.count(globals.len())?;
     for global in globals {
-        out.bytes(global.module.canonical_encoding())?;
-        out.raw(global.module.digest());
-        out.bytes(&global.symbol)?;
+        out.u32(global.initializer.0);
         out.byte_range(global.bytes)?;
         out.byte(0); // immutable module-global Read
     }

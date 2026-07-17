@@ -246,6 +246,7 @@ fn bind_spill_read(fixture: &mut Fixture) {
         b"fleet-spill-read-aot-v2".to_vec(),
     )
     .unwrap();
+    input.host_finalizer = host_finalizer(&input.identity, input.output.codec.clone());
     fixture.compiled = Arc::new(CompiledProof::compile(input, transcript()).unwrap());
     fixture.shape = shape_identity_for_test(
         b"fleet-test-topology-v2",

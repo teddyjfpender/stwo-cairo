@@ -181,7 +181,7 @@ pub(super) fn compile(
                 }
                 (
                     *ordinal,
-                    AotArgumentValue::DeviceU32Literals(
+                    AotArgumentValue::legacy_unbound_fixed_u32(
                         entries.iter().map(|entry| entry.value).collect(),
                     ),
                 )

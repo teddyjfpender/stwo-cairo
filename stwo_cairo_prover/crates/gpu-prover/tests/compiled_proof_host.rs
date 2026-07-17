@@ -3,8 +3,6 @@ use std::sync::OnceLock;
 
 use cairo_air::air::PublicData;
 use cairo_air::claims::CairoClaim;
-use stwo::core::fri::FriConfig;
-use stwo::core::pcs::PcsConfig;
 use stwo_cairo_gpu_prover::compiled_proof::*;
 use stwo_cairo_gpu_prover::proof_bundle::ResidentProofBundleLayout;
 use stwo_cairo_gpu_prover::transcript_plan::{
@@ -12,8 +10,14 @@ use stwo_cairo_gpu_prover::transcript_plan::{
     DynamicTranscriptShape,
 };
 
+#[path = "compiled_proof_host/fixture.rs"]
+mod fixture;
 #[path = "compiled_proof_host/primitive.rs"]
 mod primitive;
+#[path = "compiled_proof_host/structural_authority.rs"]
+mod structural_authority;
+
+use fixture::{host_finalizer, pcs_config};
 
 fn transcript() -> &'static CairoBlake2sTranscriptPlan {
     static PLAN: OnceLock<CairoBlake2sTranscriptPlan> = OnceLock::new();
@@ -26,11 +30,7 @@ fn transcript() -> &'static CairoBlake2sTranscriptPlan {
         .unwrap();
         plan_cairo_blake2s_transcript(
             &claim,
-            PcsConfig {
-                pow_bits: 0,
-                fri_config: FriConfig::new(2, 1, 13, 2),
-                lifting_log_size: Some(10),
-            },
+            pcs_config(),
             10,
             DynamicTranscriptShape {
                 interaction_claim_felts: Some(5),
@@ -83,6 +83,26 @@ fn value_range(version: ValueVersion, words: usize) -> ValueRange {
 
 fn module() -> ModuleIdentity {
     ModuleIdentity::new(b"sm_86:resident-proof-test-cubin-v1".to_vec()).unwrap()
+}
+
+fn module_initializer(
+    module: ModuleIdentity,
+    symbol: &[u8],
+    bytes: usize,
+) -> ModuleGlobalInitializer {
+    ModuleGlobalInitializer::new(
+        ModuleGlobalInitializerId(0),
+        module,
+        symbol.to_vec(),
+        bytes,
+        8,
+        true,
+        vec![ModuleGlobalInitializerAtom::Literal {
+            destination: ByteRange::new(0, bytes).unwrap(),
+            bytes: vec![0; bytes].into_boxed_slice(),
+        }],
+    )
+    .unwrap()
 }
 
 fn kernel(
@@ -179,7 +199,7 @@ fn valid_input() -> CompiledProofInput {
         challenge_values.push((version, requirement.min_words));
     }
 
-    let layout = ResidentProofBundleLayout::new(4, 4, 1, 4, 1).unwrap();
+    let layout = ResidentProofBundleLayout::new(20, 28, 4, 16, 1).unwrap();
     let assembly = OpId(0);
     let bundle = ValueVersion(values.len() as u32);
     values.push(u32_value(
@@ -214,13 +234,37 @@ fn valid_input() -> CompiledProofInput {
             value: bundle,
             elements: range(words.start, words.end),
         })
+        .collect::<Vec<_>>();
+    let fragments = sections
+        .iter()
+        .zip(layout_ranges(&layout))
+        .enumerate()
+        .map(|(ordinal, (section, destination))| ProofOutputFragment {
+            section: section.section,
+            ordinal: ordinal as u32,
+            source: ValueRange {
+                version: section.value,
+                elements: section.elements,
+            },
+            destination: range(destination.start, destination.end),
+        })
         .collect();
+    let identity =
+        ProofIdentity::new(b"semantic-v2".to_vec(), b"program-image-v2".to_vec()).unwrap();
+    let codec = ProofCodecIdentity::track_a_resident_bundle();
+    let transcript_segments =
+        CompiledTranscriptSegment::bind_plan(transcript, &transcript_inputs, &transcript_outputs)
+            .unwrap();
+    let partition = PartitionAuthority::monolithic();
 
     CompiledProofInput {
-        identity: ProofIdentity::new(b"semantic-v2".to_vec(), b"program-image-v2".to_vec())
-            .unwrap(),
+        host_finalizer: host_finalizer(&identity, codec.clone()),
+        identity,
+        fixed_values: vec![],
+        module_global_initializers: vec![],
         kernels: vec![kernel(module(), vec![effect_id], b"assembly-build-v1")],
         effects: vec![contract],
+        partitions: vec![partition.clone()],
         operations: vec![OpNode {
             id: assembly,
             semantic_id: SemanticOpId(1),
@@ -236,15 +280,18 @@ fn valid_input() -> CompiledProofInput {
             },
             invocation,
             effect: effect_id,
+            partition: partition.id(),
             stage: ProofStage::AfterTranscript,
         }],
         values,
         transcript_inputs,
         transcript_outputs,
+        transcript_segments,
         output: ProofOutputLayout {
-            codec: ProofCodecIdentity::track_a_resident_bundle(),
+            codec,
             layout,
             sections,
+            fragments,
         },
     }
 }
@@ -414,84 +461,6 @@ fn effect_and_kernel_authorities_are_body_derived_and_canonical() {
 }
 
 #[test]
-fn module_global_effects_bind_module_symbol_range_and_access() {
-    let mut input = valid_input();
-    let mut accesses = input.effects[0].accesses().to_vec();
-    let global = ModuleGlobalEffect {
-        module: module(),
-        symbol: b"ROUND_CONSTANTS".to_vec().into_boxed_slice(),
-        bytes: ByteRange::new(0, 256).unwrap(),
-    };
-    let with_global = EffectContract::new(accesses.clone(), vec![global]).unwrap();
-    install_effect(&mut input, with_global);
-    let compiled = CompiledProof::compile(input, transcript()).unwrap();
-    assert_eq!(compiled.effects()[0].module_globals().len(), 1);
-
-    let mut mismatched = valid_input();
-    let global = ModuleGlobalEffect {
-        module: ModuleIdentity::new(b"different-module".to_vec()).unwrap(),
-        symbol: b"ROUND_CONSTANTS".to_vec().into_boxed_slice(),
-        bytes: ByteRange::new(0, 256).unwrap(),
-    };
-    let contract =
-        EffectContract::new(mismatched.effects[0].accesses().to_vec(), vec![global]).unwrap();
-    install_effect(&mut mismatched, contract);
-    assert!(matches!(
-        CompiledProof::compile(mismatched, transcript()),
-        Err(CompiledProofError::ModuleGlobalAuthorityMismatch { .. })
-    ));
-
-    let source = accesses[0].source().unwrap().value;
-    *accesses[0].source_mut().unwrap() = bound(9, source);
-    assert!(matches!(
-        EffectContract::new(accesses, vec![]),
-        Err(CompiledProofError::NonCanonicalEffectBindings)
-    ));
-
-    let invalid_global = ModuleGlobalEffect {
-        module: module(),
-        symbol: Box::new([]),
-        bytes: ByteRange::new(0, 1).unwrap(),
-    };
-    assert!(matches!(
-        EffectContract::new(
-            vec![EffectAccess::Read {
-                source: bound(
-                    0,
-                    ValueRange {
-                        version: ValueVersion(0),
-                        elements: range(0, 1),
-                    },
-                ),
-            }],
-            vec![invalid_global],
-        ),
-        Err(CompiledProofError::InvalidModuleGlobalEffect)
-    ));
-
-    let nul_global = ModuleGlobalEffect {
-        module: module(),
-        symbol: b"ROUND\0CONSTANTS".to_vec().into_boxed_slice(),
-        bytes: ByteRange::new(0, 1).unwrap(),
-    };
-    assert!(matches!(
-        EffectContract::new(
-            vec![EffectAccess::Read {
-                source: bound(
-                    0,
-                    ValueRange {
-                        version: ValueVersion(0),
-                        elements: range(0, 1),
-                    },
-                ),
-            }],
-            vec![nul_global],
-        ),
-        Err(CompiledProofError::InvalidModuleGlobalEffect)
-    ));
-}
-
-#[test]
 fn paired_read_write_and_atomic_accesses_require_distinct_versions() {
     for atomic in [false, true] {
         let mut input = valid_input();
@@ -620,11 +589,11 @@ fn rejects_unknown_reads_incomplete_writes_and_unaccepted_effects() {
     ));
 
     let mut unaccepted = valid_input();
+    unaccepted.module_global_initializers = vec![module_initializer(module(), b"X", 4)];
     let other = EffectContract::new(
         unaccepted.effects[0].accesses().to_vec(),
         vec![ModuleGlobalEffect {
-            module: module(),
-            symbol: b"X".to_vec().into_boxed_slice(),
+            initializer: ModuleGlobalInitializerId(0),
             bytes: ByteRange::new(0, 4).unwrap(),
         }],
     )
@@ -723,6 +692,7 @@ fn rejects_noncanonical_or_overlapping_proof_output() {
     let mut gap = valid_input();
     gap.output.sections[1].elements.start += 1;
     gap.output.sections[1].elements.end += 1;
+    gap.output.fragments[1].source.elements = gap.output.sections[1].elements;
     assert!(matches!(
         CompiledProof::compile(gap, transcript()),
         Err(CompiledProofError::InvalidProofAssembly)
@@ -730,6 +700,7 @@ fn rejects_noncanonical_or_overlapping_proof_output() {
 
     let mut overlap = valid_input();
     overlap.output.sections[3].elements = overlap.output.sections[1].elements;
+    overlap.output.fragments[3].source.elements = overlap.output.sections[3].elements;
     assert!(matches!(
         CompiledProof::compile(overlap, transcript()),
         Err(CompiledProofError::InvalidProofAssembly)

@@ -100,6 +100,7 @@ fn alias_fixture(concurrent_consumer: bool) -> Fixture {
     let assembly_effect_id = assembly_effect.id();
     let assembly_invocation = invocation(assembly_effect);
     let assembly = input.operations[0].clone();
+    let partition = assembly.partition;
     input.operations = vec![
         OpNode {
             id: OpId(0),
@@ -116,6 +117,7 @@ fn alias_fixture(concurrent_consumer: bool) -> Fixture {
             },
             invocation: alias_invocation,
             effect: alias_effect_id,
+            partition,
             stage: ProofStage::AfterTranscript,
         },
         OpNode {
@@ -131,6 +133,7 @@ fn alias_fixture(concurrent_consumer: bool) -> Fixture {
         b"fleet-alias-aot-v2".to_vec(),
     )
     .unwrap();
+    input.host_finalizer = host_finalizer(&input.identity, input.output.codec.clone());
     let compiled = Arc::new(CompiledProof::compile(input, transcript()).unwrap());
 
     let final_release = fixture.placement.barrier_steps.last().unwrap().0;
@@ -248,15 +251,18 @@ fn distinct_output_fixture() -> Fixture {
         b"fleet-distinct-output-aot-v2".to_vec(),
     )
     .unwrap();
-    for ((section, &version), &words) in input
+    input.host_finalizer = host_finalizer(&input.identity, input.output.codec.clone());
+    for (index, ((section, &version), &words)) in input
         .output
         .sections
         .iter_mut()
         .zip(&output_versions)
         .zip(&widths)
+        .enumerate()
     {
         section.value = version;
         section.elements = range(0, words);
+        input.output.fragments[index].source = value_range(version, words);
     }
     let compiled = Arc::new(CompiledProof::compile(input, transcript()).unwrap());
 

@@ -206,6 +206,7 @@ fn canonical_proof_sections_may_own_distinct_output_versions() {
         ));
         section.value = version;
         section.elements = range(0, words);
+        input.output.fragments[index].source = value_range(version, words);
         accesses.push(EffectAccess::Write {
             destination: bound(
                 u32::try_from(accesses.len()).unwrap(),

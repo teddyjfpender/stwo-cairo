@@ -1,7 +1,7 @@
 use super::{CompiledProofError, IdentityKind, *};
 
 const PROOF_IDENTITY_TAG: &[u8] = b"stwo-cairo.compiled-proof.identity.v2";
-const STRUCTURE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.structure.v3\0";
+const STRUCTURE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.structure.v4\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CanonicalIdentity {
@@ -74,6 +74,10 @@ impl ProofIdentity {
         &self.semantics.digest
     }
 
+    pub const fn execution_build_digest(&self) -> &[u8; 32] {
+        &self.execution_build.digest
+    }
+
     pub const fn program_image_digest(&self) -> &[u8; 32] {
         &self.program_image_digest
     }
@@ -138,6 +142,29 @@ pub(super) fn compiled_identity(
     out.raw(input.identity.proof_semantic_digest());
     out.raw(input.identity.program_image_digest());
 
+    out.count(input.fixed_values.len())?;
+    for fixed in &input.fixed_values {
+        out.u32(fixed.constant().0);
+        out.u32(fixed.value().0);
+        out.raw(fixed.content_digest());
+        out.fixed_initializer(fixed.initializer())?;
+    }
+    out.count(input.module_global_initializers.len())?;
+    for initializer in &input.module_global_initializers {
+        out.u32(initializer.id().0);
+        out.bytes(initializer.module().canonical_encoding())?;
+        out.raw(initializer.module().digest());
+        out.bytes(initializer.symbol())?;
+        out.size(initializer.bytes())?;
+        out.size(initializer.alignment())?;
+        out.byte(u8::from(initializer.immutable()));
+        out.count(initializer.atoms().len())?;
+        for atom in initializer.atoms() {
+            out.module_initializer_atom(atom)?;
+        }
+        out.raw(initializer.content_or_recipe_digest());
+    }
+
     out.count(input.kernels.len())?;
     for kernel in &input.kernels {
         out.bytes(kernel.canonical_encoding())?;
@@ -148,12 +175,18 @@ pub(super) fn compiled_identity(
         out.bytes(effect.canonical_encoding())?;
         out.raw(effect.id().as_bytes());
     }
+    out.count(input.partitions.len())?;
+    for partition in &input.partitions {
+        out.bytes(partition.canonical_encoding())?;
+        out.raw(partition.id().as_bytes());
+    }
 
     out.count(input.operations.len())?;
     for operation in &input.operations {
         out.u32(operation.id.0);
         out.u32(operation.semantic_id.0);
         out.raw(operation.effect.as_bytes());
+        out.raw(operation.partition.as_bytes());
         out.stage(operation.stage);
         out.primitive(operation.primitive)?;
         out.invocation(operation.invocation.as_ref())?;
@@ -180,6 +213,14 @@ pub(super) fn compiled_identity(
         out.u32(binding.value.0);
         out.elements(binding.elements)?;
     }
+    out.count(input.transcript_segments.len())?;
+    for binding in &input.transcript_segments {
+        out.segment(binding.segment);
+        out.u32(binding.entry_state.0);
+        out.u32(binding.exit_state.0);
+        out.value_ranges(&binding.consumed)?;
+        out.value_ranges(&binding.produced)?;
+    }
 
     out.bytes(input.output.codec.canonical_encoding())?;
     out.raw(input.output.codec.digest());
@@ -187,12 +228,15 @@ pub(super) fn compiled_identity(
         out.range(&range)?;
     }
     out.size(input.output.layout.total_words)?;
-    out.count(input.output.sections.len())?;
-    for section in &input.output.sections {
-        out.byte(section_tag(section.section));
-        out.u32(section.value.0);
-        out.elements(section.elements)?;
+    out.count(input.output.fragments.len())?;
+    for fragment in &input.output.fragments {
+        out.byte(section_tag(fragment.section));
+        out.u32(fragment.ordinal);
+        out.value_range(fragment.source)?;
+        out.elements(fragment.destination)?;
     }
+
+    out.finalizer(&input.host_finalizer)?;
 
     let transcript_encoding = transcript.canonical_encoding()?;
     out.bytes(&transcript_encoding)?;
@@ -343,12 +387,10 @@ impl Encoder {
                         self.effect_binding(entry);
                     }
                 }
-                AotArgumentValue::DeviceU32Literals(values) => {
+                AotArgumentValue::DeviceFixedU32 { value, binding } => {
                     self.byte(3);
-                    self.count(values.len())?;
-                    for value in values {
-                        self.u32(*value);
-                    }
+                    self.u32(value.0);
+                    self.u32(binding.0);
                 }
             }
         }
@@ -408,6 +450,152 @@ impl Encoder {
         };
         self.byte(tag);
         self.u32(index);
+    }
+
+    fn fixed_initializer(
+        &mut self,
+        initializer: &FixedValueInitializer,
+    ) -> Result<(), CompiledProofError> {
+        match initializer {
+            FixedValueInitializer::InlineBytes(bytes) => {
+                self.byte(0);
+                self.bytes(bytes)?;
+            }
+            FixedValueInitializer::InlineU32(words) => {
+                self.byte(1);
+                self.count(words.len())?;
+                for word in words {
+                    self.u32(*word);
+                }
+            }
+            FixedValueInitializer::DeterministicRecipe(recipe) => {
+                self.byte(2);
+                self.bytes(recipe)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn module_initializer_atom(
+        &mut self,
+        atom: &ModuleGlobalInitializerAtom,
+    ) -> Result<(), CompiledProofError> {
+        match atom {
+            ModuleGlobalInitializerAtom::Literal { destination, bytes } => {
+                self.byte(0);
+                self.byte_range(*destination)?;
+                self.bytes(bytes)?;
+            }
+            ModuleGlobalInitializerAtom::FixedValueAddress {
+                destination,
+                value,
+                source_byte_offset,
+            } => {
+                self.byte(1);
+                self.byte_range(*destination)?;
+                self.u32(value.0);
+                self.size(*source_byte_offset)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn byte_range(&mut self, range: ByteRange) -> Result<(), CompiledProofError> {
+        self.size(range.start)?;
+        self.size(range.end)
+    }
+
+    fn value_range(&mut self, range: ValueRange) -> Result<(), CompiledProofError> {
+        self.u32(range.version.0);
+        self.elements(range.elements)
+    }
+
+    fn value_ranges(&mut self, ranges: &[ValueRange]) -> Result<(), CompiledProofError> {
+        self.count(ranges.len())?;
+        for range in ranges {
+            self.value_range(*range)?;
+        }
+        Ok(())
+    }
+
+    fn finalizer(&mut self, finalizer: &HostFinalizerAuthority) -> Result<(), CompiledProofError> {
+        self.bytes(finalizer.bundle_codec().canonical_encoding())?;
+        self.raw(finalizer.bundle_codec().digest());
+        let pcs = finalizer.pcs();
+        self.u32(pcs.pow_bits);
+        self.u32(pcs.fri_config.log_blowup_factor);
+        self.u32(pcs.fri_config.log_last_layer_degree_bound);
+        self.size(pcs.fri_config.n_queries)?;
+        self.u32(pcs.fri_config.fold_step);
+        match pcs.lifting_log_size {
+            Some(log_size) => {
+                self.byte(1);
+                self.u32(log_size);
+            }
+            None => self.byte(0),
+        }
+        let shape = finalizer.assembly_shape();
+        self.u32(shape.query_log_size);
+        self.size(shape.n_queries)?;
+        self.count(shape.trace_trees.len())?;
+        for tree in &shape.trace_trees {
+            self.u32(tree.role as u32);
+            self.u32(tree.leaf_log_size);
+            self.u32(tree.query_log_size);
+            self.count(tree.oods_samples_per_column.len())?;
+            for count in &tree.oods_samples_per_column {
+                self.size(*count)?;
+            }
+            self.count(tree.commit_to_proof_column.len())?;
+            for column in &tree.commit_to_proof_column {
+                self.size(*column)?;
+            }
+        }
+        self.count(shape.fri_trees.len())?;
+        for tree in &shape.fri_trees {
+            self.u32(tree.evaluation_log_size);
+            self.u32(tree.cumulative_fold);
+            self.u32(tree.outgoing_fold_step);
+            self.u32(tree.log_rows_per_leaf);
+        }
+        self.finalizer_identity(
+            finalizer.claim_codec().canonical_encoding(),
+            finalizer.claim_codec().digest(),
+        )?;
+        self.finalizer_identity(
+            finalizer.interaction_claim_codec().canonical_encoding(),
+            finalizer.interaction_claim_codec().digest(),
+        )?;
+        self.finalizer_identity(
+            finalizer.channel_schema().canonical_encoding(),
+            finalizer.channel_schema().digest(),
+        )?;
+        self.finalizer_identity(
+            finalizer.preprocessed_schema().canonical_encoding(),
+            finalizer.preprocessed_schema().digest(),
+        )?;
+        self.byte(match finalizer.decoder() {
+            DirectProofDecoder::ResidentBlake2sV1 => 0,
+        });
+        self.byte(match finalizer.oods_recipe() {
+            OodsConsistencyRecipe::CairoComponentsV1 => 0,
+        });
+        self.byte(match finalizer.envelope() {
+            CairoProofEnvelope::CairoProofV1 => 0,
+        });
+        self.raw(finalizer.proof_semantic_digest());
+        self.raw(finalizer.execution_build_digest());
+        Ok(())
+    }
+
+    fn finalizer_identity(
+        &mut self,
+        encoding: &[u8],
+        digest: &[u8; 32],
+    ) -> Result<(), CompiledProofError> {
+        self.bytes(encoding)?;
+        self.raw(digest);
+        Ok(())
     }
 }
 
