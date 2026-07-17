@@ -76,28 +76,28 @@ pub(super) fn invocation_catalog_order(source: &[SourceArgument]) -> Vec<ArenaCa
 /// never from arena catalog order. Descriptor values remain in the checked
 /// composite invocation receipt; only dereferenced values receive versions.
 pub(super) fn append_interpolation_catalog_order(
-    image: &ArenaProgramInventory,
+    catalog: &BaseProducerCatalog,
     schedule: &BaseProducerSchedule,
     ordered_values: &mut Vec<ArenaCatalogValueId>,
 ) -> Result<(), InvocationShapeError> {
     let interpolation = schedule
         .interpolation()
         .ok_or(InvocationShapeError::FrontierDidNotAdvance)?;
-    ordered_values.push(catalog_global(image, &interpolation.inverse_twiddles)?.id);
+    ordered_values.push(catalog_global(catalog, &interpolation.inverse_twiddles)?.id);
     for batch in &interpolation.batches {
         validate_batch_authority(interpolation.mode, batch)?;
-        catalog_global(image, &batch.input_pointers)?;
-        catalog_global(image, &batch.output_pointers)?;
+        catalog_global(catalog, &batch.input_pointers)?;
+        catalog_global(catalog, &batch.output_pointers)?;
         for column in &batch.columns {
-            ordered_values.push(catalog_scheduled(image, &column.evaluations)?.id);
-            ordered_values.push(catalog_scheduled(image, &column.coefficients)?.id);
+            ordered_values.push(catalog_scheduled(catalog, &column.evaluations)?.id);
+            ordered_values.push(catalog_scheduled(catalog, &column.coefficients)?.id);
         }
     }
     Ok(())
 }
 
 pub(super) fn lower_base_interpolation(
-    image: &ArenaProgramInventory,
+    catalog: &BaseProducerCatalog,
     schedule: &BaseProducerSchedule,
     values: &adapter::SemanticValueMap,
 ) -> Result<Vec<LoweredBaseInterpolationBatch>, InvocationShapeError> {
@@ -107,8 +107,9 @@ pub(super) fn lower_base_interpolation(
     let mut lowered = Vec::with_capacity(interpolation.batches.len());
     for (batch_index, batch) in interpolation.batches.iter().enumerate() {
         validate_batch_authority(interpolation.mode, batch)?;
-        let input_pointers = whole_catalog_range(catalog_global(image, &batch.input_pointers)?)?;
-        let output_pointers = whole_catalog_range(catalog_global(image, &batch.output_pointers)?)?;
+        let input_pointers = whole_catalog_range(catalog_global(catalog, &batch.input_pointers)?)?;
+        let output_pointers =
+            whole_catalog_range(catalog_global(catalog, &batch.output_pointers)?)?;
         let pointer_words = batch
             .columns
             .len()
@@ -125,8 +126,8 @@ pub(super) fn lower_base_interpolation(
         let mut accesses = Vec::with_capacity(batch.columns.len() + 1);
         let mut columns = Vec::with_capacity(batch.columns.len());
         for (column_index, column) in batch.columns.iter().enumerate() {
-            let evaluations = catalog_scheduled(image, &column.evaluations)?;
-            let coefficients = catalog_scheduled(image, &column.coefficients)?;
+            let evaluations = catalog_scheduled(catalog, &column.evaluations)?;
+            let coefficients = catalog_scheduled(catalog, &column.coefficients)?;
             let source = EffectBindingId(next_binding);
             next_binding = next_binding
                 .checked_add(1)
@@ -189,7 +190,7 @@ pub(super) fn lower_base_interpolation(
             });
         }
 
-        let twiddles = catalog_global(image, &interpolation.inverse_twiddles)?;
+        let twiddles = catalog_global(catalog, &interpolation.inverse_twiddles)?;
         let evaluation_domain_size = usize::try_from(batch.authority.evaluation_domain_size())
             .map_err(|_| InvocationShapeError::SizeOverflow)?;
         let suffix_start = interpolation
@@ -259,15 +260,15 @@ fn validate_batch_authority(
 }
 
 fn catalog_scheduled<'a>(
-    image: &'a ArenaProgramInventory,
+    catalog: &'a BaseProducerCatalog,
     scheduled: &ScheduledValue,
-) -> Result<&'a ProgramValueDesc, InvocationShapeError> {
-    let value = catalog_logical(image, scheduled.logical)?;
+) -> Result<&'a BaseCatalogValue, InvocationShapeError> {
+    let value = catalog_logical(catalog, scheduled.logical)?;
     if value.component != Some(scheduled.component)
         || value.part != Some(scheduled.part)
         || value.purpose != scheduled.purpose
         || value.ordinal != scheduled.ordinal
-        || value.layout.element_count().ok() != Some(scheduled.words)
+        || value.words != scheduled.words
     {
         return Err(InvocationShapeError::InvalidBaseInterpolationBinding);
     }
@@ -275,15 +276,15 @@ fn catalog_scheduled<'a>(
 }
 
 fn catalog_global<'a>(
-    image: &'a ArenaProgramInventory,
+    catalog: &'a BaseProducerCatalog,
     scheduled: &ScheduledGlobalValue,
-) -> Result<&'a ProgramValueDesc, InvocationShapeError> {
-    let value = catalog_logical(image, scheduled.logical)?;
+) -> Result<&'a BaseCatalogValue, InvocationShapeError> {
+    let value = catalog_logical(catalog, scheduled.logical)?;
     if value.component.is_some()
         || value.part.is_some()
         || value.purpose != scheduled.purpose
         || value.ordinal != scheduled.ordinal
-        || value.layout.element_count().ok() != Some(scheduled.words)
+        || value.words != scheduled.words
     {
         return Err(InvocationShapeError::InvalidBaseInterpolationBinding);
     }
@@ -291,10 +292,10 @@ fn catalog_global<'a>(
 }
 
 fn catalog_logical(
-    image: &ArenaProgramInventory,
+    catalog: &BaseProducerCatalog,
     logical: crate::arena_plan::LogicalBufferId,
-) -> Result<&ProgramValueDesc, InvocationShapeError> {
-    image
+) -> Result<&BaseCatalogValue, InvocationShapeError> {
+    catalog
         .values
         .get(logical.0 as usize)
         .filter(|value| value.logical == logical)

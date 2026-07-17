@@ -12,15 +12,15 @@ use std::sync::Arc;
 use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
-use stwo_backend_cuda::CompositionSplitLaunchMode;
 use stwo_backend_cuda::{
-    ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape, CommitCoefficientGroup,
-    CommitEvaluationGroup, CommitProgram, CompactDomainBindingError, CompactDomainProgram,
-    CompositionSplitTraffic, CudaExecContext, CudaExecTelemetry, CudaRuntimeError,
-    DecommitAssembly, DecommitColumnSource, DecommitTreeGeometry, DecommitTreeSources,
-    DeviceTranscriptError, DirectCompactDomainBindingError, DirectCompactTerminalBatchMode,
-    DirectCompactTerminalReceipt, DomainCooperativeBindingError, DomainCooperativeProgram,
-    ExecutionTablesHostData, FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
+    cuda_device_snapshot, ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape,
+    CommitCoefficientGroup, CommitEvaluationGroup, CommitProgram, CompactDomainBindingError,
+    CompactDomainProgram, CompositionSplitLaunchMode, CompositionSplitTraffic, CudaDeviceSnapshot,
+    CudaExecContext, CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
+    DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError,
+    DirectCompactDomainBindingError, DirectCompactTerminalBatchMode, DirectCompactTerminalReceipt,
+    DomainCooperativeBindingError, DomainCooperativeProgram, ExecutionTablesHostData,
+    FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
     ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError,
     PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedBlakeGFusedFeed,
     PreparedCommitError, PreparedCommitGraph, PreparedCompactDomainCommitGraph,
@@ -60,6 +60,10 @@ use crate::multiplicity_pipeline::{FixedMultiplicityCoverageGap, MultiplicityFee
 use crate::prepared_composition::{
     CompositionBindingRefreshTelemetry, CompositionExecutionReceipt, CompositionLaunchMode,
     CompositionOutputMode, CompositionReplayReceipt,
+};
+use crate::program_image::{
+    bind_replacement_base_authority, BaseProducerAuthority, LoadedBaseProducerAuthority,
+    PreparedBlakeGDirectKernel, PreparedRecordedKernel,
 };
 use crate::proof_bundle::{
     ResidentProofBundle, ResidentProofBundleError, ResidentProofBundleLayout,
@@ -433,6 +437,7 @@ pub enum ResidentRuntimeError {
         configured: ResidentBackend,
         planned: ResidentBackend,
     },
+    BaseProducerAuthority,
     ExecutionFeatureDisabled(&'static str),
     WitnessProgramInstructionLimit {
         component: &'static str,
@@ -912,6 +917,7 @@ impl From<ResidentLaunchError> for ResidentRuntimeError {
 /// resident across proof sessions.
 struct PreparedResidentWitness<'a> {
     component: &'static str,
+    part: TracePartId,
     n_real_rows: usize,
     native_input_producer: Option<&'static str>,
     input_gather: Option<PreparedWitnessInputGatherGraph<'a>>,
@@ -1562,6 +1568,7 @@ fn prepare_trace_commit_input<'a>(
 pub struct ResidentGraphRuntime<'a> {
     execution_config: SealedResidentExecutionConfig,
     base_producer_schedule: BaseProducerSchedule,
+    _loaded_base_producers: Option<LoadedBaseProducerAuthority>,
     execution_tables: Option<PreparedExecutionTablesGraph<'a>>,
     execution_tables_ingest: Option<PreparedExecutionTablesIngestTelemetry>,
     ec_op: Option<PreparedEcOpGraph<'a>>,
@@ -1601,6 +1608,26 @@ pub struct ResidentGraphRuntime<'a> {
     last_graph_replay_timing: Option<ResidentGraphReplayTimingReport>,
 }
 
+fn base_authority_matches_backend(backend: ResidentBackend, authority_present: bool) -> bool {
+    matches!(
+        (backend, authority_present),
+        (ResidentBackend::LegacyResident, false) | (ResidentBackend::ReplacementV1, true)
+    )
+}
+
+fn direct_prepared_pair_is_exact(
+    writer_count: usize,
+    feed_count: usize,
+    sole_feed_is_blake_g: bool,
+) -> bool {
+    (writer_count == 0 && feed_count == 0)
+        || (writer_count == 1 && feed_count == 1 && sole_feed_is_blake_g)
+}
+
+fn replacement_device_is_exact(device: CudaDeviceSnapshot) -> bool {
+    device.count == 1 && device.current == 0
+}
+
 impl<'a> ResidentGraphRuntime<'a> {
     /// Validate all identities and source order, upload immutable descriptor
     /// tables, and bind every launch to the workspace's isolated CUDA context.
@@ -1616,6 +1643,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         workspace: &'a GraphWorkspace,
         expected_identity: ResidentWorkspaceIdentity,
         execution_config: SealedResidentExecutionConfig,
+        base_producer_authority: Option<&BaseProducerAuthority>,
         setup_relation_challenges: RelationChallenges<'_>,
         transcript_plan: &CairoBlake2sTranscriptPlan,
         current_composition: &crate::composition_plan::CompositionPlan,
@@ -1634,6 +1662,12 @@ impl<'a> ResidentGraphRuntime<'a> {
         }
         let protocol_identity = workspace.plan().protocol_identity();
         validate_execution_backend(execution_config, protocol_identity.resident_backend)?;
+        if !base_authority_matches_backend(
+            protocol_identity.resident_backend,
+            base_producer_authority.is_some(),
+        ) {
+            return Err(ResidentRuntimeError::BaseProducerAuthority);
+        }
         if !workspace.preprocessed_commitment_ready() {
             return Err(ResidentRuntimeError::FixedPreprocessedCommitmentNotReady);
         }
@@ -1780,6 +1814,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             PreparedWitnessGraph::prepare_blake_g_direct_with_execution_tables(
                                 arena,
                                 &component.program,
+                                component.n_real_rows,
                                 component.requirements.row_count,
                                 tables,
                                 &component.slots,
@@ -1811,6 +1846,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                     .map_err(ResidentRuntimeError::from)?;
                     Ok::<_, ResidentRuntimeError>(PreparedResidentWitness {
                         component: component.component,
+                        part: component.part,
                         n_real_rows: component.n_real_rows,
                         native_input_producer: component.native_input_producer,
                         input_gather,
@@ -2107,6 +2143,79 @@ impl<'a> ResidentGraphRuntime<'a> {
             (None, Some(_)) => return Err(ResidentRuntimeError::UnexpectedPreparedEcOpSegment),
             (None, None) => (None, None),
         };
+        let loaded_base_producers = match base_producer_authority {
+            Some(authority) => {
+                let recorded = witness
+                    .iter()
+                    .filter(|prepared| !prepared.writer.is_blake_g_direct())
+                    .map(|prepared| PreparedRecordedKernel {
+                        component: prepared.component,
+                        part: prepared.part,
+                        identity: prepared.writer.kernel_identity(),
+                    })
+                    .collect::<Vec<_>>();
+                let direct_writers = witness
+                    .iter()
+                    .filter(|prepared| prepared.writer.is_blake_g_direct())
+                    .collect::<Vec<_>>();
+                let direct_feeds = multiplicity
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|prepared| &prepared.feeds)
+                    .filter_map(|feed| match feed {
+                        PreparedResidentFeed::BlakeGFused { producer, binding } => {
+                            Some((*producer, binding))
+                        }
+                        PreparedResidentFeed::Generic { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                let prepared_blake_g_direct =
+                    if direct_writers.is_empty() && direct_feeds.is_empty() {
+                        None
+                    } else {
+                        if !direct_prepared_pair_is_exact(
+                            direct_writers.len(),
+                            direct_feeds.len(),
+                            direct_feeds
+                                .first()
+                                .is_some_and(|(producer, _)| *producer == "blake_g"),
+                        ) {
+                            return Err(ResidentRuntimeError::BaseProducerAuthority);
+                        }
+                        let writer = direct_writers[0];
+                        Some(PreparedBlakeGDirectKernel {
+                            component: writer.component,
+                            part: writer.part,
+                            arena,
+                            writer: &writer.writer,
+                            feed: direct_feeds[0].1,
+                        })
+                    };
+                let device = cuda_device_snapshot()?;
+                if !replacement_device_is_exact(device) {
+                    return Err(ResidentRuntimeError::BaseProducerAuthority);
+                }
+                Some(
+                    bind_replacement_base_authority(
+                        authority,
+                        workspace.plan(),
+                        &recorded,
+                        prepared_blake_g_direct,
+                        device.current,
+                        device.sm_major,
+                        device.sm_minor,
+                    )
+                    .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)?,
+                )
+            }
+            None => None,
+        };
+        if !base_authority_matches_backend(
+            protocol_identity.resident_backend,
+            loaded_base_producers.is_some(),
+        ) {
+            return Err(ResidentRuntimeError::BaseProducerAuthority);
+        }
         require_execution_feature(execution_config.stream_fanout, "stream_fanout")?;
         let witness_lane_levels = plan_witness_lane_levels(
             &witness,
@@ -2662,6 +2771,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         let runtime = Self {
             execution_config,
             base_producer_schedule,
+            _loaded_base_producers: loaded_base_producers,
             execution_tables,
             execution_tables_ingest,
             ec_op,
@@ -5809,6 +5919,55 @@ fn require_complete_captured_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_base_runtime_seam_rejects_policy_cardinality_and_device_drift() {
+        assert!(base_authority_matches_backend(
+            ResidentBackend::LegacyResident,
+            false
+        ));
+        assert!(base_authority_matches_backend(
+            ResidentBackend::ReplacementV1,
+            true
+        ));
+        assert!(!base_authority_matches_backend(
+            ResidentBackend::LegacyResident,
+            true
+        ));
+        assert!(!base_authority_matches_backend(
+            ResidentBackend::ReplacementV1,
+            false
+        ));
+
+        assert!(direct_prepared_pair_is_exact(0, 0, false));
+        assert!(direct_prepared_pair_is_exact(1, 1, true));
+        for (writers, feeds, is_blake_g) in [
+            (0, 1, true),
+            (1, 0, false),
+            (2, 1, true),
+            (1, 2, true),
+            (1, 1, false),
+        ] {
+            assert!(!direct_prepared_pair_is_exact(writers, feeds, is_blake_g));
+        }
+
+        let exact = CudaDeviceSnapshot {
+            count: 1,
+            current: 0,
+            sm_major: 8,
+            sm_minor: 9,
+        };
+        assert!(replacement_device_is_exact(exact));
+        assert!(!replacement_device_is_exact(CudaDeviceSnapshot {
+            count: 2,
+            ..exact
+        }));
+        assert!(!replacement_device_is_exact(CudaDeviceSnapshot {
+            count: 1,
+            current: 1,
+            ..exact
+        }));
+    }
 
     #[test]
     fn static_transcript_ingest_requires_the_exact_canonical_set() {

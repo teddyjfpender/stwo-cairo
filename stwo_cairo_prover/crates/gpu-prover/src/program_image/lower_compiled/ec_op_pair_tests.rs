@@ -6,16 +6,11 @@ use crate::resident_runtime::producer_schedule::BaseProducerSchedule;
 
 fn generated_native_ec_op() -> producer_prefix::LoweredNativeEcOpProducer {
     let executable = tests::generated_sn2();
-    let image = ArenaProgramInventory::from_planned_parts(
-        executable.topology(),
-        executable.transcript(),
-        executable.arena(),
-    )
-    .unwrap();
+    let catalog = BaseProducerCatalog::compile(executable.arena()).unwrap();
     let schedule = BaseProducerSchedule::compile(executable.arena()).unwrap();
     let module = [9; 32];
     producer_prefix::map_scheduled_base_producers_with_native_authority(
-        &image,
+        &catalog,
         executable.arena(),
         &schedule,
         |contract| {

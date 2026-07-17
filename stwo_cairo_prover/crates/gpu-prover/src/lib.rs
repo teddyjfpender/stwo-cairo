@@ -34,9 +34,8 @@ pub mod multiplicity_pipeline;
 pub mod phases;
 pub mod plan;
 pub mod prepared_composition;
-pub mod proof_bundle;
-#[cfg(test)]
 mod program_image;
+pub mod proof_bundle;
 pub mod protocol_discovery;
 pub mod protocol_plan;
 pub mod prover;

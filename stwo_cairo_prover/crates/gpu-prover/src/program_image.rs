@@ -1,6 +1,7 @@
-//! Test-only migration inventory for one real [`ShapeExecutable`] arena.
+//! Diagnostic arena inventory plus the production ReplacementV1 Base authority.
 //!
-//! The arena is authoritative for value extents, alignment, transcript I/O and
+//! [`ArenaProgramInventory`] remains a test-only migration aid: the arena is
+//! authoritative for value extents, alignment, transcript I/O and
 //! the packed proof ABI. It is not authoritative for operation effects. This
 //! module therefore emits the complete arena inventory and selects the first
 //! pending entry in canonical arena order whose producer contract is missing.
@@ -11,7 +12,9 @@
 //! One inventory entry is emitted per arena `LogicalBufferId`. These entries
 //! are not semantic SSA values or `compiled_proof::ValueVersion` authority:
 //! arena reuse can place several entries in one allocation, while one entry
-//! can still require several semantic versions in the compiled program.
+//! can still require several semantic versions in the compiled program. The
+//! separate Base authority lowering is production input for ReplacementV1; it
+//! does not promote this inventory or claim the later proof DAG is compiled.
 
 use core::ops::Range;
 
@@ -28,6 +31,11 @@ mod identity;
 mod lower_compiled;
 
 use identity::ArenaProgramInventoryIdentity;
+pub(crate) use lower_compiled::{
+    bind_replacement_base_authority, compile_replacement_base_authority, BaseProducerAuthority,
+    BaseProducerAuthorityError, LoadedBaseProducerAuthority, PreparedBlakeGDirectKernel,
+    PreparedRecordedKernel,
+};
 
 /// Dense ID for one arena inventory entry. This is deliberately not named a
 /// `ValueId`: its 1:1 mapping to `LogicalBufferId` is storage inventory, not

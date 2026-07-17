@@ -88,7 +88,7 @@ impl PendingNativeEcOpContract {
 }
 
 pub(super) fn prepare(
-    image: &ArenaProgramInventory,
+    catalog: &BaseProducerCatalog,
     arena: &ProofArenaPlan,
 ) -> Result<PendingNativeEcOpContract, InvocationShapeError> {
     let ec_op = arena
@@ -120,8 +120,7 @@ pub(super) fn prepare(
     }
 
     let execution_table_pointers = exact_range(
-        image,
-        arena,
+        catalog,
         tables.slots.table_pointers,
         BufferPurpose::ExecutionTablePointers,
         0..tables.requirements.table_pointer_words,
@@ -136,8 +135,7 @@ pub(super) fn prepare(
 
     let mut execution_tables = Vec::with_capacity(EXECUTION_TABLE_POINTERS);
     execution_tables.push(exact_range(
-        image,
-        arena,
+        catalog,
         tables.slots.raw_addr_to_id,
         BufferPurpose::ExecutionTableRawAddressToId,
         0..tables.requirements.n_addrs,
@@ -150,8 +148,7 @@ pub(super) fn prepare(
             .copied()
             .map(|slot| {
                 exact_range(
-                    image,
-                    arena,
+                    catalog,
                     slot,
                     BufferPurpose::ExecutionTableBigLimb,
                     0..tables.requirements.n_big,
@@ -167,8 +164,7 @@ pub(super) fn prepare(
             .copied()
             .map(|slot| {
                 exact_range(
-                    image,
-                    arena,
+                    catalog,
                     slot,
                     BufferPurpose::ExecutionTableSmallLimb,
                     0..tables.requirements.n_small,
@@ -184,8 +180,7 @@ pub(super) fn prepare(
     }
 
     let segment_start = exact_role(
-        image,
-        arena,
+        catalog,
         ec_op.slots.segment_start,
         BufferPurpose::EcOpSegmentStart,
         Some("ec_op_builtin"),
@@ -201,8 +196,7 @@ pub(super) fn prepare(
         .enumerate()
         .map(|(ordinal, slot)| {
             exact_role(
-                image,
-                arena,
+                catalog,
                 slot,
                 BufferPurpose::BaseTrace,
                 Some("ec_op_builtin"),
@@ -213,8 +207,7 @@ pub(super) fn prepare(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let lookup_words = exact_role(
-        image,
-        arena,
+        catalog,
         ec_op.slots.lookup_words,
         BufferPurpose::LookupInputs,
         Some("ec_op_builtin"),
@@ -254,8 +247,7 @@ pub(super) fn prepare(
                 )
             };
         partial_input_columns.push(exact_role(
-            image,
-            arena,
+            catalog,
             slot,
             purpose,
             Some(component),
@@ -297,8 +289,8 @@ pub(super) fn prepare(
     ]
     .into_iter()
     .map(|(slot, purpose, component, part, words)| {
-        let range = exact_range(image, arena, slot, purpose, 0..words)?;
-        let value = &image.values[range.value.0 as usize];
+        let range = exact_range(catalog, slot, purpose, 0..words)?;
+        let value = catalog.value(range.value)?;
         if value.component != component || value.part != part {
             return Err(InvocationShapeError::InvalidNativeEcOpBinding);
         }
@@ -485,8 +477,7 @@ fn element_range(value: &ArenaCatalogRange) -> Result<ElementRange, InvocationSh
 }
 
 fn exact_role(
-    image: &ArenaProgramInventory,
-    arena: &ProofArenaPlan,
+    catalog: &BaseProducerCatalog,
     slot: ArenaSlotId,
     purpose: BufferPurpose,
     component: Option<&'static str>,
@@ -494,8 +485,8 @@ fn exact_role(
     ordinal: u32,
     elements: Range<usize>,
 ) -> Result<ArenaCatalogRange, InvocationShapeError> {
-    let range = exact_range(image, arena, slot, purpose, elements)?;
-    let value = &image.values[range.value.0 as usize];
+    let range = exact_range(catalog, slot, purpose, elements)?;
+    let value = catalog.value(range.value)?;
     if value.component != component || value.part != part || value.ordinal != ordinal {
         return Err(InvocationShapeError::InvalidNativeEcOpBinding);
     }
@@ -503,19 +494,13 @@ fn exact_role(
 }
 
 fn exact_range(
-    image: &ArenaProgramInventory,
-    arena: &ProofArenaPlan,
+    catalog: &BaseProducerCatalog,
     slot: ArenaSlotId,
     purpose: BufferPurpose,
     elements: Range<usize>,
 ) -> Result<ArenaCatalogRange, InvocationShapeError> {
-    let value = catalog_value(image, arena, slot, purpose)?;
-    if elements.end
-        > value
-            .layout
-            .element_count()
-            .map_err(|_| InvocationShapeError::SizeOverflow)?
-    {
+    let value = catalog_value(catalog, slot, purpose)?;
+    if elements.end > value.words {
         return Err(InvocationShapeError::InvalidNativeEcOpBinding);
     }
     Ok(ArenaCatalogRange {

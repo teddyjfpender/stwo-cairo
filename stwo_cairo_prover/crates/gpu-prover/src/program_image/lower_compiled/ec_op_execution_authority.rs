@@ -168,6 +168,14 @@ impl NativeEcOpLinkedModuleAuthority {
         })
     }
 
+    pub(super) fn validate_active_sm(&self, active_sm: u32) -> Result<(), InvocationShapeError> {
+        if active_sm == self.consumer_target_sm {
+            Ok(())
+        } else {
+            Err(InvocationShapeError::InvalidNativeEcOpAuthority)
+        }
+    }
+
     fn validate_contract(
         &self,
         contract: &EcOpCompositeContract,
@@ -488,6 +496,11 @@ mod tests {
         let module = [9; 32];
         let authority =
             NativeEcOpLinkedModuleAuthority::bind_exact(&contract, module, module, 89).unwrap();
+        authority.validate_active_sm(89).unwrap();
+        assert_eq!(
+            authority.validate_active_sm(90),
+            Err(InvocationShapeError::InvalidNativeEcOpAuthority)
+        );
         assert_ne!(authority.identity, ZERO_IDENTITY);
         assert_eq!(authority.entry_symbol, "ec_op_builtin_witness_on");
         assert_eq!(

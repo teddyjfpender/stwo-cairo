@@ -11,7 +11,7 @@ use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
 use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 
 use super::*;
-use crate::arena_plan::{ExecutionTableGeometry, ResidentBackend};
+use crate::arena_plan::{CommitmentTreeId, ExecutionTableGeometry, ResidentBackend};
 use crate::compiled_proof::{
     AotArgumentValue, AtomicOperation, EffectAccess, InPlaceAliasRequirement, ValueVersion,
 };
@@ -25,6 +25,10 @@ use crate::resident_witness::planned_cairo_claim;
 use crate::shape_executable::{ShapeCompileRequest, ShapeExecutable, ShapeExecutableCache};
 
 pub(super) fn generated_sn2() -> Arc<ShapeExecutable> {
+    generated_sn2_with_policy(ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048))
+}
+
+fn generated_sn2_with_policy(policy: ProtocolPlanPolicy) -> Arc<ShapeExecutable> {
     let input = run_and_adapt(
         &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
         ProgramType::Json,
@@ -50,10 +54,45 @@ pub(super) fn generated_sn2() -> Arc<ShapeExecutable> {
             pcs: PcsConfig::default(),
             include_all_preprocessed_columns: false,
             execution_tables: Some(ExecutionTableGeometry::new(19, 17, 5)),
-            policy: ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048),
+            policy,
         })
         .unwrap()
         .executable
+}
+
+fn assert_replacement_base_authority(executable: &ShapeExecutable) {
+    let authority = executable
+        .replacement_base_producers()
+        .expect("ReplacementV1 must install production Base authority");
+    let schedule = BaseProducerSchedule::compile(executable.arena()).unwrap();
+    assert!(schedule.interpolation().is_none());
+    assert_eq!(
+        authority.producer_count(),
+        schedule
+            .witness_levels()
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>()
+    );
+    let base = executable
+        .arena()
+        .commitment(CommitmentTreeId::Base)
+        .unwrap();
+    assert!(base.interpolation_batches.is_empty());
+    assert_eq!(
+        Some(authority.direct_retained_b2n()),
+        base.direct_retained_b2n_program.as_ref()
+    );
+
+    // Base producer authority is deliberately not permission to invent the
+    // rest of the proof DAG or promote the diagnostic inventory.
+    let image = ArenaProgramInventory::from_planned_parts(
+        executable.topology(),
+        executable.transcript(),
+        executable.arena(),
+    )
+    .unwrap();
+    assert!(image.try_promote_to_compiled_proof().is_err());
 }
 
 fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
@@ -63,6 +102,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         executable.arena(),
     )
     .unwrap();
+    let catalog = BaseProducerCatalog::compile(executable.arena()).unwrap();
     let schedule = BaseProducerSchedule::compile(executable.arena()).unwrap();
     schedule.validate_runtime_steps(schedule.steps()).unwrap();
     let mut cursor = schedule.cursor();
@@ -82,7 +122,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     // weakening the production binder's linked-receipt requirement.
     let module_identity = [9; 32];
     let mapped = producer_prefix::map_scheduled_base_producers_with_native_authority(
-        &image,
+        &catalog,
         executable.arena(),
         &schedule,
         |contract| {
@@ -102,7 +142,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     let native_execution = &native_producer.execution;
     let linked_execution = &native_execution.linked;
     let linked =
-        producer_prefix::map_scheduled_base_producers(&image, executable.arena(), &schedule)
+        producer_prefix::map_scheduled_base_producers(&catalog, executable.arena(), &schedule)
             .unwrap();
     if stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {
         assert_eq!(linked.bound.len(), 23);
@@ -255,8 +295,8 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         native_producer.producer.kind,
         WitnessProducerKind::NativeEcOp
     );
-    recorded_deduce_tests::assert_generated_partial_authority(executable, &image, &mapped);
-    recorded_deduce_tests::assert_generated_pedersen_state_authority(executable, &image, &mapped);
+    recorded_deduce_tests::assert_generated_partial_authority(executable, &catalog, &mapped);
+    recorded_deduce_tests::assert_generated_pedersen_state_authority(executable, &catalog, &mapped);
     let bitwise = mapped
         .bound
         .iter()
@@ -559,7 +599,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         .base_interpolation
         .windows(2)
         .all(|pair| pair[0].batch < pair[1].batch));
-    match loaded_authority::require(&first_producer.source, 8, 6) {
+    match loaded_authority::require(&first_producer.source, 0, 8, 6) {
         Ok(loaded) => {
             assert_ne!(loaded.manifest_identity, [0; 32]);
             assert_eq!(
@@ -574,7 +614,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     }
     validate_invocation(
         &first_producer.source,
-        &image,
+        &catalog,
         executable.arena(),
         first_producer.producer,
     )
@@ -588,7 +628,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     assert_eq!(
         validate_invocation(
             &mutated,
-            &image,
+            &catalog,
             executable.arena(),
             first_producer.producer
         ),
@@ -600,7 +640,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     assert_eq!(
         validate_invocation(
             &mutated,
-            &image,
+            &catalog,
             executable.arena(),
             first_producer.producer
         ),
@@ -615,7 +655,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     assert_eq!(
         validate_invocation(
             &mutated,
-            &image,
+            &catalog,
             executable.arena(),
             first_producer.producer
         ),
@@ -627,7 +667,7 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
     assert_eq!(
         validate_invocation(
             &mutated,
-            &image,
+            &catalog,
             executable.arena(),
             first_producer.producer
         ),
@@ -637,7 +677,16 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
 
 #[test]
 fn generated_sn2_source_relocation_frontier_is_exact_and_promotion_stays_closed() {
-    assert_exact_invocation_frontier(&generated_sn2());
+    let executable = generated_sn2();
+    assert!(executable.replacement_base_producers().is_none());
+    assert_exact_invocation_frontier(&executable);
+}
+
+#[test]
+fn generated_sn2_replacement_base_is_direct_and_retains_exact_b2n() {
+    let executable =
+        generated_sn2_with_policy(ProtocolPlanPolicy::replacement_v1(0x534e_0001, 2048));
+    assert_replacement_base_authority(&executable);
 }
 
 #[test]
@@ -791,5 +840,5 @@ fn sealed_sn2_recorded_witness_invocation_is_exact_but_not_promoted() {
         )
         .unwrap()
         .executable;
-    assert_exact_invocation_frontier(&executable);
+    assert_replacement_base_authority(&executable);
 }

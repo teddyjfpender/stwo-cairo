@@ -1,9 +1,11 @@
-//! Exact schedule-order invocation frontier for Base witness producers.
+//! Exact schedule-order authority for Base witness producers.
 //!
 //! Ordinary recorded witnesses lower through the source-emitter-owned typed
 //! AOT ABI. Stateful deduces also carry an address-free resource/relocation
-//! recipe; a loaded-module publication receipt remains a separate requirement
-//! before any production `CompiledProof` promotion.
+//! recipe. ReplacementV1 stores that pure authority in `ShapeExecutable`; a
+//! loaded-module publication receipt remains a separate runtime requirement.
+//! The LegacyResident mapper remains only a diagnostic migration frontier, and
+//! neither path fabricates the later operations needed by a full `CompiledProof`.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -15,13 +17,19 @@ use stwo_backend_cuda::{
 };
 
 use super::*;
-use crate::arena_plan::{BlakeGWitnessContract, PlannedWitnessComponent, ProofArenaPlan};
-use crate::compiled_proof::LaunchGeometry;
-use crate::resident_runtime::producer_schedule::{
-    BaseProducerSchedule, WitnessProducer, WitnessProducerKind,
+use crate::arena_plan::{
+    BlakeGWitnessContract, LogicalBufferId, PlannedWitnessComponent, ProofArenaPlan,
 };
+use crate::compiled_proof::LaunchGeometry;
+use crate::resident_runtime::producer_schedule::WitnessProducer;
+#[cfg(test)]
+use crate::resident_runtime::producer_schedule::{BaseProducerSchedule, WitnessProducerKind};
 
 mod adapter;
+mod blake_g_direct_execution_authority;
+mod blake_g_direct_prefix;
+#[cfg(test)]
+mod blake_g_direct_tests;
 mod ec_op_execution_authority;
 #[cfg(test)]
 mod ec_op_pair_tests;
@@ -33,8 +41,118 @@ mod recorded_deduce_authority;
 mod recorded_deduce_tests;
 mod schedule_prefix;
 
+pub(crate) use producer_prefix::{
+    BaseProducerAuthority, LoadedBaseProducerAuthority, PreparedBlakeGDirectKernel,
+    PreparedRecordedKernel,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BaseProducerAuthorityError;
+
+pub(crate) fn compile_replacement_base_authority(
+    arena: &ProofArenaPlan,
+) -> Result<BaseProducerAuthority, BaseProducerAuthorityError> {
+    producer_prefix::BaseProducerAuthority::compile_replacement(arena)
+        .map_err(|_| BaseProducerAuthorityError)
+}
+
+pub(crate) fn bind_replacement_base_authority(
+    authority: &BaseProducerAuthority,
+    arena: &ProofArenaPlan,
+    prepared: &[PreparedRecordedKernel<'_>],
+    prepared_blake_g_direct: Option<PreparedBlakeGDirectKernel<'_, '_>>,
+    device_ordinal: u32,
+    sm_major: u32,
+    sm_minor: u32,
+) -> Result<LoadedBaseProducerAuthority, BaseProducerAuthorityError> {
+    authority
+        .bind_loaded(
+            arena,
+            prepared,
+            prepared_blake_g_direct,
+            device_ordinal,
+            sm_major,
+            sm_minor,
+        )
+        .map_err(|_| BaseProducerAuthorityError)
+}
+
 const POINTER_WORDS: usize = core::mem::size_of::<*const u32>().div_ceil(WORD_BYTES);
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
+
+/// Address-free Base-only relocation catalog. Unlike [`ArenaProgramInventory`],
+/// this is production input: it contains only exact logical roles, extents and
+/// arena slot identities needed to bind Base producers. It makes no claim about
+/// the later transcript/proof DAG or semantic SSA origins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BaseProducerCatalog {
+    values: Vec<BaseCatalogValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BaseCatalogValue {
+    id: ArenaCatalogValueId,
+    logical: LogicalBufferId,
+    physical: ArenaSlotId,
+    component: Option<&'static str>,
+    part: Option<stwo_cairo_prover::witness::proof_shape::TracePartId>,
+    purpose: BufferPurpose,
+    ordinal: u32,
+    words: usize,
+}
+
+impl BaseProducerCatalog {
+    fn compile(arena: &ProofArenaPlan) -> Result<Self, InvocationShapeError> {
+        if arena.logical_buffers().is_empty()
+            || arena.logical_buffers().len() != arena.bindings().len()
+        {
+            return Err(InvocationShapeError::InvalidBaseCatalog);
+        }
+        let values = arena
+            .logical_buffers()
+            .iter()
+            .enumerate()
+            .map(|(index, logical)| {
+                let dense = LogicalBufferId(
+                    u32::try_from(index).map_err(|_| InvocationShapeError::SizeOverflow)?,
+                );
+                let binding = arena
+                    .binding(logical.id)
+                    .filter(|binding| binding.logical == logical.id)
+                    .ok_or(InvocationShapeError::InvalidBaseCatalog)?;
+                let slot = arena
+                    .layout()
+                    .slot(binding.physical)
+                    .ok_or(InvocationShapeError::MissingCatalogValue(binding.physical))?;
+                if logical.id != dense
+                    || binding.len_words != logical.len_words
+                    || binding.len_words > slot.len_words
+                    || logical.len_words == 0
+                {
+                    return Err(InvocationShapeError::InvalidBaseCatalog);
+                }
+                Ok(BaseCatalogValue {
+                    id: ArenaCatalogValueId(logical.id.0),
+                    logical: logical.id,
+                    physical: binding.physical,
+                    component: logical.component,
+                    part: logical.part,
+                    purpose: logical.purpose,
+                    ordinal: logical.ordinal,
+                    words: logical.len_words,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { values })
+    }
+
+    fn value(&self, id: ArenaCatalogValueId) -> Result<&BaseCatalogValue, InvocationShapeError> {
+        self.values
+            .get(id.0 as usize)
+            .filter(|value| value.id == id)
+            .ok_or(InvocationShapeError::InvalidCatalogRange(id))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InvocationAccess {
@@ -102,6 +220,7 @@ struct RecordedWitnessInvocationShape {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InvocationShapeError {
+    InvalidBaseCatalog,
     MissingRecordedWitness,
     MissingPreparedExecutionTables,
     LegacyExecutionTables,
@@ -117,6 +236,7 @@ enum InvocationShapeError {
     SourceEmitterRejected,
     MissingLoadedAotAuthority,
     MissingLoadedModuleStateAuthority,
+    LoadedModuleStateAuthorityMismatch,
     LoadedAotAuthorityMismatch,
     InvocationMismatch,
     FrontierDidNotAdvance,
@@ -125,18 +245,22 @@ enum InvocationShapeError {
     InvalidScheduledProducerBinding,
     InvalidNativeEcOpAuthority,
     InvalidNativeEcOpBinding,
+    InvalidNativeBlakeGDirectAuthority,
+    InvalidNativeBlakeGDirectBinding,
+    MissingNativeBlakeGDirectAuthority,
     InvalidBaseInterpolationAuthority,
     InvalidBaseInterpolationBinding,
+    InvalidProductionBaseAuthority,
 }
 
 fn validate_invocation(
     supplied: &RecordedWitnessInvocationShape,
-    image: &ArenaProgramInventory,
+    catalog: &BaseProducerCatalog,
     arena: &ProofArenaPlan,
     producer: WitnessProducer,
 ) -> Result<(), InvocationShapeError> {
     let planned = planned_recorded_component(arena, producer)?;
-    let expected = derive_invocation(image, arena, planned)?;
+    let expected = derive_invocation(catalog, arena, planned)?;
     if supplied == &expected {
         Ok(())
     } else {
@@ -160,7 +284,7 @@ fn planned_recorded_component<'a>(
 }
 
 fn derive_invocation(
-    image: &ArenaProgramInventory,
+    catalog: &BaseProducerCatalog,
     arena: &ProofArenaPlan,
     planned: &PlannedWitnessComponent,
 ) -> Result<RecordedWitnessInvocationShape, InvocationShapeError> {
@@ -200,8 +324,7 @@ fn derive_invocation(
     source_arguments.push(pointer_table(
         0,
         catalog_value(
-            image,
-            arena,
+            catalog,
             planned.slots.input_pointers,
             BufferPurpose::WitnessInputPointers,
         )?,
@@ -213,8 +336,7 @@ fn derive_invocation(
             .enumerate()
             .map(|(ordinal, slot)| {
                 target(
-                    image,
-                    arena,
+                    catalog,
                     slot,
                     BufferPurpose::WitnessInput,
                     0..planned.requirements.row_count,
@@ -229,13 +351,12 @@ fn derive_invocation(
             })
             .collect::<Result<Vec<_>, _>>()?,
     )?);
-    source_arguments.push(table_pointer_argument(image, arena, tables, &table_use)?);
-    source_arguments.push(table_stride_argument(image, arena, tables, &table_use)?);
+    source_arguments.push(table_pointer_argument(catalog, tables, &table_use)?);
+    source_arguments.push(table_stride_argument(catalog, tables, &table_use)?);
     source_arguments.push(pointer_table(
         3,
         catalog_value(
-            image,
-            arena,
+            catalog,
             planned.slots.output_pointers,
             BufferPurpose::WitnessOutputPointers,
         )?,
@@ -246,8 +367,7 @@ fn derive_invocation(
             .copied()
             .map(|slot| {
                 target(
-                    image,
-                    arena,
+                    catalog,
                     slot,
                     BufferPurpose::BaseTrace,
                     0..planned.requirements.row_count,
@@ -263,14 +383,12 @@ fn derive_invocation(
     source_arguments.push(pointer_table(
         4,
         catalog_value(
-            image,
-            arena,
+            catalog,
             planned.slots.multiplicity_pointers,
             BufferPurpose::WitnessMultiplicityPointers,
         )?,
         vec![target(
-            image,
-            arena,
+            catalog,
             multiplicity_dummy,
             BufferPurpose::WitnessMultiplicityDummy,
             0..1,
@@ -279,8 +397,7 @@ fn derive_invocation(
     )?);
     source_arguments.push(direct_output(
         5,
-        image,
-        arena,
+        catalog,
         planned.slots.lookup_words,
         if planned.program.n_lookup_words == 0 {
             BufferPurpose::WitnessLookupDummy
@@ -294,8 +411,7 @@ fn derive_invocation(
     )?);
     source_arguments.push(direct_output(
         6,
-        image,
-        arena,
+        catalog,
         planned.slots.sub_words,
         if planned.program.n_sub_words == 0 {
             BufferPurpose::WitnessSubDummy
@@ -370,21 +486,18 @@ fn table_use(program: &WitnessProgram) -> Result<TableUse, InvocationShapeError>
 }
 
 fn table_pointer_argument(
-    image: &ArenaProgramInventory,
-    arena: &ProofArenaPlan,
+    catalog: &BaseProducerCatalog,
     tables: &crate::arena_plan::PlannedExecutionTablesWorkspace,
     used: &TableUse,
 ) -> Result<SourceArgument, InvocationShapeError> {
     let descriptor = catalog_value(
-        image,
-        arena,
+        catalog,
         tables.slots.table_pointers,
         BufferPurpose::ExecutionTablePointers,
     )?;
     let mut targets = Vec::with_capacity(EXECUTION_TABLE_POINTERS);
     targets.push(target(
-        image,
-        arena,
+        catalog,
         tables.slots.raw_addr_to_id,
         BufferPurpose::ExecutionTableRawAddressToId,
         0..tables.requirements.n_addrs,
@@ -396,8 +509,7 @@ fn table_pointer_argument(
     )?);
     for (limb, &slot) in tables.slots.big_limbs.iter().enumerate() {
         targets.push(target(
-            image,
-            arena,
+            catalog,
             slot,
             BufferPurpose::ExecutionTableBigLimb,
             0..tables.requirements.n_big,
@@ -410,8 +522,7 @@ fn table_pointer_argument(
     }
     for (limb, &slot) in tables.slots.small_limbs.iter().enumerate() {
         targets.push(target(
-            image,
-            arena,
+            catalog,
             slot,
             BufferPurpose::ExecutionTableSmallLimb,
             0..tables.requirements.n_small,
@@ -426,14 +537,12 @@ fn table_pointer_argument(
 }
 
 fn table_stride_argument(
-    image: &ArenaProgramInventory,
-    arena: &ProofArenaPlan,
+    catalog: &BaseProducerCatalog,
     tables: &crate::arena_plan::PlannedExecutionTablesWorkspace,
     used: &TableUse,
 ) -> Result<SourceArgument, InvocationShapeError> {
     let value = whole_catalog_range(catalog_value(
-        image,
-        arena,
+        catalog,
         tables.slots.table_strides,
         BufferPurpose::ExecutionTableStrides,
     )?)?;
@@ -469,7 +578,7 @@ fn table_stride_argument(
 
 fn pointer_table(
     ordinal: u8,
-    descriptor: &ProgramValueDesc,
+    descriptor: &BaseCatalogValue,
     targets: Vec<InvocationTarget>,
 ) -> Result<SourceArgument, InvocationShapeError> {
     let descriptor = whole_catalog_range(descriptor)?;
@@ -518,8 +627,7 @@ fn pointer_table(
 
 fn direct_output(
     ordinal: u8,
-    image: &ArenaProgramInventory,
-    arena: &ProofArenaPlan,
+    catalog: &BaseProducerCatalog,
     slot: ArenaSlotId,
     purpose: BufferPurpose,
     words: usize,
@@ -527,8 +635,7 @@ fn direct_output(
     Ok(SourceArgument::DirectPointer {
         ordinal,
         target: target(
-            image,
-            arena,
+            catalog,
             slot,
             purpose,
             0..words.max(1),
@@ -542,21 +649,14 @@ fn direct_output(
 }
 
 fn target(
-    image: &ArenaProgramInventory,
-    arena: &ProofArenaPlan,
+    catalog: &BaseProducerCatalog,
     slot: ArenaSlotId,
     purpose: BufferPurpose,
     elements: Range<usize>,
     access: InvocationAccess,
 ) -> Result<InvocationTarget, InvocationShapeError> {
-    let value = catalog_value(image, arena, slot, purpose)?;
-    if elements.end
-        > value
-            .layout
-            .element_count()
-            .map_err(|_| InvocationShapeError::SizeOverflow)?
-        || (access != InvocationAccess::Inactive && elements.is_empty())
-    {
+    let value = catalog_value(catalog, slot, purpose)?;
+    if elements.end > value.words || (access != InvocationAccess::Inactive && elements.is_empty()) {
         return Err(InvocationShapeError::InvalidCatalogRange(value.id));
     }
     Ok(InvocationTarget {
@@ -567,17 +667,14 @@ fn target(
 }
 
 fn catalog_value<'a>(
-    image: &'a ArenaProgramInventory,
-    arena: &ProofArenaPlan,
+    catalog: &'a BaseProducerCatalog,
     slot: ArenaSlotId,
     purpose: BufferPurpose,
-) -> Result<&'a ProgramValueDesc, InvocationShapeError> {
-    let mut matches = image.values.iter().filter(|value| {
-        value.purpose == purpose
-            && arena
-                .binding(value.logical)
-                .is_some_and(|binding| binding.physical == slot)
-    });
+) -> Result<&'a BaseCatalogValue, InvocationShapeError> {
+    let mut matches = catalog
+        .values
+        .iter()
+        .filter(|value| value.purpose == purpose && value.physical == slot);
     let value = matches
         .next()
         .ok_or(InvocationShapeError::MissingCatalogValue(slot))?;
@@ -588,15 +685,11 @@ fn catalog_value<'a>(
 }
 
 fn whole_catalog_range(
-    value: &ProgramValueDesc,
+    value: &BaseCatalogValue,
 ) -> Result<ArenaCatalogRange, InvocationShapeError> {
-    let words = value
-        .layout
-        .element_count()
-        .map_err(|_| InvocationShapeError::SizeOverflow)?;
     Ok(ArenaCatalogRange {
         value: value.id,
-        value_words: 0..words,
+        value_words: 0..value.words,
     })
 }
 
@@ -608,8 +701,7 @@ fn words_per_row(count: u32, rows: usize) -> Result<usize, InvocationShapeError>
 }
 
 fn produced_values(
-    image: &ArenaProgramInventory,
-    arena: &ProofArenaPlan,
+    catalog: &BaseProducerCatalog,
     planned: &PlannedWitnessComponent,
 ) -> Result<Vec<ArenaCatalogValueId>, InvocationShapeError> {
     let mut produced = planned
@@ -617,15 +709,12 @@ fn produced_values(
         .output_columns
         .iter()
         .copied()
-        .map(|slot| {
-            catalog_value(image, arena, slot, BufferPurpose::BaseTrace).map(|value| value.id)
-        })
+        .map(|slot| catalog_value(catalog, slot, BufferPurpose::BaseTrace).map(|value| value.id))
         .collect::<Result<Vec<_>, _>>()?;
     if planned.program.n_lookup_words != 0 {
         produced.push(
             catalog_value(
-                image,
-                arena,
+                catalog,
                 planned.slots.lookup_words,
                 BufferPurpose::LookupInputs,
             )?
@@ -635,8 +724,7 @@ fn produced_values(
     if planned.program.n_sub_words != 0 {
         produced.push(
             catalog_value(
-                image,
-                arena,
+                catalog,
                 planned.slots.sub_words,
                 BufferPurpose::SubcomponentInputs,
             )?

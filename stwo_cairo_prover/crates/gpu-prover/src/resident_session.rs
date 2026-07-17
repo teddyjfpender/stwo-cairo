@@ -861,6 +861,7 @@ fn run_materialized_session<R>(
         workspace,
         ResidentWorkspaceIdentity::of(workspace),
         execution_config,
+        executable.replacement_base_producers(),
         RelationChallenges {
             alpha_powers: &setup_alphas,
             z: SecureField::zero(),
@@ -1714,6 +1715,7 @@ pub fn with_resident_pre_witness_session<R>(
                     workspace,
                     ResidentWorkspaceIdentity::of(workspace),
                     execution_config,
+                    executable.replacement_base_producers(),
                     RelationChallenges {
                         alpha_powers: &setup_alphas,
                         z: SecureField::zero(),

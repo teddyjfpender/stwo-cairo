@@ -6,7 +6,7 @@ use crate::shape_executable::ShapeExecutable;
 
 pub(super) fn assert_generated_partial_authority(
     executable: &ShapeExecutable,
-    image: &ArenaProgramInventory,
+    catalog: &BaseProducerCatalog,
     mapped: &producer_prefix::BaseProducerBindingFrontier,
 ) {
     let partial = mapped.bound[14].recorded().unwrap();
@@ -52,7 +52,13 @@ pub(super) fn assert_generated_partial_authority(
         .accesses()
         .iter()
         .all(|access| !matches!(access, EffectAccess::Atomic { .. })));
-    validate_invocation(&partial.source, image, executable.arena(), partial.producer).unwrap();
+    validate_invocation(
+        &partial.source,
+        catalog,
+        executable.arena(),
+        partial.producer,
+    )
+    .unwrap();
 
     let planned = planned_recorded_component(executable.arena(), partial.producer).unwrap();
     validate_multiplicity_free(planned).unwrap();
@@ -75,7 +81,7 @@ pub(super) fn assert_generated_partial_authority(
     let mut mutated = partial.source.clone();
     mutated.deduce.source_identity[0] ^= 1;
     assert_eq!(
-        validate_invocation(&mutated, image, executable.arena(), partial.producer),
+        validate_invocation(&mutated, catalog, executable.arena(), partial.producer),
         Err(InvocationShapeError::InvocationMismatch)
     );
 
@@ -101,7 +107,7 @@ pub(super) fn assert_generated_partial_authority(
 
 pub(super) fn assert_generated_pedersen_state_authority(
     executable: &ShapeExecutable,
-    image: &ArenaProgramInventory,
+    catalog: &BaseProducerCatalog,
     mapped: &producer_prefix::BaseProducerBindingFrontier,
 ) {
     let stateful = mapped
@@ -135,7 +141,7 @@ pub(super) fn assert_generated_pedersen_state_authority(
         assert!(producer.effect.module_globals().is_empty());
         validate_invocation(
             &producer.source,
-            image,
+            catalog,
             executable.arena(),
             producer.producer,
         )

@@ -19,12 +19,16 @@ use stwo_cairo_prover::witness::proof_shape::{ProofShape, RowResolution, TracePa
 
 use crate::arena_plan::{
     ArenaBinding, ArenaPlanError, ExecutionTableGeometry, LogicalBuffer, ProofArenaPlan,
+    ResidentBackend,
 };
 use crate::composition_plan::{
     bind_cairo_composition, compile_cairo_composition_binding_plan, plan_cairo_composition,
     CompositionBindingPlan, CompositionPlan, CompositionPlanError, CompositionProofBindings,
 };
 use crate::plan::ProofPlan;
+use crate::program_image::{
+    compile_replacement_base_authority, BaseProducerAuthority, BaseProducerAuthorityError,
+};
 use crate::protocol_discovery::{
     discover_protocol_transcript_shape, schema_zero_interaction_claim_for_composition,
     ProtocolDiscoveryError, ProtocolTranscriptDiscovery,
@@ -319,6 +323,14 @@ pub struct ShapeExecutable {
     transcript: CairoBlake2sTranscriptPlan,
     composition_bindings: CompositionBindingPlan,
     arena: Arc<ProofArenaPlan>,
+    base_producers: BaseProducerAuthoritySelection,
+}
+
+/// Legacy has no replacement semantic artifact. ReplacementV1 retains its
+/// checked Base producer authority in every production shape build.
+enum BaseProducerAuthoritySelection {
+    LegacyResidentMigrationOnly,
+    ReplacementV1(BaseProducerAuthority),
 }
 
 impl ShapeExecutable {
@@ -352,6 +364,13 @@ impl ShapeExecutable {
 
     pub(crate) fn protocol_policy(&self) -> ProtocolPlanPolicy {
         self.admission.topology.policy
+    }
+
+    pub(crate) fn replacement_base_producers(&self) -> Option<&BaseProducerAuthority> {
+        match &self.base_producers {
+            BaseProducerAuthoritySelection::LegacyResidentMigrationOnly => None,
+            BaseProducerAuthoritySelection::ReplacementV1(authority) => Some(authority),
+        }
     }
 
     fn composition_bindings(&self) -> &CompositionBindingPlan {
@@ -587,12 +606,21 @@ fn compile_shape_executable(
         None => ProofArenaPlan::build(request.proof_plan, &protocol, &composition)?,
     });
     let admission = WorkspaceAdmission::compile(Arc::new(topology), &arena)?;
+    let base_producers = match request.policy.resident_backend {
+        ResidentBackend::LegacyResident => {
+            BaseProducerAuthoritySelection::LegacyResidentMigrationOnly
+        }
+        ResidentBackend::ReplacementV1 => BaseProducerAuthoritySelection::ReplacementV1(
+            compile_replacement_base_authority(&arena)?,
+        ),
+    };
     Ok(ShapeExecutable {
         admission,
         discovery,
         transcript,
         composition_bindings,
         arena,
+        base_producers,
     })
 }
 
@@ -621,6 +649,7 @@ pub enum ShapeExecutableError {
     Composition(CompositionPlanError),
     Protocol(ProtocolPlanError),
     Arena(ArenaPlanError),
+    BaseProducerAuthority,
     MissingArenaSlot(stwo_backend_cuda::ArenaSlotId),
     ArenaViewCountMismatch {
         bound: usize,
@@ -651,6 +680,12 @@ convert_error!(TranscriptPlanError, Transcript);
 convert_error!(CompositionPlanError, Composition);
 convert_error!(ProtocolPlanError, Protocol);
 convert_error!(ArenaPlanError, Arena);
+
+impl From<BaseProducerAuthorityError> for ShapeExecutableError {
+    fn from(_: BaseProducerAuthorityError) -> Self {
+        Self::BaseProducerAuthority
+    }
+}
 
 #[cfg(test)]
 #[path = "shape_executable_tests.rs"]
