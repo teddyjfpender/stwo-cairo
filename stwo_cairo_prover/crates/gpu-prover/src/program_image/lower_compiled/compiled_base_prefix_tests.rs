@@ -19,7 +19,7 @@ const TARGET_SM: u32 = 89;
 
 #[test]
 fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
-    let executable = super::tests::generated_sn2();
+    let executable = super::tests::generated_sn2_replacement();
     let authority = BaseProducerAuthority::compile_replacement(executable.arena()).unwrap();
     let ec_op = authority
         .producers

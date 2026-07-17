@@ -28,6 +28,10 @@ pub(super) fn generated_sn2() -> Arc<ShapeExecutable> {
     generated_sn2_with_policy(ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048))
 }
 
+pub(super) fn generated_sn2_replacement() -> Arc<ShapeExecutable> {
+    generated_sn2_with_policy(ProtocolPlanPolicy::replacement_v1(0x534e_0001, 2048))
+}
+
 fn generated_sn2_with_policy(policy: ProtocolPlanPolicy) -> Arc<ShapeExecutable> {
     let input = run_and_adapt(
         &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
@@ -688,8 +692,7 @@ fn generated_sn2_source_relocation_frontier_is_exact_and_promotion_stays_closed(
 
 #[test]
 fn generated_sn2_replacement_base_is_direct_and_retains_exact_b2n() {
-    let executable =
-        generated_sn2_with_policy(ProtocolPlanPolicy::replacement_v1(0x534e_0001, 2048));
+    let executable = generated_sn2_replacement();
     assert_replacement_base_authority(&executable);
 }
 
