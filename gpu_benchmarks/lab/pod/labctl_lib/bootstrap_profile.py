@@ -157,29 +157,140 @@ def _bootstrap_command(public_key: str) -> str:
         b"    KbdInteractiveAuthentication no\n"
     ).decode()
     return f"""
-set -eu
+set -euE
+trap 'rc=$?; trap - ERR; printf "LABCTL_BOOTSTRAP_ERROR_LINE=%s RC=%s\\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
 test "$(id -u):$(id -un)" = 0:root
+KEY={shlex.quote(public_key)}
 test ! -L /home
 test -d /home
-if getent group dev >/dev/null; then
-  test "$(getent group dev | cut -d: -f3)" = 1000
-else
-  ! getent group 1000 >/dev/null
-  groupadd --gid 1000 dev
+test "$(stat -c '%u:%g:%a' /home)" = 0:0:755
+command -v groupmod >/dev/null
+command -v usermod >/dev/null
+command -v pgrep >/dev/null
+
+# The immutable image has one local ubuntu identity at 1000:1000.  Admit only
+# that exact identity and the operation boundaries reachable below.
+UID1000=$(awk -F: '$3 == 1000 {{printf "%s:%s:%s:%s\\n", $1, $4, $6, $7}}' /etc/passwd)
+GID1000=$(awk -F: '$3 == 1000 {{printf "%s:%s\\n", $1, $4}}' /etc/group)
+PRIMARY1000=$(awk -F: '$4 == 1000 {{printf "%s:%s\\n", $1, $3}}' /etc/passwd)
+case "$UID1000|$GID1000|$PRIMARY1000" in
+  'ubuntu:1000:/home/ubuntu:/bin/bash|ubuntu:|ubuntu:1000')
+    ACCOUNT_STATE=initial; SOURCE_USER=ubuntu; SOURCE_HOME=/home/ubuntu ;;
+  'ubuntu:1000:/home/ubuntu:/bin/bash|dev:|ubuntu:1000')
+    ACCOUNT_STATE=group-renamed; SOURCE_USER=ubuntu; SOURCE_HOME=/home/ubuntu ;;
+  'dev:1000:/home/ubuntu:/bin/bash|dev:|dev:1000')
+    ACCOUNT_STATE=user-renamed; SOURCE_USER=dev; SOURCE_HOME=/home/ubuntu ;;
+  'dev:1000:/home/dev:/bin/bash|dev:|dev:1000')
+    ACCOUNT_STATE=desired; SOURCE_USER=dev; SOURCE_HOME=/home/dev ;;
+  *)
+    printf 'LABCTL_BOOTSTRAP_CONFLICT=unexpected-1000-identity user=%s group=%s primary=%s\n' \
+      "$UID1000" "$GID1000" "$PRIMARY1000" >&2
+    exit 1 ;;
+esac
+
+# The seed's exact supplementary set is part of the pinned-image contract.
+# Clearing it is the first mutation; every subsequent state has primary GID only.
+GROUPS1000=$(id -G "$SOURCE_USER")
+case "$ACCOUNT_STATE|$GROUPS1000" in
+  'initial|1000 4 20 24 25 27 29 30 44 46') ;;
+  'initial|1000') ACCOUNT_STATE=groups-cleared ;;
+  'group-renamed|1000'|'user-renamed|1000'|'desired|1000') ;;
+  *)
+    printf 'LABCTL_BOOTSTRAP_CONFLICT=unexpected-1000-groups state=%s groups=%s\n' \
+      "$ACCOUNT_STATE" "$GROUPS1000" >&2
+    exit 1 ;;
+esac
+
+# Name aliases, an unlocked password, a live process, or an unsafe home all fail
+# before the first account mutation.
+case "$ACCOUNT_STATE" in
+  initial|groups-cleared)
+    if getent passwd dev >/dev/null; then
+      printf 'LABCTL_BOOTSTRAP_CONFLICT=name-alias database=passwd name=dev\n' >&2
+      exit 1
+    fi
+    if getent group dev >/dev/null; then
+      printf 'LABCTL_BOOTSTRAP_CONFLICT=name-alias database=group name=dev\n' >&2
+      exit 1
+    fi ;;
+  group-renamed)
+    if getent passwd dev >/dev/null; then
+      printf 'LABCTL_BOOTSTRAP_CONFLICT=name-alias database=passwd name=dev\n' >&2
+      exit 1
+    fi
+    if getent group ubuntu >/dev/null; then
+      printf 'LABCTL_BOOTSTRAP_CONFLICT=name-alias database=group name=ubuntu\n' >&2
+      exit 1
+    fi ;;
+  user-renamed|desired)
+    if getent passwd ubuntu >/dev/null; then
+      printf 'LABCTL_BOOTSTRAP_CONFLICT=name-alias database=passwd name=ubuntu\n' >&2
+      exit 1
+    fi
+    if getent group ubuntu >/dev/null; then
+      printf 'LABCTL_BOOTSTRAP_CONFLICT=name-alias database=group name=ubuntu\n' >&2
+      exit 1
+    fi ;;
+esac
+test "$(passwd -S "$SOURCE_USER" | awk '{{print $2}}')" = L
+test ! -L "$SOURCE_HOME"
+test -d "$SOURCE_HOME"
+test "$(stat -c '%u:%g' "$SOURCE_HOME")" = 1000:1000
+case "$(stat -c '%a' "$SOURCE_HOME")" in 700|750|755) ;; *) exit 1 ;; esac
+for path in "$SOURCE_HOME/.ssh" "$SOURCE_HOME/.ssh/authorized_keys" \
+  "$SOURCE_HOME/.ssh/.authorized_keys.new"; do
+  test ! -L "$path"
+done
+if test -e "$SOURCE_HOME/.ssh"; then
+  test -d "$SOURCE_HOME/.ssh"
+  test "$(stat -c '%u:%g:%a' "$SOURCE_HOME/.ssh")" = 1000:1000:700
 fi
-test "$(getent group 1000 | cut -d: -f1)" = dev
-if getent passwd dev >/dev/null; then
-  test "$(getent passwd dev | cut -d: -f3-4)" = 1000:1000
-  test "$(getent passwd dev | cut -d: -f6-7)" = /home/dev:/bin/bash
+test ! -e "$SOURCE_HOME/.ssh/.authorized_keys.new"
+if test -e "$SOURCE_HOME/.ssh/authorized_keys"; then
+  test -f "$SOURCE_HOME/.ssh/authorized_keys"
+  test "$(stat -c '%u:%g:%a:%h' "$SOURCE_HOME/.ssh/authorized_keys")" = 1000:1000:600:1
+  test "$(cat "$SOURCE_HOME/.ssh/authorized_keys")" = "$KEY"
+  test "$(wc -l < "$SOURCE_HOME/.ssh/authorized_keys")" = 1
+fi
+if test "$ACCOUNT_STATE" = desired; then
+  test ! -e /home/ubuntu
+  test ! -L /home/ubuntu
 else
-  ! getent passwd 1000 >/dev/null
+  if pgrep -u 1000 >/dev/null; then
+    printf 'LABCTL_BOOTSTRAP_CONFLICT=uid1000-process\n' >&2
+    exit 1
+  fi
   test ! -e /home/dev
   test ! -L /home/dev
-  useradd --uid 1000 --gid 1000 --home-dir /home/dev --create-home --shell /bin/bash dev
 fi
+
+case "$ACCOUNT_STATE" in
+  initial)
+    usermod --groups '' ubuntu
+    groupmod --new-name dev ubuntu
+    usermod --login dev ubuntu
+    usermod --home /home/dev --move-home dev ;;
+  groups-cleared)
+    groupmod --new-name dev ubuntu
+    usermod --login dev ubuntu
+    usermod --home /home/dev --move-home dev ;;
+  group-renamed)
+    usermod --login dev ubuntu
+    usermod --home /home/dev --move-home dev ;;
+  user-renamed)
+    usermod --home /home/dev --move-home dev ;;
+  desired) ;;
+esac
 test "$(getent passwd 1000 | cut -d: -f1)" = dev
+test "$(getent passwd dev | cut -d: -f3-4)" = 1000:1000
+test "$(getent passwd dev | cut -d: -f6-7)" = /home/dev:/bin/bash
+test "$(getent group 1000 | cut -d: -f1,4)" = dev:
+test "$(id -g dev)" = 1000
 test "$(id -G dev)" = 1000
+test "$(id -gn dev)" = dev
 test "$(id -Gn dev)" = dev
+test ! -e /home/ubuntu
+test ! -L /home/ubuntu
 for path in /home/dev /home/dev/.ssh /home/dev/.ssh/authorized_keys \
   /home/dev/.ssh/.authorized_keys.new; do
   test ! -L "$path"
@@ -191,9 +302,8 @@ if test -e /home/dev/.ssh; then
   test -d /home/dev/.ssh
   test "$(stat -c '%u:%g:%a' /home/dev/.ssh)" = 1000:1000:700
 else
-  install -d -m 0700 -o dev -g dev /home/dev/.ssh
+  install -d -m 0700 -o dev -g 1000 /home/dev/.ssh
 fi
-KEY={shlex.quote(public_key)}
 if test -e /home/dev/.ssh/authorized_keys; then
   test -f /home/dev/.ssh/authorized_keys
   test "$(stat -c '%u:%g:%a:%h' /home/dev/.ssh/authorized_keys)" = 1000:1000:600:1
@@ -250,12 +360,45 @@ test "$(printf '%s\n' "$POLICY" | awk '$1=="passwordauthentication" {{print $2}}
 test "$(printf '%s\n' "$POLICY" | awk '$1=="kbdinteractiveauthentication" {{print $2}}')" = no
 SSHD_PID=$(pgrep -xo sshd || pgrep -o sshd)
 test -n "$SSHD_PID"
-kill -HUP "$SSHD_PID"
+RELOAD_RECEIPT=/run/stwo-lab-sshd-reload.receipt
+test ! -L /run
+test -d /run
+test "$(stat -c '%u:%g:%a' /run)" = 0:0:755
+test ! -L "$RELOAD_RECEIPT"
+if test -e "$RELOAD_RECEIPT"; then
+  test -f "$RELOAD_RECEIPT"
+  test "$(stat -c '%u:%g:%a:%h' "$RELOAD_RECEIPT")" = 0:0:600:1
+fi
+KEY_SHA256=$(printf '%s\n' "$KEY" | sha256sum | cut -d' ' -f1)
+RELOAD_TOKEN="$(cat /proc/sys/kernel/random/boot_id):$SSHD_PID:$KEY_SHA256"
+rm -f -- "$RELOAD_RECEIPT"
+BOOTSTRAP_PID=$$
+nohup sh -c '
+  set -eu
+  pid=$1; receipt=$2; token=$3; parent=$4
+  tmp=$(mktemp /run/.stwo-lab-sshd-reload.XXXXXX)
+  trap "rm -f -- \"$tmp\"" EXIT HUP INT TERM
+  printf "%s\n" "$token" > "$tmp"
+  chown 0:0 "$tmp"
+  chmod 0600 "$tmp"
+  attempt=0
+  while kill -0 "$parent" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    test "$attempt" -lt 100 || exit 1
+    sleep 0.1
+  done
+  kill -HUP "$pid"
+  sleep 0.5
+  kill -0 "$pid"
+  mv -T "$tmp" "$receipt"
+  trap - EXIT HUP INT TERM
+' stwo-sshd-reload "$SSHD_PID" "$RELOAD_RECEIPT" "$RELOAD_TOKEN" \
+  "$BOOTSTRAP_PID" \
+  </dev/null >/dev/null 2>&1 &
 printf 'LABCTL_BOOTSTRAP_USER=dev\n'
 printf 'LABCTL_BOOTSTRAP_UID=1000\n'
 printf 'LABCTL_BOOTSTRAP_GID=1000\n'
-printf 'LABCTL_BOOTSTRAP_KEY_SHA256=%s\n' \
-  "$(printf '%s\n' "$KEY" | sha256sum | cut -d' ' -f1)"
+printf 'LABCTL_BOOTSTRAP_KEY_SHA256=%s\n' "$KEY_SHA256"
 """
 
 
@@ -279,14 +422,33 @@ def bootstrap_dev(ep: c.Endpoint) -> str:
 
 
 def verify_ssh(ep: c.Endpoint, expected_key_sha256: str) -> None:
-    root_probe = r'''
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_key_sha256):
+        raise ValueError("invalid expected bootstrap key digest")
+    root_probe = f'''
 set -eu
 test "$(id -u):$(id -un)" = 0:root
+EXPECTED_KEY={shlex.quote(expected_key_sha256)}
+RELOAD_RECEIPT=/run/stwo-lab-sshd-reload.receipt
+attempt=0
+while test ! -e "$RELOAD_RECEIPT" && test "$attempt" -lt 50; do
+  sleep 0.1
+  attempt=$((attempt + 1))
+done
+test ! -L "$RELOAD_RECEIPT"
+test -f "$RELOAD_RECEIPT"
+test "$(stat -c '%u:%g:%a:%h' "$RELOAD_RECEIPT")" = 0:0:600:1
+SSHD_PID=$(pgrep -xo sshd || pgrep -o sshd)
+test -n "$SSHD_PID"
+EXPECTED_RELOAD="$(cat /proc/sys/kernel/random/boot_id):$SSHD_PID:$EXPECTED_KEY"
+test "$(cat "$RELOAD_RECEIPT")" = "$EXPECTED_RELOAD"
+test "$(getent passwd dev | cut -d: -f3-4,6-7)" = 1000:1000:/home/dev:/bin/bash
+test "$(getent group 1000 | cut -d: -f1,4)" = dev:
+test "$(id -G dev):$(id -Gn dev)" = 1000:dev
 POLICY=$(sshd -T -C user=dev,host=localhost,addr=127.0.0.1)
-test "$(printf '%s\n' "$POLICY" | awk '$1=="authenticationmethods" {print $2}')" = publickey
-test "$(printf '%s\n' "$POLICY" | awk '$1=="pubkeyauthentication" {print $2}')" = yes
-test "$(printf '%s\n' "$POLICY" | awk '$1=="passwordauthentication" {print $2}')" = no
-test "$(printf '%s\n' "$POLICY" | awk '$1=="kbdinteractiveauthentication" {print $2}')" = no
+test "$(printf '%s\n' "$POLICY" | awk '$1=="authenticationmethods" {{print $2}}')" = publickey
+test "$(printf '%s\n' "$POLICY" | awk '$1=="pubkeyauthentication" {{print $2}}')" = yes
+test "$(printf '%s\n' "$POLICY" | awk '$1=="passwordauthentication" {{print $2}}')" = no
+test "$(printf '%s\n' "$POLICY" | awk '$1=="kbdinteractiveauthentication" {{print $2}}')" = no
 printf 'LABCTL_FRESH_ROOT_POLICY=publickey-only\n'
 printf 'LABCTL_FRESH_ROOT_KEY_SHA256=%s\n' \
   "$(sha256sum /home/dev/.ssh/authorized_keys | cut -d' ' -f1)"
@@ -300,7 +462,7 @@ printf 'LABCTL_FRESH_ROOT_KEY_SHA256=%s\n' \
     dev = c.Endpoint(ep.host, ep.port, "dev")
     command = r'''
 set -eu
-test "$(id -u):$(id -g):$(id -un)" = 1000:1000:dev
+test "$(id -u):$(id -g):$(id -un):$(id -gn):$HOME" = 1000:1000:dev:dev:/home/dev
 test "$(id -G)" = 1000
 test "$(id -Gn)" = dev
 '''

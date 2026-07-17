@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import shlex
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -105,10 +107,42 @@ def _command_checks(args: argparse.Namespace) -> None:
     public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest"
     command = profile._bootstrap_command(public_key)
     subprocess.run(["bash", "-n"], input=command, text=True, check=True)
-    assert "getent group 1000" in command and "getent passwd 1000" in command
+    assert "LABCTL_BOOTSTRAP_ERROR_LINE=" in command
+    assert "ubuntu:1000:/home/ubuntu:/bin/bash|ubuntu:|ubuntu:1000" in command
+    assert "ubuntu:1000:/home/ubuntu:/bin/bash|dev:|ubuntu:1000" in command
+    assert "dev:1000:/home/ubuntu:/bin/bash|dev:|dev:1000" in command
+    assert "dev:1000:/home/dev:/bin/bash|dev:|dev:1000" in command
+    assert "LABCTL_BOOTSTRAP_CONFLICT=unexpected-1000-identity" in command
+    assert "initial|1000 4 20 24 25 27 29 30 44 46" in command
+    assert "initial|1000') ACCOUNT_STATE=groups-cleared" in command
+    assert "LABCTL_BOOTSTRAP_CONFLICT=unexpected-1000-groups" in command
+    preflight = command.index("if pgrep -u 1000")
+    groups_clear = command.index("usermod --groups '' ubuntu")
+    group_rename = command.index("groupmod --new-name dev ubuntu")
+    login_rename = command.index("usermod --login dev ubuntu")
+    home_move = command.index("usermod --home /home/dev --move-home dev")
+    assert preflight < groups_clear < group_rename < login_rename < home_move
+    assert command.count("usermod --groups '' ubuntu") == 1
+    assert "usermod --append" not in command
+    assert "! getent" not in command and "! pgrep" not in command
+    assert "groupadd" not in command and "useradd" not in command
+    assert "groupmod --gid" not in command and "usermod --uid" not in command
+    assert 'test "$(id -g dev)" = 1000' in command
+    assert 'test "$(id -gn dev)" = dev' in command
+    assert 'test "$(id -Gn dev)" = dev' in command
     assert "1000:1000:600:1" in command and "passwd -S dev" in command
     assert "99-stwo-consumer-bootstrap.conf" in command
     assert "sshd -t" in command and "authenticationmethods" in command
+    assert "nohup sh -c" in command and "stwo-sshd-reload" in command
+    assert "/run/stwo-lab-sshd-reload.receipt" in command
+    assert "0:0:600:1" in command
+    assert "BOOTSTRAP_PID=$$" in command
+    parent_poll = command.index('while kill -0 "$parent"')
+    hup = command.index('kill -HUP "$pid"')
+    assert parent_poll < hup < command.index(
+        'mv -T "$tmp" "$receipt"'
+    )
+    assert '"$BOOTSTRAP_PID"' in command
     assert "0:0:755" in command
     assert "/root/.ssh/authorized_keys" not in command
 
@@ -146,6 +180,144 @@ def _command_checks(args: argparse.Namespace) -> None:
     )
 
 
+def _account_state_machine_checks() -> None:
+    """Execute the generated resolver against admitted and hostile databases."""
+    command = profile._bootstrap_command(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest"
+    )
+    start = command.index("UID1000=$(awk")
+    suffix = "\nesac\n\n# Name aliases"
+    end = command.index(suffix, start) + len("\nesac")
+    resolver = command[start:end]
+
+    with tempfile.TemporaryDirectory() as directory:
+        passwd_path = Path(directory) / "passwd"
+        group_path = Path(directory) / "group"
+        resolver = resolver.replace("/etc/passwd", shlex.quote(str(passwd_path)))
+        resolver = resolver.replace("/etc/group", shlex.quote(str(group_path)))
+        resolver += "\nprintf '%s|%s|%s\\n' \"$ACCOUNT_STATE\" \"$SOURCE_USER\" \"$SOURCE_HOME\"\n"
+
+        def resolve(
+            passwd: str, group: str, groups: str
+        ) -> subprocess.CompletedProcess[str]:
+            passwd_path.write_text(passwd)
+            group_path.write_text(group)
+            script = (
+                f"id() {{ printf '%s\\n' {shlex.quote(groups)}; }}\n" + resolver
+            )
+            return subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, check=False
+            )
+
+        admitted = (
+            (
+                "ubuntu:x:1000:1000::/home/ubuntu:/bin/bash\n",
+                "ubuntu:x:1000:\n",
+                "1000 4 20 24 25 27 29 30 44 46",
+                "initial|ubuntu|/home/ubuntu",
+            ),
+            (
+                "ubuntu:x:1000:1000::/home/ubuntu:/bin/bash\n",
+                "ubuntu:x:1000:\n",
+                "1000",
+                "groups-cleared|ubuntu|/home/ubuntu",
+            ),
+            (
+                "ubuntu:x:1000:1000::/home/ubuntu:/bin/bash\n",
+                "dev:x:1000:\n",
+                "1000",
+                "group-renamed|ubuntu|/home/ubuntu",
+            ),
+            (
+                "dev:x:1000:1000::/home/ubuntu:/bin/bash\n",
+                "dev:x:1000:\n",
+                "1000",
+                "user-renamed|dev|/home/ubuntu",
+            ),
+            (
+                "dev:x:1000:1000::/home/dev:/bin/bash\n",
+                "dev:x:1000:\n",
+                "1000",
+                "desired|dev|/home/dev",
+            ),
+        )
+        for passwd, group, groups, expected in admitted:
+            result = resolve(passwd, group, groups)
+            assert result.returncode == 0 and result.stdout.strip() == expected
+
+        hostile = (
+            (
+                admitted[0][0] + "peer:x:1000:1000::/home/peer:/bin/bash\n",
+                admitted[0][1], admitted[0][2],
+            ),
+            (
+                admitted[0][0] + "peer:x:1001:1000::/home/peer:/bin/bash\n",
+                admitted[0][1], admitted[0][2],
+            ),
+            (admitted[0][0], admitted[0][1] + "peer:x:1000:\n", admitted[0][2]),
+            (admitted[0][0], "ubuntu:x:1000:peer\n", admitted[0][2]),
+            ("ubuntu:x:1000:1000::/home/ubuntu:/bin/sh\n", admitted[0][1], admitted[0][2]),
+            ("ubuntu:x:1000:1000::/workspace:/bin/bash\n", admitted[0][1], admitted[0][2]),
+        )
+        for passwd, group, groups in hostile:
+            result = resolve(passwd, group, groups)
+            assert result.returncode != 0
+            assert "LABCTL_BOOTSTRAP_CONFLICT=unexpected-1000-identity" in result.stderr
+
+        for passwd, group, groups in (
+            (admitted[0][0], admitted[0][1], "1000 4"),
+            (admitted[2][0], admitted[2][1], admitted[0][2]),
+        ):
+            result = resolve(passwd, group, groups)
+            assert result.returncode != 0
+            assert "LABCTL_BOOTSTRAP_CONFLICT=unexpected-1000-groups" in result.stderr
+
+
+def _explicit_negative_guard_checks() -> None:
+    """The generated absence guards must reject explicitly under `set -e`."""
+    command = profile._bootstrap_command(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest"
+    )
+
+    alias_start = command.index("if getent passwd dev >/dev/null; then")
+    alias_end = command.index("\n    fi", alias_start) + len("\n    fi")
+    alias_guard = command[alias_start:alias_end]
+    present = subprocess.run(
+        ["bash", "-c", "set -eu\ngetent() { return 0; }\n" + alias_guard],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert present.returncode != 0
+    assert "LABCTL_BOOTSTRAP_CONFLICT=name-alias" in present.stderr
+    absent = subprocess.run(
+        ["bash", "-c", "set -eu\ngetent() { return 1; }\n" + alias_guard],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert absent.returncode == 0
+
+    process_start = command.index("if pgrep -u 1000 >/dev/null; then")
+    process_end = command.index("\n  fi", process_start) + len("\n  fi")
+    process_guard = command[process_start:process_end]
+    live = subprocess.run(
+        ["bash", "-c", "set -eu\npgrep() { return 0; }\n" + process_guard],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert live.returncode != 0
+    assert "LABCTL_BOOTSTRAP_CONFLICT=uid1000-process" in live.stderr
+    quiet = subprocess.run(
+        ["bash", "-c", "set -eu\npgrep() { return 1; }\n" + process_guard],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert quiet.returncode == 0
+
+
 def _selected_key_checks() -> None:
     old_options, old_run = c.SSH_OPTS, profile.subprocess.run
     try:
@@ -164,6 +336,95 @@ def _selected_key_checks() -> None:
         _rejected(profile._public_key, "invalid derived public key")
     finally:
         c.SSH_OPTS, profile.subprocess.run = old_options, old_run
+
+
+def _reload_receipt_checks() -> None:
+    saved = c.ssh_capture
+    calls = []
+    key_digest = "a" * 64
+    try:
+        def accepted(ep, command, *, timeout):
+            calls.append((ep.user, command, timeout))
+            if ep.user == "root":
+                assert command.index("RELOAD_RECEIPT=") < command.index("POLICY=")
+                assert "0:0:600:1" in command
+                assert "EXPECTED_RELOAD=" in command
+                assert "1000:dev" in command
+                return 0, "\n".join((
+                    "LABCTL_FRESH_ROOT_POLICY=publickey-only",
+                    f"LABCTL_FRESH_ROOT_KEY_SHA256={key_digest}",
+                ))
+            assert "1000:1000:dev:dev:/home/dev" in command
+            assert 'test "$(id -Gn)" = dev' in command
+            return 0, ""
+
+        c.ssh_capture = accepted
+        profile.verify_ssh(c.Endpoint("host", 22), key_digest)
+        assert [user for user, _command, _timeout in calls] == ["root", "dev"]
+
+        calls.clear()
+        c.ssh_capture = lambda ep, command, *, timeout: (
+            calls.append(ep.user) or (1, "missing reload receipt")
+        )
+        _rejected(
+            lambda: profile.verify_ssh(c.Endpoint("host", 22), key_digest),
+            "missing reload receipt",
+        )
+        assert calls == ["root"]
+        _rejected(
+            lambda: profile.verify_ssh(c.Endpoint("host", 22), "not-a-digest"),
+            "bootstrap key digest",
+        )
+        assert calls == ["root"]
+    finally:
+        c.ssh_capture = saved
+
+
+def _reload_parent_exit_order_check() -> None:
+    """Execute the generated worker and prove four markers precede HUP."""
+    command = profile._bootstrap_command(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest"
+    )
+    prefix = "nohup sh -c '\n"
+    start = command.index(prefix) + len(prefix)
+    end = command.index("\n' stwo-sshd-reload", start)
+    worker = command[start:end]
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        receipt = root / "reload.receipt"
+        order = root / "order.log"
+        worker = worker.replace(
+            "tmp=$(mktemp /run/.stwo-lab-sshd-reload.XXXXXX)",
+            f"tmp=$(mktemp {shlex.quote(str(root / 'reload.XXXXXX'))})",
+        )
+        worker = worker.replace('chown 0:0 "$tmp"', ":")
+        worker = worker.replace(
+            'kill -HUP "$pid"', 'printf "HUP\\n" >> "$ORDER_LOG"'
+        )
+        worker = worker.replace('kill -0 "$pid"', ":")
+        worker = worker.replace('mv -T "$tmp" "$receipt"', 'mv "$tmp" "$receipt"')
+        outer = f"""
+set -eu
+ORDER_LOG={shlex.quote(str(order))}
+export ORDER_LOG
+parent=$$
+nohup sh -c {shlex.quote(worker)} stwo-test 999 \
+  {shlex.quote(str(receipt))} token "$parent" </dev/null >/dev/null 2>&1 &
+printf '%s\n' MARKER-1 MARKER-2 MARKER-3 MARKER-4 >> "$ORDER_LOG"
+"""
+        result = subprocess.run(
+            ["bash", "-c", outer], capture_output=True, text=True, check=False
+        )
+        assert result.returncode == 0, result.stderr
+        for _ in range(50):
+            if receipt.exists():
+                break
+            time.sleep(0.05)
+        assert receipt.read_text() == "token\n"
+        assert order.read_text().splitlines() == [
+            "MARKER-1", "MARKER-2", "MARKER-3", "MARKER-4", "HUP"
+        ]
 
 
 def _ordering_checks(args: argparse.Namespace) -> None:
@@ -198,6 +459,20 @@ def _ordering_checks(args: argparse.Namespace) -> None:
             assert c._read_state()["phase"] == "bootstrapping"
 
             calls.clear()
+            profile.verify_ssh = lambda _ep, _key: (
+                calls.append("fresh-root+dev-failed"),
+                (_ for _ in ()).throw(RuntimeError("receipt missing")),
+            )[1]
+            _rejected(
+                lambda: lifecycle._install_remote_controls(
+                    state, args, c.Endpoint("host", 22), 3600
+                ),
+                "failed fresh SSH receipt",
+            )
+            assert calls == ["bootstrap", "fresh-root+dev-failed"]
+
+            calls.clear()
+            profile.verify_ssh = lambda _ep, _key: calls.append("fresh-root+dev")
             c.ssh_run = lambda *_a, **_kw: calls.append("guard-failed") or 1
             _rejected(
                 lambda: lifecycle._install_remote_controls(
@@ -288,6 +563,10 @@ def bootstrap_profile_self_test() -> None:
     args = _configuration_checks()
     _selected_key_checks()
     _command_checks(args)
+    _account_state_machine_checks()
+    _explicit_negative_guard_checks()
+    _reload_parent_exit_order_check()
+    _reload_receipt_checks()
     _ordering_checks(args)
     _nonformal_gate_check()
     _bootstrapping_close_check()
