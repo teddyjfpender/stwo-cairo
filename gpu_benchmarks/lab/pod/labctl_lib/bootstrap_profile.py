@@ -11,6 +11,7 @@ import shlex
 import subprocess
 
 from . import common as c
+from . import lease_local_root
 
 
 NAME = "consumer-4090-bootstrap"
@@ -114,7 +115,9 @@ def metadata(args: argparse.Namespace) -> dict:
         "image_digest": IMAGE_DIGEST,
         "image_digest_authority": "requested-reference-not-runtime-attested",
         "lane": LANE,
+        "persistence_scope": lease_local_root.PERSISTENCE_SCOPE,
         "profile": NAME,
+        "qualification": False,
         "qualification_eligible": False,
     }
 
@@ -475,7 +478,8 @@ def _record_payload(state: dict) -> dict:
     return {
         **{key: state[key] for key in (
             "formal", "image_digest", "image_digest_authority", "lane", "profile",
-            "qualification_eligible", "persistent_root_migration",
+            "persistence_scope", "qualification", "qualification_eligible",
+            "lease_local_root",
         )},
         "image": state["image"],
         "bootstrap_key_sha256": state["bootstrap_key_sha256"],

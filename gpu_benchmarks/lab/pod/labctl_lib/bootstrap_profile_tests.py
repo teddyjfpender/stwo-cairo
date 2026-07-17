@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from . import acceptance
 from . import bootstrap_profile as profile
 from . import common as c
-from . import legacy_root
+from . import lease_local_root
 from . import lifecycle
 from . import provider
 from . import runtime
@@ -50,7 +50,9 @@ def _configuration_checks() -> argparse.Namespace:
         "image_digest": profile.IMAGE_DIGEST,
         "image_digest_authority": "requested-reference-not-runtime-attested",
         "lane": "consumer-development",
+        "persistence_scope": lease_local_root.PERSISTENCE_SCOPE,
         "profile": profile.NAME,
+        "qualification": False,
         "qualification_eligible": False,
     }
     assert profile.metadata(args) == expected
@@ -151,15 +153,23 @@ def _command_checks(args: argparse.Namespace) -> None:
         **profile.metadata(args),
         "bootstrap_key_sha256": "a" * 64,
         "image": profile.IMAGE,
-        "persistent_root_migration": {
-            "changed": True,
-            "from_mode": "0777",
-            "marker_from_mode": "0666",
-            "marker_to_mode": "0600",
-            "owner": "0:0",
-            "resumed": False,
-            "schema_version": legacy_root.SCHEMA,
-            "to_mode": "0755",
+        "lease_local_root": {
+            "backing": lease_local_root.backing_root("pod-test"),
+            "container_device": "0:7",
+            "container_mount_id": 7,
+            "persistence_scope": lease_local_root.PERSISTENCE_SCOPE,
+            "pod_id": "pod-test",
+            "qualification": False,
+            "schema_version": lease_local_root.SCHEMA,
+            "source_device": "0:7",
+            "source_mode": "0755",
+            "source_mount_id": 7,
+            "source_owner": "0:0",
+            "target": lease_local_root.TARGET,
+            "target_device": "0:7",
+            "target_mount_id": 52,
+            "workspace_device": "0:41",
+            "workspace_mount_id": 41,
             "volume_id": profile.VOLUME_ID,
         },
         "pod_id": "pod-test",
@@ -172,9 +182,11 @@ def _command_checks(args: argparse.Namespace) -> None:
     assert len(digest) == 64 and "0:0:400:1" in record
     payload = profile._record_payload(state)
     assert payload["formal"] is False and payload["lane"] == profile.LANE
+    assert payload["persistence_scope"] == lease_local_root.PERSISTENCE_SCOPE
+    assert payload["qualification"] is False
     assert payload["qualification_eligible"] is False
     assert payload["image_digest_authority"].startswith("requested-reference")
-    assert payload["persistent_root_migration"]["changed"] is True
+    assert payload["lease_local_root"]["qualification"] is False
 
     guard = runtime._guard_command("pod-test", "volume-test", 60, 300)
     subprocess.run(["bash", "-n"], input=guard, text=True, check=True)
@@ -443,7 +455,7 @@ printf '%s\n' MARKER-1 MARKER-2 MARKER-3 MARKER-4 >> "$ORDER_LOG"
 def _ordering_checks(args: argparse.Namespace) -> None:
     old_state = c.STATE
     saved = (
-        legacy_root.migrate,
+        lease_local_root.install,
         profile.bootstrap_dev,
         profile.verify_ssh,
         profile.persist_record,
@@ -453,14 +465,16 @@ def _ordering_checks(args: argparse.Namespace) -> None:
     try:
         with tempfile.TemporaryDirectory() as directory:
             c.STATE = Path(directory) / "lease.json"
-            legacy_root.migrate = lambda *_a: (
-                calls.append("root-migration")
+            lease_local_root.install = lambda *_a: (
+                calls.append("lease-local-root")
                 or {
-                    "changed": True,
-                    "from_mode": "0777",
-                    "owner": "0:0",
-                    "schema_version": legacy_root.SCHEMA,
-                    "to_mode": "0755",
+                    "backing": lease_local_root.backing_root("pod-test"),
+                    "container_device": "0:7",
+                    "container_mount_id": 7,
+                    "persistence_scope": lease_local_root.PERSISTENCE_SCOPE,
+                    "pod_id": "pod-test",
+                    "qualification": False,
+                    "schema_version": lease_local_root.SCHEMA,
                     "volume_id": profile.VOLUME_ID,
                 }
             )
@@ -484,33 +498,38 @@ def _ordering_checks(args: argparse.Namespace) -> None:
                 state, args, c.Endpoint("host", 22), 3600
             )
             assert calls == [
-                "root-migration", "bootstrap", "fresh-root+dev", "guard", "record"
+                "lease-local-root", "bootstrap", "fresh-root+dev", "guard", "record"
             ]
             assert c._read_state()["phase"] == "bootstrapping"
-            assert c._read_state()["persistent_root_migration"]["changed"] is True
+            assert (
+                c._read_state()["lease_local_root"]["persistence_scope"]
+                == lease_local_root.PERSISTENCE_SCOPE
+            )
 
             calls.clear()
-            legacy_root.migrate = lambda *_a: (
-                calls.append("root-migration-failed"),
-                (_ for _ in ()).throw(RuntimeError("hostile legacy root")),
+            lease_local_root.install = lambda *_a: (
+                calls.append("lease-local-root-failed"),
+                (_ for _ in ()).throw(RuntimeError("hostile lease-local root")),
             )[1]
             _rejected(
                 lambda: lifecycle._install_remote_controls(
                     state, args, c.Endpoint("host", 22), 3600
                 ),
-                "hostile legacy root",
+                "hostile lease-local root",
             )
-            assert calls == ["root-migration-failed"]
+            assert calls == ["lease-local-root-failed"]
 
             calls.clear()
-            legacy_root.migrate = lambda *_a: (
-                calls.append("root-migration")
+            lease_local_root.install = lambda *_a: (
+                calls.append("lease-local-root")
                 or {
-                    "changed": False,
-                    "from_mode": "0755",
-                    "owner": "0:0",
-                    "schema_version": legacy_root.SCHEMA,
-                    "to_mode": "0755",
+                    "backing": lease_local_root.backing_root("pod-test"),
+                    "container_device": "0:7",
+                    "container_mount_id": 7,
+                    "persistence_scope": lease_local_root.PERSISTENCE_SCOPE,
+                    "pod_id": "pod-test",
+                    "qualification": False,
+                    "schema_version": lease_local_root.SCHEMA,
                     "volume_id": profile.VOLUME_ID,
                 }
             )
@@ -525,7 +544,7 @@ def _ordering_checks(args: argparse.Namespace) -> None:
                 "failed fresh SSH receipt",
             )
             assert calls == [
-                "root-migration", "bootstrap", "fresh-root+dev-failed"
+                "lease-local-root", "bootstrap", "fresh-root+dev-failed"
             ]
 
             calls.clear()
@@ -543,7 +562,7 @@ def _ordering_checks(args: argparse.Namespace) -> None:
             else:
                 raise AssertionError("failed guard was accepted")
             assert calls == [
-                "root-migration", "bootstrap", "fresh-root+dev", "guard-failed"
+                "lease-local-root", "bootstrap", "fresh-root+dev", "guard-failed"
             ]
 
             for invalid in (
@@ -562,11 +581,11 @@ def _ordering_checks(args: argparse.Namespace) -> None:
                     "invalid guard completion authority",
                 )
                 assert calls == [
-                    "root-migration", "bootstrap", "fresh-root+dev", "guard-invalid"
+                    "lease-local-root", "bootstrap", "fresh-root+dev", "guard-invalid"
                 ]
     finally:
         (
-            legacy_root.migrate,
+            lease_local_root.install,
             profile.bootstrap_dev,
             profile.verify_ssh,
             profile.persist_record,

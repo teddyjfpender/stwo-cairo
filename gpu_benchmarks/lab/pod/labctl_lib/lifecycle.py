@@ -10,7 +10,7 @@ import time
 
 from . import bootstrap_profile
 from . import common as c
-from . import legacy_root
+from . import lease_local_root
 from . import provider
 from . import runtime
 
@@ -103,8 +103,8 @@ def _install_remote_controls(state: dict, args, ep: c.Endpoint, remaining: int) 
     """Finish bootstrap before the ordinary remote guards make the lease open."""
     bootstrap = bool(bootstrap_profile.metadata(args))
     if bootstrap:
-        state["persistent_root_migration"] = legacy_root.migrate(
-            ep, state["volume_id"]
+        state["lease_local_root"] = lease_local_root.install(
+            ep, state["pod_id"], state["volume_id"]
         )
         c._write_state(state)
         state["bootstrap_key_sha256"] = bootstrap_profile.bootstrap_dev(ep)
@@ -370,7 +370,13 @@ def cmd_close(args: argparse.Namespace) -> int:
     runtime._cancel_watchdog(state)
     c.STATE.unlink(missing_ok=True)
     ids = ",".join(candidate.id for candidate in pods) or str(pod_id or "none")
-    print(f"CLOSED {ids}; compute terminated; network volume retained")
+    if state.get("persistence_scope") == lease_local_root.PERSISTENCE_SCOPE:
+        print(
+            f"CLOSED {ids}; compute terminated; lease-local cache/output discarded; "
+            "network volume unchanged"
+        )
+    else:
+        print(f"CLOSED {ids}; compute terminated; network volume retained")
     return 0 if seal_ok else 1
 
 
