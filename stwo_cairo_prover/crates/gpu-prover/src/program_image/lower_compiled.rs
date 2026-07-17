@@ -41,6 +41,7 @@ mod ec_op_setup_sources;
 mod execution_tables;
 mod loaded_authority;
 mod loaded_writer_binding;
+mod multiplicity_clear;
 mod producer_prefix;
 mod recorded_deduce_authority;
 #[cfg(test)]
