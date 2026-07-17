@@ -22,6 +22,7 @@ mod lower_compiled;
 mod runtime_view;
 mod storage;
 mod validate;
+mod worker_install;
 
 #[cfg(test)]
 mod tests;
@@ -41,6 +42,12 @@ pub use runtime_view::{
     FleetTransferSpan,
 };
 pub use storage::{StorageDesc, StorageId};
+pub use worker_install::{
+    FleetCoordinatorInstall, FleetEffectBinding, FleetInstallWindow, FleetTranscriptBinding,
+    FleetTranscriptInstall, FleetWorkerExecutable, FleetWorkerExecution,
+    FleetWorkerInstallCapacity, FleetWorkerInstallError, FleetWorkerInstallPlan,
+    FleetWorkerInstallTarget, FleetWorkerStorage,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct WorkerId(pub u16);
