@@ -80,6 +80,10 @@ def lease_local_root_self_test() -> None:
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
     assert root.PROVIDER_MOUNT in generated
     assert root.QUARANTINED_ROOT in generated
+    assert "findmnt -nr -o ID --target /" in generated
+    assert "findmnt -nr -o MAJ:MIN --target /" in generated
+    assert "findmnt -n -o" not in generated
+    assert "findmnt -n -o" not in attestation
     assert "mount --bind" not in generated
     assert f"install -d -m 0755 -o root -g root {root.TARGET}" in generated
     assert 'test "$TARGET_MOUNT_ID:$TARGET_DEVICE" = ' in generated
@@ -154,6 +158,16 @@ def lease_local_root_self_test() -> None:
     assert result["boot_id"] == BOOT_ID
     assert result["container_device"] == result["target_device"]
     assert result["container_device"] != result["quarantine_device"]
+    padded = _evidence().replace(
+        "LABCTL_LEASE_LOCAL_CONTAINER_DEVICE=0:7",
+        "LABCTL_LEASE_LOCAL_CONTAINER_DEVICE= 0:7",
+    )
+    try:
+        root._parse(padded, "pod-test")
+    except RuntimeError as error:
+        assert "LABCTL_LEASE_LOCAL_CONTAINER_DEVICE=' 0:7'" in str(error)
+    else:
+        raise AssertionError("accepted padded device evidence")
     for changed in (
         _evidence().replace("LABCTL_LEASE_LOCAL_QUALIFICATION=0",
                             "LABCTL_LEASE_LOCAL_QUALIFICATION=1"),
@@ -161,6 +175,10 @@ def lease_local_root_self_test() -> None:
                             "LABCTL_LEASE_LOCAL_TARGET_MOUNT_ID=41"),
         _evidence().replace("LABCTL_LEASE_LOCAL_QUARANTINE_DEVICE=0:41",
                             "LABCTL_LEASE_LOCAL_QUARANTINE_DEVICE=0:7"),
+        _evidence().replace("LABCTL_LEASE_LOCAL_CONTAINER_MOUNT_ID=7",
+                            "LABCTL_LEASE_LOCAL_CONTAINER_MOUNT_ID= 7"),
+        _evidence().replace("LABCTL_LEASE_LOCAL_CONTAINER_DEVICE=0:7",
+                            "LABCTL_LEASE_LOCAL_CONTAINER_DEVICE=0:7 "),
         _evidence().replace(BOOT_ID, "invalid"),
         _evidence() + "\nunexpected warning",
         _evidence() + "\nLABCTL_LEASE_LOCAL_EXTRA=1",

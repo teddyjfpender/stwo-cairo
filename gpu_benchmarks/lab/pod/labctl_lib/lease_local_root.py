@@ -248,16 +248,16 @@ PY
 python3 - {shlex.quote(TARGET)} {shlex.quote(encoded)} "$BOOT_ID" verify <<'PY'
 {LOCAL_MARKER_WORKER}
 PY
-CONTAINER_MOUNT_ID=$(findmnt -n -o ID --target /)
-CONTAINER_DEVICE=$(findmnt -n -o MAJ:MIN --target /)
-WORKSPACE_MOUNT_ID=$(findmnt -n -o ID --target /workspace)
-WORKSPACE_DEVICE=$(findmnt -n -o MAJ:MIN --target /workspace)
-QUARANTINE_MOUNT_ID=$(findmnt -n -o ID --target {shlex.quote(PROVIDER_MOUNT)})
-QUARANTINE_DEVICE=$(findmnt -n -o MAJ:MIN --target {shlex.quote(PROVIDER_MOUNT)})
-LEGACY_MOUNT_ID=$(findmnt -n -o ID --target {shlex.quote(QUARANTINED_ROOT)})
-LEGACY_DEVICE=$(findmnt -n -o MAJ:MIN --target {shlex.quote(QUARANTINED_ROOT)})
-TARGET_MOUNT_ID=$(findmnt -n -o ID --target {shlex.quote(TARGET)})
-TARGET_DEVICE=$(findmnt -n -o MAJ:MIN --target {shlex.quote(TARGET)})
+CONTAINER_MOUNT_ID=$(findmnt -nr -o ID --target /)
+CONTAINER_DEVICE=$(findmnt -nr -o MAJ:MIN --target /)
+WORKSPACE_MOUNT_ID=$(findmnt -nr -o ID --target /workspace)
+WORKSPACE_DEVICE=$(findmnt -nr -o MAJ:MIN --target /workspace)
+QUARANTINE_MOUNT_ID=$(findmnt -nr -o ID --target {shlex.quote(PROVIDER_MOUNT)})
+QUARANTINE_DEVICE=$(findmnt -nr -o MAJ:MIN --target {shlex.quote(PROVIDER_MOUNT)})
+LEGACY_MOUNT_ID=$(findmnt -nr -o ID --target {shlex.quote(QUARANTINED_ROOT)})
+LEGACY_DEVICE=$(findmnt -nr -o MAJ:MIN --target {shlex.quote(QUARANTINED_ROOT)})
+TARGET_MOUNT_ID=$(findmnt -nr -o ID --target {shlex.quote(TARGET)})
+TARGET_DEVICE=$(findmnt -nr -o MAJ:MIN --target {shlex.quote(TARGET)})
 test "$WORKSPACE_MOUNT_ID:$WORKSPACE_DEVICE" = \
   "$CONTAINER_MOUNT_ID:$CONTAINER_DEVICE"
 test "$TARGET_MOUNT_ID:$TARGET_DEVICE" = \
@@ -298,14 +298,14 @@ WORKSPACE_MODE=$(stat -c '%a' /workspace)
 test "$((8#$WORKSPACE_MODE & 8#022))" -eq 0
 test "$((8#$WORKSPACE_MODE & 8#700))" -eq "$((8#700))"
 test "$((8#$WORKSPACE_MODE & 8#001))" -eq "$((8#001))"
-CONTAINER_BEFORE=$(findmnt -n -o ID,MAJ:MIN --target /)
-WORKSPACE_BEFORE=$(findmnt -n -o ID,MAJ:MIN --target /workspace)
+CONTAINER_BEFORE=$(findmnt -nr -o ID,MAJ:MIN --target /)
+WORKSPACE_BEFORE=$(findmnt -nr -o ID,MAJ:MIN --target /workspace)
 test "$WORKSPACE_BEFORE" = "$CONTAINER_BEFORE"
 test ! -L {shlex.quote(TARGET)}
 if test -e {shlex.quote(TARGET)}; then
   test -d {shlex.quote(TARGET)}
   test "$(stat -c '%u:%g:%a' {shlex.quote(TARGET)})" = 0:0:755
-  test "$(findmnt -n -o ID,MAJ:MIN --target {shlex.quote(TARGET)})" = \
+  test "$(findmnt -nr -o ID,MAJ:MIN --target {shlex.quote(TARGET)})" = \
     "$CONTAINER_BEFORE"
 else
   install -d -m 0755 -o root -g root {shlex.quote(TARGET)}
@@ -387,10 +387,16 @@ def _parse(output: str, pod_id: str) -> dict[str, object]:
         raise RuntimeError("lease-local root emitted an invalid boot id")
     mount_keys = tuple(key for key in expected_keys if key.endswith("_MOUNT_ID"))
     device_keys = tuple(key for key in expected_keys if key.endswith("_DEVICE"))
-    if any(not re.fullmatch(r"[1-9][0-9]*", values[key]) for key in mount_keys):
-        raise RuntimeError("lease-local root emitted an invalid mount id")
-    if any(not re.fullmatch(r"[0-9]+:[0-9]+", values[key]) for key in device_keys):
-        raise RuntimeError("lease-local root emitted an invalid device identity")
+    for key in mount_keys:
+        if not re.fullmatch(r"[1-9][0-9]*", values[key]):
+            raise RuntimeError(
+                f"lease-local root emitted invalid {key}={values[key]!r}"
+            )
+    for key in device_keys:
+        if not re.fullmatch(r"[0-9]+:[0-9]+", values[key]):
+            raise RuntimeError(
+                f"lease-local root emitted invalid {key}={values[key]!r}"
+            )
     container_mount = int(values["LABCTL_LEASE_LOCAL_CONTAINER_MOUNT_ID"])
     workspace_mount = int(values["LABCTL_LEASE_LOCAL_WORKSPACE_MOUNT_ID"])
     target_mount = int(values["LABCTL_LEASE_LOCAL_TARGET_MOUNT_ID"])
