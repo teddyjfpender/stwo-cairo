@@ -276,6 +276,10 @@ impl Encoder {
         self.raw(&value.to_le_bytes());
     }
 
+    fn u64(&mut self, value: u64) {
+        self.raw(&value.to_le_bytes());
+    }
+
     fn size(&mut self, value: usize) -> Result<(), CompiledProofError> {
         self.raw(
             &u64::try_from(value)
@@ -393,6 +397,10 @@ impl Encoder {
                 AotArgumentValue::U32(value) => {
                     self.byte(0);
                     self.u32(*value);
+                }
+                AotArgumentValue::Usize(value) => {
+                    self.byte(4);
+                    self.u64(*value);
                 }
                 AotArgumentValue::DevicePointer(binding) => {
                     self.byte(1);

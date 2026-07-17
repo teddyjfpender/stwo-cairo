@@ -342,7 +342,9 @@ fn validate_exact_bindings(invocation: &AotInvocation, effect: &EffectContract) 
     let mut actual = BTreeSet::<EffectBindingId>::new();
     for argument in &invocation.arguments {
         match &argument.value {
-            AotArgumentValue::U32(_) | AotArgumentValue::DevicePointer(None) => {}
+            AotArgumentValue::U32(_)
+            | AotArgumentValue::Usize(_)
+            | AotArgumentValue::DevicePointer(None) => {}
             AotArgumentValue::DevicePointer(Some(binding)) => insert(&mut actual, *binding)?,
             AotArgumentValue::DevicePointerTable(bindings) => {
                 if bindings.is_empty() {

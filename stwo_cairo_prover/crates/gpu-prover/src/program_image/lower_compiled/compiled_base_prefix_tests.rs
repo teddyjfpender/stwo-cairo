@@ -498,7 +498,9 @@ fn assert_invocation_covers_exact_bindings(
         .arguments
         .iter()
         .flat_map(|argument| match &argument.value {
-            AotArgumentValue::U32(_) | AotArgumentValue::DevicePointer(None) => Vec::new(),
+            AotArgumentValue::U32(_)
+            | AotArgumentValue::Usize(_)
+            | AotArgumentValue::DevicePointer(None) => Vec::new(),
             AotArgumentValue::DevicePointer(Some(binding)) => vec![*binding],
             AotArgumentValue::DevicePointerTable(entries) => {
                 entries.iter().flatten().copied().collect()

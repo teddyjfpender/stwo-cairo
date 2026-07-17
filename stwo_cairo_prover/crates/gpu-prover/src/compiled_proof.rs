@@ -175,6 +175,11 @@ pub enum ExecutionPrimitive {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AotArgumentValue {
     U32(u32),
+    /// Canonical address-free encoding of a host `size_t` argument. The
+    /// executable performs a checked conversion to its local `usize`; using a
+    /// fixed u64 here keeps proof-program identity independent of the compiler
+    /// host's pointer width.
+    Usize(u64),
     DevicePointer(Option<EffectBindingId>),
     DevicePointerTable(Vec<Option<EffectBindingId>>),
     /// Full immutable u32 value installed with the executable. Literal bytes

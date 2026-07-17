@@ -442,7 +442,9 @@ fn validate_exact_binding_consumption(
             }
         };
         match &argument.value {
-            AotArgumentValue::U32(_) | AotArgumentValue::DevicePointer(None) => {}
+            AotArgumentValue::U32(_)
+            | AotArgumentValue::Usize(_)
+            | AotArgumentValue::DevicePointer(None) => {}
             AotArgumentValue::DevicePointer(Some(binding)) => insert(*binding)?,
             AotArgumentValue::DevicePointerTable(entries) => {
                 if entries.is_empty() || entries.iter().any(Option::is_none) {

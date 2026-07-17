@@ -395,6 +395,29 @@ fn aot_invocation_binds_every_effect_range_to_one_exact_abi_ordinal() {
 }
 
 #[test]
+fn host_usize_argument_is_canonical_u64_identity() {
+    let with_size = |value| {
+        let mut input = valid_input();
+        input.operations[0]
+            .invocation
+            .as_mut()
+            .unwrap()
+            .arguments
+            .push(AotArgumentBinding {
+                ordinal: 1,
+                value: AotArgumentValue::Usize(value),
+            });
+        CompiledProof::compile(input, transcript()).unwrap()
+    };
+
+    let first = with_size(u64::from(u32::MAX) + 1);
+    let repeated = with_size(u64::from(u32::MAX) + 1);
+    let different = with_size(u64::from(u32::MAX) + 2);
+    assert_eq!(first.identity(), repeated.identity());
+    assert_ne!(first.identity(), different.identity());
+}
+
+#[test]
 fn effect_and_kernel_authorities_are_body_derived_and_canonical() {
     assert!(matches!(
         ModuleIdentity::new(vec![]),

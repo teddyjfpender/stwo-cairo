@@ -357,7 +357,9 @@ fn validate_invocation(
             }
         };
         match &argument.value {
-            AotArgumentValue::U32(_) | AotArgumentValue::DevicePointer(None) => {}
+            AotArgumentValue::U32(_)
+            | AotArgumentValue::Usize(_)
+            | AotArgumentValue::DevicePointer(None) => {}
             AotArgumentValue::DevicePointer(Some(binding)) => insert(*binding)?,
             AotArgumentValue::DevicePointerTable(entries) => {
                 if entries.is_empty() {
