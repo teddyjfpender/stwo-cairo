@@ -127,12 +127,12 @@ pub(super) struct BaseProducerBindingFrontier {
 /// the real `CompiledProof` emitter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BaseProducerAuthority {
-    producers: Vec<SemanticBaseProducer>,
-    direct_retained_b2n: stwo_backend_cuda::DirectRetainedB2nProgram,
+    pub(super) producers: Vec<SemanticBaseProducer>,
+    pub(super) direct_retained_b2n: stwo_backend_cuda::DirectRetainedB2nProgram,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum SemanticBaseProducer {
+pub(super) enum SemanticBaseProducer {
     Recorded(LoweredRecordedWitnessProducer),
     NativeBlakeGDirect {
         position: ProducerSchedulePosition,
@@ -163,6 +163,17 @@ pub(crate) struct PreparedRecordedKernel<'a> {
 impl BaseProducerAuthority {
     pub(super) fn compile_replacement(
         arena: &ProofArenaPlan,
+    ) -> Result<Self, InvocationShapeError> {
+        let mut values =
+            adapter::SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>())?;
+        Self::compile_replacement_into(arena, &mut values)
+    }
+
+    /// Lower Base into the caller-owned proof-wide semantic-version stream.
+    /// The caller must retain this exact map for every later proof stage.
+    pub(super) fn compile_replacement_into(
+        arena: &ProofArenaPlan,
+        values: &mut adapter::SemanticValueMap,
     ) -> Result<Self, InvocationShapeError> {
         let catalog = BaseProducerCatalog::compile(arena)?;
         let schedule = BaseProducerSchedule::compile(arena)
@@ -236,8 +247,6 @@ impl BaseProducerAuthority {
             }
         }
 
-        let mut values =
-            adapter::SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>())?;
         let mut producers = Vec::with_capacity(pending.len());
         for pending in pending {
             match pending {
@@ -246,7 +255,7 @@ impl BaseProducerAuthority {
                         &recorded.source.source_arguments,
                     ))?;
                     let (invocation, effect) =
-                        adapter::compile(&recorded.source.source_arguments, &mut values)?;
+                        adapter::compile(&recorded.source.source_arguments, values)?;
                     producers.push(SemanticBaseProducer::Recorded(
                         LoweredRecordedWitnessProducer {
                             position: recorded.position,
@@ -263,7 +272,7 @@ impl BaseProducerAuthority {
                     producer,
                     contract,
                 } => {
-                    let contract = ec_op_prefix::lower(contract, &mut values)?;
+                    let contract = ec_op_prefix::lower(contract, values)?;
                     validate_direct_native_outputs(&catalog, &contract, &direct_outputs)?;
                     producers.push(SemanticBaseProducer::NativeEcOp {
                         position,
@@ -276,7 +285,7 @@ impl BaseProducerAuthority {
                     producer,
                     contract,
                 } => {
-                    let contract = super::blake_g_direct_prefix::lower(contract, &mut values)?;
+                    let contract = super::blake_g_direct_prefix::lower(contract, values)?;
                     validate_direct_blake_g_outputs(&catalog, &contract, &direct_outputs)?;
                     producers.push(SemanticBaseProducer::NativeBlakeGDirect {
                         position,

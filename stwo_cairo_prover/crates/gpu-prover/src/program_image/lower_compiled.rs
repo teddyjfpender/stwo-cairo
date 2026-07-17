@@ -30,6 +30,9 @@ mod blake_g_direct_execution_authority;
 mod blake_g_direct_prefix;
 #[cfg(test)]
 mod blake_g_direct_tests;
+mod compiled_base_prefix;
+#[cfg(test)]
+mod compiled_base_prefix_tests;
 mod ec_op_execution_authority;
 #[cfg(test)]
 mod ec_op_pair_tests;

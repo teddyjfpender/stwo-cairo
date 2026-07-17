@@ -2,7 +2,9 @@
 
 use std::sync::OnceLock;
 
-use stwo_backend_cuda::aot::{self, AotKernelAbiSchema, AotKernelAuthority, AotKernelSchemaScope};
+use stwo_backend_cuda::aot::{
+    self, AotKernelAbiSchema, AotKernelAuthority, AotKernelModuleGlobals, AotKernelSchemaScope,
+};
 use stwo_backend_cuda::pedersen_module_publication::{
     loaded_aot_pedersen_module_publication, PedersenModulePublicationError,
     PedersenModulePublicationReceipt,
@@ -34,10 +36,11 @@ pub(super) struct LoadedAuthorityFields {
     pub(super) source_identity: [u8; 32],
     pub(super) cubin_identity: [u8; 32],
     pub(super) authority_identity: [u8; 32],
+    pub(super) module_globals: AotKernelModuleGlobals,
 }
 
 impl LoadedAuthorityFields {
-    fn from_loaded(manifest_identity: [u8; 32], kernel: AotKernelAuthority) -> Self {
+    pub(super) fn from_loaded(manifest_identity: [u8; 32], kernel: AotKernelAuthority) -> Self {
         Self {
             manifest_identity,
             program_identity: kernel.program_identity(),
@@ -51,6 +54,7 @@ impl LoadedAuthorityFields {
             source_identity: kernel.source_identity(),
             cubin_identity: kernel.cubin_identity(),
             authority_identity: kernel.identity(),
+            module_globals: kernel.module_globals(),
         }
     }
 }
@@ -116,6 +120,12 @@ pub(super) fn validate_fields(
         || fields.source_identity != invocation.deduce.source_identity
         || fields.cubin_identity == [0; 32]
         || fields.authority_identity == [0; 32]
+        || fields.module_globals
+            != if invocation.deduce.module_state.is_some() {
+                AotKernelModuleGlobals::WitnessPedersenV1
+            } else {
+                AotKernelModuleGlobals::None
+            }
     {
         return Err(InvocationShapeError::LoadedAotAuthorityMismatch);
     }
@@ -311,6 +321,7 @@ mod tests {
             source_identity: invocation.deduce.source_identity,
             cubin_identity: [3; 32],
             authority_identity: [4; 32],
+            module_globals: AotKernelModuleGlobals::WitnessPedersenV1,
         };
         validate_fields(&invocation, 8, 9, &fields).unwrap();
         if !stwo_backend_cuda_kernels::CUDA_KERNELS_BUILT {

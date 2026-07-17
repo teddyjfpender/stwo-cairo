@@ -4,7 +4,7 @@ use std::sync::Arc;
 use cairo_air::claims::CairoClaim;
 use cairo_vm::types::layout_name::LayoutName;
 use stwo::core::pcs::PcsConfig;
-use stwo_backend_cuda::aot::AotKernelSchemaScope;
+use stwo_backend_cuda::aot::{AotKernelModuleGlobals, AotKernelSchemaScope};
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
@@ -724,6 +724,7 @@ fn loaded_authority_field_view_rejects_every_mutation() {
         source_identity: invocation.deduce.source_identity,
         cubin_identity: [6; 32],
         authority_identity: [7; 32],
+        module_globals: AotKernelModuleGlobals::None,
     };
     loaded_authority::validate_fields(&invocation, 8, 6, &fields).unwrap();
 
@@ -763,6 +764,9 @@ fn loaded_authority_field_view_rejects_every_mutation() {
     mutations.push(changed);
     let mut changed = fields.clone();
     changed.authority_identity = [0; 32];
+    mutations.push(changed);
+    let mut changed = fields.clone();
+    changed.module_globals = AotKernelModuleGlobals::WitnessPedersenV1;
     mutations.push(changed);
 
     for changed in mutations {
