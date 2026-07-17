@@ -70,7 +70,7 @@ fn direct_executable() -> Arc<ShapeExecutable> {
     }))
 }
 
-fn lowered_direct() -> (
+pub(super) fn lowered_direct() -> (
     Arc<ShapeExecutable>,
     blake_g_direct_prefix::LoweredNativeBlakeGDirectContract,
 ) {
@@ -121,7 +121,19 @@ fn real_recorded_program_compiles_into_production_direct_base_authority() {
         );
     }
     let authoritative = lowered.authority.abi().arguments();
-    for index in 0..authoritative.len() - 1 {
+    assert!(
+        static_wrapper_invocation::blake_g_direct_using_abi_for_test(
+            &lowered,
+            &authoritative[..authoritative.len() - 1],
+        )
+        .is_err()
+    );
+    let mut rotated = authoritative.to_vec();
+    rotated.rotate_right(1);
+    assert!(
+        static_wrapper_invocation::blake_g_direct_using_abi_for_test(&lowered, &rotated).is_err()
+    );
+    for index in 0..authoritative.len() {
         let mut changed = authoritative.to_vec();
         changed[index].ordinal ^= 0x80;
         assert!(
@@ -135,13 +147,24 @@ fn real_recorded_program_compiles_into_production_direct_base_authority() {
                 .is_err()
         );
         let mut changed = authoritative.to_vec();
-        changed[index].kind = stwo_backend_cuda::BlakeGDirectAbiArgumentKind::CudaStream;
+        changed[index].kind =
+            if changed[index].kind == stwo_backend_cuda::BlakeGDirectAbiArgumentKind::CudaStream {
+                stwo_backend_cuda::BlakeGDirectAbiArgumentKind::U32
+            } else {
+                stwo_backend_cuda::BlakeGDirectAbiArgumentKind::CudaStream
+            };
         assert!(
             static_wrapper_invocation::blake_g_direct_using_abi_for_test(&lowered, &changed)
                 .is_err()
         );
         let mut changed = authoritative.to_vec();
-        changed[index].access = stwo_backend_cuda::BlakeGDirectAbiAccess::OrderedExecutionStream;
+        changed[index].access = if changed[index].access
+            == stwo_backend_cuda::BlakeGDirectAbiAccess::OrderedExecutionStream
+        {
+            stwo_backend_cuda::BlakeGDirectAbiAccess::RealRowCount
+        } else {
+            stwo_backend_cuda::BlakeGDirectAbiAccess::OrderedExecutionStream
+        };
         assert!(
             static_wrapper_invocation::blake_g_direct_using_abi_for_test(&lowered, &changed)
                 .is_err()

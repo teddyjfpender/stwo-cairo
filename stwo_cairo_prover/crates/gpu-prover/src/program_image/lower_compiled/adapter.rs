@@ -167,16 +167,48 @@ impl SemanticValueMap {
             .collect()
     }
 
-    #[cfg(test)]
     pub(super) fn allocated_versions(&self) -> impl Iterator<Item = ValueVersion> + '_ {
         let catalogs = self.allocations.iter().map(|(_, version)| *version);
         let fixed = self.fixed_u32.iter().map(|fixed| fixed.value);
         catalogs.chain(fixed)
     }
 
+    pub(super) fn allocation_classes(
+        &self,
+    ) -> (
+        BTreeSet<ValueVersion>,
+        BTreeSet<ValueVersion>,
+        BTreeSet<ValueVersion>,
+    ) {
+        let mut catalogs = BTreeSet::new();
+        let mut catalog_first = BTreeSet::new();
+        let mut transitions = BTreeSet::new();
+        for &(catalog, version) in &self.allocations {
+            if catalogs.insert(catalog) {
+                catalog_first.insert(version);
+            } else {
+                transitions.insert(version);
+            }
+        }
+        let fixed = self.fixed_u32.iter().map(|fixed| fixed.value).collect();
+        (catalog_first, transitions, fixed)
+    }
+
     #[cfg(test)]
     pub(super) fn entries(&self) -> impl Iterator<Item = (ArenaCatalogValueId, ValueVersion)> + '_ {
         self.allocations.iter().copied()
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_unconsumed_transition_for_test(&self) -> Result<Self, InvocationShapeError> {
+        let mut changed = self.clone();
+        let catalog = changed
+            .allocations
+            .first()
+            .map(|(catalog, _)| *catalog)
+            .ok_or(InvocationShapeError::InvalidProgramRole)?;
+        changed.transition(catalog)?;
+        Ok(changed)
     }
 }
 

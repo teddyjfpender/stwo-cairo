@@ -4,21 +4,22 @@ use stwo_backend_cuda::aot::{AotKernelAbiSchema, AotKernelModuleGlobals, AotKern
 use stwo_backend_cuda::TraceTreeRole;
 
 use super::compiled_base_prefix::{
-    emit_recorded_base_prefix_for_test, CompiledBasePrefixError, MissingBaseAdapter,
+    emit_recorded_witness_writer_prefix_for_test, CompiledWitnessWriterPrefixError,
+    MissingBaseAdapter,
 };
 use super::loaded_authority::LoadedAuthorityFields;
 use super::producer_prefix::SemanticBaseProducer;
 use super::*;
 use crate::compiled_proof::{
-    AotArgumentValue, EffectBindingId, ExecutionPrimitive, FixedValueInitializer,
-    PartitionAuthority, ProofStage,
+    AotArgumentValue, EffectAccess, EffectBindingId, EffectContract, ExecutionPrimitive,
+    FixedValueInitializer, PartitionAuthority, ProofStage, ValueVersion,
 };
 
 const MANIFEST: [u8; 32] = [0x4d; 32];
 const TARGET_SM: u32 = 89;
 
 #[test]
-fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
+fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapper() {
     let executable = super::tests::generated_sn2_replacement();
     let authority = BaseProducerAuthority::compile_replacement(executable.arena()).unwrap();
     let ec_op = authority
@@ -73,7 +74,15 @@ fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
         );
     }
     let authoritative = ec_op.authority.abi().arguments();
-    for index in 0..authoritative.len() - 1 {
+    assert!(static_wrapper_invocation::ec_op_using_abi_for_test(
+        ec_op,
+        &authoritative[..authoritative.len() - 1],
+    )
+    .is_err());
+    let mut rotated = authoritative.to_vec();
+    rotated.rotate_right(1);
+    assert!(static_wrapper_invocation::ec_op_using_abi_for_test(ec_op, &rotated).is_err());
+    for index in 0..authoritative.len() {
         let mut changed = authoritative.to_vec();
         changed[index].ordinal ^= 0x80;
         assert!(static_wrapper_invocation::ec_op_using_abi_for_test(ec_op, &changed).is_err());
@@ -81,10 +90,20 @@ fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
         changed[index].name = "wrong_role";
         assert!(static_wrapper_invocation::ec_op_using_abi_for_test(ec_op, &changed).is_err());
         let mut changed = authoritative.to_vec();
-        changed[index].kind = stwo_backend_cuda::EcOpAbiArgumentKind::CudaStream;
+        changed[index].kind =
+            if changed[index].kind == stwo_backend_cuda::EcOpAbiArgumentKind::CudaStream {
+                stwo_backend_cuda::EcOpAbiArgumentKind::U32
+            } else {
+                stwo_backend_cuda::EcOpAbiArgumentKind::CudaStream
+            };
         assert!(static_wrapper_invocation::ec_op_using_abi_for_test(ec_op, &changed).is_err());
         let mut changed = authoritative.to_vec();
-        changed[index].access = stwo_backend_cuda::EcOpAbiAccess::OrderedExecutionStream;
+        changed[index].access =
+            if changed[index].access == stwo_backend_cuda::EcOpAbiAccess::OrderedExecutionStream {
+                stwo_backend_cuda::EcOpAbiAccess::Read
+            } else {
+                stwo_backend_cuda::EcOpAbiAccess::OrderedExecutionStream
+            };
         assert!(static_wrapper_invocation::ec_op_using_abi_for_test(ec_op, &changed).is_err());
     }
     let mut malformed = ec_op.clone();
@@ -99,26 +118,55 @@ fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
         })
         .unwrap();
     let fields = exact_fields(&recorded.source);
+    let distinct_effect = authority
+        .producers
+        .iter()
+        .map(|producer| producer.effect().id())
+        .find(|effect| *effect != recorded.effect.id())
+        .expect("generated SN2 must have more than one Base effect");
     let (kernels, first, second) =
-        super::compiled_base_prefix::install_recorded_kernel_twice_for_test(
+        super::compiled_base_prefix::install_recorded_kernel_pair_for_test(
             &recorded.source,
             &fields,
             recorded.effect.id(),
+            &recorded.source,
+            &fields,
+            distinct_effect,
         )
         .unwrap();
     assert_eq!(first, second);
     assert_eq!(kernels.len(), 1);
+    let mut accepted = vec![recorded.effect.id(), distinct_effect];
+    accepted.sort_unstable();
     assert_eq!(
         kernels[0].accepted_executions(),
-        &[(recorded.effect.id(), PartitionAuthority::monolithic().id())]
+        accepted
+            .into_iter()
+            .map(|effect| (effect, PartitionAuthority::monolithic().id()))
+            .collect::<Vec<_>>()
+    );
+    let mut drifted_source = recorded.source.clone();
+    drifted_source.semantic_hash ^= 1;
+    assert!(
+        super::compiled_base_prefix::install_recorded_kernel_pair_for_test(
+            &recorded.source,
+            &fields,
+            recorded.effect.id(),
+            &drifted_source,
+            &fields,
+            distinct_effect,
+        )
+        .is_err()
     );
 
-    let error =
-        emit_recorded_base_prefix_for_test(executable.arena(), MANIFEST, TARGET_SM, |source| {
-            Ok(exact_fields(source))
-        })
-        .unwrap_err();
-    let CompiledBasePrefixError::MissingTypedAdapter { missing, prefix } = error else {
+    let error = emit_recorded_witness_writer_prefix_for_test(
+        executable.arena(),
+        MANIFEST,
+        TARGET_SM,
+        |source| Ok(exact_fields(source)),
+    )
+    .unwrap_err();
+    let CompiledWitnessWriterPrefixError::MissingTypedAdapter { missing, prefix } = error else {
         panic!("recorded Base must stop only at the first native wrapper")
     };
 
@@ -189,7 +237,80 @@ fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
         )
         .collect::<Vec<_>>();
     assert_eq!(resumed_effects, planned_effects);
-    assert_base_def_use_is_ordered(prefix.base_authority());
+    assert_witness_writer_def_use_is_ordered(prefix.base_authority());
+    let required = super::compiled_base_prefix::validate_witness_writer_transitions_for_test(
+        prefix.base_authority(),
+        prefix.values(),
+    )
+    .unwrap();
+    assert!(!required.is_empty());
+    assert_eq!(&required, prefix.required_preproducer_versions());
+    let fixed_versions = prefix
+        .fixed_value_versions()
+        .into_iter()
+        .map(|value| value.version)
+        .collect::<BTreeSet<_>>();
+    assert!(!fixed_versions.is_empty());
+    assert!(required.is_disjoint(&fixed_versions));
+    super::compiled_base_prefix::validate_sealed_prefix_for_test(
+        &prefix,
+        prefix.next_producer(),
+        &prefix.operations,
+    )
+    .unwrap();
+    assert!(
+        super::compiled_base_prefix::validate_sealed_prefix_for_test(
+            &prefix,
+            prefix.next_producer() + 1,
+            &prefix.operations,
+        )
+        .is_err()
+    );
+    let mut wrong_kernel_use = prefix.operations.clone();
+    let ExecutionPrimitive::AotKernel { kernel, .. } = &mut wrong_kernel_use[0].primitive else {
+        unreachable!()
+    };
+    *kernel = prefix.kernels[1].id();
+    assert!(
+        super::compiled_base_prefix::validate_sealed_prefix_for_test(
+            &prefix,
+            prefix.next_producer(),
+            &wrong_kernel_use,
+        )
+        .is_err()
+    );
+    let unconsumed = prefix
+        .values()
+        .with_unconsumed_transition_for_test()
+        .unwrap();
+    assert!(
+        super::compiled_base_prefix::validate_witness_writer_transitions_for_test(
+            prefix.base_authority(),
+            &unconsumed,
+        )
+        .is_err()
+    );
+
+    let first_written = first_destination(prefix.base_authority().producers[0].effect());
+    let future_written = first_destination(prefix.base_authority().producers[1].effect());
+    let mut future_read = prefix.base_authority().clone();
+    replace_first_source(&mut future_read.producers[0], future_written);
+    assert!(
+        super::compiled_base_prefix::validate_witness_writer_transitions_for_test(
+            &future_read,
+            prefix.values(),
+        )
+        .is_err()
+    );
+    let mut duplicate_destination = prefix.base_authority().clone();
+    replace_first_destination(&mut duplicate_destination.producers[1], first_written);
+    assert!(
+        super::compiled_base_prefix::validate_witness_writer_transitions_for_test(
+            &duplicate_destination,
+            prefix.values(),
+        )
+        .is_err()
+    );
 
     assert_fixed_values_are_exact(&prefix);
     assert!(
@@ -201,7 +322,61 @@ fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
     );
 }
 
-fn assert_base_def_use_is_ordered(authority: &super::producer_prefix::BaseProducerAuthority) {
+fn first_destination(effect: &EffectContract) -> ValueVersion {
+    effect
+        .accesses()
+        .iter()
+        .find_map(EffectAccess::destination)
+        .map(|destination| destination.value.version)
+        .expect("fixture producer must write a Base value")
+}
+
+fn replace_first_source(producer: &mut SemanticBaseProducer, version: ValueVersion) {
+    replace_effect(producer, |accesses| {
+        let source = accesses
+            .iter_mut()
+            .find_map(EffectAccess::source_mut)
+            .expect("fixture producer must read a Base value");
+        source.value.version = version;
+    });
+}
+
+fn replace_first_destination(producer: &mut SemanticBaseProducer, version: ValueVersion) {
+    replace_effect(producer, |accesses| {
+        let destination = accesses
+            .iter_mut()
+            .find_map(|access| match access {
+                EffectAccess::Write { destination }
+                | EffectAccess::ReadWrite { destination, .. }
+                | EffectAccess::Atomic { destination, .. } => Some(destination),
+                EffectAccess::Read { .. } => None,
+            })
+            .expect("fixture producer must write a Base value");
+        destination.value.version = version;
+    });
+}
+
+fn replace_effect(
+    producer: &mut SemanticBaseProducer,
+    mutate: impl FnOnce(&mut Vec<EffectAccess>),
+) {
+    let current = producer.effect();
+    let mut accesses = current.accesses().to_vec();
+    let globals = current.module_globals().to_vec();
+    mutate(&mut accesses);
+    let replacement = EffectContract::new(accesses, globals).unwrap();
+    match producer {
+        SemanticBaseProducer::Recorded(recorded) => recorded.effect = replacement,
+        SemanticBaseProducer::NativeBlakeGDirect { contract, .. } => {
+            contract.effect = replacement;
+        }
+        SemanticBaseProducer::NativeEcOp { contract, .. } => contract.effect = replacement,
+    }
+}
+
+fn assert_witness_writer_def_use_is_ordered(
+    authority: &super::producer_prefix::BaseProducerAuthority,
+) {
     let mut destination_producer = BTreeMap::new();
     for (producer_index, producer) in authority.producers.iter().enumerate() {
         for destination in producer
@@ -215,7 +390,7 @@ fn assert_base_def_use_is_ordered(authority: &super::producer_prefix::BaseProduc
             {
                 assert_eq!(
                     previous, producer_index,
-                    "one semantic version cannot be produced by different Base producers"
+                    "one semantic version cannot be produced by different witness writers"
                 );
             }
         }
@@ -230,7 +405,7 @@ fn assert_base_def_use_is_ordered(authority: &super::producer_prefix::BaseProduc
             if let Some(&source_producer) = destination_producer.get(&source.value.version) {
                 assert!(
                     source_producer < producer_index,
-                    "Base source version must be initial or produced by an earlier contract"
+                    "writer-produced source version must come from an earlier writer"
                 );
             }
         }
@@ -290,7 +465,9 @@ fn assert_invocation_covers_exact_bindings(
     assert_eq!(actual.len(), expected.len());
 }
 
-fn assert_fixed_values_are_exact(prefix: &super::compiled_base_prefix::CompiledBasePrefix) {
+fn assert_fixed_values_are_exact(
+    prefix: &super::compiled_base_prefix::CompiledWitnessWriterPrefix,
+) {
     let fixed = prefix.fixed_values();
     let versions = prefix.fixed_value_versions();
     assert!(!fixed.is_empty());

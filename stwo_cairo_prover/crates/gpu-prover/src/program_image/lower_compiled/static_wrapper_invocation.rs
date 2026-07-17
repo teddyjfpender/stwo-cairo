@@ -31,7 +31,12 @@ fn blake_g_direct_using_abi(
         &contract.invocation,
         &contract.effect,
     )?;
-    if abi.len() != 7 {
+    if abi != contract.authority.abi().arguments()
+        || abi
+            .iter()
+            .enumerate()
+            .any(|(index, descriptor)| descriptor.ordinal as usize != index)
+    {
         return Err(InvocationShapeError::InvalidNativeBlakeGDirectAuthority);
     }
     let mut arguments = Vec::with_capacity(abi.len() - 1);
@@ -50,7 +55,8 @@ fn blake_g_direct_value(
     contract: &blake_g_direct_prefix::LoweredNativeBlakeGDirectContract,
     descriptor: BlakeGDirectAbiArgument,
 ) -> Result<Option<AotArgumentValue>, InvocationShapeError> {
-    use {BlakeGDirectAbiAccess as Access, BlakeGDirectAbiArgumentKind as Kind};
+    use BlakeGDirectAbiAccess as Access;
+    use BlakeGDirectAbiArgumentKind as Kind;
 
     let invocation = &contract.invocation;
     let value = match (
@@ -148,7 +154,11 @@ fn ec_op_using_abi(
             contract.authority.identity(),
         ]
         .contains(&[0; 32])
-        || abi.len() != 19
+        || abi != contract.authority.abi().arguments()
+        || abi
+            .iter()
+            .enumerate()
+            .any(|(index, descriptor)| descriptor.ordinal as usize != index)
         || contract.invocation.execution_tables.len() != EXECUTION_TABLE_POINTERS
         || contract.invocation.trace_columns.len() != requirements.trace_column_words.len()
         || contract.invocation.partial_input_columns.len()
@@ -175,7 +185,8 @@ fn ec_op_value(
     contract: &ec_op_prefix::LoweredNativeEcOpContract,
     descriptor: EcOpAbiArgument,
 ) -> Result<Option<AotArgumentValue>, InvocationShapeError> {
-    use {EcOpAbiAccess as Access, EcOpAbiArgumentKind as Kind};
+    use EcOpAbiAccess as Access;
+    use EcOpAbiArgumentKind as Kind;
 
     let invocation = &contract.invocation;
     let requirements = contract.authority.requirements();
