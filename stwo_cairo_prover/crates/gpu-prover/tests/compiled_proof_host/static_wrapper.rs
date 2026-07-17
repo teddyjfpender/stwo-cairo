@@ -86,20 +86,25 @@ fn one_and_three_launch_wrappers_compile_with_exact_identity() {
     assert_eq!(one.identity(), repeated.identity());
     assert_eq!(one.static_wrappers().len(), 1);
     assert_eq!(
-        one.static_wrapper(WRAPPER_ID).unwrap().launches()[0].symbol(),
+        one.static_wrapper(WRAPPER_ID)
+            .unwrap()
+            .kernel_launches()
+            .next()
+            .unwrap()
+            .symbol(),
         b"execute_kernel"
     );
 
     let three_input = wrapper_input(three_launches());
     let three = CompiledProof::compile(three_input, transcript()).unwrap();
     let manifest = three.static_wrapper(WRAPPER_ID).unwrap();
-    assert_eq!(manifest.launches().len(), 3);
+    assert_eq!(manifest.kernel_launches().count(), 3);
     assert_ne!(one.identity(), three.identity());
     assert_ne!(
         one.static_wrapper(WRAPPER_ID)
             .unwrap()
-            .aggregate_launch_identity(),
-        manifest.aggregate_launch_identity()
+            .aggregate_execution_identity(),
+        manifest.aggregate_execution_identity()
     );
 
     let mut reordered = three_launches();

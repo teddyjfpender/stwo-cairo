@@ -1,13 +1,21 @@
 //! Address-free authority for one linked ordinary-CUDA host wrapper.
 //!
 //! A wrapper is one semantic primitive with one outer effect. Its ordered
-//! launch manifest is identity only: it carries no child effects, SSA values,
-//! partitions, streams, function pointers, or other process-local addresses.
+//! execution manifest is identity only: it carries no child effects, SSA
+//! values, partitions, streams, function pointers, or other process-local
+//! addresses. A step is either one caller-controlled kernel launch or one
+//! library call whose internal launch geometry is deliberately library-managed.
+//! Version 2 intentionally replaces the old launch-only getters with ordered
+//! execution-step access: presenting a filtered kernel list as the complete
+//! wrapper execution would be unsound once library calls are present.
 
 use super::*;
 
-const WRAPPER_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-wrapper.v1\0";
-const AGGREGATE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-launches.v1\0";
+mod library;
+pub use library::*;
+
+const WRAPPER_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-wrapper.v2\0";
+const AGGREGATE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-execution.v2\0";
 const ZERO_IDENTITY: [u8; 32] = [0; 32];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +48,22 @@ impl StaticCudaLaunchIdentity {
     }
 }
 
+/// One address-free operation in exact wrapper-stream order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StaticCudaExecutionStepIdentity {
+    KernelLaunch(StaticCudaLaunchIdentity),
+    LibraryCall(StaticCudaLibraryCallIdentity),
+}
+
+impl StaticCudaExecutionStepIdentity {
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::KernelLaunch(launch) => launch.is_valid(),
+            Self::LibraryCall(call) => call.is_valid(),
+        }
+    }
+}
+
 /// Canonical compiled-proof projection of an already-validated producer-side
 /// linked-wrapper authority. The producer must copy the upstream receipts and
 /// compare every local symbol and launch geometry before constructing this
@@ -55,8 +79,8 @@ pub struct StaticCudaWrapperAuthority {
     semantic_effect_identity: [u8; 32],
     aggregate_contract_identity: [u8; 32],
     linked_module_identity: [u8; 32],
-    launches: Box<[StaticCudaLaunchIdentity]>,
-    aggregate_launch_identity: [u8; 32],
+    execution_steps: Box<[StaticCudaExecutionStepIdentity]>,
+    aggregate_execution_identity: [u8; 32],
     accepted_effect: EffectContractId,
     canonical_encoding: Box<[u8]>,
     digest: [u8; 32],
@@ -75,6 +99,36 @@ impl StaticCudaWrapperAuthority {
         launches: Vec<StaticCudaLaunchIdentity>,
         accepted_effect: EffectContractId,
     ) -> Result<Self, CompiledProofError> {
+        Self::new_with_execution_steps(
+            id,
+            static_module_build_identity,
+            consumer_target_sm,
+            wrapper_symbol,
+            semantic_abi_identity,
+            semantic_effect_identity,
+            aggregate_contract_identity,
+            linked_module_identity,
+            launches
+                .into_iter()
+                .map(StaticCudaExecutionStepIdentity::KernelLaunch)
+                .collect(),
+            accepted_effect,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_execution_steps(
+        id: StaticCudaWrapperId,
+        static_module_build_identity: [u8; 32],
+        consumer_target_sm: u32,
+        wrapper_symbol: Vec<u8>,
+        semantic_abi_identity: [u8; 32],
+        semantic_effect_identity: [u8; 32],
+        aggregate_contract_identity: [u8; 32],
+        linked_module_identity: [u8; 32],
+        execution_steps: Vec<StaticCudaExecutionStepIdentity>,
+        accepted_effect: EffectContractId,
+    ) -> Result<Self, CompiledProofError> {
         if id.0 == 0
             || static_module_build_identity == ZERO_IDENTITY
             || consumer_target_sm < 10
@@ -83,13 +137,13 @@ impl StaticCudaWrapperAuthority {
             || aggregate_contract_identity == ZERO_IDENTITY
             || linked_module_identity == ZERO_IDENTITY
             || !valid_symbol(&wrapper_symbol)
-            || launches.is_empty()
-            || launches.iter().any(|launch| !launch.is_valid())
+            || execution_steps.is_empty()
+            || execution_steps.iter().any(|step| !step.is_valid())
         {
             return Err(CompiledProofError::InvalidStaticWrapperAuthority(id));
         }
-        let launch_encoding = encode_launches(&launches)?;
-        let aggregate_launch_identity = digest(AGGREGATE_DOMAIN, &launch_encoding)?;
+        let execution_encoding = encode_execution_steps(&execution_steps)?;
+        let aggregate_execution_identity = digest(AGGREGATE_DOMAIN, &execution_encoding)?;
         let canonical_encoding = encode_wrapper(
             id,
             static_module_build_identity,
@@ -99,8 +153,8 @@ impl StaticCudaWrapperAuthority {
             semantic_effect_identity,
             aggregate_contract_identity,
             linked_module_identity,
-            &launch_encoding,
-            aggregate_launch_identity,
+            &execution_encoding,
+            aggregate_execution_identity,
             accepted_effect,
         )?;
         let digest = digest(WRAPPER_DOMAIN, &canonical_encoding)?;
@@ -113,8 +167,8 @@ impl StaticCudaWrapperAuthority {
             semantic_effect_identity,
             aggregate_contract_identity,
             linked_module_identity,
-            launches: launches.into_boxed_slice(),
-            aggregate_launch_identity,
+            execution_steps: execution_steps.into_boxed_slice(),
+            aggregate_execution_identity,
             accepted_effect,
             canonical_encoding: canonical_encoding.into_boxed_slice(),
             digest,
@@ -146,8 +200,8 @@ impl StaticCudaWrapperAuthority {
     }
 
     /// Identity of the upstream aggregate/composite contract. It seals the
-    /// semantic source, ABI, effect, and ordered launch contract; the local
-    /// manifest remains an independently inspectable exact launch list.
+    /// semantic source, ABI, effect, and ordered execution contract; the local
+    /// manifest remains an independently inspectable exact execution list.
     pub const fn aggregate_contract_identity(&self) -> &[u8; 32] {
         &self.aggregate_contract_identity
     }
@@ -159,12 +213,19 @@ impl StaticCudaWrapperAuthority {
         &self.linked_module_identity
     }
 
-    pub fn launches(&self) -> &[StaticCudaLaunchIdentity] {
-        &self.launches
+    pub fn execution_steps(&self) -> &[StaticCudaExecutionStepIdentity] {
+        &self.execution_steps
     }
 
-    pub const fn aggregate_launch_identity(&self) -> &[u8; 32] {
-        &self.aggregate_launch_identity
+    pub fn kernel_launches(&self) -> impl Iterator<Item = &StaticCudaLaunchIdentity> {
+        self.execution_steps.iter().filter_map(|step| match step {
+            StaticCudaExecutionStepIdentity::KernelLaunch(launch) => Some(launch),
+            StaticCudaExecutionStepIdentity::LibraryCall(_) => None,
+        })
+    }
+
+    pub const fn aggregate_execution_identity(&self) -> &[u8; 32] {
+        &self.aggregate_execution_identity
     }
 
     pub const fn accepted_effect(&self) -> EffectContractId {
@@ -188,13 +249,13 @@ impl StaticCudaWrapperAuthority {
             || self.aggregate_contract_identity == ZERO_IDENTITY
             || self.linked_module_identity == ZERO_IDENTITY
             || !valid_symbol(&self.wrapper_symbol)
-            || self.launches.is_empty()
-            || self.launches.iter().any(|launch| !launch.is_valid())
+            || self.execution_steps.is_empty()
+            || self.execution_steps.iter().any(|step| !step.is_valid())
         {
             return Ok(false);
         }
-        let launch_encoding = encode_launches(&self.launches)?;
-        let aggregate_launch_identity = digest(AGGREGATE_DOMAIN, &launch_encoding)?;
+        let execution_encoding = encode_execution_steps(&self.execution_steps)?;
+        let aggregate_execution_identity = digest(AGGREGATE_DOMAIN, &execution_encoding)?;
         let canonical_encoding = encode_wrapper(
             self.id,
             self.static_module_build_identity,
@@ -204,22 +265,35 @@ impl StaticCudaWrapperAuthority {
             self.semantic_effect_identity,
             self.aggregate_contract_identity,
             self.linked_module_identity,
-            &launch_encoding,
-            aggregate_launch_identity,
+            &execution_encoding,
+            aggregate_execution_identity,
             self.accepted_effect,
         )?;
-        Ok(self.aggregate_launch_identity == aggregate_launch_identity
-            && self.canonical_encoding.as_ref() == canonical_encoding.as_slice()
-            && self.digest == digest(WRAPPER_DOMAIN, &canonical_encoding)?)
+        Ok(
+            self.aggregate_execution_identity == aggregate_execution_identity
+                && self.canonical_encoding.as_ref() == canonical_encoding.as_slice()
+                && self.digest == digest(WRAPPER_DOMAIN, &canonical_encoding)?,
+        )
     }
 }
 
-fn encode_launches(launches: &[StaticCudaLaunchIdentity]) -> Result<Vec<u8>, CompiledProofError> {
+fn encode_execution_steps(
+    steps: &[StaticCudaExecutionStepIdentity],
+) -> Result<Vec<u8>, CompiledProofError> {
     let mut out = Vec::from(AGGREGATE_DOMAIN);
-    push_size(&mut out, launches.len())?;
-    for launch in launches {
-        push_bytes(&mut out, launch.symbol())?;
-        encode_launch(&mut out, launch.launch());
+    push_size(&mut out, steps.len())?;
+    for step in steps {
+        match step {
+            StaticCudaExecutionStepIdentity::KernelLaunch(launch) => {
+                out.push(1);
+                push_bytes(&mut out, launch.symbol())?;
+                encode_launch(&mut out, launch.launch());
+            }
+            StaticCudaExecutionStepIdentity::LibraryCall(call) => {
+                out.push(2);
+                call.encode_into(&mut out);
+            }
+        }
     }
     Ok(out)
 }
@@ -233,7 +307,7 @@ fn encode_wrapper(
     semantic_effect: [u8; 32],
     aggregate_contract: [u8; 32],
     linked_module: [u8; 32],
-    launches: &[u8],
+    execution_steps: &[u8],
     aggregate: [u8; 32],
     effect: EffectContractId,
 ) -> Result<Vec<u8>, CompiledProofError> {
@@ -246,7 +320,7 @@ fn encode_wrapper(
     out.extend_from_slice(&semantic_effect);
     out.extend_from_slice(&aggregate_contract);
     out.extend_from_slice(&linked_module);
-    push_bytes(&mut out, launches)?;
+    push_bytes(&mut out, execution_steps)?;
     out.extend_from_slice(&aggregate);
     out.extend_from_slice(effect.as_bytes());
     Ok(out)
@@ -321,6 +395,12 @@ fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CompiledProofError>
 mod tests {
     use super::*;
 
+    const GOLDEN_WRAPPER_DOMAIN_V2: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-wrapper.v2\0";
+    const GOLDEN_AGGREGATE_DOMAIN_V2: &[u8] =
+        b"stwo-cairo.compiled-proof.static-cuda-execution.v2\0";
+    const LEGACY_WRAPPER_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-wrapper.v1\0";
+    const LEGACY_AGGREGATE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-launches.v1\0";
+
     fn launch(symbol: &[u8], grid_x: u32) -> StaticCudaLaunchIdentity {
         StaticCudaLaunchIdentity::new(
             symbol.to_vec(),
@@ -387,15 +467,61 @@ mod tests {
         .unwrap()
     }
 
+    fn kernel_mut(
+        authority: &mut StaticCudaWrapperAuthority,
+        index: usize,
+    ) -> &mut StaticCudaLaunchIdentity {
+        match &mut authority.execution_steps[index] {
+            StaticCudaExecutionStepIdentity::KernelLaunch(launch) => launch,
+            StaticCudaExecutionStepIdentity::LibraryCall(_) => panic!("expected kernel launch"),
+        }
+    }
+
+    fn expected_kernel_only_canonical(
+        wrapper_domain: &[u8],
+        aggregate_domain: &[u8],
+        tagged_kernel: bool,
+    ) -> Vec<u8> {
+        let mut execution = Vec::from(aggregate_domain);
+        execution.extend_from_slice(&1u64.to_le_bytes());
+        if tagged_kernel {
+            execution.push(1);
+        }
+        execution.extend_from_slice(&(b"kernel_a".len() as u64).to_le_bytes());
+        execution.extend_from_slice(b"kernel_a");
+        for value in [4u32, 1, 1, 128, 1, 1, 0] {
+            execution.extend_from_slice(&value.to_le_bytes());
+        }
+        execution.push(0);
+        let aggregate = digest(aggregate_domain, &execution).unwrap();
+
+        let mut canonical = Vec::from(wrapper_domain);
+        canonical.extend_from_slice(&1u32.to_le_bytes());
+        canonical.extend_from_slice(&[7; 32]);
+        canonical.extend_from_slice(&89u32.to_le_bytes());
+        canonical.extend_from_slice(&(b"stwo_static_wrapper".len() as u64).to_le_bytes());
+        canonical.extend_from_slice(b"stwo_static_wrapper");
+        for identity in [[9; 32], [11; 32], [13; 32], [15; 32]] {
+            canonical.extend_from_slice(&identity);
+        }
+        canonical.extend_from_slice(&(execution.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(&execution);
+        canonical.extend_from_slice(&aggregate);
+        canonical.extend_from_slice(effect().id().as_bytes());
+        canonical
+    }
+
     #[test]
     fn one_launch_authority_is_exact_and_address_free() {
         let authority = authority(vec![launch(b"kernel_a", 4)]);
         assert!(authority.has_valid_identity().unwrap());
         assert_eq!(authority.wrapper_symbol(), b"stwo_static_wrapper");
-        assert_eq!(authority.launches().len(), 1);
+        assert_eq!(authority.execution_steps().len(), 1);
+        assert_eq!(authority.kernel_launches().count(), 1);
         assert_ne!(authority.digest(), &[0; 32]);
         let launch_encoding_bytes = AGGREGATE_DOMAIN.len()
             + core::mem::size_of::<u64>()
+            + 1
             + core::mem::size_of::<u64>()
             + b"kernel_a".len()
             + 7 * core::mem::size_of::<u32>()
@@ -408,6 +534,35 @@ mod tests {
             + core::mem::size_of::<u64>()
             + launch_encoding_bytes;
         assert_eq!(authority.canonical_encoding().len(), canonical_bytes);
+    }
+
+    #[test]
+    fn kernel_only_v2_identity_migration_is_explicit_and_deterministic() {
+        let baseline = authority(vec![launch(b"kernel_a", 4)]);
+        assert_eq!(WRAPPER_DOMAIN, GOLDEN_WRAPPER_DOMAIN_V2);
+        assert_eq!(AGGREGATE_DOMAIN, GOLDEN_AGGREGATE_DOMAIN_V2);
+        let expected_v2 = expected_kernel_only_canonical(
+            GOLDEN_WRAPPER_DOMAIN_V2,
+            GOLDEN_AGGREGATE_DOMAIN_V2,
+            true,
+        );
+        let legacy_v1 =
+            expected_kernel_only_canonical(LEGACY_WRAPPER_DOMAIN, LEGACY_AGGREGATE_DOMAIN, false);
+
+        assert_eq!(baseline.canonical_encoding(), expected_v2);
+        assert_eq!(
+            baseline.digest(),
+            &digest(WRAPPER_DOMAIN, &expected_v2).unwrap()
+        );
+        assert_ne!(baseline.canonical_encoding(), legacy_v1);
+        assert_ne!(
+            baseline.digest(),
+            &digest(LEGACY_WRAPPER_DOMAIN, &legacy_v1).unwrap()
+        );
+
+        let repeated = authority(vec![launch(b"kernel_a", 4)]);
+        assert_eq!(repeated.canonical_encoding(), baseline.canonical_encoding());
+        assert_eq!(repeated.digest(), baseline.digest());
     }
 
     #[test]
@@ -468,7 +623,7 @@ mod tests {
             |changed: &mut StaticCudaWrapperAuthority| changed.semantic_effect_identity[0] ^= 1,
             |changed: &mut StaticCudaWrapperAuthority| changed.aggregate_contract_identity[0] ^= 1,
             |changed: &mut StaticCudaWrapperAuthority| changed.linked_module_identity[0] ^= 1,
-            |changed: &mut StaticCudaWrapperAuthority| changed.aggregate_launch_identity[0] ^= 1,
+            |changed: &mut StaticCudaWrapperAuthority| changed.aggregate_execution_identity[0] ^= 1,
         ];
         for mutate in authority_mutations {
             let mut changed = baseline.clone();
@@ -477,27 +632,31 @@ mod tests {
         }
 
         let mut order = baseline.clone();
-        order.launches.swap(0, 2);
+        order.execution_steps.swap(0, 2);
         mutations.push(order);
-        for launch_index in 0..baseline.launches.len() {
+        for launch_index in 0..baseline.execution_steps.len() {
             let mut symbol = baseline.clone();
-            symbol.launches[launch_index].symbol[0] ^= 1;
+            kernel_mut(&mut symbol, launch_index).symbol[0] ^= 1;
             mutations.push(symbol);
             for axis in 0..3 {
                 let mut grid = baseline.clone();
-                grid.launches[launch_index].launch.grid[axis] += 1;
+                kernel_mut(&mut grid, launch_index).launch.grid[axis] += 1;
                 mutations.push(grid);
 
                 let mut block = baseline.clone();
-                block.launches[launch_index].launch.block[axis] += 1;
+                kernel_mut(&mut block, launch_index).launch.block[axis] += 1;
                 mutations.push(block);
             }
             let mut shared = baseline.clone();
-            shared.launches[launch_index].launch.dynamic_shared_bytes += 4;
+            kernel_mut(&mut shared, launch_index)
+                .launch
+                .dynamic_shared_bytes += 4;
             mutations.push(shared);
 
             let mut cooperative = baseline.clone();
-            cooperative.launches[launch_index].launch.cooperative = true;
+            kernel_mut(&mut cooperative, launch_index)
+                .launch
+                .cooperative = true;
             mutations.push(cooperative);
         }
 
@@ -523,3 +682,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "static_wrapper/library_tests.rs"]
+mod library_tests;

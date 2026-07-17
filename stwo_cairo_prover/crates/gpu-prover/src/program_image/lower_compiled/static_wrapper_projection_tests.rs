@@ -54,8 +54,9 @@ fn ec_op_projection_copies_every_exact_linked_receipt() {
     );
     assert_eq!(projected.linked_module_identity(), &linked.identity);
     assert_eq!(projected.accepted_effect(), lowered.effect.id());
-    assert_eq!(projected.launches().len(), linked.launches.len());
-    for (projected, exact) in projected.launches().iter().zip(linked.launches) {
+    let projected_launches = projected.kernel_launches().collect::<Vec<_>>();
+    assert_eq!(projected_launches.len(), linked.launches.len());
+    for (projected, exact) in projected_launches.into_iter().zip(linked.launches) {
         assert_eq!(projected.symbol(), exact.entry_symbol.as_bytes());
         assert_eq!(projected.launch().grid, exact.launch.grid);
         assert_eq!(projected.launch().block, exact.launch.block);
@@ -144,22 +145,23 @@ fn direct_blake_g_projection_copies_every_exact_linked_receipt() {
     );
     assert_eq!(projected.linked_module_identity(), &linked.identity);
     assert_eq!(projected.accepted_effect(), lowered.effect.id());
-    assert_eq!(projected.launches().len(), 1);
+    let projected_launches = projected.kernel_launches().collect::<Vec<_>>();
+    assert_eq!(projected_launches.len(), 1);
     assert_eq!(
-        projected.launches()[0].symbol(),
+        projected_launches[0].symbol(),
         launch.audited_internal_kernel_symbol().as_bytes()
     );
-    assert_eq!(projected.launches()[0].launch().grid, launch.grid);
-    assert_eq!(projected.launches()[0].launch().block, launch.block);
+    assert_eq!(projected_launches[0].launch().grid, launch.grid);
+    assert_eq!(projected_launches[0].launch().block, launch.block);
     assert_eq!(
-        projected.launches()[0].launch().dynamic_shared_bytes,
+        projected_launches[0].launch().dynamic_shared_bytes,
         launch.dynamic_shared_bytes
     );
     assert_eq!(
-        projected.launches()[0].launch().cooperative,
+        projected_launches[0].launch().cooperative,
         launch.cooperative
     );
-    assert_eq!(projected.launches()[0].launch().cluster, None);
+    assert_eq!(projected_launches[0].launch().cluster, None);
 }
 
 #[test]
