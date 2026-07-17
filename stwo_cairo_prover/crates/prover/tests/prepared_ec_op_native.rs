@@ -16,9 +16,10 @@ use stwo_backend_cuda::{
     ArenaSlotId, ArenaSlotSpec, CudaExecContext, DeviceArena, EcOpArenaSlotRequirement,
     EcOpMultiplicityGeometry, EcOpWorkspaceRequirements, EcOpWorkspaceSlots,
     ExecutionTablesArenaSlotRequirement, ExecutionTablesHostData,
-    ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots, PreparedEcOpGraph,
-    PreparedExecutionTablesGraph, EC_OP_LOOKUP_WORDS_PER_ROW, EC_OP_PARTIAL_INPUT_COLUMNS,
-    EC_OP_TRACE_COLUMNS, EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_SMALL_LIMBS,
+    ExecutionTablesWorkspaceRequirements, ExecutionTablesWorkspaceSlots, PreparedEcOpError,
+    PreparedEcOpGraph, PreparedExecutionTablesGraph, EC_OP_LOOKUP_WORDS_PER_ROW,
+    EC_OP_PARTIAL_INPUT_COLUMNS, EC_OP_TRACE_COLUMNS, EXECUTION_TABLE_BIG_LIMBS,
+    EXECUTION_TABLE_SMALL_LIMBS,
 };
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
@@ -387,7 +388,14 @@ fn prepared_ec_op_eager_capture_and_mutated_replay_match_generated_simd() {
         &ec_op_slot_ids,
     )
     .unwrap();
+    assert_eq!(ec_op.segment_start_receipt(), None);
+    assert!(matches!(
+        ec_op.launch(),
+        Err(PreparedEcOpError::SegmentStartNotIngested)
+    ));
     let ingest = ec_op.ingest_segment_start(first.segment_start).unwrap();
+    let first_receipt = ec_op.segment_start_receipt().unwrap();
+    assert!(ec_op.segment_start_is_current(&first_receipt));
     assert_eq!(ingest.h2d_bytes, 0);
     assert_eq!(ingest.h2d_copies, 0);
     assert_eq!(ingest.fill_calls, 1);
@@ -421,6 +429,10 @@ fn prepared_ec_op_eager_capture_and_mutated_replay_match_generated_simd() {
     execution.ingest(second.tables()).unwrap();
     execution.launch().unwrap();
     ec_op.ingest_segment_start(second.segment_start).unwrap();
+    let second_receipt = ec_op.segment_start_receipt().unwrap();
+    assert!(!ec_op.segment_start_is_current(&first_receipt));
+    assert!(ec_op.segment_start_is_current(&second_receipt));
+    assert!(second_receipt.generation() > first_receipt.generation());
     clear_multiplicities(&arena, &ec_op);
     captured.launch(arena.context()).unwrap();
     assert_eq!(

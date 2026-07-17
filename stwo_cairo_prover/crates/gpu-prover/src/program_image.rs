@@ -33,8 +33,9 @@ mod lower_compiled;
 use identity::ArenaProgramInventoryIdentity;
 pub(crate) use lower_compiled::{
     bind_replacement_base_authority, compile_replacement_base_authority, BaseProducerAuthority,
-    BaseProducerAuthorityError, LoadedBaseProducerAuthority, PreparedBlakeGDirectKernel,
-    PreparedRecordedKernel,
+    BaseProducerAuthorityError, LoadedBaseProducerAuthority, PreparedBaseProducerInventory,
+    PreparedBlakeGDirectKernel, PreparedEcOpSegment, PreparedGenericMultiplicityFeed,
+    PreparedPublicMemorySeed, PreparedRecordedKernel,
 };
 
 /// Dense ID for one arena inventory entry. This is deliberately not named a

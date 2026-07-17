@@ -215,7 +215,7 @@ impl PhaseGraph {
 
     /// Enqueue one replay. Synchronization belongs to the real transcript edge,
     /// not graph launch, so this method never blocks the host.
-    pub fn replay(&self, arena: &DeviceArena) -> Result<(), GraphError> {
+    pub(crate) fn replay(&self, arena: &DeviceArena) -> Result<(), GraphError> {
         let launch_base = arena.base_ptr().as_ptr() as usize;
         require_arena_identity(self.arena_base, launch_base)?;
         self.exec.launch(arena.context())?;
@@ -380,7 +380,7 @@ impl GraphWorkspace {
         Ok((bind_arena_binding(&self.arena, binding)?, binding.len_words))
     }
 
-    pub fn graph(&self, key: GraphKey) -> Option<Ref<'_, PhaseGraph>> {
+    pub(crate) fn graph(&self, key: GraphKey) -> Option<Ref<'_, PhaseGraph>> {
         if self.owns_key(key) {
             self.graphs.get(key)
         } else {
@@ -388,7 +388,7 @@ impl GraphWorkspace {
         }
     }
 
-    pub fn graph_segment(&self, segment: GraphSegment) -> Option<Ref<'_, PhaseGraph>> {
+    pub(crate) fn graph_segment(&self, segment: GraphSegment) -> Option<Ref<'_, PhaseGraph>> {
         self.graph(self.key(segment))
     }
 
@@ -441,7 +441,7 @@ impl GraphWorkspace {
             })
     }
 
-    pub fn replay_segment(&self, segment: GraphSegment) -> Result<(), GraphError> {
+    pub(crate) fn replay_segment(&self, segment: GraphSegment) -> Result<(), GraphError> {
         let key = self.key(segment);
         let graph = self
             .graphs

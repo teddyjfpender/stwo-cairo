@@ -11,13 +11,14 @@
 
 use std::collections::BTreeSet;
 
-use stwo_backend_cuda::{DeviceArena, EcOpCompositeContract, PreparedWitnessGraph};
+use stwo_backend_cuda::{
+    DeviceArena, EcOpCompositeContract, EcOpSegmentStartReceipt, PreparedEcOpGraph,
+    PreparedExecutionTablesGraph, PreparedWitnessFeedClearGraph, PreparedWitnessFeedGraph,
+    PreparedWitnessGraph, WitnessFeedSourceUploadReceipt,
+};
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
 pub(crate) use super::blake_g_direct_execution_authority::PreparedBlakeGDirectKernel;
-use super::blake_g_direct_execution_authority::{
-    NativeBlakeGDirectExecutionAuthority, NativeBlakeGDirectLinkedModuleAuthority,
-};
 use super::ec_op_execution_authority::{
     NativeEcOpCompositeExecutionAuthority, NativeEcOpLinkedModuleAuthority,
 };
@@ -178,12 +179,9 @@ impl SemanticBaseProducer {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct LoadedBaseProducerAuthority {
-    _recorded_receipts: Vec<super::loaded_authority::LoadedRecordedWitnessAuthority>,
-    _native_blake_g_direct_receipt: Option<NativeBlakeGDirectExecutionAuthority>,
-    _native_ec_op_receipt: Option<NativeEcOpCompositeExecutionAuthority>,
-}
+pub(crate) use super::loaded_base_binding::{
+    LoadedBaseProducerAuthority, PreparedRegisteredFixedSource,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedRecordedKernel<'prepared, 'arena> {
@@ -193,7 +191,50 @@ pub(crate) struct PreparedRecordedKernel<'prepared, 'arena> {
     pub(crate) writer: &'prepared PreparedWitnessGraph<'arena>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedGenericMultiplicityFeed<'prepared, 'arena> {
+    pub(crate) component: &'static str,
+    pub(crate) part: stwo_cairo_prover::witness::proof_shape::TracePartId,
+    pub(crate) graph: &'prepared PreparedWitnessFeedGraph<'arena>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedPublicMemorySeed<'prepared, 'arena> {
+    pub(crate) graph: &'prepared PreparedWitnessFeedGraph<'arena>,
+    pub(crate) receipt: WitnessFeedSourceUploadReceipt,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedEcOpSegment<'prepared, 'arena> {
+    pub(crate) graph: &'prepared PreparedEcOpGraph<'arena>,
+    pub(crate) receipt: EcOpSegmentStartReceipt,
+}
+
+/// Complete raw runtime inventory for one exact Base witness prefix.
+///
+/// The binder consumes this as a closed set: duplicates, omissions, extras,
+/// or a graph paired with the wrong schedule node are rejected.
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedBaseProducerInventory<'prepared, 'arena> {
+    pub(crate) arena: &'arena DeviceArena,
+    pub(crate) registered_fixed_sources: &'prepared [PreparedRegisteredFixedSource],
+    pub(crate) execution_tables: Option<&'prepared PreparedExecutionTablesGraph<'arena>>,
+    pub(crate) recorded: &'prepared [PreparedRecordedKernel<'prepared, 'arena>],
+    pub(crate) clear: &'prepared PreparedWitnessFeedClearGraph<'arena>,
+    pub(crate) public_memory_seed: Option<PreparedPublicMemorySeed<'prepared, 'arena>>,
+    pub(crate) generic_feeds: &'prepared [PreparedGenericMultiplicityFeed<'prepared, 'arena>],
+    pub(crate) blake_g_direct: Option<PreparedBlakeGDirectKernel<'prepared, 'arena>>,
+    pub(crate) ec_op_segment: Option<PreparedEcOpSegment<'prepared, 'arena>>,
+}
+
 impl BaseProducerAuthority {
+    pub(crate) fn prepare_registered_fixed_sources(
+        &self,
+    ) -> Result<Vec<PreparedRegisteredFixedSource>, BaseProducerAuthorityError> {
+        super::loaded_base_binding::prepare_registered_fixed_sources(self)
+            .map_err(|_| BaseProducerAuthorityError)
+    }
+
     pub(super) fn compile_replacement(
         arena: &ProofArenaPlan,
         preprocessed_trace_variant: PreProcessedTraceVariant,
@@ -382,8 +423,7 @@ impl BaseProducerAuthority {
     pub(super) fn bind_loaded(
         &self,
         arena: &ProofArenaPlan,
-        prepared: &[PreparedRecordedKernel<'_, '_>],
-        prepared_blake_g_direct: Option<PreparedBlakeGDirectKernel<'_, '_>>,
+        prepared: PreparedBaseProducerInventory<'_, '_>,
         device_ordinal: u32,
         sm_major: u32,
         sm_minor: u32,
@@ -391,12 +431,6 @@ impl BaseProducerAuthority {
         if self != &Self::compile_replacement(arena, self.preprocessed_trace_variant)? {
             return Err(InvocationShapeError::InvalidProductionBaseAuthority);
         }
-        let catalog = BaseProducerCatalog::compile(arena)?;
-        let mut remaining = prepared.iter().collect::<Vec<_>>();
-        let mut prepared_blake_g_direct = prepared_blake_g_direct;
-        let mut recorded = Vec::new();
-        let mut native_blake_g_direct = None;
-        let mut native_ec_op = None;
         if sm_minor >= 10 {
             return Err(InvocationShapeError::InvalidProductionBaseAuthority);
         }
@@ -404,72 +438,15 @@ impl BaseProducerAuthority {
             .checked_mul(10)
             .and_then(|major| major.checked_add(sm_minor))
             .ok_or(InvocationShapeError::SizeOverflow)?;
-        for producer in &self.producers {
-            match producer {
-                SemanticBaseProducer::Recorded(producer) => {
-                    let index = remaining
-                        .iter()
-                        .position(|prepared| {
-                            prepared.component == producer.producer.component
-                                && Some(prepared.part) == producer.producer.part
-                        })
-                        .ok_or(InvocationShapeError::InvalidProductionBaseAuthority)?;
-                    let prepared = remaining.swap_remove(index);
-                    let planned = planned_recorded_component(arena, producer.producer)?;
-                    let loaded = super::loaded_authority::require_prepared(
-                        &producer.source,
-                        &catalog,
-                        planned,
-                        prepared.arena,
-                        prepared.writer,
-                        device_ordinal,
-                        sm_major,
-                        sm_minor,
-                    )?;
-                    recorded.push(loaded);
-                }
-                SemanticBaseProducer::NativeBlakeGDirect { contract, .. } => {
-                    if native_blake_g_direct.is_some() {
-                        return Err(InvocationShapeError::InvalidNativeBlakeGDirectAuthority);
-                    }
-                    let prepared = prepared_blake_g_direct
-                        .take()
-                        .ok_or(InvocationShapeError::MissingNativeBlakeGDirectAuthority)?;
-                    let linked = NativeBlakeGDirectLinkedModuleAuthority::bind_linked(
-                        &contract.authority,
-                        active_sm,
-                    )?
-                    .ok_or(InvocationShapeError::MissingNativeBlakeGDirectAuthority)?;
-                    native_blake_g_direct = Some(linked.bind_prepared(
-                        &contract.authority,
-                        contract,
-                        arena,
-                        prepared,
-                    )?);
-                }
-                SemanticBaseProducer::NativeEcOp { contract, .. } => {
-                    if native_ec_op.is_some() {
-                        return Err(InvocationShapeError::InvalidNativeEcOpAuthority);
-                    }
-                    let linked = NativeEcOpLinkedModuleAuthority::bind_linked(&contract.authority)?
-                        .ok_or(InvocationShapeError::InvalidNativeEcOpAuthority)?;
-                    linked.validate_active_sm(active_sm)?;
-                    native_ec_op = Some(linked.bind_lowered(
-                        &contract.authority,
-                        &contract.invocation,
-                        &contract.effect,
-                    )?);
-                }
-            }
-        }
-        if !remaining.is_empty() || prepared_blake_g_direct.is_some() {
-            return Err(InvocationShapeError::InvalidProductionBaseAuthority);
-        }
-        Ok(LoadedBaseProducerAuthority {
-            _recorded_receipts: recorded,
-            _native_blake_g_direct_receipt: native_blake_g_direct,
-            _native_ec_op_receipt: native_ec_op,
-        })
+        super::loaded_base_binding::bind(
+            self,
+            arena,
+            prepared,
+            device_ordinal,
+            sm_major,
+            sm_minor,
+            active_sm,
+        )
     }
 }
 

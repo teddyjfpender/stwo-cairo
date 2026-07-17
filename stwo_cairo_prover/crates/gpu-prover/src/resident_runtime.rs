@@ -63,7 +63,8 @@ use crate::prepared_composition::{
 };
 use crate::program_image::{
     bind_replacement_base_authority, BaseProducerAuthority, LoadedBaseProducerAuthority,
-    PreparedBlakeGDirectKernel, PreparedRecordedKernel,
+    PreparedBaseProducerInventory, PreparedBlakeGDirectKernel, PreparedEcOpSegment,
+    PreparedGenericMultiplicityFeed, PreparedPublicMemorySeed, PreparedRecordedKernel,
 };
 use crate::proof_bundle::{
     ResidentProofBundle, ResidentProofBundleError, ResidentProofBundleLayout,
@@ -934,6 +935,7 @@ enum WitnessLaneLaunchError {
     Input(PreparedWitnessInputGatherError),
     Writer(PreparedWitnessError),
     Feed(PreparedWitnessFeedError),
+    Authority,
 }
 
 impl core::fmt::Display for WitnessLaneLaunchError {
@@ -952,6 +954,7 @@ impl From<WitnessLaneLaunchError> for ResidentRuntimeError {
             WitnessLaneLaunchError::Input(error) => Self::WitnessInputGather(error),
             WitnessLaneLaunchError::Writer(error) => Self::Witness(error),
             WitnessLaneLaunchError::Feed(error) => Self::WitnessFeed(error),
+            WitnessLaneLaunchError::Authority => Self::BaseProducerAuthority,
         }
     }
 }
@@ -1090,7 +1093,11 @@ fn enqueue_witness_lane_levels(
     ec_op: Option<&PreparedEcOpGraph<'_>>,
     levels: &[Vec<Vec<usize>>],
     multiplicity: Option<&PreparedResidentMultiplicity<'_>>,
+    witness_feed_indices: &[Option<usize>],
 ) -> Result<(), WitnessLaneLaunchError> {
+    if witness_feed_indices.len() != witness.len() {
+        return Err(WitnessLaneLaunchError::Authority);
+    }
     let context = arena.context();
     for level in levels {
         let active_lanes = level
@@ -1139,12 +1146,19 @@ fn enqueue_witness_lane_levels(
                                 .launch_on(launch)
                                 .map_err(WitnessLaneLaunchError::Input)?;
                         }
-                        let feed = multiplicity.and_then(|multiplicity| {
-                            multiplicity
-                                .feeds
-                                .iter()
-                                .find(|feed| feed.producer() == graph.component)
-                        });
+                        let feed = match (
+                            multiplicity,
+                            witness_feed_indices.get(component).copied().flatten(),
+                        ) {
+                            (Some(multiplicity), Some(feed)) => Some(
+                                multiplicity
+                                    .feeds
+                                    .get(feed)
+                                    .ok_or(WitnessLaneLaunchError::Authority)?,
+                            ),
+                            (None, None) => None,
+                            _ => return Err(WitnessLaneLaunchError::Authority),
+                        };
                         if let Some(PreparedResidentFeed::BlakeGFused { binding, .. }) = feed {
                             if graph.writer.is_blake_g_direct() {
                                 graph.writer.launch_blake_g_direct_on(
@@ -1210,20 +1224,101 @@ struct PreparedResidentMultiplicity<'a> {
 enum PreparedResidentFeed<'a> {
     Generic {
         producer: &'static str,
+        part: TracePartId,
         graph: PreparedWitnessFeedGraph<'a>,
     },
     BlakeGFused {
         producer: &'static str,
+        part: TracePartId,
         binding: PreparedBlakeGFusedFeed<'a>,
     },
 }
 
 impl PreparedResidentFeed<'_> {
-    fn producer(&self) -> &'static str {
+    fn key(&self) -> (&'static str, TracePartId) {
         match self {
-            Self::Generic { producer, .. } | Self::BlakeGFused { producer, .. } => producer,
+            Self::Generic { producer, part, .. } | Self::BlakeGFused { producer, part, .. } => {
+                (*producer, *part)
+            }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WitnessFeedKey {
+    component: &'static str,
+    part: TracePartId,
+    fused: bool,
+}
+
+fn witness_feed_identity(component: &'static str, part: TracePartId) -> (&'static str, u8, u32) {
+    match part {
+        TracePartId::Main => (component, 0, 0),
+        TracePartId::MemoryBig(ordinal) => (component, 1, ordinal),
+        TracePartId::MemorySmall => (component, 2, 0),
+    }
+}
+
+fn exact_witness_feed_index_map(
+    witness: &[WitnessFeedKey],
+    feeds: &[WitnessFeedKey],
+) -> Result<Vec<Option<usize>>, ()> {
+    if feeds.len() != witness.len() {
+        return Err(());
+    }
+    let mut remaining = BTreeMap::new();
+    for (index, feed) in feeds.iter().copied().enumerate() {
+        if remaining
+            .insert(
+                witness_feed_identity(feed.component, feed.part),
+                (index, feed.fused),
+            )
+            .is_some()
+        {
+            return Err(());
+        }
+    }
+    let indices = witness
+        .iter()
+        .map(|expected| {
+            let (index, fused) = remaining
+                .remove(&witness_feed_identity(expected.component, expected.part))
+                .ok_or(())?;
+            (fused == expected.fused).then_some(Some(index)).ok_or(())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    remaining.is_empty().then_some(indices).ok_or(())
+}
+
+fn exact_witness_feed_indices(
+    witness: &[PreparedResidentWitness<'_>],
+    multiplicity: Option<&PreparedResidentMultiplicity<'_>>,
+) -> Result<Vec<Option<usize>>, ResidentRuntimeError> {
+    let Some(multiplicity) = multiplicity else {
+        return Ok(vec![None; witness.len()]);
+    };
+    let witness = witness
+        .iter()
+        .map(|prepared| WitnessFeedKey {
+            component: prepared.component,
+            part: prepared.part,
+            fused: prepared.writer.is_blake_g_fused() || prepared.writer.is_blake_g_direct(),
+        })
+        .collect::<Vec<_>>();
+    let feeds = multiplicity
+        .feeds
+        .iter()
+        .map(|feed| {
+            let (component, part) = feed.key();
+            WitnessFeedKey {
+                component,
+                part,
+                fused: matches!(feed, PreparedResidentFeed::BlakeGFused { .. }),
+            }
+        })
+        .collect::<Vec<_>>();
+    exact_witness_feed_index_map(&witness, &feeds)
+        .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)
 }
 
 fn slice_matches_slot(slice: ArenaSlice, slot: ArenaSlotId, required_words: usize) -> bool {
@@ -1568,13 +1663,14 @@ fn prepare_trace_commit_input<'a>(
 pub struct ResidentGraphRuntime<'a> {
     execution_config: SealedResidentExecutionConfig,
     base_producer_schedule: BaseProducerSchedule,
-    _loaded_base_producers: Option<LoadedBaseProducerAuthority>,
+    loaded_base_producers: Option<LoadedBaseProducerAuthority>,
     execution_tables: Option<PreparedExecutionTablesGraph<'a>>,
     execution_tables_ingest: Option<PreparedExecutionTablesIngestTelemetry>,
     ec_op: Option<PreparedEcOpGraph<'a>>,
     ec_op_ingest: Option<PreparedEcOpIngestTelemetry>,
     witness: Vec<PreparedResidentWitness<'a>>,
     witness_lane_levels: Vec<Vec<Vec<usize>>>,
+    witness_feed_indices: Vec<Option<usize>>,
     multiplicity: Option<PreparedResidentMultiplicity<'a>>,
     commitments: Vec<(CommitmentTreeId, PreparedResidentCommitment<'a>)>,
     base_commit_input: PreparedTraceCommitInput<'a>,
@@ -1903,6 +1999,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             )?;
                             Ok::<_, ResidentRuntimeError>(PreparedResidentFeed::Generic {
                                 producer: feed.plan.producer,
+                                part: TracePartId::Main,
                                 graph,
                             })
                         }
@@ -1946,6 +2043,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                             )?;
                             Ok(PreparedResidentFeed::BlakeGFused {
                                 producer: plan.producer,
+                                part: TracePartId::Main,
                                 binding,
                             })
                         }
@@ -2125,6 +2223,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             }
             None => None,
         };
+        let witness_feed_indices = exact_witness_feed_indices(&witness, multiplicity.as_ref())?;
         let (ec_op, ec_op_ingest) = match (workspace.plan().ec_op(), ec_op_segment_start) {
             (Some(planned), Some(segment_start)) => {
                 let execution = execution_tables
@@ -2155,6 +2254,23 @@ impl<'a> ResidentGraphRuntime<'a> {
                         writer: &prepared.writer,
                     })
                     .collect::<Vec<_>>();
+                let generic_feeds = multiplicity
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|prepared| &prepared.feeds)
+                    .filter_map(|feed| match feed {
+                        PreparedResidentFeed::Generic {
+                            producer,
+                            part,
+                            graph,
+                        } => Some(PreparedGenericMultiplicityFeed {
+                            component: producer,
+                            part: *part,
+                            graph,
+                        }),
+                        PreparedResidentFeed::BlakeGFused { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
                 let direct_writers = witness
                     .iter()
                     .filter(|prepared| prepared.writer.is_blake_g_direct())
@@ -2164,9 +2280,9 @@ impl<'a> ResidentGraphRuntime<'a> {
                     .into_iter()
                     .flat_map(|prepared| &prepared.feeds)
                     .filter_map(|feed| match feed {
-                        PreparedResidentFeed::BlakeGFused { producer, binding } => {
-                            Some((*producer, binding))
-                        }
+                        PreparedResidentFeed::BlakeGFused {
+                            producer, binding, ..
+                        } => Some((*producer, binding)),
                         PreparedResidentFeed::Generic { .. } => None,
                     })
                     .collect::<Vec<_>>();
@@ -2196,12 +2312,46 @@ impl<'a> ResidentGraphRuntime<'a> {
                 if !replacement_device_is_exact(device) {
                     return Err(ResidentRuntimeError::BaseProducerAuthority);
                 }
+                let multiplicity = multiplicity
+                    .as_ref()
+                    .ok_or(ResidentRuntimeError::BaseProducerAuthority)?;
+                let public_memory_seed = multiplicity
+                    .public_memory_seed
+                    .as_ref()
+                    .map(|graph| {
+                        graph
+                            .source_upload_receipt()
+                            .map(|receipt| PreparedPublicMemorySeed { graph, receipt })
+                            .ok_or(ResidentRuntimeError::BaseProducerAuthority)
+                    })
+                    .transpose()?;
+                let ec_op_segment = ec_op
+                    .as_ref()
+                    .map(|graph| {
+                        graph
+                            .segment_start_receipt()
+                            .map(|receipt| PreparedEcOpSegment { graph, receipt })
+                            .ok_or(ResidentRuntimeError::BaseProducerAuthority)
+                    })
+                    .transpose()?;
+                let registered_fixed_sources = authority
+                    .prepare_registered_fixed_sources()
+                    .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)?;
                 Some(
                     bind_replacement_base_authority(
                         authority,
                         workspace.plan(),
-                        &recorded,
-                        prepared_blake_g_direct,
+                        PreparedBaseProducerInventory {
+                            arena,
+                            registered_fixed_sources: &registered_fixed_sources,
+                            execution_tables: execution_tables.as_ref(),
+                            recorded: &recorded,
+                            clear: &multiplicity.clear,
+                            public_memory_seed,
+                            generic_feeds: &generic_feeds,
+                            blake_g_direct: prepared_blake_g_direct,
+                            ec_op_segment,
+                        },
                         device.current,
                         device.sm_major,
                         device.sm_minor,
@@ -2772,13 +2922,14 @@ impl<'a> ResidentGraphRuntime<'a> {
         let runtime = Self {
             execution_config,
             base_producer_schedule,
-            _loaded_base_producers: loaded_base_producers,
+            loaded_base_producers,
             execution_tables,
             execution_tables_ingest,
             ec_op,
             ec_op_ingest,
             witness,
             witness_lane_levels,
+            witness_feed_indices,
             multiplicity,
             commitments,
             base_commit_input,
@@ -2849,62 +3000,155 @@ impl<'a> ResidentGraphRuntime<'a> {
         ec_op_segment_start: Option<usize>,
         public_memory_seed_host: Option<&[u32]>,
     ) -> Result<ResidentStatementRefreshTelemetry, ResidentRuntimeError> {
-        self.execution_tables_ingest = match (&self.execution_tables, execution_tables_host) {
-            (Some(prepared), Some(host)) => Some(prepared.ingest(host)?),
-            (Some(_), None) => return Err(ResidentRuntimeError::MissingPreparedExecutionTables),
-            (None, Some(_)) => return Err(ResidentRuntimeError::UnexpectedPreparedExecutionTables),
-            (None, None) => None,
-        };
-        self.ec_op_ingest = match (&self.ec_op, ec_op_segment_start) {
-            (Some(prepared), Some(segment_start)) => {
-                Some(prepared.ingest_segment_start(segment_start)?)
+        if let Some(loaded) = self.loaded_base_producers.as_mut() {
+            loaded.begin_statement_sources();
+        }
+        let result = (|| {
+            let execution_tables_ingest = match (&self.execution_tables, execution_tables_host) {
+                (Some(prepared), Some(host)) => Some(prepared.ingest(host)?),
+                (Some(_), None) => {
+                    return Err(ResidentRuntimeError::MissingPreparedExecutionTables)
+                }
+                (None, Some(_)) => {
+                    return Err(ResidentRuntimeError::UnexpectedPreparedExecutionTables)
+                }
+                (None, None) => None,
+            };
+            if let (Some(loaded), Some(prepared)) = (
+                self.loaded_base_producers.as_mut(),
+                self.execution_tables.as_ref(),
+            ) {
+                let receipt = prepared
+                    .ingest_receipt()
+                    .ok_or(ResidentRuntimeError::BaseProducerAuthority)?;
+                loaded
+                    .refresh_execution_tables(self.workspace.arena(), prepared, receipt)
+                    .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)?;
             }
-            (Some(_), None) => return Err(ResidentRuntimeError::MissingPreparedEcOpSegment),
-            (None, Some(_)) => return Err(ResidentRuntimeError::UnexpectedPreparedEcOpSegment),
-            (None, None) => None,
-        };
+            self.execution_tables_ingest = execution_tables_ingest;
 
-        let public_seed = self
-            .multiplicity
-            .as_ref()
-            .and_then(|multiplicity| multiplicity.public_memory_seed.as_ref());
-        let (
-            public_memory_seed_h2d_bytes,
-            public_memory_seed_h2d_copies,
-            public_memory_seed_sync_calls,
-        ) = match (public_seed, public_memory_seed_host) {
-            (Some(prepared), Some(words)) => {
-                prepared.upload_source(words)?;
-                (
-                    words
-                        .len()
-                        .checked_mul(core::mem::size_of::<u32>())
-                        .ok_or(ResidentRuntimeError::SizeOverflow)?,
-                    usize::from(!words.is_empty()),
-                    1,
-                )
+            self.ec_op_ingest = match (&self.ec_op, ec_op_segment_start) {
+                (Some(prepared), Some(segment_start)) => {
+                    let telemetry = prepared.ingest_segment_start(segment_start)?;
+                    if let Some(loaded) = self.loaded_base_producers.as_mut() {
+                        let receipt = prepared
+                            .segment_start_receipt()
+                            .ok_or(ResidentRuntimeError::BaseProducerAuthority)?;
+                        loaded
+                            .refresh_ec_op_segment_start(self.workspace.arena(), prepared, receipt)
+                            .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)?;
+                    }
+                    Some(telemetry)
+                }
+                (Some(_), None) => return Err(ResidentRuntimeError::MissingPreparedEcOpSegment),
+                (None, Some(_)) => return Err(ResidentRuntimeError::UnexpectedPreparedEcOpSegment),
+                (None, None) => None,
+            };
+
+            let public_seed = self
+                .multiplicity
+                .as_ref()
+                .and_then(|multiplicity| multiplicity.public_memory_seed.as_ref());
+            let (
+                public_memory_seed_h2d_bytes,
+                public_memory_seed_h2d_copies,
+                public_memory_seed_sync_calls,
+            ) = match (public_seed, public_memory_seed_host) {
+                (Some(prepared), Some(words)) => {
+                    let receipt = prepared.upload_source(words)?;
+                    if let Some(loaded) = self.loaded_base_producers.as_mut() {
+                        loaded
+                            .refresh_public_memory_seed(self.workspace.arena(), prepared, receipt)
+                            .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)?;
+                    }
+                    (
+                        words
+                            .len()
+                            .checked_mul(core::mem::size_of::<u32>())
+                            .ok_or(ResidentRuntimeError::SizeOverflow)?,
+                        usize::from(!words.is_empty()),
+                        1,
+                    )
+                }
+                (Some(_), None) => {
+                    return Err(ResidentRuntimeError::PublicMemoryMultiplicitySeed(
+                        "prepared seed has no claim-bound source",
+                    ))
+                }
+                (None, Some(_)) => {
+                    return Err(ResidentRuntimeError::PublicMemoryMultiplicitySeed(
+                        "claim-bound source has no prepared seed",
+                    ))
+                }
+                (None, None) => (0, 0, 0),
+            };
+            let composition = self
+                .composition
+                .refresh_proof_bindings(composition_bindings)?;
+            // Witness and static transcript ingress are statement sources too.
+            // The transcript upload publishes only after both setup fences
+            // have drained.
+            Ok(ResidentStatementRefreshTelemetry {
+                public_memory_seed_h2d_bytes,
+                public_memory_seed_h2d_copies,
+                public_memory_seed_sync_calls,
+                composition,
+            })
+        })();
+        if result.is_err() {
+            if let Some(loaded) = self.loaded_base_producers.as_mut() {
+                loaded.invalidate_statement_sources();
             }
-            (Some(_), None) => {
-                return Err(ResidentRuntimeError::PublicMemoryMultiplicitySeed(
-                    "prepared seed has no claim-bound source",
-                ))
-            }
-            (None, Some(_)) => {
-                return Err(ResidentRuntimeError::PublicMemoryMultiplicitySeed(
-                    "claim-bound source has no prepared seed",
-                ))
-            }
-            (None, None) => (0, 0, 0),
+        }
+        result
+    }
+
+    fn validate_base_statement_sources(&mut self) -> Result<(), ResidentRuntimeError> {
+        let Some(loaded) = &mut self.loaded_base_producers else {
+            return Ok(());
         };
-        let composition = self
-            .composition
-            .refresh_proof_bindings(composition_bindings)?;
-        Ok(ResidentStatementRefreshTelemetry {
-            public_memory_seed_h2d_bytes,
-            public_memory_seed_h2d_copies,
-            public_memory_seed_sync_calls,
-            composition,
-        })
+        loaded
+            .validate_statement_sources(
+                self.workspace.arena(),
+                self.execution_tables.as_ref(),
+                self.multiplicity
+                    .as_ref()
+                    .and_then(|multiplicity| multiplicity.public_memory_seed.as_ref()),
+                self.ec_op.as_ref(),
+            )
+            .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)
+    }
+
+    fn validate_before_static_transcript_upload(&mut self) -> Result<(), ResidentRuntimeError> {
+        let Some(loaded) = &mut self.loaded_base_producers else {
+            return Ok(());
+        };
+        loaded
+            .validate_before_static_transcript_upload(
+                self.workspace.arena(),
+                self.execution_tables.as_ref(),
+                self.multiplicity
+                    .as_ref()
+                    .and_then(|multiplicity| multiplicity.public_memory_seed.as_ref()),
+                self.ec_op.as_ref(),
+            )
+            .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)
+    }
+
+    fn consume_base_statement_sources(&mut self) -> Result<(), ResidentRuntimeError> {
+        let Some(loaded) = self.loaded_base_producers.as_mut() else {
+            return Ok(());
+        };
+        loaded
+            .consume_statement_sources(
+                self.workspace.arena(),
+                self.execution_tables.as_ref(),
+                self.multiplicity
+                    .as_ref()
+                    .and_then(|multiplicity| multiplicity.public_memory_seed.as_ref()),
+                self.ec_op.as_ref(),
+            )
+            .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)
     }
 
     pub fn prepared_numerator_schedule(&self) -> PreparedNumeratorSchedule {
@@ -2915,6 +3159,33 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// targets a stable arena column; one setup fence protects the borrowed host
     /// vectors, and hot-path telemetry is reset only after this boundary.
     pub fn upload_witness_inputs_at_ingest(
+        &mut self,
+        inputs: &[ResidentWitnessInput<'_>],
+    ) -> Result<ResidentWitnessIngestReport, ResidentRuntimeError> {
+        if let Some(loaded) = self.loaded_base_producers.as_mut() {
+            loaded
+                .begin_witness_input_upload_attempt()
+                .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)?;
+        }
+        let result = self
+            .upload_witness_inputs_at_ingest_inner(inputs)
+            .and_then(|report| {
+                if let Some(loaded) = self.loaded_base_producers.as_mut() {
+                    loaded
+                        .complete_witness_input_upload()
+                        .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)?;
+                }
+                Ok(report)
+            });
+        if result.is_err() {
+            if let Some(loaded) = self.loaded_base_producers.as_mut() {
+                loaded.invalidate_statement_sources();
+            }
+        }
+        result
+    }
+
+    fn upload_witness_inputs_at_ingest_inner(
         &self,
         inputs: &[ResidentWitnessInput<'_>],
     ) -> Result<ResidentWitnessIngestReport, ResidentRuntimeError> {
@@ -3237,6 +3508,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         &mut self,
         generation: u64,
     ) -> Result<(), ResidentRuntimeError> {
+        self.validate_base_statement_sources()?;
         self.transcript_cursor.begin_generation(generation)?;
         Ok(())
     }
@@ -3337,6 +3609,34 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// (salt, PCS parameters, public claim material and persistent roots) in one
     /// batch and one synchronization. Large proof data is never accepted here.
     pub fn upload_transcript_inputs_at_ingest(
+        &mut self,
+        inputs: &[(CairoTranscriptInput, Vec<u32>)],
+    ) -> Result<(), ResidentRuntimeError> {
+        if let Some(loaded) = self.loaded_base_producers.as_mut() {
+            loaded
+                .begin_static_transcript_input_upload_attempt()
+                .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)?;
+        }
+        self.validate_before_static_transcript_upload()?;
+        let result = self
+            .upload_transcript_inputs_at_ingest_inner(inputs)
+            .and_then(|_| {
+                if let Some(loaded) = self.loaded_base_producers.as_mut() {
+                    loaded
+                        .complete_static_transcript_input_upload()
+                        .map_err(|_| ResidentRuntimeError::BaseProducerAuthority)?;
+                }
+                Ok(())
+            });
+        if result.is_err() {
+            if let Some(loaded) = self.loaded_base_producers.as_mut() {
+                loaded.invalidate_statement_sources();
+            }
+        }
+        result
+    }
+
+    fn upload_transcript_inputs_at_ingest_inner(
         &self,
         inputs: &[(CairoTranscriptInput, Vec<u32>)],
     ) -> Result<(), ResidentRuntimeError> {
@@ -3371,8 +3671,8 @@ impl<'a> ResidentGraphRuntime<'a> {
         let mut fence = SetupFence::new(context);
         let enqueue = (|| {
             for (destination, words) in uploads {
-                // SAFETY: `words` remains borrowed through the one sync below
-                // and the exact logical destination width was checked above.
+                // SAFETY: `words` remains borrowed through the one sync
+                // below and the exact logical destination width was checked.
                 unsafe {
                     context.memcpy_h2d_async(
                         destination.as_void_ptr(),
@@ -3475,6 +3775,7 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn capture_base_commit_only(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.validate_base_statement_sources()?;
         let commitment_index = self
             .commitments
             .iter()
@@ -3498,6 +3799,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         let ec_op = self.ec_op.as_ref();
         let witness = &self.witness;
         let witness_lane_levels = &self.witness_lane_levels;
+        let witness_feed_indices = &self.witness_feed_indices;
         let multiplicity = self.multiplicity.as_ref();
         let commit_input = &self.base_commit_input;
         let commitment = &self.commitments[commitment_index].1;
@@ -3552,6 +3854,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                     ec_op,
                     witness_lane_levels,
                     multiplicity,
+                    witness_feed_indices,
                 )
                 .map_err(ResidentLaunchError::WitnessLanes)?;
                 if let Some(multiplicity) = multiplicity {
@@ -3908,6 +4211,7 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn replay_base_commit_only(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.consume_base_statement_sources()?;
         let bootstrap =
             self.transcript_segment_index(CairoTranscriptSegment::BootstrapThroughBase)?;
         let pow = self.transcript_segment_index(CairoTranscriptSegment::InteractionPowAndLookup)?;
@@ -4075,7 +4379,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                 actual: self.witness.len(),
             });
         }
-        for (prepared, planned) in self.witness.iter().zip(planned) {
+        for (index, (prepared, planned)) in self.witness.iter().zip(planned).enumerate() {
             let reject = |role| ResidentRuntimeError::PreparedWitnessCaptureContract {
                 component: planned.component,
                 role,
@@ -4098,12 +4402,8 @@ impl<'a> ResidentGraphRuntime<'a> {
             let prepared_feed_is_fused = self
                 .multiplicity
                 .as_ref()
-                .and_then(|multiplicity| {
-                    multiplicity
-                        .feeds
-                        .iter()
-                        .find(|feed| feed.producer() == prepared.component)
-                })
+                .zip(self.witness_feed_indices.get(index).copied().flatten())
+                .and_then(|(multiplicity, feed)| multiplicity.feeds.get(feed))
                 .is_some_and(|feed| matches!(feed, PreparedResidentFeed::BlakeGFused { .. }));
             if prepared_feed_is_fused != uses_fused_feed {
                 return Err(reject("fused feed ownership"));
@@ -4571,6 +4871,7 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn launch_base_commit_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.consume_base_statement_sources()?;
         let mut producer_cursor = self.base_producer_schedule.cursor();
         if let Some(execution_tables) = &self.execution_tables {
             producer_cursor.admit(BaseProducerStep::ExecutionTables)?;
@@ -4596,6 +4897,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             self.ec_op.as_ref(),
             &self.witness_lane_levels,
             self.multiplicity.as_ref(),
+            &self.witness_feed_indices,
         )?;
         if let Some(multiplicity) = &self.multiplicity {
             if let Some(memory) = &multiplicity.memory_traces {
@@ -4908,7 +5210,8 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// prepared witness writers. Call this before any base-commit replay: the
     /// ingest inputs are not live after `ProofEpoch::Witness` and are not
     /// re-uploaded by this diagnostic seam.
-    pub fn replay_witness_only_for_diagnostics(&self) -> Result<(), ResidentRuntimeError> {
+    pub fn replay_witness_only_for_diagnostics(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.consume_base_statement_sources()?;
         if let Some(execution_tables) = &self.execution_tables {
             execution_tables.launch()?;
         }
@@ -4924,6 +5227,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             self.ec_op.as_ref(),
             &self.witness_lane_levels,
             self.multiplicity.as_ref(),
+            &self.witness_feed_indices,
         )?;
         if let Some(multiplicity) = &self.multiplicity {
             if let Some(memory) = &multiplicity.memory_traces {
@@ -5920,6 +6224,39 @@ fn require_complete_captured_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn witness_feed_map_is_exact_unique_and_variant_bound() {
+        let witness = [
+            WitnessFeedKey {
+                component: "alpha",
+                part: TracePartId::Main,
+                fused: false,
+            },
+            WitnessFeedKey {
+                component: "blake_g",
+                part: TracePartId::Main,
+                fused: true,
+            },
+        ];
+        let reversed = [witness[1], witness[0]];
+        assert_eq!(
+            exact_witness_feed_index_map(&witness, &reversed),
+            Ok(vec![Some(1), Some(0)])
+        );
+
+        assert!(exact_witness_feed_index_map(&witness, &reversed[..1]).is_err());
+        assert!(exact_witness_feed_index_map(&witness[..1], &reversed).is_err());
+        assert!(exact_witness_feed_index_map(&witness, &[witness[0], witness[0]]).is_err());
+
+        let mut wrong_variant = reversed;
+        wrong_variant[0].fused = false;
+        assert!(exact_witness_feed_index_map(&witness, &wrong_variant).is_err());
+
+        let mut wrong_part = reversed;
+        wrong_part[1].part = TracePartId::MemoryBig(0);
+        assert!(exact_witness_feed_index_map(&witness, &wrong_part).is_err());
+    }
 
     #[test]
     fn replacement_base_runtime_seam_rejects_policy_cardinality_and_device_drift() {

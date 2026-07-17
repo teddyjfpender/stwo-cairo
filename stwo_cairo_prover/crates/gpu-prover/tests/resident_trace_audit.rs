@@ -65,7 +65,6 @@ const STRICT_RESIDENT_FIXTURE: &str = "test_prove_verify_sn2_profile";
 
 /// Production replay generation: capture consumes generation 1, the first warm
 /// replay is generation 2 (same literal as `tests/resident_smoke.rs`).
-const REPLAY_GENERATION: u64 = 2;
 
 /// Opt-in row capture consumed by the deduce-oracle hardware reproducer.
 const DUMP_POSEIDON_KIND11_ROW0_ENV: &str = "STWO_TRACE_AUDIT_DUMP_POSEIDON_KIND11_ROW0";
@@ -451,13 +450,6 @@ fn audit_resident_base_trace_against_simd_reference() {
             runtime.replay_witness_only_for_diagnostics()?;
             eprintln!("audit: witness-only prefix replayed; reading device base trace");
             let device_parts = collect_device_parts(runtime, artifacts.proof_plan)?;
-
-            // Preserve the original base-boundary device-fault coverage after
-            // readback, while the ingest inputs are still within their planned
-            // lifetime. Never move the diagnostic witness replay after this.
-            runtime.begin_transcript_generation(REPLAY_GENERATION)?;
-            runtime.replay_base_commit_only()?;
-            runtime.read_commitment_root(CommitmentTreeId::Preprocessed)?;
             Ok(device_parts)
         })
         .expect("strict resident session failed");

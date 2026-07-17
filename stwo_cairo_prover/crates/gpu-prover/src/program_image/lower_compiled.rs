@@ -41,6 +41,7 @@ mod ec_op_prefix;
 mod ec_op_setup_sources;
 mod execution_tables;
 mod loaded_authority;
+mod loaded_base_binding;
 mod loaded_writer_binding;
 mod multiplicity_clear;
 mod multiplicity_coordinator;
@@ -62,8 +63,9 @@ mod witness_input_gather_tests;
 mod witness_input_seed_compact;
 
 pub(crate) use producer_prefix::{
-    BaseProducerAuthority, LoadedBaseProducerAuthority, PreparedBlakeGDirectKernel,
-    PreparedRecordedKernel,
+    BaseProducerAuthority, LoadedBaseProducerAuthority, PreparedBaseProducerInventory,
+    PreparedBlakeGDirectKernel, PreparedEcOpSegment, PreparedGenericMultiplicityFeed,
+    PreparedPublicMemorySeed, PreparedRecordedKernel,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,21 +82,13 @@ pub(crate) fn compile_replacement_base_authority(
 pub(crate) fn bind_replacement_base_authority(
     authority: &BaseProducerAuthority,
     arena: &ProofArenaPlan,
-    prepared: &[PreparedRecordedKernel<'_, '_>],
-    prepared_blake_g_direct: Option<PreparedBlakeGDirectKernel<'_, '_>>,
+    prepared: PreparedBaseProducerInventory<'_, '_>,
     device_ordinal: u32,
     sm_major: u32,
     sm_minor: u32,
 ) -> Result<LoadedBaseProducerAuthority, BaseProducerAuthorityError> {
     authority
-        .bind_loaded(
-            arena,
-            prepared,
-            prepared_blake_g_direct,
-            device_ordinal,
-            sm_major,
-            sm_minor,
-        )
+        .bind_loaded(arena, prepared, device_ordinal, sm_major, sm_minor)
         .map_err(|_| BaseProducerAuthorityError)
 }
 
