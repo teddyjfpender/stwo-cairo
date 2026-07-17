@@ -23,6 +23,7 @@ mod adversarial;
 mod barrier;
 mod compiler;
 mod composite_internal_read;
+mod distributed_compiler;
 mod ipc_cursor;
 mod operation_execution;
 mod operation_reads;

@@ -325,6 +325,48 @@ fn exact_execution_is_a_canonical_two_worker_union() {
 }
 
 #[test]
+fn exact_write_rejects_gap_free_union_across_distinct_storages() {
+    let mut fixture = exact_fixture();
+    let exact_value = ValueVersion(fixture.compiled.values().len() as u32 - 1);
+    let binding_index = fixture
+        .placement
+        .storage_bindings
+        .iter()
+        .position(|binding| binding.value == value_range(exact_value, 4))
+        .unwrap();
+    let original = fixture.placement.storage_bindings[binding_index].storage;
+    fixture.placement.storage_bindings[binding_index]
+        .value
+        .elements
+        .end = 2;
+    fixture.placement.storages[original.0 as usize].bytes = 2 * size_of::<u32>();
+
+    let separate = StorageId(fixture.placement.storages.len() as u32);
+    fixture.placement.storages.push(StorageDesc {
+        id: separate,
+        worker: WorkerId(0),
+        bytes: 2 * size_of::<u32>(),
+        alignment_bytes: 4,
+    });
+    fixture
+        .placement
+        .storage_bindings
+        .push(FleetStoragePlacement {
+            storage: separate,
+            value: ValueRange {
+                version: exact_value,
+                elements: range(2, 4),
+            },
+            offset_bytes: 0,
+        });
+
+    assert_eq!(
+        compile(fixture).unwrap_err(),
+        FleetPlanError::InvalidProducer(exact_value)
+    );
+}
+
+#[test]
 fn exact_execution_identity_binds_workers_to_domains() {
     let baseline = compile(exact_fixture()).unwrap();
     let mut execution_only = baseline.clone();

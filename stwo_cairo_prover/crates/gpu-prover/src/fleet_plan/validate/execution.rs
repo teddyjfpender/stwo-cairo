@@ -83,13 +83,18 @@ fn validate_exact_executions(
     Ok(())
 }
 
-pub(super) fn projected_range(
-    plan: &FleetProofPlan,
+pub(in crate::fleet_plan) fn projected_range(
+    compiled: &CompiledProof,
     operation: &OpNode,
     bound: BoundValueRange,
     execution: &FleetOperationExecution,
 ) -> Result<ValueRange, FleetPlanError> {
-    let partition = operation_partition(plan, operation)?;
+    let partition = compiled
+        .partitions()
+        .iter()
+        .find(|partition| partition.id() == operation.partition)
+        .map(|partition| partition.kind())
+        .ok_or(FleetPlanError::InvalidOperation(operation.id))?;
     match (partition, execution.domain) {
         (PartitionAuthorityKind::Monolithic, OperationDomain::Monolithic) => Ok(bound.value),
         (PartitionAuthorityKind::Exact(authority), OperationDomain::Exact(execution_domain)) => {

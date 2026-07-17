@@ -272,47 +272,78 @@ fn validate_proof_output(
     {
         return Err(FleetPlanError::InvalidProofOutput(id));
     }
-    let destinations = output_ranges(&output.layout);
-    if output.sections.len() != destinations.len() {
-        return Err(FleetPlanError::InvalidProofOutput(id));
-    }
     let bindings = plan
         .placement
         .storage_bindings
         .iter()
         .filter(|binding| binding.storage == id)
         .collect::<Vec<_>>();
-    if bindings.len() != output.sections.len() {
-        return Err(FleetPlanError::InvalidProofOutput(id));
-    }
-    for (section, destination) in output.sections.iter().zip(destinations) {
-        let offset = destination
+    let mut covered_bindings = 0usize;
+    for fragment in &output.fragments {
+        let offset = fragment
+            .destination
             .start
             .checked_mul(size_of::<u32>())
             .ok_or(FleetPlanError::SizeOverflow)?;
-        let bytes = destination
+        let bytes = fragment
+            .destination
             .len()
             .checked_mul(size_of::<u32>())
             .ok_or(FleetPlanError::SizeOverflow)?;
-        let source_bytes = range_bytes(value(plan, section.value)?, section.elements)?;
+        let source = value(plan, fragment.source.version)?;
+        let source_bytes = range_bytes(source, fragment.source.elements)?;
         if source_bytes != bytes {
             return Err(FleetPlanError::InvalidProofOutput(id));
         }
-        let mut exact = bindings.iter().filter(|binding| {
-            binding.value.version == section.value
-                && binding.value.elements == section.elements
-                && binding.offset_bytes == offset
+
+        let mut covered = bindings
+            .iter()
+            .copied()
+            .filter(|binding| {
+                binding.value.version == fragment.source.version
+                    && fragment.source.elements.contains(binding.value.elements)
+            })
+            .collect::<Vec<_>>();
+        covered.sort_unstable_by_key(|binding| {
+            (
+                binding.value.elements.start,
+                binding.value.elements.end,
+                binding.offset_bytes,
+            )
         });
-        let Some(binding) = exact.next() else {
-            return Err(FleetPlanError::InvalidProofOutput(id));
-        };
-        if exact.next().is_some()
-            || binding_live(plan, binding)?.end != plan.placement.terminal_step
-        {
+        let mut cursor = fragment.source.elements.start;
+        for binding in covered {
+            let relative_elements = binding
+                .value
+                .elements
+                .start
+                .checked_sub(fragment.source.elements.start)
+                .ok_or(FleetPlanError::SizeOverflow)?;
+            let expected_offset = relative_elements
+                .checked_mul(source.layout.element.bytes)
+                .and_then(|relative| offset.checked_add(relative))
+                .ok_or(FleetPlanError::SizeOverflow)?;
+            if binding.value.elements.start != cursor
+                || binding.value.elements.end > fragment.source.elements.end
+                || binding.offset_bytes != expected_offset
+                || binding_live(plan, binding)?.end != plan.placement.terminal_step
+            {
+                return Err(FleetPlanError::InvalidProofOutput(id));
+            }
+            cursor = binding.value.elements.end;
+            covered_bindings = covered_bindings
+                .checked_add(1)
+                .ok_or(FleetPlanError::SizeOverflow)?;
+        }
+        if cursor != fragment.source.elements.end {
             return Err(FleetPlanError::InvalidProofOutput(id));
         }
     }
-    Ok(())
+    if covered_bindings == bindings.len() {
+        Ok(())
+    } else {
+        Err(FleetPlanError::InvalidProofOutput(id))
+    }
 }
 
 fn has_concurrent_source_consumer(
@@ -573,19 +604,4 @@ fn invalid_binding(binding: &FleetStoragePlacement) -> FleetPlanError {
 
 fn invalid_alias(operation: OpId, alias: crate::compiled_proof::InPlaceAliasId) -> FleetPlanError {
     FleetPlanError::InvalidInPlaceAlias { operation, alias }
-}
-
-fn output_ranges(
-    layout: &crate::proof_bundle::ResidentProofBundleLayout,
-) -> [core::ops::Range<usize>; 8] {
-    [
-        layout.commitments.clone(),
-        layout.interaction_claim.clone(),
-        layout.interaction_pow.clone(),
-        layout.sampled_values.clone(),
-        layout.fri_commitments.clone(),
-        layout.final_line_poly.clone(),
-        layout.query_pow.clone(),
-        layout.decommitment.clone(),
-    ]
 }

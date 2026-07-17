@@ -17,7 +17,7 @@ fn exact_read_fixture() -> (Fixture, ValueVersion, ValueVersion) {
     let replicated = ValueVersion(input.values.len() as u32);
     input.values.push(u32_value(
         replicated,
-        1,
+        4,
         4,
         ValueOrigin::Constant(ConstantId(0)),
         Region::FixedData,
@@ -25,7 +25,7 @@ fn exact_read_fixture() -> (Fixture, ValueVersion, ValueVersion) {
     input.fixed_values = vec![FixedValueDesc::inline_u32(
         ConstantId(0),
         replicated,
-        vec![7],
+        vec![7; 4],
     )];
 
     let effect = EffectContract::new(
@@ -34,7 +34,7 @@ fn exact_read_fixture() -> (Fixture, ValueVersion, ValueVersion) {
                 source: bound(0, value_range(sliced, 8)),
             },
             EffectAccess::Read {
-                source: bound(1, value_range(replicated, 1)),
+                source: bound(1, value_range(replicated, 4)),
             },
             EffectAccess::Write {
                 destination: bound(2, value_range(destination, 8)),
@@ -132,7 +132,7 @@ fn exact_read_fixture() -> (Fixture, ValueVersion, ValueVersion) {
         FleetOwnerPlacement {
             value: ValueRange {
                 version: sliced,
-                elements: range(0, 4),
+                elements: range(0, 2),
             },
             worker: WorkerId(0),
             live: during(0, terminal.0),
@@ -140,62 +140,167 @@ fn exact_read_fixture() -> (Fixture, ValueVersion, ValueVersion) {
         FleetOwnerPlacement {
             value: ValueRange {
                 version: sliced,
-                elements: range(4, 8),
+                elements: range(2, 4),
+            },
+            worker: WorkerId(0),
+            live: during(0, terminal.0),
+        },
+        FleetOwnerPlacement {
+            value: ValueRange {
+                version: sliced,
+                elements: range(4, 6),
             },
             worker: WorkerId(1),
             live: during(0, terminal.0),
         },
         FleetOwnerPlacement {
-            value: value_range(replicated, 1),
+            value: ValueRange {
+                version: sliced,
+                elements: range(6, 8),
+            },
+            worker: WorkerId(1),
+            live: during(0, terminal.0),
+        },
+        FleetOwnerPlacement {
+            value: ValueRange {
+                version: replicated,
+                elements: range(0, 2),
+            },
             worker: WorkerId(0),
             live: during(0, terminal.0),
         },
+        FleetOwnerPlacement {
+            value: ValueRange {
+                version: replicated,
+                elements: range(2, 4),
+            },
+            worker: WorkerId(1),
+            live: during(0, terminal.0),
+        },
     ]);
-    add_storage(&mut fixture, sliced, WorkerId(0), range(0, 4));
-    add_storage(&mut fixture, sliced, WorkerId(1), range(4, 8));
-    add_storage(&mut fixture, replicated, WorkerId(0), range(0, 1));
-    add_storage(&mut fixture, replicated, WorkerId(1), range(0, 1));
-    fixture.placement.replicas.push(FleetReplicaPlacement {
-        id: ReplicaId(0),
-        value: value_range(replicated, 1),
-        canonical_worker: WorkerId(0),
-        worker: WorkerId(1),
-        layout: fixture.compiled.value(replicated).unwrap().layout.clone(),
-        origin: ReplicaOrigin::InstalledFixed,
-        live: during(0, terminal.0),
-    });
-    fixture.placement.topology.workers[0].capacity_bytes += 20;
-    fixture.placement.topology.workers[1].capacity_bytes += 20;
+    add_affine_storage(
+        &mut fixture,
+        sliced,
+        WorkerId(0),
+        &[range(0, 2), range(2, 4)],
+    );
+    add_affine_storage(
+        &mut fixture,
+        sliced,
+        WorkerId(1),
+        &[range(4, 6), range(6, 8)],
+    );
+    add_affine_storage(
+        &mut fixture,
+        replicated,
+        WorkerId(0),
+        &[range(0, 2), range(2, 4)],
+    );
+    add_affine_storage(
+        &mut fixture,
+        replicated,
+        WorkerId(1),
+        &[range(0, 2), range(2, 4)],
+    );
+    let layout = fixture.compiled.value(replicated).unwrap().layout.clone();
+    fixture.placement.replicas.extend([
+        FleetReplicaPlacement {
+            id: ReplicaId(0),
+            value: ValueRange {
+                version: replicated,
+                elements: range(2, 4),
+            },
+            canonical_worker: WorkerId(1),
+            worker: WorkerId(0),
+            layout: layout.clone(),
+            origin: ReplicaOrigin::InstalledFixed,
+            live: during(0, terminal.0),
+        },
+        FleetReplicaPlacement {
+            id: ReplicaId(1),
+            value: ValueRange {
+                version: replicated,
+                elements: range(0, 2),
+            },
+            canonical_worker: WorkerId(0),
+            worker: WorkerId(1),
+            layout,
+            origin: ReplicaOrigin::InstalledFixed,
+            live: during(0, terminal.0),
+        },
+    ]);
+    fixture.placement.topology.workers[0].capacity_bytes += 32;
+    fixture.placement.topology.workers[1].capacity_bytes += 32;
     (fixture, sliced, replicated)
 }
 
-fn add_storage(
+fn add_affine_storage(
     fixture: &mut Fixture,
     version: ValueVersion,
     worker: WorkerId,
-    elements: ElementRange,
+    ranges: &[ElementRange],
 ) {
+    let base = ranges.first().unwrap().start;
+    let end = ranges.last().unwrap().end;
     let storage = StorageId(fixture.placement.storages.len() as u32);
     fixture.placement.storages.push(StorageDesc {
         id: storage,
         worker,
-        bytes: elements.len() * size_of::<u32>(),
+        bytes: (end - base) * size_of::<u32>(),
         alignment_bytes: 4,
     });
     fixture
         .placement
         .storage_bindings
-        .push(FleetStoragePlacement {
+        .extend(ranges.iter().map(|&elements| FleetStoragePlacement {
             storage,
             value: ValueRange { version, elements },
-            offset_bytes: 0,
-        });
+            offset_bytes: (elements.start - base) * size_of::<u32>(),
+        }));
 }
 
 #[test]
 fn exact_sliced_and_replicated_reads_are_available_locally() {
     let (fixture, ..) = exact_read_fixture();
     compile(fixture).unwrap();
+}
+
+#[test]
+fn exact_read_rejects_gap_free_union_across_distinct_storages() {
+    let (mut fixture, sliced, _) = exact_read_fixture();
+    let split = range(2, 4);
+    let binding_index = fixture
+        .placement
+        .storage_bindings
+        .iter()
+        .position(|binding| {
+            binding.value
+                == ValueRange {
+                    version: sliced,
+                    elements: split,
+                }
+        })
+        .unwrap();
+    let original = fixture.placement.storage_bindings[binding_index].storage;
+    fixture.placement.storages[original.0 as usize].bytes = 2 * size_of::<u32>();
+
+    let separate = StorageId(fixture.placement.storages.len() as u32);
+    fixture.placement.storages.push(StorageDesc {
+        id: separate,
+        worker: WorkerId(0),
+        bytes: split.len() * size_of::<u32>(),
+        alignment_bytes: 4,
+    });
+    fixture.placement.storage_bindings[binding_index].storage = separate;
+    fixture.placement.storage_bindings[binding_index].offset_bytes = 0;
+
+    assert_eq!(
+        compile(fixture).unwrap_err(),
+        FleetPlanError::UndeclaredRead {
+            operation: EXACT_OPERATION,
+            value: sliced,
+        }
+    );
 }
 
 #[test]
@@ -209,13 +314,19 @@ fn exact_sliced_read_rejects_source_shards_on_the_wrong_workers() {
     {
         owner.worker = swap(owner.worker);
     }
-    for binding in fixture
+    let storage_ids = fixture
         .placement
         .storage_bindings
         .iter()
         .filter(|binding| binding.value.version == sliced)
+        .map(|binding| binding.storage)
+        .collect::<Vec<_>>();
+    for storage in fixture
+        .placement
+        .storages
+        .iter_mut()
+        .filter(|storage| storage_ids.contains(&storage.id))
     {
-        let storage = &mut fixture.placement.storages[binding.storage.0 as usize];
         storage.worker = swap(storage.worker);
     }
     assert_eq!(
@@ -228,7 +339,7 @@ fn exact_sliced_read_rejects_source_shards_on_the_wrong_workers() {
 }
 
 #[test]
-fn exact_replicated_read_requires_a_full_local_replica() {
+fn exact_replicated_read_requires_a_gap_free_local_union() {
     let (mut fixture, _, replicated) = exact_read_fixture();
     fixture.placement.replicas.clear();
     assert_eq!(
@@ -238,6 +349,204 @@ fn exact_replicated_read_requires_a_full_local_replica() {
             value: replicated,
         }
     );
+}
+
+#[test]
+fn exact_read_rejects_overlapping_local_replica_fragments() {
+    let (mut fixture, ..) = exact_read_fixture();
+    let mut overlap = fixture.placement.replicas[0].clone();
+    overlap.id = ReplicaId(2);
+    overlap.value.elements = range(3, 4);
+    fixture.placement.replicas.push(overlap);
+    assert_eq!(
+        compile(fixture).unwrap_err(),
+        FleetPlanError::InvalidReplica(ReplicaId(2))
+    );
+}
+
+#[test]
+fn exact_sliced_read_rejects_a_stale_local_fragment() {
+    let (mut fixture, sliced, _) = exact_read_fixture();
+    fixture
+        .placement
+        .owners
+        .iter_mut()
+        .find(|owner| {
+            owner.worker == WorkerId(0)
+                && owner.value.version == sliced
+                && owner.value.elements == range(2, 4)
+        })
+        .unwrap()
+        .live = during(0, 1);
+    assert_eq!(
+        compile(fixture).unwrap_err(),
+        FleetPlanError::UndeclaredRead {
+            operation: EXACT_OPERATION,
+            value: sliced,
+        }
+    );
+}
+
+#[test]
+fn transcript_input_accepts_fragmented_local_ownership() {
+    let mut fixture = fixture();
+    let binding = fixture
+        .compiled
+        .transcript_inputs()
+        .iter()
+        .find(|binding| binding.elements.len() > 1)
+        .unwrap();
+    let version = binding.value;
+    let split = binding.elements.start + 1;
+    split_owner_and_storage(&mut fixture, version, split);
+    compile(fixture).unwrap();
+}
+
+#[test]
+fn transcript_input_rejects_a_stale_fragment() {
+    let mut fixture = fixture();
+    let binding = fixture
+        .compiled
+        .transcript_inputs()
+        .iter()
+        .find(|binding| binding.elements.len() > 1)
+        .unwrap();
+    let version = binding.value;
+    let split = binding.elements.start + 1;
+    split_owner_and_storage(&mut fixture, version, split);
+    fixture
+        .placement
+        .owners
+        .iter_mut()
+        .find(|owner| owner.value.version == version && owner.value.elements.start == split)
+        .unwrap()
+        .live = during(0, 1);
+    assert_eq!(
+        compile(fixture).unwrap_err(),
+        FleetPlanError::TranscriptValueCausality(version)
+    );
+}
+
+#[test]
+fn transcript_output_rejects_gap_free_union_across_distinct_storages() {
+    let mut fixture = fixture();
+    let transcript_binding = fixture
+        .compiled
+        .transcript_outputs()
+        .iter()
+        .find(|binding| binding.elements.len() > 1)
+        .copied()
+        .unwrap();
+    let version = transcript_binding.value;
+    let split = transcript_binding.elements.start + 1;
+    let mut input = fixture.compiled.input().clone();
+    let operation = &mut input.operations[0];
+    let previous_effect = input
+        .effects
+        .iter()
+        .find(|effect| effect.id() == operation.effect)
+        .unwrap();
+    let effect = EffectContract::new(
+        previous_effect
+            .accesses()
+            .iter()
+            .filter(|access| {
+                access
+                    .source()
+                    .is_none_or(|source| source.value.version != version)
+            })
+            .enumerate()
+            .map(|(binding, access)| match access {
+                EffectAccess::Read { source } => EffectAccess::Read {
+                    source: bound(binding as u32, source.value),
+                },
+                EffectAccess::Write { destination } => EffectAccess::Write {
+                    destination: bound(binding as u32, destination.value),
+                },
+                _ => unreachable!("the base fixture effect contains only reads and one write"),
+            })
+            .collect(),
+        previous_effect.module_globals().to_vec(),
+    )
+    .unwrap();
+    operation.effect = effect.id();
+    operation.invocation = invocation(&effect);
+    let kernel = input.kernels[0].clone();
+    input.kernels[0] = AotKernelAuthority::new(
+        kernel.id(),
+        kernel.module().clone(),
+        kernel.semantic_encoding().to_vec(),
+        kernel.execution_build_encoding().to_vec(),
+        vec![effect.id()],
+    )
+    .unwrap();
+    input.effects = vec![effect];
+    fixture.compiled = Arc::new(CompiledProof::compile(input, transcript()).unwrap());
+    fixture.shape = shape_identity_for_test(
+        b"fleet-test-topology-v2",
+        b"fleet-test-workspace-v2",
+        fixture.compiled.transcript_encoding(),
+        fixture.compiled.identity().canonical_encoding(),
+    )
+    .unwrap();
+
+    let binding_index = fixture
+        .placement
+        .storage_bindings
+        .iter()
+        .position(|binding| {
+            binding.value.version == version
+                && binding.value.elements == transcript_binding.elements
+        })
+        .unwrap();
+    let mut tail = fixture.placement.storage_bindings[binding_index];
+    fixture.placement.storage_bindings[binding_index]
+        .value
+        .elements
+        .end = split;
+    tail.value.elements.start = split;
+    tail.offset_bytes = 0;
+
+    let storage = StorageId(fixture.placement.storages.len() as u32);
+    let value = fixture.compiled.value(version).unwrap();
+    fixture.placement.storages.push(StorageDesc {
+        id: storage,
+        worker: WorkerId(0),
+        bytes: tail.value.elements.len() * value.layout.element.bytes,
+        alignment_bytes: value.alignment,
+    });
+    tail.storage = storage;
+    fixture.placement.storage_bindings.push(tail);
+
+    assert_eq!(
+        compile(fixture).unwrap_err(),
+        FleetPlanError::TranscriptValueCausality(version)
+    );
+}
+
+fn split_owner_and_storage(fixture: &mut Fixture, version: ValueVersion, split: usize) {
+    let owner = fixture
+        .placement
+        .owners
+        .iter_mut()
+        .find(|owner| owner.value.version == version)
+        .unwrap();
+    let mut tail = *owner;
+    owner.value.elements.end = split;
+    tail.value.elements.start = split;
+    fixture.placement.owners.push(tail);
+
+    let binding = fixture
+        .placement
+        .storage_bindings
+        .iter_mut()
+        .find(|binding| binding.value.version == version)
+        .unwrap();
+    let mut tail = binding.clone();
+    binding.value.elements.end = split;
+    tail.value.elements.start = split;
+    tail.offset_bytes = split * size_of::<u32>();
+    fixture.placement.storage_bindings.push(tail);
 }
 
 fn swap(worker: WorkerId) -> WorkerId {

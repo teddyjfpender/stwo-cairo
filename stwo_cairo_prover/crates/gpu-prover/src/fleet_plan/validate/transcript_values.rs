@@ -1,7 +1,10 @@
 use stwo_backend_cuda::{TranscriptInputId, TranscriptOperation, TranscriptOutputId};
 
 use super::super::*;
-use super::{operation_placement, owner_ready_at, replica_ready_at};
+use super::{
+    local_read_union_available, one_affine_storage_covers, operation_placement, owner_ready_at,
+    replica_ready_at,
+};
 use crate::compiled_proof::ValueRange;
 use crate::transcript_plan::CairoBlake2sTranscriptPlan;
 
@@ -38,33 +41,21 @@ fn validate_input_location(
     release: ScheduleStep,
 ) -> Result<(), FleetPlanError> {
     let coordinator = plan.placement.topology.coordinator;
-    let owner = plan.placement.owners.iter().find(|owner| {
-        owner.worker == coordinator
-            && owner.value.version == range.version
-            && owner.value.elements.contains(range.elements)
-    });
-    let replica = plan.placement.replicas.iter().find(|replica| {
-        replica.worker == coordinator
-            && replica.value.version == range.version
-            && replica.value.elements.contains(range.elements)
-            && plan
-                .compiled
-                .value(range.version)
-                .is_some_and(|value| replica.layout == value.layout)
-    });
-    let available = match (owner, replica) {
-        (Some(owner), None) => {
-            owner_ready_at(plan, owner)? < release
+    let available = local_read_union_available(
+        plan,
+        range,
+        coordinator,
+        |owner| {
+            owner_ready_at(plan, owner).is_ok_and(|ready| ready < release)
                 && owner.live.start <= release
                 && owner.live.end >= release
-        }
-        (None, Some(replica)) => {
-            replica_ready_at(plan, replica)? < release
+        },
+        |replica| {
+            replica_ready_at(plan, replica).is_ok_and(|ready| ready < release)
                 && replica.live.start <= release
                 && replica.live.end >= release
-        }
-        _ => false,
-    };
+        },
+    );
     if available {
         Ok(())
     } else {
@@ -77,14 +68,18 @@ fn validate_output_location(
     range: ValueRange,
     release: ScheduleStep,
 ) -> Result<(), FleetPlanError> {
-    let mut owners = plan.placement.owners.iter().filter(|owner| {
-        owner.worker == plan.placement.topology.coordinator && owner.value == range
-    });
+    let coordinator = plan.placement.topology.coordinator;
+    let mut owners = plan
+        .placement
+        .owners
+        .iter()
+        .filter(|owner| owner.worker == coordinator && owner.value == range);
     let valid = owners.next().is_some_and(|owner| {
         owners.next().is_none()
             && owner.live.start == release
             && owner.live.end > release
             && owner_ready_at(plan, owner) == Ok(release)
+            && one_affine_storage_covers(plan, range, coordinator, &[owner.value])
     });
     if valid {
         Ok(())

@@ -1,9 +1,9 @@
 //! Deterministic Track-A physical lowering.
 //!
-//! This MVP compiler is intentionally non-distributed: it admits exactly one
-//! worker and keeps every semantic operation and value there. It removes
-//! caller-authored placement without pretending that an untyped operation can
-//! be sharded, colored onto reused storage, or legally placed in-place.
+//! The monolithic compiler is the exact one-worker reference. The partitioned
+//! compiler derives conservative multi-worker exact shards and transfers from
+//! the same semantic authority. Storage reuse and required in-place aliases
+//! remain fail-closed.
 
 use std::sync::Arc;
 
@@ -16,11 +16,13 @@ use crate::fleet_pow::{FleetPowError, FleetPowSchedule};
 use crate::shape_executable::ShapeExecutableIdentity;
 use crate::transcript_plan::CairoBlake2sTranscriptPlan;
 
+mod distributed;
+
 impl FleetProofPlan {
     /// Compile one validated semantic proof into a deterministic, fail-closed
-    /// single-rank physical plan. Multi-worker placement, storage coloring and
-    /// required in-place aliases remain fail-closed until their own physical
-    /// authorities are implemented.
+    /// single-rank physical plan. Use `compile_track_a_partitioned` for
+    /// conservative multi-worker exact shards. Storage reuse and required
+    /// in-place aliases remain fail-closed.
     pub fn compile_track_a_monolithic(
         compiled: Arc<CompiledProof>,
         shape: ShapeExecutableIdentity,
@@ -433,6 +435,20 @@ pub enum FleetCompileError {
         operation: crate::compiled_proof::OpId,
         alias: crate::compiled_proof::InPlaceAliasId,
     },
+    UnsupportedExactComposite {
+        operation: crate::compiled_proof::OpId,
+    },
+    InvalidOwnership(crate::compiled_proof::ValueVersion),
+    MissingRoute {
+        source: WorkerId,
+        destination: WorkerId,
+    },
+    TransferTooLarge {
+        route: FleetLinkId,
+        bytes: usize,
+        limit: usize,
+    },
+    Projection(FleetPlanError),
     InvalidSemanticSchedule,
     SizeOverflow,
     Pow(FleetPowError),

@@ -209,7 +209,10 @@ pub(in crate::fleet_plan) fn operation_access_during(
                 .flat_map(|access| [access.source(), access.destination()])
                 .flatten()
             {
-                if ranges_overlap(projected_range(plan, operation, *bound, execution)?, range) {
+                if ranges_overlap(
+                    projected_range(&plan.compiled, operation, *bound, execution)?,
+                    range,
+                ) {
                     return Ok(true);
                 }
             }

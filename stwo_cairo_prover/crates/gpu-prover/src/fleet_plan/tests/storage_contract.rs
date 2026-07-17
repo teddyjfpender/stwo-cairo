@@ -318,6 +318,56 @@ fn distinct_output_fixture() -> Fixture {
     fixture
 }
 
+fn split_output_fragment_binding(fixture: &mut Fixture, fragment_index: usize) -> (usize, usize) {
+    let fragment = fixture.compiled.output().fragments[fragment_index].clone();
+    let storage = fixture.placement.output_storage;
+    let binding_index = fixture
+        .placement
+        .storage_bindings
+        .iter()
+        .position(|binding| binding.storage == storage && binding.value == fragment.source)
+        .unwrap();
+    let binding = fixture.placement.storage_bindings.remove(binding_index);
+    let split = fragment.source.elements.start + fragment.source.elements.len() / 2;
+    assert!(
+        fragment.source.elements.start < split && split < fragment.source.elements.end,
+        "test fragment must be splittable"
+    );
+    let element_bytes = fixture
+        .compiled
+        .value(fragment.source.version)
+        .unwrap()
+        .layout
+        .element
+        .bytes;
+    let right_offset =
+        binding.offset_bytes + (split - fragment.source.elements.start) * element_bytes;
+    let left_index = fixture.placement.storage_bindings.len();
+    fixture
+        .placement
+        .storage_bindings
+        .push(FleetStoragePlacement {
+            value: ValueRange {
+                elements: range(fragment.source.elements.start, split),
+                ..binding.value
+            },
+            ..binding
+        });
+    let right_index = fixture.placement.storage_bindings.len();
+    fixture
+        .placement
+        .storage_bindings
+        .push(FleetStoragePlacement {
+            value: ValueRange {
+                elements: range(split, fragment.source.elements.end),
+                ..binding.value
+            },
+            offset_bytes: right_offset,
+            ..binding
+        });
+    (left_index, right_index)
+}
+
 #[test]
 fn required_in_place_alias_is_exact_and_physically_audited() {
     compile(alias_fixture(false)).unwrap();
@@ -371,6 +421,102 @@ fn distinct_output_versions_pack_at_destination_offsets() {
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
     compile(fixture).unwrap();
+}
+
+#[test]
+fn fragmented_output_bindings_require_exact_canonical_coverage() {
+    let mut accepted = fixture();
+    split_output_fragment_binding(&mut accepted, 1);
+    compile(accepted).unwrap();
+
+    let mut reversed = distinct_output_fixture();
+    let output_storage = reversed.placement.output_storage;
+    let left_source = reversed.compiled.output().fragments[0].source;
+    let right_source = reversed.compiled.output().fragments[4].source;
+    assert_eq!(left_source.elements.len(), right_source.elements.len());
+    let left = reversed
+        .placement
+        .storage_bindings
+        .iter()
+        .position(|binding| binding.storage == output_storage && binding.value == left_source)
+        .unwrap();
+    let right = reversed
+        .placement
+        .storage_bindings
+        .iter()
+        .position(|binding| binding.storage == output_storage && binding.value == right_source)
+        .unwrap();
+    let left_offset = reversed.placement.storage_bindings[left].offset_bytes;
+    let right_offset = reversed.placement.storage_bindings[right].offset_bytes;
+    reversed.placement.storage_bindings[left].offset_bytes = right_offset;
+    reversed.placement.storage_bindings[right].offset_bytes = left_offset;
+    assert_eq!(
+        compile(reversed).unwrap_err(),
+        FleetPlanError::InvalidProofOutput(output_storage)
+    );
+
+    let mut missing = distinct_output_fixture();
+    let fragment = missing.compiled.output().fragments[1].clone();
+    let right = missing
+        .placement
+        .storage_bindings
+        .iter()
+        .position(|binding| {
+            binding.storage == missing.placement.output_storage && binding.value == fragment.source
+        })
+        .unwrap();
+    let binding = missing.placement.storage_bindings[right];
+    let binding_bytes = binding.value.elements.len()
+        * missing
+            .compiled
+            .value(binding.value.version)
+            .unwrap()
+            .layout
+            .element
+            .bytes;
+    let storage = StorageId(missing.placement.storages.len() as u32);
+    missing.placement.storages.push(StorageDesc {
+        id: storage,
+        worker: WorkerId(0),
+        bytes: binding_bytes,
+        alignment_bytes: 4,
+    });
+    missing.placement.storage_bindings[right].storage = storage;
+    missing.placement.storage_bindings[right].offset_bytes = 0;
+    missing.placement.topology.workers[0].capacity_bytes += binding_bytes;
+    let output_storage = missing.placement.output_storage;
+    assert_eq!(
+        compile(missing).unwrap_err(),
+        FleetPlanError::InvalidProofOutput(output_storage)
+    );
+
+    let mut overlapping = fixture();
+    let (_, right) = split_output_fragment_binding(&mut overlapping, 1);
+    let output_value = overlapping.output_value;
+    overlapping.placement.storage_bindings[right]
+        .value
+        .elements
+        .start -= 1;
+    assert_eq!(
+        compile(overlapping).unwrap_err(),
+        FleetPlanError::InvalidProducer(output_value)
+    );
+
+    let mut non_terminal = fixture();
+    let output_value = non_terminal.output_value;
+    non_terminal
+        .placement
+        .owners
+        .iter_mut()
+        .find(|owner| owner.value.version == output_value)
+        .unwrap()
+        .live
+        .end = ScheduleStep(non_terminal.placement.terminal_step.0 - 1);
+    let output_storage = non_terminal.placement.output_storage;
+    assert_eq!(
+        compile(non_terminal).unwrap_err(),
+        FleetPlanError::InvalidProofOutput(output_storage)
+    );
 }
 
 #[test]
