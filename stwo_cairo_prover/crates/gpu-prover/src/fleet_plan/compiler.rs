@@ -2,15 +2,16 @@
 //!
 //! The monolithic compiler is the exact one-worker reference. The partitioned
 //! compiler derives conservative multi-worker exact shards and transfers from
-//! the same semantic authority. Storage reuse and required in-place aliases
-//! remain fail-closed.
+//! the same semantic authority. The one-worker compiler realizes only exact,
+//! whole-value required aliases whose validated effects and lifetimes prove
+//! read-before-overwrite safety. All other storage reuse remains fail-closed.
 
 use std::sync::Arc;
 
 use super::*;
 use crate::compiled_proof::{
-    CompiledProof, InPlaceAliasRequirement, OpNode, PartitionAuthorityKind, ProofStage, Region,
-    ValueOrigin, ValueRange,
+    CompiledProof, ExecutionPrimitive, InPlaceAliasId, InPlaceAliasRequirement, OpId, OpNode,
+    PartitionAuthorityKind, ProofStage, Region, ValueOrigin, ValueRange, ValueVersion,
 };
 use crate::fleet_pow::{FleetPowError, FleetPowSchedule};
 use crate::shape_executable::ShapeExecutableIdentity;
@@ -21,8 +22,8 @@ mod distributed;
 impl FleetProofPlan {
     /// Compile one validated semantic proof into a deterministic, fail-closed
     /// single-rank physical plan. Use `compile_track_a_partitioned` for
-    /// conservative multi-worker exact shards. Storage reuse and required
-    /// in-place aliases remain fail-closed.
+    /// conservative multi-worker exact shards. Only exact whole-value required
+    /// aliases with sound one-operation overwrite timing share storage.
     pub fn compile_track_a_monolithic(
         compiled: Arc<CompiledProof>,
         shape: ShapeExecutableIdentity,
@@ -36,15 +37,15 @@ impl FleetProofPlan {
             });
         }
         pow.validate(1).map_err(FleetCompileError::Pow)?;
-        reject_required_aliases(&compiled)?;
         let schedule = compile_schedule(&compiled, &topology, transcript)?;
-        let (owners, storages, storage_bindings, output_storage) = compile_storage(
-            &compiled,
-            topology.coordinator,
-            schedule.terminal_step,
-            &schedule.barrier_steps,
-            &schedule.operations,
-        )?;
+        let (owners, storages, storage_bindings, in_place_aliases, output_storage) =
+            compile_storage(
+                &compiled,
+                topology.coordinator,
+                schedule.terminal_step,
+                &schedule.barrier_steps,
+                &schedule.operations,
+            )?;
         let placement = FleetPlacementInput {
             topology,
             pow,
@@ -58,7 +59,7 @@ impl FleetProofPlan {
             spills: vec![],
             storages,
             storage_bindings,
-            in_place_aliases: vec![],
+            in_place_aliases,
             output_storage,
         };
         Self::lower_compiled(compiled, shape, placement, transcript)
@@ -71,6 +72,14 @@ struct CompiledSchedule {
     terminal_step: ScheduleStep,
     barrier_arrivals: Vec<BarrierArrival>,
     operations: Vec<FleetOperationPlacement>,
+}
+
+#[derive(Clone, Copy)]
+struct RequiredAlias {
+    operation: OpId,
+    alias: InPlaceAliasId,
+    source: ValueRange,
+    destination: ValueRange,
 }
 
 fn compile_schedule(
@@ -191,6 +200,7 @@ fn compile_storage(
         Vec<FleetOwnerPlacement>,
         Vec<StorageDesc>,
         Vec<FleetStoragePlacement>,
+        Vec<InPlaceAliasPlacement>,
         StorageId,
     ),
     FleetCompileError,
@@ -202,24 +212,41 @@ fn compile_storage(
         barrier_steps,
         operations,
     )?;
+    let required_aliases = compile_required_aliases(compiled, &owners, operations)?;
 
     let mut storages = Vec::new();
     let mut bindings = Vec::new();
+    let mut value_storages = vec![None; compiled.values().len()];
     for value in compiled
         .values()
         .iter()
         .filter(|value| value.region != Region::Output)
     {
-        let id = next_storage_id(storages.len())?;
-        storages.push(StorageDesc {
-            id,
-            worker: coordinator,
-            bytes: value
-                .layout
-                .logical_bytes()
-                .map_err(|_| FleetCompileError::SizeOverflow)?,
-            alignment_bytes: value.alignment,
-        });
+        let value_index = value.version.0 as usize;
+        let id = match value_storages[value_index] {
+            Some(id) => id,
+            None => {
+                let id = next_storage_id(storages.len())?;
+                storages.push(StorageDesc {
+                    id,
+                    worker: coordinator,
+                    bytes: value
+                        .layout
+                        .logical_bytes()
+                        .map_err(|_| FleetCompileError::SizeOverflow)?,
+                    alignment_bytes: value.alignment,
+                });
+                value_storages[value_index] = Some(id);
+                if let Some(alias) = required_aliases.iter().find(|alias| {
+                    alias.source.version == value.version
+                        || alias.destination.version == value.version
+                }) {
+                    value_storages[alias.source.version.0 as usize] = Some(id);
+                    value_storages[alias.destination.version.0 as usize] = Some(id);
+                }
+                id
+            }
+        };
         bindings.push(FleetStoragePlacement {
             storage: id,
             value: ValueRange {
@@ -229,6 +256,21 @@ fn compile_storage(
             offset_bytes: 0,
         });
     }
+    let in_place_aliases = required_aliases
+        .iter()
+        .map(|alias| {
+            Ok(InPlaceAliasPlacement {
+                operation: alias.operation,
+                alias: alias.alias,
+                storage: value_storages
+                    .get(alias.source.version.0 as usize)
+                    .copied()
+                    .flatten()
+                    .ok_or(FleetCompileError::InvalidSemanticSchedule)?,
+                offset_bytes: 0,
+            })
+        })
+        .collect::<Result<Vec<_>, FleetCompileError>>()?;
 
     let output_storage = next_storage_id(storages.len())?;
     let output_alignment = compiled
@@ -262,7 +304,7 @@ fn compile_storage(
                 .ok_or(FleetCompileError::SizeOverflow)?,
         });
     }
-    Ok((owners, storages, bindings, output_storage))
+    Ok((owners, storages, bindings, in_place_aliases, output_storage))
 }
 
 fn compile_owners(
@@ -347,6 +389,86 @@ fn extend_live_end(
     Ok(())
 }
 
+fn compile_required_aliases(
+    compiled: &CompiledProof,
+    owners: &[FleetOwnerPlacement],
+    operations: &[FleetOperationPlacement],
+) -> Result<Vec<RequiredAlias>, FleetCompileError> {
+    let mut aliases = Vec::new();
+    let mut aliased_versions = Vec::new();
+    for operation in compiled.operations() {
+        let effect = compiled
+            .effect_for(operation.id)
+            .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+        for (access_index, access) in effect.accesses().iter().enumerate() {
+            let Some(authority) = access
+                .in_place()
+                .filter(|alias| alias.requirement == InPlaceAliasRequirement::Required)
+            else {
+                continue;
+            };
+            let invalid = || FleetCompileError::RequiredAlias {
+                operation: operation.id,
+                alias: authority.id,
+            };
+            let placement = operation_placement(operations, operation.id)?;
+            let source = access.source().ok_or_else(invalid)?.value;
+            let destination = access.destination().ok_or_else(invalid)?.value;
+            let source_value = compiled.value(source.version).ok_or_else(invalid)?;
+            let destination_value = compiled.value(destination.version).ok_or_else(invalid)?;
+            if matches!(
+                &operation.primitive,
+                ExecutionPrimitive::OrderedComposite { .. }
+            ) || !matches!(
+                placement.executions.as_slice(),
+                [FleetOperationExecution {
+                    domain: OperationDomain::Monolithic,
+                    ..
+                }]
+            ) || source.elements != full_range(source_value)?
+                || destination.elements != full_range(destination_value)?
+                || source_value.layout != destination_value.layout
+                || source_value.alignment != destination_value.alignment
+                || source_value.region == Region::FixedData
+                || destination_value.region == Region::FixedData
+                || source_value.region == Region::Output
+                || destination_value.region == Region::Output
+                || matches!(source_value.origin, ValueOrigin::Constant(_))
+                || matches!(destination_value.origin, ValueOrigin::Constant(_))
+                || aliased_versions.contains(&source.version)
+                || aliased_versions.contains(&destination.version)
+                || effect
+                    .accesses()
+                    .iter()
+                    .enumerate()
+                    .any(|(other_index, other)| {
+                        other_index != access_index
+                            && other
+                                .source()
+                                .is_some_and(|other| other.value.version == source.version)
+                    })
+            {
+                return Err(invalid());
+            }
+            let source_owner = owner(owners, source.version).ok_or_else(invalid)?;
+            let destination_owner = owner(owners, destination.version).ok_or_else(invalid)?;
+            if source_owner.live.end != placement.during.end
+                || destination_owner.live.start != placement.during.start
+            {
+                return Err(invalid());
+            }
+            aliased_versions.extend([source.version, destination.version]);
+            aliases.push(RequiredAlias {
+                operation: operation.id,
+                alias: authority.id,
+                source,
+                destination,
+            });
+        }
+    }
+    Ok(aliases)
+}
+
 fn reject_required_aliases(compiled: &CompiledProof) -> Result<(), FleetCompileError> {
     for operation in compiled.operations() {
         let effect = compiled
@@ -365,6 +487,10 @@ fn reject_required_aliases(compiled: &CompiledProof) -> Result<(), FleetCompileE
         }
     }
     Ok(())
+}
+
+fn owner(owners: &[FleetOwnerPlacement], version: ValueVersion) -> Option<&FleetOwnerPlacement> {
+    owners.iter().find(|owner| owner.value.version == version)
 }
 
 fn transcript_output_release(

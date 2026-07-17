@@ -168,6 +168,183 @@ fn with_required_alias(fixture: Fixture) -> Fixture {
     recompile(fixture, input)
 }
 
+fn replace_aot_effect(fixture: Fixture, operation: OpId, effect: EffectContract) -> Fixture {
+    let mut input = fixture.compiled.input().clone();
+    let node = &input.operations[operation.0 as usize];
+    let old_effect = node.effect;
+    let partition = node.partition;
+    let ExecutionPrimitive::AotKernel { kernel, .. } = &node.primitive else {
+        unreachable!("alias compiler fixture operation must be AOT")
+    };
+    let kernel = *kernel;
+    input.operations[operation.0 as usize].effect = effect.id();
+    input.operations[operation.0 as usize].invocation = invocation(&effect);
+
+    let authority = input
+        .kernels
+        .iter()
+        .find(|authority| authority.id() == kernel)
+        .unwrap()
+        .clone();
+    let mut accepted = authority.accepted_executions().to_vec();
+    let previous = accepted
+        .iter()
+        .position(|execution| *execution == (old_effect, partition))
+        .unwrap();
+    accepted[previous] = (effect.id(), partition);
+    accepted.sort_unstable();
+    input.kernels.retain(|candidate| candidate.id() != kernel);
+    input.kernels.push(
+        AotKernelAuthority::new_with_accepted_executions(
+            kernel,
+            authority.module().clone(),
+            authority.semantic_encoding().to_vec(),
+            authority.execution_build_encoding().to_vec(),
+            accepted,
+        )
+        .unwrap(),
+    );
+    input.kernels.sort_unstable_by_key(AotKernelAuthority::id);
+    input
+        .effects
+        .retain(|candidate| candidate.id() != old_effect);
+    input.effects.push(effect);
+    input.effects.sort_unstable_by_key(EffectContract::id);
+    recompile(fixture, input)
+}
+
+fn alias_ranges(fixture: &Fixture) -> (ValueRange, ValueRange) {
+    fixture
+        .compiled
+        .effect_for(OpId(0))
+        .unwrap()
+        .in_place_alias(InPlaceAliasId(0))
+        .map(|access| {
+            (
+                access.source().unwrap().value,
+                access.destination().unwrap().value,
+            )
+        })
+        .unwrap()
+}
+
+fn alias_authority(requirement: InPlaceAliasRequirement) -> InPlaceAliasAuthority {
+    InPlaceAliasAuthority {
+        id: InPlaceAliasId(0),
+        requirement,
+        discipline: InPlaceDiscipline::ElementWiseReadBeforeWrite,
+    }
+}
+
+fn with_optional_alias(fixture: Fixture) -> Fixture {
+    let fixture = with_required_alias(fixture);
+    let (source, destination) = alias_ranges(&fixture);
+    let effect = EffectContract::new(
+        vec![EffectAccess::ReadWrite {
+            source: bound(0, source),
+            destination: bound(1, destination),
+            in_place: Some(alias_authority(InPlaceAliasRequirement::Permitted)),
+        }],
+        vec![],
+    )
+    .unwrap();
+    replace_aot_effect(fixture, OpId(0), effect)
+}
+
+fn with_partial_required_alias(fixture: Fixture) -> Fixture {
+    let fixture = with_required_alias(fixture);
+    let (source, destination) = alias_ranges(&fixture);
+    let split = source.elements.len() / 2;
+    let left = range(0, split);
+    let right = range(split, source.elements.end);
+    let effect = EffectContract::new(
+        vec![
+            EffectAccess::ReadWrite {
+                source: bound(
+                    0,
+                    ValueRange {
+                        elements: left,
+                        ..source
+                    },
+                ),
+                destination: bound(
+                    1,
+                    ValueRange {
+                        elements: left,
+                        ..destination
+                    },
+                ),
+                in_place: Some(alias_authority(InPlaceAliasRequirement::Required)),
+            },
+            EffectAccess::Write {
+                destination: bound(
+                    2,
+                    ValueRange {
+                        elements: right,
+                        ..destination
+                    },
+                ),
+            },
+        ],
+        vec![],
+    )
+    .unwrap();
+    replace_aot_effect(fixture, OpId(0), effect)
+}
+
+fn with_same_operation_source_read(fixture: Fixture) -> Fixture {
+    let fixture = with_required_alias(fixture);
+    let (source, destination) = alias_ranges(&fixture);
+    let effect = EffectContract::new(
+        vec![
+            EffectAccess::ReadWrite {
+                source: bound(0, source),
+                destination: bound(1, destination),
+                in_place: Some(alias_authority(InPlaceAliasRequirement::Required)),
+            },
+            EffectAccess::Read {
+                source: bound(2, source),
+            },
+        ],
+        vec![],
+    )
+    .unwrap();
+    replace_aot_effect(fixture, OpId(0), effect)
+}
+
+fn with_late_source_read(fixture: Fixture) -> Fixture {
+    let fixture = with_required_alias(fixture);
+    let (source, _) = alias_ranges(&fixture);
+    let effect = fixture.compiled.effect_for(OpId(1)).unwrap();
+    let mut accesses = effect.accesses().to_vec();
+    let next_binding = accesses
+        .iter()
+        .flat_map(|access| [access.source(), access.destination()])
+        .flatten()
+        .count() as u32;
+    accesses.push(EffectAccess::Read {
+        source: bound(next_binding, source),
+    });
+    let effect = EffectContract::new(accesses, effect.module_globals().to_vec()).unwrap();
+    replace_aot_effect(fixture, OpId(1), effect)
+}
+
+fn with_composite_required_alias(fixture: Fixture) -> Fixture {
+    let fixture = with_required_alias(fixture);
+    let mut input = fixture.compiled.input().clone();
+    let operation = &mut input.operations[0];
+    let child = ExecutableStep {
+        primitive: operation.primitive.clone(),
+        invocation: operation.invocation.clone(),
+        effect: operation.effect,
+    };
+    operation.primitive = ExecutionPrimitive::OrderedComposite {
+        children: vec![child].into_boxed_slice(),
+    };
+    operation.invocation = None;
+    recompile(fixture, input)
+}
+
 fn owner(plan: &FleetProofPlan, version: ValueVersion) -> &FleetOwnerPlacement {
     plan.placement()
         .owners
@@ -380,9 +557,122 @@ fn compile_track_a_monolithic_uses_canonical_output_fragments() {
 }
 
 #[test]
-fn compile_track_a_monolithic_rejects_required_alias_until_placement_exists() {
+fn compile_track_a_monolithic_places_exact_required_alias() {
+    let fixture = with_required_alias(fixture());
+    let (source, destination) = alias_ranges(&fixture);
+    let plan = compile_monolithic(fixture).unwrap();
+    let alias = plan.placement().in_place_aliases.as_slice();
+    assert_eq!(alias.len(), 1);
+    assert_eq!(alias[0].operation, OpId(0));
+    assert_eq!(alias[0].alias, InPlaceAliasId(0));
+    assert_eq!(alias[0].offset_bytes, 0);
+    let storage_for = |range: ValueRange| {
+        plan.placement()
+            .storage_bindings
+            .iter()
+            .find(|binding| binding.value == range)
+            .unwrap()
+            .storage
+    };
+    assert_eq!(storage_for(source), alias[0].storage);
+    assert_eq!(storage_for(destination), alias[0].storage);
+    plan.validate(transcript()).unwrap();
+}
+
+#[test]
+fn compile_track_a_monolithic_keeps_permitted_alias_out_of_place() {
+    let fixture = with_optional_alias(fixture());
+    let (source, destination) = alias_ranges(&fixture);
+    let plan = compile_monolithic(fixture).unwrap();
+    assert!(plan.placement().in_place_aliases.is_empty());
+    let storage_for = |range: ValueRange| {
+        plan.placement()
+            .storage_bindings
+            .iter()
+            .find(|binding| binding.value == range)
+            .unwrap()
+            .storage
+    };
+    assert_ne!(storage_for(source), storage_for(destination));
+}
+
+#[test]
+fn compile_track_a_monolithic_rejects_partial_required_alias() {
     assert!(matches!(
-        compile_monolithic(with_required_alias(fixture())),
+        compile_monolithic(with_partial_required_alias(fixture())),
+        Err(FleetCompileError::RequiredAlias {
+            operation: OpId(0),
+            alias: InPlaceAliasId(0),
+        })
+    ));
+}
+
+#[test]
+fn compile_track_a_monolithic_rejects_alignment_incompatible_required_alias() {
+    let fixture = with_required_alias(fixture());
+    let (_, destination) = alias_ranges(&fixture);
+    let mut input = fixture.compiled.input().clone();
+    input.values[destination.version.0 as usize].alignment *= 2;
+    assert!(matches!(
+        compile_monolithic(recompile(fixture, input)),
+        Err(FleetCompileError::RequiredAlias {
+            operation: OpId(0),
+            alias: InPlaceAliasId(0),
+        })
+    ));
+}
+
+#[test]
+fn compile_track_a_monolithic_rejects_fixed_data_required_alias() {
+    let fixture = with_required_alias(fixture());
+    let (source, _) = alias_ranges(&fixture);
+    let mut input = fixture.compiled.input().clone();
+    let words = input.values[source.version.0 as usize]
+        .layout
+        .element_count()
+        .unwrap();
+    input.values[source.version.0 as usize].origin = ValueOrigin::Constant(ConstantId(0));
+    input.values[source.version.0 as usize].region = Region::FixedData;
+    input.fixed_values = vec![FixedValueDesc::inline_u32(
+        ConstantId(0),
+        source.version,
+        vec![0; words],
+    )];
+    assert!(matches!(
+        compile_monolithic(recompile(fixture, input)),
+        Err(FleetCompileError::RequiredAlias {
+            operation: OpId(0),
+            alias: InPlaceAliasId(0),
+        })
+    ));
+}
+
+#[test]
+fn compile_track_a_monolithic_rejects_second_same_operation_source_read() {
+    assert!(matches!(
+        compile_monolithic(with_same_operation_source_read(fixture())),
+        Err(FleetCompileError::RequiredAlias {
+            operation: OpId(0),
+            alias: InPlaceAliasId(0),
+        })
+    ));
+}
+
+#[test]
+fn compile_track_a_monolithic_rejects_later_cross_operation_source_read() {
+    assert!(matches!(
+        compile_monolithic(with_late_source_read(fixture())),
+        Err(FleetCompileError::RequiredAlias {
+            operation: OpId(0),
+            alias: InPlaceAliasId(0),
+        })
+    ));
+}
+
+#[test]
+fn compile_track_a_monolithic_rejects_composite_required_alias() {
+    assert!(matches!(
+        compile_monolithic(with_composite_required_alias(fixture())),
         Err(FleetCompileError::RequiredAlias {
             operation: OpId(0),
             alias: InPlaceAliasId(0),
