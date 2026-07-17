@@ -68,6 +68,10 @@ It creates and verifies only the `1000:1000` development identity before install
 guards. Its records say `formal=false` and `qualification_eligible=false`; `labctl accept` rejects
 it, so the lane cannot produce qualification or headline evidence. The recorded image digest is
 the requested immutable reference, not a runtime attestation of the provider-started filesystem.
+For this one known volume only, the profile also migrates its legacy `root:root` `0777` controller
+root and `0666` volume-id memo to `0755`/`0600`. It first anchors both inodes without following
+links, closes them to non-root mutation, verifies the memo against the provider-attested volume id,
+fsyncs and re-attests both objects, and records the transition; no recursive mode repair is allowed.
 
 ```bash
 gpu_benchmarks/lab/pod/labctl open \

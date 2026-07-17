@@ -34,13 +34,15 @@ def _run(
     )
 
 
-def _fixture(base: Path, *, mode: int = 0o777) -> tuple[Path, Path]:
+def _fixture(
+    base: Path, *, mode: int = 0o777, marker_mode: int = 0o666
+) -> tuple[Path, Path]:
     root = base / "gpu-lab"
     root.mkdir()
     root.chmod(mode)
     marker = root / legacy_root.MARKER
     marker.write_text("volume-test\n")
-    marker.chmod(0o600)
+    marker.chmod(marker_mode)
     return root, marker
 
 
@@ -55,6 +57,8 @@ def legacy_root_self_test() -> None:
     assert "mountpoint -q /workspace" in generated
     assert "test ! -L /workspace" in generated
     assert "os.O_NOFOLLOW" in generated
+    assert "os.fchmod(root_fd, 0o700)" in generated
+    assert "os.fchmod(marker_fd, 0o600)" in generated
     assert "os.fchmod(root_fd, 0o755)" in generated
     assert "os.fsync(root_fd)" in generated
     assert "chmod -R" not in generated and "chown" not in generated
@@ -70,6 +74,7 @@ def legacy_root_self_test() -> None:
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip().endswith(legacy_root.CHANGED)
         assert root.stat().st_mode & 0o777 == 0o755
+        assert marker.stat().st_mode & 0o777 == 0o600
         assert marker.read_text() == "volume-test\n"
         assert child.read_text() == "sentinel\n"
         assert child.stat().st_mode & 0o777 == 0o666
@@ -83,6 +88,20 @@ def legacy_root_self_test() -> None:
             before.st_ino,
             before.st_mtime_ns,
         )
+
+    for root_mode, marker_mode, receipt in (
+        (0o700, 0o666, legacy_root.RESUMED_MARKER),
+        (0o700, 0o600, legacy_root.RESUMED_ROOT),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root, marker = _fixture(
+                Path(directory), mode=root_mode, marker_mode=marker_mode
+            )
+            result = _run(root)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.strip().endswith(receipt)
+            assert root.stat().st_mode & 0o777 == 0o755
+            assert marker.stat().st_mode & 0o777 == 0o600
 
     with tempfile.TemporaryDirectory() as directory:
         base = Path(directory)
@@ -133,7 +152,10 @@ def legacy_root_self_test() -> None:
         assert evidence == {
             "changed": True,
             "from_mode": "0777",
+            "marker_from_mode": "0666",
+            "marker_to_mode": "0600",
             "owner": "0:0",
+            "resumed": False,
             "schema_version": legacy_root.SCHEMA,
             "to_mode": "0755",
             "volume_id": "volume-test",

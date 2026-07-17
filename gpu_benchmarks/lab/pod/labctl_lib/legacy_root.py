@@ -11,8 +11,10 @@ from . import common as c
 SCHEMA = "stwo.gpu-lab.legacy-root-migration.v1"
 ROOT = "/workspace/gpu-lab"
 MARKER = "NETWORK_VOLUME_ID"
-CHANGED = "root-0777-to-0755"
-UNCHANGED = "root-0755-unchanged"
+CHANGED = "root-0777-marker-0666-to-root-0755-marker-0600"
+RESUMED_MARKER = "root-0700-marker-0666-to-root-0755-marker-0600"
+RESUMED_ROOT = "root-0700-marker-0600-to-root-0755-marker-0600"
+UNCHANGED = "root-0755-marker-0600-unchanged"
 
 WORKER = r"""
 import os
@@ -43,7 +45,7 @@ marker_flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
 root_fd = os.open(root, root_flags)
 try:
     before = os.fstat(root_fd)
-    require_root(before, {0o755, 0o777})
+    require_root(before, {0o700, 0o755, 0o777})
     path_before = os.stat(root, follow_symlinks=False)
     if identity(path_before) != identity(before):
         raise RuntimeError("legacy gpu-lab root raced during open")
@@ -56,22 +58,64 @@ try:
             not stat.S_ISREG(marker_before.st_mode)
             or marker_before.st_uid != expected_uid
             or marker_before.st_gid != expected_gid
-            or stat.S_IMODE(marker_before.st_mode) != 0o600
+            or stat.S_IMODE(marker_before.st_mode) not in {0o600, 0o666}
             or marker_before.st_nlink != 1
             or marker_before.st_size != len(expected_marker)
         ):
             raise RuntimeError(
                 f"legacy network-volume marker mismatch: {marker_identity}"
             )
-        if os.read(marker_fd, len(expected_marker) + 1) != expected_marker:
-            raise RuntimeError("legacy network-volume marker content mismatch")
         marker_path = os.stat(
             "NETWORK_VOLUME_ID", dir_fd=root_fd, follow_symlinks=False
         )
         if identity(marker_path) != marker_identity:
             raise RuntimeError("legacy network-volume marker raced during open")
 
-        changed = stat.S_IMODE(before.st_mode) == 0o777
+        initial = (
+            stat.S_IMODE(before.st_mode),
+            stat.S_IMODE(marker_before.st_mode),
+        )
+        admitted = {
+            (0o755, 0o600),
+            (0o777, 0o666),
+            (0o700, 0o666),
+            (0o700, 0o600),
+        }
+        if initial not in admitted:
+            raise RuntimeError(f"legacy root/marker mode pair mismatch: {initial}")
+
+        changed = initial != (0o755, 0o600)
+        if changed and initial[0] == 0o777:
+            os.fchmod(root_fd, 0o700)
+            os.fsync(root_fd)
+        if changed and initial[1] == 0o666:
+            os.fchmod(marker_fd, 0o600)
+            os.fsync(marker_fd)
+
+        locked_root = os.fstat(root_fd)
+        require_root(locked_root, {0o700} if changed else {0o755})
+        locked_marker = os.fstat(marker_fd)
+        if (
+            not stat.S_ISREG(locked_marker.st_mode)
+            or locked_marker.st_uid != expected_uid
+            or locked_marker.st_gid != expected_gid
+            or stat.S_IMODE(locked_marker.st_mode) != 0o600
+            or locked_marker.st_nlink != 1
+            or (locked_marker.st_dev, locked_marker.st_ino)
+            != (marker_before.st_dev, marker_before.st_ino)
+        ):
+            raise RuntimeError(
+                f"locked network-volume marker mismatch: {identity(locked_marker)}"
+            )
+        locked_marker_path = os.stat(
+            "NETWORK_VOLUME_ID", dir_fd=root_fd, follow_symlinks=False
+        )
+        if identity(locked_marker_path) != identity(locked_marker):
+            raise RuntimeError("legacy network-volume marker changed while locking")
+        os.lseek(marker_fd, 0, os.SEEK_SET)
+        if os.read(marker_fd, len(expected_marker) + 1) != expected_marker:
+            raise RuntimeError("legacy network-volume marker content mismatch")
+
         if changed:
             os.fchmod(root_fd, 0o755)
             os.fsync(root_fd)
@@ -86,7 +130,7 @@ try:
         marker_after = os.stat(
             "NETWORK_VOLUME_ID", dir_fd=root_fd, follow_symlinks=False
         )
-        if identity(marker_after) != marker_identity:
+        if identity(marker_after) != identity(locked_marker):
             raise RuntimeError("legacy network-volume marker changed")
         os.lseek(marker_fd, 0, os.SEEK_SET)
         if os.read(marker_fd, len(expected_marker) + 1) != expected_marker:
@@ -98,7 +142,15 @@ finally:
 
 print(
     "LABCTL_LEGACY_ROOT_MIGRATION="
-    + ("root-0777-to-0755" if changed else "root-0755-unchanged")
+    + {
+        (0o777, 0o666):
+            "root-0777-marker-0666-to-root-0755-marker-0600",
+        (0o700, 0o666):
+            "root-0700-marker-0666-to-root-0755-marker-0600",
+        (0o700, 0o600):
+            "root-0700-marker-0600-to-root-0755-marker-0600",
+        (0o755, 0o600): "root-0755-marker-0600-unchanged",
+    }[initial]
 )
 """
 
@@ -126,13 +178,27 @@ def migrate(ep: c.Endpoint, volume_id: str) -> dict[str, object]:
     rc, output = c.ssh_capture(ep, command(volume_id), timeout=30)
     marker = output.strip()
     prefix = "LABCTL_LEGACY_ROOT_MIGRATION="
-    if rc or marker not in {prefix + CHANGED, prefix + UNCHANGED}:
+    results = {
+        CHANGED: ("0777", "0666", False),
+        RESUMED_MARKER: ("0700", "0666", True),
+        RESUMED_ROOT: ("0700", "0600", True),
+        UNCHANGED: ("0755", "0600", False),
+    }
+    if (
+        rc
+        or not marker.startswith(prefix)
+        or marker.removeprefix(prefix) not in results
+    ):
         raise RuntimeError(f"legacy gpu-lab root migration failed: {output[-300:]}")
     result = marker.removeprefix(prefix)
+    from_mode, marker_from_mode, resumed = results[result]
     return {
-        "changed": result == CHANGED,
-        "from_mode": "0777" if result == CHANGED else "0755",
+        "changed": result != UNCHANGED,
+        "from_mode": from_mode,
+        "marker_from_mode": marker_from_mode,
+        "marker_to_mode": "0600",
         "owner": "0:0",
+        "resumed": resumed,
         "schema_version": SCHEMA,
         "to_mode": "0755",
         "volume_id": volume_id,

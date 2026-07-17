@@ -154,7 +154,10 @@ def _command_checks(args: argparse.Namespace) -> None:
         "persistent_root_migration": {
             "changed": True,
             "from_mode": "0777",
+            "marker_from_mode": "0666",
+            "marker_to_mode": "0600",
             "owner": "0:0",
+            "resumed": False,
             "schema_version": legacy_root.SCHEMA,
             "to_mode": "0755",
             "volume_id": profile.VOLUME_ID,
