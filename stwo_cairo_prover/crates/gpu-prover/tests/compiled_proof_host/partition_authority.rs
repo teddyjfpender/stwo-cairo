@@ -533,3 +533,101 @@ fn exact_partition_rejects_u32_overflow_and_uncertified_tail() {
         Err(CompiledProofError::InvalidPartitionAuthority)
     ));
 }
+
+fn launch_materialization_fixture(granularity: usize) -> (CompiledProof, usize) {
+    let mut input = valid_input();
+    let words = output_words(&input);
+    let exact_projections = projections(&input);
+    let invocation = input.operations[0].invocation.as_mut().unwrap();
+    invocation.arguments.push(AotArgumentBinding {
+        ordinal: u8::try_from(invocation.arguments.len()).unwrap(),
+        value: AotArgumentValue::U32(0xfeed_beef),
+    });
+    let ExecutionPrimitive::AotKernel { launch, .. } = &mut input.operations[0].primitive else {
+        panic!("fixture must use an AOT kernel")
+    };
+    launch.grid[1..].copy_from_slice(&[7, 9]);
+    launch.block = [64, 2, 1];
+    launch.dynamic_shared_bytes = 12_288;
+    install_exact(
+        &mut input,
+        0,
+        range(0, words),
+        granularity,
+        4,
+        exact_projections,
+    )
+    .unwrap();
+    (CompiledProof::compile(input, transcript()).unwrap(), words)
+}
+
+#[test]
+fn exact_shard_materialization_rewrites_only_sealed_fields() {
+    let (compiled, words) = launch_materialization_fixture(1);
+    assert!(words > 2);
+    let operation = compiled.operation(OpId(0)).unwrap();
+    let full_invocation = operation.invocation.as_ref().unwrap();
+    let ExecutionPrimitive::AotKernel {
+        launch: full_launch,
+        ..
+    } = operation.primitive
+    else {
+        panic!("fixture must use an AOT kernel")
+    };
+    let shard_range = range(1, words - 1);
+    let shard = compiled
+        .materialize_exact_shard(operation.id, shard_range)
+        .unwrap();
+
+    let mut expected_invocation = full_invocation.clone();
+    let start = expected_invocation.arguments.len() - 2;
+    expected_invocation.arguments[start].value = AotArgumentValue::U32(1);
+    expected_invocation.arguments[start + 1].value =
+        AotArgumentValue::U32(u32::try_from(shard_range.len()).unwrap());
+    let mut expected_launch = full_launch;
+    expected_launch.grid[0] = u32::try_from(shard_range.len()).unwrap();
+    assert_eq!(shard.invocation(), &expected_invocation);
+    assert_eq!(shard.launch(), expected_launch);
+}
+
+#[test]
+fn exact_shard_materialization_requires_a_validated_exact_operation() {
+    let (compiled, words) = launch_materialization_fixture(1);
+    assert!(matches!(
+        compiled.materialize_exact_shard(OpId(u32::MAX), range(0, words)),
+        Err(CompiledProofError::InvalidPartitionAuthority)
+    ));
+
+    let monolithic = CompiledProof::compile(valid_input(), transcript()).unwrap();
+    assert!(matches!(
+        monolithic.materialize_exact_shard(OpId(0), range(0, words)),
+        Err(CompiledProofError::InvalidPartitionAuthority)
+    ));
+}
+
+#[test]
+fn exact_shard_materialization_rejects_invalid_domain() {
+    let (compiled, words) = launch_materialization_fixture(output_words(&valid_input()));
+    let invalid = [
+        ElementRange { start: 4, end: 4 },
+        ElementRange { start: 8, end: 4 },
+        ElementRange {
+            start: 0,
+            end: words + 1,
+        },
+        ElementRange {
+            start: 1,
+            end: words,
+        },
+        ElementRange {
+            start: 0,
+            end: u32::MAX as usize + 1,
+        },
+    ];
+    for shard in invalid {
+        assert!(matches!(
+            compiled.materialize_exact_shard(OpId(0), shard),
+            Err(CompiledProofError::InvalidPartitionAuthority)
+        ));
+    }
+}

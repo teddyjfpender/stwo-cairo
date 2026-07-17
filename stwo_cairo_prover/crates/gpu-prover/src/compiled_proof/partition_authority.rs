@@ -99,6 +99,23 @@ pub struct ExactPartitionAuthority {
     join: CanonicalPartitionJoin,
 }
 
+/// One exact shard derived from the validated full-domain AOT launch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactShardInvocation {
+    invocation: AotInvocation,
+    launch: LaunchGeometry,
+}
+
+impl ExactShardInvocation {
+    pub const fn invocation(&self) -> &AotInvocation {
+        &self.invocation
+    }
+
+    pub const fn launch(&self) -> LaunchGeometry {
+        self.launch
+    }
+}
+
 impl ExactPartitionAuthority {
     pub fn new(
         axis: u16,
@@ -149,6 +166,46 @@ impl ExactPartitionAuthority {
         self.join
     }
 
+    fn materialize_shard(
+        &self,
+        full_invocation: &AotInvocation,
+        full_launch: LaunchGeometry,
+        shard: ElementRange,
+    ) -> Result<ExactShardInvocation, CompiledProofError> {
+        self.validate_structure()?;
+        validate_full_launch_and_abi(full_invocation, full_launch, self)?;
+        if shard.is_empty() || !self.domain.contains(shard) {
+            return Err(CompiledProofError::InvalidPartitionAuthority);
+        }
+        let start = shard
+            .start
+            .checked_sub(self.domain.start)
+            .ok_or(CompiledProofError::InvalidPartitionAuthority)?;
+        let end = shard
+            .end
+            .checked_sub(self.domain.start)
+            .ok_or(CompiledProofError::InvalidPartitionAuthority)?;
+        if start % self.granularity != 0 || end % self.granularity != 0 {
+            return Err(CompiledProofError::InvalidPartitionAuthority);
+        }
+
+        let shard_start = u32::try_from(shard.start)
+            .map_err(|_| CompiledProofError::InvalidPartitionAuthority)?;
+        let shard_length = u32::try_from(shard.len())
+            .map_err(|_| CompiledProofError::InvalidPartitionAuthority)?;
+        u32::try_from(shard.end).map_err(|_| CompiledProofError::InvalidPartitionAuthority)?;
+        let grid_units = checked_grid_units(shard.len(), self.launch.elements_per_grid_unit)?;
+
+        let mut invocation = full_invocation.clone();
+        invocation.arguments[usize::from(self.launch.start_argument)].value =
+            AotArgumentValue::U32(shard_start);
+        invocation.arguments[usize::from(self.launch.length_argument)].value =
+            AotArgumentValue::U32(shard_length);
+        let mut launch = full_launch;
+        launch.grid[self.launch.grid_axis.index()] = grid_units;
+        Ok(ExactShardInvocation { invocation, launch })
+    }
+
     pub(super) fn validate_structure(&self) -> Result<(), CompiledProofError> {
         if self.domain.is_empty()
             || self.domain.start != 0
@@ -170,6 +227,35 @@ impl ExactPartitionAuthority {
             return Err(CompiledProofError::InvalidPartitionAuthority);
         }
         Ok(())
+    }
+}
+
+impl CompiledProof {
+    /// Derive one aligned shard from this validated proof's canonical AOT operation.
+    pub fn materialize_exact_shard(
+        &self,
+        operation: OpId,
+        shard: ElementRange,
+    ) -> Result<ExactShardInvocation, CompiledProofError> {
+        let operation = self
+            .operation(operation)
+            .ok_or(CompiledProofError::InvalidPartitionAuthority)?;
+        let partition = self
+            .partitions()
+            .iter()
+            .find(|partition| partition.id() == operation.partition)
+            .ok_or(CompiledProofError::InvalidPartitionAuthority)?;
+        let PartitionAuthorityKind::Exact(authority) = partition.kind() else {
+            return Err(CompiledProofError::InvalidPartitionAuthority);
+        };
+        let ExecutionPrimitive::AotKernel { launch, .. } = operation.primitive else {
+            return Err(CompiledProofError::InvalidPartitionAuthority);
+        };
+        let invocation = operation
+            .invocation
+            .as_ref()
+            .ok_or(CompiledProofError::InvalidPartitionAuthority)?;
+        authority.materialize_shard(invocation, launch, shard)
     }
 }
 
@@ -339,6 +425,24 @@ fn validate_launch_and_abi(
         .invocation
         .as_ref()
         .ok_or(CompiledProofError::InvalidPartitionAuthority)?;
+    validate_full_launch_and_abi(invocation, launch, authority)
+}
+
+fn validate_full_launch_and_abi(
+    invocation: &AotInvocation,
+    launch: LaunchGeometry,
+    authority: &ExactPartitionAuthority,
+) -> Result<(), CompiledProofError> {
+    if launch.cooperative
+        || launch.cluster.is_some()
+        || invocation
+            .arguments
+            .iter()
+            .enumerate()
+            .any(|(ordinal, argument)| usize::from(argument.ordinal) != ordinal)
+    {
+        return Err(CompiledProofError::InvalidPartitionAuthority);
+    }
     let start = u32::try_from(authority.domain.start)
         .map_err(|_| CompiledProofError::InvalidPartitionAuthority)?;
     let length = u32::try_from(authority.domain.len())
@@ -348,17 +452,27 @@ fn validate_launch_and_abi(
     require_u32_argument(invocation, authority.launch.start_argument, start)?;
     require_u32_argument(invocation, authority.launch.length_argument, length)?;
 
-    let units = authority
-        .domain
-        .len()
-        .checked_add(authority.launch.elements_per_grid_unit - 1)
-        .ok_or(CompiledProofError::SizeOverflow)?
-        / authority.launch.elements_per_grid_unit;
-    let units = u32::try_from(units).map_err(|_| CompiledProofError::InvalidPartitionAuthority)?;
+    let units = checked_grid_units(
+        authority.domain.len(),
+        authority.launch.elements_per_grid_unit,
+    )?;
     if launch.grid[authority.launch.grid_axis.index()] != units {
         return Err(CompiledProofError::InvalidPartitionAuthority);
     }
     Ok(())
+}
+
+fn checked_grid_units(
+    elements: usize,
+    elements_per_grid_unit: usize,
+) -> Result<u32, CompiledProofError> {
+    if elements == 0 || elements_per_grid_unit == 0 {
+        return Err(CompiledProofError::InvalidPartitionAuthority);
+    }
+    let units = (elements / elements_per_grid_unit)
+        .checked_add(usize::from(elements % elements_per_grid_unit != 0))
+        .ok_or(CompiledProofError::SizeOverflow)?;
+    u32::try_from(units).map_err(|_| CompiledProofError::InvalidPartitionAuthority)
 }
 
 fn require_u32_argument(
