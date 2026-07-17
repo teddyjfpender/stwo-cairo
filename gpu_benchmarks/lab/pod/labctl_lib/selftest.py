@@ -193,6 +193,7 @@ def _check_generated_commands(valid_image: str) -> None:
     assert "LOCAL_ROOT.json" in guard and "GPU_LAB_LOCAL_ROOT" in guard
     assert "DEV_LAYOUT.json" in guard
     assert "LABCTL_GUARD_ERROR phase=%s line=%s rc=%s" in guard
+    assert "LABCTL_GUARD_CONFLICT path=/workspace/gpu-lab actual=%s" in guard
     assert "LABCTL_REMOTE_GUARD_INSTALLED=%s" in guard
     for phase in (
         "mount-authority", "local-layout", "guard-programs",

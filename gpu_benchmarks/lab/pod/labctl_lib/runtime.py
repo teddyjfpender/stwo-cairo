@@ -46,7 +46,12 @@ for path in /workspace/gpu-lab /workspace/gpu-lab/NETWORK_VOLUME_ID; do
 done
 if test -e /workspace/gpu-lab; then
   test -d /workspace/gpu-lab
-  test "$(stat -c '%u:%g:%a' /workspace/gpu-lab)" = 0:0:755
+  GPU_LAB_ROOT_ID=$(stat -c '%u:%g:%a' /workspace/gpu-lab)
+  if test "$GPU_LAB_ROOT_ID" != 0:0:755; then
+    printf 'LABCTL_GUARD_CONFLICT path=/workspace/gpu-lab actual=%s expected=0:0:755\\n' \
+      "$GPU_LAB_ROOT_ID" >&2
+    exit 1
+  fi
 else
   install -d -m 0755 -o root -g root /workspace/gpu-lab
 fi
