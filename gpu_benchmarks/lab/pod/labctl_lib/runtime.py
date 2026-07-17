@@ -34,7 +34,9 @@ def _guard_command(
     idle_seal = _seal_command(pod_id, volume_id, reason="remote-idle-guard")
     local_root = persistence.local_root(pod_id)
     return f"""
-set -eu
+set -euE
+GUARD_PHASE=mount-authority
+trap 'rc=$?; trap - ERR; printf "LABCTL_GUARD_ERROR phase=%s line=%s rc=%s\\n" "$GUARD_PHASE" "$LINENO" "$rc" >&2; exit "$rc"' ERR
 POD_ID={shlex.quote(pod_id)}
 VOLUME_ID={shlex.quote(volume_id)}
 mountpoint -q /workspace
@@ -75,6 +77,7 @@ test -n "$LOCAL_DEVICE"
 test "$WORKSPACE_MOUNT" != "$LOCAL_MOUNT"
 test "$WORKSPACE_DEVICE" != "$LOCAL_DEVICE"
 export LOCAL_ROOT WORKSPACE_MOUNT LOCAL_MOUNT WORKSPACE_DEVICE LOCAL_DEVICE
+GUARD_PHASE=local-layout
 python3 - <<'PY'
 import json
 import os
@@ -236,6 +239,7 @@ finally:
 if read_regular(active, (0, 0, 0o600, 1)) != str(local) + "\\n":
     raise SystemExit("active-root marker mismatch")
 PY
+GUARD_PHASE=guard-programs
 cat > /etc/profile.d/stwo-gpu-lab-local.sh <<EOF
 export GPU_LAB_LOCAL_ROOT={shlex.quote(local_root)}
 EOF
@@ -292,6 +296,7 @@ while :; do
 done
 LABIDLE
 chmod 700 /usr/local/bin/stwo-lab-idle
+GUARD_PHASE=guard-processes
 if [ -f /var/run/stwo-lab-ttl.pid ]; then
   kill "$(cat /var/run/stwo-lab-ttl.pid)" 2>/dev/null || true
 fi
@@ -305,6 +310,7 @@ echo $! > /var/run/stwo-lab-idle.pid
 sleep 1
 kill -0 "$(cat /var/run/stwo-lab-ttl.pid)"
 kill -0 "$(cat /var/run/stwo-lab-idle.pid)"
+GUARD_PHASE=durable-lease-root
 for path in /workspace/gpu-lab/leases \
   /workspace/gpu-lab/leases/{shlex.quote(pod_id)} \
   /workspace/gpu-lab/leases/{shlex.quote(pod_id)}/records; do
@@ -312,6 +318,7 @@ for path in /workspace/gpu-lab/leases \
   test ! -e "$path" || test -d "$path"
   install -d -m 0700 -o root -g root "$path"
 done
+printf 'LABCTL_REMOTE_GUARD_INSTALLED=%s\\n' "$POD_ID"
 """
 
 

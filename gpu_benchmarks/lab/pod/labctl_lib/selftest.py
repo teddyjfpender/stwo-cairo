@@ -192,6 +192,28 @@ def _check_generated_commands(valid_image: str) -> None:
     assert "IDLE_S=300" in guard and c.HEARTBEAT_PATH in guard
     assert "LOCAL_ROOT.json" in guard and "GPU_LAB_LOCAL_ROOT" in guard
     assert "DEV_LAYOUT.json" in guard
+    assert "LABCTL_GUARD_ERROR phase=%s line=%s rc=%s" in guard
+    assert "LABCTL_REMOTE_GUARD_INSTALLED=%s" in guard
+    for phase in (
+        "mount-authority", "local-layout", "guard-programs",
+        "guard-processes", "durable-lease-root",
+    ):
+        assert phase in guard
+    assert guard.index("GUARD_PHASE=mount-authority") < guard.index(
+        "LABCTL_REMOTE_GUARD_INSTALLED=%s"
+    )
+    trap_probe = guard.split("POD_ID=", 1)[0] + "false\n"
+    trapped = subprocess.run(
+        ["bash", "-c", trap_probe], capture_output=True, text=True, check=False
+    )
+    error = trapped.stderr.strip()
+    prefix, suffix = "LABCTL_GUARD_ERROR phase=mount-authority line=", " rc=1"
+    assert (
+        trapped.returncode == 1
+        and error.startswith(prefix)
+        and error.endswith(suffix)
+    )
+    assert error.removeprefix(prefix).removesuffix(suffix).isdigit()
     assert 'install -d -m 0710 -o root -g dev "$LOCAL_ROOT"' in guard
     assert 'install -d -m 0700 -o dev -g dev "$LOCAL_ROOT/build"' in guard
     assert '"build_uid": 1000' in guard and '"fixtures_uid": 1000' in guard
@@ -268,7 +290,7 @@ def _check_state_machine(args, offer, plan, canonical) -> None:
                 provider._network_volume_attestation,
                 provider._secure_offer,
                 runtime._spawn_watchdog,
-                c.ssh_run,
+                c.ssh_capture,
                 c.wait_ready,
                 c.api.list_pods,
                 c.ledger.append,
@@ -285,7 +307,9 @@ def _check_state_machine(args, offer, plan, canonical) -> None:
                 provider._create_pod_once = lambda **_kw: fake_pod
                 runtime._spawn_watchdog = lambda _state: 12345
                 c.wait_ready = lambda *_a, **_kw: fake_pod
-                c.ssh_run = lambda *_a, **_kw: 0
+                c.ssh_capture = lambda *_a, **_kw: (
+                    0, "LABCTL_REMOTE_GUARD_INSTALLED=pod-test"
+                )
                 list_calls = iter(([], [fake_pod]))
                 c.api.list_pods = lambda: next(list_calls)
                 c.ledger.append = lambda *_a, **_kw: None
@@ -303,7 +327,7 @@ def _check_state_machine(args, offer, plan, canonical) -> None:
                     provider._network_volume_attestation,
                     provider._secure_offer,
                     runtime._spawn_watchdog,
-                    c.ssh_run,
+                    c.ssh_capture,
                     c.wait_ready,
                     c.api.list_pods,
                     c.ledger.append,

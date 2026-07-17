@@ -433,7 +433,7 @@ def _ordering_checks(args: argparse.Namespace) -> None:
         profile.bootstrap_dev,
         profile.verify_ssh,
         profile.persist_record,
-        c.ssh_run,
+        c.ssh_capture,
     )
     calls = []
     try:
@@ -441,7 +441,10 @@ def _ordering_checks(args: argparse.Namespace) -> None:
             c.STATE = Path(directory) / "lease.json"
             profile.bootstrap_dev = lambda _ep: calls.append("bootstrap") or "a" * 64
             profile.verify_ssh = lambda _ep, _key: calls.append("fresh-root+dev")
-            c.ssh_run = lambda *_a, **_kw: calls.append("guard") or 0
+            c.ssh_capture = lambda *_a, **_kw: (
+                calls.append("guard")
+                or (0, "LABCTL_REMOTE_GUARD_INSTALLED=pod-test")
+            )
             profile.persist_record = (
                 lambda *_a: calls.append("record")
                 or ("/workspace/profile.json", "b" * 64)
@@ -473,20 +476,42 @@ def _ordering_checks(args: argparse.Namespace) -> None:
 
             calls.clear()
             profile.verify_ssh = lambda _ep, _key: calls.append("fresh-root+dev")
-            c.ssh_run = lambda *_a, **_kw: calls.append("guard-failed") or 1
-            _rejected(
-                lambda: lifecycle._install_remote_controls(
-                    state, args, c.Endpoint("host", 22), 3600
-                ),
-                "failed guard",
+            diagnostic = "LABCTL_GUARD_ERROR phase=local-layout line=99 rc=1"
+            c.ssh_capture = lambda *_a, **_kw: (
+                calls.append("guard-failed") or (1, diagnostic)
             )
+            try:
+                lifecycle._install_remote_controls(
+                    state, args, c.Endpoint("host", 22), 3600
+                )
+            except RuntimeError as error:
+                assert diagnostic in str(error)
+            else:
+                raise AssertionError("failed guard was accepted")
             assert calls == ["bootstrap", "fresh-root+dev", "guard-failed"]
+
+            for invalid in (
+                "",
+                "LABCTL_REMOTE_GUARD_INSTALLED=other-pod",
+                "LABCTL_REMOTE_GUARD_INSTALLED=pod-test\nunexpected-output",
+            ):
+                calls.clear()
+                c.ssh_capture = lambda *_a, invalid=invalid, **_kw: (
+                    calls.append("guard-invalid") or (0, invalid)
+                )
+                _rejected(
+                    lambda: lifecycle._install_remote_controls(
+                        state, args, c.Endpoint("host", 22), 3600
+                    ),
+                    "invalid guard completion authority",
+                )
+                assert calls == ["bootstrap", "fresh-root+dev", "guard-invalid"]
     finally:
         (
             profile.bootstrap_dev,
             profile.verify_ssh,
             profile.persist_record,
-            c.ssh_run,
+            c.ssh_capture,
         ) = saved
         c.STATE = old_state
 

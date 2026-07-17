@@ -105,14 +105,18 @@ def _install_remote_controls(state: dict, args, ep: c.Endpoint, remaining: int) 
         state["bootstrap_key_sha256"] = bootstrap_profile.bootstrap_dev(ep)
         c._write_state(state)
         bootstrap_profile.verify_ssh(ep, state["bootstrap_key_sha256"])
-    if c.ssh_run(
+    rc, output = c.ssh_capture(
         ep,
         runtime._guard_command(
             state["pod_id"], state["volume_id"], remaining, args.idle_min * 60
         ),
         timeout=60,
-    ):
-        raise RuntimeError("failed to install remote TTL termination guard")
+    )
+    expected = f"LABCTL_REMOTE_GUARD_INSTALLED={state['pod_id']}"
+    if rc or output.strip() != expected:
+        raise RuntimeError(
+            "failed to install remote TTL termination guard: " + output[-500:]
+        )
     if bootstrap:
         record, digest = bootstrap_profile.persist_record(ep, state)
         state["profile_record"] = record
