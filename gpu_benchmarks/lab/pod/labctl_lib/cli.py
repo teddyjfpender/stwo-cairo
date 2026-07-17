@@ -11,6 +11,7 @@ from . import acceptance
 from . import bootstrap_profile
 from . import common as c
 from . import lifecycle
+from . import resolve
 from . import selftest
 from . import sync
 
@@ -42,6 +43,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm", help="exact token printed by the preview")
     sub.add_parser("status")
     sub.add_parser("sync", help="publish an exact immutable source generation")
+    sub.add_parser("resolve", help="print the active immutable source generation")
     sub.add_parser("heartbeat", help="renew the remote interactive-idle deadline")
     sub.add_parser("shell")
     p = sub.add_parser("accept", help="record readiness; --profile runs a real ncu kernel")
@@ -64,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         "open": lifecycle.cmd_open,
         "status": lifecycle.cmd_status,
         "sync": sync.cmd_sync,
+        "resolve": resolve.cmd_resolve,
         "heartbeat": acceptance.cmd_heartbeat,
         "shell": acceptance.cmd_shell,
         "accept": acceptance.cmd_accept,
@@ -74,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd in {"self-test", "_watch"}:
             return commands[args.cmd](args)
-        if args.cmd in {"sync", "heartbeat", "shell", "accept"}:
+        if args.cmd in {"sync", "resolve", "heartbeat", "shell", "accept"}:
             with c._operation_lock():
                 return commands[args.cmd](args)
         if args.cmd == "close":

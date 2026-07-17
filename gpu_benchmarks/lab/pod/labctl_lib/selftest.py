@@ -17,8 +17,9 @@ from . import (
     acceptance_tests,
     bootstrap_profile_tests,
     generation_tests,
-    legacy_root_tests,
+    lease_local_root_tests,
     lifecycle,
+    resolve_tests,
 )
 from . import lifecycle_tests, persistence_tests
 from . import provider, runtime, sync
@@ -450,10 +451,11 @@ def cmd_self_test(_args) -> int:
         _check_provider(offer)
         _check_generated_commands(args.image)
         bootstrap_profile_tests.bootstrap_profile_self_test()
-        legacy_root_tests.legacy_root_self_test()
+        lease_local_root_tests.lease_local_root_self_test()
         persistence_tests.persistence_self_test()
         _check_tree_identity()
         generation_tests.generation_self_test()
+        resolve_tests.resolve_self_test()
         lifecycle_tests.failed_open_cleanup_self_test()
         lifecycle_tests.ssh_preflight_self_test()
         _check_state_machine(args, offer, plan, canonical)
