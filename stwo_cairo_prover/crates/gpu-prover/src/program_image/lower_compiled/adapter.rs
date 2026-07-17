@@ -4,9 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 use crate::compiled_proof::{
-    AotArgumentBinding, AotArgumentValue, AotInvocation, BoundValueRange, EffectAccess,
-    EffectBindingId, EffectContract, ElementRange, ValueRange, ValueVersion,
+    AotArgumentBinding, AotArgumentValue, AotInvocation, BoundValueRange, ConstantId, EffectAccess,
+    EffectBindingId, EffectContract, ElementRange, ElementType, FixedValueDesc, LayoutAxis, Region,
+    ValueDesc, ValueLayout, ValueOrigin, ValueRange, ValueVersion,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FixedU32Value {
+    constant: ConstantId,
+    value: ValueVersion,
+    words: Vec<u32>,
+}
 
 /// Explicit semantic authority. Arena catalog IDs are storage inventory and
 /// are never cast or inferred into immutable semantic versions.
@@ -14,6 +22,9 @@ use crate::compiled_proof::{
 pub(super) struct SemanticValueMap {
     current: BTreeMap<ArenaCatalogValueId, ValueVersion>,
     allocations: Vec<(ArenaCatalogValueId, ValueVersion)>,
+    fixed_u32_by_content: BTreeMap<Vec<u32>, usize>,
+    fixed_u32: Vec<FixedU32Value>,
+    next_value: u32,
 }
 
 impl SemanticValueMap {
@@ -39,6 +50,10 @@ impl SemanticValueMap {
         Ok(Self {
             current,
             allocations,
+            fixed_u32_by_content: BTreeMap::new(),
+            fixed_u32: Vec::new(),
+            next_value: u32::try_from(versions.len())
+                .map_err(|_| InvocationShapeError::SizeOverflow)?,
         })
     }
 
@@ -58,7 +73,7 @@ impl SemanticValueMap {
             if self.current.contains_key(&catalog) {
                 continue;
             }
-            let version = self.next_version()?;
+            let version = self.allocate_version()?;
             self.current.insert(catalog, version);
             self.allocations.push((catalog, version));
         }
@@ -70,17 +85,47 @@ impl SemanticValueMap {
         catalog: ArenaCatalogValueId,
     ) -> Result<(ValueVersion, ValueVersion), InvocationShapeError> {
         let source = self.version(catalog)?;
-        let destination = self.next_version()?;
+        let destination = self.allocate_version()?;
         self.current.insert(catalog, destination);
         self.allocations.push((catalog, destination));
         Ok((source, destination))
     }
 
-    fn next_version(&self) -> Result<ValueVersion, InvocationShapeError> {
-        Ok(ValueVersion(
-            u32::try_from(self.allocations.len())
-                .map_err(|_| InvocationShapeError::SizeOverflow)?,
-        ))
+    fn allocate_version(&mut self) -> Result<ValueVersion, InvocationShapeError> {
+        let version = ValueVersion(self.next_value);
+        self.next_value = self
+            .next_value
+            .checked_add(1)
+            .ok_or(InvocationShapeError::SizeOverflow)?;
+        Ok(version)
+    }
+
+    fn register_fixed_u32(
+        &mut self,
+        words: Vec<u32>,
+    ) -> Result<ValueVersion, InvocationShapeError> {
+        if words.is_empty() {
+            return Err(InvocationShapeError::InvalidProgramRole);
+        }
+        if let Some(&index) = self.fixed_u32_by_content.get(words.as_slice()) {
+            let fixed = self
+                .fixed_u32
+                .get(index)
+                .ok_or(InvocationShapeError::InvalidProgramRole)?;
+            return Ok(fixed.value);
+        }
+        let constant = ConstantId(
+            u32::try_from(self.fixed_u32.len()).map_err(|_| InvocationShapeError::SizeOverflow)?,
+        );
+        let value = self.allocate_version()?;
+        let index = self.fixed_u32.len();
+        self.fixed_u32_by_content.insert(words.clone(), index);
+        self.fixed_u32.push(FixedU32Value {
+            constant,
+            value,
+            words,
+        });
+        Ok(value)
     }
 
     pub(super) fn version(
@@ -93,6 +138,42 @@ impl SemanticValueMap {
             .ok_or(InvocationShapeError::MissingSemanticValueMap(catalog))
     }
 
+    pub(super) fn fixed_values(&self) -> Vec<FixedValueDesc> {
+        self.fixed_u32
+            .iter()
+            .map(|fixed| {
+                FixedValueDesc::inline_u32(fixed.constant, fixed.value, fixed.words.clone())
+            })
+            .collect()
+    }
+
+    pub(super) fn fixed_value_versions(&self) -> Vec<ValueDesc> {
+        self.fixed_u32
+            .iter()
+            .map(|fixed| ValueDesc {
+                version: fixed.value,
+                layout: ValueLayout {
+                    element: ElementType::U32,
+                    axes: vec![LayoutAxis {
+                        tag: 0,
+                        extent: fixed.words.len(),
+                        stride_bytes: core::mem::size_of::<u32>(),
+                    }],
+                },
+                alignment: core::mem::align_of::<u32>(),
+                origin: ValueOrigin::Constant(fixed.constant),
+                region: Region::FixedData,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn allocated_versions(&self) -> impl Iterator<Item = ValueVersion> + '_ {
+        let catalogs = self.allocations.iter().map(|(_, version)| *version);
+        let fixed = self.fixed_u32.iter().map(|fixed| fixed.value);
+        catalogs.chain(fixed)
+    }
+
     #[cfg(test)]
     pub(super) fn entries(&self) -> impl Iterator<Item = (ArenaCatalogValueId, ValueVersion)> + '_ {
         self.allocations.iter().copied()
@@ -103,7 +184,7 @@ impl SemanticValueMap {
 /// relocation. The compiled effect names only ranges the kernel dereferences.
 pub(super) fn compile(
     source: &[SourceArgument],
-    values: &SemanticValueMap,
+    values: &mut SemanticValueMap,
 ) -> Result<(AotInvocation, EffectContract), InvocationShapeError> {
     let mut required = BTreeSet::new();
     for argument in source {
@@ -179,11 +260,27 @@ pub(super) fn compile(
                 {
                     return Err(InvocationShapeError::InvalidProgramRole);
                 }
+                let element_count = entries.len();
+                let words = entries.iter().map(|entry| entry.value).collect::<Vec<_>>();
+                let value = values.register_fixed_u32(words)?;
+                let binding = EffectBindingId(next_binding);
+                next_binding = next_binding
+                    .checked_add(1)
+                    .ok_or(InvocationShapeError::SizeOverflow)?;
+                let elements = ElementRange::new(0, element_count)
+                    .ok_or(InvocationShapeError::InvalidProgramRole)?;
+                accesses.push(EffectAccess::Read {
+                    source: BoundValueRange {
+                        binding,
+                        value: ValueRange {
+                            version: value,
+                            elements,
+                        },
+                    },
+                });
                 (
                     *ordinal,
-                    AotArgumentValue::legacy_unbound_fixed_u32(
-                        entries.iter().map(|entry| entry.value).collect(),
-                    ),
+                    AotArgumentValue::DeviceFixedU32 { value, binding },
                 )
             }
             SourceArgument::DirectPointer { ordinal, target } => (

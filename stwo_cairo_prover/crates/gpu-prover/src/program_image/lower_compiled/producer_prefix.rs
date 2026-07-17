@@ -246,7 +246,7 @@ impl BaseProducerAuthority {
                         &recorded.source.source_arguments,
                     ))?;
                     let (invocation, effect) =
-                        adapter::compile(&recorded.source.source_arguments, &values)?;
+                        adapter::compile(&recorded.source.source_arguments, &mut values)?;
                     producers.push(SemanticBaseProducer::Recorded(
                         LoweredRecordedWitnessProducer {
                             position: recorded.position,
@@ -648,17 +648,17 @@ fn map_scheduled_base_producers_using(
             PendingBaseProducer::Recorded(producer) => {
                 semantic_values
                     .extend_ordered(invocation_catalog_order(&producer.source.source_arguments))?;
-                let (invocation, effect) = adapter::compile(
-                    &producer.source.source_arguments,
-                    &semantic_values,
-                )
-                .map_err(|error| match error {
-                    InvocationShapeError::InvalidProgramRole
-                    | InvocationShapeError::InvalidAdapterEffect => {
-                        InvocationShapeError::ScheduledProducerInvalidEffect(producer.producer)
-                    }
-                    error => error,
-                })?;
+                let (invocation, effect) =
+                    adapter::compile(&producer.source.source_arguments, &mut semantic_values)
+                        .map_err(|error| match error {
+                            InvocationShapeError::InvalidProgramRole
+                            | InvocationShapeError::InvalidAdapterEffect => {
+                                InvocationShapeError::ScheduledProducerInvalidEffect(
+                                    producer.producer,
+                                )
+                            }
+                            error => error,
+                        })?;
                 bound.push(LoweredBaseProducer::Recorded(
                     LoweredRecordedWitnessProducer {
                         position: producer.position,

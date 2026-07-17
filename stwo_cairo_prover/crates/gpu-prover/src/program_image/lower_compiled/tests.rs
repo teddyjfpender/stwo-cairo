@@ -566,34 +566,38 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         assert_eq!(source.binding, lowered.invocation.inverse_twiddles);
     }
     assert_eq!(first_producer.source.source_arguments.len(), 8);
+    let mut empty_values =
+        adapter::SemanticValueMap::new(std::iter::empty::<(ArenaCatalogValueId, ValueVersion)>())
+            .unwrap();
     assert!(matches!(
-        adapter::compile(
-            &first_producer.source.source_arguments,
-            &adapter::SemanticValueMap::new(
-                std::iter::empty::<(ArenaCatalogValueId, ValueVersion,)>()
-            )
-            .unwrap(),
-        ),
+        adapter::compile(&first_producer.source.source_arguments, &mut empty_values,),
         Err(InvocationShapeError::MissingSemanticValueMap(_))
     ));
-    let (invocation, effect) = adapter::compile(
-        &first_producer.source.source_arguments,
-        &mapped.semantic_values,
-    )
-    .unwrap();
+    let mut replay_values = mapped.semantic_values.clone();
+    let (invocation, effect) =
+        adapter::compile(&first_producer.source.source_arguments, &mut replay_values).unwrap();
     assert_eq!(invocation.arguments.len(), 8);
     assert!(!effect.accesses().is_empty());
     assert_eq!(invocation, first_producer.invocation);
     assert_eq!(effect, first_producer.effect);
     let mut versions = mapped
         .semantic_values
-        .entries()
-        .map(|(_, version)| version.0)
+        .allocated_versions()
+        .map(|version| version.0)
         .collect::<Vec<_>>();
     versions.sort_unstable();
     assert_eq!(
         versions,
         (0..u32::try_from(versions.len()).unwrap()).collect::<Vec<_>>()
+    );
+    assert!(!mapped.semantic_values.fixed_values().is_empty());
+    assert_eq!(
+        mapped.semantic_values.fixed_values().len(),
+        mapped.semantic_values.fixed_value_versions().len()
+    );
+    assert_eq!(
+        replay_values.fixed_values(),
+        mapped.semantic_values.fixed_values()
     );
     assert!(mapped
         .base_interpolation
