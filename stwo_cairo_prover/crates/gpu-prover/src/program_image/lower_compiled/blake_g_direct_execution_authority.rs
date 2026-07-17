@@ -153,6 +153,24 @@ impl NativeBlakeGDirectLinkedModuleAuthority {
         Ok(authority)
     }
 
+    pub(super) fn validate_contract(
+        &self,
+        contract: &BlakeGDirectCompositeContract,
+    ) -> Result<(), InvocationShapeError> {
+        let exact = Self::derive_exact(
+            contract,
+            self.static_module_build_identity,
+            self.expected_static_module_build_identity,
+            self.consumer_target_sm,
+            self.consumer_target_sm,
+        )?;
+        if self == &exact {
+            Ok(())
+        } else {
+            Err(InvocationShapeError::InvalidNativeBlakeGDirectAuthority)
+        }
+    }
+
     pub(super) fn bind_prepared(
         self,
         contract: &BlakeGDirectCompositeContract,
