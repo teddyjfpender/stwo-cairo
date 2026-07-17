@@ -31,6 +31,7 @@ mod pow;
 mod runtime_view;
 mod spill;
 mod storage_contract;
+mod two_rank_closure;
 mod worker_install;
 
 const OP_ASSEMBLE: OpId = OpId(0);

@@ -12,7 +12,7 @@ fn compile_partitioned(fixture: Fixture) -> Result<FleetProofPlan, FleetCompileE
     )
 }
 
-fn transfer_fixture() -> Fixture {
+pub(super) fn transfer_fixture() -> Fixture {
     transfer_fixture_with_reads(None)
 }
 

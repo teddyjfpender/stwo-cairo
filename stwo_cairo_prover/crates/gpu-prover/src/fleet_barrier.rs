@@ -195,6 +195,10 @@ impl WorkerBarrierCursor {
     pub fn can_start_segment(&self, segment: u32) -> bool {
         segment < self.barrier_count && segment == self.next_release
     }
+
+    pub const fn is_complete(&self) -> bool {
+        self.next_release >= self.barrier_count
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -21,6 +21,7 @@ mod ipc_cursor;
 mod lower_compiled;
 mod runtime_view;
 mod storage;
+mod two_rank_closure;
 mod validate;
 mod worker_install;
 
@@ -42,6 +43,9 @@ pub use runtime_view::{
     FleetTransferSpan,
 };
 pub use storage::{StorageDesc, StorageId};
+pub use two_rank_closure::{
+    FleetTwoRankStructuralClosureError, FleetTwoRankStructuralClosureReceipt,
+};
 pub use worker_install::{
     FleetCoordinatorInstall, FleetEffectBinding, FleetInstallWindow, FleetTranscriptBinding,
     FleetTranscriptInstall, FleetWorkerExecutable, FleetWorkerExecution,
