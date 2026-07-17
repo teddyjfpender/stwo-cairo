@@ -10,6 +10,7 @@ import time
 
 from . import bootstrap_profile
 from . import common as c
+from . import legacy_root
 from . import provider
 from . import runtime
 
@@ -102,6 +103,10 @@ def _install_remote_controls(state: dict, args, ep: c.Endpoint, remaining: int) 
     """Finish bootstrap before the ordinary remote guards make the lease open."""
     bootstrap = bool(bootstrap_profile.metadata(args))
     if bootstrap:
+        state["persistent_root_migration"] = legacy_root.migrate(
+            ep, state["volume_id"]
+        )
+        c._write_state(state)
         state["bootstrap_key_sha256"] = bootstrap_profile.bootstrap_dev(ep)
         c._write_state(state)
         bootstrap_profile.verify_ssh(ep, state["bootstrap_key_sha256"])

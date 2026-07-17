@@ -13,7 +13,13 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import acceptance_tests, bootstrap_profile_tests, generation_tests, lifecycle
+from . import (
+    acceptance_tests,
+    bootstrap_profile_tests,
+    generation_tests,
+    legacy_root_tests,
+    lifecycle,
+)
 from . import lifecycle_tests, persistence_tests
 from . import provider, runtime, sync
 from . import common as c
@@ -444,6 +450,7 @@ def cmd_self_test(_args) -> int:
         _check_provider(offer)
         _check_generated_commands(args.image)
         bootstrap_profile_tests.bootstrap_profile_self_test()
+        legacy_root_tests.legacy_root_self_test()
         persistence_tests.persistence_self_test()
         _check_tree_identity()
         generation_tests.generation_self_test()

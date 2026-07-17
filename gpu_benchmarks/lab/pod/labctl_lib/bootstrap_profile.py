@@ -475,7 +475,7 @@ def _record_payload(state: dict) -> dict:
     return {
         **{key: state[key] for key in (
             "formal", "image_digest", "image_digest_authority", "lane", "profile",
-            "qualification_eligible",
+            "qualification_eligible", "persistent_root_migration",
         )},
         "image": state["image"],
         "bootstrap_key_sha256": state["bootstrap_key_sha256"],

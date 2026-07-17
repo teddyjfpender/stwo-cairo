@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from . import acceptance
 from . import bootstrap_profile as profile
 from . import common as c
+from . import legacy_root
 from . import lifecycle
 from . import provider
 from . import runtime
@@ -150,6 +151,14 @@ def _command_checks(args: argparse.Namespace) -> None:
         **profile.metadata(args),
         "bootstrap_key_sha256": "a" * 64,
         "image": profile.IMAGE,
+        "persistent_root_migration": {
+            "changed": True,
+            "from_mode": "0777",
+            "owner": "0:0",
+            "schema_version": legacy_root.SCHEMA,
+            "to_mode": "0755",
+            "volume_id": profile.VOLUME_ID,
+        },
         "pod_id": "pod-test",
         "volume_dc": profile.VOLUME_DC,
         "volume_id": profile.VOLUME_ID,
@@ -162,6 +171,7 @@ def _command_checks(args: argparse.Namespace) -> None:
     assert payload["formal"] is False and payload["lane"] == profile.LANE
     assert payload["qualification_eligible"] is False
     assert payload["image_digest_authority"].startswith("requested-reference")
+    assert payload["persistent_root_migration"]["changed"] is True
 
     guard = runtime._guard_command("pod-test", "volume-test", 60, 300)
     subprocess.run(["bash", "-n"], input=guard, text=True, check=True)
@@ -430,6 +440,7 @@ printf '%s\n' MARKER-1 MARKER-2 MARKER-3 MARKER-4 >> "$ORDER_LOG"
 def _ordering_checks(args: argparse.Namespace) -> None:
     old_state = c.STATE
     saved = (
+        legacy_root.migrate,
         profile.bootstrap_dev,
         profile.verify_ssh,
         profile.persist_record,
@@ -439,6 +450,17 @@ def _ordering_checks(args: argparse.Namespace) -> None:
     try:
         with tempfile.TemporaryDirectory() as directory:
             c.STATE = Path(directory) / "lease.json"
+            legacy_root.migrate = lambda *_a: (
+                calls.append("root-migration")
+                or {
+                    "changed": True,
+                    "from_mode": "0777",
+                    "owner": "0:0",
+                    "schema_version": legacy_root.SCHEMA,
+                    "to_mode": "0755",
+                    "volume_id": profile.VOLUME_ID,
+                }
+            )
             profile.bootstrap_dev = lambda _ep: calls.append("bootstrap") or "a" * 64
             profile.verify_ssh = lambda _ep, _key: calls.append("fresh-root+dev")
             c.ssh_capture = lambda *_a, **_kw: (
@@ -458,10 +480,37 @@ def _ordering_checks(args: argparse.Namespace) -> None:
             lifecycle._install_remote_controls(
                 state, args, c.Endpoint("host", 22), 3600
             )
-            assert calls == ["bootstrap", "fresh-root+dev", "guard", "record"]
+            assert calls == [
+                "root-migration", "bootstrap", "fresh-root+dev", "guard", "record"
+            ]
             assert c._read_state()["phase"] == "bootstrapping"
+            assert c._read_state()["persistent_root_migration"]["changed"] is True
 
             calls.clear()
+            legacy_root.migrate = lambda *_a: (
+                calls.append("root-migration-failed"),
+                (_ for _ in ()).throw(RuntimeError("hostile legacy root")),
+            )[1]
+            _rejected(
+                lambda: lifecycle._install_remote_controls(
+                    state, args, c.Endpoint("host", 22), 3600
+                ),
+                "hostile legacy root",
+            )
+            assert calls == ["root-migration-failed"]
+
+            calls.clear()
+            legacy_root.migrate = lambda *_a: (
+                calls.append("root-migration")
+                or {
+                    "changed": False,
+                    "from_mode": "0755",
+                    "owner": "0:0",
+                    "schema_version": legacy_root.SCHEMA,
+                    "to_mode": "0755",
+                    "volume_id": profile.VOLUME_ID,
+                }
+            )
             profile.verify_ssh = lambda _ep, _key: (
                 calls.append("fresh-root+dev-failed"),
                 (_ for _ in ()).throw(RuntimeError("receipt missing")),
@@ -472,7 +521,9 @@ def _ordering_checks(args: argparse.Namespace) -> None:
                 ),
                 "failed fresh SSH receipt",
             )
-            assert calls == ["bootstrap", "fresh-root+dev-failed"]
+            assert calls == [
+                "root-migration", "bootstrap", "fresh-root+dev-failed"
+            ]
 
             calls.clear()
             profile.verify_ssh = lambda _ep, _key: calls.append("fresh-root+dev")
@@ -488,7 +539,9 @@ def _ordering_checks(args: argparse.Namespace) -> None:
                 assert diagnostic in str(error)
             else:
                 raise AssertionError("failed guard was accepted")
-            assert calls == ["bootstrap", "fresh-root+dev", "guard-failed"]
+            assert calls == [
+                "root-migration", "bootstrap", "fresh-root+dev", "guard-failed"
+            ]
 
             for invalid in (
                 "",
@@ -505,9 +558,12 @@ def _ordering_checks(args: argparse.Namespace) -> None:
                     ),
                     "invalid guard completion authority",
                 )
-                assert calls == ["bootstrap", "fresh-root+dev", "guard-invalid"]
+                assert calls == [
+                    "root-migration", "bootstrap", "fresh-root+dev", "guard-invalid"
+                ]
     finally:
         (
+            legacy_root.migrate,
             profile.bootstrap_dev,
             profile.verify_ssh,
             profile.persist_record,
