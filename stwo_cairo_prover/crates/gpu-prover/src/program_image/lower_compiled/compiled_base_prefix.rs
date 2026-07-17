@@ -331,6 +331,12 @@ fn compiled_kernel(
     .map_err(|_| ())
 }
 
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ()> {
+    out.extend_from_slice(&u64::try_from(bytes.len()).map_err(|_| ())?.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
 fn encode_module(fields: &LoadedAuthorityFields) -> Result<Vec<u8>, ()> {
     let mut out = Vec::from(MODULE_DOMAIN);
     out.extend_from_slice(&fields.manifest_identity);

@@ -7,6 +7,7 @@ use super::compiled_base_prefix::{
     emit_recorded_base_prefix_for_test, CompiledBasePrefixError, MissingBaseAdapter,
 };
 use super::loaded_authority::LoadedAuthorityFields;
+use super::producer_prefix::SemanticBaseProducer;
 use super::*;
 use crate::compiled_proof::{
     AotArgumentValue, EffectBindingId, ExecutionPrimitive, FixedValueInitializer,

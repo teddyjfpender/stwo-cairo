@@ -29,6 +29,7 @@ pub(super) fn blake_g_direct(
             .iter()
             .enumerate()
             .any(|(ordinal, argument)| argument.ordinal as usize != ordinal)
+        || abi[6].ordinal != 6
         || abi[6].access != BlakeGDirectAbiAccess::OrderedExecutionStream
     {
         return Err(InvocationShapeError::InvalidNativeBlakeGDirectAuthority);
@@ -120,6 +121,7 @@ pub(super) fn ec_op(
             .iter()
             .enumerate()
             .any(|(ordinal, argument)| argument.ordinal as usize != ordinal)
+        || abi[18].ordinal != 18
         || abi[18].access != EcOpAbiAccess::OrderedExecutionStream
         || contract.invocation.execution_tables.len() != EXECUTION_TABLE_POINTERS
         || contract.invocation.trace_columns.len() != requirements.trace_column_words.len()
