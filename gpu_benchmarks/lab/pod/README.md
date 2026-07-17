@@ -47,6 +47,7 @@ gpu_benchmarks/lab/pod/labctl open --image IMAGE@sha256:DIGEST \
   --volume-id ID --volume-dc DC
 gpu_benchmarks/lab/pod/labctl heartbeat
 gpu_benchmarks/lab/pod/labctl sync
+gpu_benchmarks/lab/pod/labctl resolve > /tmp/stwo-gpu-source.json
 gpu_benchmarks/lab/pod/labctl accept --profile
 ```
 
@@ -68,10 +69,20 @@ It creates and verifies only the `1000:1000` development identity before install
 guards. Its records say `formal=false` and `qualification_eligible=false`; `labctl accept` rejects
 it, so the lane cannot produce qualification or headline evidence. The recorded image digest is
 the requested immutable reference, not a runtime attestation of the provider-started filesystem.
-For this one known volume only, the profile also migrates its legacy `root:root` `0777` controller
-root and `0666` volume-id memo to `0755`/`0600`. It first anchors both inodes without following
-links, closes them to non-root mutation, verifies the memo against the provider-attested volume id,
-fsyncs and re-attests both objects, and records the transition; no recursive mode repair is allowed.
+It never repairs or trusts the known volume's legacy `root:root` `0777` controller root or `0666`
+volume-id memo. It verifies that exact state without following links, creates a fresh pod-unique
+`root:root` `0755` backing directory on the container disk, and bind-mounts it over
+`/workspace/gpu-lab` before the dev bootstrap and ordinary guard. The mount record proves that
+`/workspace` remains the provider-attested mount, that its device differs from the container
+backing device, and that the new target is the exact backing inode on a distinct bind-mount
+identity. The unchanged ordinary guard then creates and validates its own `0600` marker there.
+
+This exception records `persistence_scope=lease-local-container-disk` and `qualification=false`.
+It is development-only. The network volume is not a cache, source-generation, result, profile, or
+evidence authority in this lane: everything beneath `/workspace/gpu-lab` is on the pod's container
+disk and is lost when the pod terminates. Sync source again on the next lease and copy out any
+informal diagnostics before closing. Formal development, acceptance, qualification, and headline
+evidence still require the published consumer image and the unmodified persistent-volume guards.
 
 ```bash
 gpu_benchmarks/lab/pod/labctl open \
@@ -103,27 +114,27 @@ Transactions are capped at 40 GiB and one million entries, must leave 20 GiB fre
 store is capped at 256 manifests. Prior published generations remain intact because this slice does
 not automatically garbage-collect generation history.
 
-Build, profile, sanitizer, and benchmark commands must resolve the immutable manifest named by
+Build, profile, sanitizer, and benchmark commands must use the immutable manifest named by
 `/workspace/gpu-lab/source-generations/CURRENT`, record its manifest SHA-256, and use only the exact
-repository paths inside its `generation_path`. Resolve them once per run; do not infer a generation
-from a directory listing or substitute `/workspace/src`:
+repository paths inside its `generation_path`. Resolve it once per run through the authenticated
+root controller; never list generations, read the root-owned `0400` manifest as `dev`, or substitute
+`/workspace/src`:
 
 ```bash
-CURRENT=/workspace/gpu-lab/source-generations/CURRENT
-POINTER_MANIFEST="$(readlink -f "$CURRENT")"
-POINTER_SHA256="$(sha256sum "$POINTER_MANIFEST" | cut -d' ' -f1)"
-GENERATION_PATH="$(python3 -c \
-  'import json,sys; print(json.load(open(sys.argv[1]))["generation_path"])' \
-  "$POINTER_MANIFEST")"
-STWO_SOURCE="$GENERATION_PATH/repos/stwo"
-STWO_CAIRO_SOURCE="$GENERATION_PATH/repos/stwo-cairo"
+gpu_benchmarks/lab/pod/labctl resolve > /tmp/stwo-gpu-source.json
+python3.11 -c \
+  'import json,sys; d=json.load(open(sys.argv[1])); print(d["pointer_sha256"]);
+print(d["repositories"]["stwo"]["path"]);
+print(d["repositories"]["stwo-cairo"]["path"])' /tmp/stwo-gpu-source.json
+gpu_benchmarks/lab/pod/labctl shell
 ```
 
-Record `POINTER_SHA256` with every result and run build, profile, sanitizer, and benchmark commands
-only from `STWO_SOURCE` or `STWO_CAIRO_SOURCE`. `/workspace/src` is a read-only object seed, never a
-build input. The sync evidence binds the generation path/hash, pointer path/target/hash, each exact
-HEAD, and each full-tree identity. Fixture staging remains beneath the declared local root and binds
-every source path, local destination, byte count, and SHA-256. Durable objects land under:
+The local JSON contains the pointer path/target/hash, canonical generation path/hash, exact `stwo`
+and `stwo-cairo` paths, and each repository's HEAD, full-tree hash, and worktree-identity hash. Use
+those paths in the `dev` SSH session and record `pointer_sha256` with every result. `/workspace/src`
+is a read-only object seed, never a build input. The sync evidence binds the same identities.
+Fixture staging remains beneath the declared local root and binds every source path, local
+destination, byte count, and SHA-256. Durable objects land under:
 
 ```text
 /workspace/gpu-lab/leases/<pod-id>/records/sha256/
