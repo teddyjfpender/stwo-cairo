@@ -100,7 +100,7 @@ impl SemanticValueMap {
         Ok(version)
     }
 
-    fn register_fixed_u32(
+    pub(super) fn register_fixed_u32(
         &mut self,
         words: Vec<u32>,
     ) -> Result<ValueVersion, InvocationShapeError> {

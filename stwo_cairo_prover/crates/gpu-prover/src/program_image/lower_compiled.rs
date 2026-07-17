@@ -49,6 +49,9 @@ mod static_wrapper_invocation;
 mod static_wrapper_projection;
 #[cfg(test)]
 mod static_wrapper_projection_tests;
+mod witness_input_gather;
+#[cfg(test)]
+mod witness_input_gather_tests;
 
 pub(crate) use producer_prefix::{
     BaseProducerAuthority, LoadedBaseProducerAuthority, PreparedBlakeGDirectKernel,
