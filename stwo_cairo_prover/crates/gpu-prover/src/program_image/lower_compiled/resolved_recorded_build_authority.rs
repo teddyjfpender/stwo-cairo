@@ -69,7 +69,12 @@ impl ResolvedRecordedBuildAuthority {
             || self.source_identity == ZERO_IDENTITY
             || self.cubin_identity == ZERO_IDENTITY
             || self.authority_identity == ZERO_IDENTITY
-            || self.module_globals != AotKernelModuleGlobals::None
+            || self.module_globals
+                != if source.deduce.module_state.is_some() {
+                    AotKernelModuleGlobals::WitnessPedersenV1
+                } else {
+                    AotKernelModuleGlobals::None
+                }
         {
             return Err(());
         }

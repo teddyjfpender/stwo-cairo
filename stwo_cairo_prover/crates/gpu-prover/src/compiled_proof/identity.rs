@@ -151,18 +151,7 @@ pub(super) fn compiled_identity(
     }
     out.count(input.module_global_initializers.len())?;
     for initializer in &input.module_global_initializers {
-        out.u32(initializer.id().0);
-        out.bytes(initializer.module().canonical_encoding())?;
-        out.raw(initializer.module().digest());
-        out.bytes(initializer.symbol())?;
-        out.size(initializer.bytes())?;
-        out.size(initializer.alignment())?;
-        out.byte(u8::from(initializer.immutable()));
-        out.count(initializer.atoms().len())?;
-        for atom in initializer.atoms() {
-            out.module_initializer_atom(atom)?;
-        }
-        out.raw(initializer.content_or_recipe_digest());
+        encode_module_global_initializer(&mut out, initializer)?;
     }
 
     out.count(input.kernels.len())?;
@@ -251,6 +240,34 @@ pub(super) fn compiled_identity(
         canonical_encoding: canonical_encoding.into_boxed_slice(),
         transcript_encoding: transcript_encoding.into_boxed_slice(),
     })
+}
+
+fn encode_module_global_initializer(
+    out: &mut Encoder,
+    initializer: &ModuleGlobalInitializer,
+) -> Result<(), CompiledProofError> {
+    out.u32(initializer.id().0);
+    out.bytes(initializer.module().canonical_encoding())?;
+    out.raw(initializer.module().digest());
+    out.bytes(initializer.symbol())?;
+    out.size(initializer.bytes())?;
+    out.size(initializer.alignment())?;
+    out.byte(u8::from(initializer.immutable()));
+    out.count(initializer.atoms().len())?;
+    for atom in initializer.atoms() {
+        out.module_initializer_atom(atom)?;
+    }
+    out.raw(initializer.content_or_recipe_digest());
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn module_global_initializer_structure_identity_for_test(
+    initializer: &ModuleGlobalInitializer,
+) -> Result<[u8; 32], CompiledProofError> {
+    let mut out = Encoder::new(STRUCTURE_DOMAIN);
+    encode_module_global_initializer(&mut out, initializer)?;
+    Ok(*blake3::hash(&out.finish()).as_bytes())
 }
 
 struct Encoder(Vec<u8>);
@@ -521,6 +538,15 @@ impl Encoder {
                 self.byte_range(*destination)?;
                 self.u32(value.0);
                 self.size(*source_byte_offset)?;
+            }
+            ModuleGlobalInitializerAtom::RegisteredFixedSourceColumnAddresses {
+                destination,
+                source,
+            } => {
+                self.byte(2);
+                self.byte_range(*destination)?;
+                self.bytes(source.canonical_encoding())?;
+                self.raw(source.identity());
             }
         }
         Ok(())

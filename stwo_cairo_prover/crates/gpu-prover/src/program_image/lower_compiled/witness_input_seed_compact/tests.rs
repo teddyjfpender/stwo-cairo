@@ -180,7 +180,7 @@ fn generated_sn2_has_four_seed_and_three_compact_preproducers() {
             .count(),
         29
     );
-    assert_eq!(fixture.required_preproducers.len(), 278);
+    assert_eq!(fixture.required_preproducers.len(), 249);
 
     let mut consumed_versions = BTreeSet::new();
     for setup in &fixture.lowered {

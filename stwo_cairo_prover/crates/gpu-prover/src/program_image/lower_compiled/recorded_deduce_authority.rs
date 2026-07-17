@@ -140,9 +140,10 @@ impl PedersenTableColumnsAndRowsV1 {
 pub(super) struct RecordedDeduceAuthority {
     pub(super) kinds: Vec<DeduceKind>,
     pub(super) source_identity: [u8; 32],
-    /// Private source/relocation frontier only. It must not be converted into a
-    /// module-global `EffectContract` until a loaded-module publication receipt
-    /// binds the canonical registration's digest and process-local addresses.
+    /// Address-free source/relocation authority. Static lowering may project it
+    /// into a `ModuleGlobalInitializer` and `EffectContract`; execution remains
+    /// forbidden until loaded admission binds that recipe to the canonical
+    /// registration's checked byte digest and process-local addresses.
     pub(super) module_state: Option<PedersenTableColumnsAndRowsV1>,
 }
 

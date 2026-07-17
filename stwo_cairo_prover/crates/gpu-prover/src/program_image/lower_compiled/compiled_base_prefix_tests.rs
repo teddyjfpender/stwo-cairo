@@ -1,23 +1,87 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use stwo_backend_cuda::aot::{AotKernelAbiSchema, AotKernelModuleGlobals, AotKernelSchemaScope};
 use stwo_backend_cuda::TraceTreeRole;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
+use super::compiled_base_prefix::emission::StaticWrapperRequest;
+use super::compiled_base_prefix::test_support::assert_witness_writer_def_use_is_ordered;
 use super::compiled_base_prefix::{
     emit_recorded_witness_writer_prefix_for_test, CompiledWitnessWriterPrefixError,
-    MissingBaseAdapter,
+    MissingBaseAdapter, StaticWrapperKind,
 };
 use super::producer_prefix::SemanticBaseProducer;
 use super::resolved_recorded_build_authority::ResolvedRecordedBuildAuthority;
 use super::*;
 use crate::compiled_proof::{
     AotArgumentValue, EffectAccess, EffectBindingId, EffectContract, ExecutionPrimitive,
-    FixedValueInitializer, PartitionAuthority, ProofStage, ValueVersion,
+    FixedValueInitializer, LaunchGeometry, PartitionAuthority, ProofStage,
+    StaticCudaLaunchIdentity, StaticCudaWrapperAuthority, StaticCudaWrapperId, ValueVersion,
 };
 
-const MANIFEST: [u8; 32] = [0x4d; 32];
-const TARGET_SM: u32 = 89;
+pub(super) const MANIFEST: [u8; 32] = [0x4d; 32];
+pub(super) const TARGET_SM: u32 = 89;
+
+fn resolve_static_for_prefix(
+    request: StaticWrapperRequest<'_>,
+    id: StaticCudaWrapperId,
+    target_sm: u32,
+) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
+    if request.kind() == StaticWrapperKind::NativeEcOp {
+        return Ok(None);
+    }
+    fake_static_authority(request, id, target_sm).map(Some)
+}
+
+pub(super) fn resolve_all_static_for_prefix(
+    request: StaticWrapperRequest<'_>,
+    id: StaticCudaWrapperId,
+    target_sm: u32,
+) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
+    fake_static_authority(request, id, target_sm).map(Some)
+}
+
+fn resolve_without_generic_feed(
+    request: StaticWrapperRequest<'_>,
+    id: StaticCudaWrapperId,
+    target_sm: u32,
+) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
+    if request.kind() == StaticWrapperKind::MultiplicityFeed {
+        return Ok(None);
+    }
+    fake_static_authority(request, id, target_sm).map(Some)
+}
+
+fn fake_static_authority(
+    request: StaticWrapperRequest<'_>,
+    id: StaticCudaWrapperId,
+    target_sm: u32,
+) -> Result<StaticCudaWrapperAuthority, InvocationShapeError> {
+    let launch = StaticCudaLaunchIdentity::new(
+        b"test_base_static_kernel".to_vec(),
+        LaunchGeometry {
+            grid: [1, 1, 1],
+            block: [1, 1, 1],
+            cluster: None,
+            dynamic_shared_bytes: 0,
+            cooperative: false,
+        },
+    )
+    .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?;
+    StaticCudaWrapperAuthority::new(
+        id,
+        [0x41; 32],
+        target_sm,
+        b"test_base_static_wrapper".to_vec(),
+        [0x42; 32],
+        [0x43; 32],
+        [0x44; 32],
+        [0x45; 32],
+        vec![launch],
+        request.effect()?.id(),
+    )
+    .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)
+}
 
 #[test]
 fn resolved_recorded_build_authority_rejects_every_offline_identity_mutation() {
@@ -66,6 +130,28 @@ fn resolved_recorded_build_authority_rejects_every_offline_identity_mutation() {
         .validate(&recorded.source, [0; 32], TARGET_SM)
         .is_err());
     assert!(exact.validate(&recorded.source, MANIFEST, 0).is_err());
+
+    let stateful = authority
+        .producers
+        .iter()
+        .find_map(|producer| match producer {
+            SemanticBaseProducer::Recorded(recorded)
+                if recorded.source.deduce.module_state.is_some() =>
+            {
+                Some(recorded)
+            }
+            _ => None,
+        })
+        .expect("generated SN2 must contain a Pedersen recorded deduce");
+    let exact = exact_fields(&stateful.source);
+    exact
+        .validate(&stateful.source, MANIFEST, TARGET_SM)
+        .unwrap();
+    let mut missing = exact;
+    missing.module_globals = AotKernelModuleGlobals::None;
+    assert!(missing
+        .validate(&stateful.source, MANIFEST, TARGET_SM)
+        .is_err());
 }
 
 #[test]
@@ -219,6 +305,7 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
         MANIFEST,
         TARGET_SM,
         |source| Ok(exact_fields(source)),
+        resolve_static_for_prefix,
     )
     .unwrap_err();
     let CompiledWitnessWriterPrefixError::MissingTypedAdapter { missing, prefix } = error else {
@@ -230,10 +317,11 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
     assert_eq!(missing.schedule_ordinal, 7);
     assert_eq!(prefix.execution_manifest_identity, MANIFEST);
     assert_eq!(prefix.target_sm, TARGET_SM);
-    assert_eq!(prefix.operations.len(), 7);
+    assert_eq!(prefix.operations.len(), 17);
     assert_eq!(prefix.kernels.len(), 7);
+    assert_eq!(prefix.static_wrappers.len(), 10);
     assert_eq!(prefix.recorded_kernel_authorities().len(), 7);
-    assert_eq!(prefix.effects.len(), 7);
+    assert_eq!(prefix.effects.len(), 17);
     assert_eq!(prefix.base_authority(), &authority);
     assert_eq!(prefix.next_producer(), missing.schedule_ordinal as usize);
     assert_eq!(
@@ -246,8 +334,11 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
         .effects
         .windows(2)
         .all(|pair| pair[0].id() < pair[1].id()));
+    assert_ne!(prefix.operations.len(), prefix.next_producer());
 
     let monolithic = PartitionAuthority::monolithic().id();
+    let mut aot_count = 0usize;
+    let mut wrapper_ids = Vec::new();
     for (index, operation) in prefix.operations.iter().enumerate() {
         assert_eq!(operation.id.0 as usize, index);
         assert_eq!(operation.semantic_id.0 as usize, index + 1);
@@ -256,18 +347,34 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
             ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase)
         );
         assert_eq!(operation.partition, monolithic);
-        let ExecutionPrimitive::AotKernel { kernel, launch } = &operation.primitive else {
-            panic!("ordinary recorded Base producer must be one AOT kernel")
-        };
-        assert_eq!(kernel.0 as usize, index + 1);
-        assert!(!launch.grid.contains(&0));
-        assert!(!launch.block.contains(&0));
-        let authority = &prefix.kernels[index];
-        assert_eq!(authority.id(), *kernel);
-        assert_eq!(
-            authority.accepted_executions(),
-            &[(operation.effect, monolithic)]
-        );
+        match &operation.primitive {
+            ExecutionPrimitive::AotKernel { kernel, launch } => {
+                aot_count += 1;
+                assert_eq!(kernel.0 as usize, aot_count);
+                assert!(!launch.grid.contains(&0));
+                assert!(!launch.block.contains(&0));
+                let authority = prefix
+                    .kernels
+                    .iter()
+                    .find(|authority| authority.id() == *kernel)
+                    .unwrap();
+                assert_eq!(
+                    authority.accepted_executions(),
+                    &[(operation.effect, monolithic)]
+                );
+            }
+            ExecutionPrimitive::StaticCudaWrapper { wrapper } => {
+                wrapper_ids.push(*wrapper);
+                let authority = prefix
+                    .static_wrappers
+                    .iter()
+                    .find(|authority| authority.id() == *wrapper)
+                    .unwrap();
+                assert_eq!(authority.accepted_effect(), operation.effect);
+                assert_eq!(authority.consumer_target_sm(), TARGET_SM);
+            }
+            _ => panic!("Base prefix operation has the wrong primitive"),
+        }
         let effect = prefix
             .effects
             .iter()
@@ -275,23 +382,36 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
             .unwrap();
         assert_invocation_covers_exact_bindings(operation.invocation.as_ref().unwrap(), effect);
     }
-    let planned_effects = authority
-        .producers
-        .iter()
-        .map(|producer| producer.effect().id())
+    assert_eq!(aot_count, 7);
+    assert_eq!(
+        wrapper_ids,
+        (1..=10).map(StaticCudaWrapperId).collect::<Vec<_>>()
+    );
+    assert!(prefix.operations[..3].iter().all(|operation| matches!(
+        &operation.primitive,
+        ExecutionPrimitive::StaticCudaWrapper { .. }
+    )));
+    for ordinal in 0..7 {
+        assert!(matches!(
+            &prefix.operations[3 + ordinal * 2].primitive,
+            ExecutionPrimitive::AotKernel { .. }
+        ));
+        assert!(matches!(
+            &prefix.operations[4 + ordinal * 2].primitive,
+            ExecutionPrimitive::StaticCudaWrapper { .. }
+        ));
+    }
+    let planned_effects = super::compiled_base_prefix::emission::ordered_effects(&authority)
+        .unwrap()
+        .into_iter()
+        .map(|effect| effect.id())
         .collect::<Vec<_>>();
-    let resumed_effects = prefix
+    let emitted_effects = prefix
         .operations
         .iter()
         .map(|operation| operation.effect)
-        .chain(
-            prefix
-                .pending_producers()
-                .iter()
-                .map(|producer| producer.effect().id()),
-        )
         .collect::<Vec<_>>();
-    assert_eq!(resumed_effects, planned_effects);
+    assert_eq!(emitted_effects.as_slice(), &planned_effects[..17]);
     assert_witness_writer_def_use_is_ordered(prefix.base_authority());
     let required = super::compiled_base_prefix::validate_witness_writer_transitions_for_test(
         prefix.base_authority(),
@@ -322,8 +442,12 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
         .is_err()
     );
     let mut wrong_kernel_use = prefix.operations.clone();
-    let ExecutionPrimitive::AotKernel { kernel, .. } = &mut wrong_kernel_use[0].primitive else {
-        unreachable!()
+    let first_aot = wrong_kernel_use
+        .iter_mut()
+        .find(|operation| matches!(&operation.primitive, ExecutionPrimitive::AotKernel { .. }))
+        .unwrap();
+    let ExecutionPrimitive::AotKernel { kernel, .. } = &mut first_aot.primitive else {
+        unreachable!();
     };
     *kernel = prefix.kernels[1].id();
     assert!(
@@ -331,6 +455,43 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
             &prefix,
             prefix.next_producer(),
             &wrong_kernel_use,
+        )
+        .is_err()
+    );
+    let mut wrong_ids = prefix.operations.clone();
+    wrong_ids[0].id.0 += 1;
+    assert!(
+        super::compiled_base_prefix::validate_sealed_prefix_for_test(
+            &prefix,
+            prefix.next_producer(),
+            &wrong_ids,
+        )
+        .is_err()
+    );
+    let mut wrong_semantic_ids = prefix.operations.clone();
+    wrong_semantic_ids[0].semantic_id.0 += 1;
+    assert!(
+        super::compiled_base_prefix::validate_sealed_prefix_for_test(
+            &prefix,
+            prefix.next_producer(),
+            &wrong_semantic_ids,
+        )
+        .is_err()
+    );
+    let mut wrong_wrapper = prefix.operations.clone();
+    let first_wrapper = wrong_wrapper
+        .iter_mut()
+        .find_map(|operation| match &mut operation.primitive {
+            ExecutionPrimitive::StaticCudaWrapper { wrapper } => Some(wrapper),
+            _ => None,
+        })
+        .unwrap();
+    *first_wrapper = StaticCudaWrapperId(2);
+    assert!(
+        super::compiled_base_prefix::validate_sealed_prefix_for_test(
+            &prefix,
+            prefix.next_producer(),
+            &wrong_wrapper,
         )
         .is_err()
     );
@@ -375,6 +536,51 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
             .any(|(catalog, version)| catalog.0 != version.0),
         "encounter-order semantic versions must not be catalog-ID casts"
     );
+}
+
+#[test]
+fn generated_sn2_full_prefix_and_missing_feed_are_exact() {
+    let executable = super::tests::generated_sn2_replacement();
+    let full = emit_recorded_witness_writer_prefix_for_test(
+        executable.arena(),
+        PreProcessedTraceVariant::Canonical,
+        MANIFEST,
+        TARGET_SM,
+        |source| Ok(exact_fields(source)),
+        resolve_all_static_for_prefix,
+    )
+    .unwrap();
+    assert_eq!(full.operations.len(), 48);
+    assert_eq!(full.static_wrappers.len(), 26);
+    assert_eq!(full.kernels.len(), 22);
+    assert_eq!(full.effects.len(), 48);
+    assert_eq!(full.module_global_initializers.len(), 4);
+    assert_eq!(full.next_producer(), 23);
+    assert!(full.pending_producers().is_empty());
+    assert_eq!(full.partitions, vec![PartitionAuthority::monolithic()]);
+
+    let error = emit_recorded_witness_writer_prefix_for_test(
+        executable.arena(),
+        PreProcessedTraceVariant::Canonical,
+        MANIFEST,
+        TARGET_SM,
+        |source| Ok(exact_fields(source)),
+        resolve_without_generic_feed,
+    )
+    .unwrap_err();
+    let CompiledWitnessWriterPrefixError::MissingTypedAdapter { missing, prefix } = error else {
+        panic!("missing first feed must return the complete prelude only")
+    };
+    assert_eq!(
+        missing.adapter,
+        MissingBaseAdapter::MultiplicityFeedStaticWrapper
+    );
+    assert_eq!(missing.schedule_ordinal, 0);
+    assert_eq!(prefix.next_producer(), 0);
+    assert_eq!(prefix.operations.len(), 3);
+    assert_eq!(prefix.static_wrappers.len(), 3);
+    assert!(prefix.kernels.is_empty());
+    assert!(prefix.module_global_initializers.is_empty());
 }
 
 fn first_destination(effect: &EffectContract) -> ValueVersion {
@@ -429,45 +635,9 @@ fn replace_effect(
     }
 }
 
-fn assert_witness_writer_def_use_is_ordered(
-    authority: &super::producer_prefix::BaseProducerAuthority,
-) {
-    let mut destination_producer = BTreeMap::new();
-    for (producer_index, producer) in authority.producers.iter().enumerate() {
-        for destination in producer
-            .effect()
-            .accesses()
-            .iter()
-            .filter_map(|access| access.destination())
-        {
-            if let Some(previous) =
-                destination_producer.insert(destination.value.version, producer_index)
-            {
-                assert_eq!(
-                    previous, producer_index,
-                    "one semantic version cannot be produced by different witness writers"
-                );
-            }
-        }
-    }
-    for (producer_index, producer) in authority.producers.iter().enumerate() {
-        for source in producer
-            .effect()
-            .accesses()
-            .iter()
-            .filter_map(|access| access.source())
-        {
-            if let Some(&source_producer) = destination_producer.get(&source.value.version) {
-                assert!(
-                    source_producer < producer_index,
-                    "writer-produced source version must come from an earlier writer"
-                );
-            }
-        }
-    }
-}
-
-fn exact_fields(source: &RecordedWitnessInvocationShape) -> ResolvedRecordedBuildAuthority {
+pub(super) fn exact_fields(
+    source: &RecordedWitnessInvocationShape,
+) -> ResolvedRecordedBuildAuthority {
     ResolvedRecordedBuildAuthority {
         manifest_identity: MANIFEST,
         program_identity: source.program_identity,
@@ -481,7 +651,11 @@ fn exact_fields(source: &RecordedWitnessInvocationShape) -> ResolvedRecordedBuil
         source_identity: source.deduce.source_identity,
         cubin_identity: identity(b"cubin", source),
         authority_identity: identity(b"authority", source),
-        module_globals: AotKernelModuleGlobals::None,
+        module_globals: if source.deduce.module_state.is_some() {
+            AotKernelModuleGlobals::WitnessPedersenV1
+        } else {
+            AotKernelModuleGlobals::None
+        },
     }
 }
 

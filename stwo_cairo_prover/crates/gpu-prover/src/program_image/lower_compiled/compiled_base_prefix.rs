@@ -2,26 +2,50 @@
 //!
 //! This is not a second IR. It emits canonical [`OpNode`] values directly from
 //! the producer-owned invocation/effect contract and retains the one semantic
-//! value allocator that later stages must continue. Execution-table, input,
-//! multiplicity, memory and fixed-table preproducers are deliberately retained
-//! as unresolved version requirements; this type is not a complete Base stage
-//! and has no conversion into [`crate::compiled_proof::CompiledProof`].
+//! value allocator that later stages must continue. Execution-table splits and
+//! multiplicity operations are explicit; host ingress, witness inputs, memory,
+//! and fixed-table work still retain unresolved origins. This type is not a
+//! complete Base stage and cannot become a [`crate::compiled_proof::CompiledProof`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use stwo_backend_cuda::aot::{self, AotKernelModuleGlobals};
+use stwo_backend_cuda::aot;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 
 use super::producer_prefix::{BaseProducerAuthority, SemanticBaseProducer};
 use super::resolved_recorded_build_authority::ResolvedRecordedBuildAuthority;
 use super::*;
 use crate::compiled_proof::{
-    AotKernelAuthority, AotKernelId, EffectContract, EffectContractId, ExecutionPrimitive,
-    FixedValueDesc, ModuleIdentity, OpId, OpNode, PartitionAuthority, ProofStage, SemanticOpId,
+    AotInvocation, AotKernelAuthority, AotKernelId, EffectContract, EffectContractId,
+    ExecutionPrimitive, FixedValueDesc, ModuleGlobalInitializer, ModuleIdentity, OpId, OpNode,
+    PartitionAuthority, ProofStage, SemanticOpId, StaticCudaWrapperAuthority, StaticCudaWrapperId,
     ValueDesc, ValueVersion,
 };
 use crate::resident_runtime::producer_schedule::WitnessProducer;
 use crate::transcript_plan::CairoTranscriptSegment;
+
+pub(super) mod emission;
+#[cfg(test)]
+mod module_global_tests;
+pub(super) mod module_globals;
+#[cfg(test)]
+pub(super) mod test_support;
+
+use module_globals::{
+    resolve as resolve_recorded_module_globals,
+    validate_effect as validate_recorded_module_global_effect,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StaticWrapperKind {
+    ExecutionTableBig,
+    ExecutionTableSmall,
+    MultiplicityClear,
+    PublicMemorySeed,
+    MultiplicityFeed,
+    NativeBlakeGDirect,
+    NativeEcOp,
+}
 
 const MODULE_DOMAIN: &[u8] = b"stwo-cairo.recorded-base.module.v1\0";
 const SEMANTIC_DOMAIN: &[u8] = b"stwo-cairo.recorded-base.semantic.v1\0";
@@ -29,9 +53,9 @@ const BUILD_DOMAIN: &[u8] = b"stwo-cairo.recorded-base.execution-build.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MissingBaseAdapter {
+    MultiplicityFeedStaticWrapper,
     NativeBlakeGDirectStaticWrapper,
     NativeEcOpStaticWrapper,
-    RecordedModuleGlobals,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,16 +74,19 @@ pub(super) struct MissingBaseAdapterAt {
 pub(super) struct CompiledWitnessWriterPrefix {
     pub(super) execution_manifest_identity: [u8; 32],
     pub(super) target_sm: u32,
-    /// The one proof-wide map used to lower `base_authority`. Until
-    /// `next_producer == base_authority.producers.len()`, its current versions
-    /// describe the terminal Base state and must travel with the unconsumed
-    /// producer contracts rather than being treated as the emitted frontier.
+    /// The one proof-wide map used to lower `base_authority`. It describes the
+    /// post-witness semantic state for the complete authority, including
+    /// unconsumed producer contracts in a partial prefix. It is neither the
+    /// emitted frontier nor the proof's final Base state: memory and fixed-table
+    /// lowering still follow.
     values: adapter::SemanticValueMap,
     base_authority: BaseProducerAuthority,
     next_producer: usize,
     required_preproducer_versions: BTreeSet<ValueVersion>,
     kernel_by_build_authority: BTreeMap<[u8; 32], usize>,
     pub(super) kernels: Vec<AotKernelAuthority>,
+    pub(super) static_wrappers: Vec<StaticCudaWrapperAuthority>,
+    pub(super) module_global_initializers: Vec<ModuleGlobalInitializer>,
     pub(super) effects: Vec<EffectContract>,
     pub(super) partitions: Vec<PartitionAuthority>,
     pub(super) operations: Vec<OpNode>,
@@ -120,15 +147,15 @@ pub(super) enum CompiledWitnessWriterPrefixError {
     },
 }
 
-/// Resolve exact embedded AOT authorities without initializing CUDA, emit each
-/// preceding recorded witness writer, then fail at the first native wrapper.
+/// Resolve exact embedded AOT and linked-static authorities without
+/// initializing CUDA, emitting the longest fully authorized witness prefix.
 pub(super) fn emit_recorded_witness_writer_prefix(
     arena: &ProofArenaPlan,
     preprocessed_trace_variant: PreProcessedTraceVariant,
     target_sm: u32,
 ) -> Result<CompiledWitnessWriterPrefix, CompiledWitnessWriterPrefixError> {
     let manifest = aot::loaded_manifest_identity();
-    emit_recorded_witness_writer_prefix_using(
+    emission::emit_using(
         arena,
         preprocessed_trace_variant,
         manifest,
@@ -141,254 +168,8 @@ pub(super) fn emit_recorded_witness_writer_prefix(
                 manifest, kernel,
             ))
         },
+        emission::resolve_static,
     )
-}
-
-fn emit_recorded_witness_writer_prefix_using(
-    arena: &ProofArenaPlan,
-    preprocessed_trace_variant: PreProcessedTraceVariant,
-    manifest: [u8; 32],
-    target_sm: u32,
-    mut resolve: impl FnMut(
-        &RecordedWitnessInvocationShape,
-    )
-        -> Result<ResolvedRecordedBuildAuthority, ResolveRecordedAuthorityError>,
-) -> Result<CompiledWitnessWriterPrefix, CompiledWitnessWriterPrefixError> {
-    split_sm(target_sm).map_err(|_| CompiledWitnessWriterPrefixError::InvalidTargetSm)?;
-    if manifest == [0; 32] {
-        return Err(
-            CompiledWitnessWriterPrefixError::MissingRecordedAotAuthority(
-                first_scheduled_producer(arena)?,
-            ),
-        );
-    }
-
-    let mut values =
-        adapter::SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>())
-            .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
-    let authority = BaseProducerAuthority::compile_replacement_into(
-        arena,
-        preprocessed_trace_variant,
-        &mut values,
-    )
-    .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
-    let mut kernels = Vec::new();
-    let mut effects = BTreeMap::<EffectContractId, EffectContract>::new();
-    let mut operations = Vec::new();
-    let mut kernel_by_build_authority = BTreeMap::<[u8; 32], usize>::new();
-    let monolithic = PartitionAuthority::monolithic();
-
-    for producer_index in 0..authority.producers.len() {
-        let semantic = authority.producers[producer_index].clone();
-        let position = semantic.position();
-        let producer = semantic.producer();
-        let recorded = match semantic {
-            SemanticBaseProducer::Recorded(recorded) => recorded,
-            SemanticBaseProducer::NativeBlakeGDirect {
-                position, producer, ..
-            } => {
-                return missing_adapter(
-                    MissingBaseAdapter::NativeBlakeGDirectStaticWrapper,
-                    position,
-                    producer,
-                    manifest,
-                    target_sm,
-                    values,
-                    kernels,
-                    kernel_by_build_authority,
-                    effects,
-                    operations,
-                    monolithic,
-                    authority,
-                    producer_index,
-                )
-            }
-            SemanticBaseProducer::NativeEcOp {
-                position, producer, ..
-            } => {
-                return missing_adapter(
-                    MissingBaseAdapter::NativeEcOpStaticWrapper,
-                    position,
-                    producer,
-                    manifest,
-                    target_sm,
-                    values,
-                    kernels,
-                    kernel_by_build_authority,
-                    effects,
-                    operations,
-                    monolithic,
-                    authority,
-                    producer_index,
-                )
-            }
-        };
-        if position.ordinal
-            != u32::try_from(operations.len()).map_err(|_| {
-                CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer)
-            })?
-        {
-            return Err(CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer));
-        }
-        if recorded.source.deduce.module_state.is_some() {
-            return missing_adapter(
-                MissingBaseAdapter::RecordedModuleGlobals,
-                position,
-                producer,
-                manifest,
-                target_sm,
-                values,
-                kernels,
-                kernel_by_build_authority,
-                effects,
-                operations,
-                monolithic,
-                authority,
-                producer_index,
-            );
-        }
-
-        let fields = resolve(&recorded.source).map_err(|error| match error {
-            ResolveRecordedAuthorityError::Missing => {
-                CompiledWitnessWriterPrefixError::MissingRecordedAotAuthority(producer)
-            }
-            ResolveRecordedAuthorityError::Invalid => {
-                CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer)
-            }
-        })?;
-        if fields
-            .validate(&recorded.source, manifest, target_sm)
-            .is_err()
-        {
-            return Err(CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer));
-        }
-        insert_effect(&mut effects, recorded.effect.clone())
-            .map_err(|_| CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer))?;
-        let kernel_id = install_recorded_kernel(
-            &mut kernels,
-            &mut kernel_by_build_authority,
-            &recorded.source,
-            &fields,
-            recorded.effect.id(),
-        )
-        .map_err(|_| CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer))?;
-        let id = OpId(u32::try_from(operations.len()).map_err(|_| {
-            CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer)
-        })?);
-        operations.push(OpNode {
-            id,
-            semantic_id: SemanticOpId(
-                position.ordinal.checked_add(1).ok_or(
-                    CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer),
-                )?,
-            ),
-            primitive: ExecutionPrimitive::AotKernel {
-                kernel: kernel_id,
-                launch: recorded.source.launch,
-            },
-            invocation: Some(recorded.invocation.clone()),
-            effect: recorded.effect.id(),
-            partition: monolithic.id(),
-            stage: ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase),
-        });
-    }
-
-    let next_producer = authority.producers.len();
-    finish_prefix(
-        manifest,
-        target_sm,
-        values,
-        kernels,
-        kernel_by_build_authority,
-        effects,
-        operations,
-        monolithic,
-        authority,
-        next_producer,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn missing_adapter(
-    adapter: MissingBaseAdapter,
-    position: super::producer_prefix::ProducerSchedulePosition,
-    producer: WitnessProducer,
-    manifest: [u8; 32],
-    target_sm: u32,
-    values: adapter::SemanticValueMap,
-    kernels: Vec<AotKernelAuthority>,
-    kernel_by_build_authority: BTreeMap<[u8; 32], usize>,
-    effects: BTreeMap<EffectContractId, EffectContract>,
-    operations: Vec<OpNode>,
-    monolithic: PartitionAuthority,
-    base_authority: BaseProducerAuthority,
-    next_producer: usize,
-) -> Result<CompiledWitnessWriterPrefix, CompiledWitnessWriterPrefixError> {
-    Err(CompiledWitnessWriterPrefixError::MissingTypedAdapter {
-        missing: MissingBaseAdapterAt {
-            adapter,
-            producer,
-            schedule_ordinal: position.ordinal,
-        },
-        prefix: Box::new(finish_prefix(
-            manifest,
-            target_sm,
-            values,
-            kernels,
-            kernel_by_build_authority,
-            effects,
-            operations,
-            monolithic,
-            base_authority,
-            next_producer,
-        )?),
-    })
-}
-
-fn finish_prefix(
-    execution_manifest_identity: [u8; 32],
-    target_sm: u32,
-    values: adapter::SemanticValueMap,
-    kernels: Vec<AotKernelAuthority>,
-    kernel_by_build_authority: BTreeMap<[u8; 32], usize>,
-    effects: BTreeMap<EffectContractId, EffectContract>,
-    operations: Vec<OpNode>,
-    monolithic: PartitionAuthority,
-    base_authority: BaseProducerAuthority,
-    next_producer: usize,
-) -> Result<CompiledWitnessWriterPrefix, CompiledWitnessWriterPrefixError> {
-    let effects = effects.into_values().collect::<Vec<_>>();
-    let partitions = (!operations.is_empty())
-        .then_some(monolithic.clone())
-        .into_iter()
-        .collect::<Vec<_>>();
-    let required_preproducer_versions =
-        validate_witness_writer_transitions(&base_authority, &values)
-            .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
-    validate_sealed_prefix(
-        &base_authority,
-        next_producer,
-        &kernel_by_build_authority,
-        &kernels,
-        &effects,
-        &partitions,
-        &monolithic,
-        &operations,
-    )
-    .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
-    Ok(CompiledWitnessWriterPrefix {
-        execution_manifest_identity,
-        target_sm,
-        values,
-        base_authority,
-        next_producer,
-        required_preproducer_versions,
-        kernel_by_build_authority,
-        kernels,
-        effects,
-        partitions,
-        operations,
-    })
 }
 
 fn validate_witness_writer_transitions(
@@ -411,7 +192,7 @@ fn validate_witness_writer_transitions(
     }
     let mut destination_producer = BTreeMap::<ValueVersion, usize>::new();
     let mut sources = Vec::new();
-    let effects = ordered_base_effects(authority)?;
+    let effects = emission::ordered_effects(authority)?;
     for (operation_index, effect) in effects.iter().enumerate() {
         for access in effect.accesses() {
             if let Some(destination) = access.destination() {
@@ -471,119 +252,13 @@ fn validate_witness_writer_transitions(
     Ok(required_preproducer_versions)
 }
 
-/// Derive the exact lowered effect order without introducing a second
-/// schedule: execution-table splits, clear, optional seed, then each witness
-/// producer immediately followed by its generic feed.
-fn ordered_base_effects(authority: &BaseProducerAuthority) -> Result<Vec<&EffectContract>, ()> {
-    if authority.multiplicity.after_producer.len() != authority.producers.len() {
-        return Err(());
-    }
-    let mut effects = Vec::with_capacity(
-        authority
-            .producers
-            .len()
-            .checked_mul(2)
-            .and_then(|count| count.checked_add(4))
-            .ok_or(())?,
-    );
-    if let Some(execution_tables) = &authority.execution_tables {
-        effects.extend(execution_tables.stages.iter().map(|stage| &stage.effect));
-    }
-    effects.push(&authority.multiplicity.clear.effect);
-    if let Some(seed) = &authority.multiplicity.public_memory_seed {
-        effects.push(&seed.effect);
-    }
-    for (producer, feed) in authority
-        .producers
-        .iter()
-        .zip(&authority.multiplicity.after_producer)
-    {
-        effects.push(producer.effect());
-        if let Some(feed) = feed {
-            effects.push(&feed.effect);
-        }
-    }
-    Ok(effects)
-}
-
-fn validate_sealed_prefix(
-    authority: &BaseProducerAuthority,
-    next_producer: usize,
-    kernel_by_build_authority: &BTreeMap<[u8; 32], usize>,
-    kernels: &[AotKernelAuthority],
-    effects: &[EffectContract],
-    partitions: &[PartitionAuthority],
-    monolithic: &PartitionAuthority,
-    operations: &[OpNode],
-) -> Result<(), ()> {
-    let expected_partitions = (!operations.is_empty())
-        .then(|| monolithic.clone())
-        .into_iter()
-        .collect::<Vec<_>>();
-    if next_producer != operations.len()
-        || next_producer > authority.producers.len()
-        || partitions != expected_partitions
-        || kernel_by_build_authority.len() != kernels.len()
-        || kernel_by_build_authority
-            .values()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            != (0..kernels.len()).collect()
-    {
-        return Err(());
-    }
-
-    let mut used = BTreeMap::<AotKernelId, BTreeSet<_>>::new();
-    let mut used_effects = BTreeSet::new();
-    for (index, operation) in operations.iter().enumerate() {
-        let ExecutionPrimitive::AotKernel { kernel, .. } = &operation.primitive else {
-            return Err(());
-        };
-        if operation.id.0 as usize != index
-            || operation.semantic_id.0 as usize != index + 1
-            || operation.effect != authority.producers[index].effect().id()
-            || operation.partition != monolithic.id()
-        {
-            return Err(());
-        }
-        used_effects.insert(operation.effect);
-        used.entry(*kernel)
-            .or_default()
-            .insert((operation.effect, operation.partition));
-    }
-    let declared_effects = effects
-        .iter()
-        .map(EffectContract::id)
-        .collect::<BTreeSet<_>>();
-    if declared_effects.len() != effects.len() || declared_effects != used_effects {
-        return Err(());
-    }
-    if used.len() != kernels.len() {
-        return Err(());
-    }
-    for kernel in kernels {
-        let accepted = kernel
-            .accepted_executions()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if accepted.len() != kernel.accepted_executions().len()
-            || used.remove(&kernel.id()) != Some(accepted)
-        {
-            return Err(());
-        }
-    }
-    used.is_empty().then_some(()).ok_or(())
-}
-
 fn compiled_kernel(
     id: AotKernelId,
     source: &RecordedWitnessInvocationShape,
     fields: &ResolvedRecordedBuildAuthority,
     effect: EffectContractId,
 ) -> Result<AotKernelAuthority, ()> {
-    let module_encoding = encode_module(fields)?;
-    let module = ModuleIdentity::new(module_encoding).map_err(|_| ())?;
+    let module = compiled_module(fields)?;
     AotKernelAuthority::new(
         id,
         module,
@@ -592,6 +267,10 @@ fn compiled_kernel(
         vec![effect],
     )
     .map_err(|_| ())
+}
+
+fn compiled_module(fields: &ResolvedRecordedBuildAuthority) -> Result<ModuleIdentity, ()> {
+    ModuleIdentity::new(encode_module(fields)?).map_err(|_| ())
 }
 
 fn install_recorded_kernel(
@@ -685,16 +364,29 @@ pub(super) fn validate_sealed_prefix_for_test(
     next_producer: usize,
     operations: &[OpNode],
 ) -> Result<(), ()> {
-    validate_sealed_prefix(
+    emission::validate_sealed_prefix(
         &prefix.base_authority,
         next_producer,
+        prefix.target_sm,
         &prefix.kernel_by_build_authority,
         &prefix.kernels,
+        &prefix.static_wrappers,
+        &prefix.module_global_initializers,
         &prefix.effects,
         &prefix.partitions,
         &PartitionAuthority::monolithic(),
         operations,
     )
+}
+
+#[cfg(test)]
+pub(super) fn validate_recorded_module_global_effect_for_test(
+    source: &RecordedWitnessInvocationShape,
+    module: &ModuleIdentity,
+    effect: &EffectContract,
+    initializers: &[ModuleGlobalInitializer],
+) -> Result<(), ()> {
+    validate_recorded_module_global_effect(source, module, effect, initializers)
 }
 
 fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ()> {
@@ -732,7 +424,7 @@ fn encode_execution_build(fields: &ResolvedRecordedBuildAuthority) -> Result<Vec
     out.extend_from_slice(&fields.authority_identity);
     out.extend_from_slice(&fields.target_sm.to_le_bytes());
     out.extend_from_slice(&fields.cache_key.to_le_bytes());
-    out.push(AotKernelModuleGlobals::None as u8);
+    out.push(fields.module_globals as u8);
     push_bytes(&mut out, fields.kernel_symbol.as_bytes())?;
     Ok(out)
 }
@@ -746,6 +438,42 @@ fn insert_effect(
         Some(existing) if existing == effect => Ok(()),
         Some(_) => Err(()),
     }
+}
+
+fn push_operation(
+    primitive: ExecutionPrimitive,
+    invocation: AotInvocation,
+    effect: EffectContractId,
+    monolithic: &PartitionAuthority,
+    operations: &mut Vec<OpNode>,
+) -> Result<(), CompiledWitnessWriterPrefixError> {
+    let ordinal =
+        u32::try_from(operations.len()).map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
+    operations.push(OpNode {
+        id: OpId(ordinal),
+        semantic_id: SemanticOpId(
+            ordinal
+                .checked_add(1)
+                .ok_or(CompiledWitnessWriterPrefixError::Lowering)?,
+        ),
+        primitive,
+        invocation: Some(invocation),
+        effect,
+        partition: monolithic.id(),
+        stage: ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase),
+    });
+    Ok(())
+}
+
+fn wrapper_id(existing: usize) -> Result<StaticCudaWrapperId, CompiledWitnessWriterPrefixError> {
+    Ok(StaticCudaWrapperId(
+        u32::try_from(
+            existing
+                .checked_add(1)
+                .ok_or(CompiledWitnessWriterPrefixError::Lowering)?,
+        )
+        .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?,
+    ))
 }
 
 fn split_sm(target_sm: u32) -> Result<(u32, u32), ResolveRecordedAuthorityError> {
@@ -786,12 +514,14 @@ pub(super) fn emit_recorded_witness_writer_prefix_for_test(
     resolve: impl FnMut(
         &RecordedWitnessInvocationShape,
     ) -> Result<ResolvedRecordedBuildAuthority, ResolveRecordedAuthorityError>,
+    resolve_static: emission::StaticWrapperResolver,
 ) -> Result<CompiledWitnessWriterPrefix, CompiledWitnessWriterPrefixError> {
-    emit_recorded_witness_writer_prefix_using(
+    emission::emit_using(
         arena,
         preprocessed_trace_variant,
         manifest,
         target_sm,
         resolve,
+        resolve_static,
     )
 }

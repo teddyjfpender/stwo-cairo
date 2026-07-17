@@ -91,14 +91,20 @@ pub enum ModuleGlobalInitializerAtom {
         value: ValueVersion,
         source_byte_offset: usize,
     },
+    /// Cold-install relocation of every ordered column address from one
+    /// checked process-owned registration. No process address is serialized.
+    RegisteredFixedSourceColumnAddresses {
+        destination: ByteRange,
+        source: RegisteredFixedSourceAuthority,
+    },
 }
 
 impl ModuleGlobalInitializerAtom {
     pub const fn destination(&self) -> ByteRange {
         match self {
-            Self::Literal { destination, .. } | Self::FixedValueAddress { destination, .. } => {
-                *destination
-            }
+            Self::Literal { destination, .. }
+            | Self::FixedValueAddress { destination, .. }
+            | Self::RegisteredFixedSourceColumnAddresses { destination, .. } => *destination,
         }
     }
 }
@@ -145,6 +151,20 @@ impl ModuleGlobalInitializer {
                     }
                     ModuleGlobalInitializerAtom::FixedValueAddress { destination, .. } => {
                         destination.len() != core::mem::size_of::<u64>()
+                            || destination.start % core::mem::align_of::<u64>() != 0
+                            || alignment < core::mem::align_of::<u64>()
+                    }
+                    ModuleGlobalInitializerAtom::RegisteredFixedSourceColumnAddresses {
+                        destination,
+                        source,
+                    } => {
+                        !source.has_valid_identity()?
+                            || destination.len()
+                                != source
+                                    .columns()
+                                    .len()
+                                    .checked_mul(core::mem::size_of::<u64>())
+                                    .ok_or(CompiledProofError::SizeOverflow)?
                             || destination.start % core::mem::align_of::<u64>() != 0
                             || alignment < core::mem::align_of::<u64>()
                     }
@@ -421,6 +441,13 @@ fn initializer_digest(
                 out.push(1);
                 push_u32(&mut out, value.0);
                 push_size(&mut out, *source_byte_offset)?;
+            }
+            ModuleGlobalInitializerAtom::RegisteredFixedSourceColumnAddresses {
+                source, ..
+            } => {
+                out.push(2);
+                push_bytes(&mut out, source.canonical_encoding())?;
+                out.extend_from_slice(source.identity());
             }
         }
     }

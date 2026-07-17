@@ -305,22 +305,21 @@ fn generated_sn2_five_gathers_and_native_ec_account_for_303_typed_values() {
         required_by_purpose,
         BTreeMap::from([
             (BufferPurpose::WitnessInput, 236),
-            (BufferPurpose::ExecutionTableBigLimb, 28),
-            (BufferPurpose::ExecutionTableSmallLimb, 8),
             (BufferPurpose::ExecutionTableRawAddressToId, 1),
+            (BufferPurpose::ExecutionTableRawF252Words, 1),
+            (BufferPurpose::ExecutionTableRawSmallWords, 1),
             (BufferPurpose::EcOpSegmentStart, 1),
-            (BufferPurpose::RuntimeMultiplicity, 3),
-            (BufferPurpose::FixedMultiplicity, 1),
+            (BufferPurpose::WitnessFeedLut, 9),
         ])
     );
-    assert_eq!(fixture.required_preproducers.len(), 278);
+    assert_eq!(fixture.required_preproducers.len(), 249);
     assert!(gather_versions.is_subset(&fixture.required_preproducers));
     assert_eq!(
         fixture
             .required_preproducers
             .difference(&gather_versions)
             .count(),
-        107
+        78
     );
 }
 

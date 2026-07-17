@@ -12,14 +12,18 @@ mod effect;
 mod finalizer;
 mod identity;
 mod partition_authority;
+mod registered_fixed_source;
 mod static_wrapper;
 mod structural_authority;
 mod validate;
 
 pub use effect::*;
 pub use finalizer::*;
+#[cfg(test)]
+pub(crate) use identity::module_global_initializer_structure_identity_for_test;
 pub use identity::{CompiledProofIdentity, ProofCodecIdentity, ProofIdentity};
 pub use partition_authority::*;
+pub use registered_fixed_source::*;
 pub use static_wrapper::*;
 pub use structural_authority::*;
 pub use stwo_backend_cuda::{TranscriptInputId, TranscriptOutputId};
@@ -499,6 +503,7 @@ pub enum CompiledProofError {
     InvalidFixedValue,
     NonCanonicalFixedValues,
     InvalidModuleGlobalInitializer,
+    InvalidRegisteredFixedSource,
     NonCanonicalModuleGlobalInitializers,
     UnknownModuleGlobalInitializer(ModuleGlobalInitializerId),
     InvalidPartitionAuthority,
