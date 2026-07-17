@@ -14,7 +14,9 @@ import time
 from pathlib import Path
 
 from . import common as c
+from . import bootstrap_profile
 from . import generation
+from . import lease_local_root
 from . import runtime
 
 
@@ -361,6 +363,20 @@ def _append_remote_record(
 
 
 def _verify_remote_volume(ep: c.Endpoint, state: dict) -> None:
+    if bootstrap_profile.is_lease_local_state(state):
+        command = lease_local_root.attestation_command(
+            state["pod_id"],
+            state["volume_id"],
+            state["lease_local_root"]["boot_id"],
+            guards=False,
+        )
+        rc, output = c.ssh_capture(ep, command, timeout=30)
+        expected = f"LABCTL_LEASE_LOCAL_ATTESTED={state['pod_id']}"
+        if rc or output.strip() != expected:
+            raise RuntimeError(
+                "quarantined provider-volume verification failed: " + output[-500:]
+            )
+        return
     command = f"""
 set -eu
 mountpoint -q /workspace
@@ -370,6 +386,18 @@ findmnt -n -o SOURCE,FSTYPE,TARGET /workspace
     rc, output = c.ssh_capture(ep, command, timeout=30)
     if rc:
         raise RuntimeError(f"persistent /workspace verification failed: {output}")
+
+
+def _seed_specs(state: dict) -> tuple[tuple[str, Path, str], ...]:
+    seed_root = (
+        lease_local_root.PROVIDER_MOUNT
+        if bootstrap_profile.is_lease_local_state(state)
+        else "/workspace"
+    )
+    return (
+        ("stwo", c.STWO, f"{seed_root}/src/stwo"),
+        ("stwo-cairo", c.STWO_CAIRO, f"{seed_root}/src/stwo-cairo"),
+    )
 
 
 def _require_same_identity(
@@ -390,10 +418,7 @@ def cmd_sync(_args) -> int:
     )
     runtime._touch_heartbeat(ep)
     _verify_remote_volume(ep, state)
-    specs = (
-        ("stwo", c.STWO, "/workspace/src/stwo"),
-        ("stwo-cairo", c.STWO_CAIRO, "/workspace/src/stwo-cairo"),
-    )
+    specs = _seed_specs(state)
     local_identities = {name: _local_tree_identity(repo) for name, repo, _ in specs}
     seeds = {name: remote for name, _, remote in specs}
     seed_identities = {

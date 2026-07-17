@@ -122,6 +122,58 @@ def metadata(args: argparse.Namespace) -> dict:
     }
 
 
+def provider_volume_mount(args: argparse.Namespace) -> str:
+    """Keep the formal mount unchanged and quarantine only the pinned dev volume."""
+    if getattr(args, "bootstrap_profile", None) == NAME:
+        return lease_local_root.PROVIDER_MOUNT
+    return c.VOLUME_MOUNT
+
+
+def is_lease_local_state(state: dict) -> bool:
+    """Recognize only the complete controller-created nonformal lease contract."""
+    plan = state.get("plan")
+    root = state.get("lease_local_root")
+    return (
+        isinstance(plan, dict)
+        and isinstance(root, dict)
+        and state.get("profile") == NAME
+        and state.get("lane") == LANE
+        and state.get("formal") is False
+        and state.get("qualification") is False
+        and state.get("qualification_eligible") is False
+        and state.get("persistence_scope") == lease_local_root.PERSISTENCE_SCOPE
+        and state.get("image") == IMAGE
+        and state.get("volume_id") == VOLUME_ID
+        and state.get("volume_dc") == VOLUME_DC
+        and plan.get("profile") == NAME
+        and plan.get("lane") == LANE
+        and plan.get("formal") is False
+        and plan.get("persistence_scope") == lease_local_root.PERSISTENCE_SCOPE
+        and plan.get("qualification") is False
+        and plan.get("qualification_eligible") is False
+        and plan.get("image") == IMAGE
+        and plan.get("volume_id") == VOLUME_ID
+        and plan.get("volume_dc") == VOLUME_DC
+        and plan.get("volume_mount") == lease_local_root.PROVIDER_MOUNT
+        and root.get("schema_version") == lease_local_root.SCHEMA
+        and isinstance(root.get("boot_id"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            root["boot_id"],
+        )
+        is not None
+        and root.get("persistence_scope") == lease_local_root.PERSISTENCE_SCOPE
+        and root.get("qualification") is False
+        and root.get("pod_id") == state.get("pod_id")
+        and root.get("volume_id") == VOLUME_ID
+        and root.get("provider_mount") == lease_local_root.PROVIDER_MOUNT
+        and root.get("quarantined_root") == lease_local_root.QUARANTINED_ROOT
+        and root.get("target") == lease_local_root.TARGET
+        and root.get("marker")
+        == f"{lease_local_root.TARGET}/{lease_local_root.MARKER}"
+    )
+
+
 def _public_key() -> str:
     options = tuple(c.SSH_OPTS)
     identities = [

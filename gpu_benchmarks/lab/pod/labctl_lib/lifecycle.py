@@ -43,7 +43,7 @@ def _launch_plan(args: argparse.Namespace, offer: dict, volume: dict) -> dict:
         "volume_dc": args.volume_dc,
         "volume_gb": 0,
         "volume_id": args.volume_id,
-        "volume_mount": c.VOLUME_MOUNT,
+        "volume_mount": bootstrap_profile.provider_volume_mount(args),
         "volume_rest_attestation": volume,
         **bootstrap_profile.metadata(args),
     }
@@ -112,9 +112,7 @@ def _install_remote_controls(state: dict, args, ep: c.Endpoint, remaining: int) 
         bootstrap_profile.verify_ssh(ep, state["bootstrap_key_sha256"])
     rc, output = c.ssh_capture(
         ep,
-        runtime._guard_command(
-            state["pod_id"], state["volume_id"], remaining, args.idle_min * 60
-        ),
+        runtime._guard_command(state, remaining, args.idle_min * 60),
         timeout=60,
     )
     expected = f"LABCTL_REMOTE_GUARD_INSTALLED={state['pod_id']}"
@@ -187,7 +185,12 @@ def cmd_open(args: argparse.Namespace) -> int:
         raise
     c._write_state(reservation)
     try:
-        pod = provider._create_pod_once(name=lease_name, gpu_id=gpu_id, args=args)
+        pod = provider._create_pod_once(
+            name=lease_name,
+            gpu_id=gpu_id,
+            volume_mount=plan["volume_mount"],
+            args=args,
+        )
         _validate_created_pod(pod, lease_name, offer, args)
         attached_volume = provider._attest_pod_volume(
             pod.id, args.volume_id, args.volume_dc
@@ -335,16 +338,24 @@ def cmd_close(args: argparse.Namespace) -> int:
         if candidate.name == state.get("lease_name"):
             by_id[candidate.id] = candidate
     pods = list(by_id.values())
-    if state.get("phase") == "open" and len(pods) != 1:
-        raise RuntimeError(
-            f"open lease resolved to {len(pods)} pods; refusing unsealed termination"
-        )
+    lease_local = bootstrap_profile.is_lease_local_state(state)
+    if state.get("phase") == "open":
+        ambiguous = len(pods) > 1 if lease_local else len(pods) != 1
+        if ambiguous:
+            raise RuntimeError(
+                f"open lease resolved to {len(pods)} pods; "
+                "refusing ambiguous termination"
+            )
     pod = pods[0] if len(pods) == 1 else None
-    seal_ok = state.get("phase") != "open"
-    if (state.get("phase") == "open" and pod and pod.status == "RUNNING"
+    seal_ok = state.get("phase") != "open" or lease_local
+    if lease_local and pod:
+        runtime._persist_for_termination(state, pod, reason="explicit-close")
+    if (not lease_local and state.get("phase") == "open"
+            and pod and pod.status == "RUNNING"
             and not pod.ssh_host):
         raise RuntimeError("running lease has no SSH endpoint; refusing unsealed termination")
-    if state.get("phase") == "open" and pod and pod.status == "RUNNING" and pod.ssh_host:
+    if (not lease_local and state.get("phase") == "open"
+            and pod and pod.status == "RUNNING" and pod.ssh_host):
         runtime._persist_for_termination(state, pod, reason="explicit-close")
         seal_dir = c.STATE.parent / "seals"
         seal_dir.mkdir(parents=True, exist_ok=True)

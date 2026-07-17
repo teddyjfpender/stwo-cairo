@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -11,11 +12,14 @@ from . import common as c
 from . import lease_local_root as root
 
 
+BOOT_ID = "11111111-1111-1111-1111-111111111111"
+
+
 def _legacy_fixture(base: Path) -> tuple[Path, Path]:
     target = base / "gpu-lab"
     target.mkdir()
     target.chmod(0o777)
-    marker = target / root.MARKER
+    marker = target / root.LEGACY_MARKER
     marker.write_text("volume-test\n")
     marker.chmod(0o666)
     return target, marker
@@ -28,7 +32,7 @@ def _preflight(
         [
             "python3",
             "-c",
-            root.LEGACY_TARGET_PREFLIGHT,
+            root.LEGACY_VOLUME_PREFLIGHT,
             str(target),
             volume_id,
             str(os.getuid()),
@@ -41,22 +45,23 @@ def _preflight(
 
 
 def _reject(target: Path, label: str, volume_id: str = "volume-test") -> None:
-    result = _preflight(target, volume_id)
-    assert result.returncode != 0, f"accepted hostile {label}"
+    assert _preflight(target, volume_id).returncode != 0, f"accepted hostile {label}"
 
 
 def _evidence(pod_id: str = "pod-test") -> str:
     values = (
         ("LABCTL_LEASE_LOCAL_ROOT", root.SCHEMA),
         ("LABCTL_LEASE_LOCAL_TARGET", root.TARGET),
-        ("LABCTL_LEASE_LOCAL_BACKING", root.backing_root(pod_id)),
+        ("LABCTL_LEASE_LOCAL_QUARANTINE", root.QUARANTINED_ROOT),
+        ("LABCTL_LEASE_LOCAL_MARKER", f"{root.TARGET}/{root.MARKER}"),
+        ("LABCTL_LEASE_LOCAL_BOOT_ID", BOOT_ID),
         ("LABCTL_LEASE_LOCAL_CONTAINER_MOUNT_ID", "7"),
         ("LABCTL_LEASE_LOCAL_CONTAINER_DEVICE", "0:7"),
-        ("LABCTL_LEASE_LOCAL_WORKSPACE_MOUNT_ID", "41"),
-        ("LABCTL_LEASE_LOCAL_SOURCE_MOUNT_ID", "7"),
-        ("LABCTL_LEASE_LOCAL_TARGET_MOUNT_ID", "52"),
-        ("LABCTL_LEASE_LOCAL_WORKSPACE_DEVICE", "0:41"),
-        ("LABCTL_LEASE_LOCAL_SOURCE_DEVICE", "0:7"),
+        ("LABCTL_LEASE_LOCAL_WORKSPACE_MOUNT_ID", "7"),
+        ("LABCTL_LEASE_LOCAL_WORKSPACE_DEVICE", "0:7"),
+        ("LABCTL_LEASE_LOCAL_QUARANTINE_MOUNT_ID", "41"),
+        ("LABCTL_LEASE_LOCAL_QUARANTINE_DEVICE", "0:41"),
+        ("LABCTL_LEASE_LOCAL_TARGET_MOUNT_ID", "7"),
         ("LABCTL_LEASE_LOCAL_TARGET_DEVICE", "0:7"),
         ("LABCTL_LEASE_LOCAL_PERSISTENCE_SCOPE", root.PERSISTENCE_SCOPE),
         ("LABCTL_LEASE_LOCAL_QUALIFICATION", "0"),
@@ -65,18 +70,38 @@ def _evidence(pod_id: str = "pod-test") -> str:
 
 
 def lease_local_root_self_test() -> None:
-    compile(root.LEGACY_TARGET_PREFLIGHT, "lease-local-root-preflight", "exec")
+    compile(root.LEGACY_VOLUME_PREFLIGHT, "quarantined-volume-preflight", "exec")
+    compile(root.LOCAL_MARKER_WORKER, "lease-local-marker", "exec")
     generated = root.command("pod-test", "volume-test")
-    subprocess.run(["bash", "-n"], input=generated, text=True, check=True)
-    assert "mount --bind \"$BACKING\" \"$TARGET\"" in generated
-    assert generated.index("python3 - ") < generated.index("mount --bind")
-    assert "test \"$(stat -c '%u:%g:%a' \"$TARGET\")\" = 0:0:755" in generated
-    assert "test \"$TARGET_DEVICE\" = \"$SOURCE_DEVICE\"" in generated
-    assert "test \"$SOURCE_DEVICE\" = \"$CONTAINER_DEVICE\"" in generated
-    assert "test \"$SOURCE_DEVICE\" != \"$WORKSPACE_DEVICE\"" in generated
-    assert "test \"$TARGET_MOUNT_ID\" != \"$WORKSPACE_MOUNT_ID\"" in generated
-    assert "test ! -e \"$TARGET/NETWORK_VOLUME_ID\"" in generated
-    assert "chmod" not in generated and "fchmod" not in generated
+    attestation = root.attestation_command(
+        "pod-test", "volume-test", BOOT_ID, guards=True
+    )
+    for script in (generated, attestation):
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+    assert root.PROVIDER_MOUNT in generated
+    assert root.QUARANTINED_ROOT in generated
+    assert "mount --bind" not in generated
+    assert f"install -d -m 0755 -o root -g root {root.TARGET}" in generated
+    assert 'test "$TARGET_MOUNT_ID:$TARGET_DEVICE" = ' in generated
+    assert 'test "$QUARANTINE_DEVICE" != "$CONTAINER_DEVICE"' in generated
+    assert 'test "$LEGACY_MOUNT_ID:$LEGACY_DEVICE" = ' in generated
+    assert 'test "$WORKSPACE_BEFORE" = "$CONTAINER_BEFORE"' in generated
+    assert "LEASE_LOCAL_ROOT.json" in generated
+    assert "/proc/sys/kernel/random/boot_id" in generated
+    assert "0:0:600:1" in attestation
+    assert "/proc/$PID/cmdline" in attestation
+
+    payload = json.loads(root.marker_payload("pod-test", "volume-test"))
+    assert payload == {
+        "persistence_scope": root.PERSISTENCE_SCOPE,
+        "pod_id": "pod-test",
+        "provider_mount": root.PROVIDER_MOUNT,
+        "qualification": False,
+        "quarantined_root": root.QUARANTINED_ROOT,
+        "schema_version": root.SCHEMA,
+        "target": root.TARGET,
+        "volume_id": "volume-test",
+    }
 
     with tempfile.TemporaryDirectory() as directory:
         target, marker = _legacy_fixture(Path(directory))
@@ -105,39 +130,39 @@ def lease_local_root_self_test() -> None:
         target_link.symlink_to(target, target_is_directory=True)
         _reject(target_link, "target symlink")
 
-    with tempfile.TemporaryDirectory() as directory:
-        target, marker = _legacy_fixture(Path(directory))
-        marker.unlink()
-        _reject(target, "absent marker")
-
     for value in ("", "../pod", "/pod", "pod id", "pod/child"):
-        try:
-            root.backing_root(value)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"accepted unsafe pod id: {value!r}")
-        try:
-            root.command("pod-test", value)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"accepted unsafe volume id: {value!r}")
+        for call in (
+            lambda value=value: root.command(value, "volume-test"),
+            lambda value=value: root.command("pod-test", value),
+        ):
+            try:
+                call()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted unsafe lease identity: {value!r}")
+    try:
+        root.attestation_command("pod-test", "volume-test", "bad", guards=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted unsafe boot id")
 
     result = root._parse(_evidence(), "pod-test")
     assert result["persistence_scope"] == root.PERSISTENCE_SCOPE
     assert result["qualification"] is False
-    assert result["workspace_device"] != result["source_device"]
-    assert result["source_device"] == result["target_device"]
+    assert result["boot_id"] == BOOT_ID
+    assert result["container_device"] == result["target_device"]
+    assert result["container_device"] != result["quarantine_device"]
     for changed in (
         _evidence().replace("LABCTL_LEASE_LOCAL_QUALIFICATION=0",
                             "LABCTL_LEASE_LOCAL_QUALIFICATION=1"),
-        _evidence().replace("LABCTL_LEASE_LOCAL_TARGET_MOUNT_ID=52",
+        _evidence().replace("LABCTL_LEASE_LOCAL_TARGET_MOUNT_ID=7",
                             "LABCTL_LEASE_LOCAL_TARGET_MOUNT_ID=41"),
-        _evidence().replace("LABCTL_LEASE_LOCAL_TARGET_DEVICE=0:7",
-                            "LABCTL_LEASE_LOCAL_TARGET_DEVICE=0:8"),
-        _evidence().replace("LABCTL_LEASE_LOCAL_CONTAINER_DEVICE=0:7",
-                            "LABCTL_LEASE_LOCAL_CONTAINER_DEVICE=0:8"),
+        _evidence().replace("LABCTL_LEASE_LOCAL_QUARANTINE_DEVICE=0:41",
+                            "LABCTL_LEASE_LOCAL_QUARANTINE_DEVICE=0:7"),
+        _evidence().replace(BOOT_ID, "invalid"),
+        _evidence() + "\nunexpected warning",
         _evidence() + "\nLABCTL_LEASE_LOCAL_EXTRA=1",
     ):
         try:
@@ -157,13 +182,21 @@ def lease_local_root_self_test() -> None:
             c.Endpoint("host", 22), "pod-test", "volume-test"
         )
         assert installed["volume_id"] == "volume-test"
-        assert calls[0][2] == 30 and "mount --bind" in calls[0][1]
-        c.ssh_capture = lambda *_a, **_kw: (1, "mount denied")
+        assert calls[0][2] == 30 and "mount --bind" not in calls[0][1]
+        c.ssh_capture = lambda *_a, **_kw: (
+            0, "LABCTL_LEASE_LOCAL_ATTESTED=pod-test"
+        )
+        root.attest(
+            c.Endpoint("host", 22), "pod-test", "volume-test", BOOT_ID
+        )
+        c.ssh_capture = lambda *_a, **_kw: (1, "guard missing")
         try:
-            root.install(c.Endpoint("host", 22), "pod-test", "volume-test")
+            root.attest(
+                c.Endpoint("host", 22), "pod-test", "volume-test", BOOT_ID
+            )
         except RuntimeError as error:
-            assert "mount denied" in str(error)
+            assert "guard missing" in str(error)
         else:
-            raise AssertionError("accepted failed lease-local mount")
+            raise AssertionError("accepted missing lease-local guard")
     finally:
         c.ssh_capture = saved

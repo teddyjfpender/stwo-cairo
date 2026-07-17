@@ -9,6 +9,7 @@ import urllib.parse
 import urllib.request
 
 from . import common as c
+from . import lease_local_root
 
 
 REST_BASE = "https://rest.runpod.io/v1"
@@ -131,8 +132,12 @@ def _secure_offer(gpu_id: str) -> dict:
     }
 
 
-def _create_pod_once(*, name: str, gpu_id: str, args) -> c.api.PodInfo:
+def _create_pod_once(
+    *, name: str, gpu_id: str, volume_mount: str, args
+) -> c.api.PodInfo:
     """Create exactly once: lifecycle mutations never inherit gql retries."""
+    if volume_mount not in (c.VOLUME_MOUNT, lease_local_root.PROVIDER_MOUNT):
+        raise RuntimeError(f"unsupported provider volume mount: {volume_mount!r}")
     query = """
     mutation($in: PodFindAndDeployOnDemandInput!) {
       podFindAndDeployOnDemand(input: $in) { %s }
@@ -149,7 +154,7 @@ def _create_pod_once(*, name: str, gpu_id: str, args) -> c.api.PodInfo:
                 "gpuCount": 1,
                 "containerDiskInGb": c.DEFAULT_DISK_GB,
                 "volumeInGb": 0,
-                "volumeMountPath": c.VOLUME_MOUNT,
+                "volumeMountPath": volume_mount,
                 "minVcpuCount": args.min_vcpu,
                 "minMemoryInGb": args.min_mem_gb,
                 "networkVolumeId": args.volume_id,

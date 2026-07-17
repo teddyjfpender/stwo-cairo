@@ -125,6 +125,52 @@ def _check_provider(offer) -> None:
         _rejected(lambda: provider._secure_offer(c.GPU_IDS["4090"]), "community-only offer")
     finally:
         c.api.gql = old_gql
+    old_gql = c.api.gql
+    try:
+        calls = []
+        raw = {
+            "id": "pod-test",
+            "name": "lease",
+            "desiredStatus": "RUNNING",
+            "costPerHr": 0.5,
+            "gpuCount": 1,
+            "vcpuCount": 8,
+            "memoryInGb": 32,
+            "machine": {
+                "gpuDisplayName": offer["display_name"],
+                "dataCenterId": "EU-1",
+            },
+        }
+        c.api.gql = lambda _query, variables, retries: (
+            calls.append((variables, retries))
+            or {"podFindAndDeployOnDemand": raw}
+        )
+        create_args = argparse.Namespace(
+            image="registry.example/stwo@sha256:" + "a" * 64,
+            min_mem_gb=32,
+            min_vcpu=8,
+            volume_id="volume-test",
+        )
+        provider._create_pod_once(
+            name="lease",
+            gpu_id=c.GPU_IDS["4090"],
+            volume_mount="/runpod-volume",
+            args=create_args,
+        )
+        assert calls[0][0]["in"]["volumeMountPath"] == "/runpod-volume"
+        assert calls[0][1] == 1
+        _rejected(
+            lambda: provider._create_pod_once(
+                name="lease",
+                gpu_id=c.GPU_IDS["4090"],
+                volume_mount="/hostile",
+                args=create_args,
+            ),
+            "provider volume mount",
+        )
+        assert len(calls) == 1
+    finally:
+        c.api.gql = old_gql
     old_rest = provider._rest_get
     try:
         provider._rest_get = lambda resource: {
@@ -191,7 +237,9 @@ def _check_provider(offer) -> None:
         c.api.get_pod = old_get_pod
         c.api.list_pods = old_list_pods
 def _check_generated_commands(valid_image: str) -> None:
-    guard = runtime._guard_command("pod-test", "volume-test", 60, 300)
+    guard = runtime._guard_command(
+        {"pod_id": "pod-test", "volume_id": "volume-test"}, 60, 300
+    )
     assert "SEAL.sha256" in guard and "sleep 60" in guard
     assert "RUNPOD_API_KEY" not in guard and "mountpoint -q /workspace" in guard
     assert "NETWORK_VOLUME_ID" in guard and "kill -TERM 1" in guard

@@ -172,7 +172,7 @@ if existing_transactions:
 free_bytes = os.statvfs(root).f_bavail * os.statvfs(root).f_frsize
 if free_bytes < 20 * 1024**3 + estimated_bytes:
     raise RuntimeError(
-        "source transaction estimate must leave 20 GiB free on the 100 GiB volume"
+        "source transaction estimate must leave 20 GiB free on the controller device"
     )
 failures = root / "failures"
 owned_directory(failures, publisher_uid, publisher_gid)

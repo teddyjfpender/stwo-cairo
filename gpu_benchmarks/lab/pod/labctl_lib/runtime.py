@@ -12,6 +12,8 @@ import sys
 import time
 
 from . import common as c
+from . import bootstrap_profile
+from . import lease_local_root
 from . import persistence
 from . import provider
 
@@ -26,19 +28,30 @@ def _seal_command(pod_id: str, volume_id: str, *, reason: str) -> str:
     return persistence.command(pod_id, volume_id, freeze=True, reason=reason)
 
 
-def _guard_command(
-    pod_id: str, volume_id: str, ttl_seconds: int, idle_seconds: int
-) -> str:
+def _guard_command(state: dict, ttl_seconds: int, idle_seconds: int) -> str:
     """Install independent credential-free TTL and activity guards."""
-    ttl_seal = _seal_command(pod_id, volume_id, reason="remote-ttl-guard")
-    idle_seal = _seal_command(pod_id, volume_id, reason="remote-idle-guard")
-    local_root = persistence.local_root(pod_id)
-    return f"""
-set -euE
-GUARD_PHASE=mount-authority
-trap 'rc=$?; trap - ERR; printf "LABCTL_GUARD_ERROR phase=%s line=%s rc=%s\\n" "$GUARD_PHASE" "$LINENO" "$rc" >&2; exit "$rc"' ERR
-POD_ID={shlex.quote(pod_id)}
-VOLUME_ID={shlex.quote(volume_id)}
+    pod_id, volume_id = state["pod_id"], state["volume_id"]
+    lease_local = bootstrap_profile.is_lease_local_state(state)
+    if state.get("profile") == bootstrap_profile.NAME and not lease_local:
+        raise RuntimeError("incomplete lease-local state cannot install remote guards")
+    if lease_local:
+        mount_authority = lease_local_root._checks(
+            pod_id, volume_id, guards=False, emit=False
+        )
+        mount_relation = """
+test "$WORKSPACE_MOUNT" = "$LOCAL_MOUNT"
+test "$WORKSPACE_DEVICE" = "$LOCAL_DEVICE"
+"""
+        ttl_action = (
+            "printf 'lease-local outputs discarded by remote TTL guard\\n' "
+            ">> /var/log/stwo-lab-ttl.log"
+        )
+        idle_action = (
+            "printf 'lease-local outputs discarded by remote idle guard\\n' "
+            ">> /var/log/stwo-lab-idle.log"
+        )
+    else:
+        mount_authority = """
 mountpoint -q /workspace
 test ! -L /workspace
 for path in /workspace/gpu-lab /workspace/gpu-lab/NETWORK_VOLUME_ID; do
@@ -55,7 +68,37 @@ if test -e /workspace/gpu-lab; then
 else
   install -d -m 0755 -o root -g root /workspace/gpu-lab
 fi
-export POD_ID VOLUME_ID
+"""
+        mount_relation = """
+test "$WORKSPACE_MOUNT" != "$LOCAL_MOUNT"
+test "$WORKSPACE_DEVICE" != "$LOCAL_DEVICE"
+"""
+        ttl_seal = _seal_command(
+            pod_id, volume_id, reason="remote-ttl-guard"
+        )
+        idle_seal = _seal_command(
+            pod_id, volume_id, reason="remote-idle-guard"
+        )
+        ttl_action = f"""( {ttl_seal}
+) >> /var/log/stwo-lab-ttl.log 2>&1 || {{
+  echo "persistence failed; refusing unsealed TTL exit" >> /var/log/stwo-lab-ttl.log
+  exit 1
+}}"""
+        idle_action = f"""( {idle_seal}
+) >> /var/log/stwo-lab-idle.log 2>&1 || {{
+  echo "persistence failed; refusing unsealed idle exit" >> /var/log/stwo-lab-idle.log
+  exit 1
+}}"""
+    local_root = persistence.local_root(pod_id)
+    return f"""
+set -euE
+GUARD_PHASE=mount-authority
+trap 'rc=$?; trap - ERR; printf "LABCTL_GUARD_ERROR phase=%s line=%s rc=%s\\n" "$GUARD_PHASE" "$LINENO" "$rc" >&2; exit "$rc"' ERR
+POD_ID={shlex.quote(pod_id)}
+VOLUME_ID={shlex.quote(volume_id)}
+LEASE_LOCAL={"1" if lease_local else "0"}
+{mount_authority}
+export POD_ID VOLUME_ID LEASE_LOCAL
 LOCAL_ROOT={shlex.quote(local_root)}
 DEV_UID=$(id -u dev)
 DEV_GID=$(id -g dev)
@@ -79,8 +122,7 @@ test -n "$WORKSPACE_MOUNT"
 test -n "$LOCAL_MOUNT"
 test -n "$WORKSPACE_DEVICE"
 test -n "$LOCAL_DEVICE"
-test "$WORKSPACE_MOUNT" != "$LOCAL_MOUNT"
-test "$WORKSPACE_DEVICE" != "$LOCAL_DEVICE"
+{mount_relation}
 export LOCAL_ROOT WORKSPACE_MOUNT LOCAL_MOUNT WORKSPACE_DEVICE LOCAL_DEVICE
 GUARD_PHASE=local-layout
 python3 - <<'PY'
@@ -92,44 +134,47 @@ from pathlib import Path
 
 root = Path("/workspace/gpu-lab")
 root.mkdir(parents=True, exist_ok=True)
-marker = root / "NETWORK_VOLUME_ID"
-expected = os.environ["VOLUME_ID"] + "\\n"
-if marker.is_symlink():
-    raise SystemExit(f"network-volume marker is a symlink: {{marker}}")
-if marker.exists():
+if os.environ["LEASE_LOCAL"] == "0":
+    marker = root / "NETWORK_VOLUME_ID"
+    expected = os.environ["VOLUME_ID"] + "\\n"
+    if marker.is_symlink():
+        raise SystemExit(f"network-volume marker is a symlink: {{marker}}")
+    if marker.exists():
+        info = marker.lstat()
+        identity = (info.st_uid, info.st_gid, info.st_mode & 0o7777, info.st_nlink)
+        if not stat.S_ISREG(info.st_mode) or identity != (0, 0, 0o600, 1):
+            raise SystemExit(f"network-volume marker mismatch: {{marker}}")
+        descriptor = os.open(marker, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        opened_identity = (opened.st_uid, opened.st_gid,
+                           opened.st_mode & 0o7777, opened.st_nlink)
+        if not stat.S_ISREG(opened.st_mode) or opened_identity != identity:
+            os.close(descriptor)
+            raise SystemExit(f"network-volume marker raced during open: {{marker}}")
+        with os.fdopen(descriptor) as source:
+            actual = source.read()
+        if actual != expected:
+            raise SystemExit(f"network-volume marker mismatch: {{marker}}")
+    else:
+        fd = os.open(
+            marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+        with os.fdopen(fd, "w") as out:
+            out.write(expected)
+            out.flush()
+            os.fsync(out.fileno())
+        directory = os.open(root, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     info = marker.lstat()
     identity = (info.st_uid, info.st_gid, info.st_mode & 0o7777, info.st_nlink)
-    if not stat.S_ISREG(info.st_mode) or identity != (0, 0, 0o600, 1):
-        raise SystemExit(f"network-volume marker mismatch: {{marker}}")
-    descriptor = os.open(marker, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    opened = os.fstat(descriptor)
-    opened_identity = (opened.st_uid, opened.st_gid,
-                       opened.st_mode & 0o7777, opened.st_nlink)
-    if not stat.S_ISREG(opened.st_mode) or opened_identity != identity:
-        os.close(descriptor)
-        raise SystemExit(f"network-volume marker raced during open: {{marker}}")
-    with os.fdopen(descriptor) as source:
-        actual = source.read()
-    if actual != expected:
-        raise SystemExit(f"network-volume marker mismatch: {{marker}}")
-else:
-    fd = os.open(
-        marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
-    )
-    with os.fdopen(fd, "w") as out:
-        out.write(expected)
-        out.flush()
-        os.fsync(out.fileno())
-    directory = os.open(root, os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-info = marker.lstat()
-identity = (info.st_uid, info.st_gid, info.st_mode & 0o7777, info.st_nlink)
-if (marker.is_symlink() or not stat.S_ISREG(info.st_mode)
-        or identity != (0, 0, 0o600, 1)):
-    raise SystemExit(f"unsafe network-volume marker identity: {{identity}}")
+    if (marker.is_symlink() or not stat.S_ISREG(info.st_mode)
+            or identity != (0, 0, 0o600, 1)):
+        raise SystemExit(f"unsafe network-volume marker identity: {{identity}}")
+elif os.environ["LEASE_LOCAL"] != "1":
+    raise SystemExit("invalid lease-local guard mode")
 
 local = Path(os.environ["LOCAL_ROOT"])
 
@@ -250,16 +295,17 @@ export GPU_LAB_LOCAL_ROOT={shlex.quote(local_root)}
 EOF
 chmod 644 /etc/profile.d/stwo-gpu-lab-local.sh
 HB={shlex.quote(c.HEARTBEAT_PATH)}
-touch "$HB"
+test ! -L "$HB"
+if test -e "$HB"; then
+  test -f "$HB"
+  test "$(stat -c '%u:%g:%a:%h' "$HB")" = 0:0:600:1
+fi
+install -m 0600 -o root -g root /dev/null "$HB"
 cat > /usr/local/bin/stwo-lab-ttl <<'LABTTL'
 #!/bin/sh
 set -eu
 sleep {ttl_seconds}
-( {ttl_seal}
-) >> /var/log/stwo-lab-ttl.log 2>&1 || {{
-  echo "persistence failed; refusing unsealed TTL exit" >> /var/log/stwo-lab-ttl.log
-  exit 1
-}}
+{ttl_action}
 # This credential-free guard only exits the container. The local watchdog owns
 # account-level termination; neither half is a server-side guarantee.
 kill -TERM 1 2>/dev/null || true
@@ -289,11 +335,7 @@ while :; do
   ROOT=/workspace/gpu-lab/leases/{shlex.quote(pod_id)}
   mkdir -p "$ROOT"
   date -u +%FT%TZ > "$ROOT/IDLE_TIMEOUT_AT"
-  ( {idle_seal}
-  ) >> /var/log/stwo-lab-idle.log 2>&1 || {{
-    echo "persistence failed; refusing unsealed idle exit" >> /var/log/stwo-lab-idle.log
-    exit 1
-  }}
+  {idle_action}
   kill -TERM 1 2>/dev/null || true
   sleep 10
   kill -KILL 1 2>/dev/null || true
@@ -302,6 +344,14 @@ done
 LABIDLE
 chmod 700 /usr/local/bin/stwo-lab-idle
 GUARD_PHASE=guard-processes
+umask 077
+for PID_FILE in /var/run/stwo-lab-ttl.pid /var/run/stwo-lab-idle.pid; do
+  test ! -L "$PID_FILE"
+  if test -e "$PID_FILE"; then
+    test -f "$PID_FILE"
+    test "$(stat -c '%u:%g:%a:%h' "$PID_FILE")" = 0:0:600:1
+  fi
+done
 if [ -f /var/run/stwo-lab-ttl.pid ]; then
   kill "$(cat /var/run/stwo-lab-ttl.pid)" 2>/dev/null || true
 fi
@@ -312,6 +362,7 @@ nohup /usr/local/bin/stwo-lab-ttl </dev/null >/var/log/stwo-lab-ttl.log 2>&1 &
 echo $! > /var/run/stwo-lab-ttl.pid
 nohup /usr/local/bin/stwo-lab-idle </dev/null >/var/log/stwo-lab-idle.log 2>&1 &
 echo $! > /var/run/stwo-lab-idle.pid
+chmod 0600 /var/run/stwo-lab-ttl.pid /var/run/stwo-lab-idle.pid
 sleep 1
 kill -0 "$(cat /var/run/stwo-lab-ttl.pid)"
 kill -0 "$(cat /var/run/stwo-lab-idle.pid)"
@@ -370,6 +421,14 @@ def _persist_for_termination(state: dict, pod: c.api.PodInfo, *, reason: str) ->
     if state.get("phase") != "open" or not state.get("remote_guard_installed_at"):
         return
     if pod.id != state.get("pod_id"):
+        return
+    if bootstrap_profile.is_lease_local_state(state):
+        state["discarded_lease_local_outputs"] = True
+        state["discard_reason"] = reason
+        state["persistence_note"] = (
+            "nonformal lease-local outputs are discarded when compute terminates"
+        )
+        c._write_state(state)
         return
     if pod.status != "RUNNING":
         state["persistence_note"] = "remote already exited; credential-free guard owned sealing"
@@ -508,4 +567,22 @@ def _active() -> tuple[dict, c.api.PodInfo, c.Endpoint]:
         raise RuntimeError(f"live budget invalid; terminated {pod.id}: {error}") from error
     if pod.status != "RUNNING":
         raise RuntimeError(f"lease pod is {pod.status}, not RUNNING")
-    return state, pod, c.Endpoint.of(pod)
+    ep = c.Endpoint.of(pod)
+    if bootstrap_profile.is_lease_local_state(state):
+        try:
+            lease_local_root.attest(
+                ep,
+                state["pod_id"],
+                state["volume_id"],
+                state["lease_local_root"]["boot_id"],
+            )
+        except (RuntimeError, OSError) as error:
+            _terminate_state_pod(
+                state, pod, reason="lease-local-runtime-attestation-failed"
+            )
+            raise RuntimeError(
+                f"lease-local runtime attestation failed; terminated {pod.id}: {error}"
+            ) from error
+    elif state.get("profile") == bootstrap_profile.NAME:
+        raise RuntimeError("incomplete lease-local state cannot authorize remote work")
+    return state, pod, ep

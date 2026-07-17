@@ -11,22 +11,27 @@ exact command with the content-bound confirmation token.
 - After creation, it reads `GET /v1/pods/{id}` and fails closed unless that pod reports the exact
   network-volume id. When the Pod response exposes only the current flat `networkVolumeId`, it
   independently re-attests the volume's data center through `GET /v1/networkvolumes/{id}`; the
-  GraphQL Pod record must also match that data center. `/workspace/gpu-lab/NETWORK_VOLUME_ID` is
-  only a durable memo; it is not the source of truth.
+  GraphQL Pod record must also match that data center. The formal lane's
+  `/workspace/gpu-lab/NETWORK_VOLUME_ID` and the bootstrap lane's quarantined
+  `/runpod-volume/gpu-lab/NETWORK_VOLUME_ID` are filesystem memos; neither replaces the provider
+  attestation.
 - A local process owns provider-level termination. It enforces the TTL and, once the remote guard is
   installed, polls authenticated heartbeat/process state and terminates an idle or exited pod via
   the provider API. Three consecutive unobservable polls also terminate fail-closed.
-- Separate credential-free remote TTL and idle processes seal evidence and stop PID 1. Neither
-  remote process can issue a provider mutation, so it is a fallback, not a billing guarantee.
-- `open` declares `/tmp/stwo-gpu-lab/<pod-id>` as the active local root and records the distinct
-  local and `/workspace` mount identities in `LOCAL_ROOT.json`. The replay loop fails before build
-  if an active fixture, chunk, module, plan, replay, execution manifest, harness, or build output
-  resolves outside that root.
-- `accept` persists a verified content-addressed snapshot. `close`, the idle guard, and the TTL
-  guard first freeze the local tree, persist records/results/profiles, re-scan for concurrent
-  mutation, write a durable manifest and `SEAL.sha256`, and only then permit termination. A
-  missing, changed, symlinked, or incompletely copied output leaves compute running and reports the
-  exact persistence failure; it is never treated as a successful close.
+- Separate credential-free remote TTL and idle processes stop PID 1. The formal lane first seals
+  durable evidence. The explicitly ephemeral bootstrap lane records no durable-seal claim and
+  discards its controller disk. Neither remote process can issue a provider mutation, so it is a
+  fallback, not a billing guarantee.
+- `open` declares `/tmp/stwo-gpu-lab/<pod-id>` as the active local root and records its mount
+  identity in `LOCAL_ROOT.json`. Formal runs require that root and `/workspace` to be distinct.
+  Bootstrap runs require both to resolve to the fresh container disk while `/runpod-volume`
+  remains distinct and quarantined. The replay loop fails before build if an active fixture,
+  chunk, module, plan, replay, execution manifest, harness, or build output resolves outside the
+  active root.
+- In the formal lane, `accept` persists a verified content-addressed snapshot. `close`, the idle
+  guard, and the TTL guard first freeze the local tree, persist records/results/profiles, re-scan
+  for concurrent mutation, write a durable manifest and `SEAL.sha256`, and only then permit
+  termination. The nonformal bootstrap profile cannot be accepted and makes no persistence claim.
 
 The residual trust boundary is RunPod's authenticated control-plane response. A process inside the
 container cannot cryptographically prove which physical block device the provider mounted. Missing,
@@ -69,20 +74,25 @@ It creates and verifies only the `1000:1000` development identity before install
 guards. Its records say `formal=false` and `qualification_eligible=false`; `labctl accept` rejects
 it, so the lane cannot produce qualification or headline evidence. The recorded image digest is
 the requested immutable reference, not a runtime attestation of the provider-started filesystem.
-It never repairs or trusts the known volume's legacy `root:root` `0777` controller root or `0666`
-volume-id memo. It verifies that exact state without following links, creates a fresh pod-unique
-`root:root` `0755` backing directory on the container disk, and bind-mounts it over
-`/workspace/gpu-lab` before the dev bootstrap and ordinary guard. The mount record proves that
-`/workspace` remains the provider-attested mount, that its device differs from the container
-backing device, and that the new target is the exact backing inode on a distinct bind-mount
-identity. The unchanged ordinary guard then creates and validates its own `0600` marker there.
+It mounts the provider network volume only at `/runpod-volume`; it never repairs or trusts that
+volume's known legacy `root:root` `0777` `/runpod-volume/gpu-lab` controller root or `0666`
+volume-id memo. It verifies that exact legacy state without following links, requires the provider
+mount identity/device to differ from the container root, and requires `/workspace` to resolve to a
+root-owned, non-group/world-writable container directory. It then creates and attests a fresh
+`root:root` `0755` `/workspace/gpu-lab` directly on the container disk, with a root-owned `0400`
+lease marker bound to the pod, volume, and observed boot. No mount syscall or bind mount is used.
+Before every remote operation, `labctl` re-attests that marker, the quarantined provider mount,
+heartbeat, guard programs, PID files, and live guard processes. A missing/restarted controller is
+terminated through the provider API instead of silently continuing to accrue spend.
 
 This exception records `persistence_scope=lease-local-container-disk` and `qualification=false`.
-It is development-only. The network volume is not a cache, source-generation, result, profile, or
-evidence authority in this lane: everything beneath `/workspace/gpu-lab` is on the pod's container
-disk and is lost when the pod terminates. Sync source again on the next lease and copy out any
-informal diagnostics before closing. Formal development, acceptance, qualification, and headline
-evidence still require the published consumer image and the unmodified persistent-volume guards.
+It is development-only. The network volume is a seed input used read-only by policy at
+`/runpod-volume/src`; it is not a cache, source-generation, result, profile, or evidence authority
+in this lane. Published source generations and everything beneath `/workspace/gpu-lab` are on the
+pod's container disk and are lost when the pod terminates. Sync source again on the next lease and
+copy out any informal diagnostics before closing. Formal development, acceptance, qualification,
+and headline evidence still require the published consumer image and the unmodified
+persistent-volume guards.
 
 ```bash
 gpu_benchmarks/lab/pod/labctl open \
@@ -110,9 +120,11 @@ After the durable sync record binds that publication, success cleanup removes th
 transaction, transferred objects, and quarantine. Failed or interrupted transactions are compacted
 into immutable bounded failure manifests; reconciliation validates an existing same-token manifest
 and safely finishes cleanup after a crash between evidence publication and transaction removal.
-Transactions are capped at 40 GiB and one million entries, must leave 20 GiB free, and the failure
-store is capped at 256 manifests. Prior published generations remain intact because this slice does
-not automatically garbage-collect generation history.
+Transactions are capped at 40 GiB and one million entries, must leave 20 GiB free on the controller
+device, and the failure store is capped at 256 manifests. Prior published generations remain intact
+because this slice does not automatically garbage-collect generation history. Bounded generation
+garbage collection remains a follow-up before the ephemeral lane is used for high-churn,
+multi-generation sessions.
 
 Build, profile, sanitizer, and benchmark commands must use the immutable manifest named by
 `/workspace/gpu-lab/source-generations/CURRENT`, record its manifest SHA-256, and use only the exact

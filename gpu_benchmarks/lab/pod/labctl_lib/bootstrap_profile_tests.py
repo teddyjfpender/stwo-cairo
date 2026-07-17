@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from . import acceptance
 from . import bootstrap_profile as profile
 from . import common as c
+from . import lease_local_lifecycle_tests
 from . import lease_local_root
 from . import lifecycle
 from . import provider
@@ -34,6 +35,48 @@ def _args(**changes) -> argparse.Namespace:
     for key, value in changes.items():
         setattr(args, key, value)
     return args
+
+
+def _root_evidence() -> dict:
+    return {
+        "boot_id": "11111111-1111-1111-1111-111111111111",
+        "container_device": "0:7",
+        "container_mount_id": 7,
+        "marker": f"{lease_local_root.TARGET}/{lease_local_root.MARKER}",
+        "persistence_scope": lease_local_root.PERSISTENCE_SCOPE,
+        "pod_id": "pod-test",
+        "provider_mount": lease_local_root.PROVIDER_MOUNT,
+        "qualification": False,
+        "quarantine_device": "0:41",
+        "quarantine_mount_id": 41,
+        "quarantined_root": lease_local_root.QUARANTINED_ROOT,
+        "schema_version": lease_local_root.SCHEMA,
+        "target": lease_local_root.TARGET,
+        "target_device": "0:7",
+        "target_mount_id": 7,
+        "volume_id": profile.VOLUME_ID,
+        "workspace_device": "0:7",
+        "workspace_mount_id": 7,
+    }
+
+
+def _lease_state(args: argparse.Namespace) -> dict:
+    return {
+        **profile.metadata(args),
+        "image": profile.IMAGE,
+        "lease_local_root": _root_evidence(),
+        "phase": "bootstrapping",
+        "plan": {
+            **profile.metadata(args),
+            "image": profile.IMAGE,
+            "volume_dc": profile.VOLUME_DC,
+            "volume_id": profile.VOLUME_ID,
+            "volume_mount": lease_local_root.PROVIDER_MOUNT,
+        },
+        "pod_id": "pod-test",
+        "volume_dc": profile.VOLUME_DC,
+        "volume_id": profile.VOLUME_ID,
+    }
 
 
 def _configuration_checks() -> argparse.Namespace:
@@ -56,6 +99,8 @@ def _configuration_checks() -> argparse.Namespace:
         "qualification_eligible": False,
     }
     assert profile.metadata(args) == expected
+    assert profile.provider_volume_mount(args) == lease_local_root.PROVIDER_MOUNT
+    assert profile.provider_volume_mount(argparse.Namespace()) == c.VOLUME_MOUNT
 
     exact_mutations = {
         "gpu": "5090",
@@ -150,31 +195,8 @@ def _command_checks(args: argparse.Namespace) -> None:
     assert "/root/.ssh/authorized_keys" not in command
 
     state = {
-        **profile.metadata(args),
+        **_lease_state(args),
         "bootstrap_key_sha256": "a" * 64,
-        "image": profile.IMAGE,
-        "lease_local_root": {
-            "backing": lease_local_root.backing_root("pod-test"),
-            "container_device": "0:7",
-            "container_mount_id": 7,
-            "persistence_scope": lease_local_root.PERSISTENCE_SCOPE,
-            "pod_id": "pod-test",
-            "qualification": False,
-            "schema_version": lease_local_root.SCHEMA,
-            "source_device": "0:7",
-            "source_mode": "0755",
-            "source_mount_id": 7,
-            "source_owner": "0:0",
-            "target": lease_local_root.TARGET,
-            "target_device": "0:7",
-            "target_mount_id": 52,
-            "workspace_device": "0:41",
-            "workspace_mount_id": 41,
-            "volume_id": profile.VOLUME_ID,
-        },
-        "pod_id": "pod-test",
-        "volume_dc": profile.VOLUME_DC,
-        "volume_id": profile.VOLUME_ID,
     }
     record, path, digest = profile._record_command(state)
     subprocess.run(["bash", "-n"], input=record, text=True, check=True)
@@ -188,7 +210,9 @@ def _command_checks(args: argparse.Namespace) -> None:
     assert payload["image_digest_authority"].startswith("requested-reference")
     assert payload["lease_local_root"]["qualification"] is False
 
-    guard = runtime._guard_command("pod-test", "volume-test", 60, 300)
+    guard = runtime._guard_command(
+        {"pod_id": "pod-test", "volume_id": "volume-test"}, 60, 300
+    )
     subprocess.run(["bash", "-n"], input=guard, text=True, check=True)
     assert "test ! -L /workspace" in guard
     assert "/workspace/gpu-lab/NETWORK_VOLUME_ID" in guard
@@ -467,16 +491,7 @@ def _ordering_checks(args: argparse.Namespace) -> None:
             c.STATE = Path(directory) / "lease.json"
             lease_local_root.install = lambda *_a: (
                 calls.append("lease-local-root")
-                or {
-                    "backing": lease_local_root.backing_root("pod-test"),
-                    "container_device": "0:7",
-                    "container_mount_id": 7,
-                    "persistence_scope": lease_local_root.PERSISTENCE_SCOPE,
-                    "pod_id": "pod-test",
-                    "qualification": False,
-                    "schema_version": lease_local_root.SCHEMA,
-                    "volume_id": profile.VOLUME_ID,
-                }
+                or _root_evidence()
             )
             profile.bootstrap_dev = lambda _ep: calls.append("bootstrap") or "a" * 64
             profile.verify_ssh = lambda _ep, _key: calls.append("fresh-root+dev")
@@ -488,12 +503,7 @@ def _ordering_checks(args: argparse.Namespace) -> None:
                 lambda *_a: calls.append("record")
                 or ("/workspace/profile.json", "b" * 64)
             )
-            state = {
-                **profile.metadata(args),
-                "phase": "bootstrapping",
-                "pod_id": "pod-test",
-                "volume_id": profile.VOLUME_ID,
-            }
+            state = _lease_state(args)
             lifecycle._install_remote_controls(
                 state, args, c.Endpoint("host", 22), 3600
             )
@@ -522,16 +532,7 @@ def _ordering_checks(args: argparse.Namespace) -> None:
             calls.clear()
             lease_local_root.install = lambda *_a: (
                 calls.append("lease-local-root")
-                or {
-                    "backing": lease_local_root.backing_root("pod-test"),
-                    "container_device": "0:7",
-                    "container_mount_id": 7,
-                    "persistence_scope": lease_local_root.PERSISTENCE_SCOPE,
-                    "pod_id": "pod-test",
-                    "qualification": False,
-                    "schema_version": lease_local_root.SCHEMA,
-                    "volume_id": profile.VOLUME_ID,
-                }
+                or _root_evidence()
             )
             profile.verify_ssh = lambda _ep, _key: (
                 calls.append("fresh-root+dev-failed"),
@@ -673,3 +674,6 @@ def bootstrap_profile_self_test() -> None:
     _ordering_checks(args)
     _nonformal_gate_check()
     _bootstrapping_close_check()
+    lease_local_lifecycle_tests.lease_local_lifecycle_self_test(
+        args, _lease_state
+    )

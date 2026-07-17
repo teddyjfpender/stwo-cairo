@@ -33,7 +33,9 @@ def _marker(local: Path, *, volume_id: str = "volume-test") -> None:
 
 
 def persistence_self_test() -> None:
-    guard = runtime._guard_command("pod-test", "volume-test", 60, 300)
+    guard = runtime._guard_command(
+        {"pod_id": "pod-test", "volume_id": "volume-test"}, 60, 300
+    )
     marker_worker = guard.split("python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
     compile(marker_worker, "labctl-local-root-marker", "exec")
     for name in ("ttl", "idle"):
