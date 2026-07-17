@@ -2,7 +2,7 @@ use super::*;
 use crate::compiled_proof::{OpId, ValueLayout, ValueRange, ValueVersion};
 use crate::fleet_spill::{SpillPlan, SpillTransitionKind};
 
-const DOMAIN: &[u8] = b"stwo-cairo.track-a.fleet-proof-plan.structural-v4\0";
+const DOMAIN: &[u8] = b"stwo-cairo.track-a.fleet-proof-plan.structural-v5\0";
 
 pub(super) fn compute(plan: &FleetProofPlan) -> Result<[u8; 32], FleetPlanError> {
     Ok(*blake3::hash(&encode(plan)?).as_bytes())
@@ -64,8 +64,18 @@ pub(super) fn encode(plan: &FleetProofPlan) -> Result<Vec<u8>, FleetPlanError> {
     out.count(placement.operations.len())?;
     for operation in &placement.operations {
         out.operation(operation.operation);
-        out.worker(operation.worker);
         out.schedule(operation.during);
+        out.count(operation.executions.len())?;
+        for execution in &operation.executions {
+            out.worker(execution.worker);
+            match execution.domain {
+                OperationDomain::Monolithic => out.byte(0),
+                OperationDomain::Exact(range) => {
+                    out.byte(1);
+                    out.elements(range)?;
+                }
+            }
+        }
     }
     out.count(placement.owners.len())?;
     for owner in &placement.owners {

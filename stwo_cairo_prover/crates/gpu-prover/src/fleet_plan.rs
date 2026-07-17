@@ -32,9 +32,9 @@ pub use ipc_cursor::{
     FleetIpcPhase, FleetIpcPhaseBinding, FleetIpcPhaseReceipt,
 };
 pub use lower_compiled::{
-    FleetLoweringError, FleetOperationPlacement, FleetOwnerPlacement, FleetPlacementInput,
-    FleetPlacementTopology, FleetReplicaPlacement, FleetRuntimeAdmissionError,
-    FleetStoragePlacement, FleetTransitionPlacement, InPlaceAliasPlacement,
+    FleetLoweringError, FleetOperationExecution, FleetOperationPlacement, FleetOwnerPlacement,
+    FleetPlacementInput, FleetPlacementTopology, FleetReplicaPlacement, FleetRuntimeAdmissionError,
+    FleetStoragePlacement, FleetTransitionPlacement, InPlaceAliasPlacement, OperationDomain,
 };
 pub use runtime_view::{
     FleetExchangeReserve, FleetRuntimeView, FleetRuntimeViewError, FleetStorageWindow,
@@ -311,6 +311,15 @@ fn canonicalize(input: &mut FleetPlacementInput) {
     input
         .operations
         .sort_unstable_by_key(|operation| operation.operation);
+    for operation in &mut input.operations {
+        operation.executions.sort_unstable_by_key(|execution| {
+            let (tag, start, end) = match execution.domain {
+                OperationDomain::Monolithic => (0, 0, 0),
+                OperationDomain::Exact(range) => (1, range.start, range.end),
+            };
+            (tag, start, end, execution.worker)
+        });
+    }
     input.owners.sort_unstable_by_key(|owner| {
         (
             owner.value.version,
@@ -371,6 +380,7 @@ pub enum FleetPlanError {
     UnknownValue(ValueVersion),
     UnknownOperation(OpId),
     InvalidOperation(OpId),
+    InvalidOperationDomain(OpId),
     InvalidRange(ValueVersion),
     InvalidSchedule,
     InvalidSegment(OpId),

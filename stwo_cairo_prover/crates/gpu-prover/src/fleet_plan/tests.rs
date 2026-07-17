@@ -24,6 +24,8 @@ mod barrier;
 mod compiler;
 mod composite_internal_read;
 mod ipc_cursor;
+mod operation_execution;
+mod operation_reads;
 mod pow;
 mod runtime_view;
 mod spill;
@@ -509,8 +511,11 @@ fn fixture() -> Fixture {
         barrier_arrivals,
         operations: vec![FleetOperationPlacement {
             operation: OP_ASSEMBLE,
-            worker: WorkerId(0),
             during: operation_window,
+            executions: vec![FleetOperationExecution {
+                worker: WorkerId(0),
+                domain: OperationDomain::Monolithic,
+            }],
         }],
         owners,
         replicas: vec![],

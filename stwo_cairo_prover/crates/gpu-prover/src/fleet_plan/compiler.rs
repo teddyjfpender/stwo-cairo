@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use super::*;
 use crate::compiled_proof::{
-    CompiledProof, InPlaceAliasRequirement, ProofStage, Region, ValueOrigin, ValueRange,
+    CompiledProof, InPlaceAliasRequirement, OpNode, PartitionAuthorityKind, ProofStage, Region,
+    ValueOrigin, ValueRange,
 };
 use crate::fleet_pow::{FleetPowError, FleetPowSchedule};
 use crate::shape_executable::ShapeExecutableIdentity;
@@ -88,8 +89,11 @@ fn compile_schedule(
         {
             operations.push(FleetOperationPlacement {
                 operation: operation.id,
-                worker: coordinator,
                 during: take_step(&mut cursor)?,
+                executions: vec![FleetOperationExecution {
+                    worker: coordinator,
+                    domain: operation_domain(compiled, operation)?,
+                }],
             });
         }
         cursor = increment(cursor)?;
@@ -102,8 +106,11 @@ fn compile_schedule(
     {
         operations.push(FleetOperationPlacement {
             operation: operation.id,
-            worker: coordinator,
             during: take_step(&mut cursor)?,
+            executions: vec![FleetOperationExecution {
+                worker: coordinator,
+                domain: operation_domain(compiled, operation)?,
+            }],
         });
     }
     operations.sort_unstable_by_key(|placement| placement.operation);
@@ -153,6 +160,21 @@ fn compile_schedule(
         terminal_step,
         barrier_arrivals,
         operations,
+    })
+}
+
+fn operation_domain(
+    compiled: &CompiledProof,
+    operation: &OpNode,
+) -> Result<OperationDomain, FleetCompileError> {
+    let authority = compiled
+        .partitions()
+        .iter()
+        .find(|authority| authority.id() == operation.partition)
+        .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+    Ok(match authority.kind() {
+        PartitionAuthorityKind::Monolithic => OperationDomain::Monolithic,
+        PartitionAuthorityKind::Exact(authority) => OperationDomain::Exact(authority.domain()),
     })
 }
 
@@ -262,7 +284,7 @@ fn compile_owners(
         let end = match value.origin {
             ValueOrigin::Constant(_) => terminal_step,
             ValueOrigin::OpOutput(producer) => {
-                operation_placement(operations, producer)?.during.end
+                increment(operation_placement(operations, producer)?.during.end)?
             }
             ValueOrigin::ExternalInput(_) | ValueOrigin::TranscriptOutput(_) => increment(start)?,
         };

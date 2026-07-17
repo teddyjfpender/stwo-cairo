@@ -20,11 +20,46 @@ pub struct FleetPlacementTopology {
     pub host_numa: Vec<HostNumaCapacity>,
 }
 
+/// The semantic domain realized by one physical execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationDomain {
+    /// The complete operation, valid only for monolithic authority.
+    Monolithic,
+    /// One exact authority-aligned half-open domain.
+    Exact(ElementRange),
+}
+
+/// One worker's realization of a semantic operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FleetOperationExecution {
+    pub worker: WorkerId,
+    pub domain: OperationDomain,
+}
+
+/// One canonical placement per semantic operation, with nested executions.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FleetOperationPlacement {
     pub operation: OpId,
-    pub worker: WorkerId,
     pub during: ScheduleRange,
+    pub executions: Vec<FleetOperationExecution>,
+}
+
+impl FleetOperationPlacement {
+    pub(super) fn monolithic_worker(&self) -> Option<WorkerId> {
+        match self.executions.as_slice() {
+            [FleetOperationExecution {
+                worker,
+                domain: OperationDomain::Monolithic,
+            }] => Some(*worker),
+            _ => None,
+        }
+    }
+
+    pub(super) fn executes_on(&self, worker: WorkerId) -> bool {
+        self.executions
+            .iter()
+            .any(|execution| execution.worker == worker)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

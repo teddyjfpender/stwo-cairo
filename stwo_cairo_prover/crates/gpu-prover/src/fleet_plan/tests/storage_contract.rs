@@ -142,13 +142,19 @@ fn alias_fixture(concurrent_consumer: bool) -> Fixture {
     fixture.placement.operations = vec![
         FleetOperationPlacement {
             operation: OpId(0),
-            worker: WorkerId(0),
             during: alias_window,
+            executions: vec![FleetOperationExecution {
+                worker: WorkerId(0),
+                domain: OperationDomain::Monolithic,
+            }],
         },
         FleetOperationPlacement {
             operation: OpId(1),
-            worker: WorkerId(0),
             during: assembly_window,
+            executions: vec![FleetOperationExecution {
+                worker: WorkerId(0),
+                domain: OperationDomain::Monolithic,
+            }],
         },
     ];
     fixture

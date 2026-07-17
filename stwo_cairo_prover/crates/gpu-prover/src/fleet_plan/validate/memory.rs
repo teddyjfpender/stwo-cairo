@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::*;
+use super::execution::projected_range;
 use super::transcript_values::{release_for_input, release_for_output};
 use super::{execution_interval_contains, owner_ready_at, require_worker, validate_value_range};
 use crate::compiled_proof::ValueRange;
@@ -177,7 +178,7 @@ fn validate_vmm_reclaim(
     Ok(())
 }
 
-fn operation_access_during(
+pub(in crate::fleet_plan) fn operation_access_during(
     plan: &FleetProofPlan,
     worker: WorkerId,
     range: ValueRange,
@@ -187,19 +188,31 @@ fn operation_access_during(
         .placement
         .operations
         .iter()
-        .filter(|placement| placement.worker == worker && placement.during.overlaps(window))
+        .filter(|placement| placement.executes_on(worker) && placement.during.overlaps(window))
     {
+        let operation = plan
+            .compiled
+            .operation(placement.operation)
+            .ok_or(FleetPlanError::InvalidOperation(placement.operation))?;
         let effect = plan
             .compiled
             .effect_for(placement.operation)
             .ok_or(FleetPlanError::InvalidOperation(placement.operation))?;
-        if effect.accesses().iter().any(|access| {
-            [access.source(), access.destination()]
-                .into_iter()
+        for execution in placement
+            .executions
+            .iter()
+            .filter(|execution| execution.worker == worker)
+        {
+            for bound in effect
+                .accesses()
+                .iter()
+                .flat_map(|access| [access.source(), access.destination()])
                 .flatten()
-                .any(|bound| ranges_overlap(bound.value, range))
-        }) {
-            return Ok(true);
+            {
+                if ranges_overlap(projected_range(plan, operation, *bound, execution)?, range) {
+                    return Ok(true);
+                }
+            }
         }
     }
     Ok(false)

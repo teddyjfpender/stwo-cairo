@@ -1,8 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+mod execution;
 mod memory;
 mod transcript_values;
 
+use execution::{
+    index_unique, projected_range, range_covered, ranges_overlap, validate_executions,
+};
+#[cfg(test)]
+pub(super) use memory::operation_access_during;
 use memory::{measure_workers, validate_spill};
 use transcript_values::validate_transcript_values;
 
@@ -53,7 +59,7 @@ fn validate_operations(
             return Err(FleetPlanError::DuplicateOperation(placement.operation));
         }
         let operation = operation(plan, placement.operation)?;
-        require_worker(workers, placement.worker)?;
+        validate_executions(plan, operation, placement, workers)?;
         let interval = operation_interval(plan, operation)?;
         if !execution_interval_contains(plan, interval, placement.during) {
             return Err(FleetPlanError::InvalidSchedule);
@@ -130,13 +136,25 @@ fn validate_owner_origin(
                 .compiled
                 .effect_for(producer)
                 .ok_or(FleetPlanError::InvalidOperation(producer))?;
-            let destinations = effect
-                .accesses()
+            let operation = operation(plan, producer)?;
+            let mut destinations = Vec::new();
+            for execution in placement
+                .executions
                 .iter()
-                .filter_map(|access| access.destination().map(|range| range.value))
-                .filter(|range| range.version == value.version)
-                .collect::<Vec<_>>();
-            placement.worker == owner.worker
+                .filter(|execution| execution.worker == owner.worker)
+            {
+                for destination in effect
+                    .accesses()
+                    .iter()
+                    .filter_map(|access| access.destination())
+                {
+                    let range = projected_range(plan, operation, *destination, execution)?;
+                    if range.version == value.version {
+                        destinations.push(range);
+                    }
+                }
+            }
+            !destinations.is_empty()
                 && owner.live.start == placement.during.start
                 && owner.live.contains(placement.during)
                 && range_covered(owner.value.elements, &destinations)
@@ -277,18 +295,22 @@ fn validate_effect_locations(plan: &FleetProofPlan) -> Result<(), FleetPlanError
             .compiled
             .effect_for(operation.id)
             .ok_or(FleetPlanError::InvalidOperation(operation.id))?;
-        for access in effect.accesses() {
-            if let Some(read) = access.source() {
-                if !read_available(plan, read.value, placement) {
-                    return Err(FleetPlanError::UndeclaredRead {
-                        operation: operation.id,
-                        value: read.value.version,
-                    });
+        for execution in &placement.executions {
+            for access in effect.accesses() {
+                if let Some(read) = access.source() {
+                    let range = projected_range(plan, operation, *read, execution)?;
+                    if !read_available(plan, range, placement, execution) {
+                        return Err(FleetPlanError::UndeclaredRead {
+                            operation: operation.id,
+                            value: range.version,
+                        });
+                    }
                 }
-            }
-            if let Some(write) = access.destination() {
-                if !write_available(plan, write.value, placement)? {
-                    return Err(FleetPlanError::InvalidProducer(write.value.version));
+                if let Some(write) = access.destination() {
+                    let range = projected_range(plan, operation, *write, execution)?;
+                    if !write_available(plan, range, placement, execution)? {
+                        return Err(FleetPlanError::InvalidProducer(range.version));
+                    }
                 }
             }
         }
@@ -300,6 +322,7 @@ fn read_available(
     plan: &FleetProofPlan,
     range: ValueRange,
     operation: &FleetOperationPlacement,
+    execution: &FleetOperationExecution,
 ) -> bool {
     let composite_internal = plan.compiled.value(range.version).is_some_and(|value| {
         value.origin == ValueOrigin::OpOutput(operation.operation)
@@ -314,7 +337,7 @@ fn read_available(
                 })
     });
     let canonical = plan.placement.owners.iter().any(|owner| {
-        owner.worker == operation.worker
+        owner.worker == execution.worker
             && owner.value.version == range.version
             && owner.value.elements.contains(range.elements)
             && owner.live.contains(operation.during)
@@ -322,7 +345,7 @@ fn read_available(
                 || owner_ready_at(plan, owner).is_ok_and(|ready| ready <= operation.during.start))
     });
     let replica = plan.placement.replicas.iter().any(|replica| {
-        replica.worker == operation.worker
+        replica.worker == execution.worker
             && replica.value.version == range.version
             && replica.value.elements.contains(range.elements)
             && replica.live.contains(operation.during)
@@ -339,9 +362,10 @@ fn write_available(
     plan: &FleetProofPlan,
     range: ValueRange,
     operation: &FleetOperationPlacement,
+    execution: &FleetOperationExecution,
 ) -> Result<bool, FleetPlanError> {
     Ok(plan.placement.owners.iter().any(|owner| {
-        owner.worker == operation.worker
+        owner.worker == execution.worker
             && owner.value.version == range.version
             && owner.value.elements.contains(range.elements)
             && owner.live.contains(operation.during)
@@ -425,7 +449,7 @@ fn worker_interval_completion(
 ) -> ScheduleStep {
     let operations = plan.placement.operations.iter().filter_map(|placement| {
         let operation = operation(plan, placement.operation).ok()?;
-        (placement.worker == worker && operation_interval(plan, operation).ok()? == interval)
+        (placement.executes_on(worker) && operation_interval(plan, operation).ok()? == interval)
             .then_some(placement.during.end)
     });
     let transitions = plan.placement.transitions.iter().filter_map(|transition| {
@@ -717,37 +741,4 @@ fn validate_axis_map(
         return Err(FleetPlanError::InvalidRange(value.version));
     }
     Ok(())
-}
-
-fn range_covered(target: ElementRange, ranges: &[ValueRange]) -> bool {
-    let mut ranges = ranges
-        .iter()
-        .map(|range| range.elements)
-        .filter(|range| target.overlaps(*range))
-        .collect::<Vec<_>>();
-    ranges.sort_unstable_by_key(|range| (range.start, range.end));
-    let mut cursor = target.start;
-    for range in ranges {
-        let start = range.start.max(target.start);
-        let end = range.end.min(target.end);
-        if start != cursor {
-            return false;
-        }
-        cursor = end;
-    }
-    cursor == target.end
-}
-
-fn ranges_overlap(left: ValueRange, right: ValueRange) -> bool {
-    left.version == right.version && left.elements.overlaps(right.elements)
-}
-
-fn index_unique<T, K: Ord + Copy>(values: &[T], key: impl Fn(&T) -> K) -> Option<BTreeMap<K, &T>> {
-    let mut indexed = BTreeMap::new();
-    for value in values {
-        if indexed.insert(key(value), value).is_some() {
-            return None;
-        }
-    }
-    Some(indexed)
 }

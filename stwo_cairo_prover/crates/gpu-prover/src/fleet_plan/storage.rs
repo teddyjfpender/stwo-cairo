@@ -188,6 +188,9 @@ fn validate_alias(
         return Err(invalid_alias(operation.id, alias.alias));
     }
     let operation_placement = operation_placement(plan, operation.id)?;
+    let operation_worker = operation_placement
+        .monolithic_worker()
+        .ok_or_else(|| invalid_alias(operation.id, alias.alias))?;
     let effect = plan
         .compiled
         .effect_for(operation.id)
@@ -214,7 +217,7 @@ fn validate_alias(
     let destination_live = binding_live(plan, destination_binding)?;
     if source.version == destination.version
         || source_bytes != destination_bytes
-        || storage.worker != operation_placement.worker
+        || storage.worker != operation_worker
         || source_binding.offset_bytes != alias.offset_bytes
         || destination_binding.offset_bytes != alias.offset_bytes
         || source_live.end != operation_placement.during.end
@@ -318,9 +321,12 @@ fn has_concurrent_source_consumer(
     source: ValueRange,
     aliased_placement: &FleetOperationPlacement,
 ) -> Result<bool, FleetPlanError> {
+    let Some(aliased_worker) = aliased_placement.monolithic_worker() else {
+        return Ok(true);
+    };
     for placement in &plan.placement.operations {
         if placement.operation == aliased_operation
-            || placement.worker != aliased_placement.worker
+            || !placement.executes_on(aliased_worker)
             || !placement.during.overlaps(aliased_placement.during)
         {
             continue;
@@ -339,7 +345,7 @@ fn has_concurrent_source_consumer(
         }
     }
     if plan.placement.transitions.iter().any(|transition| {
-        transition.source_worker == aliased_placement.worker
+        transition.source_worker == aliased_worker
             && ranges_overlap(transition.value, source)
             && transition.during.overlaps(aliased_placement.during)
     }) {
@@ -349,7 +355,7 @@ fn has_concurrent_source_consumer(
         .placement
         .spills
         .iter()
-        .filter(|spill| spill.store.worker == aliased_placement.worker)
+        .filter(|spill| spill.store.worker == aliased_worker)
     {
         for chunk in spill
             .chunks

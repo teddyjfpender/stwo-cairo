@@ -213,8 +213,8 @@ fn compile_track_a_monolithic_is_deterministic_and_caller_placement_free() {
 #[test]
 fn compile_track_a_monolithic_schedules_each_stage_inside_its_barrier() {
     let plan = compile_monolithic(with_early_operation(fixture())).unwrap();
-    let early = plan.placement().operations[0];
-    let late = plan.placement().operations[1];
+    let early = &plan.placement().operations[0];
+    let late = &plan.placement().operations[1];
     assert_eq!(early.during, during(0, 1));
     assert_eq!(plan.barriers()[0].release_step, ScheduleStep(2));
     assert!(early.during.end < plan.barriers()[0].release_step);
@@ -231,6 +231,22 @@ fn compile_track_a_monolithic_schedules_each_stage_inside_its_barrier() {
         plan.placement().barrier_arrivals.last().unwrap().ready_step,
         late.during.end
     );
+}
+
+#[test]
+fn compile_track_a_monolithic_preserves_exact_authority_on_one_worker() {
+    let mut fixture = super::operation_execution::exact_fixture();
+    fixture.placement.topology.workers.truncate(1);
+    let plan = compile_monolithic(fixture).unwrap();
+    let exact = &plan.placement().operations[0];
+    assert_eq!(
+        exact.executions,
+        vec![FleetOperationExecution {
+            worker: WorkerId(0),
+            domain: OperationDomain::Exact(range(0, 8)),
+        }]
+    );
+    plan.validate(transcript()).unwrap();
 }
 
 #[test]
@@ -307,7 +323,7 @@ fn compile_track_a_monolithic_derives_minimal_authorized_liveness() {
     let (fixture, constant) = with_constant(fixture());
     let unused = fixture.spill_value;
     let plan = compile_monolithic(fixture).unwrap();
-    let operation = plan.placement().operations[0];
+    let operation = &plan.placement().operations[0];
 
     assert_eq!(owner(&plan, unused).live, during(0, 1));
     assert_eq!(owner(&plan, constant).live.end, plan.terminal_step());
