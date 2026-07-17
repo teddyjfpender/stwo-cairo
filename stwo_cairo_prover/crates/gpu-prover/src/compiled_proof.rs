@@ -12,6 +12,7 @@ mod effect;
 mod finalizer;
 mod identity;
 mod partition_authority;
+mod static_wrapper;
 mod structural_authority;
 mod validate;
 
@@ -19,6 +20,7 @@ pub use effect::*;
 pub use finalizer::*;
 pub use identity::{CompiledProofIdentity, ProofCodecIdentity, ProofIdentity};
 pub use partition_authority::*;
+pub use static_wrapper::*;
 pub use structural_authority::*;
 pub use stwo_backend_cuda::{TranscriptInputId, TranscriptOutputId};
 
@@ -38,6 +40,7 @@ macro_rules! numeric_id {
 numeric_id!(OpId, u32);
 numeric_id!(SemanticOpId, u32);
 numeric_id!(AotKernelId, u32);
+numeric_id!(StaticCudaWrapperId, u32);
 numeric_id!(ValueVersion, u32);
 numeric_id!(ExternalInputId, u32);
 numeric_id!(ConstantId, u32);
@@ -148,6 +151,10 @@ pub enum ExecutionPrimitive {
         kernel: AotKernelId,
         launch: LaunchGeometry,
     },
+    /// One linked ordinary-CUDA host entry. The wrapper is one semantic
+    /// primitive with one outer effect; its authority binds an ordered launch
+    /// identity manifest without fabricating child SSA or partition claims.
+    StaticCudaWrapper { wrapper: StaticCudaWrapperId },
     /// Device-to-device contiguous byte copy. Host ingress/egress is outside
     /// the semantic proof program and cannot be disguised as this primitive.
     DeviceCopyD2D { bytes: usize },
@@ -218,9 +225,9 @@ pub struct OpNode {
     pub id: OpId,
     pub semantic_id: SemanticOpId,
     pub primitive: ExecutionPrimitive,
-    /// Present exactly for [`ExecutionPrimitive::AotKernel`]. Every effect
-    /// binding must occur once in this ABI map; non-kernel primitives have no
-    /// invocation.
+    /// Present exactly for [`ExecutionPrimitive::AotKernel`] and
+    /// [`ExecutionPrimitive::StaticCudaWrapper`]. Every effect binding must
+    /// occur once in this ABI map; other primitives have no invocation.
     pub invocation: Option<AotInvocation>,
     pub effect: EffectContractId,
     pub partition: PartitionAuthorityId,
@@ -316,6 +323,7 @@ pub struct CompiledProofInput {
     pub fixed_values: Vec<FixedValueDesc>,
     pub module_global_initializers: Vec<ModuleGlobalInitializer>,
     pub kernels: Vec<AotKernelAuthority>,
+    pub static_wrappers: Vec<StaticCudaWrapperAuthority>,
     pub effects: Vec<EffectContract>,
     pub partitions: Vec<PartitionAuthority>,
     pub operations: Vec<OpNode>,
@@ -361,6 +369,10 @@ impl CompiledProof {
 
     pub fn kernels(&self) -> &[AotKernelAuthority] {
         &self.input.kernels
+    }
+
+    pub fn static_wrappers(&self) -> &[StaticCudaWrapperAuthority] {
+        &self.input.static_wrappers
     }
 
     pub fn fixed_values(&self) -> &[FixedValueDesc] {
@@ -409,6 +421,13 @@ impl CompiledProof {
 
     pub fn kernel(&self, id: AotKernelId) -> Option<&AotKernelAuthority> {
         self.input.kernels.iter().find(|kernel| kernel.id() == id)
+    }
+
+    pub fn static_wrapper(&self, id: StaticCudaWrapperId) -> Option<&StaticCudaWrapperAuthority> {
+        self.input
+            .static_wrappers
+            .iter()
+            .find(|wrapper| wrapper.id() == id)
     }
 
     pub fn effect(&self, id: EffectContractId) -> Option<&EffectContract> {
@@ -464,6 +483,9 @@ pub enum CompiledProofError {
     EmptyKernelIdentity(AotKernelId),
     EmptyKernelEffectAuthority(AotKernelId),
     NonCanonicalKernelEffects(AotKernelId),
+    InvalidStaticWrapperManifest,
+    InvalidStaticWrapperAuthority(StaticCudaWrapperId),
+    NonCanonicalStaticWrapperAuthority,
     NonCanonicalEffectBindings,
     NonCanonicalEffectAliases,
     InvalidEffectRange,
@@ -532,12 +554,22 @@ pub enum CompiledProofError {
     KernelEffectNotAccepted {
         operation: OpId,
     },
+    UnknownStaticWrapper {
+        operation: OpId,
+    },
+    StaticWrapperEffectNotAccepted {
+        operation: OpId,
+    },
+    StaticWrapperRequiresMonolithic {
+        operation: OpId,
+    },
     ModuleGlobalAuthorityMismatch {
         operation: OpId,
     },
     InvalidLaunchGeometry(OpId),
     PrimitiveEffectMismatch(OpId),
     InvalidKernelInvocation(OpId),
+    InvalidStaticWrapperInvocation(OpId),
     InvalidOrderedComposite {
         operation: OpId,
         child: Option<usize>,

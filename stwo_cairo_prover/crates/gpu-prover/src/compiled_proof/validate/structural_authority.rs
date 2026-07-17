@@ -162,6 +162,14 @@ fn validate_partitions(input: &CompiledProofInput) -> Result<(), CompiledProofEr
                 operation: operation.id,
             })?;
         if let PartitionAuthorityKind::Exact(authority) = partition.kind() {
+            if matches!(
+                operation.primitive,
+                ExecutionPrimitive::StaticCudaWrapper { .. }
+            ) {
+                return Err(CompiledProofError::StaticWrapperRequiresMonolithic {
+                    operation: operation.id,
+                });
+            }
             let effect = super::effect(input, operation.effect).ok_or(
                 CompiledProofError::UnknownEffect {
                     operation: operation.id,

@@ -1,7 +1,7 @@
 use super::{CompiledProofError, IdentityKind, *};
 
 const PROOF_IDENTITY_TAG: &[u8] = b"stwo-cairo.compiled-proof.identity.v2";
-const STRUCTURE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.structure.v5\0";
+const STRUCTURE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.structure.v6\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CanonicalIdentity {
@@ -169,6 +169,11 @@ pub(super) fn compiled_identity(
     for kernel in &input.kernels {
         out.bytes(kernel.canonical_encoding())?;
         out.raw(kernel.digest());
+    }
+    out.count(input.static_wrappers.len())?;
+    for wrapper in &input.static_wrappers {
+        out.bytes(wrapper.canonical_encoding())?;
+        out.raw(wrapper.digest());
     }
     out.count(input.effects.len())?;
     for effect in &input.effects {
@@ -348,6 +353,10 @@ impl Encoder {
                 self.byte(0);
                 self.u32(kernel.0);
                 self.launch(*launch);
+            }
+            ExecutionPrimitive::StaticCudaWrapper { wrapper } => {
+                self.byte(4);
+                self.u32(wrapper.0);
             }
             ExecutionPrimitive::DeviceCopyD2D { bytes } => {
                 self.byte(1);

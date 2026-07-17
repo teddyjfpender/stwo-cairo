@@ -63,7 +63,34 @@ fn validate_step(
                     return Err(CompiledProofError::ModuleGlobalAuthorityMismatch { operation });
                 }
             }
-            validate_invocation(input, operation, invocation, effect)?;
+            validate_invocation(
+                input,
+                invocation,
+                effect,
+                CompiledProofError::InvalidKernelInvocation(operation),
+            )?;
+        }
+        ExecutionPrimitive::StaticCudaWrapper { wrapper } => {
+            let authority = input
+                .static_wrappers
+                .iter()
+                .find(|authority| authority.id() == *wrapper)
+                .ok_or(CompiledProofError::UnknownStaticWrapper { operation })?;
+            if partition != PartitionAuthority::monolithic().id() {
+                return Err(CompiledProofError::StaticWrapperRequiresMonolithic { operation });
+            }
+            if authority.accepted_effect() != effect_id {
+                return Err(CompiledProofError::StaticWrapperEffectNotAccepted { operation });
+            }
+            if !effect.module_globals().is_empty() {
+                return Err(CompiledProofError::ModuleGlobalAuthorityMismatch { operation });
+            }
+            validate_invocation(
+                input,
+                invocation,
+                effect,
+                CompiledProofError::InvalidStaticWrapperInvocation(operation),
+            )?;
         }
         ExecutionPrimitive::DeviceCopyD2D { bytes } => {
             if invocation.is_some()
@@ -148,7 +175,11 @@ fn validate_composite(
     let mut expected_boundary = BTreeSet::new();
     let mut expected_globals = Vec::new();
     for (child_index, child) in children.iter().enumerate() {
-        if matches!(child.primitive, ExecutionPrimitive::OrderedComposite { .. }) {
+        if matches!(
+            child.primitive,
+            ExecutionPrimitive::OrderedComposite { .. }
+                | ExecutionPrimitive::StaticCudaWrapper { .. }
+        ) {
             return Err(CompiledProofError::InvalidOrderedComposite {
                 operation: operation.id,
                 child: Some(child_index),
@@ -296,11 +327,11 @@ fn range_is_initialized(ranges: Option<&Vec<ElementRange>>, required: ElementRan
 
 fn validate_invocation(
     input: &CompiledProofInput,
-    operation: OpId,
     invocation: Option<&AotInvocation>,
     effect: &EffectContract,
+    error: CompiledProofError,
 ) -> Result<(), CompiledProofError> {
-    let invalid = || CompiledProofError::InvalidKernelInvocation(operation);
+    let invalid = || error.clone();
     let invocation = invocation.ok_or_else(invalid)?;
     if invocation.arguments.is_empty() {
         return Err(invalid());

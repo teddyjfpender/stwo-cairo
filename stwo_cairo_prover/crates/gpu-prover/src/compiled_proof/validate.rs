@@ -138,6 +138,51 @@ fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofE
         }
     }
 
+    if input
+        .static_wrappers
+        .windows(2)
+        .any(|pair| pair[0].id() >= pair[1].id())
+    {
+        return Err(CompiledProofError::NonCanonicalStaticWrapperAuthority);
+    }
+    for wrapper in &input.static_wrappers {
+        if !wrapper.has_valid_identity()? {
+            return Err(CompiledProofError::InvalidStaticWrapperAuthority(
+                wrapper.id(),
+            ));
+        }
+    }
+    let declared_wrappers = input
+        .static_wrappers
+        .iter()
+        .map(StaticCudaWrapperAuthority::id)
+        .collect::<Vec<_>>();
+    let mut used_wrappers = BTreeSet::new();
+    for operation in &input.operations {
+        for_each_leaf_step(operation, |primitive, _| {
+            if let ExecutionPrimitive::StaticCudaWrapper { wrapper } = primitive {
+                if input
+                    .static_wrappers
+                    .binary_search_by_key(wrapper, StaticCudaWrapperAuthority::id)
+                    .is_err()
+                {
+                    return Err(CompiledProofError::UnknownStaticWrapper {
+                        operation: operation.id,
+                    });
+                }
+                used_wrappers.insert(*wrapper);
+            }
+            Ok(())
+        })?;
+    }
+    if declared_wrappers
+        .iter()
+        .copied()
+        .ne(used_wrappers.iter().copied())
+    {
+        return Err(CompiledProofError::NonCanonicalStaticWrapperAuthority);
+    }
+
     let declared_effects = input
         .effects
         .iter()

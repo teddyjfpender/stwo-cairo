@@ -18,6 +18,8 @@ mod ordered_composite;
 mod partition_authority;
 #[path = "compiled_proof_host/primitive.rs"]
 mod primitive;
+#[path = "compiled_proof_host/static_wrapper.rs"]
+mod static_wrapper;
 #[path = "compiled_proof_host/structural_authority.rs"]
 mod structural_authority;
 
@@ -267,6 +269,7 @@ fn valid_input() -> CompiledProofInput {
         fixed_values: vec![],
         module_global_initializers: vec![],
         kernels: vec![kernel(module(), vec![effect_id], b"assembly-build-v1")],
+        static_wrappers: vec![],
         effects: vec![contract],
         partitions: vec![partition.clone()],
         operations: vec![OpNode {

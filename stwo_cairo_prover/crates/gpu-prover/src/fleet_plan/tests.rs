@@ -343,6 +343,7 @@ fn compiled_proof() -> (CompiledProof, ValueVersion, ValueVersion) {
             fixed_values: vec![],
             module_global_initializers: vec![],
             kernels: vec![kernel],
+            static_wrappers: vec![],
             effects: vec![effect],
             partitions: vec![partition.clone()],
             operations: vec![OpNode {
