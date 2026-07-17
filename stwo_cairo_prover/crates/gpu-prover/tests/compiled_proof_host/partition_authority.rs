@@ -142,7 +142,7 @@ fn exact_partition_rejects_missing_or_duplicate_binding_projection() {
             1,
             4,
             duplicate,
-            PartitionLaunchDerivation::new(1, 2, PartitionGridAxis::X, words).unwrap(),
+            PartitionLaunchDerivation::new(1, 2, PartitionGridAxis::X, 1).unwrap(),
         ),
         Err(CompiledProofError::InvalidPartitionAuthority)
     ));
