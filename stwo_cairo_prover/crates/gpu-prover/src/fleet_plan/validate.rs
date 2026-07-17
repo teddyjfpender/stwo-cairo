@@ -29,6 +29,7 @@ pub(super) fn validate_and_measure(
     validate_transcript_values(plan, transcript)?;
     validate_spill(plan, transcript, &workers)?;
     super::storage::validate(plan, &workers)?;
+    super::runtime_view::validate(plan)?;
     validate_barrier_arrivals(plan, &workers)?;
     measure_workers(plan, &workers)
 }

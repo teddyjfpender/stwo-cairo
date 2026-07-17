@@ -1,4 +1,5 @@
 use super::*;
+use stwo_backend_cuda::IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
 
 fn add_workers(fixture: &mut Fixture, count: usize) {
     let releases = fixture.placement.barrier_steps.clone();
@@ -33,6 +34,9 @@ fn add_workers(fixture: &mut Fixture, count: usize) {
 fn transition_fixture() -> Fixture {
     let mut fixture = fixture();
     add_workers(&mut fixture, 2);
+    fixture.placement.topology.workers[0].exchange_reserve_bytes =
+        IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
+    fixture.placement.topology.workers[0].capacity_bytes += IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
     let value = fixture.compiled.value(fixture.spill_value).unwrap();
     let elements = range(0, value.layout.element_count().unwrap());
     fixture.placement.topology.links.push(FleetLink {

@@ -129,6 +129,12 @@ impl FleetProofPlan {
     }
 }
 
+/// Construction-time validation uses the public derivation verbatim so a plan
+/// cannot defer exchange-capacity failure until a later caller requests it.
+pub(super) fn validate(plan: &FleetProofPlan) -> Result<(), FleetRuntimeViewError> {
+    plan.runtime_view().map(drop)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FleetRuntimeViewError {
     DuplicateTransition(LayoutTransitionId),

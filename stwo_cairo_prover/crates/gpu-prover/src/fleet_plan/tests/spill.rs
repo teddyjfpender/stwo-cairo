@@ -4,6 +4,7 @@ use crate::fleet_spill::{
     SpillPlanError, SpillTransition, SpillTransitionId, SpillTransitionKind, StoreExtent,
     StoreExtentId, VmmReclaim, VmmTransition,
 };
+use stwo_backend_cuda::IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
 
 fn spill_plan(
     value: ValueRange,
@@ -146,6 +147,9 @@ fn add_scratch_transition(fixture: &mut Fixture) {
     let value = fixture.compiled.values()[0].clone();
     let elements = range(0, value.layout.element_count().unwrap());
     let worker = WorkerId(1);
+    fixture.placement.topology.workers[0].exchange_reserve_bytes =
+        IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
+    fixture.placement.topology.workers[0].capacity_bytes += IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
     fixture.placement.topology.workers.push(WorkerSpec {
         id: worker,
         capacity_bytes: 1024,

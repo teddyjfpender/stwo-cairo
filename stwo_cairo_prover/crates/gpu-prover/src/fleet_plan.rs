@@ -401,6 +401,7 @@ pub enum FleetPlanError {
         capacity: usize,
     },
     TranscriptMismatch,
+    RuntimeView(FleetRuntimeViewError),
     SpillValue(SpillChunkId),
     InvalidVmmReclaim(StorageId),
     UnmappedStorageAccess(StorageId),
@@ -427,5 +428,11 @@ impl From<SpillPlanError> for FleetPlanError {
 impl From<FleetPowError> for FleetPlanError {
     fn from(value: FleetPowError) -> Self {
         Self::Pow(value)
+    }
+}
+
+impl From<FleetRuntimeViewError> for FleetPlanError {
+    fn from(value: FleetRuntimeViewError) -> Self {
+        Self::RuntimeView(value)
     }
 }

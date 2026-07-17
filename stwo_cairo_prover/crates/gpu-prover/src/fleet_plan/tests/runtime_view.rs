@@ -309,3 +309,25 @@ fn rounded_exchange_reserve_is_exact_and_near_miss_rejects() {
         }
     );
 }
+
+#[test]
+fn plan_construction_enforces_the_derived_exchange_reserve() {
+    let exact = split_transfer_fixture();
+    let required = 4 * IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
+    assert_eq!(
+        exact.placement.topology.workers[0].exchange_reserve_bytes,
+        required
+    );
+    compile(exact).unwrap();
+
+    let mut short = split_transfer_fixture();
+    short.placement.topology.workers[0].exchange_reserve_bytes = required - 1;
+    assert_eq!(
+        compile(short).unwrap_err(),
+        FleetPlanError::RuntimeView(FleetRuntimeViewError::ExchangeReserveExceeded {
+            worker: WorkerId(0),
+            required,
+            declared: required - 1,
+        })
+    );
+}
