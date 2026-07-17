@@ -146,6 +146,34 @@ pub(super) enum SemanticBaseProducer {
     },
 }
 
+impl SemanticBaseProducer {
+    pub(super) const fn position(&self) -> ProducerSchedulePosition {
+        match self {
+            Self::Recorded(producer) => producer.position,
+            Self::NativeBlakeGDirect { position, .. } | Self::NativeEcOp { position, .. } => {
+                *position
+            }
+        }
+    }
+
+    pub(super) const fn producer(&self) -> WitnessProducer {
+        match self {
+            Self::Recorded(producer) => producer.producer,
+            Self::NativeBlakeGDirect { producer, .. } | Self::NativeEcOp { producer, .. } => {
+                *producer
+            }
+        }
+    }
+
+    pub(super) const fn effect(&self) -> &EffectContract {
+        match self {
+            Self::Recorded(producer) => &producer.effect,
+            Self::NativeBlakeGDirect { contract, .. } => &contract.effect,
+            Self::NativeEcOp { contract, .. } => &contract.effect,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LoadedBaseProducerAuthority {
     _recorded_receipts: Vec<super::loaded_authority::LoadedRecordedWitnessAuthority>,

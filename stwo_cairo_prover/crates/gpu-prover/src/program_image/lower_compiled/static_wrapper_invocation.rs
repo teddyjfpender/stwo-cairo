@@ -7,7 +7,8 @@
 use std::collections::BTreeSet;
 
 use stwo_backend_cuda::{
-    BlakeGDirectAbiAccess, EcOpAbiAccess, EcOpCompositeAbi, EcOpEffectAbi, EcOpKernelStage,
+    BlakeGDirectAbiAccess, BlakeGDirectAbiArgument, BlakeGDirectAbiArgumentKind, EcOpAbiAccess,
+    EcOpAbiArgument, EcOpAbiArgumentKind, EcOpCompositeAbi, EcOpEffectAbi, EcOpKernelStage,
 };
 
 use super::*;
@@ -18,86 +19,117 @@ use crate::compiled_proof::{
 pub(super) fn blake_g_direct(
     contract: &blake_g_direct_prefix::LoweredNativeBlakeGDirectContract,
 ) -> Result<AotInvocation, InvocationShapeError> {
+    blake_g_direct_using_abi(contract, contract.authority.abi().arguments())
+}
+
+fn blake_g_direct_using_abi(
+    contract: &blake_g_direct_prefix::LoweredNativeBlakeGDirectContract,
+    abi: &[BlakeGDirectAbiArgument],
+) -> Result<AotInvocation, InvocationShapeError> {
     blake_g_direct_prefix::validate_lowered(
         &contract.authority,
         &contract.invocation,
         &contract.effect,
     )?;
-    let abi = contract.authority.abi().arguments();
-    if abi.len() != 7
-        || abi[..6]
-            .iter()
-            .enumerate()
-            .any(|(ordinal, argument)| argument.ordinal as usize != ordinal)
-        || abi[6].ordinal != 6
-        || abi[6].access != BlakeGDirectAbiAccess::OrderedExecutionStream
-    {
+    if abi.len() != 7 {
         return Err(InvocationShapeError::InvalidNativeBlakeGDirectAuthority);
     }
-    let invocation = AotInvocation {
-        arguments: vec![
-            argument(
-                0,
-                AotArgumentValue::DevicePointerTable(
-                    contract
-                        .invocation
-                        .inputs
-                        .iter()
-                        .map(|binding| Some(binding.binding))
-                        .collect(),
-                ),
-            ),
-            argument(1, AotArgumentValue::U32(contract.invocation.n_real_rows)),
-            argument(2, AotArgumentValue::U32(contract.invocation.padded_rows)),
-            argument(
-                3,
-                AotArgumentValue::DevicePointerTable(
-                    contract
-                        .invocation
-                        .traces
-                        .iter()
-                        .map(|binding| Some(binding.binding))
-                        .collect(),
-                ),
-            ),
-            argument(
-                4,
-                AotArgumentValue::DevicePointerTable(
-                    contract
-                        .invocation
-                        .luts
-                        .iter()
-                        .map(|binding| Some(binding.binding))
-                        .collect(),
-                ),
-            ),
-            argument(
-                5,
-                AotArgumentValue::DevicePointerTable(
-                    contract
-                        .invocation
-                        .counts
-                        .iter()
-                        .map(|binding| Some(binding.binding))
-                        .collect(),
-                ),
-            ),
-        ],
-    };
+    let mut arguments = Vec::with_capacity(abi.len() - 1);
+    for descriptor in abi {
+        if let Some(value) = blake_g_direct_value(contract, *descriptor)? {
+            arguments.push(argument(descriptor.ordinal, value));
+        }
+    }
+    let invocation = AotInvocation { arguments };
     validate_exact_bindings(&invocation, &contract.effect)
         .map_err(|_| InvocationShapeError::InvalidNativeBlakeGDirectBinding)?;
     Ok(invocation)
 }
 
+fn blake_g_direct_value(
+    contract: &blake_g_direct_prefix::LoweredNativeBlakeGDirectContract,
+    descriptor: BlakeGDirectAbiArgument,
+) -> Result<Option<AotArgumentValue>, InvocationShapeError> {
+    use {BlakeGDirectAbiAccess as Access, BlakeGDirectAbiArgumentKind as Kind};
+
+    let invocation = &contract.invocation;
+    let value = match (
+        descriptor.ordinal,
+        descriptor.name,
+        descriptor.kind,
+        descriptor.access,
+    ) {
+        (
+            0,
+            "input_cols_host",
+            Kind::HostConstDevicePointerTableU32,
+            Access::ReadSixInputColumns,
+        ) => AotArgumentValue::DevicePointerTable(
+            invocation
+                .inputs
+                .iter()
+                .map(|binding| Some(binding.binding))
+                .collect(),
+        ),
+        (1, "n_rows", Kind::U32, Access::RealRowCount) => {
+            AotArgumentValue::U32(invocation.n_real_rows)
+        }
+        (2, "column_length", Kind::U32, Access::PaddedRowCount) => {
+            AotArgumentValue::U32(invocation.padded_rows)
+        }
+        (
+            3,
+            "trace_cols_host",
+            Kind::HostMutDevicePointerTableU32,
+            Access::WriteFiftyThreeTraceColumns,
+        ) => AotArgumentValue::DevicePointerTable(
+            invocation
+                .traces
+                .iter()
+                .map(|binding| Some(binding.binding))
+                .collect(),
+        ),
+        (4, "luts_host", Kind::HostConstDevicePointerTableU32, Access::ReadFourCanonicalLuts) => {
+            AotArgumentValue::DevicePointerTable(
+                invocation
+                    .luts
+                    .iter()
+                    .map(|binding| Some(binding.binding))
+                    .collect(),
+            )
+        }
+        (
+            5,
+            "counts_host",
+            Kind::HostMutDevicePointerTableU32,
+            Access::AtomicAddFiveCanonicalCountDestinations,
+        ) => AotArgumentValue::DevicePointerTable(
+            invocation
+                .counts
+                .iter()
+                .map(|binding| Some(binding.binding))
+                .collect(),
+        ),
+        (6, "stream", Kind::CudaStream, Access::OrderedExecutionStream) => return Ok(None),
+        _ => return Err(InvocationShapeError::InvalidNativeBlakeGDirectAuthority),
+    };
+    Ok(Some(value))
+}
+
 pub(super) fn ec_op(
     contract: &ec_op_prefix::LoweredNativeEcOpContract,
+) -> Result<AotInvocation, InvocationShapeError> {
+    ec_op_using_abi(contract, contract.authority.abi().arguments())
+}
+
+fn ec_op_using_abi(
+    contract: &ec_op_prefix::LoweredNativeEcOpContract,
+    abi: &[EcOpAbiArgument],
 ) -> Result<AotInvocation, InvocationShapeError> {
     if ec_op_prefix::exact_effect(&contract.invocation)? != contract.effect {
         return Err(InvocationShapeError::InvalidNativeEcOpBinding);
     }
-    let abi = contract.authority.abi().arguments();
     let requirements = contract.authority.requirements();
-    let tables = contract.authority.execution_tables();
     let counts = &contract.invocation.multiplicities;
     if contract.authority.abi() != EcOpCompositeAbi::ProjectiveChainNormalizePaddingV1
         || contract.authority.effect()
@@ -117,12 +149,6 @@ pub(super) fn ec_op(
         ]
         .contains(&[0; 32])
         || abi.len() != 19
-        || abi[..18]
-            .iter()
-            .enumerate()
-            .any(|(ordinal, argument)| argument.ordinal as usize != ordinal)
-        || abi[18].ordinal != 18
-        || abi[18].access != EcOpAbiAccess::OrderedExecutionStream
         || contract.invocation.execution_tables.len() != EXECUTION_TABLE_POINTERS
         || contract.invocation.trace_columns.len() != requirements.trace_column_words.len()
         || contract.invocation.partial_input_columns.len()
@@ -133,82 +159,148 @@ pub(super) fn ec_op(
     {
         return Err(InvocationShapeError::InvalidNativeEcOpAuthority);
     }
-    let invocation = AotInvocation {
-        arguments: vec![
-            argument(
-                0,
-                AotArgumentValue::DevicePointerTable(
-                    contract
-                        .invocation
-                        .execution_tables
-                        .iter()
-                        .map(|binding| binding.binding)
-                        .collect(),
-                ),
-            ),
-            argument(1, AotArgumentValue::U32(to_u32(tables.n_addresses)?)),
-            argument(2, AotArgumentValue::U32(to_u32(tables.n_big)?)),
-            argument(3, AotArgumentValue::U32(to_u32(tables.n_small)?)),
-            argument(
-                4,
-                AotArgumentValue::DevicePointer(contract.invocation.segment_start.binding),
-            ),
-            argument(5, AotArgumentValue::U32(contract.invocation.row_count)),
-            argument(
-                6,
-                AotArgumentValue::DevicePointerTable(
-                    contract
-                        .invocation
-                        .trace_columns
-                        .iter()
-                        .map(|binding| binding.binding)
-                        .collect(),
-                ),
-            ),
-            argument(
-                7,
-                AotArgumentValue::DevicePointer(contract.invocation.lookup_words.binding),
-            ),
-            argument(
-                8,
-                AotArgumentValue::DevicePointerTable(
-                    contract
-                        .invocation
-                        .partial_input_columns
-                        .iter()
-                        .map(|binding| binding.binding)
-                        .collect(),
-                ),
-            ),
-            argument(
-                9,
-                AotArgumentValue::U32(contract.invocation.partial_row_count),
-            ),
-            argument(10, AotArgumentValue::DevicePointer(Some(counts[0].binding))),
-            argument(
-                11,
-                AotArgumentValue::U32(to_u32(requirements.address_count_words)?),
-            ),
-            argument(12, AotArgumentValue::DevicePointer(Some(counts[1].binding))),
-            argument(
-                13,
-                AotArgumentValue::U32(to_u32(requirements.big_count_words)?),
-            ),
-            argument(14, AotArgumentValue::DevicePointer(Some(counts[2].binding))),
-            argument(
-                15,
-                AotArgumentValue::U32(to_u32(requirements.small_count_words)?),
-            ),
-            argument(16, AotArgumentValue::DevicePointer(Some(counts[3].binding))),
-            argument(
-                17,
-                AotArgumentValue::U32(to_u32(requirements.range_check_8_count_words)?),
-            ),
-        ],
-    };
+    let mut arguments = Vec::with_capacity(abi.len() - 1);
+    for descriptor in abi {
+        if let Some(value) = ec_op_value(contract, *descriptor)? {
+            arguments.push(argument(descriptor.ordinal, value));
+        }
+    }
+    let invocation = AotInvocation { arguments };
     validate_exact_bindings(&invocation, &contract.effect)
         .map_err(|_| InvocationShapeError::InvalidNativeEcOpBinding)?;
     Ok(invocation)
+}
+
+fn ec_op_value(
+    contract: &ec_op_prefix::LoweredNativeEcOpContract,
+    descriptor: EcOpAbiArgument,
+) -> Result<Option<AotArgumentValue>, InvocationShapeError> {
+    use {EcOpAbiAccess as Access, EcOpAbiArgumentKind as Kind};
+
+    let invocation = &contract.invocation;
+    let requirements = contract.authority.requirements();
+    let tables = contract.authority.execution_tables();
+    let counts = &invocation.multiplicities;
+    let value = match (
+        descriptor.ordinal,
+        descriptor.name,
+        descriptor.kind,
+        descriptor.access,
+    ) {
+        (0, "execution_tables", Kind::DevicePointerTableU32, Access::Read) => {
+            AotArgumentValue::DevicePointerTable(
+                invocation
+                    .execution_tables
+                    .iter()
+                    .map(|binding| binding.binding)
+                    .collect(),
+            )
+        }
+        (1, "n_addresses", Kind::U32, Access::ExecutionTableShape) => {
+            AotArgumentValue::U32(to_u32(tables.n_addresses)?)
+        }
+        (2, "n_big", Kind::U32, Access::ExecutionTableShape) => {
+            AotArgumentValue::U32(to_u32(tables.n_big)?)
+        }
+        (3, "n_small", Kind::U32, Access::ExecutionTableShape) => {
+            AotArgumentValue::U32(to_u32(tables.n_small)?)
+        }
+        (4, "segment_start_source", Kind::DevicePointerU32, Access::Read) => {
+            AotArgumentValue::DevicePointer(invocation.segment_start.binding)
+        }
+        (5, "row_count", Kind::U32, Access::RowCount) => {
+            AotArgumentValue::U32(invocation.row_count)
+        }
+        (6, "trace_columns_host", Kind::HostPointerTableU32, Access::Write) => {
+            AotArgumentValue::DevicePointerTable(
+                invocation
+                    .trace_columns
+                    .iter()
+                    .map(|binding| binding.binding)
+                    .collect(),
+            )
+        }
+        (7, "lookup_words", Kind::DevicePointerU32, Access::Write) => {
+            AotArgumentValue::DevicePointer(invocation.lookup_words.binding)
+        }
+        (8, "partial_input_columns_host", Kind::HostPointerTableU32, Access::Write) => {
+            AotArgumentValue::DevicePointerTable(
+                invocation
+                    .partial_input_columns
+                    .iter()
+                    .map(|binding| binding.binding)
+                    .collect(),
+            )
+        }
+        (9, "partial_row_count", Kind::U32, Access::PartialRowCount) => {
+            AotArgumentValue::U32(invocation.partial_row_count)
+        }
+        (10, "address_counts", Kind::DevicePointerU32, Access::AtomicAddU32) => {
+            AotArgumentValue::DevicePointer(Some(counts[0].binding))
+        }
+        (11, "address_count_words", Kind::U32, Access::DestinationWords) => {
+            AotArgumentValue::U32(to_u32(requirements.address_count_words)?)
+        }
+        (12, "big_counts", Kind::DevicePointerU32, Access::AtomicAddU32) => {
+            AotArgumentValue::DevicePointer(Some(counts[1].binding))
+        }
+        (13, "big_count_words", Kind::U32, Access::DestinationWords) => {
+            AotArgumentValue::U32(to_u32(requirements.big_count_words)?)
+        }
+        (14, "small_counts", Kind::DevicePointerU32, Access::AtomicAddU32) => {
+            AotArgumentValue::DevicePointer(Some(counts[2].binding))
+        }
+        (15, "small_count_words", Kind::U32, Access::DestinationWords) => {
+            AotArgumentValue::U32(to_u32(requirements.small_count_words)?)
+        }
+        (16, "range_check_8_counts", Kind::DevicePointerU32, Access::AtomicAddU32) => {
+            AotArgumentValue::DevicePointer(Some(counts[3].binding))
+        }
+        (17, "range_check_8_count_words", Kind::U32, Access::DestinationWords) => {
+            AotArgumentValue::U32(to_u32(requirements.range_check_8_count_words)?)
+        }
+        (18, "stream", Kind::CudaStream, Access::OrderedExecutionStream) => return Ok(None),
+        _ => return Err(InvocationShapeError::InvalidNativeEcOpAuthority),
+    };
+    Ok(Some(value))
+}
+
+#[cfg(test)]
+pub(super) fn blake_g_direct_using_abi_for_test(
+    contract: &blake_g_direct_prefix::LoweredNativeBlakeGDirectContract,
+    abi: &[BlakeGDirectAbiArgument],
+) -> Result<AotInvocation, InvocationShapeError> {
+    blake_g_direct_using_abi(contract, abi)
+}
+
+#[cfg(test)]
+pub(super) fn ec_op_using_abi_for_test(
+    contract: &ec_op_prefix::LoweredNativeEcOpContract,
+    abi: &[EcOpAbiArgument],
+) -> Result<AotInvocation, InvocationShapeError> {
+    ec_op_using_abi(contract, abi)
+}
+
+#[cfg(test)]
+pub(super) fn validate_blake_g_direct_invocation_for_test(
+    contract: &blake_g_direct_prefix::LoweredNativeBlakeGDirectContract,
+    invocation: &AotInvocation,
+) -> Result<(), InvocationShapeError> {
+    let expected = blake_g_direct(contract)?;
+    (invocation == &expected)
+        .then_some(())
+        .ok_or(InvocationShapeError::InvalidNativeBlakeGDirectBinding)
+}
+
+#[cfg(test)]
+pub(super) fn validate_ec_op_invocation_for_test(
+    contract: &ec_op_prefix::LoweredNativeEcOpContract,
+    invocation: &AotInvocation,
+) -> Result<(), InvocationShapeError> {
+    let expected = ec_op(contract)?;
+    (invocation == &expected)
+        .then_some(())
+        .ok_or(InvocationShapeError::InvalidNativeEcOpBinding)
 }
 
 fn argument(ordinal: u8, value: AotArgumentValue) -> AotArgumentBinding {

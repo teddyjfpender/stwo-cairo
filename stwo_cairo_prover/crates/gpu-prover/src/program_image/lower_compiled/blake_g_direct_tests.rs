@@ -8,7 +8,7 @@ use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
 
 use super::*;
 use crate::arena_plan::{ExecutionTableGeometry, ResidentBackend};
-use crate::compiled_proof::InPlaceAliasRequirement;
+use crate::compiled_proof::{AotArgumentValue, InPlaceAliasRequirement};
 use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::prepare_resident_ingest;
 use crate::replacement_host_cache::ReplacementHostCache;
@@ -105,6 +105,48 @@ fn real_recorded_program_compiles_into_production_direct_base_authority() {
         .iter()
         .enumerate()
         .all(|(ordinal, argument)| argument.ordinal as usize == ordinal));
+    static_wrapper_invocation::validate_blake_g_direct_invocation_for_test(&lowered, &invocation)
+        .unwrap();
+    for ordinal in [1, 2] {
+        let mut changed = invocation.clone();
+        let AotArgumentValue::U32(value) = &changed.arguments[ordinal].value else {
+            panic!("Blake-G row geometry must be u32")
+        };
+        changed.arguments[ordinal].value = AotArgumentValue::U32(*value ^ 1);
+        assert!(
+            static_wrapper_invocation::validate_blake_g_direct_invocation_for_test(
+                &lowered, &changed,
+            )
+            .is_err()
+        );
+    }
+    let authoritative = lowered.authority.abi().arguments();
+    for index in 0..authoritative.len() - 1 {
+        let mut changed = authoritative.to_vec();
+        changed[index].ordinal ^= 0x80;
+        assert!(
+            static_wrapper_invocation::blake_g_direct_using_abi_for_test(&lowered, &changed)
+                .is_err()
+        );
+        let mut changed = authoritative.to_vec();
+        changed[index].name = "wrong_role";
+        assert!(
+            static_wrapper_invocation::blake_g_direct_using_abi_for_test(&lowered, &changed)
+                .is_err()
+        );
+        let mut changed = authoritative.to_vec();
+        changed[index].kind = stwo_backend_cuda::BlakeGDirectAbiArgumentKind::CudaStream;
+        assert!(
+            static_wrapper_invocation::blake_g_direct_using_abi_for_test(&lowered, &changed)
+                .is_err()
+        );
+        let mut changed = authoritative.to_vec();
+        changed[index].access = stwo_backend_cuda::BlakeGDirectAbiAccess::OrderedExecutionStream;
+        assert!(
+            static_wrapper_invocation::blake_g_direct_using_abi_for_test(&lowered, &changed)
+                .is_err()
+        );
+    }
     let component = executable
         .arena()
         .witness()

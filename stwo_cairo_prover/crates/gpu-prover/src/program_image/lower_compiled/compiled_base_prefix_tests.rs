@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use stwo_backend_cuda::aot::{AotKernelAbiSchema, AotKernelModuleGlobals, AotKernelSchemaScope};
 use stwo_backend_cuda::TraceTreeRole;
@@ -36,9 +36,82 @@ fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
         .iter()
         .enumerate()
         .all(|(ordinal, argument)| argument.ordinal as usize == ordinal));
+    static_wrapper_invocation::validate_ec_op_invocation_for_test(ec_op, &invocation).unwrap();
+    for ordinal in [2, 3] {
+        let mut changed = invocation.clone();
+        let AotArgumentValue::U32(value) = &changed.arguments[ordinal].value else {
+            panic!("EC-op table geometry must be u32")
+        };
+        changed.arguments[ordinal].value = AotArgumentValue::U32(*value ^ 1);
+        assert!(
+            static_wrapper_invocation::validate_ec_op_invocation_for_test(ec_op, &changed).is_err()
+        );
+    }
+    let mut changed = invocation.clone();
+    changed.arguments[6].value = invocation.arguments[8].value.clone();
+    changed.arguments[8].value = invocation.arguments[6].value.clone();
+    assert!(
+        static_wrapper_invocation::validate_ec_op_invocation_for_test(ec_op, &changed).is_err()
+    );
+    const COUNT_ARGUMENT_PAIRS: [(usize, usize); 4] = [(10, 11), (12, 13), (14, 15), (16, 17)];
+    for (index, &(pointer, words)) in COUNT_ARGUMENT_PAIRS.iter().enumerate() {
+        let (next_pointer, next_words) =
+            COUNT_ARGUMENT_PAIRS[(index + 1) % COUNT_ARGUMENT_PAIRS.len()];
+        let mut changed = invocation.clone();
+        changed.arguments[pointer].value = invocation.arguments[next_pointer].value.clone();
+        changed.arguments[words].value = invocation.arguments[next_words].value.clone();
+        assert!(
+            static_wrapper_invocation::validate_ec_op_invocation_for_test(ec_op, &changed).is_err()
+        );
+        let mut changed = invocation.clone();
+        let AotArgumentValue::U32(value) = &changed.arguments[words].value else {
+            panic!("EC-op count extent must be u32")
+        };
+        changed.arguments[words].value = AotArgumentValue::U32(*value ^ 1);
+        assert!(
+            static_wrapper_invocation::validate_ec_op_invocation_for_test(ec_op, &changed).is_err()
+        );
+    }
+    let authoritative = ec_op.authority.abi().arguments();
+    for index in 0..authoritative.len() - 1 {
+        let mut changed = authoritative.to_vec();
+        changed[index].ordinal ^= 0x80;
+        assert!(static_wrapper_invocation::ec_op_using_abi_for_test(ec_op, &changed).is_err());
+        let mut changed = authoritative.to_vec();
+        changed[index].name = "wrong_role";
+        assert!(static_wrapper_invocation::ec_op_using_abi_for_test(ec_op, &changed).is_err());
+        let mut changed = authoritative.to_vec();
+        changed[index].kind = stwo_backend_cuda::EcOpAbiArgumentKind::CudaStream;
+        assert!(static_wrapper_invocation::ec_op_using_abi_for_test(ec_op, &changed).is_err());
+        let mut changed = authoritative.to_vec();
+        changed[index].access = stwo_backend_cuda::EcOpAbiAccess::OrderedExecutionStream;
+        assert!(static_wrapper_invocation::ec_op_using_abi_for_test(ec_op, &changed).is_err());
+    }
     let mut malformed = ec_op.clone();
     malformed.invocation.multiplicities.pop();
     assert!(static_wrapper_invocation::ec_op(&malformed).is_err());
+    let recorded = authority
+        .producers
+        .iter()
+        .find_map(|producer| match producer {
+            SemanticBaseProducer::Recorded(recorded) => Some(recorded),
+            _ => None,
+        })
+        .unwrap();
+    let fields = exact_fields(&recorded.source);
+    let (kernels, first, second) =
+        super::compiled_base_prefix::install_recorded_kernel_twice_for_test(
+            &recorded.source,
+            &fields,
+            recorded.effect.id(),
+        )
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(kernels.len(), 1);
+    assert_eq!(
+        kernels[0].accepted_executions(),
+        &[(recorded.effect.id(), PartitionAuthority::monolithic().id())]
+    );
 
     let error =
         emit_recorded_base_prefix_for_test(executable.arena(), MANIFEST, TARGET_SM, |source| {
@@ -56,9 +129,16 @@ fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
     assert_eq!(prefix.target_sm, TARGET_SM);
     assert_eq!(prefix.operations.len(), 7);
     assert_eq!(prefix.kernels.len(), 7);
+    assert_eq!(prefix.recorded_kernel_authorities().len(), 7);
     assert_eq!(prefix.effects.len(), 7);
+    assert_eq!(prefix.base_authority(), &authority);
+    assert_eq!(prefix.next_producer(), missing.schedule_ordinal as usize);
+    assert_eq!(
+        prefix.pending_producers(),
+        &authority.producers[missing.schedule_ordinal as usize..]
+    );
     assert_eq!(prefix.partitions, vec![PartitionAuthority::monolithic()]);
-    assert_eq!(prefix.direct_retained_b2n.role(), TraceTreeRole::Base);
+    assert_eq!(prefix.direct_retained_b2n().role(), TraceTreeRole::Base);
     assert!(prefix
         .effects
         .windows(2)
@@ -92,15 +172,69 @@ fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
             .unwrap();
         assert_invocation_covers_exact_bindings(operation.invocation.as_ref().unwrap(), effect);
     }
+    let planned_effects = authority
+        .producers
+        .iter()
+        .map(|producer| producer.effect().id())
+        .collect::<Vec<_>>();
+    let resumed_effects = prefix
+        .operations
+        .iter()
+        .map(|operation| operation.effect)
+        .chain(
+            prefix
+                .pending_producers()
+                .iter()
+                .map(|producer| producer.effect().id()),
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(resumed_effects, planned_effects);
+    assert_base_def_use_is_ordered(prefix.base_authority());
 
     assert_fixed_values_are_exact(&prefix);
     assert!(
         prefix
-            .values
+            .values()
             .entries()
             .any(|(catalog, version)| catalog.0 != version.0),
         "encounter-order semantic versions must not be catalog-ID casts"
     );
+}
+
+fn assert_base_def_use_is_ordered(authority: &super::producer_prefix::BaseProducerAuthority) {
+    let mut destination_producer = BTreeMap::new();
+    for (producer_index, producer) in authority.producers.iter().enumerate() {
+        for destination in producer
+            .effect()
+            .accesses()
+            .iter()
+            .filter_map(|access| access.destination())
+        {
+            if let Some(previous) =
+                destination_producer.insert(destination.value.version, producer_index)
+            {
+                assert_eq!(
+                    previous, producer_index,
+                    "one semantic version cannot be produced by different Base producers"
+                );
+            }
+        }
+    }
+    for (producer_index, producer) in authority.producers.iter().enumerate() {
+        for source in producer
+            .effect()
+            .accesses()
+            .iter()
+            .filter_map(|access| access.source())
+        {
+            if let Some(&source_producer) = destination_producer.get(&source.value.version) {
+                assert!(
+                    source_producer < producer_index,
+                    "Base source version must be initial or produced by an earlier contract"
+                );
+            }
+        }
+    }
 }
 
 fn exact_fields(source: &RecordedWitnessInvocationShape) -> LoadedAuthorityFields {
