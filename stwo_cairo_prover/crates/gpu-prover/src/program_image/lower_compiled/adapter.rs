@@ -138,6 +138,16 @@ impl SemanticValueMap {
             .ok_or(InvocationShapeError::MissingSemanticValueMap(catalog))
     }
 
+    /// Semantic lineage of one reusable arena value in allocation order.
+    pub(super) fn versions_for(
+        &self,
+        catalog: ArenaCatalogValueId,
+    ) -> impl Iterator<Item = ValueVersion> + '_ {
+        self.allocations
+            .iter()
+            .filter_map(move |&(candidate, version)| (candidate == catalog).then_some(version))
+    }
+
     pub(super) fn fixed_values(&self) -> Vec<FixedValueDesc> {
         self.fixed_u32
             .iter()

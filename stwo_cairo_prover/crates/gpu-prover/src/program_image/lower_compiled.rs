@@ -38,6 +38,7 @@ mod ec_op_execution_authority;
 mod ec_op_pair_tests;
 mod ec_op_prefix;
 mod ec_op_setup_sources;
+mod execution_tables;
 mod loaded_authority;
 mod loaded_writer_binding;
 mod producer_prefix;
@@ -50,6 +51,7 @@ mod static_wrapper_invocation;
 mod static_wrapper_projection;
 #[cfg(test)]
 mod static_wrapper_projection_tests;
+mod witness_casm_input;
 mod witness_input_gather;
 #[cfg(test)]
 mod witness_input_gather_tests;

@@ -32,7 +32,27 @@ pub(super) fn generated_sn2_replacement() -> Arc<ShapeExecutable> {
     generated_sn2_with_policy(ProtocolPlanPolicy::replacement_v1(0x534e_0001, 2048))
 }
 
+pub(super) fn generated_sn2_legacy_with_execution_tables(
+    execution_tables: ExecutionTableGeometry,
+) -> Arc<ShapeExecutable> {
+    generated_sn2_with_policy_and_execution_tables(
+        ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048),
+        execution_tables,
+    )
+}
+
+pub(super) fn generated_casm_blake_replacement() -> Arc<ShapeExecutable> {
+    super::blake_g_direct_tests::direct_executable()
+}
+
 fn generated_sn2_with_policy(policy: ProtocolPlanPolicy) -> Arc<ShapeExecutable> {
+    generated_sn2_with_policy_and_execution_tables(policy, ExecutionTableGeometry::new(19, 17, 5))
+}
+
+fn generated_sn2_with_policy_and_execution_tables(
+    policy: ProtocolPlanPolicy,
+    execution_tables: ExecutionTableGeometry,
+) -> Arc<ShapeExecutable> {
     let input = run_and_adapt(
         &get_compiled_cairo_program_path("test_prove_verify_sn2_profile"),
         ProgramType::Json,
@@ -57,7 +77,7 @@ fn generated_sn2_with_policy(policy: ProtocolPlanPolicy) -> Arc<ShapeExecutable>
             preprocessed_trace: &ingest.preprocessed_trace,
             pcs: PcsConfig::default(),
             include_all_preprocessed_columns: false,
-            execution_tables: Some(ExecutionTableGeometry::new(19, 17, 5)),
+            execution_tables: Some(execution_tables),
             policy,
         })
         .unwrap()

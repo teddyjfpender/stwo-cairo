@@ -16,7 +16,7 @@ use crate::resident_runtime::producer_schedule::BaseProducerSchedule;
 use crate::resident_session::ResidentPreWitnessInput;
 use crate::shape_executable::{ShapeExecutable, ShapeExecutableCache};
 
-fn direct_executable() -> Arc<ShapeExecutable> {
+pub(super) fn direct_executable() -> Arc<ShapeExecutable> {
     static EXECUTABLE: OnceLock<Arc<ShapeExecutable>> = OnceLock::new();
     Arc::clone(EXECUTABLE.get_or_init(|| {
         let input = run_and_adapt(
