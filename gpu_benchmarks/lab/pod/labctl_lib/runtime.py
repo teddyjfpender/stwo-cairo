@@ -38,6 +38,16 @@ set -eu
 POD_ID={shlex.quote(pod_id)}
 VOLUME_ID={shlex.quote(volume_id)}
 mountpoint -q /workspace
+test ! -L /workspace
+for path in /workspace/gpu-lab /workspace/gpu-lab/NETWORK_VOLUME_ID; do
+  test ! -L "$path"
+done
+if test -e /workspace/gpu-lab; then
+  test -d /workspace/gpu-lab
+  test "$(stat -c '%u:%g:%a' /workspace/gpu-lab)" = 0:0:755
+else
+  install -d -m 0755 -o root -g root /workspace/gpu-lab
+fi
 export POD_ID VOLUME_ID
 LOCAL_ROOT={shlex.quote(local_root)}
 DEV_UID=$(id -u dev)
@@ -68,6 +78,7 @@ export LOCAL_ROOT WORKSPACE_MOUNT LOCAL_MOUNT WORKSPACE_DEVICE LOCAL_DEVICE
 python3 - <<'PY'
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -75,11 +86,28 @@ root = Path("/workspace/gpu-lab")
 root.mkdir(parents=True, exist_ok=True)
 marker = root / "NETWORK_VOLUME_ID"
 expected = os.environ["VOLUME_ID"] + "\\n"
+if marker.is_symlink():
+    raise SystemExit(f"network-volume marker is a symlink: {{marker}}")
 if marker.exists():
-    if marker.read_text() != expected:
+    info = marker.lstat()
+    identity = (info.st_uid, info.st_gid, info.st_mode & 0o7777, info.st_nlink)
+    if not stat.S_ISREG(info.st_mode) or identity != (0, 0, 0o600, 1):
+        raise SystemExit(f"network-volume marker mismatch: {{marker}}")
+    descriptor = os.open(marker, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    opened = os.fstat(descriptor)
+    opened_identity = (opened.st_uid, opened.st_gid,
+                       opened.st_mode & 0o7777, opened.st_nlink)
+    if not stat.S_ISREG(opened.st_mode) or opened_identity != identity:
+        os.close(descriptor)
+        raise SystemExit(f"network-volume marker raced during open: {{marker}}")
+    with os.fdopen(descriptor) as source:
+        actual = source.read()
+    if actual != expected:
         raise SystemExit(f"network-volume marker mismatch: {{marker}}")
 else:
-    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(
+        marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+    )
     with os.fdopen(fd, "w") as out:
         out.write(expected)
         out.flush()
@@ -89,8 +117,30 @@ else:
         os.fsync(directory)
     finally:
         os.close(directory)
+info = marker.lstat()
+identity = (info.st_uid, info.st_gid, info.st_mode & 0o7777, info.st_nlink)
+if (marker.is_symlink() or not stat.S_ISREG(info.st_mode)
+        or identity != (0, 0, 0o600, 1)):
+    raise SystemExit(f"unsafe network-volume marker identity: {{identity}}")
 
 local = Path(os.environ["LOCAL_ROOT"])
+
+def read_regular(path, identity):
+    info = path.lstat()
+    actual = (info.st_uid, info.st_gid, info.st_mode & 0o7777, info.st_nlink)
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink() or actual != identity:
+        raise SystemExit(f"unsafe marker identity for {{path}}: {{actual}}")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    opened = os.fstat(descriptor)
+    opened_identity = (
+        opened.st_uid, opened.st_gid, opened.st_mode & 0o7777, opened.st_nlink
+    )
+    if not stat.S_ISREG(opened.st_mode) or opened_identity != identity:
+        os.close(descriptor)
+        raise SystemExit(f"marker raced during open: {{path}}")
+    with os.fdopen(descriptor) as source:
+        return source.read()
+
 document = {{
     "schema_version": "stwo.gpu-lab.local-root.v1",
     "pod_id": os.environ["POD_ID"],
@@ -104,10 +154,14 @@ document = {{
 payload = json.dumps(document, allow_nan=False, indent=2, sort_keys=True) + "\\n"
 marker = local / "LOCAL_ROOT.json"
 if marker.exists():
-    if marker.is_symlink() or marker.read_text() != payload:
+    if read_regular(marker, (0, 0, 0o444, 1)) != payload:
         raise SystemExit(f"local-root marker mismatch: {{marker}}")
 else:
-    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    if marker.is_symlink():
+        raise SystemExit(f"local-root marker is a symlink: {{marker}}")
+    descriptor = os.open(
+        marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444
+    )
     with os.fdopen(descriptor, "w") as output:
         output.write(payload)
         output.flush()
@@ -135,10 +189,14 @@ layout = {{
 layout_payload = json.dumps(layout, allow_nan=False, indent=2, sort_keys=True) + "\\n"
 layout_marker = local / "DEV_LAYOUT.json"
 if layout_marker.exists():
-    if layout_marker.is_symlink() or layout_marker.read_text() != layout_payload:
+    if read_regular(layout_marker, (0, 0, 0o444, 1)) != layout_payload:
         raise SystemExit(f"dev-layout marker mismatch: {{layout_marker}}")
 else:
-    descriptor = os.open(layout_marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    if layout_marker.is_symlink():
+        raise SystemExit(f"dev-layout marker is a symlink: {{layout_marker}}")
+    descriptor = os.open(
+        layout_marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444
+    )
     with os.fdopen(descriptor, "w") as output:
         output.write(layout_payload)
         output.flush()
@@ -149,18 +207,34 @@ expected = {{
     local / "records": (0, 0, 0o700),
     local / "build": (1000, 1000, 0o700),
     local / "fixtures": (1000, 1000, 0o700),
-    marker: (0, 0, 0o444),
-    layout_marker: (0, 0, 0o444),
+    marker: (0, 0, 0o444, 1),
+    layout_marker: (0, 0, 0o444, 1),
 }}
 for path, identity in expected.items():
     info = path.lstat()
     actual = (info.st_uid, info.st_gid, info.st_mode & 0o7777)
+    if len(identity) == 4:
+        actual += (info.st_nlink,)
     if path.is_symlink() or actual != identity:
         raise SystemExit(f"unsafe dev-layout identity for {{path}}: {{actual}}")
 active = Path("/tmp/stwo-gpu-lab/ACTIVE_ROOT")
-temporary = active.with_name(".ACTIVE_ROOT.tmp")
-temporary.write_text(str(local) + "\\n")
-os.replace(temporary, active)
+if os.path.lexists(active):
+    read_regular(active, (0, 0, 0o600, 1))
+descriptor, temporary_name = tempfile.mkstemp(
+    dir=active.parent, prefix=".ACTIVE_ROOT.", text=True
+)
+temporary = Path(temporary_name)
+try:
+    with os.fdopen(descriptor, "w") as output:
+        os.fchmod(output.fileno(), 0o600)
+        output.write(str(local) + "\\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, active)
+finally:
+    temporary.unlink(missing_ok=True)
+if read_regular(active, (0, 0, 0o600, 1)) != str(local) + "\\n":
+    raise SystemExit("active-root marker mismatch")
 PY
 cat > /etc/profile.d/stwo-gpu-lab-local.sh <<EOF
 export GPU_LAB_LOCAL_ROOT={shlex.quote(local_root)}
@@ -231,7 +305,13 @@ echo $! > /var/run/stwo-lab-idle.pid
 sleep 1
 kill -0 "$(cat /var/run/stwo-lab-ttl.pid)"
 kill -0 "$(cat /var/run/stwo-lab-idle.pid)"
-mkdir -p /workspace/gpu-lab/leases/{shlex.quote(pod_id)}/records
+for path in /workspace/gpu-lab/leases \
+  /workspace/gpu-lab/leases/{shlex.quote(pod_id)} \
+  /workspace/gpu-lab/leases/{shlex.quote(pod_id)}/records; do
+  test ! -L "$path"
+  test ! -e "$path" || test -d "$path"
+  install -d -m 0700 -o root -g root "$path"
+done
 """
 
 
@@ -389,7 +469,11 @@ def _cancel_watchdog(state: dict) -> None:
 
 
 def _require_open_state(state: dict) -> None:
-    if state.get("phase") != "open" or not state.get("pod_id"):
+    if (
+        state.get("phase") != "open"
+        or not state.get("pod_id")
+        or not state.get("remote_guard_installed_at")
+    ):
         raise RuntimeError(
             f"lease is {state.get('phase', 'invalid')}; close/reconcile it before use"
         )

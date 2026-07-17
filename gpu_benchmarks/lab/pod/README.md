@@ -55,6 +55,20 @@ Use the formal `stwo` consumer-development image described in
 manifest reference from the build record; a mutable tag, a locally loaded image id, or a generic
 RunPod/PyTorch image is not admissible. Replace both placeholders below before previewing:
 
+Until that image is published, one explicitly non-formal development exception is pinned in code:
+
+```bash
+gpu_benchmarks/lab/pod/labctl open \
+  --bootstrap-profile consumer-4090-bootstrap
+```
+
+That profile is fixed to one digest-pinned RunPod CUDA 12.8 image, one Secure RTX 4090, network
+volume `2kpphx92fr` in `EU-RO-1`, and ceilings of 6 hours, 30 idle minutes, $0.80/hour, and $4.80.
+It creates and verifies only the `1000:1000` development identity before installing the ordinary
+guards. Its records say `formal=false` and `qualification_eligible=false`; `labctl accept` rejects
+it, so the lane cannot produce qualification or headline evidence. The recorded image digest is
+the requested immutable reference, not a runtime attestation of the provider-started filesystem.
+
 ```bash
 gpu_benchmarks/lab/pod/labctl open \
   --gpu 4090 \

@@ -13,7 +13,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import acceptance_tests, generation_tests, lifecycle, lifecycle_tests, persistence_tests
+from . import acceptance_tests, bootstrap_profile_tests, generation_tests, lifecycle
+from . import lifecycle_tests, persistence_tests
 from . import provider, runtime, sync
 from . import common as c
 def _rejected(call, label: str) -> None:
@@ -194,7 +195,7 @@ def _check_generated_commands(valid_image: str) -> None:
     assert 'install -d -m 0710 -o root -g dev "$LOCAL_ROOT"' in guard
     assert 'install -d -m 0700 -o dev -g dev "$LOCAL_ROOT/build"' in guard
     assert '"build_uid": 1000' in guard and '"fixtures_uid": 1000' in guard
-    assert 'marker: (0, 0, 0o444)' in guard
+    assert 'marker: (0, 0, 0o444, 1)' in guard
     assert "refusing unsealed TTL exit" in guard and "LABCTL_PERSIST_SHA256" in guard
     assert runtime._elapsed_spend({"created_at": 0, "usd_hr": 2}, 7200) == 4
     subprocess.run(["bash", "-n"], input=guard, text=True, check=True)
@@ -417,6 +418,7 @@ def cmd_self_test(_args) -> int:
         _check_budgets()
         _check_provider(offer)
         _check_generated_commands(args.image)
+        bootstrap_profile_tests.bootstrap_profile_self_test()
         persistence_tests.persistence_self_test()
         _check_tree_identity()
         generation_tests.generation_self_test()

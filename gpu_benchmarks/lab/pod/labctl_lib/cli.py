@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from . import acceptance
+from . import bootstrap_profile
 from . import common as c
 from . import lifecycle
 from . import selftest
@@ -21,22 +22,23 @@ def parser() -> argparse.ArgumentParser:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("open", help="preview/create one bounded Secure Cloud lease")
+    p.add_argument("--bootstrap-profile", choices=(bootstrap_profile.NAME,))
     p.add_argument(
         "--gpu",
-        default="4090",
+        default=argparse.SUPPRESS,
         help="3090|4090|5090|a5000|a40|l40s|h100 or RunPod id",
     )
-    p.add_argument("--image", default=os.environ.get("LABCTL_IMAGE"))
-    p.add_argument("--volume-id", default=os.environ.get("LABCTL_VOLUME_ID"))
-    p.add_argument("--volume-dc", default=os.environ.get("LABCTL_VOLUME_DC"))
-    p.add_argument("--name")
-    p.add_argument("--ttl-hours", type=float, default=4.0)
-    p.add_argument("--idle-min", type=int, default=30)
-    p.add_argument("--max-usd-hr", type=float, default=1.0)
-    p.add_argument("--max-total-usd", type=float, default=4.0)
-    p.add_argument("--min-vcpu", type=int, default=8)
-    p.add_argument("--min-mem-gb", type=int, default=32)
-    p.add_argument("--ready-timeout", type=float, default=600)
+    p.add_argument("--image", default=argparse.SUPPRESS)
+    p.add_argument("--volume-id", default=argparse.SUPPRESS)
+    p.add_argument("--volume-dc", default=argparse.SUPPRESS)
+    p.add_argument("--name", default=argparse.SUPPRESS)
+    p.add_argument("--ttl-hours", type=float, default=argparse.SUPPRESS)
+    p.add_argument("--idle-min", type=int, default=argparse.SUPPRESS)
+    p.add_argument("--max-usd-hr", type=float, default=argparse.SUPPRESS)
+    p.add_argument("--max-total-usd", type=float, default=argparse.SUPPRESS)
+    p.add_argument("--min-vcpu", type=int, default=argparse.SUPPRESS)
+    p.add_argument("--min-mem-gb", type=int, default=argparse.SUPPRESS)
+    p.add_argument("--ready-timeout", type=float, default=argparse.SUPPRESS)
     p.add_argument("--confirm", help="exact token printed by the preview")
     sub.add_parser("status")
     sub.add_parser("sync", help="publish an exact immutable source generation")
@@ -56,6 +58,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.cmd == "open":
+        bootstrap_profile.configure(args, os.environ)
     commands = {
         "open": lifecycle.cmd_open,
         "status": lifecycle.cmd_status,

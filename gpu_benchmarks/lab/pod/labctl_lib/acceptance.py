@@ -349,6 +349,10 @@ def _parse_acceptance(
 def cmd_accept(args) -> int:
     with c._lease_lock():
         state, pod, ep = runtime._active()
+    if state.get("qualification_eligible") is not True:
+        raise RuntimeError(
+            "lease is not qualification-eligible and cannot be accepted"
+        )
     lease_identity = (
         state["created_at"],
         state["expires_at"],

@@ -8,6 +8,7 @@ import math
 import sys
 import time
 
+from . import bootstrap_profile
 from . import common as c
 from . import provider
 from . import runtime
@@ -22,6 +23,7 @@ def _launch_plan(args: argparse.Namespace, offer: dict, volume: dict) -> dict:
         "cloud": "SECURE",
         "container_disk_gb": c.DEFAULT_DISK_GB,
         "gpu_count": 1,
+        "qualification_eligible": True,
         "gpu_display_name": offer["display_name"],
         "gpu_type_id": offer["gpu_type_id"],
         "image": args.image,
@@ -42,6 +44,7 @@ def _launch_plan(args: argparse.Namespace, offer: dict, volume: dict) -> dict:
         "volume_id": args.volume_id,
         "volume_mount": c.VOLUME_MOUNT,
         "volume_rest_attestation": volume,
+        **bootstrap_profile.metadata(args),
     }
 
 
@@ -95,11 +98,33 @@ def _cleanup_failed_open(reservation: dict, lease_name: str, pod) -> None:
         c._write_state(reservation)
 
 
+def _install_remote_controls(state: dict, args, ep: c.Endpoint, remaining: int) -> None:
+    """Finish bootstrap before the ordinary remote guards make the lease open."""
+    bootstrap = bool(bootstrap_profile.metadata(args))
+    if bootstrap:
+        state["bootstrap_key_sha256"] = bootstrap_profile.bootstrap_dev(ep)
+        c._write_state(state)
+        bootstrap_profile.verify_ssh(ep, state["bootstrap_key_sha256"])
+    if c.ssh_run(
+        ep,
+        runtime._guard_command(
+            state["pod_id"], state["volume_id"], remaining, args.idle_min * 60
+        ),
+        timeout=60,
+    ):
+        raise RuntimeError("failed to install remote TTL termination guard")
+    if bootstrap:
+        record, digest = bootstrap_profile.persist_record(ep, state)
+        state["profile_record"] = record
+        state["profile_record_sha256"] = digest
+
+
 def cmd_open(args: argparse.Namespace) -> int:
     if c.STATE.exists():
         existing = c._read_state()
         if (
-            existing.get("phase") in {"open", "creating", "cleanup_failed"}
+            existing.get("phase")
+            in {"open", "creating", "bootstrapping", "cleanup_failed"}
             and time.time() >= existing.get("expires_at", math.inf)
         ):
             runtime._terminate_all_state_candidates(
@@ -143,6 +168,7 @@ def cmd_open(args: argparse.Namespace) -> int:
         "plan": plan,
         "usd_hr": price,
         "volume_id": args.volume_id,
+        **bootstrap_profile.metadata(args),
     }
     c._write_state(reservation)
     try:
@@ -177,7 +203,8 @@ def cmd_open(args: argparse.Namespace) -> int:
             "lease_name": lease_name,
             "max_total_usd": args.max_total_usd,
             "max_usd_hr": args.max_usd_hr,
-            "phase": "open",
+            "phase": "bootstrapping",
+            "qualification_eligible": True,
             "plan": plan,
             "pod_id": pod.id,
             "usd_hr": actual_price,
@@ -185,6 +212,7 @@ def cmd_open(args: argparse.Namespace) -> int:
             "volume_id": args.volume_id,
             "volume_rest_attestation": attached_volume,
             "watchdog_pid": reservation["watchdog_pid"],
+            **bootstrap_profile.metadata(args),
         }
         c._write_state(state)
         c.ledger.append(
@@ -193,6 +221,7 @@ def cmd_open(args: argparse.Namespace) -> int:
             gpu=pod.gpu,
             usd_hr=actual_price,
             purpose="gpu-lab-bounded-lease",
+            **bootstrap_profile.metadata(args),
         )
         pod = c.wait_ready(pod.id, timeout_s=args.ready_timeout)
         remaining = int(state["expires_at"] - time.time())
@@ -202,14 +231,8 @@ def cmd_open(args: argparse.Namespace) -> int:
                 "lease has too little time remaining to keep idle and TTL guards separate"
             )
         ep = c.Endpoint.of(pod)
-        if c.ssh_run(
-            ep,
-            runtime._guard_command(
-                pod.id, args.volume_id, remaining, args.idle_min * 60
-            ),
-            timeout=60,
-        ):
-            raise RuntimeError("failed to install remote TTL termination guard")
+        _install_remote_controls(state, args, ep, remaining)
+        state["phase"] = "open"
         state["remote_guard_installed_at"] = time.time()
         c._write_state(state)
         print(f"OPEN {pod.id} {ep.host}:{ep.port}; expires in <= {remaining}s")
@@ -227,7 +250,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
     state = c._read_state()
     if state["phase"] != "open":
         if (
-            state["phase"] in {"creating", "cleanup_failed"}
+            state["phase"] in {"creating", "bootstrapping", "cleanup_failed"}
             and time.time() >= state.get("expires_at", math.inf)
         ):
             runtime._terminate_all_state_candidates(
@@ -235,7 +258,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
             )
             state = c._read_state()
         out = dict(state)
-        if state["phase"] in {"creating", "cleanup_failed"}:
+        if state["phase"] in {"creating", "bootstrapping", "cleanup_failed"}:
             matches = [
                 pod for pod in c.api.list_pods() if pod.name == state.get("lease_name")
             ]
@@ -274,7 +297,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
 def cmd_close(args: argparse.Namespace) -> int:
     state = c._read_state()
     if (
-        state.get("phase") in {"open", "creating", "cleanup_failed"}
+        state.get("phase") in {"open", "creating", "bootstrapping", "cleanup_failed"}
         and time.time() >= state.get("expires_at", math.inf)
     ):
         runtime._terminate_all_state_candidates(
@@ -312,7 +335,7 @@ def cmd_close(args: argparse.Namespace) -> int:
     if (state.get("phase") == "open" and pod and pod.status == "RUNNING"
             and not pod.ssh_host):
         raise RuntimeError("running lease has no SSH endpoint; refusing unsealed termination")
-    if pod and pod.status == "RUNNING" and pod.ssh_host:
+    if state.get("phase") == "open" and pod and pod.status == "RUNNING" and pod.ssh_host:
         runtime._persist_for_termination(state, pod, reason="explicit-close")
         seal_dir = c.STATE.parent / "seals"
         seal_dir.mkdir(parents=True, exist_ok=True)
