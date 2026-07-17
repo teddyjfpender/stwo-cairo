@@ -168,8 +168,13 @@ impl ResidentWorkspaceEntry {
             self.validate_installed_runtime_identity()?;
             PreparedRuntimeMaterialization::Reused
         } else {
-            let expected = ResidentWorkspaceIdentity::of(self.workspace());
-            let runtime = prepare(self.workspace());
+            // Borrow the pinned workspace field directly. Borrowing through
+            // `self.workspace()` would conservatively borrow the whole entry
+            // for the lifetime carried by the returned runtime, preventing
+            // the disjoint runtime/poison fields from being updated.
+            let workspace = self.workspace.as_ref().get_ref();
+            let expected = ResidentWorkspaceIdentity::of(workspace);
+            let runtime = prepare(workspace);
             self.runtime = match runtime {
                 Ok(runtime) => {
                     if let Err(error) = require_runtime_identity(expected, runtime.identity()) {
@@ -202,7 +207,7 @@ impl ResidentWorkspaceEntry {
     }
 
     fn validate_installed_runtime_identity(&mut self) -> Result<(), ResidentRuntimeError> {
-        let expected = ResidentWorkspaceIdentity::of(self.workspace());
+        let expected = ResidentWorkspaceIdentity::of(self.workspace.as_ref().get_ref());
         let actual = self
             .runtime
             .as_ref()
