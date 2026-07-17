@@ -12,6 +12,7 @@ SCHEMA = "stwo.gpu-lab.legacy-root-migration.v1"
 ROOT = "/workspace/gpu-lab"
 MARKER = "NETWORK_VOLUME_ID"
 CHANGED = "root-0777-marker-0666-to-root-0755-marker-0600"
+RESUMED_SECURED_MARKER = "root-0777-marker-0600-to-root-0755-marker-0600"
 RESUMED_MARKER = "root-0700-marker-0666-to-root-0755-marker-0600"
 RESUMED_ROOT = "root-0700-marker-0600-to-root-0755-marker-0600"
 UNCHANGED = "root-0755-marker-0600-unchanged"
@@ -20,6 +21,7 @@ WORKER = r"""
 import os
 import stat
 import sys
+import time
 
 root, volume_id = sys.argv[1:3]
 expected_uid, expected_gid = map(int, sys.argv[3:5])
@@ -39,6 +41,21 @@ def require_root(info, modes):
         or stat.S_IMODE(info.st_mode) not in modes
     ):
         raise RuntimeError(f"legacy gpu-lab root mismatch: {identity(info)}")
+
+def await_modes(root_fd, marker_fd, root_mode, marker_mode):
+    for _ in range(40):
+        root_info = os.fstat(root_fd)
+        marker_info = os.fstat(marker_fd)
+        if (
+            stat.S_IMODE(root_info.st_mode) == root_mode
+            and stat.S_IMODE(marker_info.st_mode) == marker_mode
+        ):
+            return root_info, marker_info
+        time.sleep(0.05)
+    raise RuntimeError(
+        "legacy root/marker modes did not converge: "
+        f"root={identity(root_info)} marker={identity(marker_info)}"
+    )
 
 root_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 marker_flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
@@ -78,6 +95,7 @@ try:
         admitted = {
             (0o755, 0o600),
             (0o777, 0o666),
+            (0o777, 0o600),
             (0o700, 0o666),
             (0o700, 0o600),
         }
@@ -92,9 +110,10 @@ try:
             os.fchmod(marker_fd, 0o600)
             os.fsync(marker_fd)
 
-        locked_root = os.fstat(root_fd)
+        locked_root, locked_marker = await_modes(
+            root_fd, marker_fd, 0o700 if changed else 0o755, 0o600
+        )
         require_root(locked_root, {0o700} if changed else {0o755})
-        locked_marker = os.fstat(marker_fd)
         if (
             not stat.S_ISREG(locked_marker.st_mode)
             or locked_marker.st_uid != expected_uid
@@ -120,7 +139,7 @@ try:
             os.fchmod(root_fd, 0o755)
             os.fsync(root_fd)
 
-        after = os.fstat(root_fd)
+        after, final_marker = await_modes(root_fd, marker_fd, 0o755, 0o600)
         require_root(after, {0o755})
         if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
             raise RuntimeError("legacy gpu-lab root descriptor changed")
@@ -130,7 +149,7 @@ try:
         marker_after = os.stat(
             "NETWORK_VOLUME_ID", dir_fd=root_fd, follow_symlinks=False
         )
-        if identity(marker_after) != identity(locked_marker):
+        if identity(marker_after) != identity(final_marker):
             raise RuntimeError("legacy network-volume marker changed")
         os.lseek(marker_fd, 0, os.SEEK_SET)
         if os.read(marker_fd, len(expected_marker) + 1) != expected_marker:
@@ -145,6 +164,8 @@ print(
     + {
         (0o777, 0o666):
             "root-0777-marker-0666-to-root-0755-marker-0600",
+        (0o777, 0o600):
+            "root-0777-marker-0600-to-root-0755-marker-0600",
         (0o700, 0o666):
             "root-0700-marker-0666-to-root-0755-marker-0600",
         (0o700, 0o600):
@@ -180,6 +201,7 @@ def migrate(ep: c.Endpoint, volume_id: str) -> dict[str, object]:
     prefix = "LABCTL_LEGACY_ROOT_MIGRATION="
     results = {
         CHANGED: ("0777", "0666", False),
+        RESUMED_SECURED_MARKER: ("0777", "0600", True),
         RESUMED_MARKER: ("0700", "0666", True),
         RESUMED_ROOT: ("0700", "0600", True),
         UNCHANGED: ("0755", "0600", False),

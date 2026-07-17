@@ -61,6 +61,7 @@ def legacy_root_self_test() -> None:
     assert "os.fchmod(marker_fd, 0o600)" in generated
     assert "os.fchmod(root_fd, 0o755)" in generated
     assert "os.fsync(root_fd)" in generated
+    assert "time.sleep(0.05)" in generated
     assert "chmod -R" not in generated and "chown" not in generated
 
     with tempfile.TemporaryDirectory() as directory:
@@ -90,6 +91,7 @@ def legacy_root_self_test() -> None:
         )
 
     for root_mode, marker_mode, receipt in (
+        (0o777, 0o600, legacy_root.RESUMED_SECURED_MARKER),
         (0o700, 0o666, legacy_root.RESUMED_MARKER),
         (0o700, 0o600, legacy_root.RESUMED_ROOT),
     ):
