@@ -98,6 +98,13 @@ fn lowered_direct() -> (
 #[test]
 fn real_recorded_program_compiles_into_production_direct_base_authority() {
     let (executable, lowered) = lowered_direct();
+    let invocation = static_wrapper_invocation::blake_g_direct(&lowered).unwrap();
+    assert_eq!(invocation.arguments.len(), 6);
+    assert!(invocation
+        .arguments
+        .iter()
+        .enumerate()
+        .all(|(ordinal, argument)| argument.ordinal as usize == ordinal));
     let component = executable
         .arena()
         .witness()

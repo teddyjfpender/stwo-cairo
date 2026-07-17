@@ -19,6 +19,26 @@ const TARGET_SM: u32 = 89;
 #[test]
 fn recorded_base_emits_real_ops_and_stops_at_first_native_wrapper() {
     let executable = super::tests::generated_sn2();
+    let authority = BaseProducerAuthority::compile_replacement(executable.arena()).unwrap();
+    let ec_op = authority
+        .producers
+        .iter()
+        .find_map(|producer| match producer {
+            SemanticBaseProducer::NativeEcOp { contract, .. } => Some(contract),
+            _ => None,
+        })
+        .expect("generated SN2 must schedule native EC-op");
+    let invocation = static_wrapper_invocation::ec_op(ec_op).unwrap();
+    assert_eq!(invocation.arguments.len(), 18);
+    assert!(invocation
+        .arguments
+        .iter()
+        .enumerate()
+        .all(|(ordinal, argument)| argument.ordinal as usize == ordinal));
+    let mut malformed = ec_op.clone();
+    malformed.invocation.multiplicities.pop();
+    assert!(static_wrapper_invocation::ec_op(&malformed).is_err());
+
     let error =
         emit_recorded_base_prefix_for_test(executable.arena(), MANIFEST, TARGET_SM, |source| {
             Ok(exact_fields(source))

@@ -43,6 +43,7 @@ mod recorded_deduce_authority;
 #[cfg(test)]
 mod recorded_deduce_tests;
 mod schedule_prefix;
+mod static_wrapper_invocation;
 
 pub(crate) use producer_prefix::{
     BaseProducerAuthority, LoadedBaseProducerAuthority, PreparedBlakeGDirectKernel,
