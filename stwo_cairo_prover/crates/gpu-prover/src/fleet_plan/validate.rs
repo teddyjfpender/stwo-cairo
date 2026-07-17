@@ -7,7 +7,9 @@ use memory::{measure_workers, validate_spill};
 use transcript_values::validate_transcript_values;
 
 use super::*;
-use crate::compiled_proof::{OpNode, ProofStage, ValueDesc, ValueOrigin, ValueRange};
+use crate::compiled_proof::{
+    ExecutionPrimitive, OpNode, ProofStage, ValueDesc, ValueOrigin, ValueRange,
+};
 use crate::transcript_plan::CairoBlake2sTranscriptPlan;
 
 pub(super) fn validate_and_measure(
@@ -298,12 +300,25 @@ fn read_available(
     range: ValueRange,
     operation: &FleetOperationPlacement,
 ) -> bool {
+    let composite_internal = plan.compiled.value(range.version).is_some_and(|value| {
+        value.origin == ValueOrigin::OpOutput(operation.operation)
+            && plan
+                .compiled
+                .operation(operation.operation)
+                .is_some_and(|operation| {
+                    matches!(
+                        operation.primitive,
+                        ExecutionPrimitive::OrderedComposite { .. }
+                    )
+                })
+    });
     let canonical = plan.placement.owners.iter().any(|owner| {
         owner.worker == operation.worker
             && owner.value.version == range.version
             && owner.value.elements.contains(range.elements)
             && owner.live.contains(operation.during)
-            && owner_ready_at(plan, owner).is_ok_and(|ready| ready <= operation.during.start)
+            && (composite_internal
+                || owner_ready_at(plan, owner).is_ok_and(|ready| ready <= operation.during.start))
     });
     let replica = plan.placement.replicas.iter().any(|replica| {
         replica.worker == operation.worker

@@ -15,6 +15,7 @@ use crate::transcript_plan::{
     CairoBlake2sTranscriptPlan, CairoTranscriptSegment, TranscriptSegmentPlan,
 };
 
+mod compiler;
 mod identity;
 mod ipc_cursor;
 mod lower_compiled;
@@ -25,6 +26,7 @@ mod validate;
 #[cfg(test)]
 mod tests;
 
+pub use compiler::FleetCompileError;
 pub use ipc_cursor::{
     FleetIpcAttemptState, FleetIpcCoordinatorCursor, FleetIpcCursorError, FleetIpcCursorProgress,
     FleetIpcPhase, FleetIpcPhaseBinding, FleetIpcPhaseReceipt,

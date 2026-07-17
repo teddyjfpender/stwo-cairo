@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
-use crate::compiled_proof::{InPlaceAliasRequirement, ValueDesc, ValueRange, ValueVersion};
+use crate::compiled_proof::{
+    ExecutionPrimitive, InPlaceAliasRequirement, ValueDesc, ValueRange, ValueVersion,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct StorageId(pub u32);
@@ -176,6 +178,15 @@ fn validate_alias(
         .get(alias.operation.0 as usize)
         .filter(|operation| operation.id == alias.operation)
         .ok_or(FleetPlanError::UnknownOperation(alias.operation))?;
+    // A composite is atomic at fleet-plan granularity. Without child-indexed
+    // alias timing, the validator cannot prove that no later child reads the
+    // overwritten source. Keep it out-of-place until that authority exists.
+    if matches!(
+        &operation.primitive,
+        ExecutionPrimitive::OrderedComposite { .. }
+    ) {
+        return Err(invalid_alias(operation.id, alias.alias));
+    }
     let operation_placement = operation_placement(plan, operation.id)?;
     let effect = plan
         .compiled

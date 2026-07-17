@@ -21,6 +21,8 @@ use crate::transcript_plan::{
 
 mod adversarial;
 mod barrier;
+mod compiler;
+mod composite_internal_read;
 mod ipc_cursor;
 mod pow;
 mod runtime_view;
