@@ -37,6 +37,7 @@ mod ec_op_execution_authority;
 #[cfg(test)]
 mod ec_op_pair_tests;
 mod ec_op_prefix;
+mod ec_op_setup_sources;
 mod loaded_authority;
 mod loaded_writer_binding;
 mod producer_prefix;
