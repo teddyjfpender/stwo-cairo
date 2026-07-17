@@ -1,24 +1,20 @@
 //! Exact source ownership at the native EC-op Base boundary.
 //!
 //! This closes the storage/SSA identity of the one ingested segment scalar and
-//! the four zero-before-accumulation multiplicity slabs. It intentionally does
-//! not emit origins or operations: `CompiledProof` still lacks typed execution
-//! authorities for host ingest, the batched clear graph, public-memory seed,
-//! and generic witness-feed graphs.
-
-use std::collections::BTreeMap;
+//! the four zero-before-accumulation multiplicity slabs. Clear, seed, feed, and
+//! native transitions are reconstructed in schedule order. Only the ingested
+//! segment scalar still lacks an origin operation.
 
 use stwo_cairo_prover::witness::proof_shape::TracePartId;
 
 use super::adapter::SemanticValueMap;
-use super::producer_prefix::SemanticBaseProducer;
+use super::multiplicity_feed::{LoweredMultiplicityFeed, MultiplicityFeedOwner};
+use super::producer_prefix::{BaseProducerAuthority, SemanticBaseProducer};
 use super::*;
 use crate::arena_plan::{
-    ArenaBinding, BufferPurpose, PlannedGraphAMultiplicityWorkspace,
-    PlannedRecordedMultiplicityFeedGraph, ProofArenaPlan,
+    ArenaBinding, BufferPurpose, PlannedGraphAMultiplicityWorkspace, ProofArenaPlan,
 };
-use crate::compiled_proof::{EffectBindingId, InPlaceAliasAuthority, ValueVersion};
-use crate::multiplicity_pipeline::blake_g_fused_feed_binding;
+use crate::compiled_proof::{EffectBindingId, ElementRange, InPlaceAliasAuthority, ValueVersion};
 use crate::resident_runtime::producer_schedule::{
     BaseProducerSchedule, BaseProducerStep, WitnessProducerKind,
 };
@@ -51,13 +47,10 @@ pub(super) enum EcOpMultiplicityAdditiveOwner {
     NativeEcOp,
 }
 
-/// The exact executable-origin layer still absent from `CompiledProof`.
+/// The one executable origin still absent from the canonical Base prefix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MissingEcOpSetupOriginAuthority {
     SegmentStartExternalInput,
-    BatchedMultiplicityClear,
-    PublicMemorySeed,
-    GenericWitnessFeeds,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,8 +69,9 @@ pub(super) struct EcOpMultiplicitySource {
     pub(super) native_destination: ValueVersion,
     pub(super) native_binding: EffectBindingId,
     pub(super) native_alias: InPlaceAliasAuthority,
-    /// Ordered ownership classes: optional seed, scheduled witness feeds, then
-    /// the native EC-op atomic transition represented by `native_destination`.
+    /// Ordered ownership classes for the complete multiplicity lineage. The
+    /// native EC-op transition appears at its producer-schedule position and
+    /// may be followed by later witness feeds.
     pub(super) additive_owners: Vec<EcOpMultiplicityAdditiveOwner>,
 }
 
@@ -94,33 +88,14 @@ impl EcOpSetupSourceAuthority {
         1 + self.multiplicities.len()
     }
 
-    /// Every mapped value still needs an origin-emitting adapter. The mapping
-    /// is complete; executable ingest/clear/seed/feed authority is not.
+    /// Clear, seed, and feed origins are canonical operations. Only the
+    /// statement-varying segment scalar still needs an external-input origin.
     pub(super) const fn unresolved_origin_count(&self) -> usize {
-        self.source_count()
+        1
     }
 
     pub(super) fn missing_origin_authorities(&self) -> Vec<MissingEcOpSetupOriginAuthority> {
-        let has_seed = self.multiplicities.iter().any(|source| {
-            source
-                .additive_owners
-                .contains(&EcOpMultiplicityAdditiveOwner::PublicMemorySeed)
-        });
-        let has_feeds = self.multiplicities.iter().any(|source| {
-            source
-                .additive_owners
-                .iter()
-                .any(|owner| matches!(owner, EcOpMultiplicityAdditiveOwner::WitnessFeed(_)))
-        });
-        [
-            Some(MissingEcOpSetupOriginAuthority::SegmentStartExternalInput),
-            Some(MissingEcOpSetupOriginAuthority::BatchedMultiplicityClear),
-            has_seed.then_some(MissingEcOpSetupOriginAuthority::PublicMemorySeed),
-            has_feeds.then_some(MissingEcOpSetupOriginAuthority::GenericWitnessFeeds),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
+        vec![MissingEcOpSetupOriginAuthority::SegmentStartExternalInput]
     }
 }
 
@@ -131,7 +106,7 @@ impl EcOpSetupSourceAuthority {
 /// clear/seed/feed routing, and the native contract owns the final atomics.
 pub(super) fn bind(
     arena: &ProofArenaPlan,
-    producers: &[SemanticBaseProducer],
+    authority: &BaseProducerAuthority,
     values: &SemanticValueMap,
 ) -> Result<EcOpSetupSourceAuthority, InvocationShapeError> {
     validate_setup_order(arena)?;
@@ -142,7 +117,7 @@ pub(super) fn bind(
     let ec_op = arena
         .ec_op()
         .ok_or(InvocationShapeError::InvalidNativeEcOpBinding)?;
-    let contract = unique_native_ec_op(producers)?;
+    let contract = unique_native_ec_op(&authority.producers)?;
     if super::ec_op_prefix::exact_effect(&contract.invocation)? != contract.effect {
         return Err(InvocationShapeError::InvalidNativeEcOpBinding);
     }
@@ -168,7 +143,6 @@ pub(super) fn bind(
         return Err(InvocationShapeError::InvalidNativeEcOpBinding);
     }
 
-    let feed_owners = feed_owners(multiplicity)?;
     let specs = [
         (
             EcOpMultiplicityRole::AddressCounts,
@@ -228,19 +202,29 @@ pub(super) fn bind(
                 .destination_words
                 .get(clear_destination_index)
                 != Some(&words)
-            || !catalog_first.contains(&atomic.source)
-            || transitions.contains(&atomic.source)
-            || fixed.contains(&atomic.source)
-            || !transitions.contains(&atomic.destination)
-            || values.version(atomic.value.value)? != atomic.destination
         {
             return Err(InvocationShapeError::InvalidNativeEcOpBinding);
         }
-        let mut additive_owners = feed_owners
-            .get(role.destination())
-            .cloned()
+        let clear = authority
+            .multiplicity
+            .clear
+            .destinations
+            .get(clear_destination_index)
+            .filter(|destination| {
+                destination.name == role.destination()
+                    && destination.value == atomic.value.value
+                    && destination.arena == clear_binding
+            })
             .ok_or(InvocationShapeError::InvalidNativeEcOpBinding)?;
-        additive_owners.push(EcOpMultiplicityAdditiveOwner::NativeEcOp);
+        let additive_owners = exact_multiplicity_lineage(
+            authority,
+            values,
+            clear,
+            atomic,
+            &catalog_first,
+            &transitions,
+            &fixed,
+        )?;
         bound.push(EcOpMultiplicitySource {
             role,
             value: atomic.value.clone(),
@@ -335,106 +319,213 @@ fn exact_multiplicity(
     Ok((index, binding))
 }
 
-fn feed_owners(
-    multiplicity: &PlannedGraphAMultiplicityWorkspace,
-) -> Result<BTreeMap<&'static str, Vec<EcOpMultiplicityAdditiveOwner>>, InvocationShapeError> {
-    if multiplicity.multiplicities.len() != multiplicity.clear_requirements.destination_words.len()
+fn exact_multiplicity_lineage(
+    authority: &BaseProducerAuthority,
+    values: &SemanticValueMap,
+    clear: &super::multiplicity_clear::MultiplicityClearDestinationBinding,
+    native: &super::ec_op_prefix::NativeEcOpAtomicBinding,
+    catalog_first: &std::collections::BTreeSet<ValueVersion>,
+    transitions: &std::collections::BTreeSet<ValueVersion>,
+    fixed: &std::collections::BTreeSet<ValueVersion>,
+) -> Result<Vec<EcOpMultiplicityAdditiveOwner>, InvocationShapeError> {
+    if !catalog_first.contains(&clear.version)
+        || transitions.contains(&clear.version)
+        || fixed.contains(&clear.version)
     {
         return Err(InvocationShapeError::InvalidNativeEcOpBinding);
     }
-    let mut owners = BTreeMap::new();
-    for &(name, _) in &multiplicity.multiplicities {
-        if owners.insert(name, Vec::new()).is_some() {
+    let mut lineage = vec![clear.version];
+    let mut owners = Vec::new();
+    if let Some(seed) = &authority.multiplicity.public_memory_seed {
+        if seed.owner != MultiplicityFeedOwner::PublicMemorySeed {
             return Err(InvocationShapeError::InvalidNativeEcOpBinding);
         }
-    }
-
-    if let Some(seed) = &multiplicity.public_memory_seed {
-        if seed.plan.destination_components
-            != [
-                "memory_address_to_id_state",
-                "memory_id_to_big_state",
-                "memory_id_to_big_state#small",
-            ]
-        {
-            return Err(InvocationShapeError::InvalidNativeEcOpBinding);
-        }
-        record_destinations(
-            multiplicity,
+        append_feed_transition(
+            seed,
+            clear,
+            &mut lineage,
             &mut owners,
-            &[
-                "memory_address_to_id",
-                "memory_id_to_big",
-                "memory_id_to_big#small",
-            ],
-            &seed.slots.multiplicity_destinations,
-            &seed.plan.requirements.multiplicity_words,
             EcOpMultiplicityAdditiveOwner::PublicMemorySeed,
         )?;
     }
-    for feed in &multiplicity.feeds {
-        match feed {
-            PlannedRecordedMultiplicityFeedGraph::Generic(feed) => record_destinations(
-                multiplicity,
-                &mut owners,
-                &feed.plan.destination_components,
-                &feed.slots.multiplicity_destinations,
-                &feed.plan.requirements.multiplicity_words,
-                EcOpMultiplicityAdditiveOwner::WitnessFeed(feed.plan.producer),
-            )?,
-            PlannedRecordedMultiplicityFeedGraph::BlakeGFused {
-                plan,
-                multiplicity_destinations,
-                ..
-            } => {
-                let binding = blake_g_fused_feed_binding(plan)
+    if authority.multiplicity.after_producer.len() != authority.producers.len() {
+        return Err(InvocationShapeError::InvalidNativeEcOpBinding);
+    }
+    let mut native_count = 0usize;
+    for (producer, feed) in authority
+        .producers
+        .iter()
+        .zip(&authority.multiplicity.after_producer)
+    {
+        match producer {
+            SemanticBaseProducer::Recorded(recorded) => {
+                let feed = feed
+                    .as_ref()
                     .ok_or(InvocationShapeError::InvalidNativeEcOpBinding)?;
-                let names = binding
-                    .destination_indices
-                    .map(|index| plan.destination_components[index]);
-                let words = binding
-                    .destination_indices
-                    .map(|index| plan.requirements.multiplicity_words[index]);
-                let slots = multiplicity_destinations.map(|binding| binding.physical);
-                record_destinations(
-                    multiplicity,
+                if feed.owner
+                    != (MultiplicityFeedOwner::Recorded {
+                        component: recorded.producer.component,
+                        part: recorded
+                            .producer
+                            .part
+                            .ok_or(InvocationShapeError::InvalidNativeEcOpBinding)?,
+                    })
+                {
+                    return Err(InvocationShapeError::InvalidNativeEcOpBinding);
+                }
+                append_feed_transition(
+                    feed,
+                    clear,
+                    &mut lineage,
                     &mut owners,
-                    &names,
-                    &slots,
-                    &words,
-                    EcOpMultiplicityAdditiveOwner::WitnessFeed(plan.producer),
+                    EcOpMultiplicityAdditiveOwner::WitnessFeed(recorded.producer.component),
                 )?;
             }
+            SemanticBaseProducer::NativeBlakeGDirect {
+                producer, contract, ..
+            } => {
+                if feed.is_some() {
+                    return Err(InvocationShapeError::InvalidNativeEcOpBinding);
+                }
+                let matching = contract
+                    .invocation
+                    .counts
+                    .iter()
+                    .filter(|transition| transition.value.value == clear.value)
+                    .collect::<Vec<_>>();
+                if matching.len() > 1 {
+                    return Err(InvocationShapeError::InvalidNativeEcOpBinding);
+                }
+                if let Some(transition) = matching.first() {
+                    append_transition(
+                        clear,
+                        transition.value.value,
+                        element_range(&transition.value)?,
+                        transition.source,
+                        transition.destination,
+                        &mut lineage,
+                    )?;
+                    owners.push(EcOpMultiplicityAdditiveOwner::WitnessFeed(
+                        producer.component,
+                    ));
+                }
+            }
+            SemanticBaseProducer::NativeEcOp { contract, .. } => {
+                if feed.is_some() {
+                    return Err(InvocationShapeError::InvalidNativeEcOpBinding);
+                }
+                let matching = contract
+                    .invocation
+                    .multiplicities
+                    .iter()
+                    .filter(|transition| transition.value.value == clear.value)
+                    .collect::<Vec<_>>();
+                if matching.len() != 1 || matching[0] != native {
+                    return Err(InvocationShapeError::InvalidNativeEcOpBinding);
+                }
+                append_transition(
+                    clear,
+                    native.value.value,
+                    element_range(&native.value)?,
+                    native.source,
+                    native.destination,
+                    &mut lineage,
+                )?;
+                owners.push(EcOpMultiplicityAdditiveOwner::NativeEcOp);
+                native_count += 1;
+            }
         }
+    }
+    let post = authority
+        .multiplicity
+        .post_witness_current
+        .iter()
+        .filter(|entry| entry.value == clear.value)
+        .collect::<Vec<_>>();
+    let native_edges = lineage
+        .windows(2)
+        .filter(|edge| edge[0] == native.source && edge[1] == native.destination)
+        .count();
+    if native_count != 1
+        || owners
+            .iter()
+            .filter(|owner| **owner == EcOpMultiplicityAdditiveOwner::NativeEcOp)
+            .count()
+            != 1
+        || native_edges != 1
+        || lineage.len() != owners.len() + 1
+        || lineage.iter().skip(1).any(|version| {
+            !transitions.contains(version)
+                || catalog_first.contains(version)
+                || fixed.contains(version)
+        })
+        || values.versions_for(clear.value).collect::<Vec<_>>() != lineage
+        || lineage.last().copied() != Some(values.version(clear.value)?)
+        || post.len() != 1
+        || post[0].ordinal != clear.ordinal
+        || post[0].name != clear.name
+        || lineage.last().copied() != Some(post[0].current)
+    {
+        return Err(InvocationShapeError::InvalidNativeEcOpBinding);
     }
     Ok(owners)
 }
 
-fn record_destinations(
-    multiplicity: &PlannedGraphAMultiplicityWorkspace,
-    owners: &mut BTreeMap<&'static str, Vec<EcOpMultiplicityAdditiveOwner>>,
-    names: &[&'static str],
-    slots: &[stwo_backend_cuda::ArenaSlotId],
-    words: &[usize],
+fn append_feed_transition(
+    feed: &LoweredMultiplicityFeed,
+    clear: &super::multiplicity_clear::MultiplicityClearDestinationBinding,
+    lineage: &mut Vec<ValueVersion>,
+    owners: &mut Vec<EcOpMultiplicityAdditiveOwner>,
     owner: EcOpMultiplicityAdditiveOwner,
 ) -> Result<(), InvocationShapeError> {
-    if names.len() != slots.len() || names.len() != words.len() {
+    let matching = feed
+        .destinations
+        .iter()
+        .filter(|transition| transition.value == clear.value)
+        .collect::<Vec<_>>();
+    if matching.len() > 1 {
         return Err(InvocationShapeError::InvalidNativeEcOpBinding);
     }
-    for ((&name, &slot), &expected_words) in names.iter().zip(slots).zip(words) {
-        let (_, binding) = exact_multiplicity(multiplicity, name)?;
-        let destinations = owners
-            .get_mut(name)
-            .ok_or(InvocationShapeError::InvalidNativeEcOpBinding)?;
-        if binding.physical != slot
-            || binding.len_words != expected_words
-            || destinations.contains(&owner)
-        {
+    if let Some(transition) = matching.first() {
+        if transition.name != clear.name {
             return Err(InvocationShapeError::InvalidNativeEcOpBinding);
         }
-        destinations.push(owner);
+        append_transition(
+            clear,
+            transition.value,
+            transition.elements,
+            transition.source,
+            transition.destination,
+            lineage,
+        )?;
+        owners.push(owner);
     }
     Ok(())
+}
+
+fn append_transition(
+    clear: &super::multiplicity_clear::MultiplicityClearDestinationBinding,
+    value: ArenaCatalogValueId,
+    elements: ElementRange,
+    source: ValueVersion,
+    destination: ValueVersion,
+    lineage: &mut Vec<ValueVersion>,
+) -> Result<(), InvocationShapeError> {
+    if value != clear.value
+        || elements != clear.elements
+        || lineage.last() != Some(&source)
+        || source == destination
+        || lineage.contains(&destination)
+    {
+        return Err(InvocationShapeError::InvalidNativeEcOpBinding);
+    }
+    lineage.push(destination);
+    Ok(())
+}
+
+fn element_range(value: &ArenaCatalogRange) -> Result<ElementRange, InvocationShapeError> {
+    ElementRange::new(value.value_words.start, value.value_words.end)
+        .ok_or(InvocationShapeError::InvalidNativeEcOpBinding)
 }
 
 #[cfg(test)]

@@ -25,16 +25,12 @@ fn generated() -> (
 #[test]
 fn generated_sn2_binds_all_five_ec_setup_sources_by_role() {
     let (executable, values, base) = generated();
-    let setup = bind(executable.arena(), &base.producers, &values).unwrap();
+    let setup = bind(executable.arena(), &base, &values).unwrap();
     assert_eq!(setup.source_count(), EC_OP_SETUP_SOURCE_COUNT);
-    assert_eq!(setup.unresolved_origin_count(), EC_OP_SETUP_SOURCE_COUNT);
+    assert_eq!(setup.unresolved_origin_count(), 1);
     assert_eq!(
         setup.missing_origin_authorities(),
-        [
-            MissingEcOpSetupOriginAuthority::SegmentStartExternalInput,
-            MissingEcOpSetupOriginAuthority::BatchedMultiplicityClear,
-            MissingEcOpSetupOriginAuthority::GenericWitnessFeeds,
-        ]
+        [MissingEcOpSetupOriginAuthority::SegmentStartExternalInput]
     );
     assert_eq!(setup.segment_start.value.value_words, 0..1);
 
@@ -65,12 +61,30 @@ fn generated_sn2_binds_all_five_ec_setup_sources_by_role() {
         4
     );
     for source in &setup.multiplicities {
-        assert_eq!(
-            source.additive_owners.last(),
-            Some(&EcOpMultiplicityAdditiveOwner::NativeEcOp)
-        );
+        let native_positions = source
+            .additive_owners
+            .iter()
+            .enumerate()
+            .filter_map(|(position, owner)| {
+                (*owner == EcOpMultiplicityAdditiveOwner::NativeEcOp).then_some(position)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(native_positions.len(), 1);
+        let native_position = native_positions[0];
+        let lineage = values.versions_for(source.value.value).collect::<Vec<_>>();
+        assert_eq!(lineage.len(), source.additive_owners.len() + 1);
+        assert_eq!(lineage[native_position], source.source);
+        assert_eq!(lineage[native_position + 1], source.native_destination);
         assert_ne!(source.source, source.native_destination);
     }
+    assert!(setup.multiplicities.iter().any(|source| {
+        let native_position = source
+            .additive_owners
+            .iter()
+            .position(|owner| *owner == EcOpMultiplicityAdditiveOwner::NativeEcOp)
+            .unwrap();
+        native_position + 1 < source.additive_owners.len()
+    }));
     for role in [
         EcOpMultiplicityRole::AddressCounts,
         EcOpMultiplicityRole::BigCounts,
@@ -109,7 +123,11 @@ fn generated_sn2_binds_all_five_ec_setup_sources_by_role() {
         )
         .unwrap();
     assert_eq!(setup_versions.len(), EC_OP_SETUP_SOURCE_COUNT);
-    assert!(setup_versions.is_subset(&required));
+    assert!(required.contains(&setup.segment_start.source));
+    assert!(setup
+        .multiplicities
+        .iter()
+        .all(|source| !required.contains(&source.source)));
 
     let catalog = BaseProducerCatalog::compile(executable.arena()).unwrap();
     let setup_required = required
@@ -127,15 +145,16 @@ fn generated_sn2_binds_all_five_ec_setup_sources_by_role() {
             })
         })
         .collect::<BTreeSet<_>>();
-    assert_eq!(setup_required, setup_versions);
+    assert_eq!(setup_required, BTreeSet::from([setup.segment_start.source]));
 }
 
 #[test]
 fn setup_binding_rejects_native_value_and_effect_drift() {
     let (executable, values, base) = generated();
 
-    let mut changed = base.producers.clone();
+    let mut changed = base.clone();
     let contract = changed
+        .producers
         .iter_mut()
         .find_map(|producer| match producer {
             SemanticBaseProducer::NativeEcOp { contract, .. } => Some(contract),
@@ -145,8 +164,9 @@ fn setup_binding_rejects_native_value_and_effect_drift() {
     contract.invocation.segment_start.version = Some(ValueVersion(u32::MAX));
     assert!(bind(executable.arena(), &changed, &values).is_err());
 
-    let mut changed = base.producers.clone();
+    let mut changed = base.clone();
     let contract = changed
+        .producers
         .iter_mut()
         .find_map(|producer| match producer {
             SemanticBaseProducer::NativeEcOp { contract, .. } => Some(contract),
@@ -156,10 +176,48 @@ fn setup_binding_rejects_native_value_and_effect_drift() {
     contract.invocation.multiplicities.swap(0, 1);
     assert!(bind(executable.arena(), &changed, &values).is_err());
 
-    let setup = bind(executable.arena(), &base.producers, &values).unwrap();
+    let setup = bind(executable.arena(), &base, &values).unwrap();
     let mut transitioned = values.clone();
     transitioned
         .transition(setup.segment_start.value.value)
         .unwrap();
-    assert!(bind(executable.arena(), &base.producers, &transitioned).is_err());
+    assert!(bind(executable.arena(), &base, &transitioned).is_err());
+}
+
+#[test]
+fn setup_binding_rejects_clear_feed_and_post_witness_lineage_drift() {
+    let (executable, values, base) = generated();
+    let setup = bind(executable.arena(), &base, &values).unwrap();
+    let target = &setup.multiplicities[0];
+
+    let mut changed = base.clone();
+    changed.multiplicity.clear.destinations[target.clear_destination_index].version =
+        ValueVersion(u32::MAX);
+    assert!(bind(executable.arena(), &changed, &values).is_err());
+
+    let feed_indices = base
+        .multiplicity
+        .after_producer
+        .iter()
+        .enumerate()
+        .filter_map(|(index, feed)| feed.as_ref().map(|_| index))
+        .take(2)
+        .collect::<Vec<_>>();
+    assert_eq!(feed_indices.len(), 2);
+    let mut changed = base.clone();
+    changed
+        .multiplicity
+        .after_producer
+        .swap(feed_indices[0], feed_indices[1]);
+    assert!(bind(executable.arena(), &changed, &values).is_err());
+
+    let mut changed = base.clone();
+    let post_index = changed
+        .multiplicity
+        .post_witness_current
+        .iter()
+        .position(|entry| entry.value == target.value.value)
+        .unwrap();
+    changed.multiplicity.post_witness_current[post_index].current = ValueVersion(u32::MAX);
+    assert!(bind(executable.arena(), &changed, &values).is_err());
 }
