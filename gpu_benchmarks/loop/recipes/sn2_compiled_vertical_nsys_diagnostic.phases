@@ -8,6 +8,23 @@ export REPLACEMENT_SN2_MODE=vertical
 # shellcheck disable=SC1091
 source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
 
+vertical_nsys_install() {
+  local deb=/workspace/.cache/nsight-systems-2024.6.2_2024.6.2.225-1_amd64.deb
+  local sha=ebb52666c5e1d68d07f2e293774765f6c8639101f70fd970a5fd7c006a8ec442
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends ca-certificates curl sqlite3
+  mkdir -p "$(dirname "$deb")"
+  if ! printf '%s  %s\n' "$sha" "$deb" | sha256sum -c - >/dev/null 2>&1; then
+    rm -f "$deb"
+    curl -fL --retry 3 --retry-delay 2 -o "$deb" \
+      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/nsight-systems-2024.6.2_2024.6.2.225-1_amd64.deb
+  fi
+  printf '%s  %s\n' "$sha" "$deb" | sha256sum -c -
+  apt-get install -y -qq --no-install-recommends "$deb"
+  "$CHECKPOINT_NSYS_FALLBACK" --version 2>&1 | grep -Fq '2024.6.2.225'
+}
+
 vertical_nsys_resolve() {
   local nsys_bin
   nsys_bin="$(command -v nsys || true)"
@@ -723,6 +740,7 @@ PY
 phase ambient_override_gate checkpoint_reject_ambient_overrides
 phase source_input_identity checkpoint_source_input_identity iteration
 phase hardware_identity vertical_nsys_hardware_identity
+phase nsys_install vertical_nsys_install
 phase nsys_tool_identity checkpoint_nsys_tool_identity
 phase build vertical_nsys_build
 phase nsys_compiled_vertical_capture vertical_nsys_capture

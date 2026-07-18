@@ -95,6 +95,7 @@ _SN2_VERTICAL_RECIPES = {
             "phase ambient_override_gate checkpoint_reject_ambient_overrides",
             "phase source_input_identity checkpoint_source_input_identity iteration",
             "phase hardware_identity vertical_nsys_hardware_identity",
+            "phase nsys_install vertical_nsys_install",
             "phase nsys_tool_identity checkpoint_nsys_tool_identity",
             "phase build vertical_nsys_build",
             "phase nsys_compiled_vertical_capture vertical_nsys_capture",
@@ -104,6 +105,8 @@ _SN2_VERTICAL_RECIPES = {
         ),
         "required": (
             "validate_sn2_vertical_checkpoint.py",
+            "ebb52666c5e1d68d07f2e293774765f6c8639101f70fd970a5fd7c006a8ec442",
+            "sha256sum -c -",
             "--cuda-graph-trace=graph",
             "cuda_gpu_kern_sum",
             "cuda_api_sum",
