@@ -21,6 +21,7 @@ mod inventory;
 mod semantic;
 #[cfg(test)]
 mod tests;
+mod wrapper_execution;
 
 use inventory::{RelationArenaRange, RelationInventory};
 
@@ -88,6 +89,8 @@ impl LoweredRelationChallenge {
 pub(super) struct LoweredRelationWrapper {
     authority: RelationWrapperExecution,
     accesses: Vec<LoweredRelationAccess>,
+    invocation: AotInvocation,
+    effect: EffectContract,
 }
 
 impl LoweredRelationWrapper {
@@ -97,6 +100,14 @@ impl LoweredRelationWrapper {
 
     pub(super) fn accesses(&self) -> &[LoweredRelationAccess] {
         &self.accesses
+    }
+
+    pub(super) const fn invocation(&self) -> &AotInvocation {
+        &self.invocation
+    }
+
+    pub(super) const fn effect(&self) -> &EffectContract {
+        &self.effect
     }
 }
 
@@ -196,12 +207,33 @@ pub(super) fn resolve_challenge_static_wrapper(
     challenge_execution::resolve_static_wrapper(id, target_sm, &lowered.challenge)
 }
 
+pub(super) fn resolve_wrapper_static_authority(
+    id: StaticCudaWrapperId,
+    target_sm: u32,
+    lowered: &LoweredRelation,
+    wrapper_ordinal: usize,
+) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
+    validate_receipt(lowered)?;
+    wrapper_execution::resolve_static_wrapper(
+        id,
+        target_sm,
+        &lowered.authority,
+        lowered
+            .wrappers
+            .get(wrapper_ordinal)
+            .ok_or(InvocationShapeError::InvalidRelationBinding)?,
+    )
+}
+
 fn validate_receipt(lowered: &LoweredRelation) -> Result<(), InvocationShapeError> {
     lowered
         .authority
         .validate()
         .map_err(|_| InvocationShapeError::InvalidRelationAuthority)?;
     challenge_execution::validate(&lowered.challenge)?;
+    for wrapper in &lowered.wrappers {
+        wrapper_execution::validate(wrapper, &lowered.roles, &lowered.authority)?;
+    }
     if lowered.challenge.authority.max_alpha_powers()
         != lowered.authority.program().max_alpha_powers
         || lowered.roles.len() != lowered.authority.values().len()
@@ -259,6 +291,14 @@ fn receipt_digest(lowered: &LoweredRelation) -> Result<[u8; 32], InvocationShape
     hash_size(&mut hasher, lowered.wrappers.len())?;
     for wrapper in &lowered.wrappers {
         hasher.update(&[wrapper.authority.stage as u8]);
+        hasher.update(
+            wrapper
+                .invocation
+                .contract_id()
+                .map_err(|_| InvocationShapeError::InvalidRelationBinding)?
+                .as_bytes(),
+        );
+        hasher.update(wrapper.effect.id().as_bytes());
         hash_size(&mut hasher, wrapper.accesses.len())?;
         for access in &wrapper.accesses {
             hasher.update(&access.authority_index.to_le_bytes());

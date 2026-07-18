@@ -31,11 +31,45 @@ pub(super) fn lower(
     InvocationShapeError,
 > {
     let challenge = challenge_execution::lower(challenge_authority, inventory, values)?;
+    let descriptors = values.register_fixed_u32(authority.descriptor_words().to_vec())?;
+    let geometry = values.register_fixed_u32(authority.geometry_words().to_vec())?;
     let mut states = initial_states(authority, inventory, &challenge, values)?;
-    let body = lower_wrapper(&authority.wrappers()[0], inventory, values, &mut states)?;
-    let tail = lower_wrapper(&authority.wrappers()[1], inventory, values, &mut states)?;
+    install_fixed_metadata(&mut states, descriptors, geometry)?;
+    let body_accesses =
+        lower_wrapper_accesses(&authority.wrappers()[0], inventory, values, &mut states)?;
+    let tail_accesses =
+        lower_wrapper_accesses(&authority.wrappers()[1], inventory, values, &mut states)?;
     let roles = finish_roles(authority, states)?;
+    let body =
+        wrapper_execution::lower(authority, &authority.wrappers()[0], body_accesses, &roles)?;
+    let tail =
+        wrapper_execution::lower(authority, &authority.wrappers()[1], tail_accesses, &roles)?;
     Ok((challenge, roles, [body, tail]))
+}
+
+fn install_fixed_metadata(
+    states: &mut [RoleState],
+    descriptors: ValueVersion,
+    geometry: ValueVersion,
+) -> Result<(), InvocationShapeError> {
+    for (role, version) in [
+        (RelationValueRole::Descriptors, descriptors),
+        (RelationValueRole::Geometry, geometry),
+    ] {
+        let index = unique_role_index(states, role)?;
+        let state = states
+            .get_mut(index)
+            .ok_or(InvocationShapeError::InvalidRelationBinding)?;
+        if state.ownership != RelationValueOwnership::PreparedMetadata
+            || state.first.is_some()
+            || state.current.is_some()
+        {
+            return Err(InvocationShapeError::InvalidRelationAuthority);
+        }
+        state.first = Some(version);
+        state.current = Some(version);
+    }
+    Ok(())
 }
 
 fn initial_states(
@@ -73,12 +107,12 @@ fn initial_states(
         .collect()
 }
 
-fn lower_wrapper(
+fn lower_wrapper_accesses(
     authority: &RelationWrapperExecution,
     inventory: &RelationInventory,
     values: &mut adapter::SemanticValueMap,
     states: &mut [RoleState],
-) -> Result<LoweredRelationWrapper, InvocationShapeError> {
+) -> Result<Vec<LoweredRelationAccess>, InvocationShapeError> {
     if authority.accesses
         != authority
             .children
@@ -88,7 +122,7 @@ fn lower_wrapper(
     {
         return Err(InvocationShapeError::InvalidRelationAuthority);
     }
-    let accesses = authority
+    authority
         .accesses
         .iter()
         .enumerate()
@@ -101,11 +135,7 @@ fn lower_wrapper(
                 states,
             )
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(LoweredRelationWrapper {
-        authority: authority.clone(),
-        accesses,
-    })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn lower_access(
@@ -151,7 +181,7 @@ fn lower_access(
 
 fn read(state: &RoleState) -> Result<Option<ValueVersion>, InvocationShapeError> {
     match state.ownership {
-        RelationValueOwnership::PreparedMetadata => Ok(None),
+        RelationValueOwnership::PreparedMetadata => Ok(state.current),
         RelationValueOwnership::ExternalSource
         | RelationValueOwnership::TranscriptChallenge
         | RelationValueOwnership::ExecutionOutput
@@ -246,8 +276,15 @@ fn finish_roles(
                     | RelationValueOwnership::ExecutionScratch => {
                         state.first.is_none() || state.current.is_none()
                     }
-                    RelationValueOwnership::PreparedMetadata
-                    | RelationValueOwnership::ReservedUnused => {
+                    RelationValueOwnership::PreparedMetadata => match state.role {
+                        RelationValueRole::Descriptors | RelationValueRole::Geometry => {
+                            state.first.is_none()
+                                || state.current.is_none()
+                                || state.first != state.current
+                        }
+                        _ => state.first.is_some() || state.current.is_some(),
+                    },
+                    RelationValueOwnership::ReservedUnused => {
                         state.first.is_some() || state.current.is_some()
                     }
                 }

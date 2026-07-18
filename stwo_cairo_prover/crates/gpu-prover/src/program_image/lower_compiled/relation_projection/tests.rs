@@ -7,7 +7,9 @@ use stwo_backend_cuda::{
 };
 
 use super::*;
-use crate::compiled_proof::{AotArgumentBinding, AotArgumentValue, EffectAccess, EffectBindingId};
+use crate::compiled_proof::{
+    AotArgumentBinding, AotArgumentValue, EffectAccess, EffectBindingId, InPlaceAliasRequirement,
+};
 use crate::shape_executable::ShapeExecutable;
 
 struct Fixture {
@@ -156,6 +158,17 @@ fn only_real_sources_and_the_transcript_draw_preexist() {
                 assert!(fixture.before.version(role.arena.catalog).is_err());
                 assert!(role.first_version.is_some());
             }
+            RelationValueOwnership::PreparedMetadata
+                if matches!(
+                    role.role,
+                    RelationValueRole::Descriptors | RelationValueRole::Geometry
+                ) =>
+            {
+                assert!(role.first_version.is_some());
+                assert_eq!(role.first_version, role.final_version);
+                assert!(fixture.before.version(role.arena.catalog).is_err());
+                assert!(fixture.after.version(role.arena.catalog).is_err());
+            }
             RelationValueOwnership::PreparedMetadata | RelationValueOwnership::ReservedUnused => {
                 assert_eq!((role.first_version, role.final_version), (None, None));
                 assert!(fixture.before.version(role.arena.catalog).is_err());
@@ -255,6 +268,108 @@ fn challenge_invocation_tamper_fails_even_with_a_rehashed_receipt() {
     let fixture = fixture();
     let mut changed = fixture.lowered.clone();
     changed.challenge.invocation.arguments[0].value = AotArgumentValue::U32(0);
+    changed.digest = receipt_digest(&changed).unwrap();
+    assert!(validate_receipt(&changed).is_err());
+}
+
+#[test]
+fn body_and_tail_invocations_bind_only_ordered_semantic_leaves() {
+    let fixture = fixture();
+    let [body, tail] = fixture.lowered.wrappers();
+    let instances = fixture.lowered.authority().instances();
+
+    assert_eq!(body.invocation().arguments.len(), 10);
+    let AotArgumentValue::DeviceNestedPointerTableValue { entries: sources } =
+        &body.invocation().arguments[0].value
+    else {
+        panic!("body sources must be a nested relocation graph")
+    };
+    let AotArgumentValue::DevicePointerTableValue(descriptors) =
+        &body.invocation().arguments[1].value
+    else {
+        panic!("body descriptors must be a relocation table")
+    };
+    let AotArgumentValue::DeviceNestedPointerTableValue { entries: outputs } =
+        &body.invocation().arguments[2].value
+    else {
+        panic!("body outputs must be a nested relocation graph")
+    };
+    assert_eq!(sources.len(), instances.len());
+    assert_eq!(descriptors.entries.len(), instances.len());
+    assert_eq!(outputs.len(), instances.len());
+    for ((source, output), instance) in sources.iter().zip(outputs).zip(instances) {
+        assert_eq!(source.entries.len(), instance.source_pointer_count as usize);
+        assert!(source.entries.iter().all(Option::is_some));
+        assert_eq!(
+            output.entries.len(),
+            instance.output_coordinate_count as usize
+        );
+        assert!(output.entries.iter().all(Option::is_some));
+    }
+    assert!(matches!(
+        body.invocation().arguments[3].value,
+        AotArgumentValue::DeviceFixedU32 { .. }
+    ));
+    assert!(matches!(
+        body.invocation().arguments[9].value,
+        AotArgumentValue::HostFixedU32(_)
+    ));
+
+    assert_eq!(tail.invocation().arguments.len(), 9);
+    let AotArgumentValue::DeviceNestedPointerTableValue {
+        entries: tail_outputs,
+    } = &tail.invocation().arguments[0].value
+    else {
+        panic!("tail outputs must be a nested relocation graph")
+    };
+    let AotArgumentValue::DevicePointerTableValue(claimed) = &tail.invocation().arguments[1].value
+    else {
+        panic!("tail claimed sums must be a relocation table")
+    };
+    assert_eq!(tail_outputs.len(), instances.len());
+    assert_eq!(claimed.entries.len(), instances.len());
+    assert_eq!(
+        tail_outputs
+            .iter()
+            .flat_map(|table| &table.entries)
+            .filter(|entry| entry.is_some())
+            .count(),
+        instances.len() * 4
+    );
+    for (table, instance) in tail_outputs.iter().zip(instances) {
+        let split = table.entries.len() - 4;
+        assert_eq!(
+            table.entries.len(),
+            instance.output_coordinate_count as usize
+        );
+        assert!(table.entries[..split].iter().all(Option::is_none));
+        assert!(table.entries[split..].iter().all(Option::is_some));
+    }
+    assert!(claimed.entries.iter().all(Option::is_some));
+    assert_eq!(
+        tail.effect()
+            .accesses()
+            .iter()
+            .filter(|access| {
+                access
+                    .in_place()
+                    .is_some_and(|alias| alias.requirement == InPlaceAliasRequirement::Required)
+            })
+            .count(),
+        instances.len() * 4
+    );
+}
+
+#[test]
+fn pointer_graph_tamper_fails_even_with_a_rehashed_receipt() {
+    let fixture = fixture();
+    let mut changed = fixture.lowered.clone();
+    let AotArgumentValue::DeviceNestedPointerTableValue { entries } =
+        &mut changed.wrappers[1].invocation.arguments[0].value
+    else {
+        panic!("tail outputs must be nested")
+    };
+    entries[0].entries[0] = Some(EffectBindingId(u32::MAX));
     changed.digest = receipt_digest(&changed).unwrap();
     assert!(validate_receipt(&changed).is_err());
 }
