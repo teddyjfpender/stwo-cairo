@@ -58,6 +58,9 @@ def valid_record() -> dict[str, object]:
         "gpu_aot_runtime_cache_hits": 0, "gpu_aot_strict_rejections": 0,
         "gpu_aot_loads": 1, "gpu_aot_cache_hits": 5,
         "gpu_aot_manifest_hash": 7, "gpu_policy_kernel_manifest_hash": 7,
+        "gpu_composition_split_launch_mode": "fused-first-forward",
+        "gpu_composition_split_executed_kernel_launches": 5,
+        "gpu_composition_split_executed_logical_bytes": 4_026_531_840,
         "prove_s_warm_median": 2.0, "prove_s_warm_p95": 2.1,
         "useful_mhz_median": 3.8, "useful_mhz_at_warm_p95": 3.6,
         "verify_ms": 1.0,
@@ -146,8 +149,14 @@ class VerticalCheckpointValidatorTests(unittest.TestCase):
 
     def test_accepts_only_explicit_non_formal_vertical(self) -> None:
         result = self.run_validation(valid_record())
+        self.assertEqual(result["schema"], "stwo.sn2-compiled-vertical-checkpoint.v2")
         self.assertEqual(result["verdict"], "PASS")
         self.assertFalse(result["formal_promotion_eligible"])
+        self.assertEqual(result["composition_split_launch_mode"], "fused-first-forward")
+        self.assertEqual(result["composition_split_executed_kernel_launches"], 5)
+        self.assertEqual(
+            result["composition_split_executed_logical_bytes"], 4_026_531_840
+        )
         for field, bad in (
             ("performance_claim_class", "formal"),
             ("performance_claim_admissible", True),
@@ -160,6 +169,18 @@ class VerticalCheckpointValidatorTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 record = copy.deepcopy(valid_record())
+                record[field] = bad
+                with self.assertRaises(CheckpointError):
+                    self.run_validation(record)
+
+    def test_requires_exact_fused_log24_split_receipt(self) -> None:
+        for field, bad in (
+            ("gpu_composition_split_launch_mode", "terminal-fallback"),
+            ("gpu_composition_split_executed_kernel_launches", 6),
+            ("gpu_composition_split_executed_logical_bytes", 5_100_273_664),
+        ):
+            with self.subTest(field=field):
+                record = valid_record()
                 record[field] = bad
                 with self.assertRaises(CheckpointError):
                     self.run_validation(record)

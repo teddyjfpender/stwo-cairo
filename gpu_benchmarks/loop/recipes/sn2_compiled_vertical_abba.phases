@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Indicative SN2 old/new/new/old checkpoint. The replacement-v1 control is the
 # existing ArenaGraph prover; the treatment adds only the compiled Composition
-# vertical flag. Every process proves and verifies six identical SN2 statements.
+# vertical flag. The fused log24 boundary is qualified first; every ABBA process
+# then proves and verifies six identical SN2 statements.
 # pod_run: lease one_shot=false final_action=stop gpu=h100 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=3.00 name_prefix=replacement-v1-sn2- ttl_hours=2 idle_min=15
 
 export REPLACEMENT_SN2_MODE=vertical
@@ -37,14 +38,108 @@ vertical_abba_focused_test() {
     --lib -- --nocapture --test-threads=1
 }
 
+vertical_abba_require_native_receipt() {
+  local log="$1" marker="$2" schema="$3" out="$4"
+  python3 - "$log" "$marker" "$schema" "$out" <<'PY'
+import json
+import pathlib
+import sys
+
+log, marker, schema, out = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], pathlib.Path(sys.argv[4])
+prefix = marker + "="
+receipts = [
+    json.loads(line[len(prefix):])
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line.startswith(prefix)
+]
+if len(receipts) != 1:
+    raise SystemExit(f"{marker}: expected one exact receipt, got {len(receipts)}")
+receipt = receipts[0]
+cases = receipt.get("cases")
+if receipt.get("schema") != schema or receipt.get("passed") is not True:
+    raise SystemExit(f"{marker}: failed or malformed receipt")
+if not isinstance(cases, list) or len(cases) != 1 or cases[0].get("log_size") != 24:
+    raise SystemExit(f"{marker}: receipt is not exactly one log24 case")
+if marker == "STWO_COMPOSITION_SPLIT_NATIVE_RECEIPT_JSON":
+    required = (
+        "all_retained_bytes_equal",
+        "source_clobber_bytes_equal",
+        "guards_preserved",
+        "eager",
+        "capture_replay",
+        "mutated_replay",
+    )
+    if cases[0].get("graph_kernel_nodes") != 11 or any(receipt.get(field) is not True for field in required):
+        raise SystemExit(f"{marker}: fallback/fused differential contract failed")
+else:
+    required = (
+        "source_postimages_equal",
+        "coefficient_halves_equal",
+        "retained_evaluations_equal",
+        "leaf_hashes_equal",
+        "retained_merkle_layers_equal",
+        "roots_equal",
+        "guards_preserved",
+        "eager",
+        "capture_replay",
+        "mutated_replay",
+    )
+    if (cases[0].get("candidate_launch_mode") != "FusedFirstForward"
+            or cases[0].get("modeled_candidate_logical_bytes") != 4_026_531_840
+            or receipt.get("log24_candidate_launch_mode") != "FusedFirstForward"
+            or any(receipt.get(field) is not True for field in required)):
+        raise SystemExit(f"{marker}: fused commit/root contract failed")
+out.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+print(out.read_text(encoding="utf-8"), end="")
+PY
+}
+
+vertical_abba_split_native_gate() {
+  local log rc
+  log="$(checkpoint_artifact composition_split_log24_native.log)"
+  checkpoint_reject_ambient_overrides
+  cd "$STWO"
+  set +e
+  STWO_COMPOSITION_SPLIT_LOGS=24 cargo test --release --locked \
+    -p stwo-backend-cuda --test composition_split_native \
+    composition_split_exact_shape_fallback_matches_fused_eager_and_graph \
+    -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  [[ $rc -eq 0 ]] || return "$rc"
+  vertical_abba_require_native_receipt \
+    "$log" STWO_COMPOSITION_SPLIT_NATIVE_RECEIPT_JSON \
+    stwo.composition-split-native.v1 \
+    "$(checkpoint_artifact composition_split_log24_native.receipt.json)"
+}
+
+vertical_abba_split_commit_native_gate() {
+  local log rc
+  log="$(checkpoint_artifact composition_split_commit_log24_native.log)"
+  checkpoint_reject_ambient_overrides
+  cd "$STWO"
+  set +e
+  STWO_COMPOSITION_COMMIT_LOGS=24 cargo test --release --locked \
+    -p stwo-backend-cuda --test composition_split_commit_native \
+    fused_split_precomputed_commit_matches_legacy_pipeline_exactly \
+    -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  [[ $rc -eq 0 ]] || return "$rc"
+  vertical_abba_require_native_receipt \
+    "$log" STWO_COMPOSITION_SPLIT_COMMIT_NATIVE_RECEIPT_JSON \
+    stwo.composition-split-commit-native.v1 \
+    "$(checkpoint_artifact composition_split_commit_log24_native.receipt.json)"
+}
+
 vertical_abba_run() {
-  local variant="$1" ordinal="$2" name stdout stderr proof args_file rc
+  local variant="$1" ordinal="$2" reps="${3:-6}" name stdout stderr proof args_file rc
   local -a args=(
     --pie "$CHECKPOINT_PIE" --backend cuda --engine gpu-native
     --resident-backend replacement-v1
     --require-gpu-native-architecture
     --require-gpu-pcs-runtime-mode arena-graph
-    --reuse-input --reps 6
+    --reuse-input --reps "$reps"
     --require-proof-byte-equal
     --require-simd-reference-byte-equal
     --require-proof-mutation-rejected
@@ -85,10 +180,29 @@ vertical_abba_run() {
   cat "$stdout"
 }
 
+vertical_abba_validate_fused_pregate() {
+  python3 "$CHECKPOINT_ROOT/gpu_benchmarks/validate_sn2_vertical_checkpoint.py" \
+    --stdout "$(checkpoint_artifact newpregate.stdout.txt)" \
+    --proof "$(checkpoint_artifact newpregate.proof.bin)" \
+    --hardware "$(checkpoint_artifact hardware_identity.json)" \
+    --source "$(checkpoint_artifact source_input_identity.json)" \
+    --pie "$CHECKPOINT_PIE" \
+    --bootloader "$CHECKPOINT_BOOTLOADER" \
+    --input-manifest "$CHECKPOINT_INPUT_MANIFEST" \
+    --aot-manifest "$CHECKPOINT_AOT_MANIFEST" \
+    --stwo-head "$STWO_PARITY_REF_STWO_HEAD" \
+    --stwo-worktree "$STWO_PARITY_REF_STWO_WORKTREE_HASH" \
+    --stwo-cairo-head "$STWO_PARITY_REF_STWO_CAIRO_HEAD" \
+    --stwo-cairo-worktree "$STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH" \
+    --reps 2 >"$(checkpoint_artifact fused_pregate.record.json)"
+  cat "$(checkpoint_artifact fused_pregate.record.json)"
+}
+
 vertical_abba_proof_identity() {
   local baseline
   baseline="$(checkpoint_artifact old1.proof.bin)"
   for proof in \
+      "$(checkpoint_artifact newpregate.proof.bin)" \
       "$(checkpoint_artifact new1.proof.bin)" \
       "$(checkpoint_artifact new2.proof.bin)" \
       "$(checkpoint_artifact old2.proof.bin)"; do
@@ -99,6 +213,7 @@ vertical_abba_proof_identity() {
   done
   sha256sum \
     "$baseline" \
+    "$(checkpoint_artifact newpregate.proof.bin)" \
     "$(checkpoint_artifact new1.proof.bin)" \
     "$(checkpoint_artifact new2.proof.bin)" \
     "$(checkpoint_artifact old2.proof.bin)" \
@@ -128,6 +243,10 @@ phase source_input_identity checkpoint_source_input_identity iteration
 phase hardware_identity vertical_abba_hardware_identity
 phase composition_address_free_test vertical_abba_focused_test
 phase build vertical_abba_build
+phase composition_split_log24_native vertical_abba_split_native_gate
+phase composition_split_commit_log24_native vertical_abba_split_commit_native_gate
+phase fused_compiled_vertical_pregate vertical_abba_run new pregate 2
+phase fused_compiled_vertical_pregate_validate vertical_abba_validate_fused_pregate
 phase abba_old_1 vertical_abba_run old 1
 phase abba_new_1 vertical_abba_run new 1
 phase abba_new_2 vertical_abba_run new 2

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import copy
+import re
 import unittest
 from pathlib import Path
 
 try:
+    from gpu_benchmarks.fleet.gpufleet import pregate
     from gpu_benchmarks.validate_sn2_vertical_abba import (
         CheckpointError,
         _common_arguments,
         aggregate_abba,
     )
 except ModuleNotFoundError:
+    from fleet.gpufleet import pregate
     from validate_sn2_vertical_abba import (
         CheckpointError,
         _common_arguments,
@@ -44,6 +47,9 @@ def record(variant: str, start: int, samples: list[float]) -> dict[str, object]:
         "gpu_aot_strict_rejections": 0, "gpu_setup_base_migration_copies": 0,
         "gpu_setup_lookup_host_copies": 0, "gpu_setup_legacy_witness_fallbacks": 0,
         "gpu_aot_manifest_hash": 7, "gpu_policy_kernel_manifest_hash": 7,
+        "gpu_composition_split_launch_mode": "fused-first-forward",
+        "gpu_composition_split_executed_kernel_launches": 5,
+        "gpu_composition_split_executed_logical_bytes": 4_026_531_840,
         "performance_measurement_available": True,
         "throughput_distribution_applicable": True,
         "gpu_proof_blake3": "ab" * 32, "simd_reference_blake3": "ab" * 32,
@@ -125,6 +131,70 @@ class VerticalAbbaTests(unittest.TestCase):
         ]
         return pie, records, [b"proof"] * 4, arguments
 
+    def test_abba_pregate_covers_log24_native_gates_and_fused_byte_checkpoint(
+        self,
+    ) -> None:
+        recipe = (
+            Path(__file__).resolve().parent
+            / "loop/recipes/sn2_compiled_vertical_abba.phases"
+        )
+        source = recipe.read_text(encoding="utf-8")
+        functions = dict(
+            re.findall(r"^([a-z0-9_]+)\(\) \{\n(.*?)^\}", source, re.M | re.S)
+        )
+        phase_functions = {
+            line.split()[2]
+            for line in source.splitlines()
+            if line.startswith("phase ")
+        }
+
+        def require_phased_function(*fragments: str) -> None:
+            matches = {
+                name
+                for name, body in functions.items()
+                if all(fragment in body for fragment in fragments)
+            }
+            self.assertTrue(matches, f"no function contains {fragments!r}")
+            self.assertTrue(
+                matches & phase_functions,
+                f"function containing {fragments!r} is not a phase",
+            )
+
+        require_phased_function(
+            "STWO_COMPOSITION_SPLIT_LOGS=24",
+            "--test composition_split_native",
+            "--ignored",
+        )
+        require_phased_function(
+            "STWO_COMPOSITION_COMMIT_LOGS=24",
+            "--test composition_split_commit_native",
+            "--ignored",
+        )
+        runner = functions["vertical_abba_run"]
+        self.assertIn("$CHECKPOINT_GPU_BENCH", runner)
+        self.assertIn("--compiled-composition-vertical-checkpoint", runner)
+        self.assertIn("--reps \"$reps\"", runner)
+        self.assertIn("--require-proof-byte-equal", runner)
+        self.assertIn(
+            "phase fused_compiled_vertical_pregate vertical_abba_run new pregate 2",
+            source,
+        )
+        require_phased_function(
+            "validate_sn2_vertical_checkpoint.py",
+            "--reps 2",
+        )
+
+        spec = pregate._SN2_VERTICAL_RECIPES[pregate.SN2_VERTICAL_ABBA_RECIPE]
+        for fragment in (
+            "STWO_COMPOSITION_SPLIT_LOGS=24",
+            "composition_split_native",
+            "STWO_COMPOSITION_COMMIT_LOGS=24",
+            "composition_split_commit_native",
+            "--reps 2",
+        ):
+            with self.subTest(pregate_fragment=fragment):
+                self.assertIn(fragment, spec["required"])
+
     def test_aggregates_ten_warm_samples_per_variant(self) -> None:
         pie, records, proofs, arguments = self.evidence()
         result = aggregate_abba(records, proofs, arguments, pie)
@@ -132,6 +202,19 @@ class VerticalAbbaTests(unittest.TestCase):
         self.assertEqual(result["order"], ["old", "new", "new", "old"])
         self.assertEqual(result["warm_samples_per_variant"], 10)
         self.assertEqual(result["new_over_old_speedup"], 1.909091)
+
+    def test_requires_exact_fused_log24_split_receipt_in_every_variant(self) -> None:
+        for index in (0, 1):
+            for field, bad in (
+                ("gpu_composition_split_launch_mode", "terminal-fallback"),
+                ("gpu_composition_split_executed_kernel_launches", 6),
+                ("gpu_composition_split_executed_logical_bytes", 5_100_273_664),
+            ):
+                with self.subTest(index=index, field=field):
+                    pie, records, proofs, arguments = self.evidence()
+                    records[index][field] = bad
+                    with self.assertRaises(CheckpointError):
+                        aggregate_abba(records, proofs, arguments, pie)
 
     def test_fails_closed_on_arguments_proofs_and_soundness(self) -> None:
         for mutation in ("arguments", "proof", "simd", "mutation"):

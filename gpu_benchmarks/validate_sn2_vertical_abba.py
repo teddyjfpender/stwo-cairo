@@ -134,6 +134,9 @@ def _validate_common_record(record: dict[str, object], reps: int) -> list[float]
         "gpu_aot_provenance_gate_passed": True,
         "performance_measurement_available": True,
         "throughput_distribution_applicable": True,
+        "gpu_composition_split_launch_mode": "fused-first-forward",
+        "gpu_composition_split_executed_kernel_launches": 5,
+        "gpu_composition_split_executed_logical_bytes": 4_026_531_840,
     }
     for field, expected in exact.items():
         _require(
