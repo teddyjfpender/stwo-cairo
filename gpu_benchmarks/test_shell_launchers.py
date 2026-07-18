@@ -759,6 +759,7 @@ checkpoint_counter_timing_only
             )
             self.assertEqual(verdict["verdict"], "INCOMPLETE")
             self.assertFalse(verdict["formal_promotion_eligible"])
+            self.assertEqual(verdict["thresholds"]["useful_mhz_median_min"], 5.0)
             self.assertIn("nsys_profile_passed", verdict["failed_completion_checks"])
             self.assertEqual(
                 verdict["profile_status"]["ncu"], "OMITTED_COUNTER_UNAVAILABLE"
@@ -944,8 +945,8 @@ checkpoint_counter_timing_only
                     "performance_claim_admissible": True,
                     "gpu_graph_submit_gap_strict_gate_passed": True,
                     "gpu_host_preparation_total_ns": 120_000_001,
-                    "useful_mhz_median": 11.999,
-                    "useful_mhz_at_warm_p95": 11.0,
+                    "useful_mhz_median": 4.999,
+                    "useful_mhz_at_warm_p95": 4.5,
                     "gpu_max_graph_submit_gap_ms": 1.0,
                 },
                 "nsys_profile.json": {"status": "FAIL"},
@@ -980,6 +981,7 @@ checkpoint_counter_timing_only
             )
             self.assertEqual(verdict["verdict"], "FAIL")
             self.assertTrue(verdict["soft_failure"])
+            self.assertEqual(verdict["thresholds"]["useful_mhz_median_min"], 5.0)
             self.assertEqual(
                 set(verdict["failed_checks"]),
                 {
