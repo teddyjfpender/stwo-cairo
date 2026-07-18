@@ -15,7 +15,7 @@ use crate::compiled_proof::{
 use crate::transcript_plan::CairoTranscriptSegment;
 
 const CAPACITY_BYTES: usize = 29 << 30;
-const EXCHANGE_RESERVE_BYTES: usize = 4 << 30;
+const EXCHANGE_RESERVE_BYTES: usize = 5 << 30;
 
 struct BaseFixture {
     fixture: Fixture,

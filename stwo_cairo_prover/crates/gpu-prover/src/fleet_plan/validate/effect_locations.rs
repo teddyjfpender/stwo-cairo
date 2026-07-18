@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::{
     operation_placement, owner_ready_at, projected_range, range_covered, replica_ready_at,
 };
@@ -115,36 +117,41 @@ pub(super) fn one_affine_storage_covers(
         return false;
     };
     let element_bytes = value.layout.element.bytes;
-    for storage in plan
+    let storage_bytes = plan
         .placement
         .storages
         .iter()
         .filter(|storage| storage.worker == worker)
-    {
-        let mut windows = plan
-            .placement
-            .storage_bindings
-            .iter()
-            .filter(|binding| {
-                binding.storage == storage.id
-                    && binding.value.version == range.version
-                    && binding.value.elements.overlaps(range.elements)
-                    && available
-                        .iter()
-                        .any(|location| location.elements.contains(binding.value.elements))
-            })
-            .filter_map(|binding| {
-                let start = binding.value.elements.start.max(range.elements.start);
-                let end = binding.value.elements.end.min(range.elements.end);
-                let skipped = start
-                    .checked_sub(binding.value.elements.start)?
-                    .checked_mul(element_bytes)?;
-                Some((
-                    ElementRange::new(start, end)?,
-                    binding.offset_bytes.checked_add(skipped)?,
-                ))
-            })
-            .collect::<Vec<_>>();
+        .map(|storage| (storage.id, storage.bytes))
+        .collect::<BTreeMap<_, _>>();
+    let mut windows_by_storage = BTreeMap::<StorageId, Vec<(ElementRange, usize)>>::new();
+    for binding in plan.placement.storage_bindings.iter().filter(|binding| {
+        storage_bytes.contains_key(&binding.storage)
+            && binding.value.version == range.version
+            && binding.value.elements.overlaps(range.elements)
+            && available
+                .iter()
+                .any(|location| location.elements.contains(binding.value.elements))
+    }) {
+        let start = binding.value.elements.start.max(range.elements.start);
+        let end = binding.value.elements.end.min(range.elements.end);
+        let Some(offset) = start
+            .checked_sub(binding.value.elements.start)
+            .and_then(|skipped| skipped.checked_mul(element_bytes))
+            .and_then(|skipped| binding.offset_bytes.checked_add(skipped))
+        else {
+            continue;
+        };
+        let Some(elements) = ElementRange::new(start, end) else {
+            continue;
+        };
+        windows_by_storage
+            .entry(binding.storage)
+            .or_default()
+            .push((elements, offset));
+    }
+    for (storage, mut windows) in windows_by_storage {
+        let storage_bytes = storage_bytes[&storage];
         windows.sort_unstable_by_key(|(elements, offset)| (elements.start, elements.end, *offset));
         let mut cursor = range.elements.start;
         let mut base_offset = None;
@@ -180,7 +187,7 @@ pub(super) fn one_affine_storage_covers(
                 valid = false;
                 break;
             };
-            if elements.start != cursor || offset != expected || end > storage.bytes {
+            if elements.start != cursor || offset != expected || end > storage_bytes {
                 valid = false;
                 break;
             }
