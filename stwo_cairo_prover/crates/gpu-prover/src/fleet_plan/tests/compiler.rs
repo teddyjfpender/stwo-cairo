@@ -175,6 +175,99 @@ fn with_required_alias(fixture: Fixture) -> Fixture {
     recompile(fixture, input)
 }
 
+fn wrapper_launch(symbol: &[u8]) -> StaticCudaLaunchIdentity {
+    StaticCudaLaunchIdentity::new(
+        symbol.to_vec(),
+        LaunchGeometry {
+            grid: [1, 1, 1],
+            block: [128, 1, 1],
+            cluster: None,
+            dynamic_shared_bytes: 0,
+            cooperative: false,
+        },
+    )
+    .unwrap()
+}
+
+fn with_base_commit_required_alias(fixture: Fixture, destination_words: usize) -> Fixture {
+    let fixture = with_required_alias(fixture);
+    let mut input = fixture.compiled.input().clone();
+    let (source, destination) = alias_ranges(&fixture);
+    input.values[destination.version.0 as usize].layout.axes[0].extent = destination_words;
+    let effect = EffectContract::new(
+        vec![EffectAccess::ReadWrite {
+            source: bound(0, source),
+            destination: bound(0, value_range(destination.version, destination_words)),
+            in_place: Some(InPlaceAliasAuthority {
+                id: InPlaceAliasId(0),
+                requirement: InPlaceAliasRequirement::Required,
+                discipline: InPlaceDiscipline::OrderedCompositeInPlace,
+            }),
+        }],
+        vec![],
+    )
+    .unwrap();
+    let invocation = invocation(&effect).unwrap();
+    let old_effect = input.operations[0].effect;
+    input.operations[0].primitive = ExecutionPrimitive::StaticCudaWrapper {
+        wrapper: StaticCudaWrapperId(1),
+    };
+    input.operations[0].invocation = Some(invocation.clone());
+    input.operations[0].effect = effect.id();
+    input.static_wrappers = vec![StaticCudaWrapperAuthority::new(
+        StaticCudaWrapperId(1),
+        [0x21; 32],
+        89,
+        b"base_commit_alias_wrapper".to_vec(),
+        [0x22; 32],
+        [0x23; 32],
+        [0x24; 32],
+        [0x25; 32],
+        vec![wrapper_launch(b"base_copy"), wrapper_launch(b"base_finish")],
+        invocation.contract_id().unwrap(),
+        effect.id(),
+    )
+    .unwrap()];
+    input
+        .effects
+        .retain(|candidate| candidate.id() != old_effect);
+    input.effects.push(effect);
+    input.effects.sort_unstable_by_key(EffectContract::id);
+
+    let kernel = input.kernels[0].clone();
+    let accepted = input
+        .operations
+        .iter()
+        .filter_map(|operation| {
+            matches!(
+                operation.primitive,
+                ExecutionPrimitive::AotKernel { kernel: id, .. } if id == kernel.id()
+            )
+            .then(|| {
+                (
+                    operation.effect,
+                    operation.partition,
+                    operation
+                        .invocation
+                        .as_ref()
+                        .unwrap()
+                        .contract_id()
+                        .unwrap(),
+                )
+            })
+        })
+        .collect();
+    input.kernels = vec![AotKernelAuthority::new_with_accepted_executions(
+        kernel.id(),
+        kernel.module().clone(),
+        kernel.semantic_encoding().to_vec(),
+        kernel.execution_build_encoding().to_vec(),
+        accepted,
+    )
+    .unwrap()];
+    recompile(fixture, input)
+}
+
 fn replace_aot_effect(fixture: Fixture, operation: OpId, effect: EffectContract) -> Fixture {
     let mut input = fixture.compiled.input().clone();
     let node = &input.operations[operation.0 as usize];
@@ -593,6 +686,86 @@ fn compile_track_a_monolithic_places_exact_required_alias() {
     assert_eq!(storage_for(source), alias[0].storage);
     assert_eq!(storage_for(destination), alias[0].storage);
     plan.validate(transcript()).unwrap();
+}
+
+#[test]
+fn compile_track_a_monolithic_places_widening_and_narrowing_base_aliases() {
+    for destination_words in [8, 32] {
+        let fixture = with_base_commit_required_alias(fixture(), destination_words);
+        let source_words = fixture
+            .compiled
+            .value(fixture.spill_value)
+            .unwrap()
+            .layout
+            .element_count()
+            .unwrap();
+        let plan = compile_monolithic(fixture).unwrap();
+        let alias = plan.placement().in_place_aliases.as_slice();
+        assert_eq!(alias.len(), 1);
+        let storage = plan
+            .placement()
+            .storages
+            .iter()
+            .find(|storage| storage.id == alias[0].storage)
+            .unwrap();
+        assert_eq!(
+            storage.bytes,
+            source_words.max(destination_words) * size_of::<u32>()
+        );
+        let install = plan
+            .worker_install_plan(plan.placement().topology.coordinator)
+            .unwrap();
+        let binding = install.executions()[0].executables[0]
+            .effects
+            .iter()
+            .find(|binding| binding.binding == EffectBindingId(0))
+            .unwrap();
+        assert!(binding.source.is_some());
+        assert!(binding.destination.is_some());
+        assert_eq!(
+            binding.window.bytes,
+            source_words.max(destination_words) * size_of::<u32>()
+        );
+        plan.validate(transcript()).unwrap();
+
+        let mut undersized = plan.clone();
+        undersized.placement.storages[storage.id.0 as usize].bytes -= size_of::<u32>();
+        let error = undersized.validate(transcript()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                FleetPlanError::UndeclaredRead {
+                    operation: OpId(0),
+                    ..
+                } | FleetPlanError::InvalidProducer(_)
+            ),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn partitioned_compiler_keeps_base_required_aliases_fail_closed() {
+    let mut fixture = with_base_commit_required_alias(fixture(), 32);
+    let capacity = fixture.placement.topology.workers[0].capacity_bytes;
+    fixture.placement.topology.workers.push(WorkerSpec {
+        id: WorkerId(1),
+        capacity_bytes: capacity,
+        exchange_reserve_bytes: 0,
+    });
+    assert!(matches!(
+        FleetProofPlan::compile_track_a_partitioned(
+            fixture.compiled,
+            fixture.shape,
+            fixture.placement.topology,
+            fixture.placement.pow,
+            transcript(),
+        ),
+        Err(FleetCompileError::RequiredAlias {
+            operation: OpId(0),
+            alias: InPlaceAliasId(0),
+        })
+    ));
 }
 
 #[test]

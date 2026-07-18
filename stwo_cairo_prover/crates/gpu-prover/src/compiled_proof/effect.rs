@@ -481,11 +481,20 @@ fn validate_transition(
     }
     let source_elements = source.value.elements;
     let destination_elements = destination.value.elements;
-    let valid_extent = match in_place.map(|alias| alias.discipline) {
-        Some(InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite) => {
-            source_elements.start == destination_elements.start
+    let valid_extent = match in_place {
+        Some(InPlaceAliasAuthority {
+            discipline: InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite,
+            ..
+        }) => {
+            source_elements.start == 0
+                && destination_elements.start == 0
                 && source_elements.end < destination_elements.end
         }
+        Some(InPlaceAliasAuthority {
+            requirement: InPlaceAliasRequirement::Required,
+            discipline: InPlaceDiscipline::OrderedCompositeInPlace,
+            ..
+        }) => source_elements.start == 0 && destination_elements.start == 0,
         _ => source_elements.len() == destination_elements.len(),
     };
     if !valid_extent {
@@ -808,40 +817,57 @@ mod tests {
     }
 
     #[test]
-    fn exact_lower_prefix_discipline_is_the_only_widening_transition() {
-        let transition =
-            |source: ElementRange, destination: ElementRange, discipline: InPlaceDiscipline| {
-                EffectContract::new(
-                    vec![EffectAccess::ReadWrite {
-                        source: BoundValueRange {
-                            binding: EffectBindingId(0),
-                            value: ValueRange {
-                                version: ValueVersion(0),
-                                elements: source,
-                            },
+    fn composite_extent_changes_are_canonical_and_required() {
+        let transition = |source: ElementRange,
+                          destination: ElementRange,
+                          requirement: InPlaceAliasRequirement,
+                          discipline: InPlaceDiscipline| {
+            EffectContract::new(
+                vec![EffectAccess::ReadWrite {
+                    source: BoundValueRange {
+                        binding: EffectBindingId(0),
+                        value: ValueRange {
+                            version: ValueVersion(0),
+                            elements: source,
                         },
-                        destination: BoundValueRange {
-                            binding: EffectBindingId(1),
-                            value: ValueRange {
-                                version: ValueVersion(1),
-                                elements: destination,
-                            },
+                    },
+                    destination: BoundValueRange {
+                        binding: EffectBindingId(1),
+                        value: ValueRange {
+                            version: ValueVersion(1),
+                            elements: destination,
                         },
-                        in_place: Some(InPlaceAliasAuthority {
-                            id: InPlaceAliasId(0),
-                            requirement: InPlaceAliasRequirement::Permitted,
-                            discipline,
-                        }),
-                    }],
-                    Vec::new(),
-                )
-            };
+                    },
+                    in_place: Some(InPlaceAliasAuthority {
+                        id: InPlaceAliasId(0),
+                        requirement,
+                        discipline,
+                    }),
+                }],
+                Vec::new(),
+            )
+        };
         let lower = ElementRange::new(0, 4).unwrap();
         let wider = ElementRange::new(0, 8).unwrap();
         assert!(transition(
             lower,
             wider,
+            InPlaceAliasRequirement::Permitted,
             InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite
+        )
+        .is_ok());
+        assert!(transition(
+            lower,
+            wider,
+            InPlaceAliasRequirement::Required,
+            InPlaceDiscipline::OrderedCompositeInPlace
+        )
+        .is_ok());
+        assert!(transition(
+            wider,
+            lower,
+            InPlaceAliasRequirement::Required,
+            InPlaceDiscipline::OrderedCompositeInPlace
         )
         .is_ok());
         for (source, destination, discipline) in [
@@ -863,9 +889,23 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                transition(source, destination, discipline),
+                transition(
+                    source,
+                    destination,
+                    InPlaceAliasRequirement::Permitted,
+                    discipline
+                ),
                 Err(CompiledProofError::InvalidValueTransition)
             );
         }
+        assert_eq!(
+            transition(
+                lower,
+                wider,
+                InPlaceAliasRequirement::Permitted,
+                InPlaceDiscipline::OrderedCompositeInPlace
+            ),
+            Err(CompiledProofError::InvalidValueTransition)
+        );
     }
 }

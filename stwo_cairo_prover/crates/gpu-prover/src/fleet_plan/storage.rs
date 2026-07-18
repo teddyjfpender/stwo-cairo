@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 use crate::compiled_proof::{
-    ExecutionPrimitive, InPlaceAliasRequirement, ValueDesc, ValueRange, ValueVersion,
+    ExecutionPrimitive, InPlaceAliasRequirement, InPlaceDiscipline, ValueDesc, ValueRange,
+    ValueVersion,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -217,7 +218,11 @@ fn validate_alias(
     let source_live = binding_live(plan, source_binding)?;
     let destination_live = binding_live(plan, destination_binding)?;
     if source.version == destination.version
-        || source_bytes != destination_bytes
+        || !alias_extents_match(
+            bound.in_place().map(|alias| alias.discipline),
+            source_bytes,
+            destination_bytes,
+        )
         || storage.worker != operation_worker
         || source_offset != alias.offset_bytes
         || destination_offset != alias.offset_bytes
@@ -228,6 +233,20 @@ fn validate_alias(
         return Err(invalid_alias(operation.id, alias.alias));
     }
     Ok(())
+}
+
+fn alias_extents_match(
+    discipline: Option<InPlaceDiscipline>,
+    source_bytes: usize,
+    destination_bytes: usize,
+) -> bool {
+    match discipline {
+        Some(InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite) => {
+            source_bytes < destination_bytes
+        }
+        Some(InPlaceDiscipline::OrderedCompositeInPlace) => true,
+        _ => source_bytes == destination_bytes,
+    }
 }
 
 fn validate_reuse(plan: &FleetProofPlan) -> Result<(), FleetPlanError> {

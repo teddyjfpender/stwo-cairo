@@ -442,9 +442,14 @@ fn merge_effect(
     } else {
         &mut effect.destination
     };
-    if effect.window != window || slot.replace(range).is_some() {
+    if effect.window.storage != window.storage
+        || effect.window.offset_bytes != window.offset_bytes
+        || effect.window.slab_offset_bytes != window.slab_offset_bytes
+        || slot.replace(range).is_some()
+    {
         return Err(FleetWorkerInstallError::AmbiguousEffect { operation, binding });
     }
+    effect.window.bytes = effect.window.bytes.max(window.bytes);
     Ok(())
 }
 

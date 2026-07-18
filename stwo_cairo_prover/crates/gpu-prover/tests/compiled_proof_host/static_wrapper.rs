@@ -43,6 +43,28 @@ fn wrapper(
     .unwrap()
 }
 
+fn wrapper_for_invocation(
+    id: StaticCudaWrapperId,
+    effect: EffectContractId,
+    invocation: InvocationContractId,
+    launches: Vec<StaticCudaLaunchIdentity>,
+) -> StaticCudaWrapperAuthority {
+    StaticCudaWrapperAuthority::new(
+        id,
+        [0x51; 32],
+        89,
+        format!("stwo_static_wrapper_{}", id.0).into_bytes(),
+        [0xa7; 32],
+        [0xb3; 32],
+        [0xc5; 32],
+        [0xd9; 32],
+        launches,
+        invocation,
+        effect,
+    )
+    .unwrap()
+}
+
 fn wrapper_input(launches: Vec<StaticCudaLaunchIdentity>) -> CompiledProofInput {
     let mut input = valid_input();
     let effect = input.operations[0].effect;
@@ -51,6 +73,65 @@ fn wrapper_input(launches: Vec<StaticCudaLaunchIdentity>) -> CompiledProofInput 
     input.operations[0].primitive = ExecutionPrimitive::StaticCudaWrapper {
         wrapper: WRAPPER_ID,
     };
+    input
+}
+
+fn base_commit_transition_input(
+    discipline: InPlaceDiscipline,
+    requirement: InPlaceAliasRequirement,
+    source_words: usize,
+    launches: Vec<StaticCudaLaunchIdentity>,
+) -> CompiledProofInput {
+    let mut input = valid_input();
+    let output = input.output.sections[0].value;
+    let output_words = input.values[output.0 as usize]
+        .layout
+        .element_count()
+        .unwrap();
+    let source = ValueVersion(input.values.len() as u32);
+    input.values.push(u32_value(
+        source,
+        source_words,
+        ValueOrigin::ExternalInput(ExternalInputId(1_000_001)),
+        Region::Input,
+    ));
+
+    let mut accesses = input.effects[0]
+        .accesses()
+        .iter()
+        .filter(|access| matches!(access, EffectAccess::Read { .. }))
+        .cloned()
+        .collect::<Vec<_>>();
+    let source_binding = u32::try_from(accesses.len()).unwrap();
+    let destination_binding = if requirement == InPlaceAliasRequirement::Required {
+        source_binding
+    } else {
+        source_binding + 1
+    };
+    accesses.push(EffectAccess::ReadWrite {
+        source: bound(source_binding, value_range(source, source_words)),
+        destination: bound(destination_binding, value_range(output, output_words)),
+        in_place: Some(InPlaceAliasAuthority {
+            id: InPlaceAliasId(0),
+            requirement,
+            discipline,
+        }),
+    });
+    let effect = EffectContract::new(accesses, vec![]).unwrap();
+    let invocation = invocation(&effect).unwrap();
+    input.kernels.clear();
+    input.static_wrappers = vec![wrapper_for_invocation(
+        WRAPPER_ID,
+        effect.id(),
+        invocation.contract_id().unwrap(),
+        launches,
+    )];
+    input.effects = vec![effect.clone()];
+    input.operations[0].primitive = ExecutionPrimitive::StaticCudaWrapper {
+        wrapper: WRAPPER_ID,
+    };
+    input.operations[0].invocation = Some(invocation);
+    input.operations[0].effect = effect.id();
     input
 }
 
@@ -83,6 +164,77 @@ fn exact_projections(effect: &EffectContract) -> Vec<PartitionEffectProjection> 
             }
         })
         .collect()
+}
+
+#[test]
+fn base_commit_extent_changes_require_exact_sealed_composite_authority() {
+    let output_words = valid_input().output.layout.total_words;
+    for input in [
+        base_commit_transition_input(
+            InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite,
+            InPlaceAliasRequirement::Permitted,
+            output_words / 2,
+            three_launches(),
+        ),
+        base_commit_transition_input(
+            InPlaceDiscipline::OrderedCompositeInPlace,
+            InPlaceAliasRequirement::Required,
+            output_words / 2,
+            three_launches(),
+        ),
+        base_commit_transition_input(
+            InPlaceDiscipline::OrderedCompositeInPlace,
+            InPlaceAliasRequirement::Required,
+            output_words * 2,
+            three_launches(),
+        ),
+    ] {
+        CompiledProof::compile(input, transcript()).unwrap();
+    }
+
+    let single_step = base_commit_transition_input(
+        InPlaceDiscipline::OrderedCompositeInPlace,
+        InPlaceAliasRequirement::Required,
+        output_words * 2,
+        vec![launch(b"single_step", 1)],
+    );
+    assert_eq!(
+        CompiledProof::compile(single_step, transcript()).unwrap_err(),
+        CompiledProofError::InvalidValueTransition
+    );
+}
+
+#[test]
+fn base_commit_extent_discipline_cannot_widen_an_aot_kernel() {
+    let output_words = valid_input().output.layout.total_words;
+    let mut input = base_commit_transition_input(
+        InPlaceDiscipline::OrderedCompositeInPlace,
+        InPlaceAliasRequirement::Required,
+        output_words / 2,
+        three_launches(),
+    );
+    let effect = input.effects[0].id();
+    let invocation = input.operations[0].invocation.clone().unwrap();
+    input.static_wrappers.clear();
+    input.kernels = vec![kernel(
+        module(),
+        vec![(effect, invocation.clone())],
+        b"forged-base-extent-aot",
+    )];
+    input.operations[0].primitive = ExecutionPrimitive::AotKernel {
+        kernel: AotKernelId(1),
+        launch: LaunchGeometry {
+            grid: [1, 1, 1],
+            block: [128, 1, 1],
+            cluster: None,
+            dynamic_shared_bytes: 0,
+            cooperative: false,
+        },
+    };
+    assert_eq!(
+        CompiledProof::compile(input, transcript()).unwrap_err(),
+        CompiledProofError::InvalidValueTransition
+    );
 }
 
 #[test]

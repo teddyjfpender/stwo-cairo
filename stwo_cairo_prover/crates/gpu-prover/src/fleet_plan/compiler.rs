@@ -11,8 +11,8 @@ use std::sync::Arc;
 use super::*;
 use crate::compiled_proof::{
     exact_partial_atomic_carry_forward, CompiledProof, ExecutionPrimitive, InPlaceAliasId,
-    InPlaceAliasRequirement, OpId, OpNode, PartitionAuthorityKind, ProofStage, Region, ValueOrigin,
-    ValueRange, ValueVersion,
+    InPlaceAliasRequirement, InPlaceDiscipline, OpId, OpNode, PartitionAuthorityKind, ProofStage,
+    Region, ValueOrigin, ValueRange, ValueVersion,
 };
 use crate::fleet_pow::{FleetPowError, FleetPowSchedule};
 use crate::shape_executable::ShapeExecutableIdentity;
@@ -244,11 +244,11 @@ fn compile_storage(
     let ingress_reuses = statement_host_reuses(compiled)?;
     let ingress_components = compile_ingress_components(compiled.values().len(), &ingress_reuses)?;
 
-    let mut storages = Vec::new();
+    let mut storages = Vec::<StorageDesc>::new();
     let mut bindings = Vec::new();
-    let mut value_storages = vec![None; compiled.values().len()];
-    let mut component_storages = vec![None; required_aliases.len()];
-    let mut ingress_storages = vec![None; ingress_reuses.len()];
+    let mut value_storages = vec![None::<StorageId>; compiled.values().len()];
+    let mut component_storages = vec![None::<StorageId>; required_aliases.len()];
+    let mut ingress_storages = vec![None::<StorageId>; ingress_reuses.len()];
     for value in compiled
         .values()
         .iter()
@@ -263,17 +263,26 @@ fn compile_storage(
         let existing = component
             .and_then(|component| component_storages[component])
             .or_else(|| ingress_component.and_then(|component| ingress_storages[component]));
+        let bytes = value
+            .layout
+            .logical_bytes()
+            .map_err(|_| FleetCompileError::SizeOverflow)?;
         let id = match existing {
-            Some(id) => id,
+            Some(id) => {
+                let storage = storages
+                    .get_mut(id.0 as usize)
+                    .filter(|storage| storage.id == id)
+                    .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+                storage.bytes = storage.bytes.max(bytes);
+                storage.alignment_bytes = storage.alignment_bytes.max(value.alignment);
+                id
+            }
             None => {
                 let id = next_storage_id(storages.len())?;
                 storages.push(StorageDesc {
                     id,
                     worker: coordinator,
-                    bytes: value
-                        .layout
-                        .logical_bytes()
-                        .map_err(|_| FleetCompileError::SizeOverflow)?,
+                    bytes,
                     alignment_bytes: value.alignment,
                 });
                 if let Some(component) = component {
@@ -501,7 +510,11 @@ fn compile_required_aliases(
                     ..
                 }]
             ) || !(whole_value || exact_carried_prefix)
-                || source_value.layout != destination_value.layout
+                || !required_alias_layouts_match(
+                    authority.discipline,
+                    source_value,
+                    destination_value,
+                )
                 || source_value.alignment != destination_value.alignment
                 || source_value.region == Region::FixedData
                 || destination_value.region == Region::FixedData
@@ -538,6 +551,28 @@ fn compile_required_aliases(
         }
     }
     Ok(aliases)
+}
+
+fn required_alias_layouts_match(
+    discipline: InPlaceDiscipline,
+    source: &crate::compiled_proof::ValueDesc,
+    destination: &crate::compiled_proof::ValueDesc,
+) -> bool {
+    if source.layout.element != destination.layout.element {
+        return false;
+    }
+    match discipline {
+        InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite => source
+            .layout
+            .element_count()
+            .ok()
+            .zip(destination.layout.element_count().ok())
+            .is_some_and(|(source, destination)| source < destination),
+        InPlaceDiscipline::OrderedCompositeInPlace => true,
+        InPlaceDiscipline::ElementWiseReadBeforeWrite
+        | InPlaceDiscipline::BlockBarrierPhases
+        | InPlaceDiscipline::CooperativeGridPhases => source.layout == destination.layout,
+    }
 }
 
 fn compile_alias_components(

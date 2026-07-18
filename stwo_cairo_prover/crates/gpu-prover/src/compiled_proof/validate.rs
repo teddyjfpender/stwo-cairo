@@ -306,15 +306,20 @@ fn validate_operations(
             if let (Some(source), Some(destination)) = (access.source(), access.destination()) {
                 let source_value = value(input, source.value.version)?;
                 let destination_value = value(input, destination.value.version)?;
-                if source_value.layout != destination_value.layout
-                    || source_value.layout.element != destination_value.layout.element
-                    || matches!(
-                        access,
-                        EffectAccess::Atomic {
-                            operation: AtomicOperation::AddU32,
-                            ..
-                        }
-                    ) && source_value.layout.element != ElementType::U32
+                validate_operation_value_transition(
+                    input,
+                    operation,
+                    access,
+                    source_value,
+                    destination_value,
+                )?;
+                if matches!(
+                    access,
+                    EffectAccess::Atomic {
+                        operation: AtomicOperation::AddU32,
+                        ..
+                    }
+                ) && source_value.layout.element != ElementType::U32
                 {
                     return Err(CompiledProofError::InvalidValueTransition);
                 }
@@ -323,6 +328,77 @@ fn validate_operations(
     }
     statement_host_ingress::validate_lineages(input)?;
     super::carry_forward::validate_write_coverage(input, &mut writes)
+}
+
+fn validate_operation_value_transition(
+    input: &CompiledProofInput,
+    operation: &OpNode,
+    access: &EffectAccess,
+    source: &ValueDesc,
+    destination: &ValueDesc,
+) -> Result<(), CompiledProofError> {
+    if source.layout.element != destination.layout.element {
+        return Err(CompiledProofError::InvalidValueTransition);
+    }
+    let EffectAccess::ReadWrite {
+        source: source_range,
+        destination: destination_range,
+        in_place: Some(alias),
+    } = access
+    else {
+        return (source.layout == destination.layout)
+            .then_some(())
+            .ok_or(CompiledProofError::InvalidValueTransition);
+    };
+    let special = matches!(
+        alias.discipline,
+        InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite
+            | InPlaceDiscipline::OrderedCompositeInPlace
+    );
+    if !special {
+        return (source.layout == destination.layout)
+            .then_some(())
+            .ok_or(CompiledProofError::InvalidValueTransition);
+    }
+    let full = |value: &ValueDesc, range: ValueRange| {
+        value
+            .layout
+            .element_count()
+            .ok()
+            .and_then(|elements| ElementRange::new(0, elements))
+            == Some(range.elements)
+    };
+    let sealed_composite_wrapper = match operation.primitive {
+        ExecutionPrimitive::StaticCudaWrapper { wrapper } => input
+            .static_wrappers
+            .binary_search_by_key(&wrapper, StaticCudaWrapperAuthority::id)
+            .ok()
+            .and_then(|index| input.static_wrappers.get(index))
+            .is_some_and(|authority| {
+                authority.accepted_effect() == operation.effect
+                    && authority.execution_steps().len() > 1
+            }),
+        _ => false,
+    };
+    let exact_shape = match alias.discipline {
+        InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite => {
+            source_range.value.elements.start == 0
+                && destination_range.value.elements.start == 0
+                && source_range.value.elements.end < destination_range.value.elements.end
+        }
+        InPlaceDiscipline::OrderedCompositeInPlace => {
+            alias.requirement == InPlaceAliasRequirement::Required
+                && source_range.value.elements.start == 0
+                && destination_range.value.elements.start == 0
+        }
+        _ => false,
+    };
+    (full(source, source_range.value)
+        && full(destination, destination_range.value)
+        && sealed_composite_wrapper
+        && exact_shape)
+        .then_some(())
+        .ok_or(CompiledProofError::InvalidValueTransition)
 }
 
 fn validate_source(
