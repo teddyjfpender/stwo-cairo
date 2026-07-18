@@ -1858,7 +1858,7 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
                     ))?
                 }
                 ResidentProofExecution::CompiledCompositionVerticalCheckpoint => {
-                    runtime.hot_path_telemetry()
+                    runtime.require_compiled_eager_boundary(bundle_bytes)?
                 }
             };
             let transcript_mirror = match transcript_mode {

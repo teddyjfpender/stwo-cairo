@@ -435,6 +435,25 @@ impl ResidentHotPathBudget {
     }
 }
 
+fn compiled_eager_boundary_accepts(
+    actual: CudaExecTelemetry,
+    expected_d2h_bytes: u64,
+) -> bool {
+    actual.sync_calls == 1
+        && actual.h2d_bytes == 0
+        && actual.d2h_bytes == expected_d2h_bytes
+        && actual.allocations == 0
+        && actual.allocation_bytes == 0
+        && actual.frees == 0
+        && actual.capture_begins == 0
+        && actual.capture_finishes == 0
+        && actual.capture_aborts == 0
+        && actual.graph_launches == 0
+        && actual.kernel_launches == 0
+        && actual.graph_submit_gap_ns_total == 0
+        && actual.graph_submit_gap_ns_max == 0
+}
+
 #[derive(Debug)]
 pub enum ResidentRuntimeError {
     PersistentRuntimePoisoned,
@@ -557,6 +576,10 @@ pub enum ResidentRuntimeError {
     FleetPowControl(String),
     HotPathBudgetExceeded {
         budget: ResidentHotPathBudget,
+        actual: CudaExecTelemetry,
+    },
+    CompiledEagerBoundaryExceeded {
+        expected_d2h_bytes: u64,
         actual: CudaExecTelemetry,
     },
     CapturedGraphTopology {
@@ -3662,6 +3685,23 @@ impl<'a> ResidentGraphRuntime<'a> {
         let actual = self.hot_path_telemetry();
         if !budget.accepts(actual) {
             return Err(ResidentRuntimeError::HotPathBudgetExceeded { budget, actual });
+        }
+        Ok(actual)
+    }
+
+    /// Accept the opt-in eager checkpoint only when its measured host boundary
+    /// is the final proof readback. Device-local clears, copies and lane
+    /// scheduling remain valid eager work and are deliberately unconstrained.
+    pub fn require_compiled_eager_boundary(
+        &self,
+        expected_d2h_bytes: u64,
+    ) -> Result<CudaExecTelemetry, ResidentRuntimeError> {
+        let actual = self.hot_path_telemetry();
+        if !compiled_eager_boundary_accepts(actual, expected_d2h_bytes) {
+            return Err(ResidentRuntimeError::CompiledEagerBoundaryExceeded {
+                expected_d2h_bytes,
+                actual,
+            });
         }
         Ok(actual)
     }
@@ -7783,6 +7823,50 @@ mod tests {
         reject_counter!(lane_forks, 1);
         reject_counter!(lane_joins, 1);
         reject_counter!(graph_submit_gap_ns_max, 50_000_000);
+    }
+
+    #[test]
+    fn compiled_eager_boundary_allows_only_the_final_host_readback() {
+        let expected_d2h_bytes = 371_604;
+        let exact = CudaExecTelemetry {
+            sync_calls: 1,
+            d2h_bytes: expected_d2h_bytes,
+            memset_bytes: 4,
+            fill_words: 2,
+            d2d_bytes: 8,
+            lane_forks: 3,
+            lane_joins: 3,
+            ..CudaExecTelemetry::default()
+        };
+        assert!(compiled_eager_boundary_accepts(
+            exact,
+            expected_d2h_bytes
+        ));
+        macro_rules! reject_counter {
+            ($field:ident, $value:expr) => {{
+                let mut changed = exact;
+                changed.$field = $value;
+                assert!(
+                    !compiled_eager_boundary_accepts(changed, expected_d2h_bytes),
+                    stringify!($field)
+                );
+            }};
+        }
+        reject_counter!(sync_calls, 0);
+        reject_counter!(sync_calls, 2);
+        reject_counter!(h2d_bytes, 4);
+        reject_counter!(d2h_bytes, expected_d2h_bytes - 4);
+        reject_counter!(d2h_bytes, expected_d2h_bytes + 4);
+        reject_counter!(allocations, 1);
+        reject_counter!(allocation_bytes, 4);
+        reject_counter!(frees, 1);
+        reject_counter!(capture_begins, 1);
+        reject_counter!(capture_finishes, 1);
+        reject_counter!(capture_aborts, 1);
+        reject_counter!(graph_launches, 1);
+        reject_counter!(kernel_launches, 1);
+        reject_counter!(graph_submit_gap_ns_total, 1);
+        reject_counter!(graph_submit_gap_ns_max, 1);
     }
 
     #[test]
