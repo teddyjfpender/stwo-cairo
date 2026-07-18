@@ -25,6 +25,7 @@ mod compiler;
 mod composite_internal_read;
 mod distributed_compiler;
 mod ipc_cursor;
+mod ipc_rank_install;
 mod operation_execution;
 mod operation_reads;
 mod pow;

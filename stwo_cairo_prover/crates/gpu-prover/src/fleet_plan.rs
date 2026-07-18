@@ -18,6 +18,7 @@ use crate::transcript_plan::{
 mod compiler;
 mod identity;
 mod ipc_cursor;
+mod ipc_rank_install;
 mod lower_compiled;
 mod runtime_view;
 mod storage;
@@ -29,9 +30,15 @@ mod worker_install;
 mod tests;
 
 pub use compiler::FleetCompileError;
-pub use ipc_cursor::{
-    FleetIpcAttemptState, FleetIpcCoordinatorCursor, FleetIpcCursorError, FleetIpcCursorProgress,
-    FleetIpcPhase, FleetIpcPhaseBinding, FleetIpcPhaseReceipt,
+pub use ipc_cursor::FleetIpcCursorError;
+use ipc_cursor::IpcScheduleCursor;
+pub(crate) use ipc_cursor::{
+    FleetIpcAttemptState, FleetIpcCoordinatorCursor, FleetIpcCursorProgress, FleetIpcPhase,
+    FleetIpcRankPhaseStatement, FleetIpcRuntimeRosterBinding,
+};
+pub(crate) use ipc_rank_install::{
+    FleetIpcDescriptorBundle, FleetIpcRankDescriptorStatement, FleetIpcRankInstallAcknowledgement,
+    FleetIpcRankInstallError, FleetIpcRankInstalled, FleetIpcRankOwnerExports,
 };
 pub use lower_compiled::{
     FleetLoweringError, FleetOperationExecution, FleetOperationPlacement, FleetOwnerPlacement,

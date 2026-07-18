@@ -100,7 +100,7 @@ impl FleetProofPlan {
         let transcript_ordinals = validate_install_closure(self, &view, &installs)?;
         let replay = ReplayIndex::new(self, &view, &installs, transcript_ordinals)?;
 
-        let mut ipc = FleetIpcCoordinatorCursor::new(&view, proof_generation)?;
+        let mut ipc = IpcScheduleCursor::new(&view, proof_generation)?;
         let mut coordinator = CoordinatorBarrierCursor::new(self, proof_generation)?;
         let mut workers = [
             WorkerBarrierCursor::new(self, proof_generation)?,
@@ -408,7 +408,7 @@ fn start_transfer_wave(
     view: &FleetRuntimeView,
     proof_generation: u64,
     step: ScheduleStep,
-    ipc: &mut FleetIpcCoordinatorCursor,
+    ipc: &mut IpcScheduleCursor,
     workers: &[WorkerBarrierCursor; 2],
     started_edges: &mut BTreeSet<u64>,
 ) -> Result<(), FleetTwoRankStructuralClosureError> {
@@ -453,14 +453,15 @@ fn start_transfer_wave(
         FleetIpcPhase::Reclaimed,
         FleetIpcPhase::Armed,
     ] {
+        let generation = if phase == FleetIpcPhase::Armed {
+            proof_generation
+                .checked_add(1)
+                .ok_or(FleetIpcCursorError::GenerationOverflow)?
+        } else {
+            proof_generation
+        };
         for &edge in &active {
-            let receipt = FleetIpcPhaseReceipt::for_span(
-                plan.identity(),
-                proof_generation,
-                span(view, edge)?,
-                phase,
-            )?;
-            ipc.accept(receipt)?;
+            ipc.accept_phase(edge, phase, generation)?;
         }
     }
     for edge in active {
