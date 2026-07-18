@@ -8,12 +8,12 @@ use stwo_backend_cuda::{
 
 use super::{CompositionWorkspaceRequirements, PreparedCompositionError, SECURE_COORDINATES};
 
-// The SM90 log-24 fused boundary is not yet hardware-qualified in a complete
-// proof graph. Keep that shape on the last byte-identical terminal path; log 25
-// retains its existing 256-thread specialization.
+// Both production shapes use the authority-sealed, spill-free 256-thread
+// fused boundary. Hardware qualification is fail-closed before the complete
+// proof checkpoint.
 const fn production_split_mode(evaluation_log_size: u32) -> CompositionSplitLaunchMode {
     match evaluation_log_size {
-        25 => CompositionSplitLaunchMode::FusedFirstForward,
+        24 | 25 => CompositionSplitLaunchMode::FusedFirstForward,
         _ => CompositionSplitLaunchMode::TerminalFallback,
     }
 }
@@ -126,7 +126,7 @@ mod tests {
     fn production_split_mode_respects_the_sm90_launch_budget() {
         assert_eq!(
             production_split_mode(24),
-            CompositionSplitLaunchMode::TerminalFallback
+            CompositionSplitLaunchMode::FusedFirstForward
         );
         assert_eq!(
             production_split_mode(25),

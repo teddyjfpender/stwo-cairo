@@ -5,7 +5,7 @@
 //! This module closes the missing proof that that prepared graph is the one
 //! described by the complete structural and linked Composition authorities.
 
-use stwo_backend_cuda::COMPOSITION_RETAINED_COLUMNS;
+use stwo_backend_cuda::{CompositionSplitLaunchMode, COMPOSITION_RETAINED_COLUMNS};
 
 use crate::arena_plan::ProofArenaPlan;
 use crate::prepared_composition::{
@@ -289,6 +289,8 @@ fn validate_prepared_graph(
             .sum::<usize>()
             != receipt.part_count
         || prepared.output_mode() != CompositionOutputMode::DirectRetainedEvaluations
+        || prepared.direct_split_launch_mode()
+            != Some(CompositionSplitLaunchMode::FusedFirstForward)
         || plan.composition().output_plan.mode() != CompositionOutputMode::DirectRetainedEvaluations
     {
         return Err("prepared Composition graph receipt");
