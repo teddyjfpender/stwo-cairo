@@ -166,7 +166,16 @@ fn generated_sn2_post_base_shape_receipt_is_exact() {
     assert_eq!(quotient.config.log_blowup_factor, 1);
     assert_eq!(quotient.requirements.subdomain_log_size, 23);
     assert_eq!(quotient.requirements.sample_count, 15);
-    assert!(quotient.producer_b2n.is_none());
+    let producer_b2n = quotient
+        .producer_b2n
+        .as_ref()
+        .expect("canonical SN2 must select the exact log23 producer/B2N fusion");
+    let receipt = producer_b2n.receipt();
+    assert_eq!(receipt.schedule.lifting_log_size, 24);
+    assert_eq!(receipt.schedule.subdomain_log_size, 23);
+    assert_eq!(receipt.schedule.sample_count, 15);
+    assert_eq!(receipt.traffic.eliminated_kernel_launches, 21);
+    assert_eq!(receipt.traffic.eliminated_logical_bytes, 5_637_144_576);
 
     let fri = arena.fri();
     assert_eq!(protocol.fri_fold_launch_mode, FriFoldLaunchMode::PerFold);
