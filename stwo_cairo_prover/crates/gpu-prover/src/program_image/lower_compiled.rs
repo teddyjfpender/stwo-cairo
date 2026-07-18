@@ -35,6 +35,7 @@ mod blake_g_direct_tests;
 mod compiled_base_prefix;
 #[cfg(test)]
 mod compiled_base_prefix_tests;
+mod composition_prelude_projection;
 mod composition_projection;
 mod ec_op_execution_authority;
 #[cfg(test)]
@@ -291,6 +292,8 @@ enum InvocationShapeError {
     InvalidRelationBinding,
     InvalidCompositionAuthority,
     InvalidCompositionBinding,
+    InvalidCompositionPreludeAuthority,
+    InvalidCompositionPreludeBinding,
     InvalidTranscriptSemanticProjection,
 }
 

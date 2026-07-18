@@ -1,25 +1,69 @@
 use super::*;
 use crate::compiled_proof::PartitionAuthorityKind;
+use crate::transcript_plan::CairoTranscriptSegment;
 
 fn fixture() -> (
     std::sync::Arc<crate::shape_executable::ShapeExecutable>,
     adapter::SemanticValueMap,
     adapter::SemanticValueMap,
+    super::super::composition_prelude_projection::LoweredCompositionPrelude,
     LoweredCompositionWaves,
 ) {
     let executable = super::super::tests::generated_sn2_replacement();
     let mut values = adapter::SemanticValueMap::allocate_ordered(
-        wave_input_catalogs(executable.arena()).unwrap(),
+        executable
+            .arena()
+            .transcript()
+            .inputs
+            .iter()
+            .map(|(_, binding)| ArenaCatalogValueId(binding.logical.0)),
     )
     .unwrap();
+    let bootstrap = super::super::transcript_semantic_projection::lower_segment(
+        executable.arena(),
+        executable.transcript(),
+        CairoTranscriptSegment::BootstrapThroughBase,
+        None,
+        &mut values,
+    )
+    .unwrap();
+    let lookup = super::super::transcript_semantic_projection::lower_segment(
+        executable.arena(),
+        executable.transcript(),
+        CairoTranscriptSegment::InteractionPowAndLookup,
+        Some(&bootstrap),
+        &mut values,
+    )
+    .unwrap();
+    values
+        .extend_ordered(
+            super::super::composition_prelude_projection::required_upstream_catalogs(
+                executable.arena(),
+            )
+            .unwrap()
+            .into_iter()
+            .chain(wave_external_catalogs(executable.arena()).unwrap()),
+        )
+        .unwrap();
+    super::super::transcript_semantic_projection::lower_segment(
+        executable.arena(),
+        executable.transcript(),
+        CairoTranscriptSegment::InteractionAndComposition,
+        Some(&lookup),
+        &mut values,
+    )
+    .unwrap();
+    let prelude =
+        super::super::composition_prelude_projection::lower_stage(executable.arena(), &mut values)
+            .unwrap();
     let before = values.clone();
-    let lowered = lower_waves(executable.arena(), &mut values).unwrap();
-    (executable, before, values, lowered)
+    let lowered = lower_waves(executable.arena(), &prelude, &mut values).unwrap();
+    (executable, before, values, prelude, lowered)
 }
 
 #[test]
 fn generated_sn2_projects_all_waves_into_exact_row_partitions() {
-    let (executable, before, after, lowered) = fixture();
+    let (executable, before, after, prelude, lowered) = fixture();
     assert_eq!(lowered.waves().len(), 14);
     assert_eq!(
         lowered
@@ -30,7 +74,7 @@ fn generated_sn2_projects_all_waves_into_exact_row_partitions() {
         (2..16).collect::<Vec<_>>()
     );
     assert_ne!(lowered.digest(), [0; 32]);
-    assert!(validate_from(executable.arena(), &before, &after, &lowered).is_ok());
+    assert!(validate_from(executable.arena(), &prelude, &before, &after, &lowered).is_ok());
 
     for (index, wave) in lowered.waves().iter().enumerate() {
         let expected = &executable.arena().composition().requirements.waves[index];
@@ -63,7 +107,7 @@ fn generated_sn2_projects_all_waves_into_exact_row_partitions() {
             .bindings()
             .iter()
             .filter(|binding| binding.kind == CompositionAccessKind::Write)
-            .all(|binding| binding.elements
+            .all(|binding| binding.role_elements
                 == ElementRange {
                     start: 0,
                     end: expected.row_count,
@@ -77,7 +121,7 @@ fn generated_sn2_projects_all_waves_into_exact_row_partitions() {
 
 #[test]
 fn pointer_graph_preserves_record_and_field_shape_without_duplicate_bindings() {
-    let (executable, _, _, lowered) = fixture();
+    let (executable, _, _, _, lowered) = fixture();
     for (wave, requirement) in lowered
         .waves()
         .iter()
@@ -120,18 +164,18 @@ fn pointer_graph_preserves_record_and_field_shape_without_duplicate_bindings() {
 
 #[test]
 fn projection_is_transactional_and_receipt_tamper_fails_closed() {
-    let (executable, before, after, lowered) = fixture();
+    let (executable, before, after, prelude, lowered) = fixture();
     let mut missing =
         adapter::SemanticValueMap::allocate_ordered(std::iter::empty::<ArenaCatalogValueId>())
             .unwrap();
     let unchanged = missing.clone();
-    assert!(lower_waves(executable.arena(), &mut missing).is_err());
+    assert!(lower_waves(executable.arena(), &prelude, &mut missing).is_err());
     assert_eq!(missing, unchanged);
 
     let mut forged = lowered.clone();
     forged.digest[0] ^= 1;
     assert_eq!(
-        validate_from(executable.arena(), &before, &after, &forged),
+        validate_from(executable.arena(), &prelude, &before, &after, &forged),
         Err(InvocationShapeError::InvalidCompositionBinding)
     );
 }

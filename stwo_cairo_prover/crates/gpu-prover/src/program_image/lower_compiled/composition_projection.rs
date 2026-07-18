@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::arena_plan::{LogicalBufferId, ProofArenaPlan};
+use crate::arena_plan::ProofArenaPlan;
 use crate::compiled_proof::{
     AotArgumentBinding, AotArgumentValue, AotInvocation, BoundValueRange,
     DeviceRecordPointerBinding, DeviceRecordPointerFieldBinding, EffectAccess, EffectBindingId,
@@ -19,7 +19,13 @@ use crate::prepared_composition::{
     CompositionLayout, CompositionOperation, CompositionOperationKind, CompositionValueRole,
 };
 
+use super::composition_prelude_projection::{
+    LoweredCompositionPrelude, LoweredCompositionPreludeValueKind,
+};
 use super::{adapter, ArenaCatalogValueId, InvocationShapeError};
+
+mod receipt;
+use receipt::{receipt_digest, validate_receipt};
 
 const RECEIPT_DOMAIN: &[u8] = b"stwo-cairo.lowered-composition-waves.v1\0";
 
@@ -29,6 +35,7 @@ pub(super) struct LoweredCompositionBinding {
     pub(super) role: CompositionValueRole,
     pub(super) arena: CompositionLayout,
     pub(super) version: ValueVersion,
+    pub(super) role_elements: ElementRange,
     pub(super) elements: ElementRange,
     pub(super) kind: CompositionAccessKind,
 }
@@ -102,8 +109,10 @@ impl LoweredCompositionWaves {
 /// external inputs.
 pub(super) fn lower_waves(
     arena: &ProofArenaPlan,
+    prelude: &LoweredCompositionPrelude,
     values: &mut adapter::SemanticValueMap,
 ) -> Result<LoweredCompositionWaves, InvocationShapeError> {
+    prelude.validate_against_values(arena, values)?;
     let authority = CompositionExecutionAuthority::compile(arena)
         .map_err(|_| InvocationShapeError::InvalidCompositionAuthority)?;
     authority
@@ -138,31 +147,33 @@ pub(super) fn lower_waves(
             operation_ordinal,
             wave_index,
             operation,
+            prelude,
             &mut next_values,
         )?);
     }
     if waves.len() != authority.waves().len() {
         return Err(InvocationShapeError::InvalidCompositionAuthority);
     }
-    let digest = receipt_digest(&authority, &waves)?;
+    let digest = receipt_digest(&authority, prelude, &waves)?;
     let lowered = LoweredCompositionWaves {
         authority,
         waves,
         digest,
     };
-    validate_receipt(arena, &lowered)?;
+    validate_receipt(arena, prelude, &lowered)?;
     *values = next_values;
     Ok(lowered)
 }
 
 pub(super) fn validate_from(
     arena: &ProofArenaPlan,
+    prelude: &LoweredCompositionPrelude,
     before: &adapter::SemanticValueMap,
     after: &adapter::SemanticValueMap,
     supplied: &LoweredCompositionWaves,
 ) -> Result<(), InvocationShapeError> {
     let mut exact_values = before.clone();
-    let exact = lower_waves(arena, &mut exact_values)?;
+    let exact = lower_waves(arena, prelude, &mut exact_values)?;
     if &exact == supplied && &exact_values == after {
         Ok(())
     } else {
@@ -170,7 +181,7 @@ pub(super) fn validate_from(
     }
 }
 
-pub(super) fn wave_input_catalogs(
+pub(super) fn wave_external_catalogs(
     arena: &ProofArenaPlan,
 ) -> Result<Vec<ArenaCatalogValueId>, InvocationShapeError> {
     let authority = CompositionExecutionAuthority::compile(arena)
@@ -192,6 +203,13 @@ pub(super) fn wave_input_catalogs(
             let Some(role) = access.source else {
                 continue;
             };
+            if matches!(
+                role,
+                CompositionValueRole::ExtParam { .. }
+                    | CompositionValueRole::RandomCoefficientPowers
+            ) {
+                continue;
+            }
             let layout = layouts
                 .get(&role)
                 .ok_or(InvocationShapeError::InvalidCompositionBinding)?;
@@ -209,6 +227,7 @@ fn lower_wave(
     operation_ordinal: usize,
     wave_index: usize,
     operation: &CompositionOperation,
+    prelude: &LoweredCompositionPrelude,
     values: &mut adapter::SemanticValueMap,
 ) -> Result<LoweredCompositionWave, InvocationShapeError> {
     let requirement = arena
@@ -239,7 +258,7 @@ fn lower_wave(
         return Err(InvocationShapeError::InvalidCompositionAuthority);
     }
 
-    let mut builder = WaveBindingBuilder::new(layouts, values);
+    let mut builder = WaveBindingBuilder::new(layouts, prelude, values);
     let parts_role = CompositionValueRole::Descriptor {
         kind: CompositionDescriptorRole::WaveParts,
         index: u32::try_from(wave_index).map_err(|_| InvocationShapeError::SizeOverflow)?,
@@ -354,6 +373,7 @@ fn lower_wave(
 
 struct WaveBindingBuilder<'a> {
     layouts: &'a BTreeMap<CompositionValueRole, CompositionLayout>,
+    prelude: &'a LoweredCompositionPrelude,
     values: &'a mut adapter::SemanticValueMap,
     outputs: BTreeMap<CompositionValueRole, ValueVersion>,
     accesses: Vec<EffectAccess>,
@@ -363,10 +383,12 @@ struct WaveBindingBuilder<'a> {
 impl<'a> WaveBindingBuilder<'a> {
     fn new(
         layouts: &'a BTreeMap<CompositionValueRole, CompositionLayout>,
+        prelude: &'a LoweredCompositionPrelude,
         values: &'a mut adapter::SemanticValueMap,
     ) -> Self {
         Self {
             layouts,
+            prelude,
             values,
             outputs: BTreeMap::new(),
             accesses: Vec::new(),
@@ -454,9 +476,36 @@ impl<'a> WaveBindingBuilder<'a> {
         elements: ElementRange,
     ) -> Result<EffectBindingId, InvocationShapeError> {
         let arena = *self.layout(role)?;
-        let semantic = offset_range(arena, elements)?;
-        let version = self.values.version(ArenaCatalogValueId(arena.logical.0))?;
-        self.push(role, arena, version, semantic, CompositionAccessKind::Read)
+        let (version, semantic) = if matches!(
+            role,
+            CompositionValueRole::ExtParam { .. } | CompositionValueRole::RandomCoefficientPowers
+        ) {
+            let value = self.prelude.wave_value(role)?;
+            let semantic = match value.kind {
+                LoweredCompositionPreludeValueKind::Fixed
+                | LoweredCompositionPreludeValueKind::DynamicOutput => elements,
+                LoweredCompositionPreludeValueKind::CatalogOutput(_) => {
+                    offset_range(arena, elements)?
+                }
+                LoweredCompositionPreludeValueKind::CatalogInput(_) => {
+                    return Err(InvocationShapeError::InvalidCompositionBinding)
+                }
+            };
+            (value.version, semantic)
+        } else {
+            (
+                self.values.version(ArenaCatalogValueId(arena.logical.0))?,
+                offset_range(arena, elements)?,
+            )
+        };
+        self.push(
+            role,
+            arena,
+            version,
+            elements,
+            semantic,
+            CompositionAccessKind::Read,
+        )
     }
 
     fn write_full(
@@ -480,6 +529,10 @@ impl<'a> WaveBindingBuilder<'a> {
                 start: 0,
                 end: arena.word_len,
             },
+            ElementRange {
+                start: 0,
+                end: arena.word_len,
+            },
             CompositionAccessKind::Write,
         )
     }
@@ -489,6 +542,7 @@ impl<'a> WaveBindingBuilder<'a> {
         role: CompositionValueRole,
         arena: CompositionLayout,
         version: ValueVersion,
+        role_elements: ElementRange,
         elements: ElementRange,
         kind: CompositionAccessKind,
     ) -> Result<EffectBindingId, InvocationShapeError> {
@@ -511,6 +565,7 @@ impl<'a> WaveBindingBuilder<'a> {
             role,
             arena,
             version,
+            role_elements,
             elements,
             kind,
         });
@@ -563,12 +618,12 @@ fn validate_projected_roles(
             .iter()
             .filter_map(|access| access.source.map(|role| (role, access.elements))),
     );
-    let actual_reads = bindings
-        .iter()
-        .filter(|binding| binding.kind == CompositionAccessKind::Read)
-        .map(relative_read_range)
-        .collect::<Result<Vec<_>, _>>()?;
-    let actual_reads = count_role_ranges(actual_reads.into_iter());
+    let actual_reads = count_role_ranges(
+        bindings
+            .iter()
+            .filter(|binding| binding.kind == CompositionAccessKind::Read)
+            .map(|binding| (binding.role, binding.role_elements)),
+    );
     let expected_writes = count_role_ranges(
         child
             .effect
@@ -580,36 +635,23 @@ fn validate_projected_roles(
         bindings
             .iter()
             .filter(|binding| binding.kind == CompositionAccessKind::Write)
-            .map(|binding| (binding.role, binding.elements)),
+            .map(|binding| (binding.role, binding.role_elements)),
     );
-    if expected_reads != actual_reads
+    // The source authority deliberately de-duplicates equal semantic reads
+    // across wave parts. The proof invocation cannot reuse one effect binding
+    // at several pointer-graph leaves, so projection expands those authorized
+    // reads into one binding per exact record occurrence. Record construction
+    // fixes multiplicity; this gate proves that expansion adds no semantic read.
+    let expected_read_roles = expected_reads.keys().copied().collect::<BTreeSet<_>>();
+    let actual_read_roles = actual_reads.keys().copied().collect::<BTreeSet<_>>();
+    if expected_read_roles != actual_read_roles
         || expected_writes != actual_writes
-        || child.effect.accesses.len() != bindings.len()
+        || child.effect.accesses.len() != expected_reads.len() + expected_writes.len()
         || effect.accesses().len() != bindings.len()
     {
         return Err(InvocationShapeError::InvalidCompositionBinding);
     }
     Ok(())
-}
-
-fn relative_read_range(
-    binding: &LoweredCompositionBinding,
-) -> Result<(CompositionValueRole, ElementRange), InvocationShapeError> {
-    Ok((
-        binding.role,
-        ElementRange {
-            start: binding
-                .elements
-                .start
-                .checked_sub(binding.arena.first_word)
-                .ok_or(InvocationShapeError::InvalidCompositionBinding)?,
-            end: binding
-                .elements
-                .end
-                .checked_sub(binding.arena.first_word)
-                .ok_or(InvocationShapeError::InvalidCompositionBinding)?,
-        },
-    ))
 }
 
 fn count_role_ranges(
@@ -682,55 +724,6 @@ fn insert_once(
 
 fn argument(ordinal: u8, value: AotArgumentValue) -> AotArgumentBinding {
     AotArgumentBinding { ordinal, value }
-}
-
-fn validate_receipt(
-    arena: &ProofArenaPlan,
-    lowered: &LoweredCompositionWaves,
-) -> Result<(), InvocationShapeError> {
-    lowered
-        .authority
-        .validate_against(arena)
-        .map_err(|_| InvocationShapeError::InvalidCompositionAuthority)?;
-    if lowered.waves.len() != lowered.authority.waves().len()
-        || lowered.waves.iter().enumerate().any(|(index, wave)| {
-            wave.shard.wave_index() != index
-                || wave.shard.effect() != wave.effect.id()
-                || wave.shard.partition().kind()
-                    == &crate::compiled_proof::PartitionAuthorityKind::Monolithic
-        })
-        || receipt_digest(&lowered.authority, &lowered.waves)? != lowered.digest
-    {
-        return Err(InvocationShapeError::InvalidCompositionBinding);
-    }
-    Ok(())
-}
-
-fn receipt_digest(
-    authority: &CompositionExecutionAuthority,
-    waves: &[LoweredCompositionWave],
-) -> Result<[u8; 32], InvocationShapeError> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(RECEIPT_DOMAIN);
-    hasher.update(&authority.identity());
-    hasher.update(
-        &u64::try_from(waves.len())
-            .map_err(|_| InvocationShapeError::SizeOverflow)?
-            .to_le_bytes(),
-    );
-    for wave in waves {
-        hasher.update(&wave.operation_ordinal.to_le_bytes());
-        hasher.update(&wave.operation.identity);
-        hasher.update(wave.effect.id().as_bytes());
-        hasher.update(
-            wave.invocation
-                .contract_id()
-                .map_err(|_| InvocationShapeError::InvalidCompositionBinding)?
-                .as_bytes(),
-        );
-        hasher.update(wave.shard.digest());
-    }
-    Ok(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]
