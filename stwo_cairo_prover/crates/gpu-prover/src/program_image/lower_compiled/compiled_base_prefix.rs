@@ -15,6 +15,8 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTra
 use super::producer_prefix::{BaseProducerAuthority, SemanticBaseProducer};
 use super::resolved_recorded_build_authority::ResolvedRecordedBuildAuthority;
 use super::*;
+#[cfg(test)]
+use crate::compiled_proof::EffectAccess;
 use crate::compiled_proof::{
     AotInvocation, AotKernelAuthority, AotKernelId, EffectContract, EffectContractId,
     ExecutionPrimitive, FixedValueDesc, ModuleGlobalInitializer, ModuleIdentity, OpId, OpNode,
@@ -43,6 +45,10 @@ pub(super) enum StaticWrapperKind {
     ExecutionTableSmall,
     MultiplicityClear,
     PublicMemorySeed,
+    WitnessInputGather,
+    WitnessInputSeed,
+    WitnessInputCompact,
+    WitnessCasmScatter,
     MultiplicityFeed,
     NativeBlakeGDirect,
     NativeEcOp,
@@ -54,6 +60,10 @@ const BUILD_DOMAIN: &[u8] = b"stwo-cairo.recorded-base.execution-build.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MissingBaseAdapter {
+    WitnessInputGatherStaticWrapper,
+    WitnessInputSeedStaticWrapper,
+    WitnessInputCompactStaticWrapper,
+    WitnessCasmScatterStaticWrapper,
     MultiplicityFeedStaticWrapper,
     NativeBlakeGDirectStaticWrapper,
     NativeEcOpStaticWrapper,
@@ -82,7 +92,9 @@ pub(super) struct CompiledWitnessWriterPrefix {
     /// lowering still follow.
     values: adapter::SemanticValueMap,
     base_authority: BaseProducerAuthority,
+    causal_setup: emission::CausalWitnessSetup,
     next_producer: usize,
+    causal_external_roots: Option<BTreeSet<ValueVersion>>,
     required_preproducer_versions: BTreeSet<ValueVersion>,
     kernel_by_build_authority: BTreeMap<[u8; 32], usize>,
     pub(super) kernels: Vec<AotKernelAuthority>,
@@ -116,6 +128,66 @@ impl CompiledWitnessWriterPrefix {
     }
 
     #[cfg(test)]
+    pub(super) fn causal_external_roots(&self) -> Option<&BTreeSet<ValueVersion>> {
+        self.causal_external_roots.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn expected_causal_external_roots(&self) -> BTreeSet<ValueVersion> {
+        let setup_destinations = self
+            .causal_setup
+            .gathers
+            .iter()
+            .map(|setup| &setup.effect)
+            .chain(
+                self.causal_setup
+                    .seed_compact
+                    .iter()
+                    .map(|setup| setup.effect()),
+            )
+            .chain(self.causal_setup.casm.iter().map(|setup| &setup.effect))
+            .flat_map(|effect| effect.accesses().iter())
+            .filter_map(EffectAccess::destination)
+            .map(|destination| destination.value.version)
+            .collect::<BTreeSet<_>>();
+        let mut roots = self
+            .required_preproducer_versions
+            .difference(&setup_destinations)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        roots.extend(self.causal_setup.seed_compact.iter().filter_map(|setup| {
+            let super::witness_input_seed_compact::LoweredWitnessInputSetup::Seed(seed) = setup
+            else {
+                return None;
+            };
+            Some(seed.scalar_source.version)
+        }));
+        roots
+    }
+
+    #[cfg(test)]
+    pub(super) fn causal_seed_scalar_roots(&self) -> BTreeSet<ValueVersion> {
+        self.causal_setup
+            .seed_compact
+            .iter()
+            .filter_map(|setup| {
+                let super::witness_input_seed_compact::LoweredWitnessInputSetup::Seed(seed) = setup
+                else {
+                    return None;
+                };
+                Some(seed.scalar_source.version)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn causal_casm_setup(
+        &self,
+    ) -> &[super::witness_casm_input::LoweredWitnessCasmInput] {
+        &self.causal_setup.casm
+    }
+
+    #[cfg(test)]
     pub(super) const fn values(&self) -> &adapter::SemanticValueMap {
         &self.values
     }
@@ -123,6 +195,15 @@ impl CompiledWitnessWriterPrefix {
     #[cfg(test)]
     pub(super) const fn base_authority(&self) -> &BaseProducerAuthority {
         &self.base_authority
+    }
+
+    #[cfg(test)]
+    pub(super) fn causal_setup_counts(&self) -> (usize, usize, usize) {
+        (
+            self.causal_setup.gathers.len(),
+            self.causal_setup.seed_compact.len(),
+            self.causal_setup.casm.len(),
+        )
     }
 
     #[cfg(test)]
@@ -253,6 +334,89 @@ fn validate_witness_writer_transitions(
     Ok(required_preproducer_versions)
 }
 
+fn validate_causal_value_closure(
+    values: &adapter::SemanticValueMap,
+    effects: &[EffectContract],
+    operations: &[OpNode],
+) -> Result<BTreeSet<ValueVersion>, ()> {
+    let (catalog_first, transitions, fixed) = values.allocation_classes();
+    let allocated = catalog_first
+        .iter()
+        .chain(&transitions)
+        .chain(&fixed)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if allocated != values.allocated_versions().collect()
+        || !catalog_first.is_disjoint(&transitions)
+        || !catalog_first.is_disjoint(&fixed)
+        || !transitions.is_disjoint(&fixed)
+    {
+        return Err(());
+    }
+    let effect_by_id = effects
+        .iter()
+        .map(|effect| (effect.id(), effect))
+        .collect::<BTreeMap<_, _>>();
+    if effect_by_id.len() != effects.len() {
+        return Err(());
+    }
+
+    let mut destination_producer = BTreeMap::<ValueVersion, usize>::new();
+    let mut sources = Vec::new();
+    for (operation_index, operation) in operations.iter().enumerate() {
+        let effect = effect_by_id.get(&operation.effect).ok_or(())?;
+        for access in effect.accesses() {
+            if let Some(destination) = access.destination() {
+                let version = destination.value.version;
+                if !allocated.contains(&version) || fixed.contains(&version) {
+                    return Err(());
+                }
+                match destination_producer.insert(version, operation_index) {
+                    Some(previous) if previous != operation_index => return Err(()),
+                    _ => {}
+                }
+            }
+            if let Some(source) = access.source() {
+                if !allocated.contains(&source.value.version) {
+                    return Err(());
+                }
+                sources.push((operation_index, source.value.version));
+            }
+        }
+    }
+    if transitions
+        .iter()
+        .any(|version| !destination_producer.contains_key(version))
+    {
+        return Err(());
+    }
+
+    let external_roots = sources
+        .iter()
+        .filter_map(|&(_, source)| {
+            (!fixed.contains(&source) && !destination_producer.contains_key(&source))
+                .then_some(source)
+        })
+        .collect::<BTreeSet<_>>();
+    if !external_roots.is_subset(&catalog_first)
+        || allocated.iter().any(|version| {
+            !fixed.contains(version)
+                && !destination_producer.contains_key(version)
+                && !external_roots.contains(version)
+        })
+    {
+        return Err(());
+    }
+    for (consumer, source) in sources {
+        match destination_producer.get(&source) {
+            Some(&producer) if producer < consumer => {}
+            None if fixed.contains(&source) || external_roots.contains(&source) => {}
+            _ => return Err(()),
+        }
+    }
+    Ok(external_roots)
+}
+
 fn compiled_kernel(
     id: AotKernelId,
     source: &RecordedWitnessInvocationShape,
@@ -366,6 +530,15 @@ pub(super) fn validate_witness_writer_transitions_for_test(
 }
 
 #[cfg(test)]
+pub(super) fn validate_causal_value_closure_for_test(
+    values: &adapter::SemanticValueMap,
+    effects: &[EffectContract],
+    operations: &[OpNode],
+) -> Result<BTreeSet<ValueVersion>, ()> {
+    validate_causal_value_closure(values, effects, operations)
+}
+
+#[cfg(test)]
 pub(super) fn validate_sealed_prefix_for_test(
     prefix: &CompiledWitnessWriterPrefix,
     next_producer: usize,
@@ -373,6 +546,7 @@ pub(super) fn validate_sealed_prefix_for_test(
 ) -> Result<(), ()> {
     emission::validate_sealed_prefix(
         &prefix.base_authority,
+        &prefix.causal_setup,
         next_producer,
         prefix.target_sm,
         &prefix.kernel_by_build_authority,
@@ -449,7 +623,7 @@ fn insert_effect(
 
 fn push_operation(
     primitive: ExecutionPrimitive,
-    invocation: AotInvocation,
+    invocation: Option<AotInvocation>,
     effect: EffectContractId,
     monolithic: &PartitionAuthority,
     operations: &mut Vec<OpNode>,
@@ -464,7 +638,7 @@ fn push_operation(
                 .ok_or(CompiledWitnessWriterPrefixError::Lowering)?,
         ),
         primitive,
-        invocation: Some(invocation),
+        invocation,
         effect,
         partition: monolithic.id(),
         stage: ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase),

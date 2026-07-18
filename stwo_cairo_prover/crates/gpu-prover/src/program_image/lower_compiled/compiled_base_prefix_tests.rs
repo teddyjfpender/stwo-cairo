@@ -3,8 +3,9 @@ use std::collections::BTreeSet;
 use stwo_backend_cuda::aot::{AotKernelAbiSchema, AotKernelModuleGlobals, AotKernelSchemaScope};
 use stwo_backend_cuda::TraceTreeRole;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
+use stwo_cairo_prover::witness::proof_shape::TracePartId;
 
-use super::compiled_base_prefix::emission::StaticWrapperRequest;
+use super::compiled_base_prefix::emission::{ResolvedStaticExecution, StaticWrapperRequest};
 use super::compiled_base_prefix::test_support::assert_witness_writer_def_use_is_ordered;
 use super::compiled_base_prefix::{
     emit_recorded_witness_writer_prefix_for_test, CompiledWitnessWriterPrefixError,
@@ -13,10 +14,12 @@ use super::compiled_base_prefix::{
 use super::producer_prefix::SemanticBaseProducer;
 use super::resolved_recorded_build_authority::ResolvedRecordedBuildAuthority;
 use super::*;
+use crate::arena_plan::BufferPurpose;
 use crate::compiled_proof::{
     AotArgumentValue, EffectAccess, EffectBindingId, EffectContract, ExecutionPrimitive,
     FixedSourcePointerEntry, FixedValueInitializer, LaunchGeometry, PartitionAuthority, ProofStage,
-    StaticCudaLaunchIdentity, StaticCudaWrapperAuthority, StaticCudaWrapperId, ValueVersion,
+    StatementHostEncoding, StatementHostPart, StatementHostSourceKind, StaticCudaLaunchIdentity,
+    StaticCudaWrapperAuthority, StaticCudaWrapperId, ValueRange, ValueVersion,
 };
 
 pub(super) const MANIFEST: [u8; 32] = [0x4d; 32];
@@ -26,7 +29,9 @@ fn resolve_static_for_prefix(
     request: StaticWrapperRequest<'_>,
     id: StaticCudaWrapperId,
     target_sm: u32,
-) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
+    _arena: &ProofArenaPlan,
+    _values: &adapter::SemanticValueMap,
+) -> Result<Option<ResolvedStaticExecution>, InvocationShapeError> {
     if request.kind() == StaticWrapperKind::NativeEcOp {
         return Ok(None);
     }
@@ -37,7 +42,9 @@ pub(super) fn resolve_all_static_for_prefix(
     request: StaticWrapperRequest<'_>,
     id: StaticCudaWrapperId,
     target_sm: u32,
-) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
+    _arena: &ProofArenaPlan,
+    _values: &adapter::SemanticValueMap,
+) -> Result<Option<ResolvedStaticExecution>, InvocationShapeError> {
     fake_static_authority(request, id, target_sm).map(Some)
 }
 
@@ -45,8 +52,23 @@ fn resolve_without_generic_feed(
     request: StaticWrapperRequest<'_>,
     id: StaticCudaWrapperId,
     target_sm: u32,
-) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
+    _arena: &ProofArenaPlan,
+    _values: &adapter::SemanticValueMap,
+) -> Result<Option<ResolvedStaticExecution>, InvocationShapeError> {
     if request.kind() == StaticWrapperKind::MultiplicityFeed {
+        return Ok(None);
+    }
+    fake_static_authority(request, id, target_sm).map(Some)
+}
+
+fn resolve_without_compact_setup(
+    request: StaticWrapperRequest<'_>,
+    id: StaticCudaWrapperId,
+    target_sm: u32,
+    _arena: &ProofArenaPlan,
+    _values: &adapter::SemanticValueMap,
+) -> Result<Option<ResolvedStaticExecution>, InvocationShapeError> {
+    if request.kind() == StaticWrapperKind::WitnessInputCompact {
         return Ok(None);
     }
     fake_static_authority(request, id, target_sm).map(Some)
@@ -56,7 +78,7 @@ fn fake_static_authority(
     request: StaticWrapperRequest<'_>,
     id: StaticCudaWrapperId,
     target_sm: u32,
-) -> Result<StaticCudaWrapperAuthority, InvocationShapeError> {
+) -> Result<ResolvedStaticExecution, InvocationShapeError> {
     let launch = StaticCudaLaunchIdentity::new(
         b"test_base_static_kernel".to_vec(),
         LaunchGeometry {
@@ -68,23 +90,39 @@ fn fake_static_authority(
         },
     )
     .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?;
-    StaticCudaWrapperAuthority::new(
+    let (invocation, execution_steps) = match request {
+        StaticWrapperRequest::WitnessInputCompact(compact) => {
+            super::witness_input_seed_compact::compact_test_execution(compact, 4, 8)?
+        }
+        _ => (
+            request.invocation()?,
+            vec![crate::compiled_proof::StaticCudaExecutionStepIdentity::KernelLaunch(launch)],
+        ),
+    };
+    let aggregate_contract_identity = match request {
+        StaticWrapperRequest::WitnessCasmScatter(lowered) => lowered.contract.identity(),
+        _ => [0x44; 32],
+    };
+    let wrapper = StaticCudaWrapperAuthority::new_with_execution_steps(
         id,
         [0x41; 32],
         target_sm,
         b"test_base_static_wrapper".to_vec(),
         [0x42; 32],
         [0x43; 32],
-        [0x44; 32],
+        aggregate_contract_identity,
         [0x45; 32],
-        vec![launch],
-        request
-            .invocation()?
+        execution_steps,
+        invocation
             .contract_id()
             .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?,
         request.effect()?.id(),
     )
-    .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)
+    .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?;
+    Ok(ResolvedStaticExecution {
+        wrapper,
+        invocation,
+    })
 }
 
 #[test]
@@ -331,11 +369,9 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
     assert_eq!(missing.schedule_ordinal, 7);
     assert_eq!(prefix.execution_manifest_identity, MANIFEST);
     assert_eq!(prefix.target_sm, TARGET_SM);
-    assert_eq!(prefix.operations.len(), 17);
     assert_eq!(prefix.kernels.len(), 7);
-    assert_eq!(prefix.static_wrappers.len(), 10);
     assert_eq!(prefix.recorded_kernel_authorities().len(), 7);
-    assert_eq!(prefix.effects.len(), 17);
+    assert_eq!(prefix.effects.len(), prefix.operations.len());
     assert_eq!(prefix.base_authority(), &authority);
     assert_eq!(prefix.next_producer(), missing.schedule_ordinal as usize);
     assert_eq!(
@@ -352,6 +388,7 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
 
     let monolithic = PartitionAuthority::monolithic().id();
     let mut aot_count = 0usize;
+    let mut host_count = 0usize;
     let mut wrapper_ids = Vec::new();
     for (index, operation) in prefix.operations.iter().enumerate() {
         assert_eq!(operation.id.0 as usize, index);
@@ -405,6 +442,10 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
                 );
                 assert_eq!(authority.consumer_target_sm(), TARGET_SM);
             }
+            ExecutionPrimitive::StatementHostIngress { .. } => {
+                host_count += 1;
+                assert!(operation.invocation.is_none());
+            }
             _ => panic!("Base prefix operation has the wrong primitive"),
         }
         let effect = prefix
@@ -412,38 +453,25 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
             .iter()
             .find(|effect| effect.id() == operation.effect)
             .unwrap();
-        assert_invocation_covers_exact_bindings(operation.invocation.as_ref().unwrap(), effect);
+        if let Some(invocation) = operation.invocation.as_ref() {
+            assert_invocation_covers_exact_bindings(invocation, effect);
+        }
     }
     assert_eq!(aot_count, 7);
     assert_eq!(
         wrapper_ids,
-        (1..=10).map(StaticCudaWrapperId).collect::<Vec<_>>()
+        (1..=u32::try_from(prefix.static_wrappers.len()).unwrap())
+            .map(StaticCudaWrapperId)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        prefix.operations.len(),
+        aot_count + host_count + wrapper_ids.len()
     );
     assert!(prefix.operations[..3].iter().all(|operation| matches!(
         &operation.primitive,
         ExecutionPrimitive::StaticCudaWrapper { .. }
     )));
-    for ordinal in 0..7 {
-        assert!(matches!(
-            &prefix.operations[3 + ordinal * 2].primitive,
-            ExecutionPrimitive::AotKernel { .. }
-        ));
-        assert!(matches!(
-            &prefix.operations[4 + ordinal * 2].primitive,
-            ExecutionPrimitive::StaticCudaWrapper { .. }
-        ));
-    }
-    let planned_effects = super::compiled_base_prefix::emission::ordered_effects(&authority)
-        .unwrap()
-        .into_iter()
-        .map(|effect| effect.id())
-        .collect::<Vec<_>>();
-    let emitted_effects = prefix
-        .operations
-        .iter()
-        .map(|operation| operation.effect)
-        .collect::<Vec<_>>();
-    assert_eq!(emitted_effects.as_slice(), &planned_effects[..17]);
     assert_witness_writer_def_use_is_ordered(prefix.base_authority());
     let required = super::compiled_base_prefix::validate_witness_writer_transitions_for_test(
         prefix.base_authority(),
@@ -582,12 +610,107 @@ fn generated_sn2_full_prefix_and_missing_feed_are_exact() {
         resolve_all_static_for_prefix,
     )
     .unwrap();
-    assert_eq!(full.operations.len(), 48);
-    assert_eq!(full.static_wrappers.len(), 26);
+    assert_eq!(full.operations.len(), 78);
+    assert_eq!(full.static_wrappers.len(), 47);
     assert_eq!(full.kernels.len(), 22);
-    assert_eq!(full.effects.len(), 48);
+    assert_eq!(full.effects.len(), 78);
     assert_eq!(full.module_global_initializers.len(), 4);
     assert_eq!(full.next_producer(), 23);
+    assert_eq!(full.causal_setup_counts(), (5, 7, 9));
+    assert_eq!(full.required_preproducer_versions().len(), 249);
+    let roots = full
+        .causal_external_roots()
+        .expect("complete causal prefix must retain its external roots");
+    assert_eq!(roots.len(), 17);
+    assert_eq!(roots, &full.expected_causal_external_roots());
+    let seed_roots = full.causal_seed_scalar_roots();
+    assert_eq!(seed_roots.len(), 4);
+    assert!(seed_roots.is_subset(roots));
+    assert_eq!(
+        roots
+            .intersection(full.required_preproducer_versions())
+            .count(),
+        13
+    );
+    let non_witness_roles = roots
+        .intersection(full.required_preproducer_versions())
+        .map(|root| {
+            let catalog = full
+                .values()
+                .entries()
+                .find_map(|(catalog, version)| (version == *root).then_some(catalog))
+                .unwrap();
+            let logical = &executable.arena().logical_buffers()[catalog.0 as usize];
+            assert_eq!(logical.id.0, catalog.0);
+            (
+                logical.purpose,
+                logical.component,
+                logical.part.map(|part| match part {
+                    TracePartId::Main => (0, 0),
+                    TracePartId::MemoryBig(ordinal) => (1, ordinal),
+                    TracePartId::MemorySmall => (2, 0),
+                }),
+                logical.ordinal,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut expected_non_witness_roles = BTreeSet::from([
+        (BufferPurpose::ExecutionTableRawAddressToId, None, None, 0),
+        (BufferPurpose::ExecutionTableRawF252Words, None, None, 0),
+        (BufferPurpose::ExecutionTableRawSmallWords, None, None, 0),
+        (
+            BufferPurpose::EcOpSegmentStart,
+            Some("ec_op_builtin"),
+            Some((0, 0)),
+            0,
+        ),
+    ]);
+    expected_non_witness_roles
+        .extend((0..9).map(|ordinal| (BufferPurpose::WitnessFeedLut, None, None, ordinal)));
+    assert_eq!(non_witness_roles, expected_non_witness_roles);
+    for root in &seed_roots {
+        let catalog = full
+            .values()
+            .entries()
+            .find_map(|(catalog, version)| (version == *root).then_some(catalog))
+            .unwrap();
+        assert_eq!(
+            executable.arena().logical_buffers()[catalog.0 as usize].purpose,
+            BufferPurpose::WitnessInputSeedScalars
+        );
+    }
+    assert_casm_ingress_chain_is_exact(&full);
+    let unused = full.values().with_unused_catalog_for_test().unwrap();
+    assert!(
+        super::compiled_base_prefix::validate_causal_value_closure_for_test(
+            &unused,
+            &full.effects,
+            &full.operations,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        super::compiled_base_prefix::emission::resolve_setup_counts_for_test(
+            executable.arena(),
+            &full,
+            resolve_all_static_for_prefix,
+        ),
+        Ok((12, 9))
+    );
+    let operation_count = full.operations.len();
+    assert_eq!(
+        super::compiled_base_prefix::emission::resolve_setup_counts_for_test(
+            executable.arena(),
+            &full,
+            resolve_without_compact_setup,
+        ),
+        Err(
+            super::compiled_base_prefix::emission::ResolveSetupError::Missing(
+                MissingBaseAdapter::WitnessInputCompactStaticWrapper,
+            )
+        )
+    );
+    assert_eq!(full.operations.len(), operation_count);
     assert!(full.pending_producers().is_empty());
     assert_eq!(full.partitions, vec![PartitionAuthority::monolithic()]);
 
@@ -613,6 +736,149 @@ fn generated_sn2_full_prefix_and_missing_feed_are_exact() {
     assert_eq!(prefix.static_wrappers.len(), 3);
     assert!(prefix.kernels.is_empty());
     assert!(prefix.module_global_initializers.is_empty());
+
+    let error = emit_recorded_witness_writer_prefix_for_test(
+        executable.arena(),
+        PreProcessedTraceVariant::Canonical,
+        MANIFEST,
+        TARGET_SM,
+        |source| Ok(exact_fields(source)),
+        resolve_without_compact_setup,
+    )
+    .unwrap_err();
+    let CompiledWitnessWriterPrefixError::MissingTypedAdapter { missing, prefix } = error else {
+        panic!("missing compact setup must return the preceding complete causal groups")
+    };
+    assert_eq!(
+        missing.adapter,
+        MissingBaseAdapter::WitnessInputCompactStaticWrapper
+    );
+    assert_eq!(prefix.next_producer(), missing.schedule_ordinal as usize);
+    assert!(prefix.causal_external_roots().is_none());
+    super::compiled_base_prefix::validate_sealed_prefix_for_test(
+        &prefix,
+        prefix.next_producer(),
+        &prefix.operations,
+    )
+    .unwrap();
+}
+
+fn assert_casm_ingress_chain_is_exact(
+    prefix: &super::compiled_base_prefix::CompiledWitnessWriterPrefix,
+) {
+    let ingress = prefix
+        .operations
+        .iter()
+        .enumerate()
+        .filter(|(_, operation)| {
+            matches!(
+                operation.primitive,
+                ExecutionPrimitive::StatementHostIngress { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ingress.len(), 9);
+    let mut setup = prefix.causal_casm_setup().iter().collect::<Vec<_>>();
+    setup.sort_by_key(|setup| setup.position.ordinal);
+    let mut previous_destination: Option<ValueRange> = None;
+    for ((index, operation), setup) in ingress.into_iter().zip(setup) {
+        let ExecutionPrimitive::StatementHostIngress {
+            source,
+            predecessor,
+        } = &operation.primitive
+        else {
+            unreachable!()
+        };
+        let requirements = setup.contract.requirements();
+        assert_eq!(source.kind, StatementHostSourceKind::WitnessCasm);
+        assert_eq!(source.producer_ordinal, setup.position.ordinal);
+        assert_eq!(source.component.as_ref(), setup.component);
+        assert_eq!(
+            source.part,
+            match setup.part {
+                TracePartId::Main => StatementHostPart::Main,
+                TracePartId::MemoryBig(ordinal) => StatementHostPart::MemoryBig(ordinal),
+                TracePartId::MemorySmall => StatementHostPart::MemorySmall,
+            }
+        );
+        assert_eq!(source.encoding, StatementHostEncoding::RowMajorU32);
+        assert_eq!(source.words, requirements.staging_words);
+        assert_eq!(source.real_rows, requirements.n_real_rows);
+        assert_eq!(source.consumer_rows, requirements.consumer_rows);
+        assert_eq!(source.include_iota, requirements.include_iota);
+        assert_eq!(source.casm_contract_identity, setup.contract.identity());
+        let expected_predecessor = previous_destination.as_ref().map(|previous| ValueRange {
+            version: previous.version,
+            elements: setup.staging.elements,
+        });
+        assert_eq!(predecessor, &expected_predecessor);
+        assert!(operation.invocation.is_none());
+        let effect = prefix
+            .effects
+            .iter()
+            .find(|effect| effect.id() == operation.effect)
+            .unwrap();
+        assert_eq!(effect.accesses().len(), 1);
+        let destination = effect
+            .accesses()
+            .iter()
+            .find_map(EffectAccess::destination)
+            .expect("host ingress must write its exact staging version")
+            .value;
+        assert_eq!(
+            destination,
+            ValueRange {
+                version: setup.staging.version,
+                elements: setup.staging.elements,
+            }
+        );
+        let access = effect.accesses()[0].destination().unwrap();
+        assert_eq!(access.binding, setup.staging.binding);
+        let scatter = &prefix.operations[index + 1];
+        let ExecutionPrimitive::StaticCudaWrapper { wrapper } = &scatter.primitive else {
+            panic!("host ingress must be immediately followed by its CASM scatter")
+        };
+        assert_eq!(
+            prefix.static_wrappers[wrapper.0 as usize - 1].aggregate_contract_identity(),
+            &setup.contract.identity()
+        );
+        assert!(scatter.invocation.is_some());
+        let scatter_effect = prefix
+            .effects
+            .iter()
+            .find(|effect| effect.id() == scatter.effect)
+            .unwrap();
+        assert!(scatter_effect.accesses().iter().any(|access| {
+            access
+                .source()
+                .is_some_and(|source| source.value == destination)
+        }));
+        previous_destination = Some(destination);
+    }
+
+    let mut mutated = prefix.operations.clone();
+    let ingress = mutated
+        .iter_mut()
+        .find(|operation| {
+            matches!(
+                operation.primitive,
+                ExecutionPrimitive::StatementHostIngress { .. }
+            )
+        })
+        .unwrap();
+    let ExecutionPrimitive::StatementHostIngress { predecessor, .. } = &mut ingress.primitive
+    else {
+        unreachable!()
+    };
+    *predecessor = previous_destination;
+    assert!(
+        super::compiled_base_prefix::validate_sealed_prefix_for_test(
+            prefix,
+            prefix.next_producer(),
+            &mutated,
+        )
+        .is_err()
+    );
 }
 
 fn first_destination(effect: &EffectContract) -> ValueVersion {
@@ -750,7 +1016,13 @@ fn assert_fixed_values_are_exact(
     }));
 
     for operation in &prefix.operations {
-        let invocation = operation.invocation.as_ref().unwrap();
+        let Some(invocation) = operation.invocation.as_ref() else {
+            assert!(matches!(
+                operation.primitive,
+                ExecutionPrimitive::StatementHostIngress { .. }
+            ));
+            continue;
+        };
         let effect = prefix
             .effects
             .iter()
@@ -772,7 +1044,12 @@ fn assert_fixed_values_are_exact(
     let fixed_bindings = prefix
         .operations
         .iter()
-        .flat_map(|operation| operation.invocation.as_ref().unwrap().arguments.iter())
+        .flat_map(|operation| {
+            operation
+                .invocation
+                .iter()
+                .flat_map(|invocation| invocation.arguments.iter())
+        })
         .filter_map(|argument| match &argument.value {
             AotArgumentValue::DeviceFixedU32 { binding, .. } => Some(*binding),
             _ => None,

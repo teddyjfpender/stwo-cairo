@@ -372,6 +372,39 @@ pub(super) fn project_compact_static_wrapper(
     projection::compact(id, linked, lowered)
 }
 
+pub(super) fn compact_invocation_from_wrapper(
+    lowered: &LoweredWitnessInputCompact,
+    wrapper: &StaticCudaWrapperAuthority,
+) -> Result<AotInvocation, InvocationShapeError> {
+    projection::compact_invocation_from_execution_steps(lowered, wrapper.execution_steps())
+}
+
+#[cfg(test)]
+pub(super) fn compact_test_execution(
+    lowered: &LoweredWitnessInputCompact,
+    exact_sort_temp_bytes: usize,
+    exact_scan_temp_bytes: usize,
+) -> Result<
+    (
+        AotInvocation,
+        Vec<crate::compiled_proof::StaticCudaExecutionStepIdentity>,
+    ),
+    InvocationShapeError,
+> {
+    Ok((
+        projection::compact_invocation_for_test(
+            lowered,
+            exact_sort_temp_bytes,
+            exact_scan_temp_bytes,
+        )?,
+        projection::compact_steps_for_test(
+            &lowered.contract,
+            exact_sort_temp_bytes,
+            exact_scan_temp_bytes,
+        )?,
+    ))
+}
+
 #[cfg(test)]
 pub(super) fn seed_invocation_using_abi_for_test(
     lowered: &LoweredWitnessInputSeed,

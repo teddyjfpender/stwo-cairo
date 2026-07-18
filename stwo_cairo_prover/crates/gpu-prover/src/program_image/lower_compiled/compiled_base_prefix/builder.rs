@@ -1,7 +1,7 @@
 //! Append-only cursor from the complete witness prefix into later Base work.
 //!
-//! This cursor owns the only semantic value map. A memory receipt is sealed
-//! before executable operations may be appended, and missing linked authority
+//! This cursor owns the only semantic value map. A stage receipt is sealed
+//! before executable operations are appended, and missing linked authority
 //! leaves that receipt retryable without publishing a partial operation list.
 
 use std::collections::BTreeMap;
@@ -10,11 +10,20 @@ use stwo_backend_cuda::MemoryBaseTraceStepKind;
 
 use super::super::producer_prefix::BaseProducerAuthority;
 use super::super::{fixed_table_materialization, memory_base_trace, InvocationShapeError};
-use super::{emission, insert_effect, push_operation, wrapper_id, CompiledWitnessWriterPrefix};
+use super::{
+    emission, insert_effect, push_operation, validate_causal_value_closure, wrapper_id,
+    CompiledWitnessWriterPrefix,
+};
 use crate::arena_plan::ProofArenaPlan;
 use crate::compiled_proof::{
     EffectContract, EffectContractId, ExecutionPrimitive, PartitionAuthority,
     StaticCudaWrapperAuthority, StaticCudaWrapperId,
+};
+
+mod validation;
+
+use validation::{
+    seal_fixed_image_roots, validate_published_base_dag, FixedImageRootReceipt, PublishedBaseStage,
 };
 
 type MemoryStaticResolver = fn(
@@ -32,6 +41,10 @@ type FixedTableStaticResolver =
         usize,
     ) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError>;
 
+/// The sole continuation of a source-complete witness prefix.
+///
+/// Later Base producers belong here so they cannot allocate from a detached
+/// semantic map or overtake the memory stage.
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum CompiledBaseDagStartError {
     IncompleteWitnessPrefix(Box<CompiledWitnessWriterPrefix>),
@@ -60,13 +73,10 @@ struct SealedMemoryBaseTrace {
 #[derive(Debug, Eq, PartialEq)]
 struct SealedFixedTables {
     lowered: fixed_table_materialization::LoweredFixedTableStage,
+    fixed_image_roots: FixedImageRootReceipt,
     emitted: bool,
 }
 
-/// The sole continuation of a source-complete witness prefix.
-///
-/// Later Base producers belong here so they cannot allocate from a detached
-/// `SemanticValueMap` or overtake the memory stage.
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct CompiledBaseDagBuilder {
     prefix: CompiledWitnessWriterPrefix,
@@ -80,8 +90,12 @@ impl CompiledBaseDagBuilder {
     ) -> Result<Self, CompiledBaseDagStartError> {
         let monolithic = PartitionAuthority::monolithic();
         let complete = prefix.next_producer == prefix.base_authority.producers.len()
+            && validate_causal_value_closure(&prefix.values, &prefix.effects, &prefix.operations)
+                .map(|roots| prefix.causal_external_roots.as_ref() == Some(&roots))
+                .unwrap_or(false)
             && emission::validate_sealed_prefix(
                 &prefix.base_authority,
+                &prefix.causal_setup,
                 prefix.next_producer,
                 prefix.target_sm,
                 &prefix.kernel_by_build_authority,
@@ -129,8 +143,7 @@ impl CompiledBaseDagBuilder {
         Ok(())
     }
 
-    /// Append all memory operations or none. A missing loaded static build is
-    /// a retryable frontier and cannot discard the semantic receipt.
+    /// Append every memory operation or none.
     pub(super) fn emit_memory_operations(&mut self) -> Result<(), CompiledBaseDagAppendError> {
         self.emit_memory_operations_using(memory_base_trace::resolve_static_wrapper)
     }
@@ -145,6 +158,19 @@ impl CompiledBaseDagBuilder {
             .filter(|memory| !memory.emitted)
             .ok_or(CompiledBaseDagAppendError::InvalidStage)?;
         let Some(lowered) = sealed.lowered.as_ref() else {
+            let roots = validate_published_base_dag(
+                &self.prefix,
+                self.memory.as_ref(),
+                None,
+                &self.prefix.values,
+                &self.prefix.effects,
+                &self.prefix.operations,
+                &self.prefix.static_wrappers,
+                PublishedBaseStage::Memory,
+            )?;
+            if self.prefix.causal_external_roots.as_ref() != Some(&roots) {
+                return Err(CompiledBaseDagAppendError::Lowering);
+            }
             self.memory
                 .as_mut()
                 .ok_or(CompiledBaseDagAppendError::InvalidStage)?
@@ -194,7 +220,7 @@ impl CompiledBaseDagBuilder {
                 .map_err(|_| CompiledBaseDagAppendError::Lowering)?;
             push_operation(
                 ExecutionPrimitive::StaticCudaWrapper { wrapper: id },
-                step.invocation().clone(),
+                Some(step.invocation().clone()),
                 step.effect().id(),
                 &monolithic,
                 &mut operations,
@@ -203,8 +229,24 @@ impl CompiledBaseDagBuilder {
             wrappers.push(wrapper);
         }
 
-        self.prefix.static_wrappers.extend(wrappers);
-        self.prefix.effects = effects.into_values().collect();
+        let effects = effects.into_values().collect::<Vec<_>>();
+        let mut static_wrappers = self.prefix.static_wrappers.clone();
+        static_wrappers.extend(wrappers);
+        let roots = validate_published_base_dag(
+            &self.prefix,
+            self.memory.as_ref(),
+            None,
+            &self.prefix.values,
+            &effects,
+            &operations,
+            &static_wrappers,
+            PublishedBaseStage::Memory,
+        )?;
+        if self.prefix.causal_external_roots.as_ref() != Some(&roots) {
+            return Err(CompiledBaseDagAppendError::Lowering);
+        }
+        self.prefix.static_wrappers = static_wrappers;
+        self.prefix.effects = effects;
         self.prefix.operations = operations;
         self.memory
             .as_mut()
@@ -217,8 +259,7 @@ impl CompiledBaseDagBuilder {
         self.memory.as_ref().is_some_and(|memory| memory.emitted)
     }
 
-    /// Seal every fixed table and the post-fixed allocator atomically. This may
-    /// run only after the memory operation sequence has been published.
+    /// Seal the fixed-table stage only after memory publication.
     pub(super) fn append_fixed_table_semantics(
         &mut self,
         arena: &ProofArenaPlan,
@@ -233,15 +274,17 @@ impl CompiledBaseDagBuilder {
             .map_err(|_| CompiledBaseDagAppendError::Lowering)?;
         fixed_table_materialization::validate_from(arena, &before, &after, &lowered)
             .map_err(|_| CompiledBaseDagAppendError::Lowering)?;
+        let fixed_image_roots = seal_fixed_image_roots(arena, &before, &after, &lowered)?;
         self.prefix.values = after;
         self.fixed_tables = Some(SealedFixedTables {
             lowered,
+            fixed_image_roots,
             emitted: false,
         });
         Ok(())
     }
 
-    /// Append all fixed-table effects, wrappers and operations or none.
+    /// Append every fixed-table operation or none.
     pub(super) fn emit_fixed_table_operations(&mut self) -> Result<(), CompiledBaseDagAppendError> {
         self.emit_fixed_table_operations_using(fixed_table_materialization::resolve_static_wrapper)
     }
@@ -297,7 +340,7 @@ impl CompiledBaseDagBuilder {
                 .map_err(|_| CompiledBaseDagAppendError::Lowering)?;
             push_operation(
                 ExecutionPrimitive::StaticCudaWrapper { wrapper: id },
-                table.invocation().clone(),
+                Some(table.invocation().clone()),
                 table.effect().id(),
                 &monolithic,
                 &mut operations,
@@ -305,9 +348,36 @@ impl CompiledBaseDagBuilder {
             .map_err(|_| CompiledBaseDagAppendError::Lowering)?;
             wrappers.push(wrapper);
         }
-        self.prefix.static_wrappers.extend(wrappers);
-        self.prefix.effects = effects.into_values().collect();
+        let effects = effects.into_values().collect::<Vec<_>>();
+        let mut static_wrappers = self.prefix.static_wrappers.clone();
+        static_wrappers.extend(wrappers);
+        let roots = validate_published_base_dag(
+            &self.prefix,
+            self.memory.as_ref(),
+            self.fixed_tables.as_ref(),
+            &self.prefix.values,
+            &effects,
+            &operations,
+            &static_wrappers,
+            PublishedBaseStage::FixedTables,
+        )?;
+        let fixed = self
+            .fixed_tables
+            .as_ref()
+            .ok_or(CompiledBaseDagAppendError::InvalidStage)?;
+        let mut expected_roots = self
+            .prefix
+            .causal_external_roots
+            .clone()
+            .ok_or(CompiledBaseDagAppendError::Lowering)?;
+        expected_roots.extend(fixed.fixed_image_roots.distinct_versions());
+        if roots != expected_roots {
+            return Err(CompiledBaseDagAppendError::Lowering);
+        }
+        self.prefix.static_wrappers = static_wrappers;
+        self.prefix.effects = effects;
         self.prefix.operations = operations;
+        self.prefix.causal_external_roots = Some(roots);
         self.fixed_tables
             .as_mut()
             .ok_or(CompiledBaseDagAppendError::InvalidStage)?
@@ -352,392 +422,5 @@ fn exact_effect_map(
 }
 
 #[cfg(test)]
-mod tests {
-    use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
-
-    use super::*;
-    use crate::compiled_proof::{
-        LaunchGeometry, ProofStage, StaticCudaLaunchIdentity, StaticCudaWrapperAuthority,
-    };
-    use crate::program_image::lower_compiled::compiled_base_prefix::{
-        emit_recorded_witness_writer_prefix_for_test, CompiledWitnessWriterPrefix,
-    };
-    use crate::program_image::lower_compiled::compiled_base_prefix_tests::{
-        exact_fields, resolve_all_static_for_prefix, MANIFEST, TARGET_SM,
-    };
-    use crate::transcript_plan::CairoTranscriptSegment;
-
-    fn complete_prefix() -> CompiledWitnessWriterPrefix {
-        let executable = crate::program_image::lower_compiled::tests::generated_sn2_replacement();
-        emit_recorded_witness_writer_prefix_for_test(
-            executable.arena(),
-            PreProcessedTraceVariant::Canonical,
-            MANIFEST,
-            TARGET_SM,
-            |source| Ok(exact_fields(source)),
-            resolve_all_static_for_prefix,
-        )
-        .unwrap()
-    }
-
-    fn fake_memory_wrapper(
-        id: StaticCudaWrapperId,
-        target_sm: u32,
-        lowered: &memory_base_trace::LoweredMemoryBaseTrace,
-        step_ordinal: usize,
-    ) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
-        let step = lowered
-            .steps()
-            .get(step_ordinal)
-            .ok_or(InvocationShapeError::InvalidMemoryBaseTraceBinding)?;
-        let launch = StaticCudaLaunchIdentity::new(
-            b"test_memory_base_kernel".to_vec(),
-            LaunchGeometry {
-                grid: [1, 1, 1],
-                block: [1, 1, 1],
-                cluster: None,
-                dynamic_shared_bytes: 0,
-                cooperative: false,
-            },
-        )
-        .map_err(|_| InvocationShapeError::InvalidMemoryBaseTraceAuthority)?;
-        StaticCudaWrapperAuthority::new(
-            id,
-            [0x51; 32],
-            target_sm,
-            b"test_memory_base_wrapper".to_vec(),
-            [0x52; 32],
-            [0x53; 32],
-            [0x54; 32],
-            [0x55; 32],
-            vec![launch],
-            step.invocation()
-                .contract_id()
-                .map_err(|_| InvocationShapeError::InvalidMemoryBaseTraceAuthority)?,
-            step.effect().id(),
-        )
-        .map(Some)
-        .map_err(|_| InvocationShapeError::InvalidMemoryBaseTraceAuthority)
-    }
-
-    fn miss_second_memory_wrapper(
-        id: StaticCudaWrapperId,
-        target_sm: u32,
-        lowered: &memory_base_trace::LoweredMemoryBaseTrace,
-        step_ordinal: usize,
-    ) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
-        if step_ordinal == 1 {
-            Ok(None)
-        } else {
-            fake_memory_wrapper(id, target_sm, lowered, step_ordinal)
-        }
-    }
-
-    fn fake_fixed_table_wrapper(
-        id: StaticCudaWrapperId,
-        target_sm: u32,
-        lowered: &fixed_table_materialization::LoweredFixedTableStage,
-        table_ordinal: usize,
-    ) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
-        let table = lowered
-            .tables()
-            .get(table_ordinal)
-            .ok_or(InvocationShapeError::InvalidFixedTableBinding)?;
-        let launch = StaticCudaLaunchIdentity::new(
-            b"test_fixed_table_kernel".to_vec(),
-            LaunchGeometry {
-                grid: [1, 1, 1],
-                block: [1, 1, 1],
-                cluster: None,
-                dynamic_shared_bytes: 0,
-                cooperative: false,
-            },
-        )
-        .map_err(|_| InvocationShapeError::InvalidFixedTableAuthority)?;
-        StaticCudaWrapperAuthority::new(
-            id,
-            [0x61; 32],
-            target_sm,
-            b"test_fixed_table_wrapper".to_vec(),
-            [0x62; 32],
-            [0x63; 32],
-            [0x64; 32],
-            [0x65; 32],
-            vec![launch],
-            table
-                .invocation()
-                .contract_id()
-                .map_err(|_| InvocationShapeError::InvalidFixedTableAuthority)?,
-            table.effect().id(),
-        )
-        .map(Some)
-        .map_err(|_| InvocationShapeError::InvalidFixedTableAuthority)
-    }
-
-    fn miss_second_fixed_table_wrapper(
-        id: StaticCudaWrapperId,
-        target_sm: u32,
-        lowered: &fixed_table_materialization::LoweredFixedTableStage,
-        table_ordinal: usize,
-    ) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
-        if table_ordinal == 1 {
-            Ok(None)
-        } else {
-            fake_fixed_table_wrapper(id, target_sm, lowered, table_ordinal)
-        }
-    }
-
-    #[test]
-    fn cursor_rejects_an_incomplete_witness_prefix_without_losing_it() {
-        let mut prefix = complete_prefix();
-        prefix.next_producer -= 1;
-        let operation_count = prefix.operations.len();
-        let CompiledBaseDagStartError::IncompleteWitnessPrefix(returned) =
-            CompiledBaseDagBuilder::from_complete_witness(prefix).unwrap_err();
-        assert_eq!(returned.operations.len(), operation_count);
-        assert_eq!(
-            returned.next_producer + 1,
-            returned.base_authority.producers.len()
-        );
-    }
-
-    #[test]
-    fn semantic_appends_reject_arena_authority_drift_transactionally() {
-        let executable = crate::program_image::lower_compiled::tests::generated_sn2_replacement();
-
-        let mut memory = CompiledBaseDagBuilder::from_complete_witness(complete_prefix()).unwrap();
-        memory.prefix.base_authority.producers.pop().unwrap();
-        let values = memory.prefix.values.clone();
-        assert_eq!(
-            memory.append_memory_semantics(executable.arena()),
-            Err(CompiledBaseDagAppendError::Lowering)
-        );
-        assert_eq!(memory.prefix.values, values);
-        assert!(memory.memory.is_none());
-
-        let mut fixed = CompiledBaseDagBuilder::from_complete_witness(complete_prefix()).unwrap();
-        fixed.append_memory_semantics(executable.arena()).unwrap();
-        fixed
-            .emit_memory_operations_using(fake_memory_wrapper)
-            .unwrap();
-        fixed.prefix.base_authority.producers.pop().unwrap();
-        let values = fixed.prefix.values.clone();
-        assert_eq!(
-            fixed.append_fixed_table_semantics(executable.arena()),
-            Err(CompiledBaseDagAppendError::Lowering)
-        );
-        assert_eq!(fixed.prefix.values, values);
-        assert!(fixed.fixed_tables.is_none());
-    }
-
-    #[test]
-    fn memory_receipt_and_operations_are_append_only_and_transactional() {
-        let executable = crate::program_image::lower_compiled::tests::generated_sn2_replacement();
-        let prefix = complete_prefix();
-        let old_operations = prefix.operations.clone();
-        let old_wrappers = prefix.static_wrappers.clone();
-        let old_effects = prefix.effects.clone();
-        let old_direct_b2n = prefix.base_authority.direct_retained_b2n.clone();
-        let before = prefix.values.clone();
-        let mut builder = CompiledBaseDagBuilder::from_complete_witness(prefix).unwrap();
-
-        assert_eq!(
-            builder.emit_memory_operations(),
-            Err(CompiledBaseDagAppendError::InvalidStage)
-        );
-        builder.append_memory_semantics(executable.arena()).unwrap();
-        assert_eq!(builder.prefix.operations, old_operations);
-        assert_eq!(builder.prefix.static_wrappers, old_wrappers);
-        assert_eq!(builder.prefix.effects, old_effects);
-        assert_eq!(
-            builder.prefix.base_authority.direct_retained_b2n,
-            old_direct_b2n
-        );
-        let missing_kind = {
-            let sealed = builder.memory.as_ref().unwrap();
-            let lowered = sealed.lowered.as_ref().unwrap();
-            assert!(lowered.steps().len() > 1);
-            assert!(!sealed.emitted);
-            memory_base_trace::validate_from(
-                executable.arena(),
-                &before,
-                &builder.prefix.values,
-                &sealed.lowered,
-            )
-            .unwrap();
-            lowered.steps()[1].kind()
-        };
-
-        let post_memory_values = builder.prefix.values.clone();
-        assert_eq!(
-            builder.append_memory_semantics(executable.arena()),
-            Err(CompiledBaseDagAppendError::InvalidStage)
-        );
-        assert_eq!(builder.prefix.values, post_memory_values);
-
-        assert_eq!(
-            builder.emit_memory_operations_using(miss_second_memory_wrapper),
-            Err(CompiledBaseDagAppendError::MissingMemoryStaticWrapper {
-                step_ordinal: 1,
-                kind: missing_kind,
-            })
-        );
-        assert_eq!(builder.prefix.operations, old_operations);
-        assert_eq!(builder.prefix.static_wrappers, old_wrappers);
-        assert_eq!(builder.prefix.effects, old_effects);
-        assert_eq!(builder.prefix.values, post_memory_values);
-        assert!(!builder.memory.as_ref().unwrap().emitted);
-
-        let old_operation_count = builder.prefix.operations.len();
-        let old_wrapper_count = builder.prefix.static_wrappers.len();
-        builder
-            .emit_memory_operations_using(fake_memory_wrapper)
-            .unwrap();
-        let lowered = builder.memory.as_ref().unwrap().lowered.as_ref().unwrap();
-        assert_eq!(
-            builder.prefix.operations.len(),
-            old_operation_count + lowered.steps().len()
-        );
-        assert_eq!(
-            builder.prefix.static_wrappers.len(),
-            old_wrapper_count + lowered.steps().len()
-        );
-        for (ordinal, step) in lowered.steps().iter().enumerate() {
-            let operation = &builder.prefix.operations[old_operation_count + ordinal];
-            let wrapper = &builder.prefix.static_wrappers[old_wrapper_count + ordinal];
-            assert_eq!(
-                operation.primitive,
-                ExecutionPrimitive::StaticCudaWrapper {
-                    wrapper: wrapper.id()
-                }
-            );
-            assert_eq!(operation.invocation.as_ref(), Some(step.invocation()));
-            assert_eq!(operation.effect, step.effect().id());
-            assert_eq!(
-                operation.stage,
-                ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase)
-            );
-            assert_eq!(wrapper.accepted_effect(), step.effect().id());
-            assert_eq!(wrapper.consumer_target_sm(), TARGET_SM);
-            assert!(builder
-                .prefix
-                .effects
-                .iter()
-                .any(|effect| effect == step.effect()));
-        }
-        assert!(builder.has_complete_memory_stage());
-        assert_eq!(builder.prefix.values, post_memory_values);
-        assert_eq!(
-            builder.prefix.base_authority.direct_retained_b2n,
-            old_direct_b2n
-        );
-        assert_eq!(
-            builder.emit_memory_operations(),
-            Err(CompiledBaseDagAppendError::InvalidStage)
-        );
-    }
-
-    #[test]
-    fn fixed_tables_publish_transactionally_after_memory_and_preserve_mixed_sources() {
-        let executable = crate::program_image::lower_compiled::tests::generated_sn2_replacement();
-        let mut builder = CompiledBaseDagBuilder::from_complete_witness(complete_prefix()).unwrap();
-        assert_eq!(
-            builder.append_fixed_table_semantics(executable.arena()),
-            Err(CompiledBaseDagAppendError::InvalidStage)
-        );
-        builder.append_memory_semantics(executable.arena()).unwrap();
-        builder
-            .emit_memory_operations_using(fake_memory_wrapper)
-            .unwrap();
-        let before = builder.prefix.values.clone();
-        builder
-            .append_fixed_table_semantics(executable.arena())
-            .unwrap();
-        let sealed = builder.fixed_tables.as_ref().unwrap();
-        fixed_table_materialization::validate_from(
-            executable.arena(),
-            &before,
-            &builder.prefix.values,
-            &sealed.lowered,
-        )
-        .unwrap();
-        let mixed = sealed
-            .lowered
-            .tables()
-            .iter()
-            .find(|table| {
-                table.sources().iter().any(|source| {
-                    matches!(
-                        source,
-                        fixed_table_materialization::LoweredFixedTableSource::Arena { .. }
-                    )
-                }) && table.sources().iter().any(|source| {
-                    matches!(
-                        source,
-                        fixed_table_materialization::LoweredFixedTableSource::Registered { .. }
-                    )
-                })
-            })
-            .expect("Pedersen-18 must retain seq_23 followed by registered columns");
-        assert!(matches!(
-            mixed.invocation().arguments[0].value,
-            crate::compiled_proof::AotArgumentValue::DeviceMixedFixedSourcePointerTable(_)
-        ));
-        let (ordinary_catalog, ordinary_version) = mixed
-            .sources()
-            .iter()
-            .find_map(|source| match source {
-                fixed_table_materialization::LoweredFixedTableSource::Arena {
-                    value,
-                    version,
-                    ..
-                } => Some((*value, *version)),
-                fixed_table_materialization::LoweredFixedTableSource::Registered { .. } => None,
-            })
-            .expect("mixed table must retain its ordinary preprocessed source");
-        assert!(before.version(ordinary_catalog).is_err());
-        assert_eq!(
-            builder.prefix.values.version(ordinary_catalog),
-            Ok(ordinary_version)
-        );
-
-        let old_operations = builder.prefix.operations.clone();
-        let old_wrappers = builder.prefix.static_wrappers.clone();
-        let old_effects = builder.prefix.effects.clone();
-        assert!(matches!(
-            builder.emit_fixed_table_operations_using(miss_second_fixed_table_wrapper),
-            Err(CompiledBaseDagAppendError::MissingFixedTableStaticWrapper {
-                table_ordinal: 1,
-                ..
-            })
-        ));
-        assert_eq!(builder.prefix.operations, old_operations);
-        assert_eq!(builder.prefix.static_wrappers, old_wrappers);
-        assert_eq!(builder.prefix.effects, old_effects);
-        assert!(!builder.fixed_tables.as_ref().unwrap().emitted);
-
-        let tables = builder
-            .fixed_tables
-            .as_ref()
-            .unwrap()
-            .lowered
-            .tables()
-            .len();
-        builder
-            .emit_fixed_table_operations_using(fake_fixed_table_wrapper)
-            .unwrap();
-        assert_eq!(
-            builder.prefix.operations.len(),
-            old_operations.len() + tables
-        );
-        assert_eq!(
-            builder.prefix.static_wrappers.len(),
-            old_wrappers.len() + tables
-        );
-        assert!(builder.has_complete_fixed_table_stage());
-        assert_eq!(
-            builder.emit_fixed_table_operations(),
-            Err(CompiledBaseDagAppendError::InvalidStage)
-        );
-    }
-}
+#[path = "builder/tests.rs"]
+mod tests;

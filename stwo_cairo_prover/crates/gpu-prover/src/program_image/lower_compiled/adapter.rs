@@ -220,6 +220,13 @@ impl SemanticValueMap {
         changed.transition(catalog)?;
         Ok(changed)
     }
+
+    #[cfg(test)]
+    pub(super) fn with_unused_catalog_for_test(&self) -> Result<Self, InvocationShapeError> {
+        let mut changed = self.clone();
+        changed.extend_ordered([ArenaCatalogValueId(u32::MAX)])?;
+        Ok(changed)
+    }
 }
 
 /// Descriptor ValueIds stay in the checked source receipt for ShapeExecutable

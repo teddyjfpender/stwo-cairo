@@ -345,6 +345,41 @@ fn compact_invocation(
     Ok(AotInvocation { arguments })
 }
 
+pub(super) fn compact_invocation_from_execution_steps(
+    lowered: &LoweredWitnessInputCompact,
+    steps: &[StaticCudaExecutionStepIdentity],
+) -> Result<AotInvocation, InvocationShapeError> {
+    let sort_temp_bytes = steps.iter().find_map(|step| match step {
+        StaticCudaExecutionStepIdentity::LibraryCall(
+            StaticCudaLibraryCallIdentity::CubStableAscendingSortPairsU32V1(call),
+        ) => Some(call.exact_temp_bytes()),
+        _ => None,
+    });
+    let scan_temp_bytes = steps.iter().find_map(|step| match step {
+        StaticCudaExecutionStepIdentity::LibraryCall(
+            StaticCudaLibraryCallIdentity::CubInclusiveSumU32V1(call),
+        ) => Some(call.exact_temp_bytes()),
+        _ => None,
+    });
+    let sort_temp_bytes = usize::try_from(
+        sort_temp_bytes.ok_or(InvocationShapeError::InvalidProductionBaseAuthority)?,
+    )
+    .map_err(|_| InvocationShapeError::SizeOverflow)?;
+    let scan_temp_bytes = usize::try_from(
+        scan_temp_bytes.ok_or(InvocationShapeError::InvalidProductionBaseAuthority)?,
+    )
+    .map_err(|_| InvocationShapeError::SizeOverflow)?;
+    if compact_steps(&lowered.contract, sort_temp_bytes, scan_temp_bytes)? != steps {
+        return Err(InvocationShapeError::InvalidProductionBaseAuthority);
+    }
+    compact_invocation(
+        lowered,
+        sort_temp_bytes,
+        scan_temp_bytes,
+        lowered.contract.abi().arguments(),
+    )
+}
+
 fn pointer(binding: &SemanticArenaBinding) -> AotArgumentValue {
     AotArgumentValue::DevicePointer(Some(binding.binding))
 }

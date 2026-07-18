@@ -24,16 +24,45 @@ fn full_sn2_order_and_module_global_authority_are_independent_and_exact() {
         resolve_all_static_for_prefix,
     )
     .unwrap();
-    assert_eq!(prefix.operations.len(), 48);
-    assert_eq!(prefix.static_wrappers.len(), 26);
+    assert_eq!(prefix.operations.len(), 78);
+    assert_eq!(prefix.static_wrappers.len(), 47);
     assert_eq!(prefix.kernels.len(), 22);
+    assert_eq!(
+        causal_prefix_fixture_digest(&prefix),
+        "a4257ab48618e3e09bb99e3073740cf8c3f58ef0224d9586256961dbf710d39f"
+    );
     assert_full_sn2_order_without_emission_oracle(&prefix);
     assert_recorded_module_globals_are_exact(&prefix);
 }
 
+fn causal_prefix_fixture_digest(prefix: &CompiledWitnessWriterPrefix) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"stwo-cairo.sn2.causal-base-fixture.v1\0");
+    for operation in &prefix.operations {
+        let encoded = format!("{operation:?}");
+        hasher.update(&(encoded.len() as u64).to_le_bytes());
+        hasher.update(encoded.as_bytes());
+        let effect = prefix
+            .effects
+            .iter()
+            .find(|effect| effect.id() == operation.effect)
+            .unwrap();
+        hasher.update(&(effect.canonical_encoding().len() as u64).to_le_bytes());
+        hasher.update(effect.canonical_encoding());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 fn assert_full_sn2_order_without_emission_oracle(prefix: &CompiledWitnessWriterPrefix) {
+    #[derive(Clone, Copy)]
+    enum ExpectedPrimitive {
+        Aot,
+        Static,
+        HostIngress,
+    }
+
     let authority = prefix.base_authority();
-    let mut expected = Vec::new();
+    let mut expected = Vec::<(ExpectedPrimitive, EffectContract, bool)>::new();
     let execution = authority
         .execution_tables
         .as_ref()
@@ -42,11 +71,15 @@ fn assert_full_sn2_order_without_emission_oracle(prefix: &CompiledWitnessWriterP
         execution
             .stages
             .iter()
-            .map(|stage| (false, &stage.effect, false)),
+            .map(|stage| (ExpectedPrimitive::Static, stage.effect.clone(), false)),
     );
-    expected.push((false, &authority.multiplicity.clear.effect, false));
+    expected.push((
+        ExpectedPrimitive::Static,
+        authority.multiplicity.clear.effect.clone(),
+        false,
+    ));
     if let Some(seed) = &authority.multiplicity.public_memory_seed {
-        expected.push((false, &seed.effect, false));
+        expected.push((ExpectedPrimitive::Static, seed.effect.clone(), false));
     }
     for (ordinal, (producer, feed)) in authority
         .producers
@@ -55,24 +88,63 @@ fn assert_full_sn2_order_without_emission_oracle(prefix: &CompiledWitnessWriterP
         .enumerate()
     {
         assert_eq!(producer.position().ordinal as usize, ordinal);
+        let ordinal = u32::try_from(ordinal).unwrap();
+        let mut setup_count = 0usize;
+        for setup in prefix
+            .causal_setup
+            .gathers
+            .iter()
+            .filter(|setup| setup.position.ordinal == ordinal)
+        {
+            expected.push((ExpectedPrimitive::Static, setup.effect.clone(), false));
+            setup_count += 1;
+        }
+        for setup in prefix
+            .causal_setup
+            .seed_compact
+            .iter()
+            .filter(|setup| setup.position().ordinal == ordinal)
+        {
+            expected.push((ExpectedPrimitive::Static, setup.effect().clone(), false));
+            setup_count += 1;
+        }
+        for setup in prefix
+            .causal_setup
+            .casm
+            .iter()
+            .filter(|setup| setup.position.ordinal == ordinal)
+        {
+            let (_, ingress) = super::emission::statement_host_ingress_for_test(setup).unwrap();
+            expected.push((ExpectedPrimitive::HostIngress, ingress, false));
+            expected.push((ExpectedPrimitive::Static, setup.effect.clone(), false));
+            setup_count += 1;
+        }
+        assert!(setup_count <= 1);
+
         let stateful = matches!(
             producer,
             SemanticBaseProducer::Recorded(recorded)
                 if recorded.source.deduce.module_state.is_some()
         );
         expected.push((
-            matches!(producer, SemanticBaseProducer::Recorded(_)),
-            producer.effect(),
+            if matches!(producer, SemanticBaseProducer::Recorded(_)) {
+                ExpectedPrimitive::Aot
+            } else {
+                ExpectedPrimitive::Static
+            },
+            producer.effect().clone(),
             stateful,
         ));
         if let Some(feed) = feed {
-            expected.push((false, &feed.effect, false));
+            expected.push((ExpectedPrimitive::Static, feed.effect.clone(), false));
         }
     }
-    assert_eq!(expected.len(), 48);
+    assert_eq!(expected.len(), 78);
+
     let mut next_aot = 1u32;
     let mut next_wrapper = 1u32;
-    for (index, (operation, (is_aot, expected_effect, stateful))) in
+    let mut host_ingress = 0usize;
+    for (index, (operation, (primitive, expected_effect, stateful))) in
         prefix.operations.iter().zip(expected).enumerate()
     {
         assert_eq!(operation.id.0 as usize, index);
@@ -86,22 +158,27 @@ fn assert_full_sn2_order_without_emission_oracle(prefix: &CompiledWitnessWriterP
         if stateful {
             assert_eq!(effect.module_globals().len(), 2);
         } else {
-            assert_eq!(effect, expected_effect);
+            assert_eq!(effect, &expected_effect);
         }
-        match (&operation.primitive, is_aot) {
-            (ExecutionPrimitive::AotKernel { kernel, .. }, true) => {
+        match (&operation.primitive, primitive) {
+            (ExecutionPrimitive::AotKernel { kernel, .. }, ExpectedPrimitive::Aot) => {
                 assert_eq!(kernel.0, next_aot);
                 next_aot += 1;
             }
-            (ExecutionPrimitive::StaticCudaWrapper { wrapper }, false) => {
+            (ExecutionPrimitive::StaticCudaWrapper { wrapper }, ExpectedPrimitive::Static) => {
                 assert_eq!(wrapper.0, next_wrapper);
                 next_wrapper += 1;
+            }
+            (ExecutionPrimitive::StatementHostIngress { .. }, ExpectedPrimitive::HostIngress) => {
+                assert!(operation.invocation.is_none());
+                host_ingress += 1;
             }
             _ => panic!("SN2 operation order changed primitive class"),
         }
     }
     assert_eq!(next_aot, 23);
-    assert_eq!(next_wrapper, 27);
+    assert_eq!(next_wrapper, 48);
+    assert_eq!(host_ingress, 9);
 }
 
 fn assert_recorded_module_globals_are_exact(prefix: &CompiledWitnessWriterPrefix) {

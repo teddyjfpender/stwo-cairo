@@ -10,7 +10,8 @@ use stwo_backend_cuda::ExecutionTablesStage;
 
 use super::super::{
     execution_tables, multiplicity_clear, multiplicity_feed, static_wrapper_invocation,
-    static_wrapper_projection,
+    static_wrapper_projection, witness_casm_input, witness_input_gather,
+    witness_input_seed_compact,
 };
 use super::*;
 use crate::compiled_proof::{
@@ -18,17 +19,47 @@ use crate::compiled_proof::{
     StaticCudaWrapperAuthority, StaticCudaWrapperId,
 };
 
+mod causal;
 mod sequence;
+mod static_resolver;
+mod validation;
 
+#[cfg(test)]
+pub(in crate::program_image::lower_compiled) use causal::resolve_setup_counts_for_test;
+pub(in crate::program_image::lower_compiled) use causal::ResolveSetupError;
+use causal::{append_setup_event, resolve_setup_event};
 pub(in super::super) use sequence::ordered_effects;
-use sequence::{sequence, BaseEvent};
+pub(super) use sequence::CausalWitnessSetup;
+use sequence::{causal_sequence, BaseEvent};
+pub(super) use static_resolver::resolve_static;
+pub(super) use validation::validate_sealed_prefix;
+
+#[cfg(test)]
+pub(in crate::program_image::lower_compiled) fn statement_host_ingress_for_test(
+    lowered: &witness_casm_input::LoweredWitnessCasmInput,
+) -> Result<(ExecutionPrimitive, EffectContract), InvocationShapeError> {
+    causal::statement_host_ingress(lowered)
+}
 
 pub(in crate::program_image::lower_compiled) type StaticWrapperResolver =
     for<'a> fn(
         StaticWrapperRequest<'a>,
         StaticCudaWrapperId,
         u32,
-    ) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError>;
+        &ProofArenaPlan,
+        &adapter::SemanticValueMap,
+    ) -> Result<Option<ResolvedStaticExecution>, InvocationShapeError>;
+
+/// Exact executable pair returned by a linked static build.
+///
+/// Most wrappers reuse an invocation fixed by semantic lowering. Composite
+/// wrappers may instead learn execution-exact arguments from the linked build,
+/// so the resolver must publish the invocation together with the wrapper.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::program_image::lower_compiled) struct ResolvedStaticExecution {
+    pub(in crate::program_image::lower_compiled) wrapper: StaticCudaWrapperAuthority,
+    pub(in crate::program_image::lower_compiled) invocation: AotInvocation,
+}
 
 #[derive(Clone, Copy)]
 pub(in crate::program_image::lower_compiled) enum StaticWrapperRequest<'a> {
@@ -37,6 +68,10 @@ pub(in crate::program_image::lower_compiled) enum StaticWrapperRequest<'a> {
         stage: ExecutionTablesStage,
     },
     MultiplicityClear(&'a multiplicity_clear::LoweredMultiplicityClear),
+    WitnessInputGather(&'a witness_input_gather::LoweredWitnessInputGather),
+    WitnessInputSeed(&'a witness_input_seed_compact::LoweredWitnessInputSeed),
+    WitnessInputCompact(&'a witness_input_seed_compact::LoweredWitnessInputCompact),
+    WitnessCasmScatter(&'a witness_casm_input::LoweredWitnessCasmInput),
     MultiplicityFeed(&'a multiplicity_feed::LoweredMultiplicityFeed),
     NativeBlakeGDirect(&'a super::super::blake_g_direct_prefix::LoweredNativeBlakeGDirectContract),
     NativeEcOp(&'a super::super::ec_op_prefix::LoweredNativeEcOpContract),
@@ -54,6 +89,10 @@ impl<'a> StaticWrapperRequest<'a> {
                 ..
             } => StaticWrapperKind::ExecutionTableSmall,
             Self::MultiplicityClear(_) => StaticWrapperKind::MultiplicityClear,
+            Self::WitnessInputGather(_) => StaticWrapperKind::WitnessInputGather,
+            Self::WitnessInputSeed(_) => StaticWrapperKind::WitnessInputSeed,
+            Self::WitnessInputCompact(_) => StaticWrapperKind::WitnessInputCompact,
+            Self::WitnessCasmScatter(_) => StaticWrapperKind::WitnessCasmScatter,
             Self::MultiplicityFeed(feed)
                 if feed.owner == multiplicity_feed::MultiplicityFeedOwner::PublicMemorySeed =>
             {
@@ -76,6 +115,10 @@ impl<'a> StaticWrapperRequest<'a> {
                 .map(|stage| &stage.effect)
                 .ok_or(InvocationShapeError::InvalidStructuredAbi),
             Self::MultiplicityClear(lowered) => Ok(&lowered.effect),
+            Self::WitnessInputGather(lowered) => Ok(&lowered.effect),
+            Self::WitnessInputSeed(lowered) => Ok(&lowered.effect),
+            Self::WitnessInputCompact(lowered) => Ok(&lowered.effect),
+            Self::WitnessCasmScatter(lowered) => Ok(&lowered.effect),
             Self::MultiplicityFeed(lowered) => Ok(&lowered.effect),
             Self::NativeBlakeGDirect(lowered) => Ok(&lowered.effect),
             Self::NativeEcOp(lowered) => Ok(&lowered.effect),
@@ -93,14 +136,47 @@ impl<'a> StaticWrapperRequest<'a> {
                 .map(|stage| stage.invocation.clone())
                 .ok_or(InvocationShapeError::InvalidStructuredAbi),
             Self::MultiplicityClear(lowered) => Ok(lowered.invocation.clone()),
+            Self::WitnessInputGather(lowered) => Ok(lowered.invocation.clone()),
+            Self::WitnessInputSeed(lowered) => Ok(lowered.invocation.clone()),
+            // The compact invocation contains exact CUB temporary sizes learned
+            // from its linked build and is therefore available only from the
+            // resolved execution.
+            Self::WitnessInputCompact(_) => {
+                Err(InvocationShapeError::InvalidProductionBaseAuthority)
+            }
+            Self::WitnessCasmScatter(lowered) => Ok(lowered.invocation.clone()),
             Self::MultiplicityFeed(lowered) => Ok(lowered.invocation.clone()),
             Self::NativeBlakeGDirect(lowered) => static_wrapper_invocation::blake_g_direct(lowered),
             Self::NativeEcOp(lowered) => static_wrapper_invocation::ec_op(lowered),
         }
     }
 
+    fn invocation_for_wrapper(
+        self,
+        wrapper: &StaticCudaWrapperAuthority,
+    ) -> Result<AotInvocation, InvocationShapeError> {
+        match self {
+            Self::WitnessInputCompact(lowered) => {
+                witness_input_seed_compact::compact_invocation_from_wrapper(lowered, wrapper)
+            }
+            _ => self.invocation(),
+        }
+    }
+
     fn missing_adapter(self) -> Option<MissingBaseAdapter> {
         match self.kind() {
+            StaticWrapperKind::WitnessInputGather => {
+                Some(MissingBaseAdapter::WitnessInputGatherStaticWrapper)
+            }
+            StaticWrapperKind::WitnessInputSeed => {
+                Some(MissingBaseAdapter::WitnessInputSeedStaticWrapper)
+            }
+            StaticWrapperKind::WitnessInputCompact => {
+                Some(MissingBaseAdapter::WitnessInputCompactStaticWrapper)
+            }
+            StaticWrapperKind::WitnessCasmScatter => {
+                Some(MissingBaseAdapter::WitnessCasmScatterStaticWrapper)
+            }
             StaticWrapperKind::MultiplicityFeed => {
                 Some(MissingBaseAdapter::MultiplicityFeedStaticWrapper)
             }
@@ -116,68 +192,7 @@ impl<'a> StaticWrapperRequest<'a> {
     }
 }
 
-pub(super) fn resolve_static(
-    request: StaticWrapperRequest<'_>,
-    id: StaticCudaWrapperId,
-    target_sm: u32,
-) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
-    let wrapper = match request {
-        StaticWrapperRequest::ExecutionTable { lowered, stage } => {
-            let Some(linked) = lowered
-                .contract
-                .bind_static_build(target_sm)
-                .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?
-            else {
-                return Ok(None);
-            };
-            execution_tables::project_static_wrapper(id, &linked, lowered, stage)?.wrapper
-        }
-        StaticWrapperRequest::MultiplicityClear(lowered) => {
-            let Some(linked) = lowered
-                .contract
-                .bind_static_build(target_sm)
-                .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?
-            else {
-                return Ok(None);
-            };
-            multiplicity_clear::project_static_wrapper(id, &linked, lowered)?.wrapper
-        }
-        StaticWrapperRequest::MultiplicityFeed(lowered) => {
-            let Some(linked) = lowered
-                .contract
-                .bind_static_build(target_sm)
-                .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?
-            else {
-                return Ok(None);
-            };
-            multiplicity_feed::project_static_wrapper(id, &linked, lowered)?.wrapper
-        }
-        StaticWrapperRequest::NativeBlakeGDirect(lowered) => {
-            let Some(linked) =
-                super::super::blake_g_direct_execution_authority::
-                    NativeBlakeGDirectLinkedModuleAuthority::bind_linked(
-                        &lowered.authority,
-                        target_sm,
-                    )?
-            else {
-                return Ok(None);
-            };
-            static_wrapper_projection::blake_g_direct(id, &linked, lowered)?
-        }
-        StaticWrapperRequest::NativeEcOp(lowered) => {
-            let Some(linked) = super::super::ec_op_execution_authority::
-                NativeEcOpLinkedModuleAuthority::bind_linked(&lowered.authority)?
-            else {
-                return Ok(None);
-            };
-            linked.validate_active_sm(target_sm)?;
-            static_wrapper_projection::ec_op(id, &linked, lowered)?
-        }
-    };
-    Ok(Some(wrapper))
-}
-
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Buffers {
     kernels: Vec<AotKernelAuthority>,
     static_wrappers: Vec<StaticCudaWrapperAuthority>,
@@ -196,7 +211,7 @@ enum ResolvedEvent<'a> {
     },
     Static {
         request: StaticWrapperRequest<'a>,
-        wrapper: StaticCudaWrapperAuthority,
+        execution: ResolvedStaticExecution,
     },
 }
 
@@ -230,7 +245,12 @@ pub(super) fn emit_using(
         &mut values,
     )
     .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
-    let sequence = sequence(&authority).map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
+    let required_preproducer_versions = validate_witness_writer_transitions(&authority, &values)
+        .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
+    let causal_setup = CausalWitnessSetup::lower(arena, &mut values, &authority)
+        .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
+    let sequence = causal_sequence(&authority, &causal_setup)
+        .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
     let monolithic = PartitionAuthority::monolithic();
     let mut buffers = Buffers::default();
 
@@ -248,10 +268,10 @@ pub(super) fn emit_using(
                 .checked_add(resolved_prelude.len())
                 .ok_or(CompiledWitnessWriterPrefixError::Lowering)?,
         )?;
-        let wrapper = resolve_static(request, id, target_sm)
+        let execution = resolve_static(request, id, target_sm, arena, &values)
             .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?
             .ok_or(CompiledWitnessWriterPrefixError::Lowering)?;
-        resolved_prelude.push(ResolvedEvent::Static { request, wrapper });
+        resolved_prelude.push(ResolvedEvent::Static { request, execution });
     }
     for event in resolved_prelude {
         append_event(event, target_sm, &monolithic, &mut buffers)?;
@@ -261,6 +281,35 @@ pub(super) fn emit_using(
         let semantic = &authority.producers[producer_index];
         let position = semantic.position();
         let producer = semantic.producer();
+        let resolved_setup = match group.setup {
+            None => None,
+            Some(setup) => {
+                let id = wrapper_id(buffers.static_wrappers.len())?;
+                match resolve_setup_event(setup, id, target_sm, arena, &values, resolve_static) {
+                    Ok(event) => Some(event),
+                    Err(ResolveSetupError::Missing(adapter)) => {
+                        return missing_adapter(
+                            adapter,
+                            position,
+                            producer,
+                            manifest,
+                            target_sm,
+                            values,
+                            causal_setup.clone(),
+                            required_preproducer_versions.clone(),
+                            buffers,
+                            monolithic,
+                            authority.clone(),
+                            producer_index,
+                        )
+                    }
+                    Err(ResolveSetupError::Invalid) => {
+                        return Err(CompiledWitnessWriterPrefixError::Lowering)
+                    }
+                }
+            }
+        };
+        let setup_static = usize::from(resolved_setup.is_some());
         let resolved_producer = match group.producer {
             BaseEvent::Recorded(recorded) => {
                 let fields = resolve_recorded(&recorded.source).map_err(|error| match error {
@@ -296,8 +345,14 @@ pub(super) fn emit_using(
                 }
             }
             BaseEvent::Static(request) => {
-                let id = wrapper_id(buffers.static_wrappers.len())?;
-                let Some(wrapper) = resolve_static(request, id, target_sm)
+                let id = wrapper_id(
+                    buffers
+                        .static_wrappers
+                        .len()
+                        .checked_add(setup_static)
+                        .ok_or(CompiledWitnessWriterPrefixError::Lowering)?,
+                )?;
+                let Some(execution) = resolve_static(request, id, target_sm, arena, &values)
                     .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?
                 else {
                     return missing_adapter(
@@ -309,13 +364,15 @@ pub(super) fn emit_using(
                         manifest,
                         target_sm,
                         values,
+                        causal_setup.clone(),
+                        required_preproducer_versions.clone(),
                         buffers,
                         monolithic,
                         authority.clone(),
                         producer_index,
                     );
                 };
-                ResolvedEvent::Static { request, wrapper }
+                ResolvedEvent::Static { request, execution }
             }
         };
         let resolved_feed = match group.feed {
@@ -331,10 +388,11 @@ pub(super) fn emit_using(
                     buffers
                         .static_wrappers
                         .len()
-                        .checked_add(producer_static)
+                        .checked_add(setup_static)
+                        .and_then(|count| count.checked_add(producer_static))
                         .ok_or(CompiledWitnessWriterPrefixError::Lowering)?,
                 )?;
-                let Some(wrapper) = resolve_static(request, id, target_sm)
+                let Some(execution) = resolve_static(request, id, target_sm, arena, &values)
                     .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?
                 else {
                     return missing_adapter(
@@ -344,23 +402,31 @@ pub(super) fn emit_using(
                         manifest,
                         target_sm,
                         values,
+                        causal_setup.clone(),
+                        required_preproducer_versions.clone(),
                         buffers,
                         monolithic,
                         authority.clone(),
                         producer_index,
                     );
                 };
-                Some(ResolvedEvent::Static { request, wrapper })
+                Some(ResolvedEvent::Static { request, execution })
             }
             Some(BaseEvent::Recorded(_)) => return Err(CompiledWitnessWriterPrefixError::Lowering),
         };
 
-        // Both authorities are resolved before either event mutates the
-        // returned prefix. A missing feed therefore cannot strand its writer.
-        append_event(resolved_producer, target_sm, &monolithic, &mut buffers)?;
-        if let Some(feed) = resolved_feed {
-            append_event(feed, target_sm, &monolithic, &mut buffers)?;
+        // Every authority in this schedule position is resolved before a
+        // cloned buffer set is mutated. Host ingress, scatter, writer and feed
+        // therefore publish as one cursor unit or not at all.
+        let mut next_buffers = buffers.clone();
+        if let Some(setup) = resolved_setup {
+            append_setup_event(setup, target_sm, &monolithic, &mut next_buffers)?;
         }
+        append_event(resolved_producer, target_sm, &monolithic, &mut next_buffers)?;
+        if let Some(feed) = resolved_feed {
+            append_event(feed, target_sm, &monolithic, &mut next_buffers)?;
+        }
+        buffers = next_buffers;
     }
     drop(sequence);
     let next_producer = authority.producers.len();
@@ -368,6 +434,8 @@ pub(super) fn emit_using(
         manifest,
         target_sm,
         values,
+        causal_setup,
+        required_preproducer_versions,
         buffers,
         monolithic,
         authority,
@@ -422,19 +490,20 @@ fn append_event(
                     kernel,
                     launch: recorded.source.launch,
                 },
-                recorded.invocation.clone(),
+                Some(recorded.invocation.clone()),
                 effect.id(),
                 monolithic,
                 &mut buffers.operations,
             )
         }
-        ResolvedEvent::Static { request, wrapper } => {
+        ResolvedEvent::Static { request, execution } => {
             let effect = request
                 .effect()
                 .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
-            let invocation = request
-                .invocation()
-                .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
+            let ResolvedStaticExecution {
+                wrapper,
+                invocation,
+            } = execution;
             let expected_id = wrapper_id(buffers.static_wrappers.len())?;
             if wrapper.id() != expected_id
                 || wrapper.consumer_target_sm() != target_sm
@@ -456,7 +525,7 @@ fn append_event(
                 ExecutionPrimitive::StaticCudaWrapper {
                     wrapper: expected_id,
                 },
-                invocation,
+                Some(invocation),
                 effect.id(),
                 monolithic,
                 &mut buffers.operations,
@@ -473,6 +542,8 @@ fn missing_adapter(
     manifest: [u8; 32],
     target_sm: u32,
     values: adapter::SemanticValueMap,
+    causal_setup: CausalWitnessSetup,
+    required_preproducer_versions: BTreeSet<ValueVersion>,
     buffers: Buffers,
     monolithic: PartitionAuthority,
     authority: BaseProducerAuthority,
@@ -488,6 +559,8 @@ fn missing_adapter(
             manifest,
             target_sm,
             values,
+            causal_setup,
+            required_preproducer_versions,
             buffers,
             monolithic,
             authority,
@@ -500,6 +573,8 @@ fn finish_prefix(
     execution_manifest_identity: [u8; 32],
     target_sm: u32,
     values: adapter::SemanticValueMap,
+    causal_setup: CausalWitnessSetup,
+    required_preproducer_versions: BTreeSet<ValueVersion>,
     buffers: Buffers,
     monolithic: PartitionAuthority,
     base_authority: BaseProducerAuthority,
@@ -518,11 +593,9 @@ fn finish_prefix(
         .then_some(monolithic.clone())
         .into_iter()
         .collect::<Vec<_>>();
-    let required_preproducer_versions =
-        validate_witness_writer_transitions(&base_authority, &values)
-            .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
     validate_sealed_prefix(
         &base_authority,
+        &causal_setup,
         next_producer,
         target_sm,
         &kernel_by_build_authority,
@@ -535,12 +608,18 @@ fn finish_prefix(
         &operations,
     )
     .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
+    let causal_external_roots = (next_producer == base_authority.producers.len())
+        .then(|| validate_causal_value_closure(&values, &effects, &operations))
+        .transpose()
+        .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
     Ok(CompiledWitnessWriterPrefix {
         execution_manifest_identity,
         target_sm,
         values,
         base_authority,
+        causal_setup,
         next_producer,
+        causal_external_roots,
         required_preproducer_versions,
         kernel_by_build_authority,
         kernels,
@@ -550,170 +629,4 @@ fn finish_prefix(
         partitions,
         operations,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn validate_sealed_prefix(
-    authority: &BaseProducerAuthority,
-    next_producer: usize,
-    target_sm: u32,
-    kernel_by_build_authority: &BTreeMap<[u8; 32], usize>,
-    kernels: &[AotKernelAuthority],
-    static_wrappers: &[StaticCudaWrapperAuthority],
-    module_global_initializers: &[ModuleGlobalInitializer],
-    effects: &[EffectContract],
-    partitions: &[PartitionAuthority],
-    monolithic: &PartitionAuthority,
-    operations: &[OpNode],
-) -> Result<(), ()> {
-    let sequence = sequence(authority)?;
-    if next_producer > sequence.witnesses.len() {
-        return Err(());
-    }
-    let expected = sequence
-        .prelude
-        .iter()
-        .copied()
-        .chain(
-            sequence.witnesses[..next_producer]
-                .iter()
-                .flat_map(|group| [Some(group.producer), group.feed].into_iter().flatten()),
-        )
-        .collect::<Vec<_>>();
-    let expected_partitions = (!operations.is_empty())
-        .then(|| monolithic.clone())
-        .into_iter()
-        .collect::<Vec<_>>();
-    if operations.len() != expected.len()
-        || partitions != expected_partitions
-        || kernel_by_build_authority.len() != kernels.len()
-        || kernel_by_build_authority
-            .values()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            != (0..kernels.len()).collect()
-        || kernels
-            .iter()
-            .enumerate()
-            .any(|(index, kernel)| kernel.id().0 as usize != index + 1)
-        || static_wrappers.iter().enumerate().any(|(index, wrapper)| {
-            wrapper.id().0 as usize != index + 1
-                || wrapper.consumer_target_sm() != target_sm
-                || !wrapper.has_valid_identity().unwrap_or(false)
-        })
-        || effects.windows(2).any(|pair| pair[0].id() >= pair[1].id())
-    {
-        return Err(());
-    }
-
-    let mut used_kernels = BTreeMap::<AotKernelId, BTreeSet<_>>::new();
-    let mut used_effects = BTreeSet::new();
-    let mut used_initializers = BTreeSet::new();
-    let mut next_wrapper = 1usize;
-    for (index, (operation, event)) in operations.iter().zip(expected).enumerate() {
-        if operation.id.0 as usize != index
-            || operation.semantic_id.0 as usize != index + 1
-            || operation.invocation.as_ref() != Some(&event.invocation().map_err(|_| ())?)
-            || operation.partition != monolithic.id()
-            || operation.stage
-                != ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase)
-        {
-            return Err(());
-        }
-        let effect = effects
-            .iter()
-            .find(|effect| effect.id() == operation.effect)
-            .ok_or(())?;
-        used_effects.insert(operation.effect);
-        match (event, &operation.primitive) {
-            (BaseEvent::Recorded(recorded), ExecutionPrimitive::AotKernel { kernel, launch })
-                if *launch == recorded.source.launch =>
-            {
-                let authority = kernels
-                    .iter()
-                    .find(|authority| authority.id() == *kernel)
-                    .ok_or(())?;
-                if effect.accesses() != recorded.effect.accesses()
-                    || validate_recorded_module_global_effect(
-                        &recorded.source,
-                        authority.module(),
-                        effect,
-                        module_global_initializers,
-                    )
-                    .is_err()
-                {
-                    return Err(());
-                }
-                used_initializers.extend(
-                    effect
-                        .module_globals()
-                        .iter()
-                        .map(|global| global.initializer),
-                );
-                used_kernels.entry(*kernel).or_default().insert((
-                    operation.effect,
-                    operation.partition,
-                    operation
-                        .invocation
-                        .as_ref()
-                        .ok_or(())?
-                        .contract_id()
-                        .map_err(|_| ())?,
-                ));
-            }
-            (BaseEvent::Static(request), ExecutionPrimitive::StaticCudaWrapper { wrapper })
-                if wrapper.0 as usize == next_wrapper =>
-            {
-                let authority = static_wrappers.get(next_wrapper - 1).ok_or(())?;
-                let invocation = operation.invocation.as_ref().ok_or(())?;
-                if authority.id() != *wrapper
-                    || authority.accepted_effect() != operation.effect
-                    || authority.accepted_invocation()
-                        != invocation.contract_id().map_err(|_| ())?
-                    || invocation != &request.invocation().map_err(|_| ())?
-                    || effect != request.effect().map_err(|_| ())?
-                {
-                    return Err(());
-                }
-                next_wrapper += 1;
-            }
-            _ => return Err(()),
-        }
-    }
-    let declared_effects = effects
-        .iter()
-        .map(EffectContract::id)
-        .collect::<BTreeSet<_>>();
-    let declared_initializers = module_global_initializers
-        .iter()
-        .enumerate()
-        .map(|(index, initializer)| {
-            (initializer.id().0 as usize == index
-                && initializer.has_valid_identity().unwrap_or(false))
-            .then_some(initializer.id())
-            .ok_or(())
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    if next_wrapper != static_wrappers.len() + 1
-        || declared_effects.len() != effects.len()
-        || declared_effects != used_effects
-        || declared_initializers.len() != module_global_initializers.len()
-        || declared_initializers != used_initializers
-        || used_kernels.len() != kernels.len()
-    {
-        return Err(());
-    }
-    for kernel in kernels {
-        let accepted = kernel
-            .accepted_executions()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if accepted.len() != kernel.accepted_executions().len()
-            || used_kernels.remove(&kernel.id()) != Some(accepted)
-        {
-            return Err(());
-        }
-    }
-    used_kernels.is_empty().then_some(()).ok_or(())
 }
