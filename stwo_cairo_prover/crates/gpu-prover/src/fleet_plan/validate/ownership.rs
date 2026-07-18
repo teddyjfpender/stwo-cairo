@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    operation, operation_placement, owner_ready_at, projected_range, range_covered, require_worker,
-    validate_value_range,
+    operation, operation_placement, owner_ready_at, projected_range, range_covered,
+    replica_ready_at, require_worker, validate_value_range,
 };
 use crate::compiled_proof::{exact_partial_atomic_carry_forward, ValueDesc, ValueOrigin};
 use crate::fleet_plan::*;
@@ -93,13 +93,12 @@ fn validate_origin(
                         .flatten()
                         .filter(|carry| carry.full_destination.version == value.version)
                         .filter(|carry| {
-                            plan.placement.owners.iter().any(|source_owner| {
-                                source_owner.worker == owner.worker
-                                    && source_owner.value == carry.full_source
-                                    && source_owner.live.contains(placement.during)
-                                    && owner_ready_at(plan, source_owner)
-                                        .is_ok_and(|ready| ready <= placement.during.start)
-                            })
+                            local_source_available(
+                                plan,
+                                owner.worker,
+                                carry.full_source,
+                                placement.during,
+                            )
                         });
                     if let Some(carry) = carried {
                         destinations.push(carry.full_destination);
@@ -119,4 +118,23 @@ fn validate_origin(
     } else {
         Err(FleetPlanError::InvalidProducer(value.version))
     }
+}
+
+fn local_source_available(
+    plan: &FleetProofPlan,
+    worker: WorkerId,
+    source: crate::compiled_proof::ValueRange,
+    during: ScheduleRange,
+) -> bool {
+    plan.placement.owners.iter().any(|owner| {
+        owner.worker == worker
+            && owner.value == source
+            && owner.live.contains(during)
+            && owner_ready_at(plan, owner).is_ok_and(|ready| ready <= during.start)
+    }) || plan.placement.replicas.iter().any(|replica| {
+        replica.worker == worker
+            && replica.value == source
+            && replica.live.contains(during)
+            && replica_ready_at(plan, replica).is_ok_and(|ready| ready <= during.start)
+    })
 }

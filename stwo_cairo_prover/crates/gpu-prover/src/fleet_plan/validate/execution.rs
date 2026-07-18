@@ -28,9 +28,6 @@ pub(super) fn validate_executions(
                 .monolithic_worker()
                 .ok_or(FleetPlanError::InvalidOperationDomain(operation.id))?;
             require_worker(workers, worker)?;
-            if worker != plan.placement.topology.coordinator {
-                return Err(FleetPlanError::InvalidOperationDomain(operation.id));
-            }
         }
         PartitionAuthorityKind::Exact(authority) => {
             if matches!(

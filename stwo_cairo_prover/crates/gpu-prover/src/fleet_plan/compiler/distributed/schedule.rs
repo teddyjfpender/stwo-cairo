@@ -1,7 +1,8 @@
 //! Deterministic operation placement and transcript-barrier scheduling.
 
 use super::*;
-use crate::compiled_proof::{ExecutionPrimitive, PartitionAuthorityKind};
+use crate::compiled_proof::{ExecutionPrimitive, OpId, PartitionAuthorityKind};
+use std::collections::BTreeMap;
 
 pub(super) struct DistributedSchedule {
     pub(super) barrier_steps: Vec<ScheduleStep>,
@@ -17,8 +18,10 @@ impl DistributedSchedule {
     pub(super) fn compile(
         compiled: &CompiledProof,
         topology: &FleetPlacementTopology,
+        static_wrapper_workers: &BTreeMap<OpId, WorkerId>,
         transcript: &CairoBlake2sTranscriptPlan,
     ) -> Result<Self, FleetCompileError> {
+        validate_static_wrapper_workers(compiled, topology, static_wrapper_workers)?;
         let mut cursor = ScheduleStep(0);
         let mut operations = Vec::with_capacity(compiled.operations().len());
         let mut pre_operation = vec![None; compiled.operations().len()];
@@ -34,7 +37,12 @@ impl DistributedSchedule {
                 operations.push(FleetOperationPlacement {
                     operation: operation.id,
                     during: take_step(&mut cursor)?,
-                    executions: operation_executions(compiled, operation, topology)?,
+                    executions: operation_executions(
+                        compiled,
+                        operation,
+                        topology,
+                        static_wrapper_workers,
+                    )?,
                 });
             }
             transcript_gathers.push(take_step(&mut cursor)?);
@@ -51,7 +59,12 @@ impl DistributedSchedule {
             operations.push(FleetOperationPlacement {
                 operation: operation.id,
                 during: take_step(&mut cursor)?,
-                executions: operation_executions(compiled, operation, topology)?,
+                executions: operation_executions(
+                    compiled,
+                    operation,
+                    topology,
+                    static_wrapper_workers,
+                )?,
             });
         }
         let tail_gather = take_step(&mut cursor)?;
@@ -86,6 +99,7 @@ fn operation_executions(
     compiled: &CompiledProof,
     operation: &OpNode,
     topology: &FleetPlacementTopology,
+    static_wrapper_workers: &BTreeMap<OpId, WorkerId>,
 ) -> Result<Vec<FleetOperationExecution>, FleetCompileError> {
     let partition = compiled
         .partitions()
@@ -94,7 +108,10 @@ fn operation_executions(
         .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
     match partition.kind() {
         PartitionAuthorityKind::Monolithic => Ok(vec![FleetOperationExecution {
-            worker: topology.coordinator,
+            worker: static_wrapper_workers
+                .get(&operation.id)
+                .copied()
+                .unwrap_or(topology.coordinator),
             domain: OperationDomain::Monolithic,
         }]),
         PartitionAuthorityKind::Exact(authority) => {
@@ -138,6 +155,35 @@ fn operation_executions(
             Ok(executions)
         }
     }
+}
+
+fn validate_static_wrapper_workers(
+    compiled: &CompiledProof,
+    topology: &FleetPlacementTopology,
+    static_wrapper_workers: &BTreeMap<OpId, WorkerId>,
+) -> Result<(), FleetCompileError> {
+    for (&operation, &worker) in static_wrapper_workers {
+        let operation = compiled
+            .operation(operation)
+            .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+        let partition = compiled
+            .partitions()
+            .iter()
+            .find(|partition| partition.id() == operation.partition)
+            .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+        if !matches!(
+            operation.primitive,
+            ExecutionPrimitive::StaticCudaWrapper { .. }
+        ) || !matches!(partition.kind(), PartitionAuthorityKind::Monolithic)
+            || !topology
+                .workers
+                .iter()
+                .any(|candidate| candidate.id == worker)
+        {
+            return Err(FleetCompileError::InvalidSemanticSchedule);
+        }
+    }
+    Ok(())
 }
 
 fn conservative_arrivals(

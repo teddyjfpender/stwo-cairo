@@ -492,7 +492,7 @@ fn exact_execution_rejects_mixed_domain_kinds() {
 }
 
 #[test]
-fn monolithic_execution_requires_exactly_one_coordinator_execution() {
+fn monolithic_execution_requires_exactly_one_known_worker_execution() {
     let mut missing = exact_fixture();
     missing.placement.operations[0].executions.clear();
     expect_domain_error(missing, MONOLITHIC_OPERATION);
@@ -506,9 +506,12 @@ fn monolithic_execution_requires_exactly_one_coordinator_execution() {
         });
     expect_domain_error(duplicate, MONOLITHIC_OPERATION);
 
-    let mut away = exact_fixture();
-    away.placement.operations[0].executions[0].worker = WorkerId(1);
-    expect_domain_error(away, MONOLITHIC_OPERATION);
+    let mut unknown = exact_fixture();
+    unknown.placement.operations[0].executions[0].worker = WorkerId(9);
+    assert_eq!(
+        compile(unknown).unwrap_err(),
+        FleetPlanError::UnknownWorker(WorkerId(9))
+    );
 }
 
 #[test]

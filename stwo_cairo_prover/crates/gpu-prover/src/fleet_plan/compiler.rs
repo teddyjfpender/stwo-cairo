@@ -85,6 +85,7 @@ struct CompiledSchedule {
 struct RequiredAlias {
     operation: OpId,
     alias: InPlaceAliasId,
+    worker: WorkerId,
     source: ValueRange,
     destination: ValueRange,
 }
@@ -239,7 +240,7 @@ fn compile_storage(
         barrier_steps,
         operations,
     )?;
-    let required_aliases = compile_required_aliases(compiled, &owners, operations)?;
+    let required_aliases = compile_required_aliases(compiled, &owners, &[], operations)?;
     let alias_components = compile_alias_components(compiled.values().len(), &required_aliases)?;
     let ingress_reuses = statement_host_reuses(compiled)?;
     let ingress_components = compile_ingress_components(compiled.values().len(), &ingress_reuses)?;
@@ -473,6 +474,7 @@ fn extend_live_end(
 fn compile_required_aliases(
     compiled: &CompiledProof,
     owners: &[FleetOwnerPlacement],
+    replicas: &[FleetReplicaPlacement],
     operations: &[FleetOperationPlacement],
 ) -> Result<Vec<RequiredAlias>, FleetCompileError> {
     let mut aliases = Vec::new();
@@ -492,23 +494,26 @@ fn compile_required_aliases(
                 alias: authority.id,
             };
             let placement = operation_placement(operations, operation.id)?;
+            let [FleetOperationExecution {
+                worker,
+                domain: OperationDomain::Monolithic,
+            }] = placement.executions.as_slice()
+            else {
+                return Err(invalid());
+            };
             let source = access.source().ok_or_else(invalid)?.value;
             let destination = access.destination().ok_or_else(invalid)?.value;
             let source_value = compiled.value(source.version).ok_or_else(invalid)?;
             let destination_value = compiled.value(destination.version).ok_or_else(invalid)?;
-            let whole_value = source.elements == full_range(source_value)?
-                && destination.elements == full_range(destination_value)?;
+            let source_full = full_range(source_value)?;
+            let destination_full = full_range(destination_value)?;
+            let whole_value =
+                source.elements == source_full && destination.elements == destination_full;
             let exact_carried_prefix =
                 exact_partial_atomic_carry_forward(compiled.values(), access).is_some();
             if matches!(
                 &operation.primitive,
                 ExecutionPrimitive::OrderedComposite { .. }
-            ) || !matches!(
-                placement.executions.as_slice(),
-                [FleetOperationExecution {
-                    domain: OperationDomain::Monolithic,
-                    ..
-                }]
             ) || !(whole_value || exact_carried_prefix)
                 || !required_alias_layouts_match(
                     authority.discipline,
@@ -535,9 +540,39 @@ fn compile_required_aliases(
             {
                 return Err(invalid());
             }
-            let source_owner = owner(owners, source.version).ok_or_else(invalid)?;
-            let destination_owner = owner(owners, destination.version).ok_or_else(invalid)?;
-            if source_owner.live.end != placement.during.end
+            let source_lives = owners
+                .iter()
+                .filter(|owner| {
+                    owner.worker == *worker
+                        && owner.value.version == source.version
+                        && owner.value.elements == source_full
+                })
+                .map(|owner| owner.live)
+                .chain(
+                    replicas
+                        .iter()
+                        .filter(|replica| {
+                            replica.worker == *worker
+                                && replica.value.version == source.version
+                                && replica.value.elements == source_full
+                        })
+                        .map(|replica| replica.live),
+                )
+                .collect::<Vec<_>>();
+            let destination_owners = owners
+                .iter()
+                .filter(|owner| {
+                    owner.worker == *worker
+                        && owner.value.version == destination.version
+                        && owner.value.elements == destination_full
+                })
+                .collect::<Vec<_>>();
+            let ([source_live], [destination_owner]) =
+                (source_lives.as_slice(), destination_owners.as_slice())
+            else {
+                return Err(invalid());
+            };
+            if source_live.end != placement.during.end
                 || destination_owner.live.start != placement.during.start
             {
                 return Err(invalid());
@@ -545,6 +580,7 @@ fn compile_required_aliases(
             aliases.push(RequiredAlias {
                 operation: operation.id,
                 alias: authority.id,
+                worker: *worker,
                 source,
                 destination,
             });
@@ -635,10 +671,6 @@ fn required_alias_error(alias: &RequiredAlias) -> FleetCompileError {
         operation: alias.operation,
         alias: alias.alias,
     }
-}
-
-fn owner(owners: &[FleetOwnerPlacement], version: ValueVersion) -> Option<&FleetOwnerPlacement> {
-    owners.iter().find(|owner| owner.value.version == version)
 }
 
 fn transcript_output_release(

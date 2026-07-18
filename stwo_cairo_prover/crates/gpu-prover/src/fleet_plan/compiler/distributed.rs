@@ -6,7 +6,7 @@
 //! validated coordinator statement-ingress lineages; exact contiguous shards;
 //! explicit point-to-point transfers; and no host bounce.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::*;
@@ -33,11 +33,37 @@ impl FleetProofPlan {
     pub fn compile_track_a_partitioned(
         compiled: Arc<CompiledProof>,
         shape: ShapeExecutableIdentity,
-        mut topology: FleetPlacementTopology,
+        topology: FleetPlacementTopology,
         pow: FleetPowSchedule,
         transcript: &CairoBlake2sTranscriptPlan,
     ) -> Result<Self, FleetCompileError> {
+        Self::compile_track_a_partitioned_with_static_wrapper_workers(
+            compiled,
+            shape,
+            topology,
+            pow,
+            &BTreeMap::new(),
+            transcript,
+        )
+    }
+
+    /// Compile an existing semantic DAG with selected whole static CUDA
+    /// wrappers assigned to explicit workers.
+    ///
+    /// The override changes placement only. It cannot split an operation or
+    /// alter its effect, invocation, partition authority, or transcript stage.
+    pub fn compile_track_a_partitioned_with_static_wrapper_workers(
+        compiled: Arc<CompiledProof>,
+        shape: ShapeExecutableIdentity,
+        mut topology: FleetPlacementTopology,
+        pow: FleetPowSchedule,
+        static_wrapper_workers: &BTreeMap<crate::compiled_proof::OpId, WorkerId>,
+        transcript: &CairoBlake2sTranscriptPlan,
+    ) -> Result<Self, FleetCompileError> {
         if topology.workers.len() == 1 {
+            if !static_wrapper_workers.is_empty() {
+                return Err(FleetCompileError::InvalidSemanticSchedule);
+            }
             return Self::compile_track_a_monolithic(compiled, shape, topology, pow, transcript);
         }
         topology.workers.sort_unstable_by_key(|worker| worker.id);
@@ -48,16 +74,17 @@ impl FleetProofPlan {
         pow.validate(topology.workers.len())
             .map_err(FleetCompileError::Pow)?;
 
-        let schedule = DistributedSchedule::compile(&compiled, &topology, transcript)?;
+        let schedule =
+            DistributedSchedule::compile(&compiled, &topology, static_wrapper_workers, transcript)?;
         let mut owners = compile_partitioned_owners(&compiled, &topology, &schedule)?;
-        prepare_required_alias_lifetimes(
+        prepare_required_alias_lifetimes(&compiled, &mut owners, &schedule.operations)?;
+        let materialized = materialize_remote_demands(&compiled, &topology, &schedule, &owners)?;
+        let required_aliases = compile_required_aliases(
             &compiled,
-            topology.coordinator,
-            &mut owners,
+            &owners,
+            &materialized.replicas,
             &schedule.operations,
         )?;
-        let required_aliases = compile_required_aliases(&compiled, &owners, &schedule.operations)?;
-        let materialized = materialize_remote_demands(&compiled, &topology, &schedule, &owners)?;
         let (storages, storage_bindings, in_place_aliases, output_storage) =
             compile_partitioned_storage(
                 &compiled,
@@ -90,7 +117,6 @@ impl FleetProofPlan {
 
 fn prepare_required_alias_lifetimes(
     compiled: &CompiledProof,
-    coordinator: WorkerId,
     owners: &mut [FleetOwnerPlacement],
     operations: &[FleetOperationPlacement],
 ) -> Result<(), FleetCompileError> {
@@ -106,40 +132,42 @@ fn prepare_required_alias_lifetimes(
             else {
                 continue;
             };
-            if !matches!(
-                placement.executions.as_slice(),
-                [FleetOperationExecution {
-                    worker,
-                    domain: OperationDomain::Monolithic,
-                }] if *worker == coordinator
-            ) {
-                continue;
-            }
             let invalid = || FleetCompileError::RequiredAlias {
                 operation: operation.id,
                 alias: alias.id,
             };
+            let [FleetOperationExecution {
+                worker,
+                domain: OperationDomain::Monolithic,
+            }] = placement.executions.as_slice()
+            else {
+                return Err(invalid());
+            };
             let source = access.source().ok_or_else(invalid)?.value;
             let destination = access.destination().ok_or_else(invalid)?.value;
-            for range in [source, destination] {
-                let value = compiled.value(range.version).ok_or_else(invalid)?;
-                let full = full_range(value)?;
-                let matching = owners
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, owner)| {
-                        (owner.value.version == range.version).then_some((index, owner))
-                    })
-                    .collect::<Vec<_>>();
-                let [(index, owner)] = matching.as_slice() else {
-                    return Err(invalid());
-                };
-                if owner.worker != coordinator || owner.value.elements != full {
-                    return Err(invalid());
-                }
-                if range.version == source.version {
-                    owners[*index].live.end = placement.during.end;
-                }
+            let destination_value = compiled.value(destination.version).ok_or_else(invalid)?;
+            let destination_full = full_range(destination_value)?;
+            if !owners.iter().any(|owner| {
+                owner.worker == *worker
+                    && owner.value.version == destination.version
+                    && owner.value.elements == destination_full
+            }) {
+                return Err(invalid());
+            }
+            let source_value = compiled.value(source.version).ok_or_else(invalid)?;
+            let source_full = full_range(source_value)?;
+            let matching = owners
+                .iter()
+                .enumerate()
+                .filter_map(|(index, owner)| {
+                    (owner.worker == *worker
+                        && owner.value.version == source.version
+                        && owner.value.elements == source_full)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if let [index] = matching.as_slice() {
+                owners[*index].live.end = placement.during.end;
             }
         }
     }

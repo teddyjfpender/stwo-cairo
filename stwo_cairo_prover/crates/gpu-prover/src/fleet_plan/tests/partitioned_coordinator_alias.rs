@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::compiler::{
     alias_ranges, compile_monolithic, recompile, with_late_source_read, with_required_alias,
 };
@@ -9,6 +11,20 @@ fn compile_partitioned(fixture: Fixture) -> Result<FleetProofPlan, FleetCompileE
         fixture.shape,
         fixture.placement.topology,
         fixture.placement.pow,
+        transcript(),
+    )
+}
+
+fn compile_partitioned_with_static_wrapper_workers(
+    fixture: Fixture,
+    workers: &BTreeMap<OpId, WorkerId>,
+) -> Result<FleetProofPlan, FleetCompileError> {
+    FleetProofPlan::compile_track_a_partitioned_with_static_wrapper_workers(
+        fixture.compiled,
+        fixture.shape,
+        fixture.placement.topology,
+        fixture.placement.pow,
+        workers,
         transcript(),
     )
 }
@@ -319,6 +335,36 @@ fn add_source_route(fixture: &mut Fixture) {
     fixture.placement.topology.workers[0].capacity_bytes += reserve;
 }
 
+fn add_bidirectional_alias_routes(fixture: &mut Fixture) {
+    add_idle_worker(fixture);
+    let max_transfer_bytes = fixture
+        .compiled
+        .values()
+        .iter()
+        .map(|value| value.layout.logical_bytes().unwrap())
+        .max()
+        .unwrap();
+    fixture.placement.topology.links.extend([
+        FleetLink {
+            id: FleetLinkId(0),
+            source: WorkerId(0),
+            destination: WorkerId(1),
+            max_transfer_bytes,
+        },
+        FleetLink {
+            id: FleetLinkId(1),
+            source: WorkerId(1),
+            destination: WorkerId(0),
+            max_transfer_bytes,
+        },
+    ]);
+    let reserve = 8 * stwo_backend_cuda::IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
+    for worker in &mut fixture.placement.topology.workers {
+        worker.exchange_reserve_bytes = reserve;
+        worker.capacity_bytes += max_transfer_bytes + reserve;
+    }
+}
+
 #[test]
 fn compile_track_a_monolithic_places_widening_and_narrowing_base_aliases() {
     for destination_words in [8, 32] {
@@ -426,6 +472,55 @@ fn partitioned_compiler_places_coordinator_base_required_aliases_exactly() {
         );
         plan.validate(transcript()).unwrap();
     }
+}
+
+#[test]
+fn partitioned_compiler_carries_remote_monolithic_alias_into_rank_install() {
+    let mut fixture = with_base_commit_required_alias(fixture(), 32);
+    let (source, destination) = alias_ranges(&fixture);
+    add_bidirectional_alias_routes(&mut fixture);
+    let plan = compile_partitioned_with_static_wrapper_workers(
+        fixture,
+        &BTreeMap::from([(OpId(0), WorkerId(1))]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.placement().operations[0].executions,
+        [FleetOperationExecution {
+            worker: WorkerId(1),
+            domain: OperationDomain::Monolithic,
+        }]
+    );
+    assert!(plan.placement().replicas.iter().any(|replica| {
+        replica.worker == WorkerId(1)
+            && replica.canonical_worker == WorkerId(0)
+            && replica.value.version == source.version
+    }));
+    assert!(plan.placement().owners.iter().any(|owner| {
+        owner.worker == WorkerId(1) && owner.value.version == destination.version
+    }));
+    let [alias] = plan.placement().in_place_aliases.as_slice() else {
+        panic!("expected one remote required alias")
+    };
+    let storage = plan.placement().storages[alias.storage.0 as usize];
+    assert_eq!(storage.worker, WorkerId(1));
+
+    let install = plan.worker_install_plan(WorkerId(1)).unwrap();
+    let execution = install
+        .executions()
+        .iter()
+        .find(|execution| execution.operation == OpId(0))
+        .unwrap();
+    let binding = execution.executables[0]
+        .effects
+        .iter()
+        .find(|binding| binding.binding == EffectBindingId(0))
+        .unwrap();
+    assert!(binding.source.is_some());
+    assert!(binding.destination.is_some());
+    assert_eq!(binding.window.storage, alias.storage);
+    plan.validate(transcript()).unwrap();
 }
 
 #[test]
