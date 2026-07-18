@@ -1,4 +1,4 @@
-//! Pure structural closure oracle for one two-rank proof attempt.
+//! Pure structural closure oracle for one supported multi-rank proof attempt.
 //!
 //! This replays only the address-free schedule already sealed by
 //! [`FleetProofPlan`]. It allocates no CUDA resource, executes no kernel or
@@ -16,18 +16,19 @@ use crate::fleet_barrier::{
 
 pub(super) mod validation;
 use validation::{
-    inside_interval, operation_segment, require_two_rank_topology, transition_segment,
+    inside_interval, operation_segment, require_supported_topology, transition_segment,
     validate_install_closure, validate_span_projection,
 };
 
 /// Sealed observational result of one successful structural replay.
 ///
 /// Private fields prevent callers from constructing a receipt independently of
-/// [`FleetProofPlan::simulate_two_rank_structural_closure`].
+/// [`FleetProofPlan::simulate_structural_closure`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FleetTwoRankStructuralClosureReceipt {
     plan_identity: [u8; 32],
     proof_generation: u64,
+    worker_count: u16,
     worker_executions: u64,
     exact_shards: u64,
     transfer_spans: u64,
@@ -37,6 +38,12 @@ pub struct FleetTwoRankStructuralClosureReceipt {
     synthesized_transcript_phases: u32,
 }
 
+/// Rank-count-neutral name for the structural closure receipt.
+pub type FleetStructuralClosureReceipt = FleetTwoRankStructuralClosureReceipt;
+
+/// Rank-count-neutral name for structural closure failures.
+pub type FleetStructuralClosureError = FleetTwoRankStructuralClosureError;
+
 impl FleetTwoRankStructuralClosureReceipt {
     pub const fn plan_identity(&self) -> [u8; 32] {
         self.plan_identity
@@ -44,6 +51,10 @@ impl FleetTwoRankStructuralClosureReceipt {
 
     pub const fn proof_generation(&self) -> u64 {
         self.proof_generation
+    }
+
+    pub const fn worker_count(&self) -> u16 {
+        self.worker_count
     }
 
     pub const fn worker_executions(&self) -> u64 {
@@ -87,25 +98,42 @@ impl FleetProofPlan {
         &self,
         proof_generation: u64,
     ) -> Result<FleetTwoRankStructuralClosureReceipt, FleetTwoRankStructuralClosureError> {
-        require_two_rank_topology(self)?;
+        if self.workers().len() != 2 {
+            return Err(FleetTwoRankStructuralClosureError::WorkerCount {
+                actual: self.workers().len(),
+            });
+        }
+        self.simulate_structural_closure(proof_generation)
+    }
+
+    /// Prove that the sealed supported-rank metadata admits one complete
+    /// execution/transfer/barrier replay.
+    ///
+    /// This remains a pure, non-admitting oracle. It accepts only dense
+    /// coordinator-zero 2/4/8/16-rank plans and grants no CUDA authority.
+    pub fn simulate_structural_closure(
+        &self,
+        proof_generation: u64,
+    ) -> Result<FleetStructuralClosureReceipt, FleetStructuralClosureError> {
+        let worker_count = require_supported_topology(self)?;
         if super::identity::compute(self)? != self.identity() {
             return Err(FleetTwoRankStructuralClosureError::PlanIdentityMismatch);
         }
 
         let view = self.runtime_view()?;
-        let installs = [
-            self.worker_install_plan(WorkerId(0))?,
-            self.worker_install_plan(WorkerId(1))?,
-        ];
+        let installs = self
+            .workers()
+            .iter()
+            .map(|worker| self.worker_install_plan(worker.worker))
+            .collect::<Result<Vec<_>, _>>()?;
         let transcript_ordinals = validate_install_closure(self, &view, &installs)?;
         let replay = ReplayIndex::new(self, &view, &installs, transcript_ordinals)?;
 
         let mut ipc = IpcScheduleCursor::new(&view, proof_generation)?;
         let mut coordinator = CoordinatorBarrierCursor::new(self, proof_generation)?;
-        let mut workers = [
-            WorkerBarrierCursor::new(self, proof_generation)?,
-            WorkerBarrierCursor::new(self, proof_generation)?,
-        ];
+        let mut workers = (0..worker_count)
+            .map(|_| WorkerBarrierCursor::new(self, proof_generation))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut started_executions = BTreeSet::new();
         let mut completed_executions = BTreeSet::new();
         let mut started_edges = BTreeSet::new();
@@ -190,6 +218,8 @@ impl FleetProofPlan {
         Ok(FleetTwoRankStructuralClosureReceipt {
             plan_identity: self.identity(),
             proof_generation,
+            worker_count: u16::try_from(worker_count)
+                .map_err(|_| FleetTwoRankStructuralClosureError::SizeOverflow)?,
             worker_executions,
             exact_shards: replay.exact_shards,
             transfer_spans,
@@ -256,7 +286,7 @@ impl ReplayIndex {
     fn new(
         plan: &FleetProofPlan,
         view: &FleetRuntimeView,
-        installs: &[FleetWorkerInstallPlan; 2],
+        installs: &[FleetWorkerInstallPlan],
         transcript_ordinals: BTreeSet<u32>,
     ) -> Result<Self, FleetTwoRankStructuralClosureError> {
         let expected = plan
@@ -409,7 +439,7 @@ fn start_transfer_wave(
     proof_generation: u64,
     step: ScheduleStep,
     ipc: &mut IpcScheduleCursor,
-    workers: &[WorkerBarrierCursor; 2],
+    workers: &[WorkerBarrierCursor],
     started_edges: &mut BTreeSet<u64>,
 ) -> Result<(), FleetTwoRankStructuralClosureError> {
     let expected = view
@@ -476,7 +506,7 @@ fn start_executions(
     plan: &FleetProofPlan,
     step: ScheduleStep,
     replay: &ReplayIndex,
-    workers: &[WorkerBarrierCursor; 2],
+    workers: &[WorkerBarrierCursor],
     started: &mut BTreeSet<ExecutionKey>,
 ) -> Result<(), FleetTwoRankStructuralClosureError> {
     for &execution in replay
@@ -538,7 +568,7 @@ fn submit_arrivals(
 }
 
 fn require_unlocked(
-    workers: &[WorkerBarrierCursor; 2],
+    workers: &[WorkerBarrierCursor],
     worker: WorkerId,
     step: ScheduleStep,
     segment: u32,
@@ -651,7 +681,7 @@ pub enum FleetTwoRankStructuralClosureError {
 
 impl core::fmt::Display for FleetTwoRankStructuralClosureError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "two-rank structural closure failed: {self:?}")
+        write!(f, "fleet structural closure failed: {self:?}")
     }
 }
 

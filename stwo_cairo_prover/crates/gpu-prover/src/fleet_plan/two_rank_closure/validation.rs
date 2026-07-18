@@ -13,31 +13,38 @@ struct TranscriptRecord {
     release_step: ScheduleStep,
 }
 
-pub(super) fn require_two_rank_topology(
+pub(super) fn require_supported_topology(
     plan: &FleetProofPlan,
-) -> Result<(), FleetTwoRankStructuralClosureError> {
+) -> Result<usize, FleetTwoRankStructuralClosureError> {
     let workers = &plan.placement().topology.workers;
-    if workers.len() != 2 {
+    if !matches!(workers.len(), 2 | 4 | 8 | 16) {
         return Err(FleetTwoRankStructuralClosureError::WorkerCount {
             actual: workers.len(),
         });
     }
-    if workers[0].id != WorkerId(0)
-        || workers[1].id != WorkerId(1)
+    if workers
+        .iter()
+        .enumerate()
+        .any(|(rank, worker)| worker.id.0 as usize != rank)
         || plan.placement().topology.coordinator != WorkerId(0)
     {
         return Err(FleetTwoRankStructuralClosureError::InstallClosure {
             worker: WorkerId(0),
         });
     }
-    Ok(())
+    Ok(workers.len())
 }
 
 pub(super) fn validate_install_closure(
     plan: &FleetProofPlan,
     view: &FleetRuntimeView,
-    installs: &[FleetWorkerInstallPlan; 2],
+    installs: &[FleetWorkerInstallPlan],
 ) -> Result<BTreeSet<u32>, FleetTwoRankStructuralClosureError> {
+    if installs.len() != plan.placement().topology.workers.len() {
+        return Err(FleetTwoRankStructuralClosureError::InstallClosure {
+            worker: WorkerId(0),
+        });
+    }
     let mut installed_arrivals = BTreeSet::new();
     let mut inbound = BTreeSet::new();
     let mut outbound = BTreeSet::new();
@@ -100,8 +107,12 @@ pub(super) fn validate_install_closure(
             || span.destination.worker != span.peer
             || span.source.bytes == 0
             || span.source.bytes != span.destination.bytes
-            || !installed_window_contains(&installs[usize::from(span.owner.0)], span.source)
-            || !installed_window_contains(&installs[usize::from(span.peer.0)], span.destination)
+            || installs
+                .get(usize::from(span.owner.0))
+                .is_none_or(|install| !installed_window_contains(install, span.source))
+            || installs
+                .get(usize::from(span.peer.0))
+                .is_none_or(|install| !installed_window_contains(install, span.destination))
         {
             return Err(FleetTwoRankStructuralClosureError::TransferClosure {
                 edge: span.edge_ordinal,
@@ -114,7 +125,10 @@ pub(super) fn validate_install_closure(
             worker: WorkerId(0),
         });
     };
-    if installs[1].coordinator().is_some()
+    if installs
+        .iter()
+        .skip(1)
+        .any(|install| install.coordinator().is_some())
         || coordinator.transcript_barriers != plan.barriers()
         || coordinator.output.storage != plan.placement().output_storage
     {

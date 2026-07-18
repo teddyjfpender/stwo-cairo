@@ -22,6 +22,26 @@ fn transfer_plan(split: bool) -> FleetProofPlan {
     compile_partitioned(fixture)
 }
 
+fn four_rank_plan() -> FleetProofPlan {
+    let mut fixture = super::distributed_compiler::transfer_fixture();
+    let reserve = fixture.placement.topology.workers[1].exchange_reserve_bytes;
+    let max_transfer_bytes = fixture.placement.topology.links[0].max_transfer_bytes;
+    for rank in 2u16..4 {
+        fixture.placement.topology.workers.push(WorkerSpec {
+            id: WorkerId(rank),
+            capacity_bytes: 1024 + reserve,
+            exchange_reserve_bytes: reserve,
+        });
+        fixture.placement.topology.links.push(FleetLink {
+            id: FleetLinkId(rank - 1),
+            source: WorkerId(rank),
+            destination: WorkerId(0),
+            max_transfer_bytes,
+        });
+    }
+    compile_partitioned(fixture)
+}
+
 #[test]
 fn partitioned_exact_shards_real_transfer_and_terminal_fence_close() {
     let plan = compile_partitioned(super::distributed_compiler::transfer_fixture());
@@ -31,6 +51,7 @@ fn partitioned_exact_shards_real_transfer_and_terminal_fence_close() {
 
     assert_eq!(receipt.plan_identity(), plan.identity());
     assert_eq!(receipt.proof_generation(), GENERATION);
+    assert_eq!(receipt.worker_count(), 2);
     assert_eq!(receipt.exact_shards(), 2);
     assert!(receipt.transfer_spans() > 0);
     assert_eq!(receipt.fence_releases(), plan.fence_count().unwrap());
@@ -45,6 +66,26 @@ fn partitioned_exact_shards_real_transfer_and_terminal_fence_close() {
             .iter()
             .map(|operation| operation.executions.len() as u64)
             .sum::<u64>()
+    );
+}
+
+#[test]
+fn four_rank_exact_shards_transfers_and_fences_close() {
+    let plan = four_rank_plan();
+    let receipt = plan.simulate_structural_closure(GENERATION).unwrap();
+
+    assert_eq!(receipt.worker_count(), 4);
+    assert_eq!(receipt.exact_shards(), 4);
+    assert_eq!(receipt.transfer_spans(), 3);
+    assert_eq!(receipt.ipc_phase_receipts(), 12);
+    assert_eq!(receipt.fence_releases(), plan.fence_count().unwrap());
+    assert_eq!(
+        receipt.synthesized_transcript_phases(),
+        plan.barriers().len() as u32
+    );
+    assert_eq!(
+        plan.simulate_two_rank_structural_closure(GENERATION),
+        Err(FleetTwoRankStructuralClosureError::WorkerCount { actual: 4 })
     );
 }
 

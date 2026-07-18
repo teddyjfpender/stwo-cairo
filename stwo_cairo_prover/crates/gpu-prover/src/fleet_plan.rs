@@ -62,7 +62,8 @@ pub use runtime_view::{
 };
 pub use storage::{StorageDesc, StorageId};
 pub use two_rank_closure::{
-    FleetTwoRankStructuralClosureError, FleetTwoRankStructuralClosureReceipt,
+    FleetStructuralClosureError, FleetStructuralClosureReceipt, FleetTwoRankStructuralClosureError,
+    FleetTwoRankStructuralClosureReceipt,
 };
 pub use worker_install::{
     FleetCoordinatorInstall, FleetEffectBinding, FleetInstallWindow, FleetStatementHostIngress,
