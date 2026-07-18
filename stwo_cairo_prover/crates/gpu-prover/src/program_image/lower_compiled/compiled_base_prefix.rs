@@ -24,6 +24,7 @@ use crate::compiled_proof::{
 use crate::resident_runtime::producer_schedule::WitnessProducer;
 use crate::transcript_plan::CairoTranscriptSegment;
 
+mod builder;
 pub(super) mod emission;
 #[cfg(test)]
 mod module_global_tests;
