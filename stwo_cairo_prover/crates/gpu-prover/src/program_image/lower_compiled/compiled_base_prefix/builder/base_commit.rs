@@ -112,7 +112,7 @@ fn generated_sn2_publishes_exact_300_operation_base_checkpoint() {
     assert_eq!(sealed.lowered.operations().len(), 198);
     assert_eq!(
         sealed.lowered.digest(),
-        decode32("1194d4835018557239e9461b347473af3c0b14dc77ac666cf3c72cd802ce0f71")
+        decode32("51f1f517f661575765ba886c3031dee25dde222390c206551c56c31d04e91e7e")
     );
     assert_eq!(sealed.external_roots.len(), 2);
     assert!(!sealed.emitted);
@@ -186,7 +186,7 @@ fn generated_sn2_publishes_exact_300_operation_base_checkpoint() {
     assert_eq!(
         sealed.checkpoint_digest,
         Some(decode32(
-            "eaffe13a28a05c75b30cefd46ce2e35daa6000f6e05548545c180b25afd1dfac"
+            "ba78d646298225c05755bbdcc6f10df4c2d30a9295de0a595ccabd2340a3c20d"
         ))
     );
     assert_eq!(

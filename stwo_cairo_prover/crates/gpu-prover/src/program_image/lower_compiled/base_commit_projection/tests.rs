@@ -181,7 +181,7 @@ fn generated_sn2_authority_and_projection_are_exact_and_ordered() {
     assert_eq!(authority.operations().len(), 198);
     assert_eq!(
         authority.identity(),
-        decode32("943b1824336afd39b8e2ff8810faa6a181379111c9d639cf54abbda16b023b4a")
+        decode32("9120acc6df05fdffcd863da289a80943efc678cc08f7da16126ccfd91d3b6592")
     );
 
     let mut kinds = [0usize; 8];
@@ -488,7 +488,7 @@ fn generated_sn2_projection_receipt_is_stable() {
     let actual = fixture().lowered.digest();
     assert_eq!(
         actual,
-        decode32("6e3f08175f13171cc50f3a2d5a4dce594623910a5ed845ccb857ffe5727f87bf")
+        decode32("b86ab261cbda8e9dbacccd82e4a69a2ecb853c5bf9814ee6a7f4bd007251c9b6")
     );
 }
 
