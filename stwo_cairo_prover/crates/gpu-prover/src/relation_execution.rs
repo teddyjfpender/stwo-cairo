@@ -23,6 +23,26 @@ pub struct RelationBatchKey {
     pub trace_part: RelationTracePart,
 }
 
+/// Canonical `CairoInteractionClaim::mix_into` order for one Relation output.
+///
+/// The Relation executor is schedule-ordered, while the claim is commitment-
+/// ordered and splits `memory_id_to_big` into big then small parts. Runtime
+/// staging and compiled-proof lowering must use this one key.
+pub(crate) fn interaction_claim_order_key(
+    batch: RelationBatchKey,
+    instance_index: usize,
+) -> Option<(usize, u8, usize)> {
+    let component = crate::schedule_table::CAIRO_COMMITMENT_COMPONENT_ORDER
+        .iter()
+        .position(|candidate| *candidate == batch.component)?;
+    let part = match batch.trace_part {
+        RelationTracePart::Component => 0,
+        RelationTracePart::EachMemoryBig => 1,
+        RelationTracePart::MemorySmall => 2,
+    };
+    Some((component, part, instance_index))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelationSourcePlane {
     LookupWords,

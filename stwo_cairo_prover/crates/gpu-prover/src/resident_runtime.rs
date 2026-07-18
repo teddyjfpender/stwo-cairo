@@ -69,8 +69,9 @@ use crate::program_image::{
 use crate::proof_bundle::{
     ResidentProofBundle, ResidentProofBundleError, ResidentProofBundleLayout,
 };
-use crate::relation::RelationTracePart;
-use crate::relation_execution::{RelationBatchKey, RelationSourcePlane};
+use crate::relation_execution::{
+    interaction_claim_order_key, RelationBatchKey, RelationSourcePlane,
+};
 use crate::resident_composition::{prepare_resident_composition, ResidentCompositionError};
 use crate::resident_direct_commit::{
     direct_commitment_inputs, trace_commit_input_mode, TraceCommitInputMode,
@@ -5711,20 +5712,15 @@ fn interaction_outputs_in_cairo_order(
     let mut outputs = relation.outputs().collect::<Vec<_>>();
     outputs.sort_by_key(|output| {
         let batch = execution.batches[output.batch_index];
-        let component = crate::schedule_table::CAIRO_COMMITMENT_COMPONENT_ORDER
-            .iter()
-            .position(|candidate| *candidate == batch.component)
-            .unwrap_or(usize::MAX);
-        let (part, instance) = match batch.trace_part {
-            RelationTracePart::Component => (0u8, output.instance_index),
-            RelationTracePart::EachMemoryBig => (1, output.instance_index),
-            RelationTracePart::MemorySmall => (2, output.instance_index),
-        };
-        (component, part, instance)
+        interaction_claim_order_key(batch, output.instance_index).unwrap_or((
+            usize::MAX,
+            u8::MAX,
+            usize::MAX,
+        ))
     });
     for output in &outputs {
         let batch = execution.batches[output.batch_index];
-        if !crate::schedule_table::CAIRO_COMMITMENT_COMPONENT_ORDER.contains(&batch.component) {
+        if interaction_claim_order_key(batch, output.instance_index).is_none() {
             return Err(ResidentRuntimeError::UnknownTranscriptRelationComponent(
                 batch.component,
             ));

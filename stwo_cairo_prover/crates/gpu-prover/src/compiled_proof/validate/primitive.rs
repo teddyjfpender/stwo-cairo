@@ -126,11 +126,15 @@ fn validate_step(
             else {
                 return Err(CompiledProofError::PrimitiveEffectMismatch(operation));
             };
-            if super::range_bytes(input, source.value)? != *bytes
-                || super::range_bytes(input, destination.value)? != *bytes
-                || super::value(input, source.value.version)?.layout
-                    != super::value(input, destination.value.version)?.layout
-            {
+            let source_value = super::value(input, source.value.version)?;
+            let destination_value = super::value(input, destination.value.version)?;
+            if !device_copy_ranges_are_compatible(
+                source_value,
+                super::range_bytes(input, source.value)?,
+                destination_value,
+                super::range_bytes(input, destination.value)?,
+                *bytes,
+            ) {
                 return Err(CompiledProofError::PrimitiveEffectMismatch(operation));
             }
         }
@@ -551,6 +555,19 @@ fn validate_invocation(
         return Err(invalid());
     }
     invocation.contract_id().map_err(|_| invalid())
+}
+
+fn device_copy_ranges_are_compatible(
+    source: &ValueDesc,
+    source_bytes: usize,
+    destination: &ValueDesc,
+    destination_bytes: usize,
+    copy_bytes: usize,
+) -> bool {
+    copy_bytes != 0
+        && source_bytes == copy_bytes
+        && destination_bytes == copy_bytes
+        && source.layout.element == destination.layout.element
 }
 
 fn valid_launch(launch: LaunchGeometry) -> bool {

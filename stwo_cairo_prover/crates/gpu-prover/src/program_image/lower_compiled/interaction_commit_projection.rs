@@ -209,7 +209,7 @@ fn receipt_digest(
 }
 
 impl InteractionCommitTranscriptStage {
-    fn compile(
+    pub(super) fn compile(
         arena: &ProofArenaPlan,
         transcript: &CairoBlake2sTranscriptPlan,
     ) -> Result<Self, InvocationShapeError> {
@@ -229,6 +229,18 @@ impl InteractionCommitTranscriptStage {
         let stage = Self::compile_segment(transcript, segment)?;
         stage.validate_input(arena, transcript)?;
         Ok(stage)
+    }
+
+    pub(super) const fn schedule_key(self) -> u64 {
+        self.schedule_key
+    }
+
+    pub(super) const fn interaction_claim_felts(self) -> u32 {
+        self.interaction_claim_felts
+    }
+
+    pub(super) const fn interaction_claim_operation(self) -> u32 {
+        self.interaction_claim
     }
 
     fn compile_segment(

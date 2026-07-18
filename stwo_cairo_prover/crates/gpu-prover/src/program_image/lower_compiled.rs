@@ -42,6 +42,7 @@ mod ec_op_prefix;
 mod ec_op_setup_sources;
 mod execution_tables;
 mod fixed_table_materialization;
+mod interaction_claim_staging;
 mod interaction_commit_projection;
 mod loaded_authority;
 mod loaded_base_binding;
@@ -281,6 +282,7 @@ enum InvocationShapeError {
     InvalidBaseCommitBinding,
     InvalidInteractionCommitAuthority,
     InvalidInteractionCommitBinding,
+    InvalidInteractionClaimStaging,
     InvalidRelationAuthority,
     InvalidRelationBinding,
 }

@@ -105,7 +105,7 @@ fn rejects_primitive_geometry_and_effect_mismatches() {
 }
 
 #[test]
-fn raw_d2d_copy_preserves_one_exact_layout_and_memset_is_byte_typed() {
+fn raw_d2d_copy_preserves_one_exact_element_type_and_memset_is_byte_typed() {
     let mut copy = valid_input();
     let bundle = copy.output.sections[0].value;
     let words = copy.output.layout.total_words;
@@ -138,6 +138,9 @@ fn raw_d2d_copy_preserves_one_exact_layout_and_memset_is_byte_typed() {
     CompiledProof::compile(copy.clone(), transcript()).unwrap();
 
     copy.values[source.0 as usize].layout.axes[0].tag = 9;
+    CompiledProof::compile(copy.clone(), transcript()).unwrap();
+
+    copy.values[source.0 as usize].layout.element.tag = 9;
     assert!(matches!(
         CompiledProof::compile(copy, transcript()),
         Err(CompiledProofError::PrimitiveEffectMismatch(OpId(0)))
