@@ -1,0 +1,115 @@
+# shellcheck shell=bash
+# Fail-soft collection, fail-closed aggregation for the three 5 MHz candidates.
+# This is an A40 sm_86 differential proxy, never an end-to-end SN2 claim.
+# pod_run: lease one_shot=true final_action=terminate gpu=a40 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=0.50 name_prefix=stwo-sn2-5mhz-ab-a40- ttl_hours=1.5 idle_min=15
+
+VALIDATOR="${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/validate_sn2_5mhz_cheap_gpu_ab.py"
+AOT_MANIFEST="$STWO/crates/backend-cuda-kernels/cuda/generated/aot_manifest.json"
+export STWO_CUDA_ARCH=sm_86
+
+soft() {
+  local label="$1" rc
+  shift
+  set +e
+  "$@"
+  rc=$?
+  printf '%s\n' "$rc" >"$RUN/$label.raw.rc"
+  set -e
+  return 0
+}
+
+compile_test() {
+  # Called only beneath soft(), so every error is returned to the raw status.
+  local label="$1" target="$2" cargo_json rc
+  shift 2
+  cargo_json="$(mktemp "$RUN/$label.cargo.XXXXXX")" || return
+  cargo test "$@" --no-run --message-format=json-render-diagnostics >"$cargo_json"
+  rc=$?
+  if [[ $rc -eq 0 ]]; then
+    python3 "$VALIDATOR" artifact \
+      --cargo-json "$cargo_json" \
+      --target "$target" \
+      --out "$RUN/$label.binary.json" \
+      >"$RUN/$label.binary.path.txt"
+    rc=$?
+  fi
+  rm -f "$cargo_json"
+  [[ $rc -eq 0 ]] || return "$rc"
+  cat "$RUN/$label.binary.json"
+}
+
+test_binary() {
+  local label="$1" binary
+  IFS= read -r binary <"$RUN/$label.binary.path.txt" || return
+  [[ -x "$binary" ]] || {
+    echo "$label test binary is absent or not executable: $binary" >&2
+    return 1
+  }
+  printf '%s\n' "$binary"
+}
+
+run_relation() {
+  local binary
+  cd "$STWO" || return
+  compile_test relation prepared_relation_native \
+    --release --locked -p stwo-backend-cuda \
+    --features test-only-relation-ab --test prepared_relation_native || return
+  binary="$(test_binary relation)" || return
+  STWO_RELATION_NATIVE_AB_WARMUPS=5 \
+  STWO_RELATION_NATIVE_AB_ITERATIONS=30 \
+  STWO_RELATION_NATIVE_AB_RECEIPT="$RUN/relation.receipt.json" \
+    "$binary" --exact fused_same_binary_selector_ab_receipt \
+    --nocapture --test-threads=1
+}
+
+run_quotient() {
+  local binary
+  cd "$STWO" || return
+  compile_test quotient replacement_stage4_native \
+    --release --locked -p stwo-backend-cuda \
+    --test replacement_stage4_native || return
+  binary="$(test_binary quotient)" || return
+  STWO_STAGE4_GIT_COMMIT="$STWO_PARITY_REF_STWO_HEAD" \
+  STWO_STAGE4_NATIVE_FIXTURE=staged-prepacked-quotient \
+  STWO_STAGE4_NATIVE_PERF=1 \
+  STWO_STAGE4_NATIVE_PERF_LOGS=18,20 \
+  STWO_STAGE4_NATIVE_PERF_WARMUPS=5 \
+  STWO_STAGE4_NATIVE_PERF_ITERATIONS=30 \
+  STWO_STAGE4_NATIVE_RECEIPT="$RUN/quotient.receipt.json" \
+    "$binary" --exact replacement_stage4_native_bytes_match \
+    --nocapture --test-threads=1
+}
+
+run_composition() {
+  local binary
+  cd "$CAIRO" || return
+  compile_test composition prepared_composition_stripes_direct_native \
+    --release --locked -p stwo-cairo-gpu-prover \
+    --features direct-retention-test-api \
+    --test prepared_composition_stripes_direct_native || return
+  binary="$(test_binary composition)" || return
+  STWO_COMPOSITION_STRIPE_PERF=1 \
+  STWO_COMPOSITION_STRIPE_RECEIPT="$RUN/composition.receipt.json" \
+    "$binary" --exact \
+    multidomain_direct_split_wave_and_installed_stripes_match_eager_and_replay \
+    --nocapture --test-threads=1
+}
+
+capture_environment() {
+  python3 "$VALIDATOR" capture \
+    --run "$RUN" \
+    --aot-manifest "$AOT_MANIFEST" \
+    --out "$RUN/environment.json"
+}
+
+validate_all() {
+  python3 "$VALIDATOR" validate \
+    --run "$RUN" \
+    --out "$RUN/sn2_5mhz_cheap_gpu_ab.verdict.json"
+}
+
+phase relation soft relation run_relation
+phase quotient soft quotient run_quotient
+phase composition soft composition run_composition
+phase environment soft environment capture_environment
+phase fail_closed_verdict validate_all
