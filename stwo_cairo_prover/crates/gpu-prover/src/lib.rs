@@ -82,8 +82,8 @@ pub use prepared_composition::{
     COMPOSITION_POINTER_ALIGNMENT_WORDS, COMPOSITION_WIDE_SMALL_MAX_EVALUATION_LOG,
 };
 pub use prover::{
-    CairoBackend, GpuCairoProver, GpuProverConfig, MirroredResidentBlake2sProof,
-    ResidentTranscriptMirrorTelemetry,
+    CairoBackend, FleetResidentBlake2sProof, FleetResidentProofTelemetry, GpuCairoProver,
+    GpuProverConfig, MirroredResidentBlake2sProof, ResidentTranscriptMirrorTelemetry,
 };
 pub use resident_composition::ResidentCompositionError;
 pub use resident_oods::{ResidentOodsError, ResidentQuotientNumeratorReceipt};

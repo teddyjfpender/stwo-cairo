@@ -20,6 +20,7 @@
 //!             [--require-proof-byte-equal] [--require-gpu-native-architecture] \
 //!             [--diagnostic-allow-slow-graph-submit] \
 //!             [--capture-slow-graph-submit] \
+//!             [--fleet-pow-socket /path/to/fleet-pow.sock] \
 //!             [--operational-safety-reserve-bytes N] \
 //!             [--require-simd-reference-byte-equal] \
 //!             [--require-proof-mutation-rejected] \
@@ -111,7 +112,7 @@
 //!   pipeline, producers, pie_mode, reps, total_s, feed_starved_s,
 //!   sustained_steps_per_s, sustained_mhz, sustained_useful_mhz (null for --program)
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -139,9 +140,11 @@ use stwo_cairo_adapter::adapter::adapt;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_gpu_prover::arena_plan::ResidentBackend;
+use stwo_cairo_gpu_prover::fleet_pow::{FleetPowPlan, FleetPowSchedule};
+use stwo_cairo_gpu_prover::fleet_pow_unix::FleetPowUnixTransport;
 use stwo_cairo_gpu_prover::{
-    CudaPcsDriverTelemetry, CudaPcsRuntimeMode, GpuCairoProver, GpuProverConfig,
-    ResidentSessionTelemetry,
+    CudaPcsDriverTelemetry, CudaPcsRuntimeMode, FleetResidentProofTelemetry, GpuCairoProver,
+    GpuProverConfig, ResidentSessionTelemetry,
 };
 use stwo_cairo_prover::prover::{prove_cairo, ChannelHash, ProverParameters};
 use stwo_cairo_serialize::CairoSerialize;
@@ -271,11 +274,16 @@ fn engine() -> String {
 thread_local! {
     static GPU_NATIVE_CUDA: RefCell<Option<GpuCairoProver<Blake2sMerkleChannel>>> =
         const { RefCell::new(None) };
+    static FLEET_POW_TRANSPORT: RefCell<Option<FleetPowUnixTransport>> =
+        const { RefCell::new(None) };
+    static FLEET_PROOF_GENERATION: Cell<u64> = const { Cell::new(1) };
 }
 static LAST_GPU_NATIVE_PCS_TELEMETRY: OnceLock<Mutex<Option<CudaPcsDriverTelemetry>>> =
     OnceLock::new();
 static LAST_GPU_NATIVE_AOT_STATS: OnceLock<Mutex<Option<AotRuntimeStats>>> = OnceLock::new();
 static LAST_GPU_NATIVE_SESSION_TELEMETRY: OnceLock<Mutex<Option<ResidentSessionTelemetry>>> =
+    OnceLock::new();
+static LAST_FLEET_PROOF_TELEMETRY: OnceLock<Mutex<Option<FleetResidentProofTelemetry>>> =
     OnceLock::new();
 
 fn record_gpu_native_pcs_telemetry(telemetry: &CudaPcsDriverTelemetry) {
@@ -299,26 +307,72 @@ fn record_gpu_native_session_telemetry(telemetry: &ResidentSessionTelemetry) {
         .expect("gpu-native session telemetry mutex poisoned") = Some(telemetry.clone());
 }
 
+fn record_fleet_proof_telemetry(telemetry: &FleetResidentProofTelemetry) {
+    *LAST_FLEET_PROOF_TELEMETRY
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("fleet proof telemetry mutex poisoned") = Some(telemetry.clone());
+}
+
 fn prove_gpu_native(input: ProverInput, params: ProverParameters) -> BenchProof {
     GPU_NATIVE_CUDA.with(|cell| {
         let mut slot = cell.borrow_mut();
         let prover = slot.get_or_insert_with(|| {
             GpuCairoProver::new(gpu_native_prover_config()).expect("gpu-native config")
         });
-        let proof = if prover.config().strict {
+        let proof = if let Some(socket) = fleet_pow_socket() {
+            assert!(
+                prover.config().strict,
+                "--fleet-pow-socket requires strict resident proving"
+            );
+            FLEET_POW_TRANSPORT.with(|transport_cell| {
+                let mut transport_slot = transport_cell.borrow_mut();
+                let transport = transport_slot.get_or_insert_with(|| {
+                    FleetPowUnixTransport::connect(&socket)
+                        .unwrap_or_else(|error| panic!("fleet PoW connect {socket}: {error}"))
+                });
+                FLEET_PROOF_GENERATION.with(|generation| {
+                    let current = generation.get();
+                    generation.set(
+                        current
+                            .checked_add(1)
+                            .expect("fleet proof generation overflow"),
+                    );
+                    let outcome = prover
+                        .prove_resident_blake2s_with_fleet_pow(
+                            input,
+                            params,
+                            fleet_pow_schedule(),
+                            current,
+                            transport,
+                        )
+                        .expect("fleet resident prove failed");
+                    let pcs = CudaPcsDriverTelemetry::completed_arena_graph(
+                        outcome.telemetry.execution,
+                        outcome.telemetry.expected_graph_launches,
+                        outcome.telemetry.expected_captured_kernel_launches,
+                    );
+                    record_gpu_native_pcs_telemetry(&pcs);
+                    record_fleet_proof_telemetry(&outcome.telemetry);
+                    Ok(outcome.proof)
+                })
+            })
+        } else if prover.config().strict {
             prover.prove_resident_blake2s(input, params)
         } else {
             prover.prove(input, params)
         }
         .expect("gpu-native prove failed");
-        let telemetry = prover
-            .last_pcs_telemetry()
-            .expect("gpu-native prove returned without CUDA PCS architecture telemetry");
-        assert!(
-            telemetry.is_complete(),
-            "gpu-native CUDA PCS driver did not complete every architecture stage"
-        );
-        record_gpu_native_pcs_telemetry(telemetry);
+        if fleet_pow_socket().is_none() {
+            let telemetry = prover
+                .last_pcs_telemetry()
+                .expect("gpu-native prove returned without CUDA PCS architecture telemetry");
+            assert!(
+                telemetry.is_complete(),
+                "gpu-native CUDA PCS driver did not complete every architecture stage"
+            );
+            record_gpu_native_pcs_telemetry(telemetry);
+        }
         if let Some(session) = prover.last_resident_session_telemetry() {
             record_gpu_native_session_telemetry(session);
         }
@@ -332,6 +386,24 @@ fn prove_gpu_native(input: ProverInput, params: ProverParameters) -> BenchProof 
         record_gpu_native_aot_stats(aot_stats);
         proof
     })
+}
+
+fn fleet_pow_socket() -> Option<String> {
+    arg("--fleet-pow-socket")
+}
+
+fn fleet_pow_schedule() -> FleetPowSchedule {
+    const WORKERS_PER_RANK: u32 = 1024 * 256;
+    FleetPowSchedule {
+        interaction: FleetPowPlan {
+            workers_per_rank: WORKERS_PER_RANK,
+            indices_per_attempt: 1 << 22,
+        },
+        query: FleetPowPlan {
+            workers_per_rank: WORKERS_PER_RANK,
+            indices_per_attempt: 1 << 24,
+        },
+    }
 }
 
 fn gpu_native_prover_config() -> GpuProverConfig {
@@ -421,7 +493,7 @@ fn performance_claim_admissible() -> bool {
         gpu_native_architecture_required(),
         required_gpu_pcs_runtime_mode(),
         graph_submit_gap_diagnostic(),
-    )
+    ) && fleet_pow_socket().is_none()
 }
 
 fn performance_claim_admissible_for(
@@ -475,6 +547,13 @@ fn last_gpu_native_aot_stats() -> Option<AotRuntimeStats> {
 
 fn last_gpu_native_session_telemetry() -> Option<ResidentSessionTelemetry> {
     LAST_GPU_NATIVE_SESSION_TELEMETRY
+        .get()
+        .and_then(|telemetry| telemetry.lock().ok())
+        .and_then(|telemetry| telemetry.clone())
+}
+
+fn last_fleet_proof_telemetry() -> Option<FleetResidentProofTelemetry> {
+    LAST_FLEET_PROOF_TELEMETRY
         .get()
         .and_then(|telemetry| telemetry.lock().ok())
         .and_then(|telemetry| telemetry.clone())
@@ -1098,6 +1177,7 @@ fn record_context(backend: &str) -> serde_json::Value {
     let telemetry = last_gpu_native_pcs_telemetry();
     let aot_stats = last_gpu_native_aot_stats();
     let session_telemetry = last_gpu_native_session_telemetry();
+    let fleet_telemetry = last_fleet_proof_telemetry();
     if let Some(required_mode) = required_mode {
         validate_gpu_native_architecture(backend, &engine(), required_mode, telemetry.as_ref())
             .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
@@ -1127,6 +1207,19 @@ fn record_context(backend: &str) -> serde_json::Value {
         "benchmark_diagnostic_reason": graph_submit_gap_diagnostic()
             .then_some("graph-submit-gap-and-replay-intervals"),
         "benchmark_graph_submit_capture_mode": graph_submit_gap_capture(),
+        "fleet_pow_enabled": fleet_pow_socket().is_some(),
+        "fleet_pow_performance_admissible": fleet_telemetry
+            .as_ref()
+            .map(FleetResidentProofTelemetry::performance_claim_admissible),
+        "fleet_pow_proof_generation": fleet_telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.proof_generation),
+        "fleet_pow_interaction_attempt": fleet_telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.pow.interaction.attempt_ordinal),
+        "fleet_pow_query_attempt": fleet_telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.pow.query.attempt_ordinal),
         "performance_measurement_available": performance_measurement_available(),
         "performance_claim_admissible": performance_claim_admissible()
             && !graph_submit_gap_capture(),

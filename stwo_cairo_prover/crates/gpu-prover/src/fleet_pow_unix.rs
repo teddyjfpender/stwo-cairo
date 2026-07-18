@@ -3,6 +3,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::Duration;
 
 use crate::fleet_pow_runtime::{
     FleetPowRankRequest, FleetPowRankResponse, FleetPowRuntimeError, FleetPowTransport,
@@ -10,13 +11,17 @@ use crate::fleet_pow_runtime::{
 };
 use crate::fleet_pow_worker::{FleetPowWorker, FleetPowWorkerError};
 
+const IO_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub struct FleetPowUnixTransport {
     stream: UnixStream,
 }
 
 impl FleetPowUnixTransport {
     pub fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
-        UnixStream::connect(path).map(Self::from_stream)
+        let stream = UnixStream::connect(path)?;
+        configure_timeouts(&stream)?;
+        Ok(Self::from_stream(stream))
     }
 
     pub fn from_stream(stream: UnixStream) -> Self {
@@ -46,12 +51,18 @@ pub fn serve_pow_worker(
     worker: &mut FleetPowWorker,
 ) -> Result<(), FleetPowUnixError> {
     let (mut stream, _) = listener.accept()?;
+    configure_timeouts(&stream)?;
     while let Some(frame) = read_frame::<FLEET_POW_REQUEST_BYTES>(&mut stream)? {
         let request = FleetPowRankRequest::from_bytes(&frame)?;
         let response = worker.execute(&request)?;
         stream.write_all(&response.to_bytes())?;
     }
     Ok(())
+}
+
+fn configure_timeouts(stream: &UnixStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))
 }
 
 fn read_frame<const N: usize>(

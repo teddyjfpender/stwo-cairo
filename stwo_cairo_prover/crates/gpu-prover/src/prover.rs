@@ -706,6 +706,9 @@ where
     /// Provenance of every generated CUDA kernel lookup during the last proof.
     /// Strict mode accepts only embedded-AOT loads/hits.
     last_aot_stats: Option<aot::RuntimeStats>,
+    /// A captured workspace has one exact graph topology. Reject mode changes
+    /// before leasing it so a comparison run cannot poison the cache.
+    resident_graph_topology: Option<ResidentGraphTopology>,
     witness_artifact_plan: Arc<WitnessArtifactPlan>,
     twiddles: HashMap<u32, &'static TwiddleTree<CudaBackend>>,
     preprocessed_trees: HashMap<u64, &'static CommitmentTreeProver<CudaBackend, MC>>,
@@ -818,6 +821,7 @@ impl PendingGpuCairoProver {
             last_resident_session_telemetry: None,
             resident_protocol_policy: self.resident_protocol_policy,
             last_aot_stats: None,
+            resident_graph_topology: None,
             witness_artifact_plan: self.witness_artifact_plan,
             twiddles: HashMap::new(),
             preprocessed_trees: HashMap::new(),
@@ -1021,6 +1025,16 @@ where
             ResidentSessionArtifacts<'_>,
         ) -> Result<R, ResidentRuntimeError>,
     ) -> Result<(R, ResidentSessionTelemetry), GpuError> {
+        match self.resident_graph_topology {
+            None => self.resident_graph_topology = Some(graph_topology),
+            Some(current) if current == graph_topology => {}
+            Some(current) => {
+                return Err(GpuError::Config(format!(
+                    "resident prover graph topology is sealed as {current:?}, requested \
+                     {graph_topology:?}; use a separate prover instance for parity comparison"
+                )));
+            }
+        }
         validate_execution_entry(
             self.config.resident_backend,
             ProverExecutionEntry::PreWitnessResident,
@@ -1532,6 +1546,11 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
         proof_generation: u64,
         transport: &mut T,
     ) -> Result<FleetResidentBlake2sProof, GpuError> {
+        if self.config.record_graph_replay_intervals_diagnostic {
+            return Err(GpuError::Config(
+                "fleet PoW replay timing is not yet topology-qualified".to_string(),
+            ));
+        }
         self.last_pcs_telemetry = None;
         self.last_resident_session_telemetry = None;
         self.last_aot_stats = None;

@@ -406,8 +406,13 @@ impl<T: FleetPowTransport> TwoRankFleetPowCoordinator<T> {
             )?;
 
             self.transport.send(&remote_request)?;
-            let local = execute_local(&local_request)?;
-            let remote = self.transport.receive()?;
+            let local = execute_local(&local_request);
+            // A sent request always owns one response. Drain it even when rank
+            // zero fails so a reusable connection cannot consume stale bytes
+            // as the next proof's response.
+            let remote = self.transport.receive();
+            let local = local?;
+            let remote = remote?;
             local.validate_for(&local_request)?;
             remote.validate_for(&remote_request)?;
             let receipts = [local.receipt(), remote.receipt()];

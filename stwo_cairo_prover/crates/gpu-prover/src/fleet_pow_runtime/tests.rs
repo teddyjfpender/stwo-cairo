@@ -65,9 +65,15 @@ fn request(rank: u16, attempt_ordinal: u64) -> FleetPowRankRequest {
         26,
         plan.workers_per_rank,
         plan.attempt(RANK_COUNT, attempt_ordinal).unwrap(),
-        [3; BLAKE2S_TRANSCRIPT_STATE_WORDS],
+        state(),
     )
     .unwrap()
+}
+
+fn state() -> [u32; BLAKE2S_TRANSCRIPT_STATE_WORDS] {
+    let mut state = [3; BLAKE2S_TRANSCRIPT_STATE_WORDS];
+    state[TRANSCRIPT_STATUS_WORD] = 0;
+    state
 }
 
 #[test]
@@ -100,7 +106,7 @@ fn wait_all_retries_then_returns_the_shared_global_minimum() {
         .resolve(
             FleetPowSite::Interaction,
             26,
-            [3; BLAKE2S_TRANSCRIPT_STATE_WORDS],
+            state(),
             |request| Ok(FleetPowRankResponse::completed(request, None)),
             |nonce| nonce == remote_nonce,
         )
@@ -112,6 +118,23 @@ fn wait_all_retries_then_returns_the_shared_global_minimum() {
             attempt_ordinal: 1
         }
     );
+}
+
+#[test]
+fn local_failure_still_drains_the_owned_remote_response() {
+    let remote = FleetPowRankResponse::completed(&request(1, 0), None);
+    let mut coordinator = coordinator(vec![remote]);
+    assert_eq!(
+        coordinator.resolve(
+            FleetPowSite::Interaction,
+            26,
+            state(),
+            |_| Err(FleetPowRuntimeError::Transport("local failure".into())),
+            |_| false,
+        ),
+        Err(FleetPowRuntimeError::Transport("local failure".into()))
+    );
+    assert!(coordinator.transport.responses.is_empty());
 }
 
 #[test]
@@ -149,7 +172,7 @@ fn rejects_stale_duplicate_and_wrong_identity_fields() {
             .resolve(
                 FleetPowSite::Interaction,
                 26,
-                [3; BLAKE2S_TRANSCRIPT_STATE_WORDS],
+                state(),
                 |request| Ok(FleetPowRankResponse::completed(request, None)),
                 |_| false,
             )
@@ -167,7 +190,7 @@ fn rejects_duplicate_site_and_malformed_wire_geometry() {
         .resolve(
             FleetPowSite::Interaction,
             26,
-            [3; BLAKE2S_TRANSCRIPT_STATE_WORDS],
+            state(),
             |request| Ok(FleetPowRankResponse::completed(request, None)),
             |candidate| candidate == nonce,
         )
@@ -176,7 +199,7 @@ fn rejects_duplicate_site_and_malformed_wire_geometry() {
         coordinator.resolve(
             FleetPowSite::Interaction,
             26,
-            [3; BLAKE2S_TRANSCRIPT_STATE_WORDS],
+            state(),
             |_| unreachable!(),
             |_| false,
         ),
