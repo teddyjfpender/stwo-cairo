@@ -20,8 +20,8 @@ use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::bit_reverse;
 use stwo_backend_cuda::aot::{
     composition_wave_kernel_identity, composition_wave_kernel_source, constraint_program,
-    CompositionWaveKernelPartIdentity, ConstraintWaveFragment, EmittedConstraintKernel,
-    EmittedKernel,
+    AotKernelAbiSchema, CompositionWaveKernelPartIdentity, ConstraintWaveFragment,
+    EmittedConstraintKernel, EmittedKernel,
 };
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{FrameworkComponent, FrameworkEval};
@@ -74,7 +74,8 @@ pub struct CompositionComponentPlan {
 }
 
 /// One cold-emitted, exact same-domain composition wave installed in the AOT
-/// pack. Warm proofs retain this immutable source/key but never regenerate it.
+/// pack. Warm proofs retain its source, typed-program identity, and lookup key
+/// but never regenerate it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionWaveKernelPlan {
     pub evaluation_log_size: u32,
@@ -82,6 +83,7 @@ pub struct CompositionWaveKernelPlan {
     pub kernel_name: String,
     pub cache_key: u64,
     pub semantic_hash: u64,
+    pub program_identity: [u8; 32],
     pub source: String,
 }
 
@@ -501,6 +503,7 @@ impl CompositionPlan {
             feed(&[0]);
             feed(&wave.cache_key.to_le_bytes());
             feed(&wave.semantic_hash.to_le_bytes());
+            feed(&wave.program_identity);
             feed(&(wave.source.len() as u64).to_le_bytes());
             feed(wave.source.as_bytes());
         }
@@ -787,10 +790,17 @@ fn emit_composition_wave_kernels(
                     evaluation_log_size,
                 },
             )?;
+            let Some(program_identity) = kernel.program_identity else {
+                return Err(CompositionPlanError::WaveKernelLowering {
+                    evaluation_log_size,
+                });
+            };
             if kernel.kernel_name != expected.kernel_name
                 || kernel.cache_key != expected.cache_key
                 || kernel.semantic_hash != expected.semantic_hash
                 || expected.part_count != identities.len()
+                || kernel.abi_schema != Some(AotKernelAbiSchema::CompositionWaveV2)
+                || program_identity == [0; 32]
             {
                 return Err(CompositionPlanError::WaveKernelLowering {
                     evaluation_log_size,
@@ -802,6 +812,7 @@ fn emit_composition_wave_kernels(
                 kernel_name: kernel.kernel_name,
                 cache_key: kernel.cache_key,
                 semantic_hash: kernel.semantic_hash,
+                program_identity,
                 source: kernel.source,
             })
         })

@@ -493,6 +493,8 @@ fn required_composition_aot_kernels(
                     || identity.kernel_name != wave.kernel_name
                     || identity.semantic_hash != wave.semantic_hash
                     || identity.cache_key != wave.cache_key
+                    || wave.program_identity == [0; 32]
+                    || wave.source.is_empty()
                 {
                     return Err(format!("composition wave {wave_index} identity drifted"));
                 }
@@ -595,6 +597,7 @@ mod composition_aot_coverage_tests {
                 kernel_name: wave.kernel_name,
                 cache_key: wave.cache_key,
                 semantic_hash: wave.semantic_hash,
+                program_identity: [7; 32],
                 source: "wave_source".to_owned(),
             }],
         }
@@ -656,6 +659,11 @@ mod composition_aot_coverage_tests {
         drifted.wave_kernels[0].cache_key ^= 1;
         assert!(
             required_composition_aot_kernels(ResidentBackend::ReplacementV1, &drifted).is_err()
+        );
+        let mut untyped = plan();
+        untyped.wave_kernels[0].program_identity = [0; 32];
+        assert!(
+            required_composition_aot_kernels(ResidentBackend::ReplacementV1, &untyped).is_err()
         );
 
         let reseal = |plan: &mut CompositionPlan| {

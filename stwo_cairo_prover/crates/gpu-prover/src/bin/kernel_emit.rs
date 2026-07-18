@@ -435,8 +435,8 @@ fn run_input(
                     cache_key: wave.cache_key,
                     semantic_hash: wave.semantic_hash,
                     source: wave.source,
-                    abi_schema: None,
-                    program_identity: None,
+                    abi_schema: Some(aot::AotKernelAbiSchema::CompositionWaveV2),
+                    program_identity: Some(wave.program_identity),
                 },
             )?;
         }

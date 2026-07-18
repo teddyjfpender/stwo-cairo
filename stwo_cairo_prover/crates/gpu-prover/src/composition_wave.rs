@@ -9,6 +9,12 @@ use std::collections::BTreeMap;
 
 use crate::composition_plan::CompositionPlan;
 
+mod shard_authority;
+pub use shard_authority::*;
+
+#[cfg(test)]
+mod shard_authority_tests;
+
 const SECURE_COORDINATES: u64 = 4;
 const WORD_BYTES: u64 = 4;
 const ACCUMULATOR_READ_WRITE_BYTES_PER_ROW: u64 = SECURE_COORDINATES * WORD_BYTES * 2;

@@ -13,7 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 
 use stwo::core::fields::m31::M31;
-use stwo_backend_cuda::{aot, ArenaError, ArenaSlice, ArenaSlotId, CudaRuntimeError, DeviceArena};
+use stwo_backend_cuda::{
+    aot, cuda_device_snapshot, ArenaError, ArenaSlice, ArenaSlotId, CudaDeviceSnapshot,
+    CudaRuntimeError, DeviceArena,
+};
 use stwo_backend_cuda_kernels::raw::{self, CudaSecureField};
 
 use crate::arena_plan::{CommitmentTreeId, OpenedColumnSource};
@@ -619,6 +622,27 @@ pub enum PreparedCompositionError {
     CompositionWaveAotMiss {
         wave: usize,
         cache_key: u64,
+    },
+    CompositionWaveAotAuthorityMissing {
+        wave: usize,
+        cache_key: u64,
+        target_sm: u32,
+    },
+    CompositionWaveAotAuthorityDrift {
+        wave: usize,
+        field: &'static str,
+    },
+    CompositionWaveAotInstall {
+        wave: usize,
+        error: aot::InstalledAotFunctionError,
+    },
+    CompositionWaveAotLaunch {
+        wave: usize,
+        error: aot::InstalledAotFunctionError,
+    },
+    CompositionWaveAotReceiptDrift {
+        wave: usize,
+        field: &'static str,
     },
     CompositionWaveNameContainsNul(usize),
     CompositionWaveLaunchMiss {
@@ -1300,6 +1324,8 @@ fn composition_wave_requirements(
             || expected.kernel_name != wave.kernel_name
             || expected.cache_key != wave.cache_key
             || expected.semantic_hash != wave.semantic_hash
+            || wave.program_identity == [0; 32]
+            || wave.source.is_empty()
         {
             return Err(PreparedCompositionError::CompositionWavePlanDrift(
                 "kernel identity",
@@ -1548,13 +1574,82 @@ struct PreparedComponent {
     kernels: Vec<PreparedKernel>,
 }
 
-#[derive(Debug)]
-struct PreparedWave {
+enum PreparedWaveAuthority<'a> {
+    Installed(aot::InstalledAotFunction<'a>),
+    #[cfg(feature = "direct-retention-test-api")]
+    SourceJitTest,
+}
+
+struct PreparedWave<'a> {
     name: CString,
     cache_key: u64,
     descriptor_offset_words: usize,
     accumulator_offset_words: usize,
-    row_count: u32,
+    full_domain_rows: u32,
+    authority: PreparedWaveAuthority<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum CompositionAotAdmission {
+    StrictEmbedded,
+    #[cfg(feature = "direct-retention-test-api")]
+    SourceJitTest,
+}
+
+#[derive(Clone, Copy)]
+enum CompositionWaveDispatch {
+    EagerInstalled,
+    CaptureSafe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompositionWaveLaunchRange {
+    full_domain_rows: u32,
+    shard_start: u32,
+    shard_rows: u32,
+}
+
+impl CompositionWaveLaunchRange {
+    fn new(
+        full_domain_rows: u32,
+        shard_start: u32,
+        shard_rows: u32,
+    ) -> Result<Self, PreparedCompositionError> {
+        if full_domain_rows == 0
+            || shard_rows == 0
+            || shard_start >= full_domain_rows
+            || shard_rows > full_domain_rows - shard_start
+        {
+            return Err(PreparedCompositionError::CompositionWavePlanDrift(
+                "launch row range",
+            ));
+        }
+        Ok(Self {
+            full_domain_rows,
+            shard_start,
+            shard_rows,
+        })
+    }
+
+    fn full_domain(full_domain_rows: u32) -> Result<Self, PreparedCompositionError> {
+        Self::new(full_domain_rows, 0, full_domain_rows)
+    }
+
+    fn coordinate_offset_words(self, coordinate: usize) -> Result<usize, PreparedCompositionError> {
+        if coordinate >= SECURE_COORDINATES {
+            return Err(PreparedCompositionError::CompositionWavePlanDrift(
+                "coordinate index",
+            ));
+        }
+        let full_domain_rows = usize::try_from(self.full_domain_rows)
+            .map_err(|_| PreparedCompositionError::SizeOverflow)?;
+        let shard_start = usize::try_from(self.shard_start)
+            .map_err(|_| PreparedCompositionError::SizeOverflow)?;
+        coordinate
+            .checked_mul(full_domain_rows)
+            .and_then(|offset| offset.checked_add(shard_start))
+            .ok_or(PreparedCompositionError::SizeOverflow)
+    }
 }
 
 /// Stable resident composition launch object.
@@ -1576,7 +1671,7 @@ pub struct PreparedCompositionGraph<'a> {
     _direct_evaluations: Vec<ArenaSlice>,
     output: PreparedCompositionOutput<'a>,
     components: Vec<PreparedComponent>,
-    waves: Vec<PreparedWave>,
+    waves: Vec<PreparedWave<'a>>,
     /// Wide-mode fanout: `lane_components[lane]` holds component indices in
     /// enqueue order (group-contiguous, members in plan order). Empty in
     /// serial mode, so the serial launch path performs no fork/join at all.
@@ -1678,7 +1773,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             direct_retention,
             direct_evaluations,
             None,
-            false,
+            CompositionAotAdmission::SourceJitTest,
         )
     }
 
@@ -1704,7 +1799,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             direct_retention,
             direct_evaluations,
             None,
-            true,
+            CompositionAotAdmission::StrictEmbedded,
         )
     }
 
@@ -1732,7 +1827,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             direct_retention,
             direct_evaluations,
             direct_split,
-            true,
+            CompositionAotAdmission::StrictEmbedded,
         )
     }
 
@@ -1748,7 +1843,7 @@ impl<'a> PreparedCompositionGraph<'a> {
         direct_retention: Option<&DirectCompositionRetentionPlan>,
         direct_evaluations: &[CompositionDirectEvaluationBinding],
         direct_split: Option<CompositionDirectSplitBinding>,
-        strict_aot: bool,
+        aot_admission: CompositionAotAdmission,
     ) -> Result<Self, PreparedCompositionError> {
         let requirements =
             composition_workspace_requirements_with_retention(plan, trace, mode, direct_retention)?;
@@ -2020,6 +2115,11 @@ impl<'a> PreparedCompositionGraph<'a> {
         }
         let alpha_power_count = relation_alpha_powers.len_words() / SECURE_WORDS;
 
+        let strict_aot = match aot_admission {
+            CompositionAotAdmission::StrictEmbedded => true,
+            #[cfg(feature = "direct-retention-test-api")]
+            CompositionAotAdmission::SourceJitTest => false,
+        };
         if strict_aot {
             if aot::loaded_manifest_hash() == 0 {
                 return Err(PreparedCompositionError::AotPackUnavailable);
@@ -2393,9 +2493,11 @@ impl<'a> PreparedCompositionGraph<'a> {
                 );
             }
             prepared_waves.push(prepare_aot_wave(
+                arena,
                 wave_index,
                 &plan.wave_kernels[wave_index],
                 wave,
+                aot_admission,
             )?);
         }
 
@@ -2461,8 +2563,21 @@ impl<'a> PreparedCompositionGraph<'a> {
     }
 
     /// Enqueue the complete composition path. Eager execution and graph capture
-    /// call this same method and therefore have identical launch topology.
+    /// retain identical launch topology. Strict waves enqueue through their
+    /// installed function; graph capture has a separate receipt-fenced wrapper
+    /// because the backend's installed seam deliberately rejects capture.
     pub fn launch(&self) -> Result<(), PreparedCompositionError> {
+        self.launch_with_wave_dispatch(CompositionWaveDispatch::EagerInstalled)
+    }
+
+    pub(crate) fn launch_capture_safe(&self) -> Result<(), PreparedCompositionError> {
+        self.launch_with_wave_dispatch(CompositionWaveDispatch::CaptureSafe)
+    }
+
+    fn launch_with_wave_dispatch(
+        &self,
+        wave_dispatch: CompositionWaveDispatch,
+    ) -> Result<(), PreparedCompositionError> {
         let context = self.arena.context();
         let stream = context.stream_raw().as_ptr();
         let descriptor_ptr = self.descriptors.as_u32_ptr();
@@ -2522,7 +2637,7 @@ impl<'a> PreparedCompositionGraph<'a> {
 
         if self.requirements.mode == CompositionLaunchMode::Wave {
             for (wave_index, wave) in self.waves.iter().enumerate() {
-                self.enqueue_wave(wave_index, wave, stream)?;
+                self.enqueue_wave(wave_index, wave, stream, wave_dispatch)?;
             }
         } else if self.lane_components.iter().all(|lane| lane.is_empty()) {
             // Serial topology: identical call sequence to the historical
@@ -2686,30 +2801,84 @@ impl<'a> PreparedCompositionGraph<'a> {
     fn enqueue_wave(
         &self,
         wave_index: usize,
-        wave: &PreparedWave,
+        wave: &PreparedWave<'_>,
         stream: *mut c_void,
+        dispatch: CompositionWaveDispatch,
     ) -> Result<(), PreparedCompositionError> {
-        let row_count = wave.row_count as usize;
-        let accumulator = unsafe {
+        self.enqueue_wave_range(
+            wave_index,
+            wave,
+            CompositionWaveLaunchRange::full_domain(wave.full_domain_rows)?,
+            stream,
+            dispatch,
+        )
+    }
+
+    fn enqueue_wave_range(
+        &self,
+        wave_index: usize,
+        wave: &PreparedWave<'_>,
+        range: CompositionWaveLaunchRange,
+        stream: *mut c_void,
+        dispatch: CompositionWaveDispatch,
+    ) -> Result<(), PreparedCompositionError> {
+        if range.full_domain_rows != wave.full_domain_rows {
+            return Err(PreparedCompositionError::CompositionWavePlanDrift(
+                "prepared wave domain",
+            ));
+        }
+        let accumulator_base = unsafe {
             self.accumulators
                 .as_u32_ptr()
                 .add(wave.accumulator_offset_words)
         };
+        let coordinate = |index| {
+            range
+                .coordinate_offset_words(index)
+                .map(|offset| unsafe { accumulator_base.add(offset) })
+        };
+        let coord_0 = coordinate(0)?;
+        let coord_1 = coordinate(1)?;
+        let coord_2 = coordinate(2)?;
+        let coord_3 = coordinate(3)?;
+        let parts = unsafe {
+            self.descriptors
+                .as_u32_ptr()
+                .add(wave.descriptor_offset_words)
+                .cast::<raw::CudaCompositionWavePart>()
+        };
+        if matches!(
+            (&wave.authority, dispatch),
+            (
+                PreparedWaveAuthority::Installed(_),
+                CompositionWaveDispatch::EagerInstalled
+            )
+        ) {
+            return wave.launch_installed(
+                self.arena,
+                range,
+                stream,
+                wave_index,
+                parts,
+                self.random_coefficient_powers.as_u32_ptr(),
+                [coord_0, coord_1, coord_2, coord_3],
+            );
+        }
+        wave.require_installed_authority(self.arena, range, stream, wave_index)?;
         let launched = unsafe {
             raw::stwo_cuda_jit_eval_composition_wave_on(
                 core::ptr::null(),
                 wave.name.as_ptr(),
                 wave.cache_key,
-                self.descriptors
-                    .as_u32_ptr()
-                    .add(wave.descriptor_offset_words)
-                    .cast::<raw::CudaCompositionWavePart>(),
+                parts,
                 self.random_coefficient_powers.as_u32_ptr(),
-                accumulator,
-                accumulator.add(row_count),
-                accumulator.add(2 * row_count),
-                accumulator.add(3 * row_count),
-                wave.row_count,
+                coord_0,
+                coord_1,
+                coord_2,
+                coord_3,
+                range.full_domain_rows,
+                range.shard_start,
+                range.shard_rows,
                 stream,
             )
         };
@@ -2848,11 +3017,13 @@ fn prepare_aot_kernel(
     })
 }
 
-fn prepare_aot_wave(
+fn prepare_aot_wave<'a>(
+    arena: &'a DeviceArena,
     wave_index: usize,
     wave: &CompositionWaveKernelPlan,
     requirements: &CompositionWaveRequirements,
-) -> Result<PreparedWave, PreparedCompositionError> {
+    admission: CompositionAotAdmission,
+) -> Result<PreparedWave<'a>, PreparedCompositionError> {
     let name = CString::new(wave.kernel_name.as_bytes())
         .map_err(|_| PreparedCompositionError::CompositionWaveNameContainsNul(wave_index))?;
     let found = unsafe {
@@ -2864,14 +3035,339 @@ fn prepare_aot_wave(
             cache_key: wave.cache_key,
         });
     }
+    let full_domain_rows = u32::try_from(requirements.row_count)
+        .map_err(|_| PreparedCompositionError::SizeOverflow)?;
+    let authority = match admission {
+        CompositionAotAdmission::StrictEmbedded => {
+            let snapshot = cuda_device_snapshot()?;
+            let target_sm = current_target_sm(snapshot).ok_or(
+                PreparedCompositionError::CompositionWaveAotAuthorityDrift {
+                    wave: wave_index,
+                    field: "current device",
+                },
+            )?;
+            let loaded =
+                aot::loaded_kernel_authority(wave.cache_key, target_sm / 10, target_sm % 10)
+                    .ok_or(
+                        PreparedCompositionError::CompositionWaveAotAuthorityMissing {
+                            wave: wave_index,
+                            cache_key: wave.cache_key,
+                            target_sm,
+                        },
+                    )?;
+            validate_wave_authority(wave_index, wave, target_sm, loaded)?;
+            let launch = composition_wave_launch_facts(full_domain_rows)?;
+            let installed = aot::InstalledAotFunction::install(arena.context(), loaded, launch)
+                .map_err(
+                    |error| PreparedCompositionError::CompositionWaveAotInstall {
+                        wave: wave_index,
+                        error,
+                    },
+                )?;
+            validate_wave_receipt(
+                wave_index, wave, arena, snapshot, target_sm, launch, loaded, &installed,
+            )?;
+            PreparedWaveAuthority::Installed(installed)
+        }
+        #[cfg(feature = "direct-retention-test-api")]
+        CompositionAotAdmission::SourceJitTest => PreparedWaveAuthority::SourceJitTest,
+    };
     Ok(PreparedWave {
         name,
         cache_key: wave.cache_key,
         descriptor_offset_words: requirements.descriptor_offset_words,
         accumulator_offset_words: requirements.accumulator_offset_words,
-        row_count: u32::try_from(requirements.row_count)
-            .map_err(|_| PreparedCompositionError::SizeOverflow)?,
+        full_domain_rows,
+        authority,
     })
+}
+
+impl PreparedWave<'_> {
+    fn require_installed_authority(
+        &self,
+        arena: &DeviceArena,
+        range: CompositionWaveLaunchRange,
+        stream: *mut c_void,
+        wave_index: usize,
+    ) -> Result<(), PreparedCompositionError> {
+        match &self.authority {
+            PreparedWaveAuthority::Installed(installed) => {
+                let receipt = installed.receipt();
+                for (matches, field) in [
+                    (installed.belongs_to(arena.context()), "execution context"),
+                    (
+                        receipt.stream_token() == stream as usize as u64 && !stream.is_null(),
+                        "stream",
+                    ),
+                    (
+                        receipt.abi_schema() == aot::AotKernelAbiSchema::CompositionWaveV2,
+                        "ABI schema",
+                    ),
+                    (
+                        receipt.kernel_symbol().as_bytes() == self.name.as_bytes(),
+                        "kernel symbol",
+                    ),
+                    (receipt.cache_key() == self.cache_key, "cache key"),
+                    (
+                        receipt.launch() == composition_wave_launch_facts(range.shard_rows)?,
+                        "launch geometry",
+                    ),
+                ] {
+                    if !matches {
+                        return Err(PreparedCompositionError::CompositionWaveAotReceiptDrift {
+                            wave: wave_index,
+                            field,
+                        });
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(feature = "direct-retention-test-api")]
+            PreparedWaveAuthority::SourceJitTest => Ok(()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_installed(
+        &self,
+        arena: &DeviceArena,
+        range: CompositionWaveLaunchRange,
+        stream: *mut c_void,
+        wave_index: usize,
+        parts: *const raw::CudaCompositionWavePart,
+        random_coefficient_powers: *const u32,
+        coordinates: [*mut u32; SECURE_COORDINATES],
+    ) -> Result<(), PreparedCompositionError> {
+        self.require_installed_authority(arena, range, stream, wave_index)?;
+        let installed = match &self.authority {
+            PreparedWaveAuthority::Installed(installed) => installed,
+            #[cfg(feature = "direct-retention-test-api")]
+            PreparedWaveAuthority::SourceJitTest => {
+                return Err(PreparedCompositionError::CompositionWaveAotReceiptDrift {
+                    wave: wave_index,
+                    field: "eager installed ownership",
+                });
+            }
+        };
+        let mut parts = parts;
+        let mut random_coefficient_powers = random_coefficient_powers;
+        let mut coord_0 = coordinates[0];
+        let mut coord_1 = coordinates[1];
+        let mut coord_2 = coordinates[2];
+        let mut coord_3 = coordinates[3];
+        let mut full_domain_rows = range.full_domain_rows;
+        let mut shard_start = range.shard_start;
+        let mut shard_rows = range.shard_rows;
+        let mut arguments = [
+            (&mut parts as *mut *const raw::CudaCompositionWavePart).cast(),
+            (&mut random_coefficient_powers as *mut *const u32).cast(),
+            (&mut coord_0 as *mut *mut u32).cast(),
+            (&mut coord_1 as *mut *mut u32).cast(),
+            (&mut coord_2 as *mut *mut u32).cast(),
+            (&mut coord_3 as *mut *mut u32).cast(),
+            (&mut full_domain_rows as *mut u32).cast(),
+            (&mut shard_start as *mut u32).cast(),
+            (&mut shard_rows as *mut u32).cast(),
+        ];
+        let checked = installed
+            .check_arguments(aot::AotKernelAbiSchema::CompositionWaveV2, &mut arguments)
+            .map_err(|error| PreparedCompositionError::CompositionWaveAotLaunch {
+                wave: wave_index,
+                error,
+            })?;
+        unsafe { installed.launch_raw(arena.context(), checked) }.map_err(|error| {
+            PreparedCompositionError::CompositionWaveAotLaunch {
+                wave: wave_index,
+                error,
+            }
+        })
+    }
+}
+
+fn current_target_sm(snapshot: CudaDeviceSnapshot) -> Option<u32> {
+    (snapshot.count != 0
+        && snapshot.current < snapshot.count
+        && snapshot.sm_major != 0
+        && snapshot.sm_minor <= 9)
+        .then_some(())
+        .and_then(|()| snapshot.sm_major.checked_mul(10))
+        .and_then(|major| major.checked_add(snapshot.sm_minor))
+}
+
+fn composition_wave_launch_facts(
+    shard_rows: u32,
+) -> Result<aot::InstalledAotLaunchFacts, PreparedCompositionError> {
+    let threads = u32::try_from(aot::COMPOSITION_WAVE_THREADS_PER_BLOCK)
+        .map_err(|_| PreparedCompositionError::SizeOverflow)?;
+    aot::InstalledAotLaunchFacts::new([shard_rows.div_ceil(threads), 1, 1], [threads, 1, 1], 0)
+        .map_err(|_| PreparedCompositionError::CompositionWavePlanDrift("launch geometry"))
+}
+
+fn validate_wave_authority(
+    wave_index: usize,
+    wave: &CompositionWaveKernelPlan,
+    target_sm: u32,
+    authority: aot::AotKernelAuthority,
+) -> Result<(), PreparedCompositionError> {
+    let schema = aot::AotKernelAbiSchema::CompositionWaveV2;
+    for (matches, field) in [
+        (
+            aot::loaded_manifest_identity() != [0; 32],
+            "manifest identity",
+        ),
+        (
+            authority.source_identity() == aot::emitted_source_identity(&wave.source),
+            "source identity",
+        ),
+        (
+            authority.kernel_symbol() == wave.kernel_name.as_str(),
+            "kernel symbol",
+        ),
+        (
+            authority.semantic_hash() == wave.semantic_hash,
+            "semantic hash",
+        ),
+        (authority.cache_key() == wave.cache_key, "cache key"),
+        (authority.target_sm() == target_sm, "target SM"),
+        (authority.cubin_identity() != [0; 32], "cubin identity"),
+        (
+            aot::loaded_cubin_identity(wave.cache_key, target_sm / 10, target_sm % 10)
+                == authority.cubin_identity(),
+            "loaded cubin identity",
+        ),
+        (
+            authority.program_identity() == wave.program_identity
+                && wave.program_identity != [0; 32],
+            "program identity",
+        ),
+        (authority.abi_schema() == Some(schema), "ABI schema"),
+        (
+            authority.abi_schema_identity() == schema.identity(),
+            "ABI schema identity",
+        ),
+        (
+            authority.schema_scope() == aot::AotKernelSchemaScope::StructuredAbi,
+            "schema scope",
+        ),
+        (
+            authority.module_globals() == aot::AotKernelModuleGlobals::None,
+            "module globals",
+        ),
+        (authority.identity() != [0; 32], "authority identity"),
+    ] {
+        if !matches {
+            return Err(PreparedCompositionError::CompositionWaveAotAuthorityDrift {
+                wave: wave_index,
+                field,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_wave_receipt(
+    wave_index: usize,
+    wave: &CompositionWaveKernelPlan,
+    arena: &DeviceArena,
+    snapshot: CudaDeviceSnapshot,
+    target_sm: u32,
+    launch: aot::InstalledAotLaunchFacts,
+    authority: aot::AotKernelAuthority,
+    installed: &aot::InstalledAotFunction<'_>,
+) -> Result<(), PreparedCompositionError> {
+    let receipt = installed.receipt();
+    let publication = receipt.function_publication();
+    let manifest = aot::loaded_manifest_identity();
+    let schema = aot::AotKernelAbiSchema::CompositionWaveV2;
+    for (matches, field) in [
+        (installed.belongs_to(arena.context()), "execution context"),
+        (
+            receipt.manifest_identity() == manifest && manifest != [0; 32],
+            "manifest identity",
+        ),
+        (
+            receipt.source_identity() == authority.source_identity(),
+            "source identity",
+        ),
+        (
+            receipt.cubin_identity() == authority.cubin_identity(),
+            "cubin identity",
+        ),
+        (
+            receipt.program_identity() == wave.program_identity,
+            "program identity",
+        ),
+        (
+            receipt.abi_schema_identity() == schema.identity(),
+            "ABI schema identity",
+        ),
+        (
+            receipt.kernel_authority_identity() == authority.identity(),
+            "authority identity",
+        ),
+        (
+            receipt.kernel_symbol() == wave.kernel_name.as_str(),
+            "kernel symbol",
+        ),
+        (
+            receipt.semantic_hash() == wave.semantic_hash,
+            "semantic hash",
+        ),
+        (receipt.cache_key() == wave.cache_key, "cache key"),
+        (receipt.target_sm() == target_sm, "target SM"),
+        (receipt.abi_schema() == schema, "ABI schema"),
+        (
+            receipt.module_globals() == aot::AotKernelModuleGlobals::None,
+            "module globals",
+        ),
+        (
+            receipt.ownership() == aot::InstalledAotFunctionOwnership::BorrowedPublished,
+            "ownership",
+        ),
+        (receipt.launch() == launch, "launch geometry"),
+        (receipt.device_ordinal() == snapshot.current, "device"),
+        (
+            receipt.exec_context_token() != 0
+                && receipt.driver_context_token() != 0
+                && receipt.module_token() != 0
+                && receipt.function_token() != 0,
+            "native tokens",
+        ),
+        (
+            receipt.stream_token() == arena.context().stream_raw().as_ptr() as usize as u64,
+            "stream",
+        ),
+        (
+            receipt.pedersen_publication().is_none(),
+            "unexpected Pedersen publication",
+        ),
+        (
+            publication.manifest_identity() == manifest
+                && publication.source_identity() == authority.source_identity()
+                && publication.cubin_identity() == authority.cubin_identity()
+                && publication.program_identity() == wave.program_identity
+                && publication.abi_schema_identity() == schema.identity()
+                && publication.kernel_authority_identity() == authority.identity()
+                && publication.kernel_symbol() == wave.kernel_name.as_str()
+                && publication.semantic_hash() == wave.semantic_hash
+                && publication.cache_key() == wave.cache_key
+                && publication.target_sm() == target_sm
+                && publication.device_ordinal() == snapshot.current
+                && publication.driver_context_token() == receipt.driver_context_token()
+                && publication.module_token() == receipt.module_token()
+                && publication.function_token() == receipt.function_token(),
+            "function publication",
+        ),
+    ] {
+        if !matches {
+            return Err(PreparedCompositionError::CompositionWaveAotReceiptDrift {
+                wave: wave_index,
+                field,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn write_wave_part_descriptor(
@@ -3069,6 +3565,123 @@ mod tests {
             source: "extern \"C\" __global__ void kernel() {}".to_owned(),
             rc_base,
         }
+    }
+
+    #[test]
+    fn production_wave_wrapper_is_fenced_by_installed_authority() {
+        let source = include_str!("prepared_composition.rs");
+        let install = source
+            .find("aot::InstalledAotFunction::install")
+            .expect("strict prepare must install the exact loaded function");
+        let retention = source
+            .find("PreparedWaveAuthority::Installed(installed)")
+            .expect("prepared wave must retain installed ownership");
+        let crate_private_capture = ["pub(crate) fn launch_", "capture_safe"].concat();
+        assert!(source.contains(crate_private_capture.as_str()));
+        let public_capture = ["pub", " fn launch_capture_safe"].concat();
+        assert!(!source.contains(public_capture.as_str()));
+        let guard = source
+            .find("wave.require_installed_authority")
+            .expect("capture-safe wrapper must have an installed receipt guard");
+        let eager_launch = ["installed.launch_", "raw(arena.context(), checked)"].concat();
+        assert!(
+            source.contains(eager_launch.as_str()),
+            "strict eager waves must use the typed installed-function launch"
+        );
+        let wrapper_symbol = ["raw::stwo_cuda_jit_eval_", "composition_wave_on"].concat();
+        let wrapper = source
+            .find(wrapper_symbol.as_str())
+            .expect("capture-safe wrapper remains the graph launch seam");
+        assert!(install < retention && guard < wrapper);
+        assert_eq!(
+            source.matches(wrapper_symbol.as_str()).count(),
+            1,
+            "a second raw wave launch would bypass the sole receipt guard"
+        );
+    }
+
+    #[test]
+    fn device_snapshot_and_wave_grid_mutations_fail_closed() {
+        let valid = CudaDeviceSnapshot {
+            count: 2,
+            current: 1,
+            sm_major: 9,
+            sm_minor: 0,
+        };
+        assert_eq!(current_target_sm(valid), Some(90));
+        for changed in [
+            CudaDeviceSnapshot { count: 0, ..valid },
+            CudaDeviceSnapshot {
+                current: 2,
+                ..valid
+            },
+            CudaDeviceSnapshot {
+                sm_major: 0,
+                ..valid
+            },
+            CudaDeviceSnapshot {
+                sm_minor: 10,
+                ..valid
+            },
+        ] {
+            assert_eq!(current_target_sm(changed), None);
+        }
+        assert_eq!(composition_wave_launch_facts(1).unwrap().grid(), [1, 1, 1]);
+        assert_eq!(
+            composition_wave_launch_facts(128).unwrap().grid(),
+            [1, 1, 1]
+        );
+        assert_eq!(
+            composition_wave_launch_facts(129).unwrap().grid(),
+            [2, 1, 1]
+        );
+        assert_eq!(
+            composition_wave_launch_facts(129).unwrap().block(),
+            [128, 1, 1]
+        );
+        assert_ne!(
+            composition_wave_launch_facts(1_024).unwrap(),
+            composition_wave_launch_facts(384).unwrap(),
+            "a full-domain receipt must not authorize a smaller fleet shard"
+        );
+    }
+
+    #[test]
+    fn composition_wave_range_binds_global_reads_to_disjoint_local_outputs() {
+        let range = CompositionWaveLaunchRange::new(1024, 256, 384).unwrap();
+        assert_eq!(
+            range,
+            CompositionWaveLaunchRange {
+                full_domain_rows: 1024,
+                shard_start: 256,
+                shard_rows: 384,
+            }
+        );
+        let offsets = (0..SECURE_COORDINATES)
+            .map(|coordinate| range.coordinate_offset_words(coordinate).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, [256, 1280, 2304, 3328]);
+        let shard_rows = usize::try_from(range.shard_rows).unwrap();
+        assert!(offsets
+            .windows(2)
+            .all(|pair| pair[0] + shard_rows <= pair[1]));
+        for invalid in [
+            (0, 0, 1),
+            (1024, 0, 0),
+            (1024, 1024, 1),
+            (1024, 900, 125),
+            (1024, u32::MAX, 1),
+        ] {
+            assert!(CompositionWaveLaunchRange::new(invalid.0, invalid.1, invalid.2).is_err());
+        }
+        assert_eq!(
+            CompositionWaveLaunchRange::full_domain(1024).unwrap(),
+            CompositionWaveLaunchRange {
+                full_domain_rows: 1024,
+                shard_start: 0,
+                shard_rows: 1024,
+            }
+        );
     }
 
     fn component(
@@ -3376,9 +3989,10 @@ mod tests {
             kernel_name: wave_identity.kernel_name,
             cache_key: wave_identity.cache_key,
             semantic_hash: wave_identity.semantic_hash,
-            // The strict warm binder resolves by name/key and must not require
-            // a retained cold CUDA TU.
-            source: String::new(),
+            program_identity: [9; 32],
+            // Warm launch resolves by name/key, while structural and loaded
+            // authority retain the canonical emitted identity.
+            source: "wave_source".to_owned(),
         });
 
         let policy = crate::protocol_plan::ProtocolPlanPolicy::replacement_v1(1, 192);

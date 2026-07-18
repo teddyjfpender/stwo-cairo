@@ -293,12 +293,19 @@ pub(super) fn fixture() -> Fixture {
                     expected.semantic_hash
                 )
             );
+            assert_eq!(
+                emitted.abi_schema,
+                Some(aot::AotKernelAbiSchema::CompositionWaveV2)
+            );
+            let program_identity = emitted.program_identity.unwrap();
+            assert_ne!(program_identity, [0; 32]);
             CompositionWaveKernelPlan {
                 evaluation_log_size,
                 parts: identities,
                 kernel_name: emitted.kernel_name,
                 cache_key: emitted.cache_key,
                 semantic_hash: emitted.semantic_hash,
+                program_identity,
                 source: emitted.source,
             }
         })

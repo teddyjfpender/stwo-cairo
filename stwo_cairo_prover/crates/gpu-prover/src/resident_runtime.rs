@@ -4001,7 +4001,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         let capture = capture_with_cursor_rollback(cursor, |cursor| {
             workspace.capture_segment(GraphSegment::CompositionQuotientCommit, |arena| {
                 composition
-                    .launch()
+                    .launch_capture_safe()
                     .map_err(ResidentLaunchError::Composition)?;
                 commitment.launch()?;
                 enqueue_copy_words(arena, root_source, root_destination, 8)?;
