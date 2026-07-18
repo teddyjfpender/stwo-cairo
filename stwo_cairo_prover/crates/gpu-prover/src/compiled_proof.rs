@@ -8,6 +8,7 @@
 use crate::proof_bundle::ResidentProofBundleLayout;
 use crate::transcript_plan::{CairoBlake2sTranscriptPlan, CairoTranscriptSegment};
 
+mod carry_forward;
 mod effect;
 mod finalizer;
 mod identity;
@@ -18,6 +19,7 @@ mod static_wrapper;
 mod structural_authority;
 mod validate;
 
+pub(crate) use carry_forward::exact_partial_atomic_carry_forward;
 pub use effect::*;
 pub use finalizer::*;
 #[cfg(test)]

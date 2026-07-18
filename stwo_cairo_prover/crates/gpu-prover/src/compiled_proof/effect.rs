@@ -96,9 +96,10 @@ pub struct InPlaceAliasAuthority {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AtomicOperation {
-    /// Exact wrapping CUDA `atomicAdd` on one `u32` element. Deterministic
-    /// canonical reduction still requires explicit partial versions + merge
-    /// operations; this authority only describes the audited memory effect.
+    /// Exact wrapping CUDA `atomicAdd` on one `u32` element. A strict prefix
+    /// may carry its untouched source suffix only through the audited
+    /// required-alias predicate; every other partial write needs an explicit
+    /// merge operation.
     AddU32,
 }
 

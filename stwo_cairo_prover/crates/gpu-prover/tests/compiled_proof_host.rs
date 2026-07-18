@@ -14,6 +14,8 @@ use stwo_cairo_gpu_prover::transcript_plan::{
 mod fixture;
 #[path = "compiled_proof_host/ordered_composite.rs"]
 mod ordered_composite;
+#[path = "compiled_proof_host/partial_atomic.rs"]
+mod partial_atomic;
 #[path = "compiled_proof_host/partition_authority.rs"]
 mod partition_authority;
 #[path = "compiled_proof_host/primitive.rs"]

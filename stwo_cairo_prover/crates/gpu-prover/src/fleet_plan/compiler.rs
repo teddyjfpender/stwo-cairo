@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use super::*;
 use crate::compiled_proof::{
-    CompiledProof, ExecutionPrimitive, InPlaceAliasId, InPlaceAliasRequirement, OpId, OpNode,
-    PartitionAuthorityKind, ProofStage, Region, ValueOrigin, ValueRange, ValueVersion,
+    exact_partial_atomic_carry_forward, CompiledProof, ExecutionPrimitive, InPlaceAliasId,
+    InPlaceAliasRequirement, OpId, OpNode, PartitionAuthorityKind, ProofStage, Region, ValueOrigin,
+    ValueRange, ValueVersion,
 };
 use crate::fleet_pow::{FleetPowError, FleetPowSchedule};
 use crate::shape_executable::ShapeExecutableIdentity;
@@ -213,17 +214,20 @@ fn compile_storage(
         operations,
     )?;
     let required_aliases = compile_required_aliases(compiled, &owners, operations)?;
+    let alias_components = compile_alias_components(compiled.values().len(), &required_aliases)?;
 
     let mut storages = Vec::new();
     let mut bindings = Vec::new();
     let mut value_storages = vec![None; compiled.values().len()];
+    let mut component_storages = vec![None; required_aliases.len()];
     for value in compiled
         .values()
         .iter()
         .filter(|value| value.region != Region::Output)
     {
         let value_index = value.version.0 as usize;
-        let id = match value_storages[value_index] {
+        let component = alias_components[value_index];
+        let id = match component.and_then(|component| component_storages[component]) {
             Some(id) => id,
             None => {
                 let id = next_storage_id(storages.len())?;
@@ -236,17 +240,13 @@ fn compile_storage(
                         .map_err(|_| FleetCompileError::SizeOverflow)?,
                     alignment_bytes: value.alignment,
                 });
-                value_storages[value_index] = Some(id);
-                if let Some(alias) = required_aliases.iter().find(|alias| {
-                    alias.source.version == value.version
-                        || alias.destination.version == value.version
-                }) {
-                    value_storages[alias.source.version.0 as usize] = Some(id);
-                    value_storages[alias.destination.version.0 as usize] = Some(id);
+                if let Some(component) = component {
+                    component_storages[component] = Some(id);
                 }
                 id
             }
         };
+        value_storages[value_index] = Some(id);
         bindings.push(FleetStoragePlacement {
             storage: id,
             value: ValueRange {
@@ -267,7 +267,19 @@ fn compile_storage(
                     .copied()
                     .flatten()
                     .ok_or(FleetCompileError::InvalidSemanticSchedule)?,
-                offset_bytes: 0,
+                offset_bytes: alias
+                    .source
+                    .elements
+                    .start
+                    .checked_mul(
+                        compiled
+                            .value(alias.source.version)
+                            .ok_or(FleetCompileError::InvalidSemanticSchedule)?
+                            .layout
+                            .element
+                            .bytes,
+                    )
+                    .ok_or(FleetCompileError::SizeOverflow)?,
             })
         })
         .collect::<Result<Vec<_>, FleetCompileError>>()?;
@@ -395,7 +407,6 @@ fn compile_required_aliases(
     operations: &[FleetOperationPlacement],
 ) -> Result<Vec<RequiredAlias>, FleetCompileError> {
     let mut aliases = Vec::new();
-    let mut aliased_versions = Vec::new();
     for operation in compiled.operations() {
         let effect = compiled
             .effect_for(operation.id)
@@ -416,6 +427,10 @@ fn compile_required_aliases(
             let destination = access.destination().ok_or_else(invalid)?.value;
             let source_value = compiled.value(source.version).ok_or_else(invalid)?;
             let destination_value = compiled.value(destination.version).ok_or_else(invalid)?;
+            let whole_value = source.elements == full_range(source_value)?
+                && destination.elements == full_range(destination_value)?;
+            let exact_carried_prefix =
+                exact_partial_atomic_carry_forward(compiled.values(), access).is_some();
             if matches!(
                 &operation.primitive,
                 ExecutionPrimitive::OrderedComposite { .. }
@@ -425,8 +440,7 @@ fn compile_required_aliases(
                     domain: OperationDomain::Monolithic,
                     ..
                 }]
-            ) || source.elements != full_range(source_value)?
-                || destination.elements != full_range(destination_value)?
+            ) || !(whole_value || exact_carried_prefix)
                 || source_value.layout != destination_value.layout
                 || source_value.alignment != destination_value.alignment
                 || source_value.region == Region::FixedData
@@ -435,8 +449,6 @@ fn compile_required_aliases(
                 || destination_value.region == Region::Output
                 || matches!(source_value.origin, ValueOrigin::Constant(_))
                 || matches!(destination_value.origin, ValueOrigin::Constant(_))
-                || aliased_versions.contains(&source.version)
-                || aliased_versions.contains(&destination.version)
                 || effect
                     .accesses()
                     .iter()
@@ -457,7 +469,6 @@ fn compile_required_aliases(
             {
                 return Err(invalid());
             }
-            aliased_versions.extend([source.version, destination.version]);
             aliases.push(RequiredAlias {
                 operation: operation.id,
                 alias: authority.id,
@@ -467,6 +478,68 @@ fn compile_required_aliases(
         }
     }
     Ok(aliases)
+}
+
+fn compile_alias_components(
+    value_count: usize,
+    aliases: &[RequiredAlias],
+) -> Result<Vec<Option<usize>>, FleetCompileError> {
+    let mut incoming = vec![None; value_count];
+    let mut outgoing = vec![None; value_count];
+    for (edge, alias) in aliases.iter().enumerate() {
+        let source = alias.source.version.0 as usize;
+        let destination = alias.destination.version.0 as usize;
+        if source >= value_count
+            || destination >= value_count
+            || outgoing[source].replace(edge).is_some()
+            || incoming[destination].replace(edge).is_some()
+        {
+            return Err(required_alias_error(alias));
+        }
+    }
+
+    let mut components = vec![None; value_count];
+    let mut visited = vec![false; aliases.len()];
+    let mut component = 0usize;
+    for root in 0..value_count {
+        if incoming[root].is_some() || outgoing[root].is_none() {
+            continue;
+        }
+        let mut version = root;
+        loop {
+            if components[version].replace(component).is_some() {
+                let edge = outgoing[version]
+                    .or(incoming[version])
+                    .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+                return Err(required_alias_error(&aliases[edge]));
+            }
+            let Some(edge) = outgoing[version] else {
+                break;
+            };
+            if visited[edge] {
+                return Err(required_alias_error(&aliases[edge]));
+            }
+            visited[edge] = true;
+            version = aliases[edge].destination.version.0 as usize;
+            if incoming[version] != Some(edge) {
+                return Err(required_alias_error(&aliases[edge]));
+            }
+        }
+        component = component
+            .checked_add(1)
+            .ok_or(FleetCompileError::SizeOverflow)?;
+    }
+    if let Some((edge, _)) = visited.iter().enumerate().find(|(_, visited)| !**visited) {
+        return Err(required_alias_error(&aliases[edge]));
+    }
+    Ok(components)
+}
+
+fn required_alias_error(alias: &RequiredAlias) -> FleetCompileError {
+    FleetCompileError::RequiredAlias {
+        operation: alias.operation,
+        alias: alias.alias,
+    }
 }
 
 fn reject_required_aliases(compiled: &CompiledProof) -> Result<(), FleetCompileError> {

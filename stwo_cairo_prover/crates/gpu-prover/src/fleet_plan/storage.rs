@@ -209,8 +209,9 @@ fn validate_alias(
     let storage = storages
         .get(&alias.storage)
         .ok_or(FleetPlanError::InvalidStorage(alias.storage))?;
-    let source_binding = exact_binding(plan, alias.storage, source)?;
-    let destination_binding = exact_binding(plan, alias.storage, destination)?;
+    let (source_binding, source_offset) = full_binding_offset(plan, alias.storage, source)?;
+    let (destination_binding, destination_offset) =
+        full_binding_offset(plan, alias.storage, destination)?;
     let source_bytes = range_bytes(value(plan, source.version)?, source.elements)?;
     let destination_bytes = range_bytes(value(plan, destination.version)?, destination.elements)?;
     let source_live = binding_live(plan, source_binding)?;
@@ -218,8 +219,8 @@ fn validate_alias(
     if source.version == destination.version
         || source_bytes != destination_bytes
         || storage.worker != operation_worker
-        || source_binding.offset_bytes != alias.offset_bytes
-        || destination_binding.offset_bytes != alias.offset_bytes
+        || source_offset != alias.offset_bytes
+        || destination_offset != alias.offset_bytes
         || source_live.end != operation_placement.during.end
         || destination_live.start != operation_placement.during.start
         || has_concurrent_source_consumer(plan, operation.id, source, operation_placement)?
@@ -426,34 +427,66 @@ fn alias_matches_pair(
                    destination_binding: &FleetStoragePlacement| {
         alias.storage == source_binding.storage
             && source_binding.storage == destination_binding.storage
-            && source_binding.value == source.value
-            && destination_binding.value == destination.value
-            && source_binding.offset_bytes == alias.offset_bytes
-            && destination_binding.offset_bytes == alias.offset_bytes
+            && source_binding.value.version == source.value.version
+            && destination_binding.value.version == destination.value.version
+            && source_binding.offset_bytes == destination_binding.offset_bytes
+            && is_full_binding(plan, source_binding)
+            && is_full_binding(plan, destination_binding)
     };
     matches(left, right) || matches(right, left)
 }
 
-fn exact_binding(
+fn full_binding_offset(
     plan: &FleetProofPlan,
     storage: StorageId,
-    value: ValueRange,
-) -> Result<&FleetStoragePlacement, FleetPlanError> {
-    let mut matches = plan
-        .placement
-        .storage_bindings
-        .iter()
-        .filter(|binding| binding.storage == storage && binding.value == value);
+    target: ValueRange,
+) -> Result<(&FleetStoragePlacement, usize), FleetPlanError> {
+    let value = value(plan, target.version)?;
+    let full = ElementRange::new(
+        0,
+        value
+            .layout
+            .element_count()
+            .map_err(|_| FleetPlanError::SizeOverflow)?,
+    )
+    .ok_or(FleetPlanError::InvalidRange(target.version))?;
+    if !full.contains(target.elements) {
+        return Err(FleetPlanError::InvalidRange(target.version));
+    }
+    let mut matches = plan.placement.storage_bindings.iter().filter(|binding| {
+        binding.storage == storage
+            && binding.value.version == target.version
+            && binding.value.elements == full
+    });
     let binding = matches
         .next()
         .ok_or(FleetPlanError::InvalidStorageBinding {
-            value: value.version,
+            value: target.version,
             storage,
         })?;
     if matches.next().is_some() {
         return Err(invalid_binding(binding));
     }
-    Ok(binding)
+    let offset = target
+        .elements
+        .start
+        .checked_mul(value.layout.element.bytes)
+        .and_then(|relative| binding.offset_bytes.checked_add(relative))
+        .ok_or(FleetPlanError::SizeOverflow)?;
+    Ok((binding, offset))
+}
+
+fn is_full_binding(plan: &FleetProofPlan, binding: &FleetStoragePlacement) -> bool {
+    plan.compiled
+        .value(binding.value.version)
+        .is_some_and(|value| {
+            value
+                .layout
+                .element_count()
+                .ok()
+                .and_then(|words| ElementRange::new(0, words))
+                == Some(binding.value.elements)
+        })
 }
 
 pub(super) fn binding_live(

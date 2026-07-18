@@ -1,10 +1,8 @@
 use stwo_backend_cuda::{TranscriptInputId, TranscriptOperation, TranscriptOutputId};
 
 use super::super::*;
-use super::{
-    local_read_union_available, one_affine_storage_covers, operation_placement, owner_ready_at,
-    replica_ready_at,
-};
+use super::effect_locations::{local_read_union_available, one_affine_storage_covers};
+use super::{operation_placement, owner_ready_at, replica_ready_at};
 use crate::compiled_proof::ValueRange;
 use crate::transcript_plan::CairoBlake2sTranscriptPlan;
 

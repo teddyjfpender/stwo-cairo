@@ -30,6 +30,7 @@ mod ipc_rank_install;
 mod operation_execution;
 mod operation_reads;
 mod pow;
+mod rc99_alias;
 mod runtime_view;
 mod spill;
 mod storage_contract;

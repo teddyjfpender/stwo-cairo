@@ -320,7 +320,7 @@ fn validate_operations(
             }
         }
     }
-    validate_write_coverage(input, &mut writes)
+    super::carry_forward::validate_write_coverage(input, &mut writes)
 }
 
 fn validate_source(
@@ -357,49 +357,6 @@ fn validate_source(
             Ok(())
         }
     }
-}
-
-fn validate_write_coverage(
-    input: &CompiledProofInput,
-    writes: &mut [Vec<(OpId, ElementRange)>],
-) -> Result<(), CompiledProofError> {
-    for value in &input.values {
-        let ranges = &mut writes[value.version.0 as usize];
-        let ValueOrigin::OpOutput(producer) = value.origin else {
-            if !ranges.is_empty() {
-                return Err(CompiledProofError::ProducerMismatch {
-                    value: value.version,
-                });
-            }
-            continue;
-        };
-        if ranges.iter().any(|(writer, _)| *writer != producer) {
-            return Err(CompiledProofError::ProducerMismatch {
-                value: value.version,
-            });
-        }
-        ranges.sort_unstable_by_key(|(_, range)| (range.start, range.end));
-        let mut cursor = 0;
-        for &(_, range) in ranges.iter() {
-            if range.start < cursor {
-                return Err(CompiledProofError::OverlappingWrite {
-                    value: value.version,
-                });
-            }
-            if range.start != cursor {
-                return Err(CompiledProofError::IncompleteWrite {
-                    value: value.version,
-                });
-            }
-            cursor = range.end;
-        }
-        if cursor != value.layout.element_count()? {
-            return Err(CompiledProofError::IncompleteWrite {
-                value: value.version,
-            });
-        }
-    }
-    Ok(())
 }
 
 fn validate_transcript(
