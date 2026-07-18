@@ -342,6 +342,15 @@ fn validate_causal_value_closure(
     effects: &[EffectContract],
     operations: &[OpNode],
 ) -> Result<BTreeSet<ValueVersion>, ()> {
+    validate_causal_value_closure_with_sources(values, effects, operations, &BTreeSet::new())
+}
+
+fn validate_causal_value_closure_with_sources(
+    values: &adapter::SemanticValueMap,
+    effects: &[EffectContract],
+    operations: &[OpNode],
+    structural_sources: &BTreeSet<ValueVersion>,
+) -> Result<BTreeSet<ValueVersion>, ()> {
     let (catalog_first, transitions, fixed) = values.allocation_classes();
     let allocated = catalog_first
         .iter()
@@ -386,6 +395,12 @@ fn validate_causal_value_closure(
                 sources.push((operation_index, source.value.version));
             }
         }
+    }
+    for &source in structural_sources {
+        if !allocated.contains(&source) {
+            return Err(());
+        }
+        sources.push((operations.len(), source));
     }
     if transitions
         .iter()
@@ -631,6 +646,24 @@ fn push_operation(
     monolithic: &PartitionAuthority,
     operations: &mut Vec<OpNode>,
 ) -> Result<(), CompiledWitnessWriterPrefixError> {
+    push_operation_at_stage(
+        primitive,
+        invocation,
+        effect,
+        monolithic,
+        ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase),
+        operations,
+    )
+}
+
+fn push_operation_at_stage(
+    primitive: ExecutionPrimitive,
+    invocation: Option<AotInvocation>,
+    effect: EffectContractId,
+    monolithic: &PartitionAuthority,
+    stage: ProofStage,
+    operations: &mut Vec<OpNode>,
+) -> Result<(), CompiledWitnessWriterPrefixError> {
     let ordinal =
         u32::try_from(operations.len()).map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
     operations.push(OpNode {
@@ -644,7 +677,7 @@ fn push_operation(
         invocation,
         effect,
         partition: monolithic.id(),
-        stage: ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase),
+        stage,
     });
     Ok(())
 }

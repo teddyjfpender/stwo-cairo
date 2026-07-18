@@ -2,7 +2,8 @@ use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTra
 
 use super::*;
 use crate::compiled_proof::{
-    LaunchGeometry, ProofStage, StaticCudaLaunchIdentity, StaticCudaWrapperAuthority,
+    ExecutionPrimitive, LaunchGeometry, ProofStage, StaticCudaLaunchIdentity,
+    StaticCudaWrapperAuthority,
 };
 use crate::program_image::lower_compiled::compiled_base_prefix::{
     emit_recorded_witness_writer_prefix_for_test, CompiledWitnessWriterPrefix,
@@ -13,6 +14,8 @@ use crate::program_image::lower_compiled::compiled_base_prefix_tests::{
 use crate::transcript_plan::CairoTranscriptSegment;
 
 mod base_commit;
+mod interaction_stage;
+mod relation_stage;
 
 #[test]
 fn generated_sn2_releases_the_exact_bootstrap_transcript_after_base() {
@@ -22,6 +25,30 @@ fn generated_sn2_releases_the_exact_bootstrap_transcript_after_base() {
     let operations = builder.prefix.operations.clone();
     let effects = builder.prefix.effects.clone();
     let wrappers = builder.prefix.static_wrappers.clone();
+    let roots = builder.prefix.causal_external_roots.clone().unwrap();
+
+    builder
+        .append_bootstrap_root_stage(executable.arena(), executable.transcript())
+        .unwrap();
+    assert!(builder.has_complete_bootstrap_root_stage());
+    assert_eq!(
+        builder.prefix.values.entries().count(),
+        values.entries().count() + 3
+    );
+    assert_eq!(builder.prefix.operations.len(), operations.len() + 2);
+    assert_eq!(builder.prefix.effects.len(), effects.len() + 2);
+    assert_eq!(builder.prefix.static_wrappers, wrappers);
+    assert_eq!(
+        builder.prefix.causal_external_roots.as_ref().unwrap().len(),
+        roots.len() + 1
+    );
+    assert!(builder.prefix.operations[operations.len()..]
+        .iter()
+        .all(|operation| {
+            operation.primitive == ExecutionPrimitive::DeviceCopyD2D { bytes: 32 }
+                && operation.stage
+                    == ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase)
+        }));
 
     builder
         .append_bootstrap_transcript(executable.arena(), executable.transcript())
@@ -36,9 +63,28 @@ fn generated_sn2_releases_the_exact_bootstrap_transcript_after_base() {
     assert_eq!(lowered.operation_range(), &(0..11));
     assert_eq!(lowered.inputs().len(), 11);
     assert!(lowered.outputs().is_empty());
-    assert_eq!(builder.prefix.values, values);
-    assert_eq!(builder.prefix.operations, operations);
-    assert_eq!(builder.prefix.effects, effects);
+    assert_eq!(
+        builder.prefix.values.entries().count(),
+        values.entries().count() + 12
+    );
+    for semantic in crate::transcript_plan::CAIRO_STATIC_TRANSCRIPT_INPUTS {
+        let id = semantic.id().unwrap();
+        let logical = executable
+            .arena()
+            .transcript()
+            .inputs
+            .iter()
+            .find_map(|(candidate, binding)| (*candidate == id).then_some(binding.logical))
+            .unwrap();
+        let catalog = crate::program_image::ArenaCatalogValueId(logical.0);
+        assert!(values.version(catalog).is_err());
+        assert!(builder.prefix.values.version(catalog).is_ok());
+    }
+    assert_eq!(
+        builder.prefix.causal_external_roots.as_ref().unwrap().len(),
+        roots.len() + 10
+    );
+    assert_eq!(&builder.prefix.operations[..operations.len()], operations);
     assert_eq!(builder.prefix.static_wrappers, wrappers);
     assert_eq!(
         builder.append_bootstrap_transcript(executable.arena(), executable.transcript()),
@@ -58,6 +104,41 @@ fn bootstrap_release_rejects_missing_or_tampered_base_transactionally() {
     assert_eq!(missing.prefix.values, values);
     assert!(missing.bootstrap_transcript.is_none());
 
+    let mut missing_root = base_commit::ready_post_base(executable.arena());
+    missing_root
+        .append_bootstrap_root_stage(executable.arena(), executable.transcript())
+        .unwrap();
+    let base_roots = missing_root
+        .base_commit
+        .as_ref()
+        .unwrap()
+        .causal_roots
+        .as_ref()
+        .unwrap();
+    let prepared_root = *missing_root
+        .prefix
+        .causal_external_roots
+        .as_ref()
+        .unwrap()
+        .difference(base_roots)
+        .next()
+        .unwrap();
+    missing_root
+        .prefix
+        .causal_external_roots
+        .as_mut()
+        .unwrap()
+        .remove(&prepared_root);
+    let values = missing_root.prefix.values.clone();
+    let operations = missing_root.prefix.operations.clone();
+    assert_eq!(
+        missing_root.append_bootstrap_transcript(executable.arena(), executable.transcript()),
+        Err(CompiledBaseDagAppendError::Lowering)
+    );
+    assert_eq!(missing_root.prefix.values, values);
+    assert_eq!(missing_root.prefix.operations, operations);
+    assert!(missing_root.bootstrap_transcript.is_none());
+
     let mut tampered = base_commit::ready_post_base(executable.arena());
     tampered
         .base_commit
@@ -68,10 +149,11 @@ fn bootstrap_release_rejects_missing_or_tampered_base_transactionally() {
         .unwrap()[0] ^= 1;
     let values = tampered.prefix.values.clone();
     assert_eq!(
-        tampered.append_bootstrap_transcript(executable.arena(), executable.transcript()),
+        tampered.append_bootstrap_root_stage(executable.arena(), executable.transcript()),
         Err(CompiledBaseDagAppendError::Lowering)
     );
     assert_eq!(tampered.prefix.values, values);
+    assert!(tampered.bootstrap_roots.is_none());
     assert!(tampered.bootstrap_transcript.is_none());
 }
 

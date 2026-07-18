@@ -11,10 +11,11 @@ use stwo_backend_cuda::MemoryBaseTraceStepKind;
 use super::super::producer_prefix::BaseProducerAuthority;
 use super::super::{
     adapter, base_commit_projection, fixed_table_materialization, memory_base_trace,
-    InvocationShapeError,
+    relation_projection, InvocationShapeError,
 };
 use super::{
-    emission, insert_effect, push_operation, validate_causal_value_closure, wrapper_id,
+    emission, insert_effect, push_operation, push_operation_at_stage,
+    validate_causal_value_closure, validate_causal_value_closure_with_sources, wrapper_id,
     CompiledWitnessWriterPrefix,
 };
 use crate::arena_plan::ProofArenaPlan;
@@ -23,6 +24,9 @@ use crate::compiled_proof::{
     StaticCudaWrapperAuthority, StaticCudaWrapperId, ValueVersion,
 };
 
+mod bootstrap_roots;
+mod interaction;
+mod relation;
 mod transcript;
 mod validation;
 
@@ -78,6 +82,12 @@ pub(super) enum CompiledBaseDagAppendError {
     MissingBaseCommitStaticWrapper {
         operation_ordinal: u32,
     },
+    MissingRelationStaticWrapper {
+        operation_ordinal: u32,
+    },
+    MissingInteractionCommitStaticWrapper {
+        operation_ordinal: u32,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -98,6 +108,9 @@ struct SealedBaseCommit {
     before: adapter::SemanticValueMap,
     lowered: base_commit_projection::LoweredBaseCommit,
     external_roots: BTreeSet<ValueVersion>,
+    causal_roots: Option<BTreeSet<ValueVersion>>,
+    operation_count: Option<usize>,
+    wrapper_count: Option<usize>,
     checkpoint_digest: Option<[u8; 32]>,
     emitted: bool,
 }
@@ -108,7 +121,11 @@ pub(super) struct CompiledBaseDagBuilder {
     memory: Option<SealedMemoryBaseTrace>,
     fixed_tables: Option<SealedFixedTables>,
     base_commit: Option<SealedBaseCommit>,
-    bootstrap_transcript: Option<transcript::SealedBootstrapTranscript>,
+    bootstrap_roots: Option<bootstrap_roots::SealedBootstrapRoots>,
+    bootstrap_transcript: Option<transcript::SealedTranscriptSegment>,
+    interaction_transcript: Option<transcript::SealedTranscriptSegment>,
+    relation: Option<relation::SealedRelation>,
+    interaction_stage: Option<interaction::SealedInteractionStage>,
 }
 
 impl CompiledBaseDagBuilder {
@@ -145,7 +162,11 @@ impl CompiledBaseDagBuilder {
             memory: None,
             fixed_tables: None,
             base_commit: None,
+            bootstrap_roots: None,
             bootstrap_transcript: None,
+            interaction_transcript: None,
+            relation: None,
+            interaction_stage: None,
         })
     }
 
@@ -444,6 +465,9 @@ impl CompiledBaseDagBuilder {
             before,
             lowered,
             external_roots,
+            causal_roots: None,
+            operation_count: None,
+            wrapper_count: None,
             checkpoint_digest: None,
             emitted: false,
         });
@@ -572,6 +596,9 @@ impl CompiledBaseDagBuilder {
             .base_commit
             .as_mut()
             .ok_or(CompiledBaseDagAppendError::InvalidStage)?;
+        base.causal_roots = Some(roots.clone());
+        base.operation_count = Some(operations.len());
+        base.wrapper_count = Some(static_wrappers.len());
         base.checkpoint_digest = Some(checkpoint_digest);
         base.emitted = true;
         self.prefix.static_wrappers = static_wrappers;
@@ -582,9 +609,13 @@ impl CompiledBaseDagBuilder {
     }
 
     pub(super) fn has_complete_base_commit_stage(&self) -> bool {
-        self.base_commit
-            .as_ref()
-            .is_some_and(|base| base.emitted && base.checkpoint_digest.is_some())
+        self.base_commit.as_ref().is_some_and(|base| {
+            base.emitted
+                && base.causal_roots.is_some()
+                && base.operation_count.is_some()
+                && base.wrapper_count.is_some()
+                && base.checkpoint_digest.is_some()
+        })
     }
 
     fn validate_arena_authority(
