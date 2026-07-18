@@ -483,6 +483,30 @@ fn validate_invocation(
                     }
                 }
             }
+            AotArgumentValue::DeviceRecordPointerGraphValue { root, records } => {
+                if records.is_empty() {
+                    return Err(invalid());
+                }
+                insert(*root)?;
+                for record in records {
+                    if record.fields.is_empty() {
+                        return Err(invalid());
+                    }
+                    for field in &record.fields {
+                        for &binding in field.entries.iter().flatten() {
+                            insert(binding)?;
+                        }
+                    }
+                }
+            }
+            AotArgumentValue::DevicePointerRangeSetValue { ranges } => {
+                if ranges.is_empty() {
+                    return Err(invalid());
+                }
+                for &binding in ranges {
+                    insert(binding)?;
+                }
+            }
             AotArgumentValue::HostFixedU32(words) => {
                 if words.is_empty() {
                     return Err(invalid());

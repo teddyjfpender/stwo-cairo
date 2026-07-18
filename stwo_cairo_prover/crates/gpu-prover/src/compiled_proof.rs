@@ -213,6 +213,20 @@ pub enum AotArgumentValue {
     DeviceNestedPointerTableValue {
         entries: Vec<DevicePointerTableBinding>,
     },
+    /// Device-resident records containing scalar fields and embedded pointers.
+    ///
+    /// `root` binds the record bytes passed to the kernel. `records` preserves
+    /// record order, pointer-field order, nulls, and every transitive leaf.
+    /// Address bytes remain runtime relocation metadata.
+    DeviceRecordPointerGraphValue {
+        root: EffectBindingId,
+        records: Vec<DeviceRecordPointerBinding>,
+    },
+    /// One direct device pointer whose primitive-owned program reaches several
+    /// exact semantic ranges from the same base address.
+    DevicePointerRangeSetValue {
+        ranges: Vec<EffectBindingId>,
+    },
     /// Immutable host u32 words copied by value into a wrapper's kernel
     /// parameter. They have identity but no device value or effect binding.
     HostFixedU32(Vec<u32>),
@@ -237,6 +251,22 @@ pub enum AotArgumentValue {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DevicePointerTableBinding {
     pub entries: Vec<Option<EffectBindingId>>,
+}
+
+/// One pointer-bearing field in an element of a device-resident record table.
+///
+/// The field may be a direct pointer (`entries.len() == 1`) or an ordered
+/// pointer table. Empty fields are retained because record field position is
+/// semantic even when a generated program does not dereference that field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceRecordPointerFieldBinding {
+    pub entries: Vec<Option<EffectBindingId>>,
+}
+
+/// Exact transitive pointer leaves reached from one device-resident record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceRecordPointerBinding {
+    pub fields: Vec<DeviceRecordPointerFieldBinding>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

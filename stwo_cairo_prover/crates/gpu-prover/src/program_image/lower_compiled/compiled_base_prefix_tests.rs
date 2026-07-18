@@ -994,6 +994,17 @@ fn assert_invocation_covers_exact_bindings(
                 .iter()
                 .flat_map(|entry| entry.entries.iter().flatten().copied())
                 .collect(),
+            AotArgumentValue::DeviceRecordPointerGraphValue { root, records } => {
+                std::iter::once(*root)
+                    .chain(records.iter().flat_map(|record| {
+                        record
+                            .fields
+                            .iter()
+                            .flat_map(|field| field.entries.iter().flatten().copied())
+                    }))
+                    .collect()
+            }
+            AotArgumentValue::DevicePointerRangeSetValue { ranges } => ranges.clone(),
             AotArgumentValue::HostFixedU32(_) => Vec::new(),
             AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_) => Vec::new(),
             AotArgumentValue::DeviceMixedFixedSourcePointerTable(entries) => entries

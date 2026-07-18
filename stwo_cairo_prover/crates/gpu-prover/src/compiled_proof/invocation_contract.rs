@@ -103,6 +103,27 @@ pub(crate) fn encode_invocation_payload(
                     out.extend_from_slice(&word.to_le_bytes());
                 }
             }
+            AotArgumentValue::DeviceRecordPointerGraphValue { root, records } => {
+                out.push(10);
+                out.extend_from_slice(&root.0.to_le_bytes());
+                push_size(out, records.len())?;
+                for record in records {
+                    push_size(out, record.fields.len())?;
+                    for field in &record.fields {
+                        push_size(out, field.entries.len())?;
+                        for &entry in &field.entries {
+                            encode_binding(out, entry);
+                        }
+                    }
+                }
+            }
+            AotArgumentValue::DevicePointerRangeSetValue { ranges } => {
+                out.push(11);
+                push_size(out, ranges.len())?;
+                for binding in ranges {
+                    out.extend_from_slice(&binding.0.to_le_bytes());
+                }
+            }
         }
     }
     Ok(())
@@ -273,6 +294,64 @@ mod tests {
         ] {
             assert_ne!(exact.contract_id().unwrap(), changed.contract_id().unwrap());
         }
+    }
+
+    #[test]
+    fn digest_binds_record_graph_root_shape_and_range_set_order() {
+        fn field<const N: usize>(leaves: [Option<u32>; N]) -> DeviceRecordPointerFieldBinding {
+            DeviceRecordPointerFieldBinding {
+                entries: leaves
+                    .into_iter()
+                    .map(|leaf| leaf.map(EffectBindingId))
+                    .collect(),
+            }
+        }
+        fn record<const N: usize>(
+            fields: [DeviceRecordPointerFieldBinding; N],
+        ) -> DeviceRecordPointerBinding {
+            DeviceRecordPointerBinding {
+                fields: fields.into(),
+            }
+        }
+
+        let exact = invocation(AotArgumentValue::DeviceRecordPointerGraphValue {
+            root: EffectBindingId(0),
+            records: vec![
+                record([field([Some(1), None]), field([Some(2)])]),
+                record([field([Some(3)]), field([Some(4)])]),
+            ],
+        });
+        for changed in [
+            invocation(AotArgumentValue::DeviceRecordPointerGraphValue {
+                root: EffectBindingId(5),
+                records: vec![
+                    record([field([Some(1), None]), field([Some(2)])]),
+                    record([field([Some(3)]), field([Some(4)])]),
+                ],
+            }),
+            invocation(AotArgumentValue::DeviceRecordPointerGraphValue {
+                root: EffectBindingId(0),
+                records: vec![
+                    record([field([Some(2)]), field([Some(1), None])]),
+                    record([field([Some(3)]), field([Some(4)])]),
+                ],
+            }),
+        ] {
+            assert_ne!(exact.contract_id().unwrap(), changed.contract_id().unwrap());
+        }
+
+        assert_ne!(
+            invocation(AotArgumentValue::DevicePointerRangeSetValue {
+                ranges: vec![EffectBindingId(0), EffectBindingId(1)],
+            })
+            .contract_id()
+            .unwrap(),
+            invocation(AotArgumentValue::DevicePointerRangeSetValue {
+                ranges: vec![EffectBindingId(1), EffectBindingId(0)],
+            })
+            .contract_id()
+            .unwrap()
+        );
     }
 
     #[test]

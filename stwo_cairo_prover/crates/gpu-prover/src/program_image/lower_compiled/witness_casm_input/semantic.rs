@@ -300,6 +300,8 @@ pub(super) fn validate_exact_bindings(
             | AotArgumentValue::DevicePointerTable(_)
             | AotArgumentValue::DevicePointerTableValue(_)
             | AotArgumentValue::DeviceNestedPointerTableValue { .. }
+            | AotArgumentValue::DeviceRecordPointerGraphValue { .. }
+            | AotArgumentValue::DevicePointerRangeSetValue { .. }
             | AotArgumentValue::HostFixedU32(_)
             | AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_)
             | AotArgumentValue::DeviceMixedFixedSourcePointerTable(_)

@@ -381,7 +381,9 @@ fn validate_exact_bindings(invocation: &AotInvocation, effect: &EffectContract) 
             }
             AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_)
             | AotArgumentValue::DeviceMixedFixedSourcePointerTable(_)
-            | AotArgumentValue::DeviceFixedU32 { .. } => return Err(()),
+            | AotArgumentValue::DeviceFixedU32 { .. }
+            | AotArgumentValue::DeviceRecordPointerGraphValue { .. }
+            | AotArgumentValue::DevicePointerRangeSetValue { .. } => return Err(()),
         }
     }
     (actual == expected).then_some(()).ok_or(())
