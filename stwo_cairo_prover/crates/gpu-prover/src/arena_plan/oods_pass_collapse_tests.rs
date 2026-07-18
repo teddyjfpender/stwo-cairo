@@ -25,6 +25,13 @@ fn replacement_selects_exact_program_and_legacy_never_does() {
         Some(&selected),
     )
     .unwrap();
+    let cached = BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble).unwrap();
+    let scratch = BufferLifetime::at(ProofEpoch::Oods);
+    assert_eq!(
+        oods_barycentric_scales_lifetime(Some(&selected), cached, scratch),
+        cached,
+        "collapsed descriptor offsets must survive every captured replay"
+    );
 
     assert!(
         select_oods_pass_collapse(ResidentBackend::LegacyResident, config(), &columns)
@@ -38,6 +45,11 @@ fn replacement_selects_exact_program_and_legacy_never_does() {
         None,
     )
     .unwrap();
+    assert_eq!(
+        oods_barycentric_scales_lifetime(None, cached, scratch),
+        scratch,
+        "ordinary OODS keeps barycentric scales as epoch-local scratch"
+    );
 }
 
 #[test]

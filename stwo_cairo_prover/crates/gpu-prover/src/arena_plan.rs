@@ -3596,6 +3596,18 @@ fn select_oods_pass_collapse(
     }
 }
 
+fn oods_barycentric_scales_lifetime(
+    pass_collapse: Option<&OodsPassCollapseProgram>,
+    descriptor: BufferLifetime,
+    scratch: BufferLifetime,
+) -> BufferLifetime {
+    if pass_collapse.is_some() {
+        descriptor
+    } else {
+        scratch
+    }
+}
+
 pub(crate) fn validate_oods_pass_collapse_selection(
     resident_backend: ResidentBackend,
     config: OodsWorkspaceConfig,
@@ -9033,7 +9045,7 @@ fn append_protocol_buffers(
         BufferPurpose::OodsBarycentricScales,
         0,
         oods_runtime_requirements.barycentric_scale_words,
-        oods_live,
+        oods_barycentric_scales_lifetime(oods_pass_collapse.as_ref(), oods_descriptor, oods_live),
     )?;
     let oods_barycentric_partials = oods_slot(
         BufferPurpose::OodsBarycentricPartials,
