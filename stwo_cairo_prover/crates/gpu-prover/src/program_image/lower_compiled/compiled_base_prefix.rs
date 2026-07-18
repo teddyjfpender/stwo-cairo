@@ -28,6 +28,9 @@ use crate::transcript_plan::CairoTranscriptSegment;
 
 mod builder;
 pub(super) mod emission;
+pub(super) mod execution;
+#[cfg(test)]
+mod execution_tests;
 #[cfg(test)]
 mod module_global_tests;
 pub(super) mod module_globals;
