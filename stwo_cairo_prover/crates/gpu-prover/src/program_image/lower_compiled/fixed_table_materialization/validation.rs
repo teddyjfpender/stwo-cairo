@@ -239,6 +239,9 @@ fn invocation_matches_effect(
                 })
             }
             AotArgumentValue::DeviceFixedU32 { binding, .. } => insert(*binding),
+            AotArgumentValue::DevicePointerTableValue(_)
+            | AotArgumentValue::DeviceNestedPointerTableValue { .. }
+            | AotArgumentValue::HostFixedU32(_) => false,
         };
         if !unique {
             return Ok(false);

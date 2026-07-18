@@ -348,6 +348,9 @@ fn validate_exact_bindings(
             }
             AotArgumentValue::DevicePointer(None)
             | AotArgumentValue::DevicePointerTable(_)
+            | AotArgumentValue::DevicePointerTableValue(_)
+            | AotArgumentValue::DeviceNestedPointerTableValue { .. }
+            | AotArgumentValue::HostFixedU32(_)
             | AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_)
             | AotArgumentValue::DeviceMixedFixedSourcePointerTable(_)
             | AotArgumentValue::DeviceFixedU32 { .. } => {

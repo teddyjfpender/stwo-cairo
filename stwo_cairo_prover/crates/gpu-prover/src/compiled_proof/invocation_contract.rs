@@ -85,7 +85,38 @@ pub(crate) fn encode_invocation_payload(
                     }
                 }
             }
+            AotArgumentValue::DevicePointerTableValue(table) => {
+                out.push(7);
+                encode_pointer_table(out, table)?;
+            }
+            AotArgumentValue::DeviceNestedPointerTableValue { table, entries } => {
+                out.push(8);
+                out.extend_from_slice(&table.0.to_le_bytes());
+                push_size(out, entries.len())?;
+                for entry in entries {
+                    encode_pointer_table(out, entry)?;
+                }
+            }
+            AotArgumentValue::HostFixedU32(words) => {
+                out.push(9);
+                push_size(out, words.len())?;
+                for word in words {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+            }
         }
+    }
+    Ok(())
+}
+
+fn encode_pointer_table(
+    out: &mut Vec<u8>,
+    table: &DevicePointerTableBinding,
+) -> Result<(), CompiledProofError> {
+    out.extend_from_slice(&table.table.0.to_le_bytes());
+    push_size(out, table.entries.len())?;
+    for &entry in &table.entries {
+        encode_binding(out, entry);
     }
     Ok(())
 }
@@ -209,6 +240,51 @@ mod tests {
         ] {
             assert_ne!(exact.contract_id().unwrap(), changed.contract_id().unwrap());
         }
+    }
+
+    #[test]
+    fn digest_binds_device_resident_pointer_graph_storage_and_shape() {
+        fn inner<const N: usize>(table: u32, leaves: [u32; N]) -> DevicePointerTableBinding {
+            DevicePointerTableBinding {
+                table: EffectBindingId(table),
+                entries: leaves
+                    .into_iter()
+                    .map(|leaf| Some(EffectBindingId(leaf)))
+                    .collect(),
+            }
+        }
+        let exact = invocation(AotArgumentValue::DeviceNestedPointerTableValue {
+            table: EffectBindingId(0),
+            entries: vec![inner(1, [2, 3]), inner(4, [5, 6])],
+        });
+        for changed in [
+            invocation(AotArgumentValue::DeviceNestedPointerTableValue {
+                table: EffectBindingId(7),
+                entries: vec![inner(1, [2, 3]), inner(4, [5, 6])],
+            }),
+            invocation(AotArgumentValue::DeviceNestedPointerTableValue {
+                table: EffectBindingId(0),
+                entries: vec![inner(4, [5, 6]), inner(1, [2, 3])],
+            }),
+            invocation(AotArgumentValue::DevicePointerTableValue(inner(
+                0,
+                [1, 2, 3, 4, 5, 6],
+            ))),
+        ] {
+            assert_ne!(exact.contract_id().unwrap(), changed.contract_id().unwrap());
+        }
+    }
+
+    #[test]
+    fn digest_binds_host_fixed_words_by_value() {
+        assert_ne!(
+            invocation(AotArgumentValue::HostFixedU32(vec![1, 2, 3]))
+                .contract_id()
+                .unwrap(),
+            invocation(AotArgumentValue::HostFixedU32(vec![1, 3, 2]))
+                .contract_id()
+                .unwrap()
+        );
     }
 
     #[test]

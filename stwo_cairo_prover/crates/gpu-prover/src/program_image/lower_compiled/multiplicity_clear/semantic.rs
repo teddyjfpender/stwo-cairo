@@ -116,8 +116,7 @@ pub(super) fn invocation_using_abi(
     }
     let mut arguments = Vec::with_capacity(abi.len().saturating_sub(1));
     for descriptor in abi {
-        use WitnessFeedClearAbiAccess as Access;
-        use WitnessFeedClearAbiArgumentKind as Kind;
+        use {WitnessFeedClearAbiAccess as Access, WitnessFeedClearAbiArgumentKind as Kind};
         let value = match (
             descriptor.ordinal,
             descriptor.name,
@@ -206,6 +205,9 @@ pub(super) fn validate_exact_bindings(
             }
             AotArgumentValue::Usize(_)
             | AotArgumentValue::DevicePointer(_)
+            | AotArgumentValue::DevicePointerTableValue(_)
+            | AotArgumentValue::DeviceNestedPointerTableValue { .. }
+            | AotArgumentValue::HostFixedU32(_)
             | AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_)
             | AotArgumentValue::DeviceMixedFixedSourcePointerTable(_)
             | AotArgumentValue::DeviceFixedU32 { .. } => {

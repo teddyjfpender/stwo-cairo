@@ -37,6 +37,14 @@ fn validate_step(
             if !valid_launch(*launch) {
                 return Err(CompiledProofError::InvalidLaunchGeometry(operation));
             }
+            if invocation.is_some_and(|invocation| {
+                invocation
+                    .arguments
+                    .iter()
+                    .any(|argument| matches!(&argument.value, AotArgumentValue::HostFixedU32(_)))
+            }) {
+                return Err(CompiledProofError::InvalidKernelInvocation(operation));
+            }
             let authority = input
                 .kernels
                 .iter()
@@ -448,6 +456,35 @@ fn validate_invocation(
                 }
                 for &binding in entries.iter().flatten() {
                     insert(binding)?;
+                }
+            }
+            AotArgumentValue::DevicePointerTableValue(table) => {
+                if table.entries.is_empty() {
+                    return Err(invalid());
+                }
+                insert(table.table)?;
+                for &binding in table.entries.iter().flatten() {
+                    insert(binding)?;
+                }
+            }
+            AotArgumentValue::DeviceNestedPointerTableValue { table, entries } => {
+                if entries.is_empty() {
+                    return Err(invalid());
+                }
+                insert(*table)?;
+                for entry in entries {
+                    if entry.entries.is_empty() {
+                        return Err(invalid());
+                    }
+                    insert(entry.table)?;
+                    for &binding in entry.entries.iter().flatten() {
+                        insert(binding)?;
+                    }
+                }
+            }
+            AotArgumentValue::HostFixedU32(words) => {
+                if words.is_empty() {
+                    return Err(invalid());
                 }
             }
             AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(reads) => {

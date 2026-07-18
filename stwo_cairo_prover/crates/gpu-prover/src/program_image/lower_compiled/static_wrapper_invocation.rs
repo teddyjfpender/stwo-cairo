@@ -55,8 +55,7 @@ fn blake_g_direct_value(
     contract: &blake_g_direct_prefix::LoweredNativeBlakeGDirectContract,
     descriptor: BlakeGDirectAbiArgument,
 ) -> Result<Option<AotArgumentValue>, InvocationShapeError> {
-    use BlakeGDirectAbiAccess as Access;
-    use BlakeGDirectAbiArgumentKind as Kind;
+    use {BlakeGDirectAbiAccess as Access, BlakeGDirectAbiArgumentKind as Kind};
 
     let invocation = &contract.invocation;
     let value = match (
@@ -185,8 +184,7 @@ fn ec_op_value(
     contract: &ec_op_prefix::LoweredNativeEcOpContract,
     descriptor: EcOpAbiArgument,
 ) -> Result<Option<AotArgumentValue>, InvocationShapeError> {
-    use EcOpAbiAccess as Access;
-    use EcOpAbiArgumentKind as Kind;
+    use {EcOpAbiAccess as Access, EcOpAbiArgumentKind as Kind};
 
     let invocation = &contract.invocation;
     let requirements = contract.authority.requirements();
@@ -353,6 +351,35 @@ fn validate_exact_bindings(invocation: &AotInvocation, effect: &EffectContract) 
                 }
                 for &binding in bindings.iter().flatten() {
                     insert(&mut actual, binding)?;
+                }
+            }
+            AotArgumentValue::DevicePointerTableValue(table) => {
+                if table.entries.is_empty() {
+                    return Err(());
+                }
+                insert(&mut actual, table.table)?;
+                for &binding in table.entries.iter().flatten() {
+                    insert(&mut actual, binding)?;
+                }
+            }
+            AotArgumentValue::DeviceNestedPointerTableValue { table, entries } => {
+                if entries.is_empty() {
+                    return Err(());
+                }
+                insert(&mut actual, *table)?;
+                for entry in entries {
+                    if entry.entries.is_empty() {
+                        return Err(());
+                    }
+                    insert(&mut actual, entry.table)?;
+                    for &binding in entry.entries.iter().flatten() {
+                        insert(&mut actual, binding)?;
+                    }
+                }
+            }
+            AotArgumentValue::HostFixedU32(words) => {
+                if words.is_empty() {
+                    return Err(());
                 }
             }
             AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_)

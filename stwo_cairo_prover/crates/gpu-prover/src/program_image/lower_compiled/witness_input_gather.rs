@@ -369,8 +369,7 @@ fn exact_invocation(
     let geometry = contract.effect_geometry();
     let mut arguments = Vec::with_capacity(abi.len().saturating_sub(1));
     for descriptor in abi {
-        use WitnessInputGatherAbiAccess as Access;
-        use WitnessInputGatherAbiArgumentKind as Kind;
+        use {WitnessInputGatherAbiAccess as Access, WitnessInputGatherAbiArgumentKind as Kind};
         let value = match (
             descriptor.ordinal,
             descriptor.name,
@@ -476,6 +475,11 @@ fn validate_exact_binding_consumption(
                 for &binding in entries.iter().flatten() {
                     insert(binding)?;
                 }
+            }
+            AotArgumentValue::DevicePointerTableValue(_)
+            | AotArgumentValue::DeviceNestedPointerTableValue { .. }
+            | AotArgumentValue::HostFixedU32(_) => {
+                return Err(InvocationShapeError::InvalidAdapterEffect)
             }
             AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_) => {
                 return Err(InvocationShapeError::InvalidAdapterEffect)

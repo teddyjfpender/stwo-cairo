@@ -152,8 +152,7 @@ fn invocation_using_abi(
     let geometry = contract.effect_geometry();
     let mut arguments = Vec::with_capacity(abi.len() - 1);
     for descriptor in abi {
-        use WitnessFeedAbiAccess as Access;
-        use WitnessFeedAbiArgumentKind as Kind;
+        use {WitnessFeedAbiAccess as Access, WitnessFeedAbiArgumentKind as Kind};
         let value = match (
             descriptor.ordinal,
             descriptor.name,
@@ -248,6 +247,11 @@ pub(super) fn validate_exact_bindings(
                 for &binding in entries.iter().flatten() {
                     insert(binding)?;
                 }
+            }
+            AotArgumentValue::DevicePointerTableValue(_)
+            | AotArgumentValue::DeviceNestedPointerTableValue { .. }
+            | AotArgumentValue::HostFixedU32(_) => {
+                return Err(InvocationShapeError::InvalidAdapterEffect)
             }
             AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_) => {
                 return Err(InvocationShapeError::InvalidAdapterEffect)

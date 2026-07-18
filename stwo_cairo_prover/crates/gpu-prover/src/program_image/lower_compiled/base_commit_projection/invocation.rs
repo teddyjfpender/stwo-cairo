@@ -177,7 +177,9 @@ pub(super) fn validate_exact_bindings(
     let mut actual = BTreeSet::new();
     for argument in &invocation.arguments {
         match &argument.value {
-            AotArgumentValue::U32(_) | AotArgumentValue::Usize(_) => {}
+            AotArgumentValue::U32(_)
+            | AotArgumentValue::Usize(_)
+            | AotArgumentValue::HostFixedU32(_) => {}
             AotArgumentValue::DevicePointer(Some(binding)) => {
                 if !actual.insert(*binding) {
                     return Err(InvocationShapeError::InvalidBaseCommitBinding);
@@ -192,6 +194,10 @@ pub(super) fn validate_exact_bindings(
                         return Err(InvocationShapeError::InvalidBaseCommitBinding);
                     }
                 }
+            }
+            AotArgumentValue::DevicePointerTableValue(_)
+            | AotArgumentValue::DeviceNestedPointerTableValue { .. } => {
+                return Err(InvocationShapeError::InvalidBaseCommitBinding);
             }
             _ => return Err(InvocationShapeError::InvalidBaseCommitBinding),
         }

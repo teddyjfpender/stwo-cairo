@@ -194,8 +194,7 @@ pub(super) fn invocation_using_abi(
     let fixed = contract.fixed_words();
     let mut arguments = Vec::with_capacity(abi.len() - 1);
     for descriptor in abi {
-        use WitnessCasmInputAbiAccess as Access;
-        use WitnessCasmInputAbiArgumentKind as Kind;
+        use {WitnessCasmInputAbiAccess as Access, WitnessCasmInputAbiArgumentKind as Kind};
         let value = match (
             descriptor.ordinal,
             descriptor.name,
@@ -299,6 +298,9 @@ pub(super) fn validate_exact_bindings(
             }
             AotArgumentValue::Usize(_)
             | AotArgumentValue::DevicePointerTable(_)
+            | AotArgumentValue::DevicePointerTableValue(_)
+            | AotArgumentValue::DeviceNestedPointerTableValue { .. }
+            | AotArgumentValue::HostFixedU32(_)
             | AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_)
             | AotArgumentValue::DeviceMixedFixedSourcePointerTable(_)
             | AotArgumentValue::DeviceFixedU32 { .. } => {
