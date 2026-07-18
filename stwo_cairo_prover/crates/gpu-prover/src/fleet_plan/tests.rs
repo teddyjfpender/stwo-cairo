@@ -24,6 +24,7 @@ mod barrier;
 mod compiler;
 mod composite_internal_read;
 mod distributed_compiler;
+mod ipc_control_frame;
 mod ipc_cursor;
 mod ipc_rank_install;
 mod operation_execution;

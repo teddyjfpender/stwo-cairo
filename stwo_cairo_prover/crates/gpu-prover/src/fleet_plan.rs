@@ -17,6 +17,7 @@ use crate::transcript_plan::{
 
 mod compiler;
 mod identity;
+mod ipc_control_frame;
 mod ipc_cursor;
 mod ipc_rank_install;
 mod lower_compiled;
@@ -30,6 +31,10 @@ mod worker_install;
 mod tests;
 
 pub use compiler::FleetCompileError;
+pub(crate) use ipc_control_frame::{
+    FleetIpcControlCodec, FleetIpcControlEndpointRole, FleetIpcControlFrameError,
+    FleetIpcControlMessageKind,
+};
 pub use ipc_cursor::FleetIpcCursorError;
 use ipc_cursor::IpcScheduleCursor;
 pub(crate) use ipc_cursor::{
