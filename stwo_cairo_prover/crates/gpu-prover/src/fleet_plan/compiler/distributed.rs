@@ -21,7 +21,9 @@ mod commit_batches;
 mod schedule;
 mod storage;
 
-use commit_batches::base_commit_static_wrapper_workers;
+use commit_batches::{
+    base_commit_static_wrapper_workers, interaction_commit_static_wrapper_workers,
+};
 use schedule::DistributedSchedule;
 use storage::compile_partitioned_storage;
 
@@ -69,6 +71,33 @@ impl FleetProofPlan {
             &compiled,
             &topology,
             first_base_operation,
+            authority,
+        )?;
+        if topology.workers.len() == 1 {
+            return Self::compile_track_a_partitioned(compiled, shape, topology, pow, transcript);
+        }
+        Self::compile_track_a_partitioned_with_static_wrapper_workers(
+            compiled, shape, topology, pow, &workers, transcript,
+        )
+    }
+
+    /// Place each complete canonical Interaction commitment batch on one worker.
+    ///
+    /// The supplied compiled range must carry the Interaction-linked static
+    /// wrapper receipt; a canonical Base wrapper is not interchangeable.
+    pub fn compile_track_a_partitioned_with_interaction_commit_batches(
+        compiled: Arc<CompiledProof>,
+        shape: ShapeExecutableIdentity,
+        topology: FleetPlacementTopology,
+        pow: FleetPowSchedule,
+        first_interaction_operation: crate::compiled_proof::OpId,
+        authority: &stwo_backend_cuda::InteractionCommitProgramAuthority,
+        transcript: &CairoBlake2sTranscriptPlan,
+    ) -> Result<Self, FleetCompileError> {
+        let workers = interaction_commit_static_wrapper_workers(
+            &compiled,
+            &topology,
+            first_interaction_operation,
             authority,
         )?;
         if topology.workers.len() == 1 {

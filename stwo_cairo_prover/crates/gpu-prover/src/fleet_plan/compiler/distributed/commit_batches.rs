@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use stwo_backend_cuda::{
     BaseCommitAccessKind, BaseCommitOperation, BaseCommitOperationKind, BaseCommitProgramAuthority,
-    BaseCommitValueRole,
+    BaseCommitValueRole, InteractionCommitProgramAuthority, TraceTreeRole,
 };
 
 use super::*;
@@ -34,6 +34,53 @@ pub(super) fn base_commit_static_wrapper_workers(
     authority
         .validate()
         .map_err(|_| FleetCompileError::InvalidSemanticSchedule)?;
+    let workers = topology_workers(topology)?;
+    let placement = compile(authority, &workers)?;
+    validate_compiled_range(
+        compiled,
+        first_operation,
+        authority.operations(),
+        &placement.operation_workers,
+        ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase),
+        |_, _| Ok(()),
+    )?;
+    operation_worker_map(first_operation, placement.operation_workers)
+}
+
+pub(super) fn interaction_commit_static_wrapper_workers(
+    compiled: &CompiledProof,
+    topology: &FleetPlacementTopology,
+    first_operation: OpId,
+    authority: &InteractionCommitProgramAuthority,
+) -> Result<BTreeMap<OpId, WorkerId>, FleetCompileError> {
+    let workers = topology_workers(topology)?;
+    let placement = compile_interaction(authority, &workers)?;
+    validate_compiled_range(
+        compiled,
+        first_operation,
+        authority.operations(),
+        &placement.operation_workers,
+        ProofStage::BeforeTranscript(CairoTranscriptSegment::InteractionAndComposition),
+        |wrapper, _| {
+            let linked = authority
+                .bind_static_build(wrapper.consumer_target_sm())
+                .map_err(|_| FleetCompileError::InvalidSemanticSchedule)?
+                .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+            linked
+                .validate(authority)
+                .map_err(|_| FleetCompileError::InvalidSemanticSchedule)?;
+            if wrapper.static_module_build_identity() != &linked.module_build_identity()
+                || wrapper.linked_module_identity() != &linked.identity()
+            {
+                return Err(FleetCompileError::InvalidSemanticSchedule);
+            }
+            Ok(())
+        },
+    )?;
+    operation_worker_map(first_operation, placement.operation_workers)
+}
+
+fn topology_workers(topology: &FleetPlacementTopology) -> Result<Vec<WorkerId>, FleetCompileError> {
     let mut workers = topology
         .workers
         .iter()
@@ -46,15 +93,14 @@ pub(super) fn base_commit_static_wrapper_workers(
     {
         return Err(FleetCompileError::InvalidSemanticSchedule);
     }
-    let placement = compile(authority, &workers)?;
-    validate_compiled_range(
-        compiled,
-        first_operation,
-        authority.operations(),
-        &placement.operation_workers,
-    )?;
-    placement
-        .operation_workers
+    Ok(workers)
+}
+
+fn operation_worker_map(
+    first_operation: OpId,
+    operation_workers: Vec<WorkerId>,
+) -> Result<BTreeMap<OpId, WorkerId>, FleetCompileError> {
+    operation_workers
         .into_iter()
         .enumerate()
         .map(|(ordinal, worker)| {
@@ -66,6 +112,19 @@ pub(super) fn base_commit_static_wrapper_workers(
                 .ok_or(FleetCompileError::SizeOverflow)
         })
         .collect()
+}
+
+fn compile_interaction(
+    authority: &InteractionCommitProgramAuthority,
+    workers: &[WorkerId],
+) -> Result<Placement, FleetCompileError> {
+    authority
+        .validate()
+        .map_err(|_| FleetCompileError::InvalidSemanticSchedule)?;
+    if authority.role() != TraceTreeRole::Interaction {
+        return Err(FleetCompileError::InvalidSemanticSchedule);
+    }
+    compile(authority.canonical(), workers)
 }
 
 fn compile(
@@ -358,6 +417,11 @@ fn validate_compiled_range(
     first: OpId,
     authority: &[BaseCommitOperation],
     workers: &[WorkerId],
+    stage: ProofStage,
+    validate_wrapper: impl Fn(
+        &crate::compiled_proof::StaticCudaWrapperAuthority,
+        &BaseCommitOperation,
+    ) -> Result<(), FleetCompileError>,
 ) -> Result<(), FleetCompileError> {
     if authority.len() != workers.len() {
         return Err(FleetCompileError::InvalidSemanticSchedule);
@@ -384,8 +448,7 @@ fn validate_compiled_range(
             .iter()
             .find(|partition| partition.id() == operation.partition)
             .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
-        if operation.stage
-            != ProofStage::BeforeTranscript(CairoTranscriptSegment::BootstrapThroughBase)
+        if operation.stage != stage
             || !matches!(partition.kind(), PartitionAuthorityKind::Monolithic)
             || wrapper.wrapper_symbol() != exact.abi.wrapper_symbol().as_bytes()
             || wrapper.semantic_abi_identity() != &exact.abi_identity
@@ -394,6 +457,69 @@ fn validate_compiled_range(
         {
             return Err(FleetCompileError::InvalidSemanticSchedule);
         }
+        validate_wrapper(wrapper, exact)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arena_plan::CommitmentTreeId;
+
+    #[test]
+    fn real_sn2_interaction_batches_cover_once_and_remain_contiguous() {
+        let executable = crate::program_image::generated_sn2_replacement();
+        let planned = executable
+            .arena()
+            .commitment(CommitmentTreeId::Interaction)
+            .unwrap();
+        let authority = InteractionCommitProgramAuthority::compile(
+            planned.commit_program.as_ref().unwrap(),
+            planned.direct_retained_b2n_program.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(authority.role(), TraceTreeRole::Interaction);
+        assert_ne!(authority.identity(), authority.canonical().identity());
+
+        for ranks in [1, 2, 4] {
+            let workers = (0..ranks)
+                .map(|rank| WorkerId(rank as u16))
+                .collect::<Vec<_>>();
+            let placement = compile_interaction(&authority, &workers).unwrap();
+            assert_eq!(
+                placement.operation_workers.len(),
+                authority.operations().len()
+            );
+
+            let mut batch_workers = BTreeMap::<u32, WorkerId>::new();
+            let mut columns = Vec::<u32>::new();
+            for (ordinal, operation) in authority.operations().iter().enumerate() {
+                let BaseCommitOperationKind::DirectB2n {
+                    batch_index,
+                    canonical_columns,
+                    ..
+                } = &operation.kind
+                else {
+                    continue;
+                };
+                let worker = placement.operation_workers[ordinal];
+                assert_eq!(batch_workers.entry(*batch_index).or_insert(worker), &worker);
+                assert_eq!(placement.operation_workers[ordinal + 1], worker);
+                assert_eq!(placement.operation_workers[ordinal + 2], worker);
+                columns.extend(canonical_columns);
+            }
+            assert_eq!(
+                columns,
+                authority
+                    .retained_evaluations()
+                    .iter()
+                    .map(|retained| retained.canonical_column)
+                    .collect::<Vec<_>>()
+            );
+            let owners = batch_workers.values().copied().collect::<Vec<_>>();
+            assert!(owners.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert_eq!(owners.iter().copied().collect::<BTreeSet<_>>().len(), ranks);
+        }
+    }
 }
