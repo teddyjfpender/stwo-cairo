@@ -38,7 +38,7 @@ use crate::composition_plan::{CompositionPlan, CompositionPlanError, Composition
 use crate::fixed_table_materializer::{
     PEDERSEN_POINTS_18_COLUMN_COUNT, PEDERSEN_POINTS_18_ROW_COUNT,
 };
-use crate::graphs::GraphWorkspace;
+use crate::graphs::{GraphWorkspace, ResidentGraphTopology};
 use crate::memory_ledger::{AllocatorPoolCheckpoint, PhysicalMemoryInputs};
 use crate::plan::{ProofPlan, ProofPlanError};
 use crate::prepared_composition::CompositionOutputMode;
@@ -1590,6 +1590,29 @@ pub fn with_resident_pre_witness_session<R>(
         ResidentSessionArtifacts<'_>,
     ) -> Result<R, ResidentRuntimeError>,
 ) -> Result<(R, ResidentSessionTelemetry), ResidentSessionError> {
+    with_resident_pre_witness_session_for_topology(
+        executable_cache,
+        cache,
+        request,
+        ResidentGraphTopology::Monolithic,
+        run,
+    )
+}
+
+/// Strict Graph-A hand-off for one exact CUDA-graph topology.
+///
+/// Fleet execution uses the same resident preparation and stable arena as the
+/// monolithic prover; only the two PoW transcript boundaries are split.
+pub fn with_resident_pre_witness_session_for_topology<R>(
+    executable_cache: &mut ShapeExecutableCache,
+    cache: &mut WorkspaceCache,
+    request: ResidentPreWitnessSessionRequest,
+    graph_topology: ResidentGraphTopology,
+    run: impl FnOnce(
+        &mut ResidentGraphRuntime<'_>,
+        ResidentSessionArtifacts<'_>,
+    ) -> Result<R, ResidentRuntimeError>,
+) -> Result<(R, ResidentSessionTelemetry), ResidentSessionError> {
     let session_start = Instant::now();
     let ResidentPreWitnessSessionRequest {
         preprocessed_trace,
@@ -1743,7 +1766,8 @@ pub fn with_resident_pre_witness_session<R>(
                     .transpose()?;
                 let execution_tables_ingest = runtime.execution_tables_ingest_telemetry();
                 let ec_op_ingest = runtime.ec_op_ingest_telemetry();
-                let prepared_runtime_capture_ready_at_entry = runtime.prepared_capture_ready()?;
+                let prepared_runtime_capture_ready_at_entry =
+                    runtime.prepared_capture_ready_for(graph_topology)?;
                 let witness_ingest = runtime.upload_witness_inputs_at_ingest(&witness_inputs)?;
                 let transcript_inputs =
                     encode_static_transcript_inputs(channel_salt, pcs, &planned_claim)?;
@@ -1825,7 +1849,7 @@ pub fn with_resident_pre_witness_session<R>(
                 )?;
                 telemetry.composition_commit = Some(runtime.composition_commit_telemetry());
                 telemetry.graph_replay_timing = runtime.take_graph_replay_timing_report();
-                runtime.require_complete_captured_topology()?;
+                runtime.require_complete_captured_topology_for(graph_topology)?;
                 telemetry.prepared_runtime_capture_ready_at_exit = Some(true);
                 Ok((result, telemetry))
             },

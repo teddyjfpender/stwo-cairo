@@ -3525,6 +3525,12 @@ impl<'a> ResidentGraphRuntime<'a> {
         Ok(())
     }
 
+    /// Start the next proof replay without exposing transcript cursor internals.
+    pub fn begin_next_transcript_generation(&mut self) -> Result<(), ResidentRuntimeError> {
+        let generation = next_capture_generation(&self.transcript_cursor)?;
+        self.begin_transcript_generation(generation)
+    }
+
     pub fn transcript_segment_count(&self) -> usize {
         self.transcript_segments.len()
     }
@@ -4440,6 +4446,10 @@ impl<'a> ResidentGraphRuntime<'a> {
         Ok(())
     }
 
+    pub fn fri_round_count(&self) -> usize {
+        self.fri.round_count()
+    }
+
     pub fn replay_fri_round(&mut self, round_index: usize) -> Result<(), ResidentRuntimeError> {
         self.require_next_fri_round(round_index)?;
         let generation = *self
@@ -4503,8 +4513,7 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// over true FRI challenge boundaries; component and relation work remains
     /// inside the captured graphs.
     pub fn replay_all_prepared_subgraphs(&mut self) -> Result<(), ResidentRuntimeError> {
-        let generation = next_capture_generation(&self.transcript_cursor)?;
-        self.begin_transcript_generation(generation)?;
+        self.begin_next_transcript_generation()?;
         self.replay_base_commit_only()?;
         self.replay_interaction_relation_and_commit()?;
         self.replay_composition_commit_only()?;
