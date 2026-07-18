@@ -92,8 +92,10 @@ use crate::transcript_plan::{
 };
 use crate::{PreparedCompositionError, PreparedCompositionGraph};
 
+mod loaded_composition;
 pub(crate) mod producer_schedule;
 
+use loaded_composition::AdmittedCompositionExecution;
 use producer_schedule::{BaseProducerSchedule, BaseProducerStep, ProducerScheduleError};
 
 /// One setup drain even through ordinary errors or unwinding. Host buffers
@@ -464,6 +466,7 @@ pub enum ResidentRuntimeError {
     },
     MissingPreparedCommitment(CommitmentTreeId),
     DirectRetainedOutputMismatch(CommitmentTreeId),
+    CompiledCompositionAdmission(&'static str),
     PostCompiledCompositionHandoff(&'static str),
     FixedPreprocessedCommitmentNotReady,
     TranscriptScheduleMismatch {
@@ -1786,6 +1789,7 @@ pub struct ResidentGraphRuntime<'a> {
     interaction_commit_input: PreparedTraceCommitInput<'a>,
     interaction_claim_sources: Vec<ArenaSlice>,
     composition: PreparedCompositionGraph<'a>,
+    loaded_composition: Option<AdmittedCompositionExecution>,
     oods: ResidentOodsPipeline<'a>,
     fri: PreparedFriGraph<'a>,
     fri_final: PreparedFriFinalGraph<'a>,
@@ -1828,6 +1832,13 @@ fn direct_prepared_pair_is_exact(
 
 fn replacement_device_is_exact(device: CudaDeviceSnapshot) -> bool {
     device.count == 1 && device.current == 0
+}
+
+fn replacement_target_sm(device: CudaDeviceSnapshot) -> Option<u32> {
+    (replacement_device_is_exact(device) && device.sm_major != 0 && device.sm_minor <= 9)
+        .then_some(())
+        .and_then(|()| device.sm_major.checked_mul(10))
+        .and_then(|major| major.checked_add(device.sm_minor))
 }
 
 impl<'a> ResidentGraphRuntime<'a> {
@@ -3045,6 +3056,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             interaction_commit_input,
             interaction_claim_sources,
             composition,
+            loaded_composition: None,
             oods,
             fri,
             fri_final,
@@ -3094,6 +3106,31 @@ impl<'a> ResidentGraphRuntime<'a> {
 
     pub const fn ec_op_ingest_telemetry(&self) -> Option<PreparedEcOpIngestTelemetry> {
         self.ec_op_ingest
+    }
+
+    /// Admit the complete compiled Composition path before entering a timed
+    /// replay window. This is opt-in until the replacement-path selector owns
+    /// the vertical execution lane.
+    pub fn admit_compiled_composition_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        if self.workspace.plan().protocol_identity().resident_backend
+            != ResidentBackend::ReplacementV1
+        {
+            return Err(ResidentRuntimeError::CompiledCompositionAdmission(
+                "replacement resident backend is not selected",
+            ));
+        }
+        let target_sm = replacement_target_sm(cuda_device_snapshot()?).ok_or(
+            ResidentRuntimeError::CompiledCompositionAdmission("current CUDA target"),
+        )?;
+        self.loaded_composition = Some(
+            AdmittedCompositionExecution::admit(
+                self.workspace.plan(),
+                &self.composition,
+                target_sm,
+            )
+            .map_err(ResidentRuntimeError::CompiledCompositionAdmission)?,
+        );
+        Ok(())
     }
 
     /// Rebind every statement-varying input of a persistent same-shape
@@ -5330,6 +5367,26 @@ impl<'a> ResidentGraphRuntime<'a> {
             self.transcript_segment_index(CairoTranscriptSegment::CompositionAndOods)?;
         self.launch_transcript_segment_eager(transcript_segment)?;
         self.oods.launch_oods()?;
+        Ok(())
+    }
+
+    /// Execute the prepare-time-admitted complete Composition program and its
+    /// existing commitment/transcript/OODS continuation.
+    pub fn launch_compiled_composition_commit_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.loaded_composition
+            .as_ref()
+            .ok_or(ResidentRuntimeError::CompiledCompositionAdmission(
+                "compiled Composition was not admitted before replay",
+            ))?
+            .launch_eager(&self.composition)?;
+        self.launch_post_compiled_composition_handoff_eager()?;
+        let requirements = self.composition.requirements();
+        self.composition_replay_receipt = Some(CompositionReplayReceipt {
+            mode: requirements.mode,
+            wave_launches: requirements
+                .execution_receipt
+                .map_or(0, |receipt| receipt.wave_count),
+        });
         Ok(())
     }
 
