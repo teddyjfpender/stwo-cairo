@@ -77,8 +77,6 @@ _SN2_VERTICAL_RECIPES = {
             "STWO_COMPOSITION_SPLIT_NATIVE_RECEIPT_JSON",
             "STWO_COMPOSITION_SPLIT_COMMIT_NATIVE_RECEIPT_JSON",
             "--reps 2",
-            "gpu_composition_split_launch_mode",
-            "fused-first-forward",
         ),
         "test": "gpu_benchmarks.test_validate_sn2_vertical_abba",
         "control": (
