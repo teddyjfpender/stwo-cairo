@@ -32,6 +32,34 @@ CHECKPOINT_AOT_TOTAL=373
 CHECKPOINT_AOT_WITNESS=35
 CHECKPOINT_AOT_ORDINARY_CONSTRAINT=219
 CHECKPOINT_AOT_COMPOSITION_WAVE=119
+if [[ "$REPLACEMENT_SN2_MODE" == iteration ]]; then
+  read -r CHECKPOINT_AOT_TOTAL CHECKPOINT_AOT_WITNESS \
+    CHECKPOINT_AOT_ORDINARY_CONSTRAINT CHECKPOINT_AOT_COMPOSITION_WAVE \
+    CHECKPOINT_AOT_MANIFEST_SHA256 < <(
+      python3 - "$CHECKPOINT_AOT_MANIFEST" <<'PY'
+import hashlib, json, re, sys
+
+path = sys.argv[1]
+raw = open(path, "rb").read()
+entries = json.loads(raw)
+if not isinstance(entries, list) or not entries or any(not isinstance(entry, dict) for entry in entries):
+    raise SystemExit("iteration AOT manifest is empty or malformed")
+keys = [entry.get("cache_key") for entry in entries]
+if (any(not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{16}", key) for key in keys)
+        or len(set(keys)) != len(keys)):
+    raise SystemExit("iteration AOT manifest keys are invalid or duplicated")
+waves = [entry for entry in entries
+         if entry.get("kind") == "constraint"
+         and re.fullmatch(r"wave_log_[0-9]+", str(entry.get("label", "")))]
+witness = [entry for entry in entries if entry.get("kind") == "witness"]
+ordinary = [entry for entry in entries
+            if entry.get("kind") == "constraint" and entry not in waves]
+if len(witness) + len(ordinary) + len(waves) != len(entries):
+    raise SystemExit("iteration AOT manifest contains an unknown entry kind")
+print(len(entries), len(witness), len(ordinary), len(waves), hashlib.sha256(raw).hexdigest())
+PY
+    )
+fi
 CHECKPOINT_SN2_PACKED_OUTPUT_ROWS=20971472
 CHECKPOINT_SN2_COMPOSITION_PARTS=153
 CHECKPOINT_SN2_COMPOSITION_WAVES=18
@@ -150,6 +178,9 @@ checkpoint_source_input_identity() {
   [[ "$source_policy" != clean ]] || rm -f "$CHECKPOINT_SEAL"
   out="$(checkpoint_artifact source_input_identity.json)"
   RAW_SHA="$raw_actual" BOOT_SHA="$boot_actual" SOURCE_POLICY="$source_policy" \
+    AOT_TOTAL="$CHECKPOINT_AOT_TOTAL" AOT_WITNESS="$CHECKPOINT_AOT_WITNESS" \
+    AOT_ORDINARY="$CHECKPOINT_AOT_ORDINARY_CONSTRAINT" \
+    AOT_WAVE="$CHECKPOINT_AOT_COMPOSITION_WAVE" \
     OUT="$out" python3 - <<'PY'
 import json, os
 record = {
@@ -166,10 +197,10 @@ record = {
         "simple_bootloader_compiled.json": os.environ["BOOT_SHA"],
     },
     "aot_pack": {
-        "total": 373,
-        "witness": 35,
-        "ordinary_constraint": 219,
-        "composition_wave": 119,
+        "total": int(os.environ["AOT_TOTAL"]),
+        "witness": int(os.environ["AOT_WITNESS"]),
+        "ordinary_constraint": int(os.environ["AOT_ORDINARY"]),
+        "composition_wave": int(os.environ["AOT_WAVE"]),
     },
 }
 with open(os.environ["OUT"], "w", encoding="utf-8") as stream:
