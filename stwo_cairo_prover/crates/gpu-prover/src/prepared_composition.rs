@@ -24,6 +24,11 @@ use crate::composition_plan::{
     CompositionComponentPlan, CompositionExtParamSource, CompositionKernelPart, CompositionPlan,
     CompositionProofBindings, CompositionWaveKernelPlan,
 };
+use crate::composition_stripes::ResourceBoundedCompositionError;
+#[cfg(feature = "direct-retention-test-api")]
+use crate::composition_stripes::{
+    CompositionFinalCubinResource, ResourceBoundedCompositionSchedule,
+};
 use crate::direct_composition_retention::{
     direct_composition_plan_key, DirectCompositionRetentionPlan,
 };
@@ -31,6 +36,7 @@ use crate::direct_composition_retention::{
 mod binding_refresh;
 mod direct_split;
 mod execution_authority;
+mod ordinary_stripes;
 pub use binding_refresh::CompositionBindingRefreshTelemetry;
 pub use direct_split::{
     CompositionDirectSplitBinding, CompositionOutputMode, CompositionOutputPlan,
@@ -44,6 +50,7 @@ pub use execution_authority::{
     CompositionRelocationLayout, CompositionRelocationRole, CompositionValueAccess,
     CompositionValueRole,
 };
+use ordinary_stripes::{enqueue_prepared_stripe, prepare_aot_kernel, PreparedStripeLaunch};
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
 const SECURE_WORDS: usize = 4;
@@ -336,6 +343,58 @@ pub struct CompositionExecutionReceipt {
 pub struct CompositionReplayReceipt {
     pub mode: CompositionLaunchMode,
     pub wave_launches: usize,
+}
+
+/// Exact loaded-function facts for one resource-bounded ordinary stripe.
+#[cfg(feature = "direct-retention-test-api")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositionStripeResourceReceipt {
+    pub component: usize,
+    pub kernel: usize,
+    pub cache_key: u64,
+    pub semantic_hash: u64,
+    pub target_sm: u32,
+    pub cubin_identity: [u8; 32],
+    pub launch: aot::InstalledAotLaunchFacts,
+    pub resources: aot::InstalledAotFunctionResources,
+}
+
+/// Address-free output-ownership boundary for a stripe qualification run.
+#[cfg(feature = "direct-retention-test-api")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompositionStripeBoundaryReceipt {
+    pub launch_mode: CompositionLaunchMode,
+    pub output_mode: CompositionOutputMode,
+    pub stripe_count: usize,
+    pub serial_component_count: usize,
+    pub direct_retention_plan_key: Option<u64>,
+}
+
+#[cfg(feature = "direct-retention-test-api")]
+fn require_resource_bounded_direct_boundary(
+    receipt: &CompositionStripeBoundaryReceipt,
+) -> Result<(), PreparedCompositionError> {
+    for (matches, field) in [
+        (
+            receipt.launch_mode == CompositionLaunchMode::Serial,
+            "launch mode",
+        ),
+        (
+            receipt.output_mode == CompositionOutputMode::DirectRetainedEvaluations,
+            "output ownership",
+        ),
+        (receipt.stripe_count != 0, "stripe count"),
+        (receipt.serial_component_count != 0, "component count"),
+        (
+            receipt.direct_retention_plan_key.is_some(),
+            "direct retention",
+        ),
+    ] {
+        if !matches {
+            return Err(PreparedCompositionError::CompositionStripePlanDrift(field));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -640,6 +699,38 @@ pub enum PreparedCompositionError {
         component: usize,
         kernel: usize,
         cache_key: u64,
+    },
+    CompositionStripeRequiresAllDirect {
+        component: usize,
+        fallback_count: usize,
+    },
+    CompositionStripePlan(ResourceBoundedCompositionError),
+    CompositionStripePlanDrift(&'static str),
+    CompositionStripeAotAuthorityMissing {
+        component: usize,
+        kernel: usize,
+        cache_key: u64,
+        target_sm: u32,
+    },
+    CompositionStripeAotAuthorityDrift {
+        component: usize,
+        kernel: usize,
+        field: &'static str,
+    },
+    CompositionStripeAotInstall {
+        component: usize,
+        kernel: usize,
+        error: aot::InstalledAotFunctionError,
+    },
+    CompositionStripeAotLaunch {
+        component: usize,
+        kernel: usize,
+        error: aot::InstalledAotFunctionError,
+    },
+    CompositionStripeAotReceiptDrift {
+        component: usize,
+        kernel: usize,
+        field: &'static str,
     },
     CompositionWaveRequiresAllDirect {
         component: usize,
@@ -1575,16 +1666,16 @@ impl DescriptorAllocator {
     }
 }
 
-#[derive(Debug)]
-struct PreparedKernel {
+struct PreparedKernel<'a> {
     source: CString,
     name: CString,
     cache_key: u64,
+    semantic_hash: u64,
     rc_base: u32,
+    installed: Option<aot::InstalledAotFunction<'a>>,
 }
 
-#[derive(Debug)]
-struct PreparedComponent {
+struct PreparedComponent<'a> {
     evaluation_pointers: usize,
     fallback_coefficient_pointers: usize,
     fallback_coefficient_sizes: usize,
@@ -1598,7 +1689,7 @@ struct PreparedComponent {
     evaluation_log_size: u32,
     row_count: u32,
     fallback_count: u32,
-    kernels: Vec<PreparedKernel>,
+    kernels: Vec<PreparedKernel<'a>>,
 }
 
 enum PreparedWaveAuthority<'a> {
@@ -1626,6 +1717,22 @@ enum CompositionAotAdmission {
 #[derive(Clone, Copy)]
 enum CompositionWaveDispatch {
     EagerInstalled,
+    CaptureSafe,
+}
+
+#[derive(Clone, Copy)]
+enum CompositionStripeAdmission {
+    Wrapper,
+    #[cfg(feature = "direct-retention-test-api")]
+    InstalledResourceBounded,
+}
+
+#[derive(Clone, Copy)]
+enum CompositionStripeDispatch {
+    Wrapper,
+    #[cfg(feature = "direct-retention-test-api")]
+    EagerInstalled,
+    #[cfg(feature = "direct-retention-test-api")]
     CaptureSafe,
 }
 
@@ -1697,8 +1804,10 @@ pub struct PreparedCompositionGraph<'a> {
     _claimed_sums: Vec<ArenaSlice>,
     _direct_evaluations: Vec<ArenaSlice>,
     output: PreparedCompositionOutput<'a>,
-    components: Vec<PreparedComponent>,
+    components: Vec<PreparedComponent<'a>>,
     waves: Vec<PreparedWave<'a>>,
+    #[cfg(feature = "direct-retention-test-api")]
+    stripe_schedule: Option<ResourceBoundedCompositionSchedule>,
     /// Wide-mode fanout: `lane_components[lane]` holds component indices in
     /// enqueue order (group-contiguous, members in plan order). Empty in
     /// serial mode, so the serial launch path performs no fork/join at all.
@@ -1708,6 +1817,140 @@ pub struct PreparedCompositionGraph<'a> {
 enum PreparedCompositionOutput<'a> {
     CoefficientSplit([ArenaSlice; SPLIT_COORDINATES]),
     DirectRetainedEvaluations(stwo_backend_cuda::PreparedCompositionSplitGraph<'a>),
+}
+
+#[cfg(feature = "direct-retention-test-api")]
+fn validate_resource_bounded_stripe_topology(
+    requirements: &CompositionWorkspaceRequirements,
+    lane_components: &[Vec<usize>],
+) -> Result<(), PreparedCompositionError> {
+    if requirements.mode != CompositionLaunchMode::Serial {
+        return Err(PreparedCompositionError::CompositionStripePlanDrift(
+            "launch mode",
+        ));
+    }
+    if !requirements.wide_groups.is_empty() || !lane_components.is_empty() {
+        return Err(PreparedCompositionError::CompositionStripePlanDrift(
+            "component lanes",
+        ));
+    }
+    if !requirements.waves.is_empty() || requirements.execution_receipt.is_some() {
+        return Err(PreparedCompositionError::CompositionStripePlanDrift(
+            "wave topology",
+        ));
+    }
+    if requirements.serial_components.len() != requirements.components.len()
+        || !requirements
+            .serial_components
+            .iter()
+            .copied()
+            .eq(0..requirements.components.len())
+    {
+        return Err(PreparedCompositionError::CompositionStripePlanDrift(
+            "serial component order",
+        ));
+    }
+    if let Some((component, fallback_count)) =
+        requirements
+            .components
+            .iter()
+            .enumerate()
+            .find_map(|(component, value)| {
+                (value.fallback_count != 0).then_some((component, value.fallback_count))
+            })
+    {
+        return Err(
+            PreparedCompositionError::CompositionStripeRequiresAllDirect {
+                component,
+                fallback_count,
+            },
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "direct-retention-test-api")]
+fn validate_resource_bounded_stripe_schedule(
+    schedule: &ResourceBoundedCompositionSchedule,
+    components: &[PreparedComponent<'_>],
+) -> Result<(), PreparedCompositionError> {
+    let mut prepared = components
+        .iter()
+        .enumerate()
+        .flat_map(|(component, prepared)| {
+            prepared
+                .kernels
+                .iter()
+                .enumerate()
+                .map(move |(kernel, prepared)| (component, kernel, prepared))
+        });
+    for stripe in schedule.stripes() {
+        let (component, kernel, prepared) =
+            prepared
+                .next()
+                .ok_or(PreparedCompositionError::CompositionStripePlanDrift(
+                    "stripe count",
+                ))?;
+        let installed = prepared.installed.as_ref().ok_or(
+            PreparedCompositionError::CompositionStripePlanDrift("installed function"),
+        )?;
+        if stripe.part.component_index != component
+            || stripe.part.kernel_index != kernel
+            || stripe.part.cache_key != prepared.cache_key
+            || stripe.part.semantic_hash != prepared.semantic_hash
+            || stripe.cubin != CompositionFinalCubinResource::from_installed(installed.receipt())
+        {
+            return Err(PreparedCompositionError::CompositionStripePlanDrift(
+                "stripe identity/order/resource",
+            ));
+        }
+    }
+    if prepared.next().is_some() {
+        return Err(PreparedCompositionError::CompositionStripePlanDrift(
+            "stripe count",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "direct-retention-test-api")]
+fn compile_resource_bounded_stripe_schedule(
+    plan: &CompositionPlan,
+    requirements: &CompositionWorkspaceRequirements,
+    components: &[PreparedComponent<'_>],
+) -> Result<ResourceBoundedCompositionSchedule, PreparedCompositionError> {
+    let mut target_sm = None;
+    let mut resources = BTreeMap::new();
+    for kernel in components.iter().flat_map(|component| &component.kernels) {
+        let installed = kernel.installed.as_ref().ok_or(
+            PreparedCompositionError::CompositionStripePlanDrift("installed function"),
+        )?;
+        let receipt = installed.receipt();
+        target_sm.get_or_insert(receipt.target_sm());
+        let resource = CompositionFinalCubinResource::from_installed(receipt);
+        match resources.insert((resource.cache_key, resource.semantic_hash), resource) {
+            Some(previous) if previous != resource => {
+                return Err(PreparedCompositionError::CompositionStripePlanDrift(
+                    "duplicate resource identity",
+                ));
+            }
+            _ => {}
+        }
+    }
+    let target_sm = target_sm.ok_or(PreparedCompositionError::CompositionStripePlanDrift(
+        "missing installed function",
+    ))?;
+    let fallback_counts = requirements
+        .components
+        .iter()
+        .map(|component| component.fallback_count)
+        .collect::<Vec<_>>();
+    let resources = resources.into_values().collect::<Vec<_>>();
+    let schedule =
+        ResourceBoundedCompositionSchedule::compile(plan, &fallback_counts, target_sm, &resources)
+            .map_err(PreparedCompositionError::CompositionStripePlan)?;
+    validate_resource_bounded_stripe_schedule(&schedule, components)?;
+    Ok(schedule)
 }
 
 impl<'a> PreparedCompositionGraph<'a> {
@@ -1801,7 +2044,81 @@ impl<'a> PreparedCompositionGraph<'a> {
             direct_evaluations,
             None,
             CompositionAotAdmission::SourceJitTest,
+            CompositionStripeAdmission::Wrapper,
         )
+    }
+
+    /// Strict-AOT ordinary-stripe constraint-body fixture.
+    ///
+    /// Every source must already be retained at its consumer log. Preparation
+    /// installs and resource-qualifies every exact loaded ordinary function.
+    /// This coefficient-split boundary is for correctness only; it is not a
+    /// production-wave speed comparator.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "direct-retention-test-api")]
+    #[doc(hidden)]
+    pub fn prepare_resource_bounded_stripes_coefficient_for_test(
+        arena: &'a DeviceArena,
+        plan: &CompositionPlan,
+        trace: &CompositionTraceTopology,
+        inputs: &CompositionDeviceInputs,
+        slots: &CompositionWorkspaceSlots,
+        direct_retention: &DirectCompositionRetentionPlan,
+        direct_evaluations: &[CompositionDirectEvaluationBinding],
+    ) -> Result<Self, PreparedCompositionError> {
+        Self::prepare_impl(
+            arena,
+            plan,
+            None,
+            trace,
+            inputs,
+            slots,
+            CompositionLaunchMode::Serial,
+            Some(direct_retention),
+            direct_evaluations,
+            None,
+            CompositionAotAdmission::StrictEmbedded,
+            CompositionStripeAdmission::InstalledResourceBounded,
+        )
+    }
+
+    /// Strict-AOT stripe candidate at the production direct-retained boundary.
+    ///
+    /// This is the only stripe constructor suitable for timing against the
+    /// current wave path: both arms bind the same proof parameters, direct
+    /// evaluations, direct-split output ownership, and downstream semantic
+    /// boundary. Production selection remains unchanged.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "direct-retention-test-api")]
+    #[doc(hidden)]
+    pub fn prepare_resource_bounded_stripes_for_test(
+        arena: &'a DeviceArena,
+        plan: &CompositionPlan,
+        proof_bindings: &CompositionProofBindings,
+        trace: &CompositionTraceTopology,
+        inputs: &CompositionDeviceInputs,
+        slots: &CompositionWorkspaceSlots,
+        direct_retention: &DirectCompositionRetentionPlan,
+        direct_evaluations: &[CompositionDirectEvaluationBinding],
+        direct_split: CompositionDirectSplitBinding,
+    ) -> Result<Self, PreparedCompositionError> {
+        let graph = Self::prepare_impl(
+            arena,
+            plan,
+            Some(proof_bindings),
+            trace,
+            inputs,
+            slots,
+            CompositionLaunchMode::Serial,
+            Some(direct_retention),
+            direct_evaluations,
+            Some(direct_split),
+            CompositionAotAdmission::StrictEmbedded,
+            CompositionStripeAdmission::InstalledResourceBounded,
+        )?;
+        let boundary = graph.resource_bounded_stripe_boundary_receipt_for_test()?;
+        require_resource_bounded_direct_boundary(&boundary)?;
+        Ok(graph)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1827,6 +2144,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             direct_evaluations,
             None,
             CompositionAotAdmission::StrictEmbedded,
+            CompositionStripeAdmission::Wrapper,
         )
     }
 
@@ -1855,6 +2173,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             direct_evaluations,
             direct_split,
             CompositionAotAdmission::StrictEmbedded,
+            CompositionStripeAdmission::Wrapper,
         )
     }
 
@@ -1871,6 +2190,7 @@ impl<'a> PreparedCompositionGraph<'a> {
         direct_evaluations: &[CompositionDirectEvaluationBinding],
         direct_split: Option<CompositionDirectSplitBinding>,
         aot_admission: CompositionAotAdmission,
+        stripe_admission: CompositionStripeAdmission,
     ) -> Result<Self, PreparedCompositionError> {
         let requirements =
             composition_workspace_requirements_with_retention(plan, trace, mode, direct_retention)?;
@@ -1891,6 +2211,13 @@ impl<'a> PreparedCompositionGraph<'a> {
                 })
                 .collect()
         };
+        #[cfg(feature = "direct-retention-test-api")]
+        if matches!(
+            stripe_admission,
+            CompositionStripeAdmission::InstalledResourceBounded
+        ) {
+            validate_resource_bounded_stripe_topology(&requirements, &lane_components)?;
+        }
         if inputs.ext_params.len() != requirements.components.len() {
             return Err(PreparedCompositionError::ExtParamBindingCount {
                 expected: requirements.components.len(),
@@ -2467,7 +2794,14 @@ impl<'a> PreparedCompositionGraph<'a> {
             if mode != CompositionLaunchMode::Wave {
                 kernels.reserve(component_plan.kernels.len());
                 for (kernel_index, kernel) in component_plan.kernels.iter().enumerate() {
-                    kernels.push(prepare_aot_kernel(component_index, kernel_index, kernel)?);
+                    kernels.push(prepare_aot_kernel(
+                        arena,
+                        component_index,
+                        kernel_index,
+                        component.row_count,
+                        kernel,
+                        stripe_admission,
+                    )?);
                 }
             }
             prepared_components.push(PreparedComponent {
@@ -2497,6 +2831,20 @@ impl<'a> PreparedCompositionGraph<'a> {
         }
         debug_assert_eq!(dynamic_index, requirements.dynamic_ext_param_count);
         debug_assert_eq!(claimed_index, requirements.claimed_sum_count);
+
+        #[cfg(feature = "direct-retention-test-api")]
+        let stripe_schedule = if matches!(
+            stripe_admission,
+            CompositionStripeAdmission::InstalledResourceBounded
+        ) {
+            Some(compile_resource_bounded_stripe_schedule(
+                plan,
+                &requirements,
+                &prepared_components,
+            )?)
+        } else {
+            None
+        };
 
         let descriptor_ptr = descriptors.as_u32_ptr();
         let mut prepared_waves = Vec::with_capacity(requirements.waves.len());
@@ -2585,6 +2933,8 @@ impl<'a> PreparedCompositionGraph<'a> {
             output,
             components: prepared_components,
             waves: prepared_waves,
+            #[cfg(feature = "direct-retention-test-api")]
+            stripe_schedule,
             lane_components,
         })
     }
@@ -2594,16 +2944,108 @@ impl<'a> PreparedCompositionGraph<'a> {
     /// installed function; graph capture has a separate receipt-fenced wrapper
     /// because the backend's installed seam deliberately rejects capture.
     pub fn launch(&self) -> Result<(), PreparedCompositionError> {
-        self.launch_with_wave_dispatch(CompositionWaveDispatch::EagerInstalled)
+        self.launch_with_dispatch(
+            CompositionWaveDispatch::EagerInstalled,
+            CompositionStripeDispatch::Wrapper,
+        )
     }
 
     pub(crate) fn launch_capture_safe(&self) -> Result<(), PreparedCompositionError> {
-        self.launch_with_wave_dispatch(CompositionWaveDispatch::CaptureSafe)
+        self.launch_with_dispatch(
+            CompositionWaveDispatch::CaptureSafe,
+            CompositionStripeDispatch::Wrapper,
+        )
     }
 
-    fn launch_with_wave_dispatch(
+    #[cfg(feature = "direct-retention-test-api")]
+    #[doc(hidden)]
+    pub fn launch_resource_bounded_stripes_eager_for_test(
+        &self,
+    ) -> Result<(), PreparedCompositionError> {
+        self.require_resource_bounded_stripe_topology()?;
+        self.launch_with_dispatch(
+            CompositionWaveDispatch::EagerInstalled,
+            CompositionStripeDispatch::EagerInstalled,
+        )
+    }
+
+    #[cfg(feature = "direct-retention-test-api")]
+    #[doc(hidden)]
+    pub fn launch_resource_bounded_stripes_capture_for_test(
+        &self,
+    ) -> Result<(), PreparedCompositionError> {
+        self.require_resource_bounded_stripe_topology()?;
+        self.launch_with_dispatch(
+            CompositionWaveDispatch::CaptureSafe,
+            CompositionStripeDispatch::CaptureSafe,
+        )
+    }
+
+    #[cfg(feature = "direct-retention-test-api")]
+    #[doc(hidden)]
+    pub fn resource_bounded_stripe_receipts_for_test(
+        &self,
+    ) -> Vec<CompositionStripeResourceReceipt> {
+        self.components
+            .iter()
+            .enumerate()
+            .flat_map(|(component, prepared)| {
+                prepared
+                    .kernels
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(kernel, prepared)| {
+                        prepared.installed.as_ref().map(|installed| {
+                            let receipt = installed.receipt();
+                            CompositionStripeResourceReceipt {
+                                component,
+                                kernel,
+                                cache_key: receipt.cache_key(),
+                                semantic_hash: receipt.semantic_hash(),
+                                target_sm: receipt.target_sm(),
+                                cubin_identity: receipt.cubin_identity(),
+                                launch: receipt.launch(),
+                                resources: receipt.resources(),
+                            }
+                        })
+                    })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "direct-retention-test-api")]
+    #[doc(hidden)]
+    pub fn resource_bounded_stripe_boundary_receipt_for_test(
+        &self,
+    ) -> Result<CompositionStripeBoundaryReceipt, PreparedCompositionError> {
+        self.require_resource_bounded_stripe_topology()?;
+        Ok(CompositionStripeBoundaryReceipt {
+            launch_mode: self.requirements.mode,
+            output_mode: self.output_mode(),
+            stripe_count: self
+                .stripe_schedule
+                .as_ref()
+                .expect("topology validation requires the schedule")
+                .stripes()
+                .len(),
+            serial_component_count: self.requirements.serial_components.len(),
+            direct_retention_plan_key: self.requirements.direct_retention_plan_key,
+        })
+    }
+
+    #[cfg(feature = "direct-retention-test-api")]
+    fn require_resource_bounded_stripe_topology(&self) -> Result<(), PreparedCompositionError> {
+        validate_resource_bounded_stripe_topology(&self.requirements, &self.lane_components)?;
+        let schedule = self.stripe_schedule.as_ref().ok_or(
+            PreparedCompositionError::CompositionStripePlanDrift("missing schedule"),
+        )?;
+        validate_resource_bounded_stripe_schedule(schedule, &self.components)
+    }
+
+    fn launch_with_dispatch(
         &self,
         wave_dispatch: CompositionWaveDispatch,
+        stripe_dispatch: CompositionStripeDispatch,
     ) -> Result<(), PreparedCompositionError> {
         let context = self.arena.context();
         let stream = context.stream_raw().as_ptr();
@@ -2670,7 +3112,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             // Serial topology: identical call sequence to the historical
             // launch path — plan order on the main stream, no fork/join.
             for &component in &self.requirements.serial_components {
-                self.enqueue_component(component, stream)?;
+                self.enqueue_component(component, stream, stripe_dispatch)?;
             }
         } else {
             // Wide topology: fork the active component lanes off the main
@@ -2699,9 +3141,11 @@ impl<'a> PreparedCompositionGraph<'a> {
             if first_error.is_none() {
                 'lanes: for &(lane, launch) in &forked {
                     for &component in &self.lane_components[lane] {
-                        if let Err(error) =
-                            self.enqueue_component(component, launch.stream_raw().as_ptr())
-                        {
+                        if let Err(error) = self.enqueue_component(
+                            component,
+                            launch.stream_raw().as_ptr(),
+                            stripe_dispatch,
+                        ) {
                             first_error = Some(error);
                             break 'lanes;
                         }
@@ -2710,7 +3154,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             }
             if first_error.is_none() {
                 for &component in &self.requirements.serial_components {
-                    if let Err(error) = self.enqueue_component(component, stream) {
+                    if let Err(error) = self.enqueue_component(component, stream, stripe_dispatch) {
                         first_error = Some(error);
                         break;
                     }
@@ -2926,6 +3370,7 @@ impl<'a> PreparedCompositionGraph<'a> {
         &self,
         component_index: usize,
         stream: *mut c_void,
+        stripe_dispatch: CompositionStripeDispatch,
     ) -> Result<(), PreparedCompositionError> {
         let descriptor_ptr = self.descriptors.as_u32_ptr();
         let requirement = &self.requirements.components[component_index];
@@ -2964,35 +3409,42 @@ impl<'a> PreparedCompositionGraph<'a> {
                 .checked_add(kernel.rc_base as usize)
                 .and_then(|offset| u32::try_from(offset).ok())
                 .ok_or(PreparedCompositionError::SizeOverflow)?;
-            let launched = unsafe {
-                raw::stwo_cuda_jit_eval_fused_on(
-                    kernel.source.as_ptr(),
-                    kernel.name.as_ptr(),
-                    kernel.cache_key,
-                    descriptor_ptr.add(component.evaluation_pointers),
-                    descriptor_ptr.add(component.interaction_offsets),
-                    descriptor_ptr.add(component.base_params),
-                    component.ext_params,
-                    self.random_coefficient_powers.as_u32_ptr(),
-                    descriptor_ptr.add(component.denominator_inverses),
-                    accumulator,
-                    accumulator.add(row_count),
-                    accumulator.add(2 * row_count),
-                    accumulator.add(3 * row_count),
-                    component.row_count,
-                    component.trace_log_size,
+            // Preparation validated every descriptor offset and accumulator
+            // coordinate extent against its bound arena slice.
+            let launch = unsafe {
+                PreparedStripeLaunch {
+                    trace_values: descriptor_ptr
+                        .add(component.evaluation_pointers)
+                        .cast_const(),
+                    interaction_offsets: descriptor_ptr
+                        .add(component.interaction_offsets)
+                        .cast_const(),
+                    base_params: descriptor_ptr.add(component.base_params).cast_const(),
+                    ext_params: component.ext_params,
+                    random_coefficient_powers: self.random_coefficient_powers.as_u32_ptr(),
+                    denominator_inverses: descriptor_ptr
+                        .add(component.denominator_inverses)
+                        .cast_const(),
+                    coordinates: [
+                        accumulator,
+                        accumulator.add(row_count),
+                        accumulator.add(2 * row_count),
+                        accumulator.add(3 * row_count),
+                    ],
+                    row_count: component.row_count,
+                    log_n_rows: component.trace_log_size,
                     rc_base,
-                    false,
-                    stream,
-                )
+                }
             };
-            if !launched {
-                return Err(PreparedCompositionError::KernelLaunchMiss {
-                    component: component_index,
-                    kernel: kernel_index,
-                    cache_key: kernel.cache_key,
-                });
-            }
+            enqueue_prepared_stripe(
+                self.arena,
+                component_index,
+                kernel_index,
+                kernel,
+                stream,
+                stripe_dispatch,
+                launch,
+            )?;
         }
         Ok(())
     }
@@ -3007,41 +3459,6 @@ impl<'a> PreparedCompositionGraph<'a> {
             PreparedCompositionOutput::DirectRetainedEvaluations(_) => None,
         }
     }
-}
-
-fn prepare_aot_kernel(
-    component_index: usize,
-    kernel_index: usize,
-    kernel: &CompositionKernelPart,
-) -> Result<PreparedKernel, PreparedCompositionError> {
-    let source = CString::new(kernel.source.as_bytes()).map_err(|_| {
-        PreparedCompositionError::KernelSourceContainsNul {
-            component: component_index,
-            kernel: kernel_index,
-        }
-    })?;
-    let name = CString::new(kernel.kernel_name.as_bytes()).map_err(|_| {
-        PreparedCompositionError::KernelNameContainsNul {
-            component: component_index,
-            kernel: kernel_index,
-        }
-    })?;
-    let found = unsafe {
-        raw::stwo_cuda_jit_precompile(source.as_ptr(), name.as_ptr(), kernel.cache_key, false)
-    };
-    if !found {
-        return Err(PreparedCompositionError::AotKernelMiss {
-            component: component_index,
-            kernel: kernel_index,
-            cache_key: kernel.cache_key,
-        });
-    }
-    Ok(PreparedKernel {
-        source,
-        name,
-        cache_key: kernel.cache_key,
-        rc_base: kernel.rc_base,
-    })
 }
 
 fn prepare_aot_wave<'a>(
@@ -3401,7 +3818,7 @@ fn write_wave_part_descriptor(
     words: &mut [u32],
     base: usize,
     descriptor_ptr: *mut u32,
-    component: &PreparedComponent,
+    component: &PreparedComponent<'_>,
     proof_global_rc_base: u32,
 ) {
     let field = |offset: usize| base + offset / WORD_BYTES;
@@ -3910,6 +4327,120 @@ mod tests {
             .len();
         plan.cache_key = direct_composition_plan_key(&plan);
         plan
+    }
+
+    #[cfg(feature = "direct-retention-test-api")]
+    #[test]
+    fn resource_bounded_stripes_require_all_direct_serial_main_stream_topology() {
+        let plan = one_component_plan(vec![2, 0]);
+        let fallback = composition_workspace_requirements_with_mode(
+            &plan,
+            &trace(),
+            CompositionLaunchMode::Serial,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_resource_bounded_stripe_topology(&fallback, &[]),
+            Err(PreparedCompositionError::CompositionStripeRequiresAllDirect { .. })
+        ));
+
+        let source_count = fallback.components[0].sources.len();
+        let retention = retention_plan(&fallback, &(0..source_count).collect::<Vec<_>>());
+        let serial = composition_workspace_requirements_with_retention(
+            &plan,
+            &trace(),
+            CompositionLaunchMode::Serial,
+            Some(&retention),
+        )
+        .unwrap();
+        validate_resource_bounded_stripe_topology(&serial, &[]).unwrap();
+
+        let mut order_drift = serial.clone();
+        order_drift.serial_components.clear();
+        assert_eq!(
+            validate_resource_bounded_stripe_topology(&order_drift, &[]),
+            Err(PreparedCompositionError::CompositionStripePlanDrift(
+                "serial component order"
+            ))
+        );
+
+        let wide = composition_workspace_requirements_with_retention(
+            &plan,
+            &trace(),
+            CompositionLaunchMode::Wide,
+            Some(&retention),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_resource_bounded_stripe_topology(&wide, &[vec![0]]),
+            Err(PreparedCompositionError::CompositionStripePlanDrift(
+                "launch mode"
+            ))
+        );
+    }
+
+    #[cfg(feature = "direct-retention-test-api")]
+    #[test]
+    fn resource_bounded_speed_comparator_requires_direct_split_boundary_receipt() {
+        let valid = CompositionStripeBoundaryReceipt {
+            launch_mode: CompositionLaunchMode::Serial,
+            output_mode: CompositionOutputMode::DirectRetainedEvaluations,
+            stripe_count: 153,
+            serial_component_count: 45,
+            direct_retention_plan_key: Some(7),
+        };
+        require_resource_bounded_direct_boundary(&valid).unwrap();
+        for (mutated, field) in [
+            (
+                CompositionStripeBoundaryReceipt {
+                    launch_mode: CompositionLaunchMode::Wide,
+                    ..valid
+                },
+                "launch mode",
+            ),
+            (
+                CompositionStripeBoundaryReceipt {
+                    output_mode: CompositionOutputMode::CoefficientSplit,
+                    ..valid
+                },
+                "output ownership",
+            ),
+            (
+                CompositionStripeBoundaryReceipt {
+                    stripe_count: 0,
+                    ..valid
+                },
+                "stripe count",
+            ),
+            (
+                CompositionStripeBoundaryReceipt {
+                    serial_component_count: 0,
+                    ..valid
+                },
+                "component count",
+            ),
+            (
+                CompositionStripeBoundaryReceipt {
+                    direct_retention_plan_key: None,
+                    ..valid
+                },
+                "direct retention",
+            ),
+        ] {
+            assert_eq!(
+                require_resource_bounded_direct_boundary(&mutated),
+                Err(PreparedCompositionError::CompositionStripePlanDrift(field))
+            );
+        }
+        let source = include_str!("prepared_composition.rs");
+        let constructor = source
+            .find("pub fn prepare_resource_bounded_stripes_for_test")
+            .unwrap();
+        let direct_split = source[constructor..].find("Some(direct_split)").unwrap();
+        let boundary_guard = source[constructor..]
+            .find("require_resource_bounded_direct_boundary(&boundary)")
+            .unwrap();
+        assert!(direct_split < boundary_guard);
     }
 
     #[test]

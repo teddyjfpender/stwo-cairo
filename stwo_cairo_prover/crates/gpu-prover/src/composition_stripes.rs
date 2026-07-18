@@ -13,7 +13,9 @@
 
 use crate::composition_plan::CompositionPlan;
 use crate::composition_wave::{CompositionWaveError, CompositionWavePart, CompositionWaveProgram};
+use stwo_backend_cuda::aot::InstalledAotFunctionReceipt;
 
+pub const COMPOSITION_STRIPE_THREADS_PER_BLOCK: u32 = 128;
 pub const COMPOSITION_STRIPE_MAX_REGISTERS_PER_THREAD: u32 = 128;
 
 /// Resource facts measured from the final loadable cubin, never source or PTX
@@ -24,10 +26,30 @@ pub struct CompositionFinalCubinResource {
     pub semantic_hash: u64,
     pub cubin_identity: [u8; 32],
     pub target_sm: u32,
+    pub max_threads_per_block: u32,
     pub registers_per_thread: u32,
-    pub stack_frame_bytes: u64,
-    pub spill_store_bytes: u64,
-    pub spill_load_bytes: u64,
+    pub binary_version: u32,
+    pub ptx_version: u32,
+    pub local_bytes: u64,
+    pub static_shared_bytes: u64,
+}
+
+impl CompositionFinalCubinResource {
+    pub fn from_installed(receipt: &InstalledAotFunctionReceipt) -> Self {
+        let resources = receipt.resources();
+        Self {
+            cache_key: receipt.cache_key(),
+            semantic_hash: receipt.semantic_hash(),
+            cubin_identity: receipt.cubin_identity(),
+            target_sm: receipt.target_sm(),
+            max_threads_per_block: resources.max_threads_per_block,
+            registers_per_thread: resources.registers_per_thread,
+            binary_version: resources.binary_version,
+            ptx_version: resources.ptx_version,
+            local_bytes: resources.local_bytes,
+            static_shared_bytes: resources.static_shared_bytes,
+        }
+    }
 }
 
 /// One resource-qualified ordinary AOT part.
@@ -103,15 +125,21 @@ pub enum ResourceBoundedCompositionError {
         limit: u32,
         actual: u32,
     },
-    StackFrame {
+    MaxThreadsPerBlock {
+        stripe: usize,
+        required: u32,
+        actual: u32,
+    },
+    BinaryVersion {
+        stripe: usize,
+        expected: u32,
+        actual: u32,
+    },
+    LocalMemory {
         stripe: usize,
         actual_bytes: u64,
     },
-    SpillStores {
-        stripe: usize,
-        actual_bytes: u64,
-    },
-    SpillLoads {
+    StaticSharedMemory {
         stripe: usize,
         actual_bytes: u64,
     },
@@ -275,6 +303,13 @@ fn qualify_cubin(
             actual: cubin.target_sm,
         });
     }
+    if cubin.max_threads_per_block < COMPOSITION_STRIPE_THREADS_PER_BLOCK {
+        return Err(ResourceBoundedCompositionError::MaxThreadsPerBlock {
+            stripe,
+            required: COMPOSITION_STRIPE_THREADS_PER_BLOCK,
+            actual: cubin.max_threads_per_block,
+        });
+    }
     if cubin.registers_per_thread == 0
         || cubin.registers_per_thread > COMPOSITION_STRIPE_MAX_REGISTERS_PER_THREAD
     {
@@ -284,22 +319,23 @@ fn qualify_cubin(
             actual: cubin.registers_per_thread,
         });
     }
-    if cubin.stack_frame_bytes != 0 {
-        return Err(ResourceBoundedCompositionError::StackFrame {
+    if cubin.binary_version != target_sm {
+        return Err(ResourceBoundedCompositionError::BinaryVersion {
             stripe,
-            actual_bytes: cubin.stack_frame_bytes,
+            expected: target_sm,
+            actual: cubin.binary_version,
         });
     }
-    if cubin.spill_store_bytes != 0 {
-        return Err(ResourceBoundedCompositionError::SpillStores {
+    if cubin.local_bytes != 0 {
+        return Err(ResourceBoundedCompositionError::LocalMemory {
             stripe,
-            actual_bytes: cubin.spill_store_bytes,
+            actual_bytes: cubin.local_bytes,
         });
     }
-    if cubin.spill_load_bytes != 0 {
-        return Err(ResourceBoundedCompositionError::SpillLoads {
+    if cubin.static_shared_bytes != 0 {
+        return Err(ResourceBoundedCompositionError::StaticSharedMemory {
             stripe,
-            actual_bytes: cubin.spill_load_bytes,
+            actual_bytes: cubin.static_shared_bytes,
         });
     }
     Ok(())
@@ -368,10 +404,12 @@ mod tests {
                 semantic_hash: id + 100,
                 cubin_identity: [id as u8; 32],
                 target_sm: TARGET_SM,
+                max_threads_per_block: COMPOSITION_STRIPE_THREADS_PER_BLOCK,
                 registers_per_thread: 128,
-                stack_frame_bytes: 0,
-                spill_store_bytes: 0,
-                spill_load_bytes: 0,
+                binary_version: TARGET_SM,
+                ptx_version: 86,
+                local_bytes: 0,
+                static_shared_bytes: 0,
             })
             .collect()
     }
@@ -510,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn final_cubin_gate_rejects_identity_register_stack_and_spill_drift() {
+    fn final_cubin_gate_rejects_loaded_function_resource_drift() {
         assert!(matches!(
             rejected_resource(|resource| resource.cubin_identity = [0; 32]),
             ResourceBoundedCompositionError::EmptyCubinIdentity { stripe: 0 }
@@ -530,22 +568,31 @@ mod tests {
             ));
         }
         assert!(matches!(
-            rejected_resource(|resource| resource.stack_frame_bytes = 8),
-            ResourceBoundedCompositionError::StackFrame {
+            rejected_resource(|resource| resource.max_threads_per_block = 127),
+            ResourceBoundedCompositionError::MaxThreadsPerBlock {
+                stripe: 0,
+                actual: 127,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rejected_resource(|resource| resource.binary_version = 89),
+            ResourceBoundedCompositionError::BinaryVersion {
+                stripe: 0,
+                actual: 89,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rejected_resource(|resource| resource.local_bytes = 8),
+            ResourceBoundedCompositionError::LocalMemory {
                 stripe: 0,
                 actual_bytes: 8,
             }
         ));
         assert!(matches!(
-            rejected_resource(|resource| resource.spill_store_bytes = 8),
-            ResourceBoundedCompositionError::SpillStores {
-                stripe: 0,
-                actual_bytes: 8,
-            }
-        ));
-        assert!(matches!(
-            rejected_resource(|resource| resource.spill_load_bytes = 8),
-            ResourceBoundedCompositionError::SpillLoads {
+            rejected_resource(|resource| resource.static_shared_bytes = 8),
+            ResourceBoundedCompositionError::StaticSharedMemory {
                 stripe: 0,
                 actual_bytes: 8,
             }

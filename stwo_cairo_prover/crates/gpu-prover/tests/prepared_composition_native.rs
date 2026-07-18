@@ -34,6 +34,7 @@ use stwo_cairo_gpu_prover::direct_composition_retention::{
 };
 use stwo_cairo_gpu_prover::prepared_composition::{
     composition_workspace_requirements_with_retention_for_test, CompositionDirectEvaluationBinding,
+    CompositionOutputMode,
 };
 use stwo_cairo_gpu_prover::{
     composition_workspace_requirements, composition_workspace_requirements_with_mode,
@@ -1107,7 +1108,7 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
         interpolate_and_split(second, EVALUATION_LOG_SIZE)
     };
     let all_direct_bindings = all_direct_bindings();
-    let all_direct_prepared = PreparedCompositionGraph::prepare_with_mode_and_retention_for_test(
+    let all_direct_legacy = PreparedCompositionGraph::prepare_with_mode_and_retention_for_test(
         &arena,
         &all_direct_plan,
         &all_direct_trace,
@@ -1118,6 +1119,61 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
         &all_direct_bindings,
     )
     .unwrap();
+    let all_direct_prepared =
+        PreparedCompositionGraph::prepare_resource_bounded_stripes_coefficient_for_test(
+            &arena,
+            &all_direct_plan,
+            &all_direct_trace,
+            &all_direct_inputs,
+            &slots,
+            &all_direct_retention,
+            &all_direct_bindings,
+        )
+        .unwrap();
+    let boundary = all_direct_prepared
+        .resource_bounded_stripe_boundary_receipt_for_test()
+        .unwrap();
+    assert_eq!(boundary.launch_mode, CompositionLaunchMode::Serial);
+    assert_eq!(
+        boundary.output_mode,
+        CompositionOutputMode::CoefficientSplit
+    );
+    assert_eq!(
+        boundary.direct_retention_plan_key,
+        Some(all_direct_retention.cache_key)
+    );
+    let expected_stripes = all_direct_plan
+        .components
+        .iter()
+        .enumerate()
+        .flat_map(|(component, plan)| {
+            plan.kernels
+                .iter()
+                .enumerate()
+                .map(move |(kernel, plan)| (component, kernel, plan.cache_key, plan.semantic_hash))
+        })
+        .collect::<Vec<_>>();
+    let receipts = all_direct_prepared.resource_bounded_stripe_receipts_for_test();
+    assert_eq!(receipts.len(), expected_stripes.len());
+    for (receipt, expected) in receipts.iter().zip(expected_stripes) {
+        assert_eq!(
+            (
+                receipt.component,
+                receipt.kernel,
+                receipt.cache_key,
+                receipt.semantic_hash,
+            ),
+            expected
+        );
+        assert_eq!(receipt.launch.block(), [128, 1, 1]);
+        assert_eq!(receipt.launch.dynamic_shared_bytes(), 0);
+        assert!(receipt.resources.max_threads_per_block >= 128);
+        assert!((1..=128).contains(&receipt.resources.registers_per_thread));
+        assert_eq!(receipt.resources.binary_version, receipt.target_sm);
+        assert_eq!(receipt.resources.local_bytes, 0);
+        assert_eq!(receipt.resources.static_shared_bytes, 0);
+        assert_ne!(receipt.cubin_identity, [0; 32]);
+    }
     assert!(all_direct_prepared
         .composition_coefficients()
         .unwrap()
@@ -1133,15 +1189,22 @@ fn mixed_direct_fallback_duplicate_reuse_and_all_direct_zero_lde_are_native_safe
     let all_direct_coefficients_0 = coefficients(2000);
     upload_coefficients(&arena, &all_direct_coefficients_0);
     upload_all_direct(&all_direct_coefficients_0);
-    all_direct_prepared.launch().unwrap();
+    all_direct_legacy.launch().unwrap();
+    let all_direct_legacy_eager = read_outputs(&arena, &all_direct_legacy);
+    all_direct_prepared
+        .launch_resource_bounded_stripes_eager_for_test()
+        .unwrap();
     let all_direct_eager = read_outputs(&arena, &all_direct_prepared);
     arena.context().sync().unwrap();
+    assert_eq!(all_direct_eager, all_direct_legacy_eager);
     assert_eq!(
         all_direct_eager,
         expected_all_direct(&all_direct_coefficients_0)
     );
     let capture = arena.context().capture().unwrap();
-    all_direct_prepared.launch().unwrap();
+    all_direct_prepared
+        .launch_resource_bounded_stripes_capture_for_test()
+        .unwrap();
     let graph = capture.finish().unwrap();
     let all_direct_coefficients_1 = coefficients(3000);
     upload_coefficients(&arena, &all_direct_coefficients_1);
