@@ -69,11 +69,21 @@ vertical_validate() {
     --stdout "$(checkpoint_artifact stdout.txt)" \
     --proof "$(checkpoint_artifact proof.bin)" \
     --hardware "$(checkpoint_artifact hardware_identity.json)" \
+    --source "$(checkpoint_artifact source_input_identity.json)" \
+    --pie "$CHECKPOINT_PIE" \
+    --bootloader "$CHECKPOINT_BOOTLOADER" \
+    --input-manifest "$CHECKPOINT_INPUT_MANIFEST" \
+    --aot-manifest "$CHECKPOINT_AOT_MANIFEST" \
+    --stwo-head "$STWO_PARITY_REF_STWO_HEAD" \
+    --stwo-worktree "$STWO_PARITY_REF_STWO_WORKTREE_HASH" \
+    --stwo-cairo-head "$STWO_PARITY_REF_STWO_CAIRO_HEAD" \
+    --stwo-cairo-worktree "$STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH" \
     --reps 6 >"$(checkpoint_artifact record.json)"
   cat "$(checkpoint_artifact record.json)"
 }
 
 phase ambient_override_gate checkpoint_reject_ambient_overrides
+phase source_input_identity checkpoint_source_input_identity iteration
 phase hardware_identity vertical_hardware_identity
 phase build vertical_build
 phase sn2_compiled_vertical vertical_run

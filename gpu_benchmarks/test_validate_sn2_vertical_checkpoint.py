@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -71,20 +72,77 @@ def valid_record() -> dict[str, object]:
 
 
 class VerticalCheckpointValidatorTests(unittest.TestCase):
-    def run_validation(self, record: dict[str, object]) -> dict[str, object]:
+    def run_validation(
+        self, record: dict[str, object], receipt_mutator=None
+    ) -> dict[str, object]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             stdout = root / "stdout.txt"
             proof = root / "proof.bin"
             hardware = root / "hardware.json"
+            source = root / "source.json"
+            pie = root / "SN_PIE_2.zip"
+            bootloader = root / "simple_bootloader_compiled.json"
+            input_manifest = root / "SHA256SUMS"
+            aot_manifest = root / "aot_manifest.json"
             stdout.write_text(json.dumps(record) + "\n", encoding="utf-8")
             proof.write_bytes(b"proof")
+            pie.write_bytes(b"sn2")
+            bootloader.write_bytes(b"bootloader")
+            input_hashes = {
+                "SN_PIE_2.zip": hashlib.sha256(pie.read_bytes()).hexdigest(),
+                "simple_bootloader_compiled.json": hashlib.sha256(
+                    bootloader.read_bytes()
+                ).hexdigest(),
+            }
+            input_manifest.write_text(
+                "".join(f"{digest}  {name}\n" for name, digest in input_hashes.items()),
+                encoding="utf-8",
+            )
+            entries = [
+                {"cache_key": "01" * 8, "kind": "witness", "label": "witness"},
+                {"cache_key": "02" * 8, "kind": "constraint", "label": "ordinary"},
+                {"cache_key": "03" * 8, "kind": "constraint", "label": "wave_log_21"},
+            ]
+            aot_manifest.write_text(
+                json.dumps(entries) + "\n", encoding="utf-8"
+            )
+            expected_source = {
+                "stwo": {"head": "ab" * 20, "worktree_sha256": "12" * 32},
+                "stwo_cairo": {"head": "cd" * 20, "worktree_sha256": "34" * 32},
+            }
+            source_receipt = {
+                "schema": "stwo.replacement-v1-sn2.source-input-identity.v1",
+                "source_policy": "iteration",
+                "source": copy.deepcopy(expected_source),
+                "inputs": input_hashes,
+                "aot_pack": {
+                    "manifest_sha256": hashlib.sha256(aot_manifest.read_bytes()).hexdigest(),
+                    "total": 3,
+                    "witness": 1,
+                    "ordinary_constraint": 1,
+                    "composition_wave": 1,
+                },
+            }
+            if receipt_mutator is not None:
+                receipt_mutator(source_receipt)
+            source.write_text(json.dumps(source_receipt), encoding="utf-8")
             hardware.write_text(json.dumps({
                 "schema": "stwo.replacement-v1-sn2.hardware-identity.v2",
                 "name": "NVIDIA H100 80GB HBM3", "uuid": "GPU-test",
                 "compute_capability": "9.0", "memory_mib": 81_559,
             }), encoding="utf-8")
-            return validate_checkpoint(stdout, proof, hardware)
+            return validate_checkpoint(
+                stdout,
+                proof,
+                hardware,
+                source,
+                pie,
+                bootloader,
+                input_manifest,
+                aot_manifest,
+                expected_source,
+            )
 
     def test_accepts_only_explicit_non_formal_vertical(self) -> None:
         result = self.run_validation(valid_record())
@@ -113,6 +171,23 @@ class VerticalCheckpointValidatorTests(unittest.TestCase):
                 record[field] = "unexpected"
                 with self.assertRaises(CheckpointError):
                     self.run_validation(record)
+
+    def test_rejects_mutated_source_input_and_aot_receipts(self) -> None:
+        mutations = {
+            "source": lambda receipt: receipt["source"]["stwo"].update(
+                head="ef" * 20
+            ),
+            "input": lambda receipt: receipt["inputs"].update(
+                {"SN_PIE_2.zip": "00" * 32}
+            ),
+            "aot_hash": lambda receipt: receipt["aot_pack"].update(
+                manifest_sha256="00" * 32
+            ),
+            "aot_shape": lambda receipt: receipt["aot_pack"].update(total=4),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), self.assertRaises(CheckpointError):
+                self.run_validation(valid_record(), mutate)
 
 
 if __name__ == "__main__":

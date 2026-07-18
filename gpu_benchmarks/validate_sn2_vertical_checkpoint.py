@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 
 
@@ -59,6 +60,99 @@ def _positive_number(value: object) -> bool:
     )
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _input_hashes(path: Path) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        digest, name = line.split()
+        _require(
+            re.fullmatch(r"[0-9a-f]{64}", digest) is not None and name not in hashes,
+            "input manifest is malformed or duplicated",
+        )
+        hashes[name] = digest
+    expected = {"SN_PIE_2.zip", "simple_bootloader_compiled.json"}
+    _require(expected <= hashes.keys(), "input manifest omits SN2 or bootloader")
+    return {name: hashes[name] for name in sorted(expected)}
+
+
+def _aot_identity(path: Path) -> dict[str, object]:
+    raw = path.read_bytes()
+    entries = json.loads(raw)
+    _require(
+        isinstance(entries, list)
+        and bool(entries)
+        and all(isinstance(entry, dict) for entry in entries),
+        "AOT manifest is empty or malformed",
+    )
+    keys = [entry.get("cache_key") for entry in entries]
+    _require(
+        all(isinstance(key, str) and re.fullmatch(r"[0-9a-f]{16}", key) for key in keys)
+        and len(set(keys)) == len(keys),
+        "AOT manifest cache keys are invalid or duplicated",
+    )
+    waves = [
+        entry
+        for entry in entries
+        if entry.get("kind") == "constraint"
+        and re.fullmatch(r"wave_log_[0-9]+", str(entry.get("label", "")))
+    ]
+    witness = [entry for entry in entries if entry.get("kind") == "witness"]
+    ordinary = [
+        entry
+        for entry in entries
+        if entry.get("kind") == "constraint" and entry not in waves
+    ]
+    _require(
+        len(witness) + len(ordinary) + len(waves) == len(entries),
+        "AOT manifest contains an unknown entry kind",
+    )
+    return {
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "total": len(entries),
+        "witness": len(witness),
+        "ordinary_constraint": len(ordinary),
+        "composition_wave": len(waves),
+    }
+
+
+def _validate_source_identity(
+    source_path: Path,
+    pie_path: Path,
+    bootloader_path: Path,
+    input_manifest_path: Path,
+    aot_manifest_path: Path,
+    expected_source: dict[str, dict[str, str]],
+) -> dict[str, object]:
+    receipt = json.loads(source_path.read_text(encoding="utf-8"))
+    _require(
+        receipt.get("schema") == "stwo.replacement-v1-sn2.source-input-identity.v1"
+        and receipt.get("source_policy") == "iteration",
+        "vertical source/input receipt is absent or promotable",
+    )
+    for repository, identity in expected_source.items():
+        _require(
+            re.fullmatch(r"[0-9a-f]{40}", identity["head"]) is not None
+            and re.fullmatch(r"[0-9a-f]{64}", identity["worktree_sha256"]) is not None,
+            f"{repository} source identity is malformed",
+        )
+    _require(receipt.get("source") == expected_source, "vertical source identity drifted")
+
+    expected_inputs = _input_hashes(input_manifest_path)
+    actual_inputs = {
+        "SN_PIE_2.zip": _sha256(pie_path),
+        "simple_bootloader_compiled.json": _sha256(bootloader_path),
+    }
+    _require(actual_inputs == expected_inputs, "vertical input bytes differ from the manifest")
+    _require(receipt.get("inputs") == actual_inputs, "vertical input receipt drifted")
+
+    aot_pack = _aot_identity(aot_manifest_path)
+    _require(receipt.get("aot_pack") == aot_pack, "vertical AOT receipt drifted")
+    return receipt
+
+
 def _load_primary(path: Path) -> dict[str, object]:
     records = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -80,11 +174,25 @@ def validate_checkpoint(
     stdout_path: Path,
     proof_path: Path,
     hardware_path: Path,
+    source_path: Path,
+    pie_path: Path,
+    bootloader_path: Path,
+    input_manifest_path: Path,
+    aot_manifest_path: Path,
+    expected_source: dict[str, dict[str, str]],
     *,
     reps: int = 6,
 ) -> dict[str, object]:
     record = _load_primary(stdout_path)
     hardware = json.loads(hardware_path.read_text(encoding="utf-8"))
+    source = _validate_source_identity(
+        source_path,
+        pie_path,
+        bootloader_path,
+        input_manifest_path,
+        aot_manifest_path,
+        expected_source,
+    )
     proof = proof_path.read_bytes()
     _require(bool(proof), "proof artifact is empty")
 
@@ -208,6 +316,9 @@ def validate_checkpoint(
         "strict_session_gate": True,
         "strict_aot_gate": True,
         "pcs_telemetry": None,
+        "source": source["source"],
+        "inputs": source["inputs"],
+        "aot_pack": source["aot_pack"],
     }
 
 
@@ -216,11 +327,38 @@ def main() -> int:
     parser.add_argument("--stdout", required=True, type=Path)
     parser.add_argument("--proof", required=True, type=Path)
     parser.add_argument("--hardware", required=True, type=Path)
+    parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--pie", required=True, type=Path)
+    parser.add_argument("--bootloader", required=True, type=Path)
+    parser.add_argument("--input-manifest", required=True, type=Path)
+    parser.add_argument("--aot-manifest", required=True, type=Path)
+    parser.add_argument("--stwo-head", required=True)
+    parser.add_argument("--stwo-worktree", required=True)
+    parser.add_argument("--stwo-cairo-head", required=True)
+    parser.add_argument("--stwo-cairo-worktree", required=True)
     parser.add_argument("--reps", type=int, default=6)
     args = parser.parse_args()
     try:
         result = validate_checkpoint(
-            args.stdout, args.proof, args.hardware, reps=args.reps
+            args.stdout,
+            args.proof,
+            args.hardware,
+            args.source,
+            args.pie,
+            args.bootloader,
+            args.input_manifest,
+            args.aot_manifest,
+            {
+                "stwo": {
+                    "head": args.stwo_head,
+                    "worktree_sha256": args.stwo_worktree,
+                },
+                "stwo_cairo": {
+                    "head": args.stwo_cairo_head,
+                    "worktree_sha256": args.stwo_cairo_worktree,
+                },
+            },
+            reps=args.reps,
         )
     except (CheckpointError, OSError, ValueError) as error:
         parser.error(str(error))

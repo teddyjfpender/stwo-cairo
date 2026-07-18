@@ -32,7 +32,7 @@ CHECKPOINT_AOT_TOTAL=373
 CHECKPOINT_AOT_WITNESS=35
 CHECKPOINT_AOT_ORDINARY_CONSTRAINT=219
 CHECKPOINT_AOT_COMPOSITION_WAVE=119
-if [[ "$REPLACEMENT_SN2_MODE" == iteration ]]; then
+if [[ "$REPLACEMENT_SN2_MODE" == iteration || "$REPLACEMENT_SN2_MODE" == vertical ]]; then
   read -r CHECKPOINT_AOT_TOTAL CHECKPOINT_AOT_WITNESS \
     CHECKPOINT_AOT_ORDINARY_CONSTRAINT CHECKPOINT_AOT_COMPOSITION_WAVE \
     CHECKPOINT_AOT_MANIFEST_SHA256 < <(
@@ -178,6 +178,7 @@ checkpoint_source_input_identity() {
   [[ "$source_policy" != clean ]] || rm -f "$CHECKPOINT_SEAL"
   out="$(checkpoint_artifact source_input_identity.json)"
   RAW_SHA="$raw_actual" BOOT_SHA="$boot_actual" SOURCE_POLICY="$source_policy" \
+    AOT_MANIFEST_SHA="$CHECKPOINT_AOT_MANIFEST_SHA256" \
     AOT_TOTAL="$CHECKPOINT_AOT_TOTAL" AOT_WITNESS="$CHECKPOINT_AOT_WITNESS" \
     AOT_ORDINARY="$CHECKPOINT_AOT_ORDINARY_CONSTRAINT" \
     AOT_WAVE="$CHECKPOINT_AOT_COMPOSITION_WAVE" \
@@ -197,6 +198,7 @@ record = {
         "simple_bootloader_compiled.json": os.environ["BOOT_SHA"],
     },
     "aot_pack": {
+        "manifest_sha256": os.environ["AOT_MANIFEST_SHA"],
         "total": int(os.environ["AOT_TOTAL"]),
         "witness": int(os.environ["AOT_WITNESS"]),
         "ordinary_constraint": int(os.environ["AOT_ORDINARY"]),
