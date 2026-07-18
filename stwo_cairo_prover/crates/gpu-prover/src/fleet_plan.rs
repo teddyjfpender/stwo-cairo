@@ -17,6 +17,7 @@ use crate::transcript_plan::{
 
 mod casm_setup_admission;
 mod compiler;
+mod device_install;
 mod identity;
 mod ipc_control_frame;
 mod ipc_cursor;
@@ -37,6 +38,7 @@ pub use casm_setup_admission::{
     FleetCasmSetupSource,
 };
 pub use compiler::FleetCompileError;
+pub(crate) use device_install::{FleetWorkerDeviceInstall, FleetWorkerDeviceInstallError};
 pub(crate) use ipc_control_frame::{
     FleetIpcControlCodec, FleetIpcControlEndpointRole, FleetIpcControlFrameError,
     FleetIpcControlMessageKind,
