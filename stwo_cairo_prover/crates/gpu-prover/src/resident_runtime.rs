@@ -13,20 +13,20 @@ use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo_backend_cuda::{
-    cuda_device_snapshot, ArenaError, ArenaSlice, ArenaSlotId, Blake2sProofAssemblyShape,
-    CommitCoefficientGroup, CommitEvaluationGroup, CommitProgram, CompactDomainBindingError,
-    CompactDomainProgram, CompositionSplitLaunchMode, CompositionSplitTraffic, CudaDeviceSnapshot,
-    CudaExecContext, CudaExecTelemetry, CudaRuntimeError, DecommitAssembly, DecommitColumnSource,
-    DecommitTreeGeometry, DecommitTreeSources, DeviceTranscriptError,
-    DirectCompactDomainBindingError, DirectCompactTerminalBatchMode, DirectCompactTerminalReceipt,
-    DomainCooperativeBindingError, DomainCooperativeProgram, ExecutionTablesHostData,
-    FixedTableSourceColumn, FriDecommitOwnedSources, MemoryBaseTracePart,
-    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError,
-    PreparedBlake2sPowGraph, PreparedBlake2sTranscript, PreparedBlakeGFusedFeed,
-    PreparedCommitError, PreparedCommitGraph, PreparedCompactDomainCommitGraph,
-    PreparedDecommitError, PreparedDecommitGraph, PreparedDirectCompactDomainCommitGraph,
-    PreparedEcOpError, PreparedEcOpGraph, PreparedEcOpIngestTelemetry,
-    PreparedExecutionTablesError, PreparedExecutionTablesGraph,
+    cuda_device_snapshot, ArenaError, ArenaSlice, ArenaSlotId, Blake2sPowRankTile,
+    Blake2sProofAssemblyShape, CommitCoefficientGroup, CommitEvaluationGroup, CommitProgram,
+    CompactDomainBindingError, CompactDomainProgram, CompositionSplitLaunchMode,
+    CompositionSplitTraffic, CudaDeviceSnapshot, CudaExecContext, CudaExecTelemetry,
+    CudaRuntimeError, DecommitAssembly, DecommitColumnSource, DecommitTreeGeometry,
+    DecommitTreeSources, DeviceTranscriptError, DirectCompactDomainBindingError,
+    DirectCompactTerminalBatchMode, DirectCompactTerminalReceipt, DomainCooperativeBindingError,
+    DomainCooperativeProgram, ExecutionTablesHostData, FixedTableSourceColumn,
+    FriDecommitOwnedSources, MemoryBaseTracePart, ModeAwareCommitWorkspaceRequirements,
+    ModeAwareCommitWorkspaceSlots, PreparedBlake2sPowError, PreparedBlake2sPowGraph,
+    PreparedBlake2sTranscript, PreparedBlakeGFusedFeed, PreparedCommitError, PreparedCommitGraph,
+    PreparedCompactDomainCommitGraph, PreparedDecommitError, PreparedDecommitGraph,
+    PreparedDirectCompactDomainCommitGraph, PreparedEcOpError, PreparedEcOpGraph,
+    PreparedEcOpIngestTelemetry, PreparedExecutionTablesError, PreparedExecutionTablesGraph,
     PreparedExecutionTablesIngestTelemetry, PreparedFixedTableError, PreparedFixedTableGraph,
     PreparedFriError, PreparedFriFinalError, PreparedFriFinalGraph, PreparedFriGraph,
     PreparedInterpolationError, PreparedInterpolationGraph, PreparedMemoryBaseTraceError,
@@ -4882,6 +4882,17 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn launch_base_commit_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.launch_base_through_interaction_pow_challenge_eager()?;
+        self.interaction_pow.launch()?;
+        self.resume_interaction_after_pow_eager()
+    }
+
+    /// Execute the ordinary resident Base path up to the exact interaction-PoW
+    /// challenge. Fleet coordination may search from this boundary without
+    /// changing any preceding proof operation.
+    pub fn launch_base_through_interaction_pow_challenge_eager(
+        &mut self,
+    ) -> Result<(), ResidentRuntimeError> {
         self.consume_base_statement_sources()?;
         let mut producer_cursor = self.base_producer_schedule.cursor();
         if let Some(execution_tables) = &self.execution_tables {
@@ -4942,9 +4953,35 @@ impl<'a> ResidentGraphRuntime<'a> {
         )?;
         let bootstrap =
             self.transcript_segment_index(CairoTranscriptSegment::BootstrapThroughBase)?;
-        let pow = self.transcript_segment_index(CairoTranscriptSegment::InteractionPowAndLookup)?;
         self.launch_transcript_segment_eager(bootstrap)?;
-        self.interaction_pow.launch()?;
+        Ok(())
+    }
+
+    pub fn interaction_pow_state(
+        &self,
+    ) -> Result<[u32; stwo_backend_cuda::BLAKE2S_TRANSCRIPT_STATE_WORDS], ResidentRuntimeError>
+    {
+        Ok(self.interaction_pow.read_state()?)
+    }
+
+    pub fn launch_interaction_pow_rank_tile(
+        &self,
+        tile: Blake2sPowRankTile,
+    ) -> Result<u64, ResidentRuntimeError> {
+        self.interaction_pow.launch_rank_tile(tile)?;
+        Ok(self.interaction_pow.read_rank_result()?)
+    }
+
+    pub fn resume_interaction_with_pow_nonce_eager(
+        &mut self,
+        nonce: u64,
+    ) -> Result<(), ResidentRuntimeError> {
+        self.interaction_pow.upload_nonce(nonce)?;
+        self.resume_interaction_after_pow_eager()
+    }
+
+    fn resume_interaction_after_pow_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        let pow = self.transcript_segment_index(CairoTranscriptSegment::InteractionPowAndLookup)?;
         self.launch_transcript_segment_eager(pow)?;
         self.publish_relation_challenges_from_transcript()?;
         Ok(())
@@ -5072,12 +5109,47 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn launch_final_transcript_boundary_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.launch_final_through_query_pow_challenge_eager()?;
+        self.query_pow.launch()?;
+        self.resume_query_after_pow_eager()
+    }
+
+    /// Execute the resident FRI tail up to the exact query-PoW challenge.
+    pub fn launch_final_through_query_pow_challenge_eager(
+        &mut self,
+    ) -> Result<(), ResidentRuntimeError> {
         let last_layer = self.transcript_segment_index(CairoTranscriptSegment::FriLastLayer)?;
-        let queries =
-            self.transcript_segment_index(CairoTranscriptSegment::QueryPowAndPositions)?;
         self.fri_final.launch()?;
         self.launch_transcript_segment_eager(last_layer)?;
-        self.query_pow.launch()?;
+        Ok(())
+    }
+
+    pub fn query_pow_state(
+        &self,
+    ) -> Result<[u32; stwo_backend_cuda::BLAKE2S_TRANSCRIPT_STATE_WORDS], ResidentRuntimeError>
+    {
+        Ok(self.query_pow.read_state()?)
+    }
+
+    pub fn launch_query_pow_rank_tile(
+        &self,
+        tile: Blake2sPowRankTile,
+    ) -> Result<u64, ResidentRuntimeError> {
+        self.query_pow.launch_rank_tile(tile)?;
+        Ok(self.query_pow.read_rank_result()?)
+    }
+
+    pub fn resume_query_with_pow_nonce_eager(
+        &mut self,
+        nonce: u64,
+    ) -> Result<(), ResidentRuntimeError> {
+        self.query_pow.upload_nonce(nonce)?;
+        self.resume_query_after_pow_eager()
+    }
+
+    fn resume_query_after_pow_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        let queries =
+            self.transcript_segment_index(CairoTranscriptSegment::QueryPowAndPositions)?;
         self.launch_transcript_segment_eager(queries)?;
         self.decommit.launch_query_normalization()?;
         let trace_tree_count = self.workspace.plan().commitments().len();

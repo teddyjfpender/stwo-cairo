@@ -2,13 +2,16 @@
 
 use std::collections::BTreeMap;
 
-use stwo_backend_cuda::{pow_index_to_nonce, POW_GRIND_LOW_BITS};
+use stwo_backend_cuda::{
+    pow_index_to_nonce, Blake2sPowFleetAttempt, POW_GRIND_LOW_BITS, POW_INDEX_LIMIT,
+    POW_THREADS_PER_BLOCK,
+};
 
 use crate::fleet_plan::WorkerId;
 
 // Mirrors resident_pow.cu: SIMD requires `hi < 2^31 - 1`, so this is the
 // exclusive end of the `(hi << POW_GRIND_LOW_BITS) | low` index lattice.
-const MAX_INDEX_EXCLUSIVE: u64 = ((1u64 << 31) - 1) << POW_GRIND_LOW_BITS;
+const MAX_INDEX_EXCLUSIVE: u64 = POW_INDEX_LIMIT;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum FleetPowSite {
@@ -123,6 +126,76 @@ impl FleetPowPlan {
             .ok_or(FleetPowError::SizeOverflow)?
             .min(MAX_INDEX_EXCLUSIVE);
         Ok((start, end))
+    }
+
+    /// Bind one shared attempt directly to the production CUDA rank kernel.
+    /// Every worker tile must be derived from the returned value.
+    pub fn attempt(
+        self,
+        rank_count: usize,
+        attempt_ordinal: u64,
+    ) -> Result<Blake2sPowFleetAttempt, FleetPowError> {
+        self.validate(rank_count)?;
+        if self.workers_per_rank % POW_THREADS_PER_BLOCK != 0 {
+            return Err(FleetPowError::InvalidGeometry);
+        }
+        let (start, end) = self.attempt_bounds(attempt_ordinal)?;
+        Blake2sPowFleetAttempt::new(
+            u32::try_from(rank_count).map_err(|_| FleetPowError::SizeOverflow)?,
+            start,
+            end,
+            self.workers_per_rank / POW_THREADS_PER_BLOCK,
+        )
+        .map_err(|_| FleetPowError::InvalidGeometry)
+    }
+
+    /// Wait for exactly one completed result from every rank, validate its
+    /// generation and ownership, and return the canonical global minimum.
+    /// `None` means this complete attempt tile contained no winner.
+    pub fn reduce_attempt(
+        self,
+        site: FleetPowSite,
+        rank_count: usize,
+        plan_identity: [u8; 32],
+        proof_generation: u64,
+        attempt_ordinal: u64,
+        receipts: &[PowRankReceipt],
+        is_valid_nonce: impl Fn(u64) -> bool,
+    ) -> Result<Option<u64>, FleetPowError> {
+        self.validate(rank_count)?;
+        let (start, end) = self.attempt_bounds(attempt_ordinal)?;
+        if receipts.len() != rank_count {
+            return Err(FleetPowError::IncompleteReceipts);
+        }
+        let mut seen = vec![false; rank_count];
+        let mut winner = None;
+        for receipt in receipts {
+            let rank = receipt.rank.0 as usize;
+            if receipt.site != site
+                || receipt.plan_identity != plan_identity
+                || receipt.proof_generation != proof_generation
+                || receipt.attempt_ordinal != attempt_ordinal
+                || rank >= rank_count
+                || std::mem::replace(&mut seen[rank], true)
+            {
+                return Err(FleetPowError::InvalidReceipt(receipt.rank));
+            }
+            if let Some(nonce) = receipt.candidate_nonce {
+                let index = nonce_to_index(nonce)?;
+                if index < start
+                    || index >= end
+                    || !self.index_belongs_to_rank(rank_count, receipt.rank, index)?
+                    || !is_valid_nonce(nonce)
+                {
+                    return Err(FleetPowError::InvalidReceipt(receipt.rank));
+                }
+                winner = Some(winner.map_or(nonce, |current: u64| current.min(nonce)));
+            }
+        }
+        if seen.iter().any(|&present| !present) {
+            return Err(FleetPowError::IncompleteReceipts);
+        }
+        Ok(winner)
     }
 
     /// Reduce dense, wait-all attempt tiles. A receipt attests that its rank

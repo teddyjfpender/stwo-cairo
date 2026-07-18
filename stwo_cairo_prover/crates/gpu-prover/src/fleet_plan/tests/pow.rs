@@ -68,6 +68,30 @@ fn final_non_divisor_attempt_is_partial_then_exhausted() {
 }
 
 #[test]
+fn plan_binds_exactly_to_the_production_rank_tile_kernel() {
+    let pow = FleetPowPlan {
+        workers_per_rank: 4 * stwo_backend_cuda::POW_THREADS_PER_BLOCK,
+        indices_per_attempt: 65_537,
+    };
+    let attempt = pow.attempt(4, 2).unwrap();
+    let tile = attempt.rank_tile(3).unwrap();
+    assert_eq!(tile.rank_count(), 4);
+    assert_eq!(tile.rank(), 3);
+    assert_eq!(tile.start_index(), 131_074);
+    assert_eq!(tile.end_index(), 196_611);
+    assert_eq!(tile.grid_blocks(), 4);
+
+    let unlaunchable = FleetPowPlan {
+        workers_per_rank: stwo_backend_cuda::POW_THREADS_PER_BLOCK + 1,
+        indices_per_attempt: 1,
+    };
+    assert_eq!(
+        unlaunchable.attempt(2, 0),
+        Err(FleetPowError::InvalidGeometry)
+    );
+}
+
+#[test]
 fn partition_and_winner_are_exact_rank_and_site_contracts() {
     let pow = FleetPowPlan {
         workers_per_rank: 2,
@@ -106,6 +130,46 @@ fn partition_and_winner_are_exact_rank_and_site_contracts() {
         .filter_map(|receipt| receipt.candidate_nonce)
         .min()
         .unwrap();
+    assert_eq!(
+        pow.reduce_attempt(
+            FleetPowSite::Interaction,
+            2,
+            [9; 32],
+            7,
+            0,
+            &receipts,
+            |_| true,
+        )
+        .unwrap(),
+        Some(expected)
+    );
+    let no_winner = [receipt(WorkerId(1), None), receipt(WorkerId(0), None)];
+    assert_eq!(
+        pow.reduce_attempt(
+            FleetPowSite::Interaction,
+            2,
+            [9; 32],
+            7,
+            0,
+            &no_winner,
+            |_| true,
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        pow.reduce_attempt(
+            FleetPowSite::Interaction,
+            2,
+            [9; 32],
+            7,
+            0,
+            &receipts[..1],
+            |_| true,
+        )
+        .unwrap_err(),
+        FleetPowError::IncompleteReceipts
+    );
     assert_eq!(
         pow.verify_winner(FleetPowSite::Interaction, 2, [9; 32], 7, &receipts, |_| {
             true

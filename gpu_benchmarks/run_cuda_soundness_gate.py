@@ -331,7 +331,7 @@ GATES = (
             "--test",
             "prepared_fri_final_pow_native",
         ),
-        2,
+        3,
     ),
     (
         "prepared_decommit_eager_capture_reference",
