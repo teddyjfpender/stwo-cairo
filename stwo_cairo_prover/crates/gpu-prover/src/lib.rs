@@ -29,6 +29,7 @@ pub mod fleet_plan;
 pub mod fleet_pow;
 pub mod fleet_spill;
 pub mod graphs;
+pub mod interaction_pow_vertical;
 pub mod memory_ledger;
 pub mod multiplicity_pipeline;
 pub mod phases;
