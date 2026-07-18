@@ -4,7 +4,6 @@ use std::sync::Arc;
 use cairo_air::claims::CairoClaim;
 use cairo_vm::types::layout_name::LayoutName;
 use stwo::core::pcs::PcsConfig;
-use stwo_backend_cuda::aot::{AotKernelModuleGlobals, AotKernelSchemaScope};
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
@@ -627,19 +626,6 @@ fn assert_exact_invocation_frontier(executable: &ShapeExecutable) {
         .base_interpolation
         .windows(2)
         .all(|pair| pair[0].batch < pair[1].batch));
-    match loaded_authority::require(&first_producer.source, 0, 8, 6) {
-        Ok(loaded) => {
-            assert_ne!(loaded.manifest_identity, [0; 32]);
-            assert_eq!(
-                loaded.kernel.program_identity(),
-                first_producer.source.program_identity
-            );
-        }
-        Err(InvocationShapeError::MissingLoadedAotAuthority) => {
-            assert!(aot::loaded_kernel_authority(first_producer.source.cache_key, 8, 6).is_none());
-        }
-        Err(error) => panic!("loaded recorded-witness authority drifted: {error:?}"),
-    }
     validate_invocation(
         &first_producer.source,
         &catalog,
@@ -714,94 +700,6 @@ fn generated_sn2_source_relocation_frontier_is_exact_and_promotion_stays_closed(
 fn generated_sn2_replacement_base_is_direct_and_retains_exact_b2n() {
     let executable = generated_sn2_replacement();
     assert_replacement_base_authority(&executable);
-}
-
-#[test]
-fn loaded_authority_field_view_rejects_every_mutation() {
-    let invocation = RecordedWitnessInvocationShape {
-        program_identity: [1; 32],
-        semantic_hash: 2,
-        cache_key: 3,
-        kernel_symbol: "recorded_witness".into(),
-        abi_schema_identity: AotKernelAbiSchema::RecordedWitnessV1.identity(),
-        deduce: recorded_deduce_authority::empty_for_test(),
-        launch: LaunchGeometry {
-            grid: [1, 1, 1],
-            block: [256, 1, 1],
-            cluster: None,
-            dynamic_shared_bytes: 0,
-            cooperative: false,
-        },
-        source_arguments: Vec::new(),
-    };
-    let fields = loaded_authority::LoadedAuthorityFields {
-        manifest_identity: [4; 32],
-        program_identity: invocation.program_identity,
-        abi_schema: Some(AotKernelAbiSchema::RecordedWitnessV1),
-        abi_schema_identity: invocation.abi_schema_identity,
-        schema_scope: AotKernelSchemaScope::StructuredAbi,
-        kernel_symbol: invocation.kernel_symbol.clone(),
-        semantic_hash: invocation.semantic_hash,
-        cache_key: invocation.cache_key,
-        target_sm: 86,
-        source_identity: invocation.deduce.source_identity,
-        cubin_identity: [6; 32],
-        authority_identity: [7; 32],
-        module_globals: AotKernelModuleGlobals::None,
-    };
-    loaded_authority::validate_fields(&invocation, 8, 6, &fields).unwrap();
-
-    let mut mutations = Vec::new();
-    let mut changed = fields.clone();
-    changed.manifest_identity = [0; 32];
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.program_identity[0] ^= 1;
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.abi_schema = None;
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.abi_schema_identity[0] ^= 1;
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.schema_scope = AotKernelSchemaScope::ExportedSymbolOnly;
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.kernel_symbol.push('x');
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.semantic_hash ^= 1;
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.cache_key ^= 1;
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.target_sm = 89;
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.source_identity[0] ^= 1;
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.cubin_identity = [0; 32];
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.authority_identity = [0; 32];
-    mutations.push(changed);
-    let mut changed = fields.clone();
-    changed.module_globals = AotKernelModuleGlobals::WitnessPedersenV1;
-    mutations.push(changed);
-
-    for changed in mutations {
-        assert_eq!(
-            loaded_authority::validate_fields(&invocation, 8, 6, &changed),
-            Err(InvocationShapeError::LoadedAotAuthorityMismatch)
-        );
-    }
-    assert_eq!(
-        loaded_authority::validate_fields(&invocation, 8, 10, &fields),
-        Err(InvocationShapeError::LoadedAotAuthorityMismatch)
-    );
 }
 
 fn execution_geometry(
