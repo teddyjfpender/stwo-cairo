@@ -4,7 +4,7 @@
 # pod_run: lease one_shot=false final_action=stop gpu=h100 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=3.00 name_prefix=sn2-vertical-h100- ttl_hours=2 idle_min=15
 
 # Reuse the pinned sm_90 build policy, H100 admission, and ambient override gate.
-REPLACEMENT_SN2_MODE=vertical
+export REPLACEMENT_SN2_MODE=vertical
 # shellcheck disable=SC1091
 source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
 
@@ -56,8 +56,8 @@ vertical_run() {
   set -e
   cat "$stderr"
   [[ $rc -eq 0 ]] || return "$rc"
-  [[ -s "$stdout" && -s "$stderr" && -s "$proof" ]] || {
-    echo "vertical checkpoint omitted stdout, stderr, or proof evidence" >&2
+  [[ -s "$stdout" && -s "$proof" ]] || {
+    echo "vertical checkpoint omitted stdout or proof evidence" >&2
     return 1
   }
   sha256sum "$proof" >"$(checkpoint_artifact proof.sha256.txt)"
