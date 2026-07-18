@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use super::*;
 
-pub(super) fn optional_captured_abba<WE, SE, WC, SC>(
+pub(crate) fn optional_captured_abba<WE, SE, WC, SC>(
     ready: &Ready,
     mut wave_eager: WE,
     mut stripes_eager: SE,
@@ -73,7 +73,7 @@ fn timed_abba<W: FnMut(), S: FnMut()>(arena: &DeviceArena, wave: &mut W, stripes
     })
 }
 
-pub(super) fn publish_receipt(
+pub(crate) fn publish_receipt(
     fixture: &Fixture,
     stripes: &PreparedCompositionGraph<'_>,
     eager_digest: [u8; 32],

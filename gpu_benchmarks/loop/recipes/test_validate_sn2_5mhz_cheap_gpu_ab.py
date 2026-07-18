@@ -291,6 +291,23 @@ class ReceiptValidationTests(unittest.TestCase):
         for path, marker in consumers:
             self.assertEqual(match_variants(path, marker), variants, path)
 
+    def test_composition_helpers_are_visible_to_the_integration_test(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[3]
+        support = (
+            root
+            / "stwo_cairo_prover/crates/gpu-prover/tests/support/composition_stripe_direct"
+        )
+        for path, names in (
+            (support / "device.rs", ("ready", "refresh")),
+            (
+                support / "receipt.rs",
+                ("optional_captured_abba", "publish_receipt"),
+            ),
+        ):
+            source = path.read_text(encoding="utf-8")
+            for name in names:
+                self.assertRegex(source, rf"(?m)^pub\(crate\) fn {name}(?:<|\()")
+
     def test_relation_accepts_exact_shape_and_rejects_poison_policy_and_speedup(self) -> None:
         checks = Checks()
         self.assertEqual(set(relation(checks, relation_receipt(), HEAD)), {"eager", "captured"})

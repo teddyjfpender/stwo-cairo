@@ -150,7 +150,7 @@ fn fill(arena: &DeviceArena, slice: ArenaSlice, word: u32) {
     }
 }
 
-pub(super) fn ready(fixture: &Fixture, twiddles: &Twiddles, seed: u32) -> Ready {
+pub(crate) fn ready(fixture: &Fixture, twiddles: &Twiddles, seed: u32) -> Ready {
     let wave_requirements = composition_workspace_requirements_with_retention_for_test(
         &fixture.plan,
         &fixture.trace,
@@ -280,7 +280,7 @@ fn secure(seed: u32) -> SecureField {
     SecureField::from_u32_unchecked(seed + 2, seed + 3, seed + 5, seed + 7)
 }
 
-pub(super) fn refresh(ready: &Ready, seed: u32) {
+pub(crate) fn refresh(ready: &Ready, seed: u32) {
     upload(
         &ready.arena,
         ready.arena.bind(RANDOM).unwrap().truncated(4),
