@@ -1,0 +1,520 @@
+# shellcheck shell=bash
+# Nsight Systems follow-up for the indicative SN2 compiled-Composition vertical
+# checkpoint. The profiler-perturbed measurements are diagnostic only: they
+# cannot become a headline, a promotion result, or a replacement for ABBA.
+# pod_run: lease one_shot=false final_action=stop gpu=h100 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=3.00 name_prefix=replacement-v1-sn2- ttl_hours=2 idle_min=15
+
+export REPLACEMENT_SN2_MODE=vertical
+# shellcheck disable=SC1091
+source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
+
+vertical_nsys_resolve() {
+  local nsys_bin
+  nsys_bin="$(command -v nsys || true)"
+  [[ -n "$nsys_bin" ]] || nsys_bin="$CHECKPOINT_NSYS_FALLBACK"
+  [[ -x "$nsys_bin" ]] || {
+    echo "required Nsight Systems executable is absent: $nsys_bin" >&2
+    return 1
+  }
+  printf '%s' "$nsys_bin"
+}
+
+vertical_nsys_hardware_identity() {
+  checkpoint_hardware_identity
+  nvidia-smi -q >"$(checkpoint_artifact nvidia-smi-q.txt)"
+}
+
+vertical_nsys_build() {
+  checkpoint_reject_ambient_overrides
+  cd "$CAIRO"
+  cargo build --release --locked -p stwo-cairo-gpu-prover \
+    --bin gpu_bench --features pie-bench
+  [[ -x "$CHECKPOINT_GPU_BENCH" ]] || {
+    echo "SN2 Nsight diagnostic binary was not produced" >&2
+    return 1
+  }
+  {
+    sha256sum "$CHECKPOINT_GPU_BENCH"
+    rustc -Vv
+    nvcc --version
+  } >"$(checkpoint_artifact build-identity.txt)"
+}
+
+vertical_nsys_capture() {
+  local nsys_bin base report stdout stderr proof args_file rc
+  local -a args=(
+    --pie "$CHECKPOINT_PIE" --backend cuda --engine gpu-native
+    --resident-backend replacement-v1
+    --require-gpu-native-architecture
+    --require-gpu-pcs-runtime-mode arena-graph
+    --compiled-composition-vertical-checkpoint
+    --reuse-input --reps 2
+    --require-proof-byte-equal
+    --require-simd-reference-byte-equal
+    --require-proof-mutation-rejected
+  )
+  checkpoint_reject_ambient_overrides
+  [[ -f "$CHECKPOINT_PIE" ]] || {
+    echo "missing SN2 PIE: $CHECKPOINT_PIE" >&2
+    return 1
+  }
+  nsys_bin="$(vertical_nsys_resolve)"
+  base="$(checkpoint_artifact nsys_vertical)"
+  report="$base.nsys-rep"
+  stdout="$(checkpoint_artifact nsys_vertical.stdout.txt)"
+  stderr="$(checkpoint_artifact nsys_vertical.stderr.txt)"
+  proof="$(checkpoint_artifact nsys_vertical.proof.bin)"
+  args_file="$(checkpoint_artifact nsys_vertical.args.txt)"
+  rm -f "$report" "$stdout" "$stderr" "$proof" "$args_file"
+  printf '%s\n' "${args[@]}" >"$args_file"
+
+  set +e
+  "$nsys_bin" profile \
+    --trace=cuda,nvtx,osrt \
+    --sample=none \
+    --cpuctxsw=none \
+    --osrt-threshold=1000 \
+    --cuda-graph-trace=graph \
+    --stats=false \
+    --wait=all \
+    --force-overwrite=true \
+    --output="$base" \
+    env STWO_BENCH_TRACE=json STWO_DUMP_PROOF="$proof" \
+    "$CHECKPOINT_GPU_BENCH" "${args[@]}" >"$stdout" 2>"$stderr"
+  rc=$?
+  set -e
+
+  cat "$stderr"
+  [[ $rc -eq 0 ]] || {
+    echo "SN2 Nsight diagnostic failed rc=$rc" >&2
+    return "$rc"
+  }
+  [[ -s "$report" && -s "$stdout" && -s "$proof" && -s "$args_file" ]] || {
+    echo "SN2 Nsight diagnostic omitted required evidence" >&2
+    return 1
+  }
+  if grep -Eiq 'cuda[_ -]error|cudaError|out[_ -]of[_ -]memory|memory allocation failed|(^|[^[:alnum:]_])OOM([^[:alnum:]_]|$)' \
+      "$stdout" "$stderr"; then
+    echo "SN2 Nsight diagnostic emitted a CUDA/OOM signature" >&2
+    return 1
+  fi
+  sha256sum "$proof" "$report" >"$(checkpoint_artifact nsys_vertical.capture.sha256.txt)"
+  cat "$stdout"
+}
+
+vertical_nsys_validate() {
+  python3 "$CHECKPOINT_ROOT/gpu_benchmarks/validate_sn2_vertical_checkpoint.py" \
+    --stdout "$(checkpoint_artifact nsys_vertical.stdout.txt)" \
+    --proof "$(checkpoint_artifact nsys_vertical.proof.bin)" \
+    --hardware "$(checkpoint_artifact hardware_identity.json)" \
+    --source "$(checkpoint_artifact source_input_identity.json)" \
+    --pie "$CHECKPOINT_PIE" \
+    --bootloader "$CHECKPOINT_BOOTLOADER" \
+    --input-manifest "$CHECKPOINT_INPUT_MANIFEST" \
+    --aot-manifest "$CHECKPOINT_AOT_MANIFEST" \
+    --stwo-head "$STWO_PARITY_REF_STWO_HEAD" \
+    --stwo-worktree "$STWO_PARITY_REF_STWO_WORKTREE_HASH" \
+    --stwo-cairo-head "$STWO_PARITY_REF_STWO_CAIRO_HEAD" \
+    --stwo-cairo-worktree "$STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH" \
+    --reps 2 >"$(checkpoint_artifact nsys_vertical.strict-record.json)"
+  cat "$(checkpoint_artifact nsys_vertical.strict-record.json)"
+}
+
+vertical_nsys_export_query() {
+  local nsys_bin base report sqlite kernels apis timeline summary
+  nsys_bin="$(vertical_nsys_resolve)"
+  base="$(checkpoint_artifact nsys_vertical)"
+  report="$base.nsys-rep"
+  sqlite="$base.sqlite"
+  kernels="$(checkpoint_artifact nsys_vertical.cuda_gpu_kern_sum.csv)"
+  apis="$(checkpoint_artifact nsys_vertical.cuda_api_sum.csv)"
+  timeline="$(checkpoint_artifact nsys_vertical.graph-timeline.csv)"
+  summary="$(checkpoint_artifact nsys_vertical.graph-timeline.json)"
+  rm -f "$sqlite" "$kernels" "$apis" "$timeline" "$summary"
+
+  "$nsys_bin" export --type=sqlite --force-overwrite=true \
+    --output="$sqlite" "$report"
+  [[ -s "$sqlite" ]] || {
+    echo "Nsight Systems SQLite export is absent" >&2
+    return 1
+  }
+  "$nsys_bin" stats --force-export=false --report cuda_gpu_kern_sum \
+    --format csv "$sqlite" >"$kernels"
+  "$nsys_bin" stats --force-export=false --report cuda_api_sum \
+    --format csv "$sqlite" >"$apis"
+  [[ -s "$kernels" && -s "$apis" ]] || {
+    echo "Nsight Systems summary reports are absent" >&2
+    return 1
+  }
+
+  python3 - "$sqlite" "$timeline" "$summary" <<'PY'
+import csv
+import hashlib
+import json
+import pathlib
+import sqlite3
+import sys
+
+database, timeline_path, summary_path = map(pathlib.Path, sys.argv[1:])
+connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+tables = {
+    row[0]
+    for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    )
+}
+if "StringIds" not in tables or "CUPTI_ACTIVITY_KIND_RUNTIME" not in tables:
+    raise SystemExit("Nsight export omits StringIds or CUDA runtime activity")
+
+api_tables = sorted(
+    table
+    for table in tables
+    if table in {"CUPTI_ACTIVITY_KIND_RUNTIME", "CUPTI_ACTIVITY_KIND_DRIVER"}
+)
+events = []
+for table in api_tables:
+    columns = {
+        row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')
+    }
+    if not {"start", "end", "nameId"} <= columns:
+        raise SystemExit(f"Nsight API table has an unknown shape: {table}")
+    global_tid = "a.globalTid" if "globalTid" in columns else "NULL"
+    correlation_id = "a.correlationId" if "correlationId" in columns else "NULL"
+    query = f"""
+        SELECT a.start, a.end, s.value, {global_tid}, {correlation_id}
+        FROM "{table}" AS a
+        JOIN StringIds AS s ON s.id = a.nameId
+        WHERE lower(s.value) LIKE '%graph%'
+           OR lower(s.value) LIKE '%capture%'
+        ORDER BY a.start, a.end, s.value
+    """
+    for start, end, name, tid, correlation in connection.execute(query):
+        if not isinstance(start, int) or not isinstance(end, int) or end < start:
+            raise SystemExit("Nsight graph API interval is malformed")
+        events.append(
+            {
+                "table": table,
+                "start_ns": start,
+                "end_ns": end,
+                "duration_ns": end - start,
+                "api": name,
+                "global_tid": tid,
+                "correlation_id": correlation,
+            }
+        )
+events.sort(key=lambda event: (event["start_ns"], event["end_ns"], event["api"]))
+
+def api_count(fragment):
+    fragment = fragment.lower()
+    return sum(fragment in str(event["api"]).lower() for event in events)
+
+captures_started = api_count("streambegincapture")
+captures_finished = api_count("streamendcapture")
+graphs_instantiated = api_count("graphinstantiate")
+graphs_launched = api_count("graphlaunch")
+if (captures_started, captures_finished, graphs_instantiated, graphs_launched) != (
+    14,
+    14,
+    14,
+    0,
+):
+    raise SystemExit(
+        "vertical graph lifecycle drifted: "
+        f"begin={captures_started}, end={captures_finished}, "
+        f"instantiate={graphs_instantiated}, launch={graphs_launched}"
+    )
+
+kernel_table = next(
+    (
+        table
+        for table in (
+            "CUPTI_ACTIVITY_KIND_KERNEL",
+            "CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL",
+        )
+        if table in tables
+    ),
+    None,
+)
+if kernel_table is None:
+    raise SystemExit("Nsight export omits CUDA kernel activity")
+kernel_columns = {
+    row[1] for row in connection.execute(f'PRAGMA table_info("{kernel_table}")')
+}
+if not {"start", "end"} <= kernel_columns:
+    raise SystemExit("Nsight kernel table has an unknown shape")
+kernel_count, kernel_device_ns = connection.execute(
+    f'SELECT count(*), coalesce(sum("end" - "start"), 0) FROM "{kernel_table}"'
+).fetchone()
+if not isinstance(kernel_count, int) or kernel_count <= 0 or kernel_device_ns <= 0:
+    raise SystemExit("Nsight kernel timeline is empty")
+
+graph_trace_rows = 0
+graph_trace_device_ns = 0
+if "CUPTI_ACTIVITY_KIND_GRAPH_TRACE" in tables:
+    graph_trace_rows, graph_trace_device_ns = connection.execute(
+        "SELECT count(*), coalesce(sum(end - start), 0) "
+        "FROM CUPTI_ACTIVITY_KIND_GRAPH_TRACE"
+    ).fetchone()
+if graph_trace_rows != 0 or graph_trace_device_ns != 0:
+    raise SystemExit(
+        "compiled vertical lane replayed a CUDA graph instead of remaining eager"
+    )
+
+graph_events = {}
+if "CUDA_GRAPH_EVENTS" in tables:
+    graph_events = {
+        name: {"count": count, "total_ns": total_ns}
+        for name, count, total_ns in connection.execute(
+            "SELECT s.value, count(*), coalesce(sum(e.end - e.start), 0) "
+            "FROM CUDA_GRAPH_EVENTS AS e "
+            "JOIN StringIds AS s ON s.id = e.nameId "
+            "GROUP BY s.value ORDER BY s.value"
+        )
+    }
+
+with timeline_path.open("w", encoding="utf-8", newline="") as stream:
+    writer = csv.DictWriter(
+        stream,
+        fieldnames=(
+            "table",
+            "start_ns",
+            "end_ns",
+            "duration_ns",
+            "api",
+            "global_tid",
+            "correlation_id",
+        ),
+    )
+    writer.writeheader()
+    writer.writerows(events)
+
+summary = {
+    "schema": "stwo.sn2-compiled-vertical-nsys-timeline.v1",
+    "verdict": "PASS",
+    "diagnostic_only": True,
+    "headline_eligible": False,
+    "performance_claim_admissible": False,
+    "timing_class": "profiler-perturbed-diagnostic-only",
+    "cuda_graph_trace_mode": "graph",
+    "graph_capture_begin_count": captures_started,
+    "graph_capture_end_count": captures_finished,
+    "graph_instantiate_count": graphs_instantiated,
+    "graph_launch_count": graphs_launched,
+    "graph_trace_row_count": graph_trace_rows,
+    "graph_trace_device_ns": graph_trace_device_ns,
+    "kernel_activity_table": kernel_table,
+    "kernel_activity_count": kernel_count,
+    "kernel_activity_device_ns": kernel_device_ns,
+    "graph_events": graph_events,
+    "timeline_event_count": len(events),
+    "timeline_csv_sha256": hashlib.sha256(timeline_path.read_bytes()).hexdigest(),
+    "sqlite_sha256": hashlib.sha256(database.read_bytes()).hexdigest(),
+}
+summary_path.write_text(
+    json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+print(summary_path.read_text(encoding="utf-8"), end="")
+PY
+
+  sha256sum "$report" "$sqlite" "$kernels" "$apis" "$timeline" "$summary" \
+    >"$(checkpoint_artifact nsys_vertical.export.sha256.txt)"
+}
+
+vertical_nsys_seal() {
+  python3 - \
+    "$(checkpoint_artifact nsys_vertical.strict-record.json)" \
+    "$(checkpoint_artifact nsys_vertical.graph-timeline.json)" \
+    "$(checkpoint_artifact nsys_tool_identity.json)" \
+    "$(checkpoint_artifact hardware_identity.json)" \
+    "$(checkpoint_artifact source_input_identity.json)" \
+    "$(checkpoint_artifact nsys_vertical.stdout.txt)" \
+    "$(checkpoint_artifact nsys_vertical.stderr.txt)" \
+    "$(checkpoint_artifact nsys_vertical.proof.bin)" \
+    "$(checkpoint_artifact nsys_vertical.args.txt)" \
+    "$(checkpoint_artifact nsys_vertical.nsys-rep)" \
+    "$(checkpoint_artifact nsys_vertical.sqlite)" \
+    "$(checkpoint_artifact nsys_vertical.cuda_gpu_kern_sum.csv)" \
+    "$(checkpoint_artifact nsys_vertical.cuda_api_sum.csv)" \
+    "$(checkpoint_artifact nsys_vertical.graph-timeline.csv)" \
+    "$CHECKPOINT_PIE" \
+    "$(checkpoint_artifact nsys_vertical.receipt.json)" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+(
+    strict_path,
+    timeline_path,
+    tool_path,
+    hardware_path,
+    source_path,
+    stdout_path,
+    stderr_path,
+    proof_path,
+    args_path,
+    report_path,
+    sqlite_path,
+    kernels_path,
+    apis_path,
+    timeline_csv_path,
+    pie_path,
+    receipt_path,
+) = map(pathlib.Path, sys.argv[1:])
+
+required = (
+    strict_path,
+    timeline_path,
+    tool_path,
+    hardware_path,
+    source_path,
+    stdout_path,
+    proof_path,
+    args_path,
+    report_path,
+    sqlite_path,
+    kernels_path,
+    apis_path,
+    timeline_csv_path,
+)
+if any(not path.is_file() or path.stat().st_size == 0 for path in required):
+    raise SystemExit("SN2 Nsight receipt input is missing or empty")
+if not stderr_path.is_file():
+    raise SystemExit("SN2 Nsight stderr artifact is missing")
+
+strict = json.loads(strict_path.read_text(encoding="utf-8"))
+timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+tool = json.loads(tool_path.read_text(encoding="utf-8"))
+hardware = json.loads(hardware_path.read_text(encoding="utf-8"))
+source = json.loads(source_path.read_text(encoding="utf-8"))
+expected_args = [
+    "--pie",
+    str(pie_path),
+    "--backend",
+    "cuda",
+    "--engine",
+    "gpu-native",
+    "--resident-backend",
+    "replacement-v1",
+    "--require-gpu-native-architecture",
+    "--require-gpu-pcs-runtime-mode",
+    "arena-graph",
+    "--compiled-composition-vertical-checkpoint",
+    "--reuse-input",
+    "--reps",
+    "2",
+    "--require-proof-byte-equal",
+    "--require-simd-reference-byte-equal",
+    "--require-proof-mutation-rejected",
+]
+actual_args = args_path.read_text(encoding="utf-8").splitlines()
+if actual_args != expected_args:
+    raise SystemExit(f"SN2 Nsight command drifted: {actual_args}")
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+if (
+    strict.get("schema") != "stwo.sn2-compiled-vertical-checkpoint.v2"
+    or strict.get("verdict") != "PASS"
+    or strict.get("formal_promotion_eligible") is not False
+    or strict.get("proof_byte_equal") is not True
+    or strict.get("simd_reference_byte_equal") is not True
+    or strict.get("mutation_rejected") is not True
+    or strict.get("composition_split_launch_mode") != "fused-first-forward"
+    or strict.get("composition_split_executed_kernel_launches") != 5
+    or strict.get("composition_split_executed_logical_bytes") != 4_026_531_840
+    or strict.get("proof_sha256") != digest(proof_path)
+):
+    raise SystemExit("strict fused-first-forward checkpoint receipt is invalid")
+if (
+    timeline.get("schema") != "stwo.sn2-compiled-vertical-nsys-timeline.v1"
+    or timeline.get("verdict") != "PASS"
+    or timeline.get("diagnostic_only") is not True
+    or timeline.get("headline_eligible") is not False
+    or timeline.get("performance_claim_admissible") is not False
+    or timeline.get("timing_class") != "profiler-perturbed-diagnostic-only"
+    or timeline.get("graph_capture_begin_count") != 14
+    or timeline.get("graph_capture_end_count") != 14
+    or timeline.get("graph_instantiate_count") != 14
+    or timeline.get("graph_launch_count") != 0
+    or timeline.get("graph_trace_row_count") != 0
+    or timeline.get("timeline_csv_sha256") != digest(timeline_csv_path)
+    or timeline.get("sqlite_sha256") != digest(sqlite_path)
+):
+    raise SystemExit("CUDA graph timeline receipt is invalid")
+if (
+    tool.get("schema") != "stwo.replacement-v1-sn2.nsys-tool-identity.v1"
+    or not tool.get("path")
+    or not tool.get("version")
+    or hardware.get("schema") != "stwo.replacement-v1-sn2.hardware-identity.v2"
+    or source.get("schema") != "stwo.replacement-v1-sn2.source-input-identity.v1"
+    or source.get("source_policy") != "iteration"
+):
+    raise SystemExit("SN2 Nsight authority identity is invalid")
+
+artifacts = {
+    path.name: {"bytes": path.stat().st_size, "sha256": digest(path)}
+    for path in (
+        stdout_path,
+        stderr_path,
+        proof_path,
+        args_path,
+        report_path,
+        sqlite_path,
+        kernels_path,
+        apis_path,
+        timeline_csv_path,
+        strict_path,
+        timeline_path,
+        tool_path,
+        hardware_path,
+        source_path,
+    )
+}
+receipt = {
+    "schema": "stwo.sn2-compiled-vertical-nsys-diagnostic.v1",
+    "verdict": "PASS",
+    "diagnostic_only": True,
+    "headline_eligible": False,
+    "formal_promotion_eligible": False,
+    "performance_claim_admissible": False,
+    "timing_class": "profiler-perturbed-diagnostic-only",
+    "program": "SN_PIE_2.zip",
+    "gpu": hardware["name"],
+    "gpu_uuid": hardware["uuid"],
+    "nsys_path": tool["path"],
+    "nsys_version": tool["version"],
+    "proof_byte_equal": True,
+    "simd_reference_byte_equal": True,
+    "mutation_rejected": True,
+    "composition_split_launch_mode": "fused-first-forward",
+    "composition_split_executed_kernel_launches": 5,
+    "composition_split_executed_logical_bytes": 4_026_531_840,
+    "graph_capture_count": 14,
+    "graph_launch_count": 0,
+    "profiled_benchmark_metrics": {
+        "prove_s_warm_median": strict["prove_s_warm_median"],
+        "useful_mhz_median": strict["useful_mhz_median"],
+        "admissible": False,
+    },
+    "artifacts": artifacts,
+}
+receipt_path.write_text(
+    json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+print(receipt_path.read_text(encoding="utf-8"), end="")
+PY
+}
+
+phase ambient_override_gate checkpoint_reject_ambient_overrides
+phase source_input_identity checkpoint_source_input_identity iteration
+phase hardware_identity vertical_nsys_hardware_identity
+phase nsys_tool_identity checkpoint_nsys_tool_identity
+phase build vertical_nsys_build
+phase nsys_compiled_vertical_capture vertical_nsys_capture
+phase nsys_compiled_vertical_validate vertical_nsys_validate
+phase nsys_compiled_vertical_export_query vertical_nsys_export_query
+phase nsys_compiled_vertical_seal vertical_nsys_seal
