@@ -183,6 +183,10 @@ class VerticalAbbaTests(unittest.TestCase):
             "validate_sn2_vertical_checkpoint.py",
             "--reps 2",
         )
+        receipt_parser = functions["vertical_abba_require_native_receipt"]
+        self.assertIn("line.split(prefix, 1)[1]", receipt_parser)
+        self.assertIn("if prefix in line", receipt_parser)
+        self.assertNotIn("line.startswith(prefix)", receipt_parser)
 
         spec = pregate._SN2_VERTICAL_RECIPES[pregate.SN2_VERTICAL_ABBA_RECIPE]
         for fragment in (

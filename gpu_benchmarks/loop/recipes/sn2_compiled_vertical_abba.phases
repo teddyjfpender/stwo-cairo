@@ -48,9 +48,9 @@ import sys
 log, marker, schema, out = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], pathlib.Path(sys.argv[4])
 prefix = marker + "="
 receipts = [
-    json.loads(line[len(prefix):])
+    json.loads(line.split(prefix, 1)[1])
     for line in log.read_text(encoding="utf-8", errors="replace").splitlines()
-    if line.startswith(prefix)
+    if prefix in line
 ]
 if len(receipts) != 1:
     raise SystemExit(f"{marker}: expected one exact receipt, got {len(receipts)}")
