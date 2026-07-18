@@ -5,13 +5,17 @@
 //! binding pass and constructs the three allocation-free launch objects in
 //! dependency order. No caller may recreate quotient constants on the host.
 
+mod receipt;
+
+pub use receipt::ResidentQuotientNumeratorReceipt;
 use stwo_backend_cuda::{
     quotient_numerator_staged_single_write_plan_with_overflow_capacities, ArenaError, ArenaSlice,
-    OodsColumnSource, OodsPolynomialColumn, OodsSourceKind, PreparedNumeratorSchedule,
-    PreparedOodsError, PreparedOodsGraph, PreparedQuotientError, PreparedQuotientGraph,
-    PreparedQuotientNumeratorError, PreparedQuotientNumeratorGraph, QuotientNumeratorColumn,
-    QuotientNumeratorColumnSource, QuotientNumeratorDestination, QuotientNumeratorSingleWriteError,
-    QuotientNumeratorSourceKind, QuotientNumeratorStagedSingleWriteError,
+    CudaRuntimeError, DeviceArena, OodsColumnSource, OodsPolynomialColumn, OodsSourceKind,
+    PreparedNumeratorSchedule, PreparedOodsError, PreparedOodsGraph, PreparedQuotientError,
+    PreparedQuotientGraph, PreparedQuotientNumeratorError, PreparedQuotientNumeratorGraph,
+    QuotientNumeratorColumn, QuotientNumeratorColumnSource, QuotientNumeratorDestination,
+    QuotientNumeratorSingleWriteError, QuotientNumeratorSourceKind,
+    QuotientNumeratorStagedSingleWriteError,
 };
 
 use crate::arena_plan::{
@@ -57,6 +61,21 @@ pub enum ResidentOodsError {
     Numerator(PreparedQuotientNumeratorError),
     NumeratorSchedule(QuotientNumeratorSingleWriteError),
     NumeratorStagedSchedule(QuotientNumeratorStagedSingleWriteError),
+    NumeratorDestinationCount {
+        expected: usize,
+        actual: usize,
+    },
+    NumeratorDestinationLogSize {
+        group: usize,
+        expected: u32,
+        actual: u32,
+    },
+    NumeratorDestinationWords {
+        group: usize,
+        coordinate: usize,
+        expected: usize,
+        actual: usize,
+    },
     StagedNumeratorBinding(&'static str),
     QuotientSourceLogsMismatch {
         planned: Vec<u32>,
@@ -64,6 +83,7 @@ pub enum ResidentOodsError {
     },
     QuotientProducerB2n(QuotientProducerB2nSelectionError),
     Quotient(PreparedQuotientError),
+    Cuda(CudaRuntimeError),
 }
 
 impl core::fmt::Display for ResidentOodsError {
@@ -113,6 +133,12 @@ impl From<QuotientNumeratorStagedSingleWriteError> for ResidentOodsError {
 impl From<PreparedQuotientError> for ResidentOodsError {
     fn from(value: PreparedQuotientError) -> Self {
         Self::Quotient(value)
+    }
+}
+
+impl From<CudaRuntimeError> for ResidentOodsError {
+    fn from(value: CudaRuntimeError) -> Self {
+        Self::Cuda(value)
     }
 }
 
@@ -529,10 +555,26 @@ impl<'a> ResidentOodsPipeline<'a> {
         Ok(())
     }
 
-    pub(crate) fn launch_numerator_and_quotient(&self) -> Result<(), ResidentOodsError> {
+    pub(crate) fn launch_numerator(&self) -> Result<(), ResidentOodsError> {
         self.numerator.launch()?;
+        Ok(())
+    }
+
+    pub(crate) fn read_numerator_receipt(
+        &self,
+        arena: &DeviceArena,
+    ) -> Result<ResidentQuotientNumeratorReceipt, ResidentOodsError> {
+        receipt::read_numerator_receipt(arena, &self.numerator)
+    }
+
+    pub(crate) fn launch_quotient(&self) -> Result<(), ResidentOodsError> {
         self.quotient.launch()?;
         Ok(())
+    }
+
+    pub(crate) fn launch_numerator_and_quotient(&self) -> Result<(), ResidentOodsError> {
+        self.launch_numerator()?;
+        self.launch_quotient()
     }
 
     pub(crate) const fn quotient(&self) -> &PreparedQuotientGraph<'a> {

@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 use cairo_vm::types::layout_name::LayoutName;
 use stwo::core::pcs::PcsConfig;
 use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
-use stwo_backend_cuda::{assemble_blake2s_stark_proof, Blake2sProofAssemblyInput};
+use stwo_backend_cuda::{
+    assemble_blake2s_stark_proof, Blake2sProofAssemblyInput, PreparedNumeratorSchedule,
+};
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
@@ -309,6 +311,51 @@ fn smoke_single_resident_proof_boundary_stepped() {
              STWO_SMOKE_DIVERGENCE_DIR is set)"
         );
     }
+}
+
+/// Hardware-only vertical check for the first CUDA arithmetic producer after
+/// the real OODS values and quotient random coefficient exist on device.
+///
+/// It deliberately stops before `PreparedQuotientGraph::launch`: the receipt
+/// pins the exact numerator output boundary, and
+/// `launch_quotient_after_numerator_eager` is the public continuation seam.
+#[test]
+#[ignore = "requires an explicit CUDA resident vertical run"]
+fn smoke_quotient_numerator_vertical_eager() {
+    let mut config = GpuProverConfig::default();
+    config.strict = true;
+    let mut prover = GpuCairoProver::<Blake2sMerkleChannel>::new(config).unwrap();
+
+    let (receipt, _) = prover
+        .with_strict_resident_session(
+            resident_input(),
+            resident_params(),
+            |runtime, _artifacts| {
+                runtime.require_prepared_witness_coverage()?;
+                runtime.begin_transcript_generation(1)?;
+                runtime.launch_base_commit_eager()?;
+                runtime.launch_interaction_eager()?;
+                runtime.launch_composition_commit_eager()?;
+                runtime.launch_quotient_numerator_eager_with_receipt()
+            },
+        )
+        .expect("resident quotient-numerator vertical run failed");
+
+    assert_eq!(receipt.group_count, 15);
+    assert_eq!(receipt.batch_count, 14);
+    assert_eq!(receipt.term_count, 4_853);
+    assert_eq!(receipt.output_rows, 18_210_768);
+    assert_eq!(receipt.output_words, 72_843_072);
+    assert_eq!(receipt.validation_d2h_bytes, 291_372_288);
+    assert!(matches!(
+        receipt.schedule,
+        PreparedNumeratorSchedule::StagedPackedSingleWrite {
+            packed_output_rows: 18_210_768
+        }
+    ));
+    assert_ne!(receipt.shape_digest, [0; 32]);
+    assert_ne!(receipt.output_digest, [0; 32]);
+    eprintln!("quotient-numerator vertical receipt: {receipt:?}");
 }
 
 /// Map felt indices to proof sections by mirroring the manual

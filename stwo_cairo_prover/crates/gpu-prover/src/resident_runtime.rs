@@ -76,7 +76,9 @@ use crate::resident_composition::{prepare_resident_composition, ResidentComposit
 use crate::resident_direct_commit::{
     direct_commitment_inputs, trace_commit_input_mode, TraceCommitInputMode,
 };
-use crate::resident_oods::{ResidentOodsError, ResidentOodsPipeline};
+use crate::resident_oods::{
+    ResidentOodsError, ResidentOodsPipeline, ResidentQuotientNumeratorReceipt,
+};
 use crate::resident_sources::{
     commitment_group, commitment_groups, prepare_commitment_interpolation, ResidentSourceStageError,
 };
@@ -4989,10 +4991,37 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn launch_oods_transcript_boundary_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.launch_quotient_numerator_eager()?;
+        self.oods.launch_quotient()?;
+        Ok(())
+    }
+
+    /// Run the real resident OODS transcript hand-off and quotient numerator,
+    /// then return diagnostic evidence for every numerator destination.
+    ///
+    /// This intentionally synchronizes and copies the numerator output to the
+    /// host. It is a vertical correctness seam, not part of captured production
+    /// replay. [`Self::launch_quotient_after_numerator_eager`] is the exact next
+    /// proof operation.
+    pub fn launch_quotient_numerator_eager_with_receipt(
+        &mut self,
+    ) -> Result<ResidentQuotientNumeratorReceipt, ResidentRuntimeError> {
+        self.launch_quotient_numerator_eager()?;
+        Ok(self.oods.read_numerator_receipt(self.workspace.arena())?)
+    }
+
+    /// Continue the diagnostic vertical path after a successful numerator
+    /// receipt. The prepared quotient graph consumes those same arena slices.
+    pub fn launch_quotient_after_numerator_eager(&self) -> Result<(), ResidentRuntimeError> {
+        self.oods.launch_quotient()?;
+        Ok(())
+    }
+
+    fn launch_quotient_numerator_eager(&mut self) -> Result<(), ResidentRuntimeError> {
         let transcript_segment =
             self.transcript_segment_index(CairoTranscriptSegment::OodsAndQuotient)?;
         self.launch_transcript_segment_eager(transcript_segment)?;
-        self.oods.launch_numerator_and_quotient()?;
+        self.oods.launch_numerator()?;
         Ok(())
     }
 

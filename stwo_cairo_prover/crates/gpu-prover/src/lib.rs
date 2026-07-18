@@ -82,7 +82,7 @@ pub use prover::{
     ResidentTranscriptMirrorTelemetry,
 };
 pub use resident_composition::ResidentCompositionError;
-pub use resident_oods::ResidentOodsError;
+pub use resident_oods::{ResidentOodsError, ResidentQuotientNumeratorReceipt};
 pub use resident_session::{
     ResidentExecutionReadiness, ResidentPreparationState, ResidentSessionError,
     ResidentSessionTelemetry,
