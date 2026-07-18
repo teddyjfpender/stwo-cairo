@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -134,6 +135,59 @@ class PregateInputAdmissionTests(unittest.TestCase):
                 ),
             ):
                 self.assertFalse(pregate.is_fresh(self.stwo, self.stwo_cairo))
+
+    def test_sn2_vertical_admission_is_recipe_and_source_bound(self) -> None:
+        recipe = self.stwo_cairo / pregate.SN2_VERTICAL_RECIPE
+        recipe.parent.mkdir(parents=True)
+        canonical = (
+            Path(__file__).resolve().parents[3] / pregate.SN2_VERTICAL_RECIPE
+        )
+        recipe.write_bytes(canonical.read_bytes())
+        common = recipe.parent / "replacement_v1_sn2_common.sh"
+        common.write_text("true\n")
+        source_identity = {
+            "stwo": {"head": "ab" * 20, "worktree_sha256": "12" * 32},
+            "stwo_cairo": {"head": "cd" * 20, "worktree_sha256": "34" * 32},
+        }
+        passed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            mock.patch.object(
+                pregate, "_source_identity", return_value=source_identity
+            ),
+            mock.patch.object(
+                pregate, "_tracked_control_is_clean", return_value=True
+            ),
+            mock.patch.object(pregate.subprocess, "run", return_value=passed) as run,
+        ):
+            receipt = pregate.admit_sn2_vertical(
+                recipe, self.stwo, self.stwo_cairo
+            )
+            self.assertIsNotNone(receipt)
+            self.assertEqual(receipt["scope"], pregate.SN2_VERTICAL_SCOPE)
+            self.assertTrue(
+                pregate.sn2_vertical_is_current(
+                    receipt, recipe, self.stwo, self.stwo_cairo
+                )
+            )
+            self.assertEqual(run.call_count, 2)
+            with (
+                mock.patch.object(
+                    pregate, "_tracked_control_is_clean", return_value=False
+                ),
+                mock.patch.object(pregate.subprocess, "run") as blocked,
+            ):
+                self.assertIsNone(
+                    pregate.admit_sn2_vertical(
+                        recipe, self.stwo, self.stwo_cairo
+                    )
+                )
+            blocked.assert_not_called()
+            recipe.write_text(recipe.read_text() + "\n# drift\n")
+            self.assertFalse(
+                pregate.sn2_vertical_is_current(
+                    receipt, recipe, self.stwo, self.stwo_cairo
+                )
+            )
 
 
 if __name__ == "__main__":

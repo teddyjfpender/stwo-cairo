@@ -49,6 +49,7 @@ def admission_args(**changes) -> argparse.Namespace:
         "one_shot": False,
         "failure_action": "stop",
         "purpose": "test",
+        "recipe": None,
     }
     values.update(changes)
     return argparse.Namespace(**values)
@@ -185,6 +186,56 @@ class ExistingPodAdmissionTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "fresh pregate"):
                 cli._prepare_existing_pod(admission_args())
+        offer.assert_not_called()
+        get.assert_not_called()
+        resume.assert_not_called()
+
+    def test_sn2_vertical_uses_only_its_bounded_recipe_admission(self) -> None:
+        recipe = (
+            FLEET_DIR.parent
+            / "loop/recipes/sn2_compiled_vertical_checkpoint.phases"
+        )
+        args = admission_args(
+            gpu="h100",
+            name_prefix="replacement-v1-sn2-",
+            max_usd_hr=3.0,
+            ttl_hours=2.0,
+            recipe=str(recipe),
+        )
+        receipt = {"scope": cli.pregate.SN2_VERTICAL_SCOPE}
+        with (
+            mock.patch.object(
+                cli.pregate, "admit_sn2_vertical", return_value=receipt
+            ) as vertical,
+            mock.patch.object(cli, "_require_pregate") as formal,
+        ):
+            self.assertIs(cli._require_resume_admission(args), receipt)
+        vertical.assert_called_once_with(recipe, cli.STWO, cli.STWO_CAIRO)
+        formal.assert_not_called()
+
+    def test_failed_sn2_vertical_gate_touches_no_provider_state(self) -> None:
+        recipe = (
+            FLEET_DIR.parent
+            / "loop/recipes/sn2_compiled_vertical_checkpoint.phases"
+        )
+        args = admission_args(
+            gpu="h100",
+            name_prefix="replacement-v1-sn2-",
+            max_usd_hr=3.0,
+            ttl_hours=2.0,
+            recipe=str(recipe),
+        )
+        with (
+            mock.patch.object(cli, "_bind_explicit_ssh_key"),
+            mock.patch.object(cli.pregate, "admit_sn2_vertical", return_value=None),
+            mock.patch.object(cli, "_require_pregate") as formal,
+            mock.patch.object(cli.api, "secure_offer") as offer,
+            mock.patch.object(cli.api, "get_pod") as get,
+            mock.patch.object(cli.api, "resume_pod") as resume,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "fresh pregate"):
+                cli._prepare_existing_pod(args)
+        formal.assert_not_called()
         offer.assert_not_called()
         get.assert_not_called()
         resume.assert_not_called()
@@ -464,6 +515,7 @@ class PodRunStaticTests(unittest.TestCase):
             '--min-vcpu "$LEASE_MIN_VCPU" --min-mem-gb "$LEASE_MIN_MEM_GB"',
             '--ttl-hours "$LEASE_TTL_HOURS" --idle-min "$LEASE_IDLE_MIN"',
             '--failure-action "$POD_RUN_FINAL_ACTION"',
+            '--recipe "$PHASES_FILE"',
             '[[ "$LEASE_ONE_SHOT" == 1 ]] && RESUME_ARGS+=(--one-shot)',
             "one-shot recipes require an explicit BENCH_POD_ID",
         )

@@ -142,6 +142,50 @@ def _require_pregate() -> bool:
     return False
 
 
+def _require_resume_admission(args) -> dict[str, object] | None:
+    recipe_value = getattr(args, "recipe", None)
+    recipe = Path(recipe_value) if recipe_value else None
+    if recipe is None or not pregate.is_sn2_vertical_recipe(recipe, STWO_CAIRO):
+        return {"scope": "formal-pregate"} if _require_pregate() else None
+
+    policy = load_lease_policy(recipe)
+    if (
+        policy.one_shot
+        or policy.final_action != "stop"
+        or policy.gpu != "h100"
+        or policy.gpu_count != 1
+        or policy.min_vcpu < 16
+        or policy.min_mem_gb < 62
+        or policy.ttl_hours > 2
+        or policy.idle_min > 15
+        or policy.max_usd_hr > 3
+        or policy.name_prefix != "replacement-v1-sn2-"
+        or _gpu_type(args.gpu) != _gpu_type(policy.gpu)
+        or args.name_prefix != policy.name_prefix
+        or args.max_usd_hr != policy.max_usd_hr
+        or args.min_vcpu != policy.min_vcpu
+        or args.min_mem_gb != policy.min_mem_gb
+        or args.ttl_hours != policy.ttl_hours
+        or args.idle_min != policy.idle_min
+        or args.one_shot != policy.one_shot
+        or args.failure_action != policy.final_action
+    ):
+        raise ValueError("SN2 vertical resume differs from its bounded H100 lease")
+    return pregate.admit_sn2_vertical(recipe, STWO, STWO_CAIRO)
+
+
+def _resume_admission_is_current(
+    receipt: dict[str, object], recipe_value: str | None
+) -> bool:
+    if receipt.get("scope") == pregate.SN2_VERTICAL_SCOPE:
+        return bool(recipe_value) and pregate.sn2_vertical_is_current(
+            receipt, Path(recipe_value), STWO, STWO_CAIRO
+        )
+    return receipt.get("scope") == "formal-pregate" and pregate.is_fresh(
+        STWO, STWO_CAIRO
+    )
+
+
 def _bind_explicit_ssh_key() -> None:
     pod_control._ssh_opts()
 
@@ -280,7 +324,8 @@ def _prepare_existing_pod(args) -> tuple[api.PodInfo, Endpoint]:
     ):
         raise ValueError("pod admission limits must be finite and positive")
     _bind_explicit_ssh_key()
-    if not _require_pregate():
+    admission = _require_resume_admission(args)
+    if admission is None:
         raise RuntimeError("fresh pregate required before pod resume or adoption")
     gpu_type = _gpu_type(args.gpu)
     offer = api.secure_offer(gpu_type)
@@ -360,8 +405,10 @@ def _prepare_existing_pod(args) -> tuple[api.PodInfo, Endpoint]:
             idle_min=args.idle_min,
             log_file=log_file,
         )
-        if not pregate.is_fresh(STWO, STWO_CAIRO):
-            raise RuntimeError("source-bound pregate changed during pod admission")
+        if not _resume_admission_is_current(
+            admission, getattr(args, "recipe", None)
+        ):
+            raise RuntimeError("source-bound provider admission changed")
         _sync_pods_conf()
         return pod, ep
     except BaseException as error:
@@ -834,6 +881,7 @@ def main() -> int:
     p.add_argument("--one-shot", action="store_true")
     p.add_argument("--failure-action", choices=["stop", "terminate"], default="stop")
     p.add_argument("--purpose", default="")
+    p.add_argument("--recipe")
 
     for name in ("stop", "terminate"):
         p = sub.add_parser(name)

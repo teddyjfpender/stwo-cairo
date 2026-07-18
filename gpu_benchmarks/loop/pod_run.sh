@@ -238,6 +238,7 @@ trap cleanup EXIT
 printf -v KEY_Q '%q' "$KEY"
 RESUME_ARGS=(
   resume --pod "$POD_ID" --gpu "$LEASE_GPU"
+  --recipe "$PHASES_FILE"
   --name-prefix "$LEASE_NAME_PREFIX"
   --max-usd-hr "$LEASE_MAX_USD_HR"
   --min-vcpu "$LEASE_MIN_VCPU" --min-mem-gb "$LEASE_MIN_MEM_GB"

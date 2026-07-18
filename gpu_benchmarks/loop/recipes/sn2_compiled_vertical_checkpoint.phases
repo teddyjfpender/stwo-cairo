@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Indicative SN2 vertical checkpoint only: compiled Base through Composition,
 # then the verified monolithic OODS/FRI tail. This is never a formal promotion.
-# pod_run: lease one_shot=false final_action=stop gpu=h100 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=3.00 name_prefix=sn2-vertical-h100- ttl_hours=2 idle_min=15
+# pod_run: lease one_shot=false final_action=stop gpu=h100 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=3.00 name_prefix=replacement-v1-sn2- ttl_hours=2 idle_min=15
 
 # Reuse the pinned sm_90 build policy, H100 admission, and ambient override gate.
 export REPLACEMENT_SN2_MODE=vertical

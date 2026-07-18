@@ -63,6 +63,19 @@ class LeasePolicyTests(unittest.TestCase):
             ],
         )
 
+    def test_sn2_vertical_reuses_the_existing_bounded_h100_lease(self) -> None:
+        recipe = (
+            FLEET_DIR.parent
+            / "loop/recipes/sn2_compiled_vertical_checkpoint.phases"
+        )
+        policy = load(recipe)
+        self.assertEqual(policy.gpu, "h100")
+        self.assertEqual(policy.gpu_count, 1)
+        self.assertEqual(policy.name_prefix, "replacement-v1-sn2-")
+        self.assertEqual((policy.ttl_hours, policy.max_usd_hr), (2.0, 3.0))
+        self.assertFalse(policy.one_shot)
+        self.assertEqual(policy.final_action, "stop")
+
     def test_rejects_missing_duplicate_unknown_and_malformed_fields(self) -> None:
         missing = dict(BASE)
         del missing["gpu"]

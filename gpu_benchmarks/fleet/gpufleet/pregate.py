@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -23,6 +24,42 @@ STAMP = Path(__file__).resolve().parent.parent / ".pregate_ok.json"
 FRESH_S = 6 * 3600
 SN_INPUT_ENV = "STWO_SN_ADAPTED_DIR"
 SN_INPUT_NAMES = tuple(f"SN_PIE_{index}.adapted.bin" for index in range(1, 5))
+SN2_VERTICAL_SCOPE = "sn2-vertical-indicative-v1"
+SN2_VERTICAL_RECIPE = Path(
+    "gpu_benchmarks/loop/recipes/sn2_compiled_vertical_checkpoint.phases"
+)
+_SN2_VERTICAL_PHASES = (
+    "phase ambient_override_gate checkpoint_reject_ambient_overrides",
+    "phase source_input_identity checkpoint_source_input_identity iteration",
+    "phase hardware_identity vertical_hardware_identity",
+    "phase build vertical_build",
+    "phase sn2_compiled_vertical vertical_run",
+    "phase sn2_compiled_vertical_validate vertical_validate",
+)
+_SN2_VERTICAL_REQUIRED = (
+    "export REPLACEMENT_SN2_MODE=vertical",
+    "--compiled-composition-vertical-checkpoint",
+    "--require-proof-byte-equal",
+    "--require-simd-reference-byte-equal",
+    "--require-proof-mutation-rejected",
+    "validate_sn2_vertical_checkpoint.py",
+)
+_SN2_VERTICAL_CAIRO_CONTROL = (
+    "gpu_benchmarks/fleet/gpufleet/pregate.py",
+    "gpu_benchmarks/fleet/gpufleet/__main__.py",
+    "gpu_benchmarks/fleet/gpufleet/source_projection.py",
+    "gpu_benchmarks/fleet/gpufleet/lease_policy.py",
+    "gpu_benchmarks/loop/pod_run.sh",
+    SN2_VERTICAL_RECIPE.as_posix(),
+    "gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh",
+    "gpu_benchmarks/validate_sn2_vertical_checkpoint.py",
+    "gpu_benchmarks/test_validate_sn2_vertical_checkpoint.py",
+    "gpu_benchmarks/pie/SHA256SUMS",
+    "gpu_benchmarks/pie/ADAPTED_SHA256SUMS",
+)
+_SN2_VERTICAL_STWO_CONTROL = (
+    "crates/backend-cuda-kernels/cuda/generated/aot_manifest.json",
+)
 
 
 def _write_stamp(
@@ -52,6 +89,112 @@ def _source_identity(stwo: Path, stwo_cairo: Path) -> dict[str, dict[str, str]]:
         "stwo": _repo_identity(stwo),
         "stwo_cairo": _repo_identity(stwo_cairo),
     }
+
+
+def is_sn2_vertical_recipe(recipe: Path, stwo_cairo: Path) -> bool:
+    """True only for the one canonical non-formal vertical checkpoint recipe."""
+    try:
+        return recipe.expanduser().resolve(strict=True) == (
+            stwo_cairo / SN2_VERTICAL_RECIPE
+        ).resolve(strict=True)
+    except OSError:
+        return False
+
+
+def _tracked_control_is_clean(repository: Path, paths: tuple[str, ...]) -> bool:
+    commands = (
+        ["git", "ls-files", "--error-unmatch", "--", *paths],
+        ["git", "diff", "--quiet", "HEAD", "--", *paths],
+    )
+    return all(
+        subprocess.run(
+            command, cwd=repository, capture_output=True, check=False
+        ).returncode
+        == 0
+        for command in commands
+    )
+
+
+def _sn2_vertical_identity(
+    recipe: Path, stwo: Path, stwo_cairo: Path
+) -> dict[str, object]:
+    if not is_sn2_vertical_recipe(recipe, stwo_cairo):
+        raise ValueError("not the canonical SN2 vertical checkpoint recipe")
+    if not (
+        _tracked_control_is_clean(stwo_cairo, _SN2_VERTICAL_CAIRO_CONTROL)
+        and _tracked_control_is_clean(stwo, _SN2_VERTICAL_STWO_CONTROL)
+    ):
+        raise ValueError("SN2 vertical control plane differs from tracked HEAD")
+    raw = recipe.read_bytes()
+    source = raw.decode("utf-8")
+    phases = tuple(line for line in source.splitlines() if line.startswith("phase "))
+    if phases != _SN2_VERTICAL_PHASES:
+        raise ValueError("SN2 vertical checkpoint phase contract drifted")
+    if any(fragment not in source for fragment in _SN2_VERTICAL_REQUIRED):
+        raise ValueError("SN2 vertical checkpoint safety contract is incomplete")
+    return {
+        "scope": SN2_VERTICAL_SCOPE,
+        "recipe": {
+            "path": SN2_VERTICAL_RECIPE.as_posix(),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        },
+        "source_identity": _source_identity(stwo, stwo_cairo),
+    }
+
+
+def admit_sn2_vertical(
+    recipe: Path, stwo: Path, stwo_cairo: Path
+) -> dict[str, object] | None:
+    """Run the bounded no-Cargo admission for the indicative SN2 checkpoint."""
+    try:
+        identity = _sn2_vertical_identity(recipe, stwo, stwo_cairo)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        print(f"[pregate] FAIL SN2 vertical identity: {error}")
+        return None
+
+    common = (
+        stwo_cairo
+        / "gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
+    )
+    checks = (
+        ("SN2 vertical shell syntax", ["bash", "-n", str(common), str(recipe)]),
+        (
+            "SN2 vertical result validator",
+            [
+                sys.executable,
+                "-m",
+                "unittest",
+                "gpu_benchmarks.test_validate_sn2_vertical_checkpoint",
+            ],
+        ),
+    )
+    for name, argv in checks:
+        result = subprocess.run(
+            argv, cwd=stwo_cairo, capture_output=True, text=True, check=False
+        )
+        if result.returncode:
+            tail = "\n".join((result.stdout + result.stderr).splitlines()[-15:])
+            print(f"[pregate] FAIL {name}\n{tail}")
+            return None
+        print(f"[pregate] PASS {name}")
+    try:
+        stable = identity == _sn2_vertical_identity(recipe, stwo, stwo_cairo)
+    except (OSError, UnicodeDecodeError, ValueError):
+        stable = False
+    if not stable:
+        print("[pregate] FAIL SN2 vertical recipe or source changed during admission")
+        return None
+    print("[pregate] ALL GREEN SN2 vertical indicative admission")
+    return identity
+
+
+def sn2_vertical_is_current(
+    receipt: dict[str, object], recipe: Path, stwo: Path, stwo_cairo: Path
+) -> bool:
+    try:
+        return receipt == _sn2_vertical_identity(recipe, stwo, stwo_cairo)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
 
 
 def _admit_sn_inputs(stwo_cairo: Path) -> tuple[list[Path], dict[str, str], str]:
