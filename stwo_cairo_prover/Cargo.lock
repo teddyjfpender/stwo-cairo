@@ -3734,6 +3734,7 @@ dependencies = [
  "cairo-air",
  "cairo-program-runner-lib",
  "cairo-vm",
+ "hex",
  "libc",
  "num-traits",
  "serde_json",
