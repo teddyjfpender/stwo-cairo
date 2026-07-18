@@ -23,6 +23,7 @@ use crate::compiled_proof::{
     StaticCudaWrapperAuthority, StaticCudaWrapperId, ValueVersion,
 };
 
+mod transcript;
 mod validation;
 
 use validation::{
@@ -107,6 +108,7 @@ pub(super) struct CompiledBaseDagBuilder {
     memory: Option<SealedMemoryBaseTrace>,
     fixed_tables: Option<SealedFixedTables>,
     base_commit: Option<SealedBaseCommit>,
+    bootstrap_transcript: Option<transcript::SealedBootstrapTranscript>,
 }
 
 impl CompiledBaseDagBuilder {
@@ -143,6 +145,7 @@ impl CompiledBaseDagBuilder {
             memory: None,
             fixed_tables: None,
             base_commit: None,
+            bootstrap_transcript: None,
         })
     }
 

@@ -22,6 +22,15 @@ fn ready_post_fixed(arena: &ProofArenaPlan) -> CompiledBaseDagBuilder {
     builder
 }
 
+pub(super) fn ready_post_base(arena: &ProofArenaPlan) -> CompiledBaseDagBuilder {
+    let mut builder = ready_post_fixed(arena);
+    builder.append_base_commit_semantics(arena).unwrap();
+    builder
+        .emit_base_commit_operations_using(arena, fake_base_commit_wrapper)
+        .unwrap();
+    builder
+}
+
 fn fake_base_commit_wrapper(
     id: StaticCudaWrapperId,
     target_sm: u32,

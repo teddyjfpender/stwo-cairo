@@ -14,6 +14,67 @@ use crate::transcript_plan::CairoTranscriptSegment;
 
 mod base_commit;
 
+#[test]
+fn generated_sn2_releases_the_exact_bootstrap_transcript_after_base() {
+    let executable = crate::program_image::lower_compiled::tests::generated_sn2_replacement();
+    let mut builder = base_commit::ready_post_base(executable.arena());
+    let values = builder.prefix.values.clone();
+    let operations = builder.prefix.operations.clone();
+    let effects = builder.prefix.effects.clone();
+    let wrappers = builder.prefix.static_wrappers.clone();
+
+    builder
+        .append_bootstrap_transcript(executable.arena(), executable.transcript())
+        .unwrap();
+    let sealed = builder.bootstrap_transcript.as_ref().unwrap();
+    let lowered = sealed.lowered();
+    assert!(builder.has_complete_bootstrap_transcript());
+    assert_eq!(
+        lowered.segment(),
+        CairoTranscriptSegment::BootstrapThroughBase
+    );
+    assert_eq!(lowered.operation_range(), &(0..11));
+    assert_eq!(lowered.inputs().len(), 11);
+    assert!(lowered.outputs().is_empty());
+    assert_eq!(builder.prefix.values, values);
+    assert_eq!(builder.prefix.operations, operations);
+    assert_eq!(builder.prefix.effects, effects);
+    assert_eq!(builder.prefix.static_wrappers, wrappers);
+    assert_eq!(
+        builder.append_bootstrap_transcript(executable.arena(), executable.transcript()),
+        Err(CompiledBaseDagAppendError::InvalidStage)
+    );
+}
+
+#[test]
+fn bootstrap_release_rejects_missing_or_tampered_base_transactionally() {
+    let executable = crate::program_image::lower_compiled::tests::generated_sn2_replacement();
+    let mut missing = CompiledBaseDagBuilder::from_complete_witness(complete_prefix()).unwrap();
+    let values = missing.prefix.values.clone();
+    assert_eq!(
+        missing.append_bootstrap_transcript(executable.arena(), executable.transcript()),
+        Err(CompiledBaseDagAppendError::InvalidStage)
+    );
+    assert_eq!(missing.prefix.values, values);
+    assert!(missing.bootstrap_transcript.is_none());
+
+    let mut tampered = base_commit::ready_post_base(executable.arena());
+    tampered
+        .base_commit
+        .as_mut()
+        .unwrap()
+        .checkpoint_digest
+        .as_mut()
+        .unwrap()[0] ^= 1;
+    let values = tampered.prefix.values.clone();
+    assert_eq!(
+        tampered.append_bootstrap_transcript(executable.arena(), executable.transcript()),
+        Err(CompiledBaseDagAppendError::Lowering)
+    );
+    assert_eq!(tampered.prefix.values, values);
+    assert!(tampered.bootstrap_transcript.is_none());
+}
+
 fn complete_prefix() -> CompiledWitnessWriterPrefix {
     let executable = crate::program_image::lower_compiled::tests::generated_sn2_replacement();
     emit_recorded_witness_writer_prefix_for_test(
