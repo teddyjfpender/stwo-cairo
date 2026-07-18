@@ -506,6 +506,10 @@ pub struct GpuProverConfig {
     /// deliberately separate from the soft graph-gap capture used by formal
     /// timing runs, which must remain free of event instrumentation.
     pub record_graph_replay_intervals_diagnostic: bool,
+    /// Correctness-only vertical checkpoint for the compiled Composition
+    /// authority. The ordinary captured replay remains the default; this lane
+    /// is never eligible for a formal performance claim.
+    pub compiled_composition_vertical_checkpoint: bool,
 }
 
 impl Default for GpuProverConfig {
@@ -521,8 +525,44 @@ impl Default for GpuProverConfig {
             strict: false,
             allow_slow_graph_submit_diagnostic: false,
             record_graph_replay_intervals_diagnostic: false,
+            compiled_composition_vertical_checkpoint: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidentProofExecution {
+    CapturedGraph,
+    CompiledCompositionVerticalCheckpoint,
+}
+
+impl ResidentProofExecution {
+    const fn from_config(config: &GpuProverConfig) -> Self {
+        if config.compiled_composition_vertical_checkpoint {
+            Self::CompiledCompositionVerticalCheckpoint
+        } else {
+            Self::CapturedGraph
+        }
+    }
+}
+
+fn validate_resident_proof_execution_config(config: &GpuProverConfig) -> Result<(), GpuError> {
+    if !config.compiled_composition_vertical_checkpoint {
+        return Ok(());
+    }
+    if config.resident_backend != ResidentBackend::ReplacementV1 || !config.strict {
+        return Err(GpuError::Config(
+            "compiled Composition vertical checkpoint requires strict replacement-v1".to_string(),
+        ));
+    }
+    if config.allow_slow_graph_submit_diagnostic || config.record_graph_replay_intervals_diagnostic
+    {
+        return Err(GpuError::Config(
+            "compiled Composition vertical checkpoint cannot be combined with graph-submit diagnostics"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 const REPLACEMENT_V1_REQUIRED_ENV: &[(&str, &str)] = &[
@@ -854,6 +894,7 @@ where
                     .to_string(),
             ));
         }
+        validate_resident_proof_execution_config(&config)?;
         let resident_execution_config = match config.resident_backend {
             ResidentBackend::LegacyResident => SealedResidentExecutionConfig::legacy_strict(),
             ResidentBackend::ReplacementV1 => replacement_execution_config_from_environment()?,
@@ -1519,9 +1560,10 @@ where
 }
 
 impl GpuCairoProver<Blake2sMerkleChannel> {
-    /// Production Starknet resident path. Every soundness-critical prover stage
-    /// runs through the sealed arena graph; the host receives one compact proof
-    /// bundle and only decodes it into the existing verifier-facing type.
+    /// Production Starknet resident path. The default execution runs every
+    /// soundness-critical stage through the sealed arena graph. The explicit
+    /// compiled-Composition checkpoint selector instead runs the non-formal
+    /// eager vertical; both routes return one verifier-facing proof bundle.
     pub fn prove_resident_blake2s(
         &mut self,
         input: ProverInput,
@@ -1746,6 +1788,15 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
         aot::reset_runtime_stats();
         let allow_slow_graph_submit_diagnostic = self.config.allow_slow_graph_submit_diagnostic;
         let capture_graph_replay_timing = self.config.record_graph_replay_intervals_diagnostic;
+        let resident_proof_execution = ResidentProofExecution::from_config(&self.config);
+        if resident_proof_execution == ResidentProofExecution::CompiledCompositionVerticalCheckpoint
+            && transcript_mode != ResidentTranscriptMode::DeviceOnly
+        {
+            return Err(GpuError::Config(
+                "compiled Composition vertical checkpoint requires device-only transcript mode"
+                    .to_string(),
+            ));
+        }
 
         let (
             (
@@ -1777,22 +1828,39 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
             let bundle_bytes = runtime
                 .workspace_proof_bundle_bytes()
                 .ok_or(ResidentRuntimeError::TranscriptRequirementsMismatch)?;
+            if resident_proof_execution
+                == ResidentProofExecution::CompiledCompositionVerticalCheckpoint
+            {
+                runtime.admit_compiled_composition_eager()?;
+            }
             runtime.begin_hot_path_telemetry();
             if capture_graph_replay_timing {
                 runtime.begin_graph_replay_timing()?;
             }
-            runtime.replay_all_prepared_subgraphs()?;
+            match resident_proof_execution {
+                ResidentProofExecution::CapturedGraph => runtime.replay_all_prepared_subgraphs()?,
+                ResidentProofExecution::CompiledCompositionVerticalCheckpoint => {
+                    runtime.launch_compiled_eager_vertical()?
+                }
+            }
             let bundle = runtime.read_proof_bundle_once()?;
             if capture_graph_replay_timing {
                 runtime.finish_graph_replay_timing()?;
             }
-            let exec = runtime.require_hot_path_budget(resident_hot_path_budget(
-                transcript_mode,
-                allow_slow_graph_submit_diagnostic,
-                expected_graphs,
-                expected_kernel_launches,
-                bundle_bytes,
-            ))?;
+            let exec = match resident_proof_execution {
+                ResidentProofExecution::CapturedGraph => {
+                    runtime.require_hot_path_budget(resident_hot_path_budget(
+                        transcript_mode,
+                        allow_slow_graph_submit_diagnostic,
+                        expected_graphs,
+                        expected_kernel_launches,
+                        bundle_bytes,
+                    ))?
+                }
+                ResidentProofExecution::CompiledCompositionVerticalCheckpoint => {
+                    runtime.hot_path_telemetry()
+                }
+            };
             let transcript_mirror = match transcript_mode {
                 ResidentTranscriptMode::DeviceOnly => None,
                 ResidentTranscriptMode::DeviceMirrored => {
@@ -1839,11 +1907,16 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
             lifting_log_size,
         )?;
 
-        let pcs_telemetry = CudaPcsDriverTelemetry::completed_arena_graph(
-            exec,
-            expected_graphs,
-            expected_kernel_launches,
-        );
+        // Eager execution is deliberately not represented as ArenaGraph
+        // telemetry; the typed surface stays truthful.
+        let pcs_telemetry = (resident_proof_execution == ResidentProofExecution::CapturedGraph)
+            .then(|| {
+                CudaPcsDriverTelemetry::completed_arena_graph(
+                    exec,
+                    expected_graphs,
+                    expected_kernel_launches,
+                )
+            });
         let aot_stats = aot::runtime_stats();
         if aot_stats.aot_misses != 0
             || aot_stats.runtime_loads != 0
@@ -1863,7 +1936,7 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
             channel_salt: params.channel_salt,
             preprocessed_trace_variant: params.preprocessed_trace,
         };
-        self.last_pcs_telemetry = Some(pcs_telemetry);
+        self.last_pcs_telemetry = pcs_telemetry;
         self.last_resident_session_telemetry = Some(session_telemetry);
         self.last_aot_stats = Some(aot_stats);
 
@@ -1893,6 +1966,59 @@ mod resident_transcript_mirror_tests {
             current,
             sm_major: 9,
             sm_minor: 0,
+        }
+    }
+
+    #[test]
+    fn compiled_composition_vertical_checkpoint_is_opt_in() {
+        let default = GpuProverConfig::default();
+        assert!(!default.compiled_composition_vertical_checkpoint);
+        assert_eq!(
+            ResidentProofExecution::from_config(&default),
+            ResidentProofExecution::CapturedGraph
+        );
+
+        let enabled = GpuProverConfig {
+            compiled_composition_vertical_checkpoint: true,
+            resident_backend: ResidentBackend::ReplacementV1,
+            strict: true,
+            ..default
+        };
+        assert_eq!(
+            ResidentProofExecution::from_config(&enabled),
+            ResidentProofExecution::CompiledCompositionVerticalCheckpoint
+        );
+        validate_resident_proof_execution_config(&enabled).unwrap();
+    }
+
+    #[test]
+    fn compiled_composition_vertical_checkpoint_rejects_non_strict_or_mixed_diagnostics() {
+        let valid = GpuProverConfig {
+            compiled_composition_vertical_checkpoint: true,
+            resident_backend: ResidentBackend::ReplacementV1,
+            strict: true,
+            ..GpuProverConfig::default()
+        };
+        for invalid in [
+            GpuProverConfig {
+                resident_backend: ResidentBackend::LegacyResident,
+                ..valid
+            },
+            GpuProverConfig {
+                strict: false,
+                ..valid
+            },
+            GpuProverConfig {
+                allow_slow_graph_submit_diagnostic: true,
+                ..valid
+            },
+            GpuProverConfig {
+                allow_slow_graph_submit_diagnostic: true,
+                record_graph_replay_intervals_diagnostic: true,
+                ..valid
+            },
+        ] {
+            assert!(validate_resident_proof_execution_config(&invalid).is_err());
         }
     }
 

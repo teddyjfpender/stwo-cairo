@@ -16,6 +16,7 @@
 //!   gpu_bench --program path/to/compiled.json --iterations N --backend cuda|simd \
 //!             [--engine legacy|gpu-native] \
 //!             [--resident-backend legacy-resident|replacement-v1] \
+//!             [--compiled-composition-vertical-checkpoint] \
 //!             [--reps 3] [--pipeline <depth>] [--reuse-input] [--adapt-only] \
 //!             [--require-proof-byte-equal] [--require-gpu-native-architecture] \
 //!             [--diagnostic-allow-slow-graph-submit] \
@@ -48,6 +49,10 @@
 //! proof for the same adapted input and parameters, then exact-compares every
 //! serialized GPU proof to it. The record reports this separately from same-backend
 //! repetition determinism.
+//! `--compiled-composition-vertical-checkpoint` selects the replacement backend's
+//! eager end-to-end checkpoint. It is a correctness diagnostic: the default captured
+//! path is unchanged, the SIMD byte oracle is mandatory, and its timing is always
+//! labeled indicative/non-formal.
 //! `--require-proof-mutation-rejected` retains a verifier-form clone of repetition 0,
 //! waits for the original to verify, adds one to the always-present memory-id
 //! interaction claimed sum, and requires rejection. This is a verifier-integrity
@@ -233,6 +238,66 @@ where
     Ok(selected.unwrap_or_default())
 }
 
+fn parse_compiled_composition_vertical_checkpoint_args<I, S>(args: I) -> Result<bool, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    const FLAG: &str = "--compiled-composition-vertical-checkpoint";
+    const VALUE_FORM: &str = "--compiled-composition-vertical-checkpoint=";
+    let mut selected = false;
+    for argument in args {
+        let argument = argument.as_ref();
+        if argument.starts_with(VALUE_FORM) {
+            return Err(format!("{FLAG} is a value-less flag"));
+        }
+        if argument != FLAG {
+            continue;
+        }
+        if selected {
+            return Err(format!("{FLAG} may be passed only once"));
+        }
+        selected = true;
+    }
+    Ok(selected)
+}
+
+fn compiled_composition_vertical_checkpoint_gate(
+    enabled: bool,
+    resident_backend: ResidentBackend,
+    simd_reference: bool,
+    reuse_input: bool,
+    fleet_pow: bool,
+    graph_submit_diagnostic: bool,
+    graph_submit_capture: bool,
+) -> Result<(), &'static str> {
+    if !enabled {
+        return Ok(());
+    }
+    if resident_backend != ResidentBackend::ReplacementV1 {
+        return Err(
+            "--compiled-composition-vertical-checkpoint requires --resident-backend replacement-v1",
+        );
+    }
+    if !simd_reference {
+        return Err(
+            "--compiled-composition-vertical-checkpoint requires --require-simd-reference-byte-equal",
+        );
+    }
+    if !reuse_input {
+        return Err("--compiled-composition-vertical-checkpoint requires --reuse-input");
+    }
+    if fleet_pow {
+        return Err("--compiled-composition-vertical-checkpoint cannot be combined with fleet PoW");
+    }
+    if graph_submit_diagnostic || graph_submit_capture {
+        return Err(
+            "--compiled-composition-vertical-checkpoint cannot be combined with graph-submit diagnostic or capture flags",
+        );
+    }
+    Ok(())
+}
+
 fn resident_backend_gate(
     selected: ResidentBackend,
     architecture_required: bool,
@@ -291,6 +356,13 @@ fn record_gpu_native_pcs_telemetry(telemetry: &CudaPcsDriverTelemetry) {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .expect("gpu-native telemetry mutex poisoned") = Some(telemetry.clone());
+}
+
+fn clear_gpu_native_pcs_telemetry() {
+    *LAST_GPU_NATIVE_PCS_TELEMETRY
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("gpu-native telemetry mutex poisoned") = None;
 }
 
 fn record_gpu_native_aot_stats(stats: AotRuntimeStats) {
@@ -364,14 +436,22 @@ fn prove_gpu_native(input: ProverInput, params: ProverParameters) -> BenchProof 
         }
         .expect("gpu-native prove failed");
         if fleet_pow_socket().is_none() {
-            let telemetry = prover
-                .last_pcs_telemetry()
-                .expect("gpu-native prove returned without CUDA PCS architecture telemetry");
-            assert!(
-                telemetry.is_complete(),
-                "gpu-native CUDA PCS driver did not complete every architecture stage"
-            );
-            record_gpu_native_pcs_telemetry(telemetry);
+            if prover.config().compiled_composition_vertical_checkpoint {
+                assert!(
+                    prover.last_pcs_telemetry().is_none(),
+                    "eager vertical checkpoint must not claim ArenaGraph PCS telemetry"
+                );
+                clear_gpu_native_pcs_telemetry();
+            } else {
+                let telemetry = prover
+                    .last_pcs_telemetry()
+                    .expect("gpu-native prove returned without CUDA PCS architecture telemetry");
+                assert!(
+                    telemetry.is_complete(),
+                    "gpu-native CUDA PCS driver did not complete every architecture stage"
+                );
+                record_gpu_native_pcs_telemetry(telemetry);
+            }
         }
         if let Some(session) = prover.last_resident_session_telemetry() {
             record_gpu_native_session_telemetry(session);
@@ -423,6 +503,7 @@ fn gpu_native_prover_config() -> GpuProverConfig {
         graph_submit_gap_diagnostic(),
         graph_submit_gap_capture(),
     );
+    config.compiled_composition_vertical_checkpoint = compiled_composition_vertical_checkpoint();
     config.operational_safety_reserve_bytes = gpu_bench_physical::operational_safety_reserve_bytes(
         arg("--operational-safety-reserve-bytes"),
     );
@@ -447,6 +528,11 @@ fn flag(name: &str) -> bool {
 
 fn requested_resident_backend() -> ResidentBackend {
     parse_resident_backend_args(std::env::args()).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn compiled_composition_vertical_checkpoint() -> bool {
+    parse_compiled_composition_vertical_checkpoint_args(std::env::args())
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn enforce_resident_backend_invocation() {
@@ -493,6 +579,7 @@ fn performance_claim_admissible() -> bool {
         gpu_native_architecture_required(),
         required_gpu_pcs_runtime_mode(),
         graph_submit_gap_diagnostic(),
+        compiled_composition_vertical_checkpoint(),
     ) && fleet_pow_socket().is_none()
 }
 
@@ -501,9 +588,11 @@ fn performance_claim_admissible_for(
     architecture_required: bool,
     mode: RequiredCudaPcsRuntimeMode,
     diagnostic: bool,
+    compiled_composition_vertical_checkpoint: bool,
 ) -> bool {
     performance_measurement_available_for(selected_engine, architecture_required, mode)
         && !diagnostic
+        && !compiled_composition_vertical_checkpoint
 }
 
 fn graph_capture_claim_admissible(
@@ -1178,9 +1267,17 @@ fn record_context(backend: &str) -> serde_json::Value {
     let aot_stats = last_gpu_native_aot_stats();
     let session_telemetry = last_gpu_native_session_telemetry();
     let fleet_telemetry = last_fleet_proof_telemetry();
+    let vertical_checkpoint = compiled_composition_vertical_checkpoint();
     if let Some(required_mode) = required_mode {
-        validate_gpu_native_architecture(backend, &engine(), required_mode, telemetry.as_ref())
-            .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
+        if vertical_checkpoint {
+            assert!(
+                telemetry.is_none(),
+                "eager vertical checkpoint must not report ArenaGraph PCS telemetry"
+            );
+        } else {
+            validate_gpu_native_architecture(backend, &engine(), required_mode, telemetry.as_ref())
+                .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
+        }
         validate_strict_aot_provenance(aot_stats.as_ref())
             .unwrap_or_else(|error| panic!("GPU-native architecture gate failed: {error}"));
         validate_resident_session_architecture(
@@ -1202,10 +1299,21 @@ fn record_context(backend: &str) -> serde_json::Value {
         "gpu_resident_backend_requested": requested_resident_backend().cli_name(),
         "gpu_native_architecture_required": architecture_required,
         "gpu_pcs_required_runtime_mode": required_mode.map(RequiredCudaPcsRuntimeMode::cli_name),
-        "gpu_native_architecture_gate_passed": architecture_required.then_some(true),
-        "benchmark_diagnostic_mode": graph_submit_gap_diagnostic(),
-        "benchmark_diagnostic_reason": graph_submit_gap_diagnostic()
-            .then_some("graph-submit-gap-and-replay-intervals"),
+        "gpu_native_architecture_gate_passed": (architecture_required && !vertical_checkpoint)
+            .then_some(true),
+        "gpu_pcs_architecture_gate_applicable": architecture_required && !vertical_checkpoint,
+        "benchmark_diagnostic_mode": graph_submit_gap_diagnostic() || vertical_checkpoint,
+        "benchmark_diagnostic_reason": if vertical_checkpoint {
+            Some("compiled-composition-vertical-checkpoint")
+        } else {
+            graph_submit_gap_diagnostic().then_some("graph-submit-gap-and-replay-intervals")
+        },
+        "compiled_composition_vertical_checkpoint": vertical_checkpoint,
+        "compiled_composition_vertical_checkpoint_gate_passed": vertical_checkpoint.then_some(true),
+        "compiled_composition_vertical_checkpoint_timing_scope": vertical_checkpoint
+            .then_some("public-prove-call-warm-end-to-end"),
+        "performance_claim_class": vertical_checkpoint
+            .then_some("indicative-non-formal"),
         "benchmark_graph_submit_capture_mode": graph_submit_gap_capture(),
         "fleet_pow_enabled": fleet_pow_socket().is_some(),
         "fleet_pow_performance_admissible": fleet_telemetry
@@ -1581,27 +1689,22 @@ fn compute_simd_reference(input: ProverInput, params: ProverParameters) -> SimdR
 /// `dump_rep0` keeps STWO_DUMP_PROOF scoped to the standard and pipeline modes,
 /// matching its historical behavior. `compare_to_rep0` is false when reps are
 /// intentionally different statements (pipeline rotate mode).
-fn validate_proofs(
+fn validate_gpu_proofs(
     proofs: Vec<BenchProof>,
     dump_rep0: bool,
     compare_to_rep0: bool,
-    simd_reference: Option<&SimdReference>,
-) -> ProofValidation {
+) -> (ProofValidation, Vec<Vec<u8>>) {
     assert!(!proofs.is_empty(), "at least one proof is required");
 
     let verified_reps = proofs.len();
-    let mut rep0_bytes = None;
+    let mut serialized_proofs = Vec::with_capacity(verified_reps);
     let mut proof_size = 0;
     let mut gpu_proof_blake3 = None;
     let mut verify_ms = 0.0;
     let mut proof_byte_equal = initial_proof_byte_equal(compare_to_rep0, verified_reps);
-    let mut simd_reference_byte_equal = simd_reference.map(|_| true);
     let mut proof_mutation = None;
     for (rep, proof) in proofs.into_iter().enumerate() {
         let bytes = bincode::serialize(&proof).expect("serialize proof");
-        if let (Some(equal), Some(reference)) = (&mut simd_reference_byte_equal, simd_reference) {
-            *equal &= bytes.as_slice() == reference.bytes.as_slice();
-        }
         if rep == 0 {
             proof_size = bytes.len();
             gpu_proof_blake3 = Some(blake3::hash(&bytes).to_hex().to_string());
@@ -1611,11 +1714,8 @@ fn validate_proofs(
                     eprintln!("proof dumped: {} bytes -> {path}", bytes.len());
                 }
             }
-            rep0_bytes = Some(bytes);
-        } else {
-            if let Some(equal) = &mut proof_byte_equal {
-                *equal &= rep0_bytes.as_ref() == Some(&bytes);
-            }
+        } else if let Some(equal) = &mut proof_byte_equal {
+            *equal &= serialized_proofs.first() == Some(&bytes);
         }
 
         let verify_start = Instant::now();
@@ -1639,18 +1739,47 @@ fn validate_proofs(
                 verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
             }
         }
+        serialized_proofs.push(bytes);
     }
 
-    ProofValidation {
-        proof_size,
-        gpu_proof_blake3: gpu_proof_blake3.expect("repetition 0 proof digest must exist"),
-        verify_ms,
-        verified_reps,
-        proof_byte_equal,
-        simd_reference_byte_equal,
-        simd_reference: simd_reference.map(|reference| reference.record.clone()),
-        proof_mutation,
-    }
+    (
+        ProofValidation {
+            proof_size,
+            gpu_proof_blake3: gpu_proof_blake3.expect("repetition 0 proof digest must exist"),
+            verify_ms,
+            verified_reps,
+            proof_byte_equal,
+            simd_reference_byte_equal: None,
+            simd_reference: None,
+            proof_mutation,
+        },
+        serialized_proofs,
+    )
+}
+
+fn apply_simd_reference(
+    validation: &mut ProofValidation,
+    serialized_gpu_proofs: &[Vec<u8>],
+    simd_reference: Option<&SimdReference>,
+) {
+    validation.simd_reference_byte_equal = simd_reference.map(|reference| {
+        serialized_gpu_proofs
+            .iter()
+            .all(|proof| proof.as_slice() == reference.bytes.as_slice())
+    });
+    validation.simd_reference = simd_reference.map(|reference| reference.record.clone());
+}
+
+fn validate_proofs(
+    proofs: Vec<BenchProof>,
+    dump_rep0: bool,
+    compare_to_rep0: bool,
+    simd_reference: Option<&SimdReference>,
+) -> ProofValidation {
+    let (mut validation, serialized_gpu_proofs) =
+        validate_gpu_proofs(proofs, dump_rep0, compare_to_rep0);
+    apply_simd_reference(&mut validation, &serialized_gpu_proofs, simd_reference);
+    validation
 }
 
 fn proof_byte_equal_required() -> bool {
@@ -2421,6 +2550,16 @@ fn main() {
     enforce_resident_backend_invocation();
     enforce_gpu_native_architecture_invocation(&backend);
     let reuse_input = flag("--reuse-input");
+    compiled_composition_vertical_checkpoint_gate(
+        compiled_composition_vertical_checkpoint(),
+        requested_resident_backend(),
+        simd_reference_required(),
+        reuse_input,
+        fleet_pow_socket().is_some(),
+        graph_submit_gap_diagnostic(),
+        graph_submit_gap_capture(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     if simd_reference_required() {
         assert_eq!(
             (backend.as_str(), engine().as_str()),
@@ -2618,17 +2757,23 @@ fn main() {
         emit_phase_totals(rep);
     }
     let proof_loop_finished_unix_ns = unix_time_ns();
-    // This oracle is deliberately outside every reported GPU proving sample.
+    // Fail an invalid eager proof before paying for the slow SIMD oracle. Both
+    // validation phases remain outside every reported GPU proving sample.
+    let (mut validation, serialized_gpu_proofs) = validate_gpu_proofs(proofs, true, true);
     // The qualification path consumes the retained input only after the timed
-    // repetitions, so the SIMD proof adds neither a clone nor memory pressure
-    // to the measured GPU samples.
+    // repetitions and full GPU verification, so the SIMD proof adds neither a
+    // clone nor memory pressure to the measured GPU samples.
     let simd_reference = simd_reference_required().then(|| {
         let input = reusable_input
             .take()
             .expect("SIMD reference input must remain available");
         compute_simd_reference(input, prover_params(variant))
     });
-    let validation = validate_proofs(proofs, true, true, simd_reference.as_ref());
+    apply_simd_reference(
+        &mut validation,
+        &serialized_gpu_proofs,
+        simd_reference.as_ref(),
+    );
     let outcome = RepOutcome {
         times,
         graph_submit_samples,
@@ -2669,9 +2814,11 @@ mod tests {
     use crate::gpu_bench_physical::resident_session_telemetry_json;
 
     use super::{
-        cairo_verification_error_class, claimed_graph_submit_gap_ns, configure_graph_submit_policy,
+        cairo_verification_error_class, claimed_graph_submit_gap_ns,
+        compiled_composition_vertical_checkpoint_gate, configure_graph_submit_policy,
         configure_resident_backend, graph_capture_claim_admissible, graph_submit_gap_average_ns,
-        initial_proof_byte_equal, mutate_claimed_sum, parse_resident_backend_args,
+        initial_proof_byte_equal, mutate_claimed_sum,
+        parse_compiled_composition_vertical_checkpoint_args, parse_resident_backend_args,
         pcs_telemetry_json, performance_claim_admissible_for, proof_byte_equal_gate_passes,
         proof_mutation_gate_passes, quantile, simd_reference_gate_passes,
         simd_reference_reuse_input_gate_passes, throughput_mhz, validate_gpu_native_architecture,
@@ -2768,6 +2915,117 @@ mod tests {
     }
 
     #[test]
+    fn compiled_composition_vertical_checkpoint_parser_is_exact_and_default_off() {
+        assert!(!parse_compiled_composition_vertical_checkpoint_args(["gpu_bench"]).unwrap());
+        assert!(parse_compiled_composition_vertical_checkpoint_args([
+            "gpu_bench",
+            "--compiled-composition-vertical-checkpoint",
+        ])
+        .unwrap());
+        for args in [
+            vec![
+                "gpu_bench",
+                "--compiled-composition-vertical-checkpoint=true",
+            ],
+            vec![
+                "gpu_bench",
+                "--compiled-composition-vertical-checkpoint",
+                "--compiled-composition-vertical-checkpoint",
+            ],
+        ] {
+            assert!(parse_compiled_composition_vertical_checkpoint_args(args).is_err());
+        }
+    }
+
+    #[test]
+    fn compiled_composition_vertical_checkpoint_requires_replacement_and_byte_oracle() {
+        let valid = (
+            true,
+            ResidentBackend::ReplacementV1,
+            true,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert!(compiled_composition_vertical_checkpoint_gate(
+            valid.0, valid.1, valid.2, valid.3, valid.4, valid.5, valid.6
+        )
+        .is_ok());
+        assert!(compiled_composition_vertical_checkpoint_gate(
+            false,
+            ResidentBackend::LegacyResident,
+            false,
+            false,
+            true,
+            true,
+            true,
+        )
+        .is_ok());
+        for invalid in [
+            (
+                true,
+                ResidentBackend::LegacyResident,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                true,
+                ResidentBackend::ReplacementV1,
+                false,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                true,
+                ResidentBackend::ReplacementV1,
+                true,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                true,
+                ResidentBackend::ReplacementV1,
+                true,
+                true,
+                true,
+                false,
+                false,
+            ),
+            (
+                true,
+                ResidentBackend::ReplacementV1,
+                true,
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                true,
+                ResidentBackend::ReplacementV1,
+                true,
+                true,
+                false,
+                false,
+                true,
+            ),
+        ] {
+            assert!(compiled_composition_vertical_checkpoint_gate(
+                invalid.0, invalid.1, invalid.2, invalid.3, invalid.4, invalid.5, invalid.6
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn resident_backend_config_requires_strict_arena_graph_for_replacement() {
         let mut legacy = GpuProverConfig::default();
         configure_resident_backend(
@@ -2814,17 +3072,20 @@ mod tests {
             true,
             RequiredCudaPcsRuntimeMode::DetachedEager,
             false,
+            false,
         ));
         assert!(!performance_claim_admissible_for(
             "gpu-native",
             false,
             RequiredCudaPcsRuntimeMode::ArenaGraph,
             false,
+            false,
         ));
         assert!(performance_claim_admissible_for(
             "gpu-native",
             true,
             RequiredCudaPcsRuntimeMode::ArenaGraph,
+            false,
             false,
         ));
         assert!(performance_claim_admissible_for(
@@ -2832,11 +3093,20 @@ mod tests {
             false,
             RequiredCudaPcsRuntimeMode::DetachedEager,
             false,
+            false,
         ));
         assert!(!performance_claim_admissible_for(
             "gpu-native",
             true,
             RequiredCudaPcsRuntimeMode::ArenaGraph,
+            true,
+            false,
+        ));
+        assert!(!performance_claim_admissible_for(
+            "gpu-native",
+            true,
+            RequiredCudaPcsRuntimeMode::ArenaGraph,
+            false,
             true,
         ));
     }

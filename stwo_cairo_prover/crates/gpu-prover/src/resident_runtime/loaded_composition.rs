@@ -5,13 +5,14 @@
 //! This module closes the missing proof that that prepared graph is the one
 //! described by the complete structural and linked Composition authorities.
 
+use stwo_backend_cuda::COMPOSITION_RETAINED_COLUMNS;
+
 use crate::arena_plan::ProofArenaPlan;
 use crate::prepared_composition::{
     CompositionAbi, CompositionExecutionAuthority, CompositionOperationKind, CompositionOutputMode,
     CompositionValueRole, CompositionWorkspaceRequirements, PreparedCompositionError,
     PreparedCompositionGraph,
 };
-use stwo_backend_cuda::COMPOSITION_RETAINED_COLUMNS;
 
 const PRELUDE_OPERATIONS: usize = 2;
 const TERMINAL_OPERATIONS: usize = 2;
