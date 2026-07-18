@@ -10,7 +10,9 @@ use stwo_backend_cuda::{
     RelationTailMode, TraceTreeRole,
 };
 
-use crate::arena_plan::{BufferPurpose, CommitmentTreeId, QuotientNumeratorSchedule};
+use crate::arena_plan::{
+    BufferLifetime, BufferPurpose, CommitmentTreeId, ProofEpoch, QuotientNumeratorSchedule,
+};
 use crate::prepared_composition::{
     CompositionExecutionReceipt, CompositionLaunchMode, CompositionOutputMode,
 };
@@ -126,10 +128,22 @@ fn generated_sn2_post_base_shape_receipt_is_exact() {
     assert_eq!(receipt.logical_bytes_removed, 4_400_328_576);
     assert_eq!(receipt.workspace_bytes_removed, 268_435_360);
     assert_eq!(receipt.retained_weight_bytes, 268_435_456);
-    let descriptor_offsets = arena
+    let (descriptor_offsets_logical, descriptor_offsets) = arena
         .find(None, None, BufferPurpose::OodsBarycentricScales, 0)
-        .expect("collapsed OODS descriptor storage must be planned")
-        .1;
+        .expect("collapsed OODS descriptor storage must be planned");
+    assert_eq!(
+        descriptor_offsets_logical.lifetime,
+        BufferLifetime::new(ProofEpoch::Ingest, ProofEpoch::Assemble).unwrap()
+    );
+    assert_eq!(
+        arena
+            .bindings()
+            .iter()
+            .filter(|binding| binding.physical == descriptor_offsets.physical)
+            .count(),
+        1,
+        "collapsed OODS descriptor storage must not physically alias"
+    );
     assert_eq!(
         descriptor_offsets.len_words,
         collapse.collapsed_requirements().barycentric_scale_words
