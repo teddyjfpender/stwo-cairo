@@ -106,13 +106,23 @@ impl PreparedRegisteredFixedSource {
         read: &RegisteredFixedSourceRead,
         column: RegisteredPedersenColumn,
     ) -> Result<(), InvocationShapeError> {
+        let column_address = u64::try_from(column.as_u32_ptr() as usize)
+            .map_err(|_| InvocationShapeError::SizeOverflow)?;
+        self.validate_read_column_facts(read, column.index(), column_address, column.len_words())
+    }
+
+    fn validate_read_column_facts(
+        &self,
+        read: &RegisteredFixedSourceRead,
+        column_index: usize,
+        column_address: u64,
+        column_elements: usize,
+    ) -> Result<(), InvocationShapeError> {
         let canonical = registered_pedersen_source(PedersenTableColumnsAndRowsV1::CANONICAL)
             .map_err(|_| InvocationShapeError::LoadedModuleStateAuthorityMismatch)?;
         bind_source(canonical.clone(), self)?;
-        let column_address = u64::try_from(column.as_u32_ptr() as usize)
-            .map_err(|_| InvocationShapeError::SizeOverflow)?;
         if read.source() != &canonical
-            || read.column() != column.index()
+            || read.column() != column_index
             || read.elements().start != 0
             || read.elements().end != canonical.padded_rows()
             || self.registered != self.canonical
@@ -129,7 +139,7 @@ impl PreparedRegisteredFixedSource {
                     && snapshot.elements == read.elements().end
                     && snapshot.address != 0
                     && snapshot.address == column_address
-                    && column.len_words() == read.elements().len()
+                    && column_elements == read.elements().len()
             })
             .ok_or(InvocationShapeError::LoadedModuleStateAuthorityMismatch)?;
         if snapshot.address % self.canonical.element_bytes as u64 != 0 {
@@ -393,7 +403,7 @@ fn bind_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiled_proof::{ByteRange, ModuleGlobalInitializerAtom};
+    use crate::compiled_proof::{ByteRange, ElementRange, ModuleGlobalInitializerAtom};
 
     fn canonical_authority() -> RegisteredFixedSourceAuthority {
         registered_pedersen_source(PedersenTableColumnsAndRowsV1::CANONICAL).unwrap()
@@ -670,5 +680,63 @@ mod tests {
                 "accepted invalid live source {ordinal}"
             );
         }
+    }
+
+    #[test]
+    fn direct_read_requires_exact_authority_range_and_live_column() {
+        let exact = prepared();
+        let authority = canonical_authority();
+        let rows = authority.padded_rows();
+        let address = exact.canonical.columns[0].address;
+        let full = ElementRange::new(0, rows).unwrap();
+        let read = RegisteredFixedSourceRead::new(authority.clone(), 0, full).unwrap();
+        exact
+            .validate_read_column_facts(&read, 0, address, rows)
+            .unwrap();
+
+        let mut recipe = *authority.recipe_identity();
+        recipe[0] ^= 1;
+        let foreign = RegisteredFixedSourceAuthority::new(
+            recipe,
+            authority.source_rows(),
+            rows,
+            authority.element_bytes(),
+            authority.columns().map(|column| column.to_vec()).collect(),
+        )
+        .unwrap();
+        let foreign_read = RegisteredFixedSourceRead::new(foreign, 0, full).unwrap();
+        let partial_read = RegisteredFixedSourceRead::new(
+            authority.clone(),
+            0,
+            ElementRange::new(1, rows).unwrap(),
+        )
+        .unwrap();
+        let cases = [
+            (foreign_read, 0, address, rows),
+            (partial_read, 0, address, rows - 1),
+            (read.clone(), 1, address, rows),
+            (
+                read.clone(),
+                0,
+                address + authority.element_bytes() as u64,
+                rows,
+            ),
+            (read.clone(), 0, address, rows - 1),
+        ];
+        for (ordinal, (read, index, address, elements)) in cases.into_iter().enumerate() {
+            assert!(
+                exact
+                    .validate_read_column_facts(&read, index, address, elements)
+                    .is_err(),
+                "accepted forged direct read {ordinal}"
+            );
+        }
+
+        let mut wrong_generation = exact.clone();
+        wrong_generation.canonical.generation += 1;
+        wrong_generation.registered = wrong_generation.canonical.clone();
+        assert!(wrong_generation
+            .validate_read_column_facts(&read, 0, address, rows)
+            .is_err());
     }
 }
