@@ -89,9 +89,8 @@ pub(crate) fn encode_invocation_payload(
                 out.push(7);
                 encode_pointer_table(out, table)?;
             }
-            AotArgumentValue::DeviceNestedPointerTableValue { table, entries } => {
+            AotArgumentValue::DeviceNestedPointerTableValue { entries } => {
                 out.push(8);
-                out.extend_from_slice(&table.0.to_le_bytes());
                 push_size(out, entries.len())?;
                 for entry in entries {
                     encode_pointer_table(out, entry)?;
@@ -113,7 +112,6 @@ fn encode_pointer_table(
     out: &mut Vec<u8>,
     table: &DevicePointerTableBinding,
 ) -> Result<(), CompiledProofError> {
-    out.extend_from_slice(&table.table.0.to_le_bytes());
     push_size(out, table.entries.len())?;
     for &entry in &table.entries {
         encode_binding(out, entry);
@@ -243,33 +241,35 @@ mod tests {
     }
 
     #[test]
-    fn digest_binds_device_resident_pointer_graph_storage_and_shape() {
-        fn inner<const N: usize>(table: u32, leaves: [u32; N]) -> DevicePointerTableBinding {
+    fn digest_binds_device_resident_pointer_graph_shape_order_nulls_and_leaves() {
+        fn inner<const N: usize>(leaves: [Option<u32>; N]) -> DevicePointerTableBinding {
             DevicePointerTableBinding {
-                table: EffectBindingId(table),
                 entries: leaves
                     .into_iter()
-                    .map(|leaf| Some(EffectBindingId(leaf)))
+                    .map(|leaf| leaf.map(EffectBindingId))
                     .collect(),
             }
         }
         let exact = invocation(AotArgumentValue::DeviceNestedPointerTableValue {
-            table: EffectBindingId(0),
-            entries: vec![inner(1, [2, 3]), inner(4, [5, 6])],
+            entries: vec![inner([Some(0), None, Some(1)]), inner([Some(2), Some(3)])],
         });
         for changed in [
             invocation(AotArgumentValue::DeviceNestedPointerTableValue {
-                table: EffectBindingId(7),
-                entries: vec![inner(1, [2, 3]), inner(4, [5, 6])],
+                entries: vec![inner([Some(2), Some(3)]), inner([Some(0), None, Some(1)])],
             }),
             invocation(AotArgumentValue::DeviceNestedPointerTableValue {
-                table: EffectBindingId(0),
-                entries: vec![inner(4, [5, 6]), inner(1, [2, 3])],
+                entries: vec![inner([Some(0), Some(1), None]), inner([Some(2), Some(3)])],
             }),
-            invocation(AotArgumentValue::DevicePointerTableValue(inner(
-                0,
-                [1, 2, 3, 4, 5, 6],
-            ))),
+            invocation(AotArgumentValue::DeviceNestedPointerTableValue {
+                entries: vec![inner([Some(0), None, Some(4)]), inner([Some(2), Some(3)])],
+            }),
+            invocation(AotArgumentValue::DevicePointerTableValue(inner([
+                Some(0),
+                None,
+                Some(1),
+                Some(2),
+                Some(3),
+            ]))),
         ] {
             assert_ne!(exact.contract_id().unwrap(), changed.contract_id().unwrap());
         }

@@ -987,16 +987,13 @@ fn assert_invocation_covers_exact_bindings(
             AotArgumentValue::DevicePointerTable(entries) => {
                 entries.iter().flatten().copied().collect()
             }
-            AotArgumentValue::DevicePointerTableValue(table) => std::iter::once(table.table)
-                .chain(table.entries.iter().flatten().copied())
-                .collect(),
-            AotArgumentValue::DeviceNestedPointerTableValue { table, entries } => {
-                std::iter::once(*table)
-                    .chain(entries.iter().flat_map(|entry| {
-                        std::iter::once(entry.table).chain(entry.entries.iter().flatten().copied())
-                    }))
-                    .collect()
+            AotArgumentValue::DevicePointerTableValue(table) => {
+                table.entries.iter().flatten().copied().collect()
             }
+            AotArgumentValue::DeviceNestedPointerTableValue { entries } => entries
+                .iter()
+                .flat_map(|entry| entry.entries.iter().flatten().copied())
+                .collect(),
             AotArgumentValue::HostFixedU32(_) => Vec::new(),
             AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_) => Vec::new(),
             AotArgumentValue::DeviceMixedFixedSourcePointerTable(entries) => entries

@@ -357,21 +357,18 @@ fn validate_exact_bindings(invocation: &AotInvocation, effect: &EffectContract) 
                 if table.entries.is_empty() {
                     return Err(());
                 }
-                insert(&mut actual, table.table)?;
                 for &binding in table.entries.iter().flatten() {
                     insert(&mut actual, binding)?;
                 }
             }
-            AotArgumentValue::DeviceNestedPointerTableValue { table, entries } => {
+            AotArgumentValue::DeviceNestedPointerTableValue { entries } => {
                 if entries.is_empty() {
                     return Err(());
                 }
-                insert(&mut actual, *table)?;
                 for entry in entries {
                     if entry.entries.is_empty() {
                         return Err(());
                     }
-                    insert(&mut actual, entry.table)?;
                     for &binding in entry.entries.iter().flatten() {
                         insert(&mut actual, binding)?;
                     }

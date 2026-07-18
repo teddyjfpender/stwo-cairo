@@ -202,16 +202,15 @@ pub enum AotArgumentValue {
     DevicePointer(Option<EffectBindingId>),
     /// Host-resident array of device pointers passed directly to a wrapper.
     DevicePointerTable(Vec<Option<EffectBindingId>>),
-    /// Device-resident pointer table plus the exact values reached through it.
-    ///
-    /// The table storage and every non-null entry are separate effect
-    /// bindings. This is required when a wrapper receives a device pointer to
-    /// a prepared pointer table rather than a host array of raw pointers.
+    /// Device-resident relocation table plus the exact values reached through
+    /// it. The table allocation and address bytes are installed runtime
+    /// metadata derived from this ordered leaf map, not semantic proof values.
     DevicePointerTableValue(DevicePointerTableBinding),
-    /// Device-resident outer table whose entries are device-resident pointer
-    /// tables. The root, each inner table, and every leaf are bound exactly.
+    /// Device-resident outer relocation table whose entries are
+    /// device-resident pointer tables. Nested shape, order, nulls, and every
+    /// non-null leaf are bound exactly; root and inner address storage are
+    /// derived runtime metadata.
     DeviceNestedPointerTableValue {
-        table: EffectBindingId,
         entries: Vec<DevicePointerTableBinding>,
     },
     /// Immutable host u32 words copied by value into a wrapper's kernel
@@ -237,7 +236,6 @@ pub enum AotArgumentValue {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DevicePointerTableBinding {
-    pub table: EffectBindingId,
     pub entries: Vec<Option<EffectBindingId>>,
 }
 

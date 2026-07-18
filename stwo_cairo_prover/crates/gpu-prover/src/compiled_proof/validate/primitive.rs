@@ -462,21 +462,18 @@ fn validate_invocation(
                 if table.entries.is_empty() {
                     return Err(invalid());
                 }
-                insert(table.table)?;
                 for &binding in table.entries.iter().flatten() {
                     insert(binding)?;
                 }
             }
-            AotArgumentValue::DeviceNestedPointerTableValue { table, entries } => {
+            AotArgumentValue::DeviceNestedPointerTableValue { entries } => {
                 if entries.is_empty() {
                     return Err(invalid());
                 }
-                insert(*table)?;
                 for entry in entries {
                     if entry.entries.is_empty() {
                         return Err(invalid());
                     }
-                    insert(entry.table)?;
                     for &binding in entry.entries.iter().flatten() {
                         insert(binding)?;
                     }
