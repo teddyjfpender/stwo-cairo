@@ -22,6 +22,7 @@ struct FixedU32Value {
 pub(super) struct SemanticValueMap {
     current: BTreeMap<ArenaCatalogValueId, ValueVersion>,
     allocations: Vec<(ArenaCatalogValueId, ValueVersion)>,
+    ephemeral: Vec<ValueVersion>,
     fixed_u32_by_content: BTreeMap<Vec<u32>, usize>,
     fixed_u32: Vec<FixedU32Value>,
     next_value: u32,
@@ -50,6 +51,7 @@ impl SemanticValueMap {
         Ok(Self {
             current,
             allocations,
+            ephemeral: Vec::new(),
             fixed_u32_by_content: BTreeMap::new(),
             fixed_u32: Vec::new(),
             next_value: u32::try_from(versions.len())
@@ -89,6 +91,28 @@ impl SemanticValueMap {
         self.current.insert(catalog, destination);
         self.allocations.push((catalog, destination));
         Ok((source, destination))
+    }
+
+    /// Allocate one operation-owned value with no arena-catalog lineage.
+    ///
+    /// This is reserved for exact wrapper-local outputs such as an installed
+    /// scratch buffer. It cannot become the current value of an arena role.
+    pub(super) fn allocate_ephemeral(&mut self) -> Result<ValueVersion, InvocationShapeError> {
+        let version = self.allocate_version()?;
+        self.ephemeral.push(version);
+        Ok(version)
+    }
+
+    /// Allocate the first semantic output for an exact arena-catalog role.
+    pub(super) fn allocate_output(
+        &mut self,
+        catalog: ArenaCatalogValueId,
+    ) -> Result<ValueVersion, InvocationShapeError> {
+        if self.current.contains_key(&catalog) {
+            return Err(InvocationShapeError::InvalidProgramRole);
+        }
+        self.extend_ordered([catalog])?;
+        self.version(catalog)
     }
 
     fn allocate_version(&mut self) -> Result<ValueVersion, InvocationShapeError> {
@@ -179,8 +203,9 @@ impl SemanticValueMap {
 
     pub(super) fn allocated_versions(&self) -> impl Iterator<Item = ValueVersion> + '_ {
         let catalogs = self.allocations.iter().map(|(_, version)| *version);
+        let ephemeral = self.ephemeral.iter().copied();
         let fixed = self.fixed_u32.iter().map(|fixed| fixed.value);
-        catalogs.chain(fixed)
+        catalogs.chain(ephemeral).chain(fixed)
     }
 
     pub(super) fn allocation_classes(
@@ -200,8 +225,13 @@ impl SemanticValueMap {
                 transitions.insert(version);
             }
         }
+        transitions.extend(self.ephemeral.iter().copied());
         let fixed = self.fixed_u32.iter().map(|fixed| fixed.value).collect();
         (catalog_first, transitions, fixed)
+    }
+
+    pub(super) fn ephemeral_versions(&self) -> impl Iterator<Item = ValueVersion> + '_ {
+        self.ephemeral.iter().copied()
     }
 
     #[cfg(test)]

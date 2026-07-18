@@ -31,6 +31,7 @@ mod blake_g_direct_execution_authority;
 mod blake_g_direct_prefix;
 #[cfg(test)]
 mod blake_g_direct_tests;
+mod base_commit_projection;
 mod compiled_base_prefix;
 #[cfg(test)]
 mod compiled_base_prefix_tests;
@@ -272,6 +273,8 @@ enum InvocationShapeError {
     InvalidMemoryBaseTraceBinding,
     InvalidFixedTableAuthority,
     InvalidFixedTableBinding,
+    InvalidBaseCommitAuthority,
+    InvalidBaseCommitBinding,
 }
 
 fn validate_invocation(
