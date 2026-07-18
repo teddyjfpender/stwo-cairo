@@ -29,6 +29,7 @@ pub mod fleet_plan;
 pub mod fleet_pow;
 pub mod fleet_pow_replay;
 pub mod fleet_pow_runtime;
+pub mod fleet_pow_unix;
 pub mod fleet_pow_worker;
 pub mod fleet_spill;
 pub mod graphs;
