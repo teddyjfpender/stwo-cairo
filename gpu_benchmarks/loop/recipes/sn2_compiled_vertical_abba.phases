@@ -1,0 +1,136 @@
+# shellcheck shell=bash
+# Indicative SN2 old/new/new/old checkpoint. The replacement-v1 control is the
+# existing ArenaGraph prover; the treatment adds only the compiled Composition
+# vertical flag. Every process proves and verifies six identical SN2 statements.
+# pod_run: lease one_shot=false final_action=stop gpu=h100 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=3.00 name_prefix=replacement-v1-sn2- ttl_hours=2 idle_min=15
+
+export REPLACEMENT_SN2_MODE=vertical
+# shellcheck disable=SC1091
+source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
+
+vertical_abba_hardware_identity() {
+  checkpoint_hardware_identity
+  nvidia-smi -q >"$(checkpoint_artifact nvidia-smi-q.txt)"
+}
+
+vertical_abba_build() {
+  checkpoint_reject_ambient_overrides
+  cd "$CAIRO"
+  cargo build --release --locked -p stwo-cairo-gpu-prover \
+    --bin gpu_bench --features pie-bench
+  [[ -x "$CHECKPOINT_GPU_BENCH" ]] || {
+    echo "SN2 ABBA binary was not produced" >&2
+    return 1
+  }
+  {
+    sha256sum "$CHECKPOINT_GPU_BENCH"
+    rustc -Vv
+    nvcc --version
+  } >"$(checkpoint_artifact build-identity.txt)"
+}
+
+vertical_abba_focused_test() {
+  checkpoint_reject_ambient_overrides
+  cd "$CAIRO"
+  cargo test --release --locked -p stwo-cairo-gpu-prover \
+    address_free_structure_ignores_only_rebound_source_slots \
+    --lib -- --nocapture --test-threads=1
+}
+
+vertical_abba_run() {
+  local variant="$1" ordinal="$2" name stdout stderr proof args_file rc
+  local -a args=(
+    --pie "$CHECKPOINT_PIE" --backend cuda --engine gpu-native
+    --resident-backend replacement-v1
+    --require-gpu-native-architecture
+    --require-gpu-pcs-runtime-mode arena-graph
+    --reuse-input --reps 6
+    --require-proof-byte-equal
+    --require-simd-reference-byte-equal
+    --require-proof-mutation-rejected
+  )
+  case "$variant" in
+    old) ;;
+    new) args+=(--compiled-composition-vertical-checkpoint) ;;
+    *) echo "invalid SN2 ABBA variant: $variant" >&2; return 2 ;;
+  esac
+  checkpoint_reject_ambient_overrides
+  name="${variant}${ordinal}"
+  stdout="$(checkpoint_artifact "$name.stdout.txt")"
+  stderr="$(checkpoint_artifact "$name.stderr.txt")"
+  proof="$(checkpoint_artifact "$name.proof.bin")"
+  args_file="$(checkpoint_artifact "$name.args.txt")"
+  printf '%s\n' "${args[@]}" >"$args_file"
+
+  set +e
+  env STWO_BENCH_TRACE=json STWO_DUMP_PROOF="$proof" \
+    "$CHECKPOINT_GPU_BENCH" "${args[@]}" >"$stdout" 2>"$stderr"
+  rc=$?
+  set -e
+  cat "$stderr"
+  [[ $rc -eq 0 ]] || {
+    echo "SN2 ABBA $name process failed rc=$rc" >&2
+    return "$rc"
+  }
+  [[ -s "$stdout" && -s "$proof" && -s "$args_file" ]] || {
+    echo "SN2 ABBA $name omitted required evidence" >&2
+    return 1
+  }
+  if grep -Eiq 'cuda[_ -]error|cudaError|out[_ -]of[_ -]memory|memory allocation failed|(^|[^[:alnum:]_])OOM([^[:alnum:]_]|$)' \
+      "$stdout" "$stderr"; then
+    echo "SN2 ABBA $name emitted a CUDA/OOM signature" >&2
+    return 1
+  fi
+  sha256sum "$proof" >"$(checkpoint_artifact "$name.proof.sha256.txt")"
+  cat "$stdout"
+}
+
+vertical_abba_proof_identity() {
+  local baseline
+  baseline="$(checkpoint_artifact old1.proof.bin)"
+  for proof in \
+      "$(checkpoint_artifact new1.proof.bin)" \
+      "$(checkpoint_artifact new2.proof.bin)" \
+      "$(checkpoint_artifact old2.proof.bin)"; do
+    cmp -s "$baseline" "$proof" || {
+      echo "SN2 ABBA cross-process proof bytes differ: $proof" >&2
+      return 1
+    }
+  done
+  sha256sum \
+    "$baseline" \
+    "$(checkpoint_artifact new1.proof.bin)" \
+    "$(checkpoint_artifact new2.proof.bin)" \
+    "$(checkpoint_artifact old2.proof.bin)" \
+    >"$(checkpoint_artifact abba.proofs.sha256.txt)"
+}
+
+vertical_abba_validate() {
+  python3 "$CHECKPOINT_ROOT/gpu_benchmarks/validate_sn2_vertical_abba.py" \
+    --run-root "$RUN" \
+    --prefix "$CHECKPOINT_PREFIX" \
+    --hardware "$(checkpoint_artifact hardware_identity.json)" \
+    --source "$(checkpoint_artifact source_input_identity.json)" \
+    --pie "$CHECKPOINT_PIE" \
+    --bootloader "$CHECKPOINT_BOOTLOADER" \
+    --input-manifest "$CHECKPOINT_INPUT_MANIFEST" \
+    --aot-manifest "$CHECKPOINT_AOT_MANIFEST" \
+    --stwo-head "$STWO_PARITY_REF_STWO_HEAD" \
+    --stwo-worktree "$STWO_PARITY_REF_STWO_WORKTREE_HASH" \
+    --stwo-cairo-head "$STWO_PARITY_REF_STWO_CAIRO_HEAD" \
+    --stwo-cairo-worktree "$STWO_PARITY_REF_STWO_CAIRO_WORKTREE_HASH" \
+    --reps 6 >"$(checkpoint_artifact abba.record.json)"
+  cat "$(checkpoint_artifact abba.record.json)"
+}
+
+phase ambient_override_gate checkpoint_reject_ambient_overrides
+phase source_input_identity checkpoint_source_input_identity iteration
+phase hardware_identity vertical_abba_hardware_identity
+phase composition_address_free_test vertical_abba_focused_test
+phase build vertical_abba_build
+phase abba_old_1 vertical_abba_run old 1
+phase abba_new_1 vertical_abba_run new 1
+phase abba_new_2 vertical_abba_run new 2
+phase abba_old_2 vertical_abba_run old 2
+phase abba_proof_identity vertical_abba_proof_identity
+phase abba_validate vertical_abba_validate
