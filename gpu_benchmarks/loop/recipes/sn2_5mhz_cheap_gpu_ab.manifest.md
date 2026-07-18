@@ -27,7 +27,8 @@ The phase recipe uses:
 - exact test-binary SHA-256 and AOT-manifest SHA-256
 - GPU name, UUID, PCI bus, `sm_86`, memory, driver, power limit, and maximum
   SM/memory clocks
-- `nvcc --version`, `rustc -Vv`, and `cargo -V`
+- `nvcc --version`, plus `rustc -Vv` and `cargo -V` from each repo's pinned
+  working directory
 
 Every A/B pair must execute in one process from one binary, on one CUDA stream,
 with identical fixtures. Baseline must run before candidate and candidate

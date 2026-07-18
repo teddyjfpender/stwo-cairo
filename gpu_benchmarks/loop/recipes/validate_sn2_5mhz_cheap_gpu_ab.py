@@ -117,8 +117,14 @@ def artifact_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def output(command: list[str]) -> str:
-    return subprocess.run(command, check=True, text=True, capture_output=True).stdout.strip()
+def output(command: list[str], *, cwd: pathlib.Path | None = None) -> str:
+    return subprocess.run(
+        command,
+        check=True,
+        text=True,
+        capture_output=True,
+        cwd=cwd,
+    ).stdout.strip()
 
 
 def capture_command(args: argparse.Namespace) -> int:
@@ -160,13 +166,15 @@ def capture_command(args: argparse.Namespace) -> int:
             )
         )
     tools: dict[str, str] = {}
-    for name, command in (
-        ("nvcc", ["nvcc", "--version"]),
-        ("rustc", ["rustc", "-Vv"]),
-        ("cargo", ["cargo", "-V"]),
+    for name, command, cwd in (
+        ("nvcc", ["nvcc", "--version"], None),
+        ("stwo_rustc", ["rustc", "-Vv"], args.stwo),
+        ("stwo_cargo", ["cargo", "-V"], args.stwo),
+        ("stwo_cairo_rustc", ["rustc", "-Vv"], args.cairo),
+        ("stwo_cairo_cargo", ["cargo", "-V"], args.cairo),
     ):
         try:
-            tools[name] = output(command)
+            tools[name] = output(command, cwd=cwd)
         except (OSError, subprocess.CalledProcessError) as error:
             errors.append(f"{name} identity failed: {error}")
     source = {
@@ -601,7 +609,16 @@ def validate_run(run: pathlib.Path) -> dict:
         checks.require(False, "AOT manifest cannot be re-read")
     toolchain = environment.get("toolchain", {})
     checks.require(
-        all(isinstance(toolchain.get(tool), str) and toolchain[tool] for tool in ("nvcc", "rustc", "cargo")),
+        all(
+            isinstance(toolchain.get(tool), str) and toolchain[tool]
+            for tool in (
+                "nvcc",
+                "stwo_rustc",
+                "stwo_cargo",
+                "stwo_cairo_rustc",
+                "stwo_cairo_cargo",
+            )
+        ),
         "toolchain identity incomplete",
     )
     binaries = environment.get("test_binaries", {})
@@ -709,6 +726,8 @@ def parser() -> argparse.ArgumentParser:
     artifact.add_argument("--out", type=pathlib.Path, required=True)
     capture = subcommands.add_parser("capture")
     capture.add_argument("--run", type=pathlib.Path, required=True)
+    capture.add_argument("--stwo", type=pathlib.Path, required=True)
+    capture.add_argument("--cairo", type=pathlib.Path, required=True)
     capture.add_argument("--aot-manifest", type=pathlib.Path, required=True)
     capture.add_argument("--out", type=pathlib.Path, required=True)
     validate = subcommands.add_parser("validate")

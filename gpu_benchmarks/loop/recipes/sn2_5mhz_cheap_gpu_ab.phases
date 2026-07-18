@@ -98,6 +98,8 @@ run_composition() {
 capture_environment() {
   python3 "$VALIDATOR" capture \
     --run "$RUN" \
+    --stwo "$STWO" \
+    --cairo "$CAIRO" \
     --aot-manifest "$AOT_MANIFEST" \
     --out "$RUN/environment.json"
 }
