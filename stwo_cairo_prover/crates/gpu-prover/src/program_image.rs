@@ -31,6 +31,8 @@ mod identity;
 mod lower_compiled;
 
 use identity::ArenaProgramInventoryIdentity;
+#[cfg(test)]
+pub(crate) use lower_compiled::tests::{generated_sn2, generated_sn2_replacement};
 pub(crate) use lower_compiled::{
     bind_replacement_base_authority, compile_replacement_base_authority, BaseProducerAuthority,
     BaseProducerAuthorityError, LoadedBaseProducerAuthority, PreparedBaseProducerInventory,

@@ -398,7 +398,7 @@ fn canonical_direct_evaluations(
         .collect()
 }
 
-fn relation_claimed_sum_key(
+pub(crate) fn relation_claimed_sum_key(
     component: &'static str,
     instance: usize,
 ) -> (&'static str, RelationTracePart, usize) {

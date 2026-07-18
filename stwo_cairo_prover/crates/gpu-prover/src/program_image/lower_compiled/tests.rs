@@ -23,11 +23,11 @@ use crate::resident_session::ResidentPreWitnessInput;
 use crate::resident_witness::planned_cairo_claim;
 use crate::shape_executable::{ShapeCompileRequest, ShapeExecutable, ShapeExecutableCache};
 
-pub(super) fn generated_sn2() -> Arc<ShapeExecutable> {
+pub(crate) fn generated_sn2() -> Arc<ShapeExecutable> {
     generated_sn2_with_policy(ProtocolPlanPolicy::starknet_blake2s(0x1234, 2048))
 }
 
-pub(super) fn generated_sn2_replacement() -> Arc<ShapeExecutable> {
+pub(crate) fn generated_sn2_replacement() -> Arc<ShapeExecutable> {
     generated_sn2_with_policy(ProtocolPlanPolicy::replacement_v1(0x534e_0001, 2048))
 }
 

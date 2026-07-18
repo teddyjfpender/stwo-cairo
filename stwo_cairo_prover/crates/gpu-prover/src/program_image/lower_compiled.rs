@@ -840,4 +840,4 @@ fn validate_recorded_witness_abi() -> Result<(), InvocationShapeError> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

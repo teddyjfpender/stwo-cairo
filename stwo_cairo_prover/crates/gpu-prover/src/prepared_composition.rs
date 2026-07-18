@@ -30,9 +30,19 @@ use crate::direct_composition_retention::{
 
 mod binding_refresh;
 mod direct_split;
+mod execution_authority;
 pub use binding_refresh::CompositionBindingRefreshTelemetry;
 pub use direct_split::{
     CompositionDirectSplitBinding, CompositionOutputMode, CompositionOutputPlan,
+};
+pub use execution_authority::{
+    CompositionAbi, CompositionAccessKind, CompositionAuthorityError, CompositionChildLaunch,
+    CompositionDescriptorRole, CompositionEffect, CompositionEmbeddedPointerTable,
+    CompositionExecutionAuthority, CompositionInvocation, CompositionInvocationArgument,
+    CompositionInvocationValue, CompositionLaunchGeometry, CompositionLayout,
+    CompositionLinkedAuthority, CompositionOperation, CompositionOperationKind,
+    CompositionRelocationLayout, CompositionRelocationRole, CompositionValueAccess,
+    CompositionValueRole,
 };
 
 const WORD_BYTES: usize = core::mem::size_of::<u32>();
