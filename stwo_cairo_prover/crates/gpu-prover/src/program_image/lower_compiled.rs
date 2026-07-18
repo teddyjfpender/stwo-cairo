@@ -40,9 +40,11 @@ mod ec_op_pair_tests;
 mod ec_op_prefix;
 mod ec_op_setup_sources;
 mod execution_tables;
+mod fixed_table_materialization;
 mod loaded_authority;
 mod loaded_base_binding;
 mod loaded_writer_binding;
+mod memory_base_trace;
 mod multiplicity_clear;
 mod multiplicity_coordinator;
 mod multiplicity_feed;
@@ -266,6 +268,10 @@ enum InvocationShapeError {
     InvalidBaseInterpolationAuthority,
     InvalidBaseInterpolationBinding,
     InvalidProductionBaseAuthority,
+    InvalidMemoryBaseTraceAuthority,
+    InvalidMemoryBaseTraceBinding,
+    InvalidFixedTableAuthority,
+    InvalidFixedTableBinding,
 }
 
 fn validate_invocation(
