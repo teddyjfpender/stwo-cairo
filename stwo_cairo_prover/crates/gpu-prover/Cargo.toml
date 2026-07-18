@@ -83,3 +83,4 @@ optional = true
 [dev-dependencies]
 stwo-cairo-dev-utils = { path = "../dev_utils" }
 test-log = { version = "0.2.17", features = ["trace"] }
+hex.workspace = true
