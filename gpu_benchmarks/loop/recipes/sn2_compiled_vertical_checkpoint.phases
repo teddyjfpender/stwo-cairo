@@ -1,0 +1,80 @@
+# shellcheck shell=bash
+# Indicative SN2 vertical checkpoint only: compiled Base through Composition,
+# then the verified monolithic OODS/FRI tail. This is never a formal promotion.
+# pod_run: lease one_shot=false final_action=stop gpu=h100 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=3.00 name_prefix=sn2-vertical-h100- ttl_hours=2 idle_min=15
+
+# Reuse the pinned sm_90 build policy, H100 admission, and ambient override gate.
+REPLACEMENT_SN2_MODE=vertical
+# shellcheck disable=SC1091
+source "${CAIRO%/stwo_cairo_prover}/gpu_benchmarks/loop/recipes/replacement_v1_sn2_common.sh"
+
+vertical_hardware_identity() {
+  checkpoint_hardware_identity
+  nvidia-smi -q >"$(checkpoint_artifact nvidia-smi-q.txt)"
+}
+
+vertical_build() {
+  checkpoint_reject_ambient_overrides
+  cd "$CAIRO"
+  cargo build --release --locked -p stwo-cairo-gpu-prover \
+    --bin gpu_bench --features pie-bench
+  [[ -x "$CHECKPOINT_GPU_BENCH" ]] || {
+    echo "vertical checkpoint binary was not produced" >&2
+    return 1
+  }
+  {
+    sha256sum "$CHECKPOINT_GPU_BENCH"
+    rustc -Vv
+    nvcc --version
+  } >"$(checkpoint_artifact build-identity.txt)"
+}
+
+vertical_run() {
+  local stdout stderr proof rc
+  checkpoint_reject_ambient_overrides
+  [[ -f "$CHECKPOINT_PIE" ]] || {
+    echo "missing SN2 PIE: $CHECKPOINT_PIE" >&2
+    return 1
+  }
+  stdout="$(checkpoint_artifact stdout.txt)"
+  stderr="$(checkpoint_artifact stderr.txt)"
+  proof="$(checkpoint_artifact proof.bin)"
+  set +e
+  env STWO_BENCH_TRACE=json STWO_DUMP_PROOF="$proof" \
+    "$CHECKPOINT_GPU_BENCH" \
+    --pie "$CHECKPOINT_PIE" --backend cuda --engine gpu-native \
+    --resident-backend replacement-v1 \
+    --require-gpu-native-architecture \
+    --require-gpu-pcs-runtime-mode arena-graph \
+    --compiled-composition-vertical-checkpoint \
+    --reuse-input --reps 6 \
+    --require-proof-byte-equal \
+    --require-simd-reference-byte-equal \
+    --require-proof-mutation-rejected \
+    >"$stdout" 2>"$stderr"
+  rc=$?
+  set -e
+  cat "$stderr"
+  [[ $rc -eq 0 ]] || return "$rc"
+  [[ -s "$stdout" && -s "$stderr" && -s "$proof" ]] || {
+    echo "vertical checkpoint omitted stdout, stderr, or proof evidence" >&2
+    return 1
+  }
+  sha256sum "$proof" >"$(checkpoint_artifact proof.sha256.txt)"
+  cat "$stdout"
+}
+
+vertical_validate() {
+  python3 "$CHECKPOINT_ROOT/gpu_benchmarks/validate_sn2_vertical_checkpoint.py" \
+    --stdout "$(checkpoint_artifact stdout.txt)" \
+    --proof "$(checkpoint_artifact proof.bin)" \
+    --hardware "$(checkpoint_artifact hardware_identity.json)" \
+    --reps 6 >"$(checkpoint_artifact record.json)"
+  cat "$(checkpoint_artifact record.json)"
+}
+
+phase ambient_override_gate checkpoint_reject_ambient_overrides
+phase hardware_identity vertical_hardware_identity
+phase build vertical_build
+phase sn2_compiled_vertical vertical_run
+phase sn2_compiled_vertical_validate vertical_validate
