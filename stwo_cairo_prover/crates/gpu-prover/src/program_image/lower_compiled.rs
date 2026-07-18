@@ -37,6 +37,7 @@ mod compiled_base_prefix;
 mod compiled_base_prefix_tests;
 mod composition_prelude_projection;
 mod composition_projection;
+mod composition_terminal_projection;
 mod ec_op_execution_authority;
 #[cfg(test)]
 mod ec_op_pair_tests;
