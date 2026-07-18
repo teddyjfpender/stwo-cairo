@@ -546,6 +546,7 @@ pub enum ResidentRuntimeError {
     },
     StaleRelationChallenges,
     StaleFriChallenge(usize),
+    FleetPowControl(String),
     HotPathBudgetExceeded {
         budget: ResidentHotPathBudget,
         actual: CudaExecTelemetry,

@@ -320,6 +320,16 @@ pub trait FleetPowTransport {
     fn receive(&mut self) -> Result<FleetPowRankResponse, FleetPowRuntimeError>;
 }
 
+impl<T: FleetPowTransport + ?Sized> FleetPowTransport for &mut T {
+    fn send(&mut self, request: &FleetPowRankRequest) -> Result<(), FleetPowRuntimeError> {
+        (**self).send(request)
+    }
+
+    fn receive(&mut self) -> Result<FleetPowRankResponse, FleetPowRuntimeError> {
+        (**self).receive()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FleetPowResolution {
     pub nonce: u64,

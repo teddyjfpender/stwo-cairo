@@ -54,7 +54,10 @@ use stwo_constraint_framework::{FrameworkBackend, LogupFinalizeBackend};
 use tracing::{span, Level};
 
 use crate::arena_plan::ResidentBackend;
-use crate::graphs::{GraphError, GraphWorkspace};
+use crate::fleet_pow::FleetPowSchedule;
+use crate::fleet_pow_replay::{replay_fleet_pow_split, FleetPowReplayReceipt};
+use crate::fleet_pow_runtime::{FleetPowTransport, TwoRankFleetPowCoordinator};
+use crate::graphs::{GraphError, GraphWorkspace, ResidentGraphTopology};
 use crate::protocol_discovery::interaction_claim_from_flattened;
 use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::replacement_host_cache::{
@@ -65,10 +68,10 @@ use crate::resident_runtime::{
     SealedResidentExecutionConfig,
 };
 use crate::resident_session::{
-    with_resident_pre_witness_session, with_resident_session, ResidentExecutionReadiness,
-    ResidentIngressAudit, ResidentPreWitnessInput, ResidentPreWitnessSessionRequest,
-    ResidentPreparationState, ResidentSessionArtifacts, ResidentSessionError,
-    ResidentSessionRequest, ResidentSessionTelemetry,
+    with_resident_pre_witness_session_for_topology, with_resident_session,
+    ResidentExecutionReadiness, ResidentIngressAudit, ResidentPreWitnessInput,
+    ResidentPreWitnessSessionRequest, ResidentPreparationState, ResidentSessionArtifacts,
+    ResidentSessionError, ResidentSessionRequest, ResidentSessionTelemetry,
 };
 use crate::resident_shape::RawResidentShapeError;
 use crate::schedule::ScheduleError;
@@ -189,6 +192,32 @@ impl ResidentTranscriptMirrorTelemetry {
 pub struct MirroredResidentBlake2sProof {
     pub proof: CairoProof<Blake2sMerkleHasher>,
     pub transcript_mirror: ResidentTranscriptMirrorTelemetry,
+}
+
+/// Correctness result for the first cooperative two-rank resident path.
+///
+/// This result is deliberately excluded from headline benchmarking until the
+/// fleet-specific copy, synchronization, and transport budgets are qualified.
+pub struct FleetResidentBlake2sProof {
+    pub proof: CairoProof<Blake2sMerkleHasher>,
+    pub telemetry: FleetResidentProofTelemetry,
+}
+
+#[derive(Clone, Debug)]
+pub struct FleetResidentProofTelemetry {
+    pub proof_generation: u64,
+    pub plan_identity: [u8; 32],
+    pub pow: FleetPowReplayReceipt,
+    pub execution: CudaExecTelemetry,
+    pub expected_graph_launches: u64,
+    pub expected_captured_kernel_launches: u64,
+    pub performance_admissible: bool,
+}
+
+impl FleetResidentProofTelemetry {
+    pub const fn performance_claim_admissible(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -974,6 +1003,24 @@ where
             ResidentSessionArtifacts<'_>,
         ) -> Result<R, ResidentRuntimeError>,
     ) -> Result<(R, ResidentSessionTelemetry), GpuError> {
+        self.with_strict_resident_session_for_topology(
+            input,
+            params,
+            ResidentGraphTopology::Monolithic,
+            run,
+        )
+    }
+
+    fn with_strict_resident_session_for_topology<R>(
+        &mut self,
+        input: ProverInput,
+        params: ProverParameters,
+        graph_topology: ResidentGraphTopology,
+        run: impl FnOnce(
+            &mut ResidentGraphRuntime<'_>,
+            ResidentSessionArtifacts<'_>,
+        ) -> Result<R, ResidentRuntimeError>,
+    ) -> Result<(R, ResidentSessionTelemetry), GpuError> {
         validate_execution_entry(
             self.config.resident_backend,
             ProverExecutionEntry::PreWitnessResident,
@@ -1003,7 +1050,7 @@ where
         let protocol_policy = self.resident_protocol_policy.ok_or_else(|| {
             GpuError::Config("strict resident protocol policy was not resolved".to_string())
         })?;
-        Ok(with_resident_pre_witness_session(
+        Ok(with_resident_pre_witness_session_for_topology(
             &mut self.shape_executable_cache,
             &mut self.workspace_cache,
             ResidentPreWitnessSessionRequest {
@@ -1017,6 +1064,7 @@ where
                 protocol_policy,
                 execution_config: self.resident_execution_config,
             },
+            graph_topology,
             run,
         )?)
     }
@@ -1472,6 +1520,162 @@ impl GpuCairoProver<Blake2sMerkleChannel> {
         )?;
         debug_assert!(transcript_mirror.is_none());
         Ok(proof)
+    }
+
+    /// Prove through the real resident DAG while ranks 0 and 1 cooperatively
+    /// search both transcript PoW boundaries.
+    pub fn prove_resident_blake2s_with_fleet_pow<T: FleetPowTransport>(
+        &mut self,
+        input: ProverInput,
+        params: ProverParameters,
+        schedule: FleetPowSchedule,
+        proof_generation: u64,
+        transport: &mut T,
+    ) -> Result<FleetResidentBlake2sProof, GpuError> {
+        self.last_pcs_telemetry = None;
+        self.last_resident_session_telemetry = None;
+        self.last_aot_stats = None;
+        if !self.config.strict {
+            return Err(GpuError::Config(
+                "resident Blake2s proving requires strict GPU-native mode".to_string(),
+            ));
+        }
+        aot::reset_runtime_stats();
+        let capture_graph_replay_timing = self.config.record_graph_replay_intervals_diagnostic;
+
+        let (
+            (
+                claim,
+                bundle,
+                shape,
+                lifting_log_size,
+                plan_identity,
+                pow,
+                execution,
+                expected_graphs,
+                expected_kernel_launches,
+            ),
+            session_telemetry,
+        ) = self.with_strict_resident_session_for_topology(
+            input,
+            params,
+            ResidentGraphTopology::FleetPowSplit,
+            |runtime, artifacts| {
+                runtime.require_prepared_witness_coverage()?;
+                if artifacts
+                    .telemetry
+                    .prepared_runtime_materialization
+                    .is_none()
+                {
+                    return Err(ResidentRuntimeError::MissingPreparedRuntimeMaterialization);
+                }
+                if !runtime.prepared_capture_ready_for(ResidentGraphTopology::FleetPowSplit)? {
+                    runtime
+                        .capture_all_prepared_subgraphs_for(ResidentGraphTopology::FleetPowSplit)?;
+                }
+                let expected_graphs =
+                    u64::try_from(runtime.require_complete_captured_topology_for(
+                        ResidentGraphTopology::FleetPowSplit,
+                    )?)
+                    .map_err(|_| ResidentRuntimeError::FriRoundIndexTooLarge(usize::MAX))?;
+                let expected_kernel_launches = runtime.captured_graph_kernel_node_count()?;
+                runtime
+                    .workspace_proof_bundle_bytes()
+                    .ok_or(ResidentRuntimeError::TranscriptRequirementsMismatch)?;
+                let plan_identity = artifacts
+                    .telemetry
+                    .shape_executable_topology_digest
+                    .ok_or(ResidentRuntimeError::TranscriptRequirementsMismatch)?;
+                let mut coordinator = TwoRankFleetPowCoordinator::new(
+                    schedule,
+                    plan_identity,
+                    proof_generation,
+                    &mut *transport,
+                )
+                .map_err(|error| ResidentRuntimeError::FleetPowControl(error.to_string()))?;
+
+                runtime.begin_hot_path_telemetry();
+                if capture_graph_replay_timing {
+                    runtime.begin_graph_replay_timing()?;
+                }
+                let pow = replay_fleet_pow_split(runtime, &mut coordinator)
+                    .map_err(|error| error.into_resident())?;
+                let bundle = runtime.read_proof_bundle_once()?;
+                if capture_graph_replay_timing {
+                    runtime.finish_graph_replay_timing()?;
+                }
+                let execution = runtime.hot_path_telemetry();
+                Ok((
+                    artifacts.claim.clone(),
+                    bundle,
+                    runtime.proof_assembly_shape().clone(),
+                    artifacts.discovery.lifting_log_size,
+                    plan_identity,
+                    pow,
+                    execution,
+                    expected_graphs,
+                    expected_kernel_launches,
+                ))
+            },
+        )?;
+        session_telemetry.require_strict_graph_a()?;
+
+        let interaction_claim = interaction_claim_from_flattened(&claim, &bundle.interaction_claim)
+            .map_err(ResidentSessionError::Discovery)?;
+        let proof = assemble_blake2s_stark_proof(Blake2sProofAssemblyInput {
+            config: params.pcs_config,
+            shape,
+            commitments: bundle.commitments,
+            sampled_values: bundle.sampled_values,
+            raw_queries: bundle.decommitment.raw_queries().to_vec(),
+            proof_of_work: bundle.query_pow,
+            final_line_poly_words: bundle.final_line_poly_words,
+            fri_commitments: bundle.fri_commitments,
+            decommitment: bundle.decommitment,
+        })?;
+        validate_resident_composition_oods(
+            &claim,
+            &interaction_claim,
+            bundle.interaction_pow,
+            &proof,
+            &params,
+            lifting_log_size,
+        )?;
+
+        let aot_stats = aot::runtime_stats();
+        if aot_stats.aot_misses != 0
+            || aot_stats.runtime_loads != 0
+            || aot_stats.runtime_cache_hits != 0
+            || aot_stats.strict_rejections != 0
+        {
+            return Err(GpuError::Config(format!(
+                "strict GPU-native AOT provenance failed: {aot_stats:?}"
+            )));
+        }
+
+        let proof = CairoProof {
+            claim,
+            interaction_pow: bundle.interaction_pow,
+            interaction_claim,
+            extended_stark_proof: proof,
+            channel_salt: params.channel_salt,
+            preprocessed_trace_variant: params.preprocessed_trace,
+        };
+        self.last_resident_session_telemetry = Some(session_telemetry);
+        self.last_aot_stats = Some(aot_stats);
+
+        Ok(FleetResidentBlake2sProof {
+            proof,
+            telemetry: FleetResidentProofTelemetry {
+                proof_generation,
+                plan_identity,
+                pow,
+                execution,
+                expected_graph_launches: expected_graphs,
+                expected_captured_kernel_launches: expected_kernel_launches,
+                performance_admissible: false,
+            },
+        })
     }
 
     /// Opt-in U4 migration gate. It proves through the same strict resident

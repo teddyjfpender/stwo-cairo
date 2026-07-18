@@ -18,7 +18,7 @@ const TRANSCRIPT_STATUS_WORD: usize = 10;
 pub fn replay_fleet_pow_split<T: FleetPowTransport>(
     runtime: &mut ResidentGraphRuntime<'_>,
     coordinator: &mut TwoRankFleetPowCoordinator<T>,
-) -> Result<(), FleetPowReplayError> {
+) -> Result<FleetPowReplayReceipt, FleetPowReplayError> {
     runtime.require_complete_captured_topology_for(ResidentGraphTopology::FleetPowSplit)?;
     runtime.begin_next_transcript_generation()?;
 
@@ -53,7 +53,13 @@ pub fn replay_fleet_pow_split<T: FleetPowTransport>(
     )?;
     runtime.upload_query_pow_nonce(query.nonce)?;
     runtime.replay_final_resume()?;
-    Ok(())
+    Ok(FleetPowReplayReceipt { interaction, query })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FleetPowReplayReceipt {
+    pub interaction: FleetPowResolution,
+    pub query: FleetPowResolution,
 }
 
 fn resolve<T: FleetPowTransport>(
@@ -123,6 +129,15 @@ impl core::fmt::Display for FleetPowReplayError {
 }
 
 impl std::error::Error for FleetPowReplayError {}
+
+impl FleetPowReplayError {
+    pub fn into_resident(self) -> ResidentRuntimeError {
+        match self {
+            Self::Resident(error) => error,
+            other => ResidentRuntimeError::FleetPowControl(other.to_string()),
+        }
+    }
+}
 
 impl From<ResidentRuntimeError> for FleetPowReplayError {
     fn from(value: ResidentRuntimeError) -> Self {
