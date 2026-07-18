@@ -27,6 +27,8 @@ pub mod flags;
 pub mod fleet_barrier;
 pub mod fleet_plan;
 pub mod fleet_pow;
+pub mod fleet_pow_runtime;
+pub mod fleet_pow_worker;
 pub mod fleet_spill;
 pub mod graphs;
 pub mod interaction_pow_vertical;
