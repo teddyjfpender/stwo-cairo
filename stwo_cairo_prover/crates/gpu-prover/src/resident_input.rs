@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use cairo_air::air::PublicData;
+use stwo_backend_cuda::ExecutionTablesHostData;
 use stwo_cairo_adapter::builtins::BuiltinSegments;
 use stwo_cairo_adapter::memory::Memory;
 use stwo_cairo_adapter::opcodes::{
@@ -74,6 +75,15 @@ impl ResidentProverInputOwner {
 
     pub fn execution_memory(&self) -> &Arc<Memory> {
         &self.execution_memory
+    }
+
+    /// Exact compact execution-table payload consumed by the CUDA split stage.
+    pub fn execution_tables_host_data(&self) -> ExecutionTablesHostData<'_> {
+        ExecutionTablesHostData {
+            addr_to_id: bytemuck::cast_slice(&self.execution_memory.address_to_id),
+            f252_values: &self.execution_memory.f252_values,
+            small_values: &self.execution_memory.small_values,
+        }
     }
 
     pub fn pc_count(&self) -> usize {
@@ -179,6 +189,13 @@ mod tests {
             owner.execution_memory().small_values,
             oracle_memory.small_values
         );
+        let execution_tables = owner.execution_tables_host_data();
+        assert_eq!(
+            execution_tables.addr_to_id,
+            bytemuck::cast_slice::<_, u32>(&oracle_memory.address_to_id)
+        );
+        assert_eq!(execution_tables.f252_values, oracle_memory.f252_values);
+        assert_eq!(execution_tables.small_values, oracle_memory.small_values);
         assert_eq!(
             owner.execution_memory().config.small_max,
             oracle_memory.config.small_max
