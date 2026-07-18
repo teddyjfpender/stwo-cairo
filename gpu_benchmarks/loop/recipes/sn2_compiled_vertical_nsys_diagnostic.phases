@@ -27,8 +27,7 @@ vertical_nsys_install() {
 
 vertical_nsys_resolve() {
   local nsys_bin
-  nsys_bin="$(command -v nsys || true)"
-  [[ -n "$nsys_bin" ]] || nsys_bin="$CHECKPOINT_NSYS_FALLBACK"
+  nsys_bin="$CHECKPOINT_NSYS_FALLBACK"
   [[ -x "$nsys_bin" ]] || {
     echo "required Nsight Systems executable is absent: $nsys_bin" >&2
     return 1

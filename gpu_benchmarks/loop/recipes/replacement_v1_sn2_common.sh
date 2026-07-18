@@ -255,8 +255,7 @@ PY
 
 checkpoint_nsys_tool_identity() {
   local nsys_bin version out
-  nsys_bin="$(command -v nsys || true)"
-  [[ -n "$nsys_bin" ]] || nsys_bin="$CHECKPOINT_NSYS_FALLBACK"
+  nsys_bin="$CHECKPOINT_NSYS_FALLBACK"
   [[ -x "$nsys_bin" ]] \
     || { echo "required Nsight Systems executable is absent: $nsys_bin" >&2; return 1; }
   version="$("$nsys_bin" --version 2>&1)" \
