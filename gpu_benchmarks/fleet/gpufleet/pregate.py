@@ -13,17 +13,77 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+from .lease_policy import LeasePolicy, load as load_lease_policy
 from .source_projection import projection_identity
 
 STAMP = Path(__file__).resolve().parent.parent / ".pregate_ok.json"
 FRESH_S = 6 * 3600
 SN_INPUT_ENV = "STWO_SN_ADAPTED_DIR"
 SN_INPUT_NAMES = tuple(f"SN_PIE_{index}.adapted.bin" for index in range(1, 5))
+SN2_5MHZ_CHEAP_SCOPE = "sn2-5mhz-cheap-a40-ab-v1"
+SN2_5MHZ_CHEAP_RECIPE = Path(
+    "gpu_benchmarks/loop/recipes/sn2_5mhz_cheap_gpu_ab.phases"
+)
+SN2_5MHZ_CHEAP_POLICY = LeasePolicy(
+    one_shot=True,
+    final_action="terminate",
+    gpu="a40",
+    gpu_count=1,
+    min_vcpu=16,
+    min_mem_gb=62,
+    max_usd_hr=0.50,
+    name_prefix="stwo-sn2-5mhz-ab-a40-",
+    ttl_hours=1.5,
+    idle_min=15,
+)
+_SN2_5MHZ_CHEAP_PHASES = (
+    "phase relation soft relation run_relation",
+    "phase quotient soft quotient run_quotient",
+    "phase composition soft composition run_composition",
+    "phase environment soft environment capture_environment",
+    "phase fail_closed_verdict validate_all",
+)
+_SN2_5MHZ_CHEAP_CAIRO_CONTROL = (
+    "gpu_benchmarks/fleet/gpufleet/__init__.py",
+    "gpu_benchmarks/fleet/gpufleet/pregate.py",
+    "gpu_benchmarks/fleet/gpufleet/__main__.py",
+    "gpu_benchmarks/fleet/gpufleet/api.py",
+    "gpu_benchmarks/fleet/gpufleet/podctl.py",
+    "gpu_benchmarks/fleet/gpufleet/source_projection.py",
+    "gpu_benchmarks/fleet/gpufleet/lease_policy.py",
+    "gpu_benchmarks/fleet/gpufleet.sh",
+    "gpu_benchmarks/loop/pod_run.sh",
+    "gpu_benchmarks/loop/stage_source_projection.sh",
+    SN2_5MHZ_CHEAP_RECIPE.as_posix(),
+    "gpu_benchmarks/loop/recipes/validate_sn2_5mhz_cheap_gpu_ab.py",
+    "gpu_benchmarks/loop/recipes/test_validate_sn2_5mhz_cheap_gpu_ab.py",
+)
+_SN2_5MHZ_CHEAP_STWO_CONTROL = (
+    "crates/backend-cuda-kernels/cuda/generated/aot_manifest.json",
+)
+_SN2_5MHZ_CHEAP_REQUIRED = (
+    "export STWO_CUDA_ARCH=sm_86",
+    "--release --locked -p stwo-backend-cuda",
+    "--features test-only-relation-ab,test-only-empty-aot-pack",
+    "--test prepared_relation_native",
+    "fused_same_binary_selector_ab_receipt",
+    "STWO_STAGE4_NATIVE_FIXTURE=staged-prepacked-quotient",
+    "--features test-only-empty-aot-pack",
+    "--test replacement_stage4_native",
+    "replacement_stage4_native_bytes_match",
+    "--release --locked -p stwo-cairo-gpu-prover",
+    "--features direct-retention-test-api",
+    "--test prepared_composition_stripes_direct_native",
+    "multidomain_direct_split_wave_and_installed_stripes_match_eager_and_replay",
+    'printf \'%s\\n\' "$rc" >"$RUN/$label.raw.rc"',
+    'python3 "$VALIDATOR" validate',
+)
 SN2_VERTICAL_SCOPE = "sn2-vertical-indicative-v1"
 SN2_VERTICAL_RECIPE = Path(
     "gpu_benchmarks/loop/recipes/sn2_compiled_vertical_checkpoint.phases"
@@ -207,6 +267,111 @@ def _tracked_control_is_clean(repository: Path, paths: tuple[str, ...]) -> bool:
         == 0
         for command in commands
     )
+
+
+def is_sn2_5mhz_cheap_recipe(recipe: Path, stwo_cairo: Path) -> bool:
+    """True only for the canonical one-shot A40 differential recipe."""
+    try:
+        return recipe.expanduser().resolve(strict=True) == (
+            stwo_cairo / SN2_5MHZ_CHEAP_RECIPE
+        ).resolve(strict=True)
+    except OSError:
+        return False
+
+
+def _sn2_5mhz_cheap_identity(
+    recipe: Path, stwo: Path, stwo_cairo: Path
+) -> dict[str, object]:
+    if not is_sn2_5mhz_cheap_recipe(recipe, stwo_cairo):
+        raise ValueError("not the canonical SN2 5 MHz cheap-GPU recipe")
+    if load_lease_policy(recipe) != SN2_5MHZ_CHEAP_POLICY:
+        raise ValueError("SN2 5 MHz cheap-GPU lease policy drifted")
+    if not (
+        _tracked_control_is_clean(stwo_cairo, _SN2_5MHZ_CHEAP_CAIRO_CONTROL)
+        and _tracked_control_is_clean(stwo, _SN2_5MHZ_CHEAP_STWO_CONTROL)
+    ):
+        raise ValueError("SN2 5 MHz cheap-GPU control plane differs from tracked HEAD")
+    raw = recipe.read_bytes()
+    source = raw.decode("utf-8")
+    phases = tuple(line for line in source.splitlines() if line.startswith("phase "))
+    if phases != _SN2_5MHZ_CHEAP_PHASES:
+        raise ValueError("SN2 5 MHz cheap-GPU phase contract drifted")
+    if any(fragment not in source for fragment in _SN2_5MHZ_CHEAP_REQUIRED):
+        raise ValueError("SN2 5 MHz cheap-GPU safety contract is incomplete")
+    return {
+        "scope": SN2_5MHZ_CHEAP_SCOPE,
+        "recipe": {
+            "path": SN2_5MHZ_CHEAP_RECIPE.as_posix(),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        },
+        "source_identity": _source_identity(stwo, stwo_cairo),
+    }
+
+
+def admit_sn2_5mhz_cheap(
+    recipe: Path, stwo: Path, stwo_cairo: Path
+) -> dict[str, object] | None:
+    """Run the exact no-Cargo admission before the one-shot A40 lease."""
+    try:
+        identity = _sn2_5mhz_cheap_identity(recipe, stwo, stwo_cairo)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        print(f"[pregate] FAIL SN2 5 MHz cheap-GPU identity: {error}")
+        return None
+
+    validator = (
+        stwo_cairo
+        / "gpu_benchmarks/loop/recipes/validate_sn2_5mhz_cheap_gpu_ab.py"
+    )
+    synthetic = (
+        stwo_cairo
+        / "gpu_benchmarks/loop/recipes/test_validate_sn2_5mhz_cheap_gpu_ab.py"
+    )
+    checks = [
+        ("SN2 5 MHz cheap-GPU shell syntax", ["bash", "-n", str(recipe)]),
+        (
+            "SN2 5 MHz cheap-GPU validator self-test",
+            [sys.executable, "-B", str(validator), "self-test"],
+        ),
+        (
+            "SN2 5 MHz cheap-GPU synthetic validator",
+            [sys.executable, "-B", str(synthetic)],
+        ),
+    ]
+    if shutil.which("shellcheck"):
+        checks.insert(
+            1,
+            (
+                "SN2 5 MHz cheap-GPU shellcheck",
+                ["shellcheck", str(recipe)],
+            ),
+        )
+    for name, argv in checks:
+        result = subprocess.run(
+            argv, cwd=stwo_cairo, capture_output=True, text=True, check=False
+        )
+        if result.returncode:
+            tail = "\n".join((result.stdout + result.stderr).splitlines()[-15:])
+            print(f"[pregate] FAIL {name}\n{tail}")
+            return None
+        print(f"[pregate] PASS {name}")
+    try:
+        stable = identity == _sn2_5mhz_cheap_identity(recipe, stwo, stwo_cairo)
+    except (OSError, UnicodeDecodeError, ValueError):
+        stable = False
+    if not stable:
+        print("[pregate] FAIL SN2 5 MHz recipe or source changed during admission")
+        return None
+    print("[pregate] ALL GREEN SN2 5 MHz cheap-GPU admission")
+    return identity
+
+
+def sn2_5mhz_cheap_is_current(
+    receipt: dict[str, object], recipe: Path, stwo: Path, stwo_cairo: Path
+) -> bool:
+    try:
+        return receipt == _sn2_5mhz_cheap_identity(recipe, stwo, stwo_cairo)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
 
 
 def _sn2_vertical_identity(

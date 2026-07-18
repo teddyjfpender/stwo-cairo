@@ -194,6 +194,99 @@ class PregateInputAdmissionTests(unittest.TestCase):
                     )
                 )
 
+    def test_sn2_5mhz_cheap_admission_is_exact_no_cargo_and_source_bound(
+        self,
+    ) -> None:
+        recipe = self.stwo_cairo / pregate.SN2_5MHZ_CHEAP_RECIPE
+        recipe.parent.mkdir(parents=True, exist_ok=True)
+        canonical = (
+            Path(__file__).resolve().parents[3] / pregate.SN2_5MHZ_CHEAP_RECIPE
+        )
+        recipe.write_bytes(canonical.read_bytes())
+        source_identity = {
+            "stwo": {"head": "ab" * 20, "worktree_sha256": "12" * 32},
+            "stwo_cairo": {"head": "cd" * 20, "worktree_sha256": "34" * 32},
+        }
+        passed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            mock.patch.object(pregate, "_source_identity", return_value=source_identity),
+            mock.patch.object(pregate, "_tracked_control_is_clean", return_value=True),
+            mock.patch.object(pregate.shutil, "which", return_value=None),
+            mock.patch.object(
+                pregate.subprocess, "run", return_value=passed
+            ) as run,
+        ):
+            receipt = pregate.admit_sn2_5mhz_cheap(
+                recipe, self.stwo, self.stwo_cairo
+            )
+            self.assertIsNotNone(receipt)
+            self.assertEqual(receipt["scope"], pregate.SN2_5MHZ_CHEAP_SCOPE)
+            self.assertTrue(
+                pregate.sn2_5mhz_cheap_is_current(
+                    receipt, recipe, self.stwo, self.stwo_cairo
+                )
+            )
+        self.assertEqual(run.call_count, 3)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertTrue(all("cargo" not in command for command in commands))
+
+        with (
+            mock.patch.object(pregate, "_tracked_control_is_clean", return_value=False),
+            mock.patch.object(pregate.subprocess, "run") as blocked,
+        ):
+            self.assertIsNone(
+                pregate.admit_sn2_5mhz_cheap(
+                    recipe, self.stwo, self.stwo_cairo
+                )
+            )
+        blocked.assert_not_called()
+
+        recipe.write_text(
+            recipe.read_text().replace(
+                "max_usd_hr=0.50", "max_usd_hr=0.51", 1
+            )
+        )
+        with (
+            mock.patch.object(pregate, "_tracked_control_is_clean", return_value=True),
+            mock.patch.object(pregate.subprocess, "run") as blocked,
+        ):
+            self.assertIsNone(
+                pregate.admit_sn2_5mhz_cheap(
+                    recipe, self.stwo, self.stwo_cairo
+                )
+            )
+        blocked.assert_not_called()
+
+    def test_sn2_5mhz_cheap_admission_rechecks_identity_after_checks(self) -> None:
+        recipe = self.stwo_cairo / pregate.SN2_5MHZ_CHEAP_RECIPE
+        recipe.parent.mkdir(parents=True, exist_ok=True)
+        canonical = (
+            Path(__file__).resolve().parents[3] / pregate.SN2_5MHZ_CHEAP_RECIPE
+        )
+        recipe.write_bytes(canonical.read_bytes())
+        first = {
+            "stwo": {"head": "ab" * 20, "worktree_sha256": "12" * 32},
+            "stwo_cairo": {"head": "cd" * 20, "worktree_sha256": "34" * 32},
+        }
+        changed = {
+            **first,
+            "stwo": {"head": "ef" * 20, "worktree_sha256": "56" * 32},
+        }
+        passed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            mock.patch.object(
+                pregate, "_source_identity", side_effect=[first, changed]
+            ),
+            mock.patch.object(pregate, "_tracked_control_is_clean", return_value=True),
+            mock.patch.object(pregate.shutil, "which", return_value=None),
+            mock.patch.object(pregate.subprocess, "run", return_value=passed),
+        ):
+            self.assertIsNone(
+                pregate.admit_sn2_5mhz_cheap(
+                    recipe, self.stwo, self.stwo_cairo
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

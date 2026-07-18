@@ -335,6 +335,80 @@ class FleetCliTests(unittest.TestCase):
             self.assertEqual(cli.do_up(up_args()), created)
         self.assertEqual(deadman.call_count, 2)
 
+    def test_sn2_5mhz_up_uses_bounded_admission_and_rechecks_after_bootstrap(
+        self,
+    ) -> None:
+        recipe = cli.STWO_CAIRO / cli.pregate.SN2_5MHZ_CHEAP_RECIPE
+        created = pod(name="stwo-sn2-5mhz-ab-a40-deadbeef")
+        args = up_args(
+            recipe=str(recipe),
+            name=created.name,
+            volume_id=None,
+        )
+        receipt = {"scope": cli.pregate.SN2_5MHZ_CHEAP_SCOPE}
+        with (
+            mock.patch.object(
+                cli.pregate, "admit_sn2_5mhz_cheap", return_value=receipt
+            ) as cheap,
+            mock.patch.object(cli, "_require_pregate") as formal,
+            mock.patch.object(
+                cli.api,
+                "secure_offer",
+                return_value={"display_name": created.gpu, "usd_hr": 0.44},
+            ),
+            mock.patch.object(
+                cli.api, "list_pods", side_effect=[[], [created], [created]]
+            ),
+            mock.patch.object(cli.api, "create_pod", return_value=created),
+            mock.patch.object(cli, "wait_ready", return_value=created),
+            mock.patch.object(cli, "_install_deadman_first"),
+            mock.patch.object(cli, "bootstrap", return_value=True),
+            mock.patch.object(cli, "health_check", return_value={}),
+            mock.patch.object(
+                cli.pregate, "sn2_5mhz_cheap_is_current", return_value=True
+            ) as current,
+            mock.patch.object(cli, "_sync_pods_conf"),
+            mock.patch.object(cli.ledger, "append"),
+        ):
+            self.assertEqual(cli.do_up(args), created)
+        cheap.assert_called_once_with(recipe, cli.STWO, cli.STWO_CAIRO)
+        current.assert_called_once_with(receipt, recipe, cli.STWO, cli.STWO_CAIRO)
+        formal.assert_not_called()
+
+    def test_sn2_5mhz_up_drift_after_bootstrap_terminates_created_pod(self) -> None:
+        recipe = cli.STWO_CAIRO / cli.pregate.SN2_5MHZ_CHEAP_RECIPE
+        created = pod(name="stwo-sn2-5mhz-ab-a40-deadbeef")
+        args = up_args(recipe=str(recipe), name=created.name, volume_id=None)
+        receipt = {"scope": cli.pregate.SN2_5MHZ_CHEAP_SCOPE}
+        with (
+            mock.patch.object(
+                cli.pregate, "admit_sn2_5mhz_cheap", return_value=receipt
+            ),
+            mock.patch.object(
+                cli.api,
+                "secure_offer",
+                return_value={"display_name": created.gpu, "usd_hr": 0.44},
+            ),
+            mock.patch.object(
+                cli.api, "list_pods", side_effect=[[], [created], [created]]
+            ),
+            mock.patch.object(cli.api, "create_pod", return_value=created),
+            mock.patch.object(cli, "wait_ready", return_value=created),
+            mock.patch.object(cli, "_install_deadman_first"),
+            mock.patch.object(cli, "bootstrap", return_value=True),
+            mock.patch.object(cli, "health_check", return_value={}),
+            mock.patch.object(
+                cli.pregate, "sn2_5mhz_cheap_is_current", return_value=False
+            ),
+            mock.patch.object(cli, "_cleanup_failed_up") as cleanup,
+            mock.patch.object(cli.ledger, "append"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "source-bound provider admission changed"
+            ):
+                cli.do_up(args)
+        cleanup.assert_called_once_with(created.name, created)
+
     def test_wrong_ready_id_rejects_and_cleans_the_created_pod(self) -> None:
         created = pod()
         wrong = replace(created, id="other-pod")

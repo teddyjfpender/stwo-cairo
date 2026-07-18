@@ -1401,6 +1401,71 @@ checkpoint_counter_timing_only
         self.assertEqual(pod_run.count("--perms"), 2)
         self.assertNotIn("--no-perms", pod_run)
 
+    def test_cheap_5mhz_pod_run_binds_roots_and_immutable_recipe_snapshot(
+        self,
+    ) -> None:
+        pod_run = (ROOT / "loop" / "pod_run.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'CANONICAL_CAIRO_LOCAL="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"',
+            pod_run,
+        )
+        self.assertIn(
+            '[[ "$(resolve_path "$CAIRO_LOCAL")" == "$CANONICAL_CAIRO_LOCAL" &&',
+            pod_run,
+        )
+        self.assertIn('PHASES_SHA256="$(file_sha256 "$PHASES_SNAPSHOT")"', pod_run)
+        self.assertIn(
+            'lease-policy --recipe "$PHASES_SNAPSHOT"',
+            pod_run,
+        )
+        self.assertIn('--recipe "$PHASES_FILE"', pod_run)
+        self.assertIn('cat "$PHASES_SNAPSHOT"', pod_run)
+        resume = pod_run.index('"$FLEET_CTL" "${RESUME_ARGS[@]}"')
+        verify_before_resume = pod_run.rindex("verify_phases_snapshot", 0, resume)
+        admitted_endpoint = pod_run.index('ADMITTED_ENDPOINT="$(', resume)
+        external_endpoint = pod_run.index('runpodctl ssh info "$POD_ID"', resume)
+        endpoint_match = pod_run.index(
+            '[[ "$HOST" == "$ADMITTED_HOST" && "$PORT" == "$ADMITTED_PORT" ]]',
+            external_endpoint,
+        )
+        upload = pod_run.index('cat "$PHASES_SNAPSHOT"')
+        verify_after_sync = pod_run.rindex("verify_phases_snapshot", resume, upload)
+        self.assertLess(verify_before_resume, resume)
+        self.assertLess(resume, admitted_endpoint)
+        self.assertLess(admitted_endpoint, external_endpoint)
+        self.assertLess(external_endpoint, endpoint_match)
+        self.assertLess(resume, verify_after_sync)
+        self.assertLess(verify_after_sync, upload)
+
+    def test_cheap_5mhz_pod_run_rejects_ambient_source_roots_before_provider(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cairo = root / "stwo-cairo"
+            stwo = root / "stwo"
+            cairo.mkdir()
+            stwo.mkdir()
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / "loop" / "pod_run.sh"),
+                    str(ROOT / "loop/recipes/sn2_5mhz_cheap_gpu_ab.phases"),
+                    "root-override-test",
+                ],
+                env={
+                    **os.environ,
+                    "CAIRO_LOCAL": str(cairo),
+                    "STWO_LOCAL": str(stwo),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("requires canonical stwo/stwo-cairo roots", result.stderr)
+        self.assertNotIn("admitting provider lease", result.stdout + result.stderr)
+
     def test_generated_heredocs_are_not_captured_by_command_substitution(self) -> None:
         source = (ROOT / "loop" / "perf_gates.sh").read_text(encoding="utf-8")
         self.assertNotIn('="$(cat <<EOF', source)

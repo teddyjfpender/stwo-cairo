@@ -142,9 +142,35 @@ def _require_pregate() -> bool:
     return False
 
 
-def _require_resume_admission(args) -> dict[str, object] | None:
+def _resume_matches_policy(args, policy: LeasePolicy) -> bool:
+    return (
+        _gpu_type(args.gpu) == _gpu_type(policy.gpu)
+        and args.name_prefix == policy.name_prefix
+        and args.max_usd_hr == policy.max_usd_hr
+        and args.min_vcpu == policy.min_vcpu
+        and args.min_mem_gb == policy.min_mem_gb
+        and args.ttl_hours == policy.ttl_hours
+        and args.idle_min == policy.idle_min
+        and args.one_shot == policy.one_shot
+        and args.failure_action == policy.final_action
+    )
+
+
+def _require_provider_admission(
+    args, provision_policy: LeasePolicy | None = None
+) -> dict[str, object] | None:
     recipe_value = getattr(args, "recipe", None)
     recipe = Path(recipe_value) if recipe_value else None
+    if recipe is not None and pregate.is_sn2_5mhz_cheap_recipe(recipe, STWO_CAIRO):
+        policy = provision_policy or load_lease_policy(recipe)
+        if policy != pregate.SN2_5MHZ_CHEAP_POLICY or (
+            provision_policy is None and not _resume_matches_policy(args, policy)
+        ):
+            raise ValueError(
+                "SN2 5 MHz cheap-GPU operation differs from its exact A40 lease"
+            )
+        return pregate.admit_sn2_5mhz_cheap(recipe, STWO, STWO_CAIRO)
+
     if recipe is None or not pregate.is_sn2_vertical_recipe(recipe, STWO_CAIRO):
         return {"scope": "formal-pregate"} if _require_pregate() else None
 
@@ -160,23 +186,30 @@ def _require_resume_admission(args) -> dict[str, object] | None:
         or policy.idle_min > 15
         or policy.max_usd_hr > 3
         or policy.name_prefix != "replacement-v1-sn2-"
-        or _gpu_type(args.gpu) != _gpu_type(policy.gpu)
-        or args.name_prefix != policy.name_prefix
-        or args.max_usd_hr != policy.max_usd_hr
-        or args.min_vcpu != policy.min_vcpu
-        or args.min_mem_gb != policy.min_mem_gb
-        or args.ttl_hours != policy.ttl_hours
-        or args.idle_min != policy.idle_min
-        or args.one_shot != policy.one_shot
-        or args.failure_action != policy.final_action
+        or (
+            provision_policy is not None
+            and provision_policy != policy
+        )
+        or (
+            provision_policy is None
+            and not _resume_matches_policy(args, policy)
+        )
     ):
         raise ValueError("SN2 vertical resume differs from its bounded H100 lease")
     return pregate.admit_sn2_vertical(recipe, STWO, STWO_CAIRO)
 
 
-def _resume_admission_is_current(
+def _require_resume_admission(args) -> dict[str, object] | None:
+    return _require_provider_admission(args)
+
+
+def _provider_admission_is_current(
     receipt: dict[str, object], recipe_value: str | None
 ) -> bool:
+    if receipt.get("scope") == pregate.SN2_5MHZ_CHEAP_SCOPE:
+        return bool(recipe_value) and pregate.sn2_5mhz_cheap_is_current(
+            receipt, Path(recipe_value), STWO, STWO_CAIRO
+        )
     if receipt.get("scope") == pregate.SN2_VERTICAL_SCOPE:
         return bool(recipe_value) and pregate.sn2_vertical_is_current(
             receipt, Path(recipe_value), STWO, STWO_CAIRO
@@ -184,6 +217,12 @@ def _resume_admission_is_current(
     return receipt.get("scope") == "formal-pregate" and pregate.is_fresh(
         STWO, STWO_CAIRO
     )
+
+
+def _resume_admission_is_current(
+    receipt: dict[str, object], recipe_value: str | None
+) -> bool:
+    return _provider_admission_is_current(receipt, recipe_value)
 
 
 def _bind_explicit_ssh_key() -> None:
@@ -347,6 +386,12 @@ def _prepare_existing_pod(args) -> tuple[api.PodInfo, Endpoint]:
         min_mem_gb=args.min_mem_gb,
         name_prefix=args.name_prefix,
     )
+    if (
+        admission.get("scope") == pregate.SN2_5MHZ_CHEAP_SCOPE
+        and re.fullmatch(re.escape(args.name_prefix) + r"[0-9a-f]{8}", pod.name)
+        is None
+    ):
+        raise RuntimeError("SN2 5 MHz one-shot pod name is not an exact lease name")
     if pod.status not in {"EXITED", "RUNNING"}:
         raise RuntimeError(f"pod {pod.id} is not resumable: {pod.status}")
     if args.one_shot and pod.status != "RUNNING":
@@ -522,7 +567,7 @@ def do_up(args) -> api.PodInfo | None:
     if args.cloud != "SECURE":
         print("REFUSED: bounded gpufleet provisioning requires Secure Cloud")
         return None
-    _apply_recipe_lease(args)
+    policy = _apply_recipe_lease(args)
     _bind_explicit_ssh_key()
     if (
         not math.isfinite(args.ttl_hours)
@@ -536,7 +581,8 @@ def do_up(args) -> api.PodInfo | None:
         or args.max_usd_hr <= 0
     ):
         raise ValueError("pod provisioning limits must be finite and positive")
-    if not _require_pregate():
+    admission = _require_provider_admission(args, policy)
+    if admission is None:
         return None
     gpu_type = _gpu_type(args.gpu)
     offer = api.secure_offer(gpu_type)
@@ -607,6 +653,11 @@ def do_up(args) -> api.PodInfo | None:
         )
         for key, value in health_check(ep).items():
             print(f"  {key}: {value}")
+        if (
+            admission.get("scope") != "formal-pregate"
+            and not _provider_admission_is_current(admission, args.recipe)
+        ):
+            raise RuntimeError("source-bound provider admission changed")
         _sync_pods_conf()
         print(f"[gpufleet] up: {pod.id}  ({ep.host}:{ep.port})")
         return pod

@@ -240,6 +240,120 @@ class ExistingPodAdmissionTests(unittest.TestCase):
         get.assert_not_called()
         resume.assert_not_called()
 
+    def test_sn2_5mhz_cheap_resume_uses_only_exact_no_cargo_admission(self) -> None:
+        recipe = cli.STWO_CAIRO / cli.pregate.SN2_5MHZ_CHEAP_RECIPE
+        args = admission_args(
+            gpu="a40",
+            name_prefix="stwo-sn2-5mhz-ab-a40-",
+            max_usd_hr=0.50,
+            ttl_hours=1.5,
+            one_shot=True,
+            failure_action="terminate",
+            recipe=str(recipe),
+        )
+        receipt = {"scope": cli.pregate.SN2_5MHZ_CHEAP_SCOPE}
+        with (
+            mock.patch.object(
+                cli.pregate, "admit_sn2_5mhz_cheap", return_value=receipt
+            ) as cheap,
+            mock.patch.object(cli, "_require_pregate") as formal,
+        ):
+            self.assertIs(cli._require_resume_admission(args), receipt)
+        cheap.assert_called_once_with(recipe, cli.STWO, cli.STWO_CAIRO)
+        formal.assert_not_called()
+
+        for change in (
+            {"max_usd_hr": 0.51},
+            {"one_shot": False},
+            {"failure_action": "stop"},
+            {"name_prefix": "wrong-"},
+        ):
+            with self.subTest(change=change):
+                with (
+                    mock.patch.object(
+                        cli.pregate, "admit_sn2_5mhz_cheap"
+                    ) as blocked,
+                    self.assertRaises(ValueError),
+                ):
+                    cli._require_resume_admission(
+                        argparse.Namespace(**{**vars(args), **change})
+                    )
+                blocked.assert_not_called()
+
+    def test_sn2_5mhz_post_bootstrap_drift_terminates_one_shot(self) -> None:
+        recipe = cli.STWO_CAIRO / cli.pregate.SN2_5MHZ_CHEAP_RECIPE
+        active = pod(name="stwo-sn2-5mhz-ab-a40-deadbeef")
+        args = admission_args(
+            gpu="a40",
+            name_prefix="stwo-sn2-5mhz-ab-a40-",
+            max_usd_hr=0.50,
+            ttl_hours=1.5,
+            one_shot=True,
+            failure_action="terminate",
+            recipe=str(recipe),
+        )
+        receipt = {"scope": cli.pregate.SN2_5MHZ_CHEAP_SCOPE}
+        with (
+            mock.patch.object(cli, "_bind_explicit_ssh_key"),
+            mock.patch.object(
+                cli.pregate, "admit_sn2_5mhz_cheap", return_value=receipt
+            ),
+            mock.patch.object(
+                cli.api,
+                "secure_offer",
+                return_value={"display_name": active.gpu, "usd_hr": 0.44},
+            ),
+            mock.patch.object(cli.api, "get_pod", return_value=active),
+            mock.patch.object(cli, "wait_ready", return_value=active),
+            mock.patch.object(cli, "_install_deadman_first"),
+            mock.patch.object(cli, "bootstrap", return_value=True),
+            mock.patch.object(
+                cli.pregate, "sn2_5mhz_cheap_is_current", return_value=False
+            ),
+            mock.patch.object(cli.api, "terminate_pod") as terminate,
+            mock.patch.object(cli.ledger, "append"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "source-bound provider admission changed"
+            ):
+                cli._prepare_existing_pod(args)
+        terminate.assert_called_once_with(active.id)
+
+    def test_sn2_5mhz_rejects_noncanonical_one_shot_name_before_adoption(
+        self,
+    ) -> None:
+        recipe = cli.STWO_CAIRO / cli.pregate.SN2_5MHZ_CHEAP_RECIPE
+        active = pod(name="stwo-sn2-5mhz-ab-a40-nothex")
+        args = admission_args(
+            gpu="a40",
+            name_prefix="stwo-sn2-5mhz-ab-a40-",
+            max_usd_hr=0.50,
+            ttl_hours=1.5,
+            one_shot=True,
+            failure_action="terminate",
+            recipe=str(recipe),
+        )
+        with (
+            mock.patch.object(cli, "_bind_explicit_ssh_key"),
+            mock.patch.object(
+                cli.pregate,
+                "admit_sn2_5mhz_cheap",
+                return_value={"scope": cli.pregate.SN2_5MHZ_CHEAP_SCOPE},
+            ),
+            mock.patch.object(
+                cli.api,
+                "secure_offer",
+                return_value={"display_name": active.gpu, "usd_hr": 0.44},
+            ),
+            mock.patch.object(cli.api, "get_pod", return_value=active),
+            mock.patch.object(cli, "wait_ready") as wait,
+            mock.patch.object(cli.api, "terminate_pod") as terminate,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exact lease name"):
+                cli._prepare_existing_pod(args)
+        wait.assert_not_called()
+        terminate.assert_not_called()
+
     def test_current_price_ceiling_blocks_before_pod_read_or_resume(self) -> None:
         with (
             mock.patch.object(cli, "_require_pregate", return_value=True),

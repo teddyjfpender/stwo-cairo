@@ -64,7 +64,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-CAIRO_LOCAL="${CAIRO_LOCAL:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+CANONICAL_CAIRO_LOCAL="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+CANONICAL_STWO_LOCAL="$(cd "${CANONICAL_CAIRO_LOCAL}/../stwo" && pwd -P)"
+CAIRO_LOCAL="${CAIRO_LOCAL:-$CANONICAL_CAIRO_LOCAL}"
 STWO_LOCAL="${STWO_LOCAL:-${CAIRO_LOCAL}/../stwo}"
 POD_CONF="${POD_CONF:-${SCRIPT_DIR}/pod.conf}"
 RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results}"
@@ -83,6 +85,52 @@ PHASES_FILE="${1:?usage: pod_run.sh <phases_file> [label]}"
 [[ -x "$FLEET_CTL" ]] \
   || { echo "fleet lifecycle tool is absent or not executable: $FLEET_CTL" >&2; exit 2; }
 
+resolve_path() {
+  python3 -B - "$1" <<'PY'
+import pathlib
+import sys
+print(pathlib.Path(sys.argv[1]).expanduser().resolve(strict=True))
+PY
+}
+
+file_sha256() {
+  python3 -B - "$1" <<'PY'
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+}
+
+PHASES_RESOLVED="$(resolve_path "$PHASES_FILE")" \
+  || { echo "cannot resolve phases file: $PHASES_FILE" >&2; exit 2; }
+CHEAP_5MHZ_RECIPE="$(resolve_path "${SCRIPT_DIR}/recipes/sn2_5mhz_cheap_gpu_ab.phases")" \
+  || { echo "cannot resolve canonical SN2 5 MHz recipe" >&2; exit 2; }
+if [[ "$PHASES_RESOLVED" == "$CHEAP_5MHZ_RECIPE" ]]; then
+  [[ "$(resolve_path "$CAIRO_LOCAL")" == "$CANONICAL_CAIRO_LOCAL" &&
+     "$(resolve_path "$STWO_LOCAL")" == "$CANONICAL_STWO_LOCAL" ]] \
+    || {
+      echo "canonical SN2 5 MHz recipe requires canonical stwo/stwo-cairo roots" >&2
+      exit 2
+    }
+fi
+
+PHASES_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/stwo-pod-phases.XXXXXX")" \
+  || { echo "cannot create phases snapshot" >&2; exit 2; }
+cp -- "$PHASES_FILE" "$PHASES_SNAPSHOT" \
+  || { rm -f -- "$PHASES_SNAPSHOT"; echo "cannot snapshot phases file" >&2; exit 2; }
+PHASES_SHA256="$(file_sha256 "$PHASES_SNAPSHOT")" \
+  || { rm -f -- "$PHASES_SNAPSHOT"; echo "cannot hash phases snapshot" >&2; exit 2; }
+trap 'rm -f -- "$PHASES_SNAPSHOT"' EXIT
+verify_phases_snapshot() {
+  if [[ "$(file_sha256 "$PHASES_SNAPSHOT")" == "$PHASES_SHA256" ]] &&
+    cmp -s -- "$PHASES_FILE" "$PHASES_SNAPSHOT"; then
+    return 0
+  fi
+  echo "phases file changed after admission snapshot" >&2
+  return 1
+}
+
 LEASE_ONE_SHOT="" LEASE_FINAL_ACTION="" LEASE_GPU="" LEASE_GPU_COUNT=""
 LEASE_MIN_VCPU="" LEASE_MIN_MEM_GB="" LEASE_MAX_USD_HR=""
 LEASE_NAME_PREFIX="" LEASE_TTL_HOURS="" LEASE_IDLE_MIN=""
@@ -100,7 +148,7 @@ while IFS='=' read -r name value; do
     IDLE_MIN) LEASE_IDLE_MIN="$value" ;;
     *) echo "unexpected lease-policy output: $name" >&2; exit 2 ;;
   esac
-done < <("$FLEET_CTL" lease-policy --recipe "$PHASES_FILE") \
+done < <("$FLEET_CTL" lease-policy --recipe "$PHASES_SNAPSHOT") \
   || { echo "invalid or missing recipe lease policy" >&2; exit 2; }
 for value in "$LEASE_ONE_SHOT" "$LEASE_FINAL_ACTION" "$LEASE_GPU" \
   "$LEASE_GPU_COUNT" "$LEASE_MIN_VCPU" "$LEASE_MIN_MEM_GB" \
@@ -115,7 +163,7 @@ fi
 POD_RUN_FINAL_ACTION="$LEASE_FINAL_ACTION"
 LABEL="${2:-pod_run_$(date -u +%Y%m%dT%H%M%SZ)}"
 REQUIRE_CLEAN_SOURCES=0
-grep -Fqx '# pod_run: require_clean_sources' "$PHASES_FILE" && REQUIRE_CLEAN_SOURCES=1
+grep -Fqx '# pod_run: require_clean_sources' "$PHASES_SNAPSHOT" && REQUIRE_CLEAN_SOURCES=1
 
 # --- pod identity ---
 POD_ID="${BENCH_POD_ID:-}"
@@ -184,7 +232,7 @@ if [[ "$REQUIRE_CLEAN_SOURCES" == 1 &&
   exit 2
 fi
 
-PHASE_NAMES="$(awk '$1=="phase"{print $2}' "$PHASES_FILE")"
+PHASE_NAMES="$(awk '$1=="phase"{print $2}' "$PHASES_SNAPSHOT")"
 [[ -n "$PHASE_NAMES" ]] || { echo "no 'phase NAME ...' lines in $PHASES_FILE" >&2; exit 2; }
 PHASE_DUPLICATES="$(printf '%s\n' "$PHASE_NAMES" | sort | uniq -d)"
 [[ -z "$PHASE_DUPLICATES" ]] \
@@ -199,6 +247,7 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   note "DRY_RUN: pod=$POD_ID key=$KEY"
   note "DRY_RUN: RUSTUP_HOME=$POD_RUSTUP_HOME CARGO_HOME=$POD_CARGO_HOME"
   note "DRY_RUN: lease gpu=$LEASE_GPU count=$LEASE_GPU_COUNT name_prefix=$LEASE_NAME_PREFIX max_usd_hr=$LEASE_MAX_USD_HR final_action=$POD_RUN_FINAL_ACTION"
+  note "DRY_RUN: phases_sha256=$PHASES_SHA256"
   note "DRY_RUN: source stwo=${STWO_HEAD}:${STWO_WORKTREE_HASH} stwo-cairo=${CAIRO_HEAD}:${CAIRO_WORKTREE_HASH}"
   note "DRY_RUN: would bootstrap, stage and rsync exact source projections from $STWO_LOCAL and $CAIRO_LOCAL, install the pinned toolchain, run the phases above, fetch to $RESULTS_DIR/$LABEL, then confirm pod action=$POD_RUN_FINAL_ACTION."
   exit 0
@@ -223,6 +272,7 @@ finalize_pod() {
 cleanup() {
   local rc=$?
   trap - EXIT
+  rm -f -- "$PHASES_SNAPSHOT"
   [[ -z "$PROJECTION_ROOT" || ! -d "$PROJECTION_ROOT" ]] \
     || rm -rf -- "$PROJECTION_ROOT"
   if ! finalize_pod; then
@@ -248,22 +298,36 @@ RESUME_ARGS=(
 )
 [[ "$LEASE_ONE_SHOT" == 1 ]] && RESUME_ARGS+=(--one-shot)
 note "admitting provider lease and installing deadman before proof work"
+verify_phases_snapshot || exit 1
 RUNPOD_SSH_KEY="$KEY" "$FLEET_CTL" "${RESUME_ARGS[@]}" \
   || { note "PROVIDER ADMISSION/RESUME FAILED"; exit 1; }
 POD_LIFECYCLE_OWNED=1
+
+ADMITTED_ENDPOINT="$(
+  awk -F'|' -v pod="$POD_ID" '
+    $1 == pod { endpoint = $2 "|" $3; count += 1 }
+    END {
+      if (count != 1 || endpoint !~ /^[^|]+[|][0-9]+$/) exit 1
+      print endpoint
+    }
+  ' "${SCRIPT_DIR}/../fleet/pods.conf"
+)" || { note "API-VALIDATED POD ENDPOINT IS ABSENT OR AMBIGUOUS"; exit 1; }
+IFS='|' read -r ADMITTED_HOST ADMITTED_PORT <<<"$ADMITTED_ENDPOINT"
 
 HOST=""; PORT=""
 for _ in $(seq 1 40); do
   info="$(runpodctl ssh info "$POD_ID" 2>/dev/null)"
   HOST="$(printf '%s' "$info" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("ip",""))' 2>/dev/null)"
   PORT="$(printf '%s' "$info" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("port",""))' 2>/dev/null)"
-  if [[ -n "$HOST" && -n "$PORT" ]] && ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "root@$HOST" true 2>/dev/null; then
+  if [[ "$HOST" == "$ADMITTED_HOST" && "$PORT" == "$ADMITTED_PORT" ]] &&
+    ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "root@$HOST" true 2>/dev/null; then
     break
   fi
   HOST=""; PORT=""
   sleep 15
 done
-[[ -n "$HOST" && -n "$PORT" ]] || { note "FAILED to reach pod ssh endpoint"; exit 1; }
+[[ -n "$HOST" && -n "$PORT" ]] \
+  || { note "FAILED to reach exact API-validated pod ssh endpoint"; exit 1; }
 note "endpoint: $HOST:$PORT"
 
 # --- 2. bootstrap the reset container layer ---
@@ -307,6 +371,7 @@ rsync -azc --delete --partial --no-owner --no-group --perms --no-times \
    "$CAIRO_HEAD" == "$(source_head "$CAIRO_LOCAL")" &&
    "$CAIRO_WORKTREE_HASH" == "$(source_hash "$CAIRO_LOCAL")" ]] \
   || { note "LOCAL SOURCES CHANGED DURING SYNC"; exit 1; }
+verify_phases_snapshot || { note "PHASES CHANGED AFTER ADMISSION"; exit 1; }
 
 # --- 4. install + verify both repo-pinned Rust toolchains ---
 note "install pinned Rust toolchains"
@@ -357,7 +422,7 @@ phase() {
   return "$rc"
 }
 PROLOGUE
-  cat "$PHASES_FILE"
+  cat "$PHASES_SNAPSHOT"
   # shellcheck disable=SC2016 # $RUN expands in the generated pod-side script.
   echo 'echo done > "$RUN/session.done"'
 } | pssh "mkdir -p '$RUN' && cat > '$RUN/session.sh'" \
