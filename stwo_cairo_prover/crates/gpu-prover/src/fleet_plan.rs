@@ -15,6 +15,7 @@ use crate::transcript_plan::{
     CairoBlake2sTranscriptPlan, CairoTranscriptSegment, TranscriptSegmentPlan,
 };
 
+mod casm_setup_admission;
 mod compiler;
 mod identity;
 mod ipc_control_frame;
@@ -30,6 +31,11 @@ mod worker_install;
 #[cfg(test)]
 mod tests;
 
+pub use casm_setup_admission::{
+    FleetCasmRuntimeBinding, FleetCasmSetupAdmission, FleetCasmSetupAdmissionError,
+    FleetCasmSetupAdmissionState, FleetCasmSetupDisposition, FleetCasmSetupIngress,
+    FleetCasmSetupSource,
+};
 pub use compiler::FleetCompileError;
 pub(crate) use ipc_control_frame::{
     FleetIpcControlCodec, FleetIpcControlEndpointRole, FleetIpcControlFrameError,
