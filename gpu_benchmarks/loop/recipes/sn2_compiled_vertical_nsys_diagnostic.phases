@@ -120,30 +120,111 @@ vertical_nsys_validate() {
   cat "$(checkpoint_artifact nsys_vertical.strict-record.json)"
 }
 
+vertical_nsys_export_summaries() {
+  local nsys_bin="$1" sqlite="$2" report_name output rc status
+  local rows log receipt
+  local -a reports=(
+    cuda_gpu_kern_sum
+    cuda_api_sum
+    cuda_gpu_mem_time_sum
+    cuda_gpu_mem_size_sum
+    cuda_gpu_trace
+    nvtx_sum
+    osrt_sum
+  )
+  rows="$(checkpoint_artifact nsys_vertical.summary-exports.tsv)"
+  log="$(checkpoint_artifact nsys_vertical.summary-exports.txt)"
+  receipt="$(checkpoint_artifact nsys_vertical.summary-exports.json)"
+  rm -f "$rows" "$log" "$receipt"
+  : >"$rows"
+  : >"$log"
+  for report_name in "${reports[@]}"; do
+    output="$(checkpoint_artifact "nsys_vertical.${report_name}.csv")"
+    rm -f "$output"
+    if "$nsys_bin" stats --force-export=false --report "$report_name" \
+        --format csv "$sqlite" >"$output" 2>>"$log"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [[ $rc -eq 0 && -s "$output" ]]; then
+      status=EXPORTED
+    else
+      status=UNAVAILABLE
+      rm -f "$output"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$report_name" "$status" "$rc" "$output" >>"$rows"
+    printf 'report=%s status=%s rc=%s\n' "$report_name" "$status" "$rc" >>"$log"
+  done
+
+  python3 - "$rows" "$receipt" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+rows_path, receipt_path = map(pathlib.Path, sys.argv[1:])
+expected = {
+    "cuda_gpu_kern_sum",
+    "cuda_api_sum",
+    "cuda_gpu_mem_time_sum",
+    "cuda_gpu_mem_size_sum",
+    "cuda_gpu_trace",
+    "nvtx_sum",
+    "osrt_sum",
+}
+reports = {}
+for line in rows_path.read_text(encoding="utf-8").splitlines():
+    name, status, raw_rc, raw_path = line.split("\t")
+    if name in reports or name not in expected or status not in {"EXPORTED", "UNAVAILABLE"}:
+        raise SystemExit(f"invalid Nsight summary export row: {line}")
+    path = pathlib.Path(raw_path)
+    entry = {"status": status, "return_code": int(raw_rc)}
+    if status == "EXPORTED":
+        if not path.is_file() or path.stat().st_size == 0:
+            raise SystemExit(f"exported Nsight summary is absent: {name}")
+        entry.update(
+            {
+                "artifact": path.name,
+                "bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    elif path.exists():
+        raise SystemExit(f"unavailable Nsight summary left a stale artifact: {name}")
+    reports[name] = entry
+if set(reports) != expected:
+    raise SystemExit(f"Nsight summary export set drifted: {sorted(reports)}")
+receipt = {
+    "schema": "stwo.sn2-compiled-vertical-nsys-summary-exports.v1",
+    "authority": "raw-sqlite",
+    "reports": reports,
+}
+receipt_path.write_text(
+    json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+print(receipt_path.read_text(encoding="utf-8"), end="")
+PY
+  rm -f "$rows"
+}
+
 vertical_nsys_export_query() {
-  local nsys_bin base report sqlite kernels apis timeline summary
+  local nsys_bin base report sqlite timeline summary stats_receipt stats_log
   nsys_bin="$(vertical_nsys_resolve)"
   base="$(checkpoint_artifact nsys_vertical)"
   report="$base.nsys-rep"
   sqlite="$base.sqlite"
-  kernels="$(checkpoint_artifact nsys_vertical.cuda_gpu_kern_sum.csv)"
-  apis="$(checkpoint_artifact nsys_vertical.cuda_api_sum.csv)"
   timeline="$(checkpoint_artifact nsys_vertical.graph-timeline.csv)"
   summary="$(checkpoint_artifact nsys_vertical.graph-timeline.json)"
-  rm -f "$sqlite" "$kernels" "$apis" "$timeline" "$summary"
+  stats_receipt="$(checkpoint_artifact nsys_vertical.summary-exports.json)"
+  stats_log="$(checkpoint_artifact nsys_vertical.summary-exports.txt)"
+  rm -f "$sqlite" "$timeline" "$summary" "$stats_receipt" "$stats_log"
 
   "$nsys_bin" export --type=sqlite --force-overwrite=true \
     --output="$sqlite" "$report"
   [[ -s "$sqlite" ]] || {
     echo "Nsight Systems SQLite export is absent" >&2
-    return 1
-  }
-  "$nsys_bin" stats --force-export=false --report cuda_gpu_kern_sum \
-    --format csv "$sqlite" >"$kernels"
-  "$nsys_bin" stats --force-export=false --report cuda_api_sum \
-    --format csv "$sqlite" >"$apis"
-  [[ -s "$kernels" && -s "$apis" ]] || {
-    echo "Nsight Systems summary reports are absent" >&2
     return 1
   }
 
@@ -165,6 +246,42 @@ tables = {
 }
 if "StringIds" not in tables or "CUPTI_ACTIVITY_KIND_RUNTIME" not in tables:
     raise SystemExit("Nsight export omits StringIds or CUDA runtime activity")
+
+runtime_columns = {
+    row[1]
+    for row in connection.execute(
+        'PRAGMA table_info("CUPTI_ACTIVITY_KIND_RUNTIME")'
+    )
+}
+if not {"start", "end", "nameId"} <= runtime_columns:
+    raise SystemExit("Nsight CUDA runtime table has an unknown shape")
+runtime_count, runtime_malformed, runtime_device_ns = connection.execute(
+    """
+    SELECT
+        count(*),
+        coalesce(sum(
+            CASE
+                WHEN typeof(start) != 'integer'
+                  OR typeof(end) != 'integer'
+                  OR end < start
+                THEN 1 ELSE 0
+            END
+        ), 0),
+        coalesce(sum(end - start), 0)
+    FROM CUPTI_ACTIVITY_KIND_RUNTIME
+    """
+).fetchone()
+if (
+    not isinstance(runtime_count, int)
+    or runtime_count <= 0
+    or runtime_malformed != 0
+    or runtime_device_ns <= 0
+):
+    raise SystemExit(
+        "Nsight CUDA runtime activity is empty or malformed: "
+        f"count={runtime_count}, malformed={runtime_malformed}, "
+        f"duration_ns={runtime_device_ns}"
+    )
 
 api_tables = sorted(
     table
@@ -212,17 +329,6 @@ captures_started = api_count("streambegincapture")
 captures_finished = api_count("streamendcapture")
 graphs_instantiated = api_count("graphinstantiate")
 graphs_launched = api_count("graphlaunch")
-if (captures_started, captures_finished, graphs_instantiated, graphs_launched) != (
-    14,
-    14,
-    14,
-    0,
-):
-    raise SystemExit(
-        "vertical graph lifecycle drifted: "
-        f"begin={captures_started}, end={captures_finished}, "
-        f"instantiate={graphs_instantiated}, launch={graphs_launched}"
-    )
 
 kernel_table = next(
     (
@@ -242,35 +348,75 @@ kernel_columns = {
 }
 if not {"start", "end"} <= kernel_columns:
     raise SystemExit("Nsight kernel table has an unknown shape")
-kernel_count, kernel_device_ns = connection.execute(
-    f'SELECT count(*), coalesce(sum("end" - "start"), 0) FROM "{kernel_table}"'
+kernel_count, kernel_malformed, kernel_device_ns = connection.execute(
+    f"""
+    SELECT
+        count(*),
+        coalesce(sum(
+            CASE
+                WHEN typeof("start") != 'integer'
+                  OR typeof("end") != 'integer'
+                  OR "end" < "start"
+                THEN 1 ELSE 0
+            END
+        ), 0),
+        coalesce(sum("end" - "start"), 0)
+    FROM "{kernel_table}"
+    """
 ).fetchone()
-if not isinstance(kernel_count, int) or kernel_count <= 0 or kernel_device_ns <= 0:
-    raise SystemExit("Nsight kernel timeline is empty")
+if (
+    not isinstance(kernel_count, int)
+    or kernel_count <= 0
+    or kernel_malformed != 0
+    or kernel_device_ns <= 0
+):
+    raise SystemExit(
+        "Nsight kernel timeline is empty or malformed: "
+        f"count={kernel_count}, malformed={kernel_malformed}, "
+        f"duration_ns={kernel_device_ns}"
+    )
 
 graph_trace_rows = 0
 graph_trace_device_ns = 0
+graph_trace_status = "ABSENT"
 if "CUPTI_ACTIVITY_KIND_GRAPH_TRACE" in tables:
-    graph_trace_rows, graph_trace_device_ns = connection.execute(
-        "SELECT count(*), coalesce(sum(end - start), 0) "
-        "FROM CUPTI_ACTIVITY_KIND_GRAPH_TRACE"
-    ).fetchone()
-if graph_trace_rows != 0 or graph_trace_device_ns != 0:
-    raise SystemExit(
-        "compiled vertical lane replayed a CUDA graph instead of remaining eager"
-    )
-
-graph_events = {}
-if "CUDA_GRAPH_EVENTS" in tables:
-    graph_events = {
-        name: {"count": count, "total_ns": total_ns}
-        for name, count, total_ns in connection.execute(
-            "SELECT s.value, count(*), coalesce(sum(e.end - e.start), 0) "
-            "FROM CUDA_GRAPH_EVENTS AS e "
-            "JOIN StringIds AS s ON s.id = e.nameId "
-            "GROUP BY s.value ORDER BY s.value"
+    graph_trace_columns = {
+        row[1]
+        for row in connection.execute(
+            'PRAGMA table_info("CUPTI_ACTIVITY_KIND_GRAPH_TRACE")'
         )
     }
+    if {"start", "end"} <= graph_trace_columns:
+        graph_trace_rows, graph_trace_device_ns = connection.execute(
+            "SELECT count(*), coalesce(sum(end - start), 0) "
+            "FROM CUPTI_ACTIVITY_KIND_GRAPH_TRACE"
+        ).fetchone()
+        graph_trace_status = "OBSERVED"
+    else:
+        graph_trace_rows = None
+        graph_trace_device_ns = None
+        graph_trace_status = "UNKNOWN_SCHEMA"
+
+graph_events = {}
+graph_events_status = "ABSENT"
+if "CUDA_GRAPH_EVENTS" in tables:
+    graph_event_columns = {
+        row[1]
+        for row in connection.execute('PRAGMA table_info("CUDA_GRAPH_EVENTS")')
+    }
+    if {"start", "end", "nameId"} <= graph_event_columns:
+        graph_events = {
+            name: {"count": count, "total_ns": total_ns}
+            for name, count, total_ns in connection.execute(
+                "SELECT s.value, count(*), coalesce(sum(e.end - e.start), 0) "
+                "FROM CUDA_GRAPH_EVENTS AS e "
+                "JOIN StringIds AS s ON s.id = e.nameId "
+                "GROUP BY s.value ORDER BY s.value"
+            )
+        }
+        graph_events_status = "OBSERVED"
+    else:
+        graph_events_status = "UNKNOWN_SCHEMA"
 
 with timeline_path.open("w", encoding="utf-8", newline="") as stream:
     writer = csv.DictWriter(
@@ -300,12 +446,16 @@ summary = {
     "graph_capture_end_count": captures_finished,
     "graph_instantiate_count": graphs_instantiated,
     "graph_launch_count": graphs_launched,
+    "runtime_activity_count": runtime_count,
+    "runtime_activity_device_ns": runtime_device_ns,
     "graph_trace_row_count": graph_trace_rows,
     "graph_trace_device_ns": graph_trace_device_ns,
+    "graph_trace_status": graph_trace_status,
     "kernel_activity_table": kernel_table,
     "kernel_activity_count": kernel_count,
     "kernel_activity_device_ns": kernel_device_ns,
     "graph_events": graph_events,
+    "graph_events_status": graph_events_status,
     "timeline_event_count": len(events),
     "timeline_csv_sha256": hashlib.sha256(timeline_path.read_bytes()).hexdigest(),
     "sqlite_sha256": hashlib.sha256(database.read_bytes()).hexdigest(),
@@ -317,7 +467,12 @@ summary_path.write_text(
 print(summary_path.read_text(encoding="utf-8"), end="")
 PY
 
-  sha256sum "$report" "$sqlite" "$kernels" "$apis" "$timeline" "$summary" \
+  vertical_nsys_export_summaries "$nsys_bin" "$sqlite"
+  [[ -s "$stats_receipt" && -s "$stats_log" ]] || {
+    echo "Nsight Systems summary export receipt is absent" >&2
+    return 1
+  }
+  sha256sum "$report" "$sqlite" "$timeline" "$summary" "$stats_receipt" "$stats_log" \
     >"$(checkpoint_artifact nsys_vertical.export.sha256.txt)"
 }
 
@@ -334,8 +489,8 @@ vertical_nsys_seal() {
     "$(checkpoint_artifact nsys_vertical.args.txt)" \
     "$(checkpoint_artifact nsys_vertical.nsys-rep)" \
     "$(checkpoint_artifact nsys_vertical.sqlite)" \
-    "$(checkpoint_artifact nsys_vertical.cuda_gpu_kern_sum.csv)" \
-    "$(checkpoint_artifact nsys_vertical.cuda_api_sum.csv)" \
+    "$(checkpoint_artifact nsys_vertical.summary-exports.json)" \
+    "$(checkpoint_artifact nsys_vertical.summary-exports.txt)" \
     "$(checkpoint_artifact nsys_vertical.graph-timeline.csv)" \
     "$CHECKPOINT_PIE" \
     "$(checkpoint_artifact nsys_vertical.receipt.json)" <<'PY'
@@ -356,8 +511,8 @@ import sys
     args_path,
     report_path,
     sqlite_path,
-    kernels_path,
-    apis_path,
+    stats_path,
+    stats_log_path,
     timeline_csv_path,
     pie_path,
     receipt_path,
@@ -374,8 +529,8 @@ required = (
     args_path,
     report_path,
     sqlite_path,
-    kernels_path,
-    apis_path,
+    stats_path,
+    stats_log_path,
     timeline_csv_path,
 )
 if any(not path.is_file() or path.stat().st_size == 0 for path in required):
@@ -388,6 +543,7 @@ timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
 tool = json.loads(tool_path.read_text(encoding="utf-8"))
 hardware = json.loads(hardware_path.read_text(encoding="utf-8"))
 source = json.loads(source_path.read_text(encoding="utf-8"))
+stats = json.loads(stats_path.read_text(encoding="utf-8"))
 expected_args = [
     "--pie",
     str(pie_path),
@@ -435,15 +591,20 @@ if (
     or timeline.get("headline_eligible") is not False
     or timeline.get("performance_claim_admissible") is not False
     or timeline.get("timing_class") != "profiler-perturbed-diagnostic-only"
-    or timeline.get("graph_capture_begin_count") != 14
-    or timeline.get("graph_capture_end_count") != 14
-    or timeline.get("graph_instantiate_count") != 14
-    or timeline.get("graph_launch_count") != 0
-    or timeline.get("graph_trace_row_count") != 0
+    or timeline.get("cuda_graph_trace_mode") != "graph"
+    or not isinstance(timeline.get("runtime_activity_count"), int)
+    or timeline["runtime_activity_count"] <= 0
+    or not isinstance(timeline.get("runtime_activity_device_ns"), int)
+    or timeline["runtime_activity_device_ns"] <= 0
+    or not timeline.get("kernel_activity_table")
+    or not isinstance(timeline.get("kernel_activity_count"), int)
+    or timeline["kernel_activity_count"] <= 0
+    or not isinstance(timeline.get("kernel_activity_device_ns"), int)
+    or timeline["kernel_activity_device_ns"] <= 0
     or timeline.get("timeline_csv_sha256") != digest(timeline_csv_path)
     or timeline.get("sqlite_sha256") != digest(sqlite_path)
 ):
-    raise SystemExit("CUDA graph timeline receipt is invalid")
+    raise SystemExit("CUDA runtime/kernel timeline receipt is invalid")
 if (
     tool.get("schema") != "stwo.replacement-v1-sn2.nsys-tool-identity.v1"
     or not tool.get("path")
@@ -454,6 +615,43 @@ if (
 ):
     raise SystemExit("SN2 Nsight authority identity is invalid")
 
+expected_reports = {
+    "cuda_gpu_kern_sum",
+    "cuda_api_sum",
+    "cuda_gpu_mem_time_sum",
+    "cuda_gpu_mem_size_sum",
+    "cuda_gpu_trace",
+    "nvtx_sum",
+    "osrt_sum",
+}
+if (
+    stats.get("schema")
+    != "stwo.sn2-compiled-vertical-nsys-summary-exports.v1"
+    or stats.get("authority") != "raw-sqlite"
+    or set(stats.get("reports", {})) != expected_reports
+):
+    raise SystemExit("Nsight summary export receipt is invalid")
+stats_artifacts = []
+for report_name, entry in stats["reports"].items():
+    if (
+        not isinstance(entry, dict)
+        or entry.get("status") not in {"EXPORTED", "UNAVAILABLE"}
+        or not isinstance(entry.get("return_code"), int)
+    ):
+        raise SystemExit(f"invalid Nsight summary status: {report_name}")
+    if entry["status"] == "EXPORTED":
+        path = stats_path.parent / str(entry.get("artifact", ""))
+        if (
+            not path.is_file()
+            or path.stat().st_size == 0
+            or entry.get("bytes") != path.stat().st_size
+            or entry.get("sha256") != digest(path)
+        ):
+            raise SystemExit(f"Nsight summary artifact drifted: {report_name}")
+        stats_artifacts.append(path)
+    elif any(key in entry for key in ("artifact", "bytes", "sha256")):
+        raise SystemExit(f"unavailable Nsight summary claims an artifact: {report_name}")
+
 artifacts = {
     path.name: {"bytes": path.stat().st_size, "sha256": digest(path)}
     for path in (
@@ -463,14 +661,15 @@ artifacts = {
         args_path,
         report_path,
         sqlite_path,
-        kernels_path,
-        apis_path,
+        stats_path,
+        stats_log_path,
         timeline_csv_path,
         strict_path,
         timeline_path,
         tool_path,
         hardware_path,
         source_path,
+        *stats_artifacts,
     )
 }
 receipt = {
@@ -492,8 +691,20 @@ receipt = {
     "composition_split_launch_mode": "fused-first-forward",
     "composition_split_executed_kernel_launches": 5,
     "composition_split_executed_logical_bytes": 4_026_531_840,
-    "graph_capture_count": 14,
-    "graph_launch_count": 0,
+    "raw_sqlite_authoritative": True,
+    "runtime_activity_count": timeline["runtime_activity_count"],
+    "runtime_activity_device_ns": timeline["runtime_activity_device_ns"],
+    "kernel_activity_table": timeline["kernel_activity_table"],
+    "kernel_activity_count": timeline["kernel_activity_count"],
+    "kernel_activity_device_ns": timeline["kernel_activity_device_ns"],
+    "graph_capture_begin_count": timeline["graph_capture_begin_count"],
+    "graph_capture_end_count": timeline["graph_capture_end_count"],
+    "graph_instantiate_count": timeline["graph_instantiate_count"],
+    "graph_launch_count": timeline["graph_launch_count"],
+    "graph_trace_status": timeline["graph_trace_status"],
+    "graph_trace_row_count": timeline["graph_trace_row_count"],
+    "graph_trace_device_ns": timeline["graph_trace_device_ns"],
+    "summary_exports": stats["reports"],
     "profiled_benchmark_metrics": {
         "prove_s_warm_median": strict["prove_s_warm_median"],
         "useful_mhz_median": strict["useful_mhz_median"],

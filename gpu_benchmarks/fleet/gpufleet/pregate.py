@@ -31,6 +31,9 @@ SN2_VERTICAL_RECIPE = Path(
 SN2_VERTICAL_ABBA_RECIPE = Path(
     "gpu_benchmarks/loop/recipes/sn2_compiled_vertical_abba.phases"
 )
+SN2_VERTICAL_NSYS_RECIPE = Path(
+    "gpu_benchmarks/loop/recipes/sn2_compiled_vertical_nsys_diagnostic.phases"
+)
 _SN2_VERTICAL_RECIPES = {
     SN2_VERTICAL_RECIPE: {
         "phases": (
@@ -85,6 +88,41 @@ _SN2_VERTICAL_RECIPES = {
             "gpu_benchmarks/test_validate_sn2_vertical_checkpoint.py",
             "gpu_benchmarks/validate_sn2_vertical_abba.py",
             "gpu_benchmarks/test_validate_sn2_vertical_abba.py",
+        ),
+    },
+    SN2_VERTICAL_NSYS_RECIPE: {
+        "phases": (
+            "phase ambient_override_gate checkpoint_reject_ambient_overrides",
+            "phase source_input_identity checkpoint_source_input_identity iteration",
+            "phase hardware_identity vertical_nsys_hardware_identity",
+            "phase nsys_tool_identity checkpoint_nsys_tool_identity",
+            "phase build vertical_nsys_build",
+            "phase nsys_compiled_vertical_capture vertical_nsys_capture",
+            "phase nsys_compiled_vertical_validate vertical_nsys_validate",
+            "phase nsys_compiled_vertical_export_query vertical_nsys_export_query",
+            "phase nsys_compiled_vertical_seal vertical_nsys_seal",
+        ),
+        "required": (
+            "validate_sn2_vertical_checkpoint.py",
+            "--cuda-graph-trace=graph",
+            "cuda_gpu_kern_sum",
+            "cuda_api_sum",
+            "cuda_gpu_mem_time_sum",
+            "cuda_gpu_mem_size_sum",
+            "cuda_gpu_trace",
+            "nvtx_sum",
+            "osrt_sum",
+            '"diagnostic_only": True',
+            '"headline_eligible": False',
+            '"performance_claim_admissible": False',
+            '"composition_split_launch_mode": "fused-first-forward"',
+            '"composition_split_executed_kernel_launches": 5',
+            '"composition_split_executed_logical_bytes": 4_026_531_840',
+        ),
+        "test": "gpu_benchmarks.test_validate_sn2_vertical_checkpoint",
+        "control": (
+            "gpu_benchmarks/validate_sn2_vertical_checkpoint.py",
+            "gpu_benchmarks/test_validate_sn2_vertical_checkpoint.py",
         ),
     },
 }
@@ -143,12 +181,15 @@ def is_sn2_vertical_recipe(recipe: Path, stwo_cairo: Path) -> bool:
     """True only for a canonical non-formal vertical checkpoint recipe."""
     try:
         resolved = recipe.expanduser().resolve(strict=True)
-        return any(
-            resolved == (stwo_cairo / candidate).resolve(strict=True)
-            for candidate in _SN2_VERTICAL_RECIPES
-        )
     except OSError:
         return False
+    for candidate in _SN2_VERTICAL_RECIPES:
+        try:
+            if resolved == (stwo_cairo / candidate).resolve(strict=True):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _tracked_control_is_clean(repository: Path, paths: tuple[str, ...]) -> bool:
@@ -171,11 +212,16 @@ def _sn2_vertical_identity(
     if not is_sn2_vertical_recipe(recipe, stwo_cairo):
         raise ValueError("not the canonical SN2 vertical checkpoint recipe")
     resolved = recipe.expanduser().resolve(strict=True)
-    relative = next(
-        candidate
-        for candidate in _SN2_VERTICAL_RECIPES
-        if resolved == (stwo_cairo / candidate).resolve(strict=True)
-    )
+    relative = None
+    for candidate in _SN2_VERTICAL_RECIPES:
+        try:
+            if resolved == (stwo_cairo / candidate).resolve(strict=True):
+                relative = candidate
+                break
+        except OSError:
+            continue
+    if relative is None:
+        raise ValueError("not the canonical SN2 vertical checkpoint recipe")
     spec = _SN2_VERTICAL_RECIPES[relative]
     cairo_control = (
         *_SN2_VERTICAL_CAIRO_CONTROL,
