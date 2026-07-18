@@ -69,6 +69,12 @@ fn scan() -> StaticCudaLibraryCallIdentity {
     )
 }
 
+fn copy() -> StaticCudaLibraryCallIdentity {
+    StaticCudaLibraryCallIdentity::MemcpyD2DV1(
+        StaticCudaMemcpyD2DV1::new(2, 16, 3, 32, 64).unwrap(),
+    )
+}
+
 fn compact_steps() -> Vec<StaticCudaExecutionStepIdentity> {
     vec![
         StaticCudaExecutionStepIdentity::KernelLaunch(launch(
@@ -178,17 +184,40 @@ fn typed_calls_are_complete_fixed_width_and_address_free() {
     assert_eq!(encoded.len(), 13);
     let scan_encoding = encoded;
 
+    let copy = copy();
+    assert_eq!(copy.api(), b"cudaMemcpyAsync(cudaMemcpyDeviceToDevice)");
+    let StaticCudaLibraryCallIdentity::MemcpyD2DV1(call) = &copy else {
+        panic!("expected device copy");
+    };
+    assert_eq!(call.source_argument(), 2);
+    assert_eq!(call.source_byte_offset(), 16);
+    assert_eq!(call.destination_argument(), 3);
+    assert_eq!(call.destination_byte_offset(), 32);
+    assert_eq!(call.bytes(), 64);
+    let mut copy_encoding = Vec::new();
+    copy.encode_into(&mut copy_encoding);
+    let mut expected = vec![3, 2];
+    expected.extend_from_slice(&16u64.to_le_bytes());
+    expected.push(3);
+    expected.extend_from_slice(&32u64.to_le_bytes());
+    expected.extend_from_slice(&64u64.to_le_bytes());
+    assert_eq!(copy_encoding, expected);
+    assert_eq!(copy_encoding.len(), 27);
+
     let execution = encode_execution_steps(&[
         StaticCudaExecutionStepIdentity::LibraryCall(sort),
         StaticCudaExecutionStepIdentity::LibraryCall(scan),
+        StaticCudaExecutionStepIdentity::LibraryCall(copy),
     ])
     .unwrap();
     let mut expected = Vec::from(AGGREGATE_DOMAIN);
-    expected.extend_from_slice(&2u64.to_le_bytes());
+    expected.extend_from_slice(&3u64.to_le_bytes());
     expected.push(2);
     expected.extend_from_slice(&sort_encoding);
     expected.push(2);
     expected.extend_from_slice(&scan_encoding);
+    expected.push(2);
+    expected.extend_from_slice(&copy_encoding);
     assert_eq!(execution, expected);
 }
 
@@ -283,6 +312,23 @@ fn invalid_sort_and_scan_fields_fail_closed() {
             Err(CompiledProofError::InvalidStaticWrapperManifest)
         );
     }
+}
+
+#[test]
+fn device_copy_rejects_zero_overflow_and_overlap() {
+    for invalid in [
+        StaticCudaMemcpyD2DV1::new(0, 0, 1, 0, 0),
+        StaticCudaMemcpyD2DV1::new(0, u64::MAX, 1, 0, 1),
+        StaticCudaMemcpyD2DV1::new(0, 0, 1, u64::MAX, 1),
+        StaticCudaMemcpyD2DV1::new(0, 0, 0, 0, 1),
+        StaticCudaMemcpyD2DV1::new(0, 0, 0, 1, 2),
+    ] {
+        assert_eq!(
+            invalid,
+            Err(CompiledProofError::InvalidStaticWrapperManifest)
+        );
+    }
+    assert!(StaticCudaMemcpyD2DV1::new(0, 0, 0, 2, 2).is_ok());
 }
 
 #[test]

@@ -140,6 +140,75 @@ impl StaticCudaCubInclusiveSumU32V1 {
     }
 }
 
+/// Exact identity of one ordered asynchronous device-to-device copy.
+///
+/// Argument ordinals and byte offsets are relative to the enclosing static
+/// wrapper ABI; they are never process-local addresses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticCudaMemcpyD2DV1 {
+    source_argument: u8,
+    source_byte_offset: u64,
+    destination_argument: u8,
+    destination_byte_offset: u64,
+    bytes: u64,
+}
+
+impl StaticCudaMemcpyD2DV1 {
+    pub fn new(
+        source_argument: u8,
+        source_byte_offset: u64,
+        destination_argument: u8,
+        destination_byte_offset: u64,
+        bytes: u64,
+    ) -> Result<Self, CompiledProofError> {
+        let copy = Self {
+            source_argument,
+            source_byte_offset,
+            destination_argument,
+            destination_byte_offset,
+            bytes,
+        };
+        if copy.is_valid() {
+            Ok(copy)
+        } else {
+            Err(CompiledProofError::InvalidStaticWrapperManifest)
+        }
+    }
+
+    pub const fn source_argument(&self) -> u8 {
+        self.source_argument
+    }
+
+    pub const fn source_byte_offset(&self) -> u64 {
+        self.source_byte_offset
+    }
+
+    pub const fn destination_argument(&self) -> u8 {
+        self.destination_argument
+    }
+
+    pub const fn destination_byte_offset(&self) -> u64 {
+        self.destination_byte_offset
+    }
+
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    const fn is_valid(&self) -> bool {
+        let Some(source_end) = self.source_byte_offset.checked_add(self.bytes) else {
+            return false;
+        };
+        let Some(destination_end) = self.destination_byte_offset.checked_add(self.bytes) else {
+            return false;
+        };
+        self.bytes != 0
+            && (self.source_argument != self.destination_argument
+                || source_end <= self.destination_byte_offset
+                || destination_end <= self.source_byte_offset)
+    }
+}
+
 /// Closed, versioned set of CUDA-library operations admitted into wrapper
 /// identity. Each variant fixes its API, element types, ordering semantics,
 /// stream ordering, and canonical field widths.
@@ -147,6 +216,7 @@ impl StaticCudaCubInclusiveSumU32V1 {
 pub enum StaticCudaLibraryCallIdentity {
     CubStableAscendingSortPairsU32V1(StaticCudaCubStableAscendingSortPairsU32V1),
     CubInclusiveSumU32V1(StaticCudaCubInclusiveSumU32V1),
+    MemcpyD2DV1(StaticCudaMemcpyD2DV1),
 }
 
 impl StaticCudaLibraryCallIdentity {
@@ -154,6 +224,7 @@ impl StaticCudaLibraryCallIdentity {
         match self {
             Self::CubStableAscendingSortPairsU32V1(_) => b"cub::DeviceRadixSort::SortPairs",
             Self::CubInclusiveSumU32V1(_) => b"cub::DeviceScan::InclusiveSum",
+            Self::MemcpyD2DV1(_) => b"cudaMemcpyAsync(cudaMemcpyDeviceToDevice)",
         }
     }
 
@@ -169,6 +240,7 @@ impl StaticCudaLibraryCallIdentity {
         match self {
             Self::CubStableAscendingSortPairsU32V1(call) => call.is_valid(),
             Self::CubInclusiveSumU32V1(call) => call.is_valid(),
+            Self::MemcpyD2DV1(call) => call.is_valid(),
         }
     }
 
@@ -190,6 +262,14 @@ impl StaticCudaLibraryCallIdentity {
                 out.push(2);
                 out.extend_from_slice(&call.rows.to_le_bytes());
                 out.extend_from_slice(&call.exact_temp_bytes.to_le_bytes());
+            }
+            Self::MemcpyD2DV1(call) => {
+                out.push(3);
+                out.push(call.source_argument);
+                out.extend_from_slice(&call.source_byte_offset.to_le_bytes());
+                out.push(call.destination_argument);
+                out.extend_from_slice(&call.destination_byte_offset.to_le_bytes());
+                out.extend_from_slice(&call.bytes.to_le_bytes());
             }
         }
     }
