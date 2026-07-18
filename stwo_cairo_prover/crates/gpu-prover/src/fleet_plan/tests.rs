@@ -20,6 +20,7 @@ use crate::transcript_plan::{
 };
 
 mod adversarial;
+mod base_commit_batches;
 mod barrier;
 mod compiler;
 mod composite_internal_read;

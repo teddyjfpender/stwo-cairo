@@ -17,9 +17,11 @@ use crate::fleet_pow::FleetPowSchedule;
 use crate::shape_executable::ShapeExecutableIdentity;
 use crate::transcript_plan::CairoBlake2sTranscriptPlan;
 
+mod commit_batches;
 mod schedule;
 mod storage;
 
+use commit_batches::base_commit_static_wrapper_workers;
 use schedule::DistributedSchedule;
 use storage::compile_partitioned_storage;
 
@@ -44,6 +46,36 @@ impl FleetProofPlan {
             pow,
             &BTreeMap::new(),
             transcript,
+        )
+    }
+
+    /// Place each complete canonical Base commitment batch on one worker.
+    ///
+    /// Batches remain in authority order and are never row-sharded. The
+    /// existing distributed compiler materializes exact source replicas and
+    /// the progressive H8-plus-tail state transition between consecutive
+    /// batch owners; the final Base root remains on the last batch worker
+    /// until the coordinator's transcript gather.
+    pub fn compile_track_a_partitioned_with_base_commit_batches(
+        compiled: Arc<CompiledProof>,
+        shape: ShapeExecutableIdentity,
+        topology: FleetPlacementTopology,
+        pow: FleetPowSchedule,
+        first_base_operation: crate::compiled_proof::OpId,
+        authority: &stwo_backend_cuda::BaseCommitProgramAuthority,
+        transcript: &CairoBlake2sTranscriptPlan,
+    ) -> Result<Self, FleetCompileError> {
+        let workers = base_commit_static_wrapper_workers(
+            &compiled,
+            &topology,
+            first_base_operation,
+            authority,
+        )?;
+        if topology.workers.len() == 1 {
+            return Self::compile_track_a_partitioned(compiled, shape, topology, pow, transcript);
+        }
+        Self::compile_track_a_partitioned_with_static_wrapper_workers(
+            compiled, shape, topology, pow, &workers, transcript,
         )
     }
 
