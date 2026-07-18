@@ -55,6 +55,11 @@ replacement_stage4_native::replacement_stage4_native_bytes_match
 prepared_composition_stripes_direct_native::multidomain_direct_split_wave_and_installed_stripes_match_eager_and_replay
 ```
 
+Relation and quotient deliberately use the test-only empty generated-AOT pack;
+their compared functions are static CUDA kernels. Composition alone builds the
+generated ordinary-stripe pack it installs and attests. This avoids rebuilding
+the unrelated full pack for all three feature sets on a cold one-shot pod.
+
 Each candidate phase is fail-soft: its raw exit status, phase log, binary
 identity, and any receipt survive even when it fails. All three candidate
 phases therefore run. `validate_sn2_5mhz_cheap_gpu_ab.py` is the only

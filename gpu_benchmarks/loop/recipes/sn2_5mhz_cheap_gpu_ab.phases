@@ -53,7 +53,8 @@ run_relation() {
   cd "$STWO" || return
   compile_test relation prepared_relation_native \
     --release --locked -p stwo-backend-cuda \
-    --features test-only-relation-ab --test prepared_relation_native || return
+    --features test-only-relation-ab,test-only-empty-aot-pack \
+    --test prepared_relation_native || return
   binary="$(test_binary relation)" || return
   STWO_RELATION_NATIVE_AB_WARMUPS=5 \
   STWO_RELATION_NATIVE_AB_ITERATIONS=30 \
@@ -67,6 +68,7 @@ run_quotient() {
   cd "$STWO" || return
   compile_test quotient replacement_stage4_native \
     --release --locked -p stwo-backend-cuda \
+    --features test-only-empty-aot-pack \
     --test replacement_stage4_native || return
   binary="$(test_binary quotient)" || return
   STWO_STAGE4_GIT_COMMIT="$STWO_PARITY_REF_STWO_HEAD" \
