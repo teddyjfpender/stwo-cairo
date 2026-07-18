@@ -41,15 +41,16 @@ use stwo_backend_cuda::{
     RelationGraphError, RelationInstanceSources, TraceDecommitSources, TraceSourceGroup,
     TranscriptInputBinding, TranscriptInputId, TranscriptMirrorReport, TranscriptOutputBinding,
     TranscriptOutputId, TranscriptSegmentCursor, TranscriptSegmentStart,
+    COMPOSITION_RETAINED_COLUMNS,
 };
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::witness::device_feed::canonical_count_lut;
 use stwo_cairo_prover::witness::proof_shape::{ProofShapeKey, TracePartId};
 
 use crate::arena_plan::{
-    BlakeGWitnessContract, BufferPurpose, CommitmentColumnSource, CommitmentTreeId,
+    ArenaBinding, BlakeGWitnessContract, BufferPurpose, CommitmentColumnSource, CommitmentTreeId,
     DirectCompactTerminalPlan, DynamicCommitmentLeafSchedule, PlannedFixedTableSource,
-    PlannedRecordedMultiplicityFeedGraph, ResidentBackend,
+    PlannedRecordedMultiplicityFeedGraph, ProofArenaPlan, ResidentBackend,
 };
 use crate::composition_plan::CompositionProofBindings;
 use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
@@ -59,8 +60,8 @@ use crate::graphs::{
 };
 use crate::multiplicity_pipeline::{FixedMultiplicityCoverageGap, MultiplicityFeedBlocker};
 use crate::prepared_composition::{
-    CompositionBindingRefreshTelemetry, CompositionExecutionReceipt, CompositionLaunchMode,
-    CompositionOutputMode, CompositionReplayReceipt,
+    CompositionBindingRefreshTelemetry, CompositionExecutionAuthority, CompositionExecutionReceipt,
+    CompositionLaunchMode, CompositionOutputMode, CompositionReplayReceipt, CompositionValueRole,
 };
 use crate::program_image::{
     bind_replacement_base_authority, BaseProducerAuthority, LoadedBaseProducerAuthority,
@@ -463,6 +464,7 @@ pub enum ResidentRuntimeError {
     },
     MissingPreparedCommitment(CommitmentTreeId),
     DirectRetainedOutputMismatch(CommitmentTreeId),
+    PostCompiledCompositionHandoff(&'static str),
     FixedPreprocessedCommitmentNotReady,
     TranscriptScheduleMismatch {
         expected: u64,
@@ -1375,6 +1377,91 @@ fn direct_retained_outputs_match(
     })
 }
 
+/// Resolve the only output contract accepted by the compiled-Composition
+/// eager handoff. The compiler's terminal generation, the commitment's
+/// canonical output order, and the arena's logical-to-physical bindings must
+/// all name the same eight full evaluation columns.
+fn post_compiled_composition_output_bindings(
+    plan: &ProofArenaPlan,
+) -> Result<[ArenaBinding; COMPOSITION_RETAINED_COLUMNS], ResidentRuntimeError> {
+    let reject = |reason| ResidentRuntimeError::PostCompiledCompositionHandoff(reason);
+    if plan.composition().output_plan.mode() != CompositionOutputMode::DirectRetainedEvaluations {
+        return Err(reject(
+            "Composition output is not direct retained evaluations",
+        ));
+    }
+    let authority = CompositionExecutionAuthority::compile(plan)
+        .map_err(|_| reject("Composition execution authority is not exact"))?;
+    let expected_roles = std::array::from_fn(|column| CompositionValueRole::SplitRetained {
+        canonical_column: column as u8,
+        generation: 3,
+    });
+    if authority.outputs() != &expected_roles {
+        return Err(reject(
+            "Composition authority does not terminate at generation-3 retained evaluations",
+        ));
+    }
+
+    let commitment = plan
+        .commitment(CommitmentTreeId::Composition)
+        .ok_or_else(|| reject("Composition commitment is absent"))?;
+    let [Some(outputs)] = commitment.evaluation_output_groups.as_slice() else {
+        return Err(reject(
+            "Composition commitment does not own one output group",
+        ));
+    };
+    let outputs: [ArenaBinding; COMPOSITION_RETAINED_COLUMNS] = outputs
+        .as_slice()
+        .try_into()
+        .map(|outputs: &[ArenaBinding; COMPOSITION_RETAINED_COLUMNS]| *outputs)
+        .map_err(|_| reject("Composition commitment output count is not eight"))?;
+    let program = plan
+        .composition()
+        .output_plan
+        .direct_program()
+        .ok_or_else(|| reject("Composition split program is absent"))?;
+    let expected_words = 1usize
+        .checked_shl(program.schedule().evaluation_log_size)
+        .ok_or_else(|| reject("Composition output extent overflows"))?;
+
+    for (column, (&role, &output)) in expected_roles.iter().zip(&outputs).enumerate() {
+        let mut layouts = authority
+            .layouts()
+            .iter()
+            .filter(|layout| layout.role == role);
+        let layout = layouts
+            .next()
+            .filter(|_| layouts.next().is_none())
+            .ok_or_else(|| reject("Composition output role is not unique"))?;
+        let logical = plan
+            .binding(layout.logical)
+            .ok_or_else(|| reject("Composition output has no arena binding"))?;
+        if layout.first_word != 0
+            || layout.word_len != expected_words
+            || output.len_words != expected_words
+            || logical != output
+            || expected_roles[column]
+                != (CompositionValueRole::SplitRetained {
+                    canonical_column: column as u8,
+                    generation: 3,
+                })
+        {
+            return Err(reject(
+                "Composition output role, extent, or arena binding drifted",
+            ));
+        }
+    }
+    for (column, output) in outputs.iter().enumerate() {
+        if outputs[..column]
+            .iter()
+            .any(|previous| previous.physical == output.physical)
+        {
+            return Err(reject("Composition output slices alias"));
+        }
+    }
+    Ok(outputs)
+}
+
 fn canonical_output_order_matches<T, U>(
     actual: &[Option<T>],
     planned: &[Option<Vec<U>>],
@@ -1395,6 +1482,20 @@ fn canonical_output_order_matches<T, U>(
         }
     }
     actual.next().is_none()
+}
+
+fn validate_resume_cursor(
+    cursor: &TranscriptSegmentCursor,
+    schedule: &stwo_backend_cuda::Blake2sTranscriptSchedule,
+    range: std::ops::Range<usize>,
+) -> Result<(), DeviceTranscriptError> {
+    let mut probe = cursor.clone();
+    probe.admit_segment(
+        schedule,
+        cursor.generation(),
+        range,
+        TranscriptSegmentStart::Resume,
+    )
 }
 
 enum PreparedResidentCommitment<'a> {
@@ -5232,6 +5333,80 @@ impl<'a> ResidentGraphRuntime<'a> {
         Ok(())
     }
 
+    /// Continue the resident proof after an externally executed, complete
+    /// compiled Composition stage.
+    ///
+    /// The caller must have executed the exact prepared Composition authority,
+    /// including every lift and the terminal split, into this runtime's arena.
+    /// This method validates the immutable eight-column generation-3 handoff
+    /// and the next transcript segment before launching anything. It then
+    /// skips only [`PreparedCompositionGraph::launch`] and reuses the existing
+    /// commitment, root staging, transcript, and OODS path unchanged.
+    pub fn launch_post_compiled_composition_handoff_eager(
+        &mut self,
+    ) -> Result<(), ResidentRuntimeError> {
+        let planned_outputs = post_compiled_composition_output_bindings(self.workspace.plan())?;
+        let commitment = self.commitment(CommitmentTreeId::Composition)?;
+        let PreparedResidentCommitment::PrecomputedCompact { graph, .. } = commitment else {
+            return Err(ResidentRuntimeError::PostCompiledCompositionHandoff(
+                "Composition commitment is not precomputed compact",
+            ));
+        };
+        let actual_outputs = graph.retained_evaluations();
+        if actual_outputs.len() != COMPOSITION_RETAINED_COLUMNS {
+            return Err(ResidentRuntimeError::PostCompiledCompositionHandoff(
+                "prepared Composition output count is not eight",
+            ));
+        }
+        for (&actual, planned) in actual_outputs.iter().zip(planned_outputs) {
+            let actual = actual.ok_or(ResidentRuntimeError::PostCompiledCompositionHandoff(
+                "prepared Composition output is absent",
+            ))?;
+            let planned = bind_arena_binding(self.workspace.arena(), planned)?;
+            if actual.id() != planned.id()
+                || actual.as_u32_ptr() != planned.as_u32_ptr()
+                || actual.len_words() != planned.len_words()
+            {
+                return Err(ResidentRuntimeError::PostCompiledCompositionHandoff(
+                    "prepared Composition output differs from the generation-3 binding",
+                ));
+            }
+        }
+
+        let interaction_segment =
+            self.transcript_segment_index(CairoTranscriptSegment::InteractionAndComposition)?;
+        let composition_segment =
+            self.transcript_segment_index(CairoTranscriptSegment::CompositionAndOods)?;
+        if composition_segment != interaction_segment + 1
+            || self.transcript_segments[interaction_segment]
+                .operation_range
+                .end
+                != self.transcript_segments[composition_segment]
+                    .operation_range
+                    .start
+        {
+            return Err(ResidentRuntimeError::PostCompiledCompositionHandoff(
+                "Composition transcript boundary is not the immediate successor",
+            ));
+        }
+        validate_resume_cursor(
+            &self.transcript_cursor,
+            self.transcript.schedule(),
+            self.transcript_segments[composition_segment]
+                .operation_range
+                .clone(),
+        )?;
+
+        commitment.launch()?;
+        self.stage_commitment_root_for_transcript(
+            CommitmentTreeId::Composition,
+            CairoTranscriptInput::CompositionRoot,
+        )?;
+        self.launch_transcript_segment_eager(composition_segment)?;
+        self.oods.launch_oods()?;
+        Ok(())
+    }
+
     pub fn launch_oods_transcript_boundary_eager(&mut self) -> Result<(), ResidentRuntimeError> {
         self.launch_quotient_numerator_eager()?;
         self.oods.launch_quotient()?;
@@ -6749,6 +6924,68 @@ mod tests {
             &[Some(vec![first]), None],
             |actual, planned| actual == planned
         ));
+    }
+
+    #[test]
+    fn post_compiled_composition_handoff_seals_exact_generation_three_outputs() {
+        let replacement = crate::program_image::generated_sn2_replacement();
+        let outputs = post_compiled_composition_output_bindings(replacement.arena()).unwrap();
+        assert_eq!(outputs.len(), COMPOSITION_RETAINED_COLUMNS);
+        assert!(outputs.iter().enumerate().all(|(column, output)| {
+            outputs[..column]
+                .iter()
+                .all(|previous| previous.physical != output.physical)
+        }));
+
+        let legacy = crate::program_image::generated_sn2();
+        assert!(matches!(
+            post_compiled_composition_output_bindings(legacy.arena()),
+            Err(ResidentRuntimeError::PostCompiledCompositionHandoff(_))
+        ));
+    }
+
+    #[test]
+    fn post_compiled_composition_handoff_requires_exact_resume_cursor() {
+        use stwo_backend_cuda::{
+            Blake2sTranscriptSchedule, TranscriptBoundaryId, TranscriptInputId,
+            TranscriptOperation, TranscriptStart,
+        };
+
+        let schedule = Blake2sTranscriptSchedule::new(
+            TranscriptStart::Default,
+            vec![
+                TranscriptOperation::MixU32s {
+                    boundary: TranscriptBoundaryId(1),
+                    source: TranscriptInputId(1),
+                    n_words: 1,
+                },
+                TranscriptOperation::MixU32s {
+                    boundary: TranscriptBoundaryId(2),
+                    source: TranscriptInputId(2),
+                    n_words: 1,
+                },
+            ],
+            8,
+        )
+        .unwrap();
+        let mut cursor = TranscriptSegmentCursor::new(&schedule);
+        cursor.begin_generation(1).unwrap();
+        assert!(validate_resume_cursor(&cursor, &schedule, 1..2).is_err());
+
+        cursor
+            .admit_segment(&schedule, 1, 0..1, TranscriptSegmentStart::Initialize)
+            .unwrap();
+        validate_resume_cursor(&cursor, &schedule, 1..2).unwrap();
+        assert_eq!(
+            cursor.next_operation(),
+            1,
+            "validation must not advance the live cursor"
+        );
+
+        cursor
+            .admit_segment(&schedule, 1, 1..2, TranscriptSegmentStart::Resume)
+            .unwrap();
+        assert!(validate_resume_cursor(&cursor, &schedule, 1..2).is_err());
     }
 
     #[test]
