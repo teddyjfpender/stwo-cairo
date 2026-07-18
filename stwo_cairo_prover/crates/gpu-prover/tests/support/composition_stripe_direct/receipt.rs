@@ -104,6 +104,11 @@ pub(super) fn publish_receipt(
             && receipt.resources.registers_per_thread != 0
             && receipt.resources.binary_version == receipt.target_sm
     }));
+    let runtime_stats = aot::runtime_stats();
+    assert_eq!(
+        runtime_stats.strict_rejections, 0,
+        "diagnostic eager/captured ordering must never enter strict-miss"
+    );
     let resources = installed
         .into_iter()
         .map(|receipt| {
@@ -137,6 +142,7 @@ pub(super) fn publish_receipt(
             "direct_split_output": true,
             "shared_source_inputs": true,
             "single_process_device_arena_context_main_stream": true,
+            "runtime_strict_rejections": runtime_stats.strict_rejections,
             "all_retained_bytes_equal_eager": true,
             "all_retained_bytes_equal_mutated_capture_replay": true,
             "mutated_replay_digest_changed": true,

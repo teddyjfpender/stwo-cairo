@@ -2084,12 +2084,16 @@ impl<'a> PreparedCompositionGraph<'a> {
         )
     }
 
-    /// Strict-AOT stripe candidate at the production direct-retained boundary.
+    /// Exact-installed stripe candidate at the production direct-retained boundary.
     ///
     /// This is the only stripe constructor suitable for timing against the
     /// current wave path: both arms bind the same proof parameters, direct
     /// evaluations, direct-split output ownership, and downstream semantic
-    /// boundary. Production selection remains unchanged.
+    /// boundary. It deliberately does not close process-wide strict admission:
+    /// the diagnostic wave baseline remains runtime-origin for eager ABBA.
+    /// Every stripe still installs and validates the exact embedded function,
+    /// cubin identity, launch geometry, and CUDA resources. Production strict
+    /// admission and production Wave selection remain unchanged.
     #[allow(clippy::too_many_arguments)]
     #[cfg(feature = "direct-retention-test-api")]
     #[doc(hidden)]
@@ -2115,7 +2119,7 @@ impl<'a> PreparedCompositionGraph<'a> {
             Some(direct_retention),
             direct_evaluations,
             Some(direct_split),
-            CompositionAotAdmission::StrictEmbedded,
+            CompositionAotAdmission::SourceJitTest,
             CompositionStripeAdmission::InstalledResourceBounded,
         )?;
         let boundary = graph.resource_bounded_stripe_boundary_receipt_for_test()?;
@@ -4474,11 +4478,34 @@ mod tests {
         let constructor = source
             .find("pub fn prepare_resource_bounded_stripes_for_test")
             .unwrap();
+        let next_constructor = source[constructor..]
+            .find("pub fn prepare_wave_direct_retained_jit_for_test")
+            .unwrap();
+        let comparator = &source[constructor..constructor + next_constructor];
+        assert!(comparator.contains("CompositionAotAdmission::SourceJitTest"));
+        assert!(!comparator.contains("CompositionAotAdmission::StrictEmbedded"));
         let direct_split = source[constructor..].find("Some(direct_split)").unwrap();
         let boundary_guard = source[constructor..]
             .find("require_resource_bounded_direct_boundary(&boundary)")
             .unwrap();
         assert!(direct_split < boundary_guard);
+
+        let harness = include_str!("../tests/prepared_composition_stripes_direct_native.rs");
+        let wave_prepare = harness
+            .find("prepare_wave_direct_retained_jit_for_test")
+            .unwrap();
+        let stripe_prepare = harness
+            .find("prepare_resource_bounded_stripes_for_test")
+            .unwrap();
+        let performance = harness.find("optional_captured_abba").unwrap();
+        let eager_wave = harness[performance..]
+            .find("|| wave.launch().unwrap()")
+            .unwrap();
+        assert!(wave_prepare < stripe_prepare && stripe_prepare < performance);
+        assert_ne!(
+            eager_wave, 0,
+            "performance-enabled eager Wave launch must remain after stripe preparation"
+        );
     }
 
     #[test]
