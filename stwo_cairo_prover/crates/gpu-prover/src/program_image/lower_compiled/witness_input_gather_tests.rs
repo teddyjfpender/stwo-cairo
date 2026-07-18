@@ -15,6 +15,8 @@ use crate::compiled_proof::{
 };
 use crate::shape_executable::ShapeExecutable;
 
+mod projection;
+
 struct Fixture {
     executable: Arc<ShapeExecutable>,
     authority: BaseProducerAuthority,

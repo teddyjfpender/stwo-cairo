@@ -18,11 +18,12 @@ use super::*;
 use crate::arena_plan::{ArenaBinding, PlannedWitnessComponent, ProofArenaPlan};
 use crate::compiled_proof::{
     AotArgumentBinding, AotArgumentValue, AotInvocation, EffectAccess, EffectBindingId,
-    EffectContract, ElementRange, ValueVersion,
+    EffectContract, ElementRange, StaticCudaWrapperAuthority, StaticCudaWrapperId, ValueVersion,
 };
 use crate::resident_runtime::producer_schedule::BaseProducerSchedule;
 
 mod bindings;
+mod projection;
 use bindings::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +70,11 @@ pub(super) struct LoweredWitnessInputGather {
     pub(super) outputs: Vec<WitnessInputGatherOutputBinding>,
     pub(super) invocation: AotInvocation,
     pub(super) effect: EffectContract,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct LinkedWitnessInputGatherExecution {
+    pub(super) wrapper: StaticCudaWrapperAuthority,
 }
 
 /// Lower every gather in witness-DAG order without allocating any global
@@ -161,6 +167,20 @@ pub(super) fn validate(
     } else {
         Err(InvocationShapeError::InvalidScheduledProducerBinding)
     }
+}
+
+/// Project one exact gather into the linked static-wrapper authority.
+///
+/// The proof-wide semantic map is deliberately required: projection may bind
+/// an existing value lineage, but it may not invent one from arena addresses.
+pub(super) fn project_static_wrapper(
+    arena: &ProofArenaPlan,
+    values: &adapter::SemanticValueMap,
+    id: StaticCudaWrapperId,
+    linked: &stwo_backend_cuda::WitnessInputGatherLinkedContract,
+    lowered: &LoweredWitnessInputGather,
+) -> Result<LinkedWitnessInputGatherExecution, InvocationShapeError> {
+    projection::linked(arena, values, id, linked, lowered)
 }
 
 #[allow(clippy::too_many_arguments)]
