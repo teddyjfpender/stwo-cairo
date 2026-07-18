@@ -35,11 +35,30 @@ pub(crate) fn bind_arena_binding(
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum GraphSegment {
     IngestWitnessBaseCommit,
+    /// Fleet topology: Base work through the interaction-PoW challenge.
+    BasePrefix,
+    /// Fleet topology: transcript resume after an externally supplied interaction-PoW nonce.
+    BaseResume,
     InteractionCommit,
     CompositionQuotientCommit,
     OodsEvaluation,
     FriLayer(u8),
     OodsQueriesDecommitAssemble,
+    /// Fleet topology: final FRI work through the query-PoW challenge.
+    FinalPrefix,
+    /// Fleet topology: transcript resume and assembly after an externally supplied query nonce.
+    FinalResume,
+}
+
+/// Exact graph boundary layout for one resident proof.
+///
+/// `FleetPowSplit` changes only ownership of the two PoW searches. All work
+/// before and after each search remains in the same transcript order.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ResidentGraphTopology {
+    #[default]
+    Monolithic,
+    FleetPowSplit,
 }
 
 /// Cache identity. `protocol_key` is supplied by the proof planner and must cover

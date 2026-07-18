@@ -55,6 +55,7 @@ use crate::composition_plan::CompositionProofBindings;
 use crate::fixed_table_materializer::PEDERSEN_POINTS_18_ROW_COUNT;
 use crate::graphs::{
     bind_arena_binding, GraphCaptureStatus, GraphError, GraphKey, GraphSegment, GraphWorkspace,
+    ResidentGraphTopology,
 };
 use crate::multiplicity_pipeline::{FixedMultiplicityCoverageGap, MultiplicityFeedBlocker};
 use crate::prepared_composition::{
@@ -3786,6 +3787,20 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn capture_base_commit_only(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.capture_base_prefix_graph(GraphSegment::IngestWitnessBaseCommit, true)
+    }
+
+    /// Capture the fleet-owned Base prefix, ending exactly before interaction
+    /// PoW. The nonce upload and `BaseResume` replay are intentionally external.
+    pub fn capture_base_prefix(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.capture_base_prefix_graph(GraphSegment::BasePrefix, false)
+    }
+
+    fn capture_base_prefix_graph(
+        &mut self,
+        graph_segment: GraphSegment,
+        include_pow_resume: bool,
+    ) -> Result<(), ResidentRuntimeError> {
         self.validate_base_statement_sources()?;
         let commitment_index = self
             .commitments
@@ -3823,7 +3838,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
         let capture = capture_with_cursor_rollback(cursor, |cursor| {
-            workspace.capture_segment(GraphSegment::IngestWitnessBaseCommit, |arena| {
+            workspace.capture_segment(graph_segment, |arena| {
                 let mut producer_cursor = producer_schedule.cursor();
                 if let Some(execution_tables) = execution_tables {
                     producer_cursor
@@ -3919,7 +3934,46 @@ impl<'a> ResidentGraphRuntime<'a> {
                         TranscriptSegmentStart::Initialize,
                     )
                     .map_err(ResidentLaunchError::Transcript)?;
-                interaction_pow.launch().map_err(ResidentLaunchError::Pow)?;
+                if include_pow_resume {
+                    interaction_pow.launch().map_err(ResidentLaunchError::Pow)?;
+                    transcript
+                        .launch_segment(
+                            cursor,
+                            generation,
+                            pow_range,
+                            TranscriptSegmentStart::Resume,
+                        )
+                        .map_err(ResidentLaunchError::Transcript)?;
+                    relation
+                        .expand_challenges_from_transcript(lookup_output)
+                        .map_err(ResidentLaunchError::Relation)?;
+                }
+                Ok::<(), ResidentLaunchError>(())
+            })
+        })?;
+        self.admit_reused_transcript_segment(capture, bootstrap_segment)?;
+        if include_pow_resume {
+            self.admit_reused_transcript_segment(capture, pow_segment)?;
+        }
+        Ok(())
+    }
+
+    /// Capture the fleet-owned transcript resume after the interaction nonce
+    /// has been written to the prepared PoW nonce slot.
+    pub fn capture_base_resume(&mut self) -> Result<(), ResidentRuntimeError> {
+        let pow_segment =
+            self.transcript_segment_index(CairoTranscriptSegment::InteractionPowAndLookup)?;
+        let pow_range = self.transcript_segments[pow_segment]
+            .operation_range
+            .clone();
+        let lookup_output = self.transcript_output(CairoTranscriptOutput::CommonLookupElements)?;
+        let transcript = &self.transcript;
+        let relation = &self.relation;
+        let workspace = self.workspace;
+        let cursor = &mut self.transcript_cursor;
+        let generation = cursor.generation();
+        let capture = capture_with_cursor_rollback(cursor, |cursor| {
+            workspace.capture_segment(GraphSegment::BaseResume, |_| {
                 transcript
                     .launch_segment(
                         cursor,
@@ -3933,9 +3987,7 @@ impl<'a> ResidentGraphRuntime<'a> {
                     .map_err(ResidentLaunchError::Relation)
             })
         })?;
-        self.admit_reused_transcript_segment(capture, bootstrap_segment)?;
-        self.admit_reused_transcript_segment(capture, pow_segment)?;
-        Ok(())
+        self.admit_reused_transcript_segment(capture, pow_segment)
     }
 
     pub fn capture_interaction_relation_and_commit(&mut self) -> Result<(), ResidentRuntimeError> {
@@ -4149,6 +4201,19 @@ impl<'a> ResidentGraphRuntime<'a> {
     }
 
     pub fn capture_final_transcript_boundary(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.capture_final_prefix_graph(GraphSegment::OodsQueriesDecommitAssemble, true)
+    }
+
+    /// Capture the fleet-owned final prefix, ending exactly before query PoW.
+    pub fn capture_final_prefix(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.capture_final_prefix_graph(GraphSegment::FinalPrefix, false)
+    }
+
+    fn capture_final_prefix_graph(
+        &mut self,
+        graph_segment: GraphSegment,
+        include_pow_resume: bool,
+    ) -> Result<(), ResidentRuntimeError> {
         let last_layer_segment =
             self.transcript_segment_index(CairoTranscriptSegment::FriLastLayer)?;
         let query_segment =
@@ -4172,7 +4237,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         let cursor = &mut self.transcript_cursor;
         let generation = cursor.generation();
         let capture = capture_with_cursor_rollback(cursor, |cursor| {
-            workspace.capture_segment(GraphSegment::OodsQueriesDecommitAssemble, |arena| {
+            workspace.capture_segment(graph_segment, |arena| {
                 fri_final.launch().map_err(ResidentLaunchError::FriFinal)?;
                 transcript
                     .launch_segment(
@@ -4182,7 +4247,54 @@ impl<'a> ResidentGraphRuntime<'a> {
                         TranscriptSegmentStart::Resume,
                     )
                     .map_err(ResidentLaunchError::Transcript)?;
-                query_pow.launch().map_err(ResidentLaunchError::Pow)?;
+                if include_pow_resume {
+                    query_pow.launch().map_err(ResidentLaunchError::Pow)?;
+                    transcript
+                        .launch_segment(
+                            cursor,
+                            generation,
+                            query_range,
+                            TranscriptSegmentStart::Resume,
+                        )
+                        .map_err(ResidentLaunchError::Transcript)?;
+                    enqueue_decommit_tail(fri, decommit, trace_tree_count)?;
+                    enqueue_proof_bundle(
+                        arena,
+                        &proof_bundle_sources,
+                        proof_bundle,
+                        &proof_bundle_layout,
+                    )?;
+                }
+                Ok::<(), ResidentLaunchError>(())
+            })
+        })?;
+        self.admit_reused_transcript_segment(capture, last_layer_segment)?;
+        if include_pow_resume {
+            self.admit_reused_transcript_segment(capture, query_segment)?;
+        }
+        Ok(())
+    }
+
+    /// Capture the fleet-owned query transcript resume, decommitment, and proof
+    /// assembly after the query nonce has been written to its prepared slot.
+    pub fn capture_final_resume(&mut self) -> Result<(), ResidentRuntimeError> {
+        let query_segment =
+            self.transcript_segment_index(CairoTranscriptSegment::QueryPowAndPositions)?;
+        let query_range = self.transcript_segments[query_segment]
+            .operation_range
+            .clone();
+        let transcript = &self.transcript;
+        let fri = &self.fri;
+        let decommit = &self.decommit;
+        let proof_bundle_sources = self.proof_bundle_sources()?;
+        let proof_bundle = self.proof_bundle;
+        let proof_bundle_layout = self.workspace.plan().decommit().proof_bundle_layout.clone();
+        let trace_tree_count = self.workspace.plan().commitments().len();
+        let workspace = self.workspace;
+        let cursor = &mut self.transcript_cursor;
+        let generation = cursor.generation();
+        let capture = capture_with_cursor_rollback(cursor, |cursor| {
+            workspace.capture_segment(GraphSegment::FinalResume, |arena| {
                 transcript
                     .launch_segment(
                         cursor,
@@ -4200,15 +4312,29 @@ impl<'a> ResidentGraphRuntime<'a> {
                 )
             })
         })?;
-        self.admit_reused_transcript_segment(capture, last_layer_segment)?;
-        self.admit_reused_transcript_segment(capture, query_segment)?;
-        Ok(())
+        self.admit_reused_transcript_segment(capture, query_segment)
     }
 
     pub fn capture_all_prepared_subgraphs(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.capture_all_prepared_subgraphs_for(ResidentGraphTopology::Monolithic)
+    }
+
+    /// Capture one exact resident topology. The fleet topology records the
+    /// prefix/resume units around each external PoW boundary; middle graphs are
+    /// byte-for-byte the ordinary resident graph units.
+    pub fn capture_all_prepared_subgraphs_for(
+        &mut self,
+        topology: ResidentGraphTopology,
+    ) -> Result<(), ResidentRuntimeError> {
         let generation = next_capture_generation(&self.transcript_cursor)?;
         self.begin_transcript_generation(generation)?;
-        self.capture_base_commit_only()?;
+        match topology {
+            ResidentGraphTopology::Monolithic => self.capture_base_commit_only()?,
+            ResidentGraphTopology::FleetPowSplit => {
+                self.capture_base_prefix()?;
+                self.capture_base_resume()?;
+            }
+        }
         self.capture_interaction_relation_and_commit()?;
         self.capture_composition_commit_only()?;
         self.capture_oods_transcript_boundary()?;
@@ -4216,8 +4342,15 @@ impl<'a> ResidentGraphRuntime<'a> {
         for round in 0..self.fri.round_count() {
             self.capture_fri_round(round)?;
         }
-        self.capture_final_transcript_boundary()?;
+        match topology {
+            ResidentGraphTopology::Monolithic => self.capture_final_transcript_boundary()?,
+            ResidentGraphTopology::FleetPowSplit => {
+                self.capture_final_prefix()?;
+                self.capture_final_resume()?;
+            }
+        }
         self.require_transcript_complete()?;
+        self.require_complete_captured_topology_for(topology)?;
         Ok(())
     }
 
@@ -4229,6 +4362,28 @@ impl<'a> ResidentGraphRuntime<'a> {
         self.admit_transcript_segment_replay(bootstrap)?;
         self.admit_transcript_segment_replay(pow)?;
         self.replay(GraphSegment::IngestWitnessBaseCommit)?;
+        self.relation_challenge_generation = self
+            .relation_challenge_generation
+            .checked_add(1)
+            .ok_or(ResidentRuntimeError::StaleRelationChallenges)?;
+        Ok(())
+    }
+
+    /// Replay the fleet Base prefix and stop with the interaction-PoW state
+    /// resident and ready for rank-partitioned search.
+    pub fn replay_base_prefix(&mut self) -> Result<(), ResidentRuntimeError> {
+        self.consume_base_statement_sources()?;
+        let bootstrap =
+            self.transcript_segment_index(CairoTranscriptSegment::BootstrapThroughBase)?;
+        self.admit_transcript_segment_replay(bootstrap)?;
+        self.replay(GraphSegment::BasePrefix)
+    }
+
+    /// Replay the fleet Base resume after [`Self::upload_interaction_pow_nonce`].
+    pub fn replay_base_resume(&mut self) -> Result<(), ResidentRuntimeError> {
+        let pow = self.transcript_segment_index(CairoTranscriptSegment::InteractionPowAndLookup)?;
+        self.admit_transcript_segment_replay(pow)?;
+        self.replay(GraphSegment::BaseResume)?;
         self.relation_challenge_generation = self
             .relation_challenge_generation
             .checked_add(1)
@@ -4328,6 +4483,22 @@ impl<'a> ResidentGraphRuntime<'a> {
         self.require_transcript_complete()
     }
 
+    /// Replay the fleet final prefix and stop with the query-PoW state resident.
+    pub fn replay_final_prefix(&mut self) -> Result<(), ResidentRuntimeError> {
+        let last_layer = self.transcript_segment_index(CairoTranscriptSegment::FriLastLayer)?;
+        self.admit_transcript_segment_replay(last_layer)?;
+        self.replay(GraphSegment::FinalPrefix)
+    }
+
+    /// Replay the fleet final resume after [`Self::upload_query_pow_nonce`].
+    pub fn replay_final_resume(&mut self) -> Result<(), ResidentRuntimeError> {
+        let queries =
+            self.transcript_segment_index(CairoTranscriptSegment::QueryPowAndPositions)?;
+        self.admit_transcript_segment_replay(queries)?;
+        self.replay(GraphSegment::FinalResume)?;
+        self.require_transcript_complete()
+    }
+
     /// Replay the complete transcript-bounded proof DAG. The only host loop is
     /// over true FRI challenge boundaries; component and relation work remains
     /// inside the captured graphs.
@@ -4353,17 +4524,32 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// captured topology. Any nonempty partial topology is corruption and
     /// fails instead of being captured over or replayed.
     pub fn prepared_capture_ready(&self) -> Result<bool, ResidentRuntimeError> {
+        self.prepared_capture_ready_for(ResidentGraphTopology::Monolithic)
+    }
+
+    pub fn prepared_capture_ready_for(
+        &self,
+        topology: ResidentGraphTopology,
+    ) -> Result<bool, ResidentRuntimeError> {
         if self.captured_graph_count() == 0 {
             return Ok(false);
         }
-        self.require_complete_captured_topology()?;
+        self.require_complete_captured_topology_for(topology)?;
         Ok(true)
     }
 
     /// Require the protocol topology independently of the replay counters: six
     /// fixed transcript-boundary graphs plus one graph per FRI fold round.
     pub fn require_complete_captured_topology(&self) -> Result<usize, ResidentRuntimeError> {
+        self.require_complete_captured_topology_for(ResidentGraphTopology::Monolithic)
+    }
+
+    pub fn require_complete_captured_topology_for(
+        &self,
+        topology: ResidentGraphTopology,
+    ) -> Result<usize, ResidentRuntimeError> {
         require_complete_captured_topology(
+            topology,
             self.identity.shape_key,
             self.identity.protocol_key,
             self.fri.round_count(),
@@ -4964,6 +5150,10 @@ impl<'a> ResidentGraphRuntime<'a> {
         Ok(self.interaction_pow.read_state()?)
     }
 
+    pub const fn interaction_pow_bits(&self) -> u32 {
+        self.interaction_pow.pow_bits()
+    }
+
     pub fn launch_interaction_pow_rank_tile(
         &self,
         tile: Blake2sPowRankTile,
@@ -4976,8 +5166,13 @@ impl<'a> ResidentGraphRuntime<'a> {
         &mut self,
         nonce: u64,
     ) -> Result<(), ResidentRuntimeError> {
-        self.interaction_pow.upload_nonce(nonce)?;
+        self.upload_interaction_pow_nonce(nonce)?;
         self.resume_interaction_after_pow_eager()
+    }
+
+    /// Write a coordinator-selected nonce without advancing the transcript.
+    pub fn upload_interaction_pow_nonce(&self, nonce: u64) -> Result<(), ResidentRuntimeError> {
+        Ok(self.interaction_pow.upload_nonce(nonce)?)
     }
 
     fn resume_interaction_after_pow_eager(&mut self) -> Result<(), ResidentRuntimeError> {
@@ -5131,6 +5326,10 @@ impl<'a> ResidentGraphRuntime<'a> {
         Ok(self.query_pow.read_state()?)
     }
 
+    pub const fn query_pow_bits(&self) -> u32 {
+        self.query_pow.pow_bits()
+    }
+
     pub fn launch_query_pow_rank_tile(
         &self,
         tile: Blake2sPowRankTile,
@@ -5143,8 +5342,13 @@ impl<'a> ResidentGraphRuntime<'a> {
         &mut self,
         nonce: u64,
     ) -> Result<(), ResidentRuntimeError> {
-        self.query_pow.upload_nonce(nonce)?;
+        self.upload_query_pow_nonce(nonce)?;
         self.resume_query_after_pow_eager()
+    }
+
+    /// Write a coordinator-selected nonce without advancing the transcript.
+    pub fn upload_query_pow_nonce(&self, nonce: u64) -> Result<(), ResidentRuntimeError> {
+        Ok(self.query_pow.upload_nonce(nonce)?)
     }
 
     fn resume_query_after_pow_eager(&mut self) -> Result<(), ResidentRuntimeError> {
@@ -6253,6 +6457,8 @@ fn graph_transcript_membership_for(
             CairoTranscriptSegment::BootstrapThroughBase,
             CairoTranscriptSegment::InteractionPowAndLookup,
         ],
+        GraphSegment::BasePrefix => vec![CairoTranscriptSegment::BootstrapThroughBase],
+        GraphSegment::BaseResume => vec![CairoTranscriptSegment::InteractionPowAndLookup],
         GraphSegment::InteractionCommit => {
             vec![CairoTranscriptSegment::InteractionAndComposition]
         }
@@ -6272,40 +6478,78 @@ fn graph_transcript_membership_for(
             CairoTranscriptSegment::FriLastLayer,
             CairoTranscriptSegment::QueryPowAndPositions,
         ],
+        GraphSegment::FinalPrefix => vec![CairoTranscriptSegment::FriLastLayer],
+        GraphSegment::FinalResume => vec![CairoTranscriptSegment::QueryPowAndPositions],
     }
 }
 
+fn graph_segments_for_topology(
+    topology: ResidentGraphTopology,
+    fri_rounds: usize,
+) -> Result<Vec<GraphSegment>, ResidentRuntimeError> {
+    let fixed = match topology {
+        ResidentGraphTopology::Monolithic => 6,
+        ResidentGraphTopology::FleetPowSplit => 8,
+    };
+    let mut segments = Vec::with_capacity(
+        fri_rounds
+            .checked_add(fixed)
+            .ok_or(ResidentRuntimeError::SizeOverflow)?,
+    );
+    match topology {
+        ResidentGraphTopology::Monolithic => {
+            segments.push(GraphSegment::IngestWitnessBaseCommit);
+        }
+        ResidentGraphTopology::FleetPowSplit => {
+            segments.extend([GraphSegment::BasePrefix, GraphSegment::BaseResume]);
+        }
+    }
+    segments.extend([
+        GraphSegment::InteractionCommit,
+        GraphSegment::CompositionQuotientCommit,
+        GraphSegment::OodsEvaluation,
+        GraphSegment::FriLayer(0),
+    ]);
+    for round in 0..fri_rounds {
+        segments.push(fri_round_segment(round)?);
+    }
+    match topology {
+        ResidentGraphTopology::Monolithic => {
+            segments.push(GraphSegment::OodsQueriesDecommitAssemble);
+        }
+        ResidentGraphTopology::FleetPowSplit => {
+            segments.extend([GraphSegment::FinalPrefix, GraphSegment::FinalResume]);
+        }
+    }
+    Ok(segments)
+}
+
 fn require_complete_captured_topology(
+    topology: ResidentGraphTopology,
     shape_key: ProofShapeKey,
     protocol_key: u64,
     fri_rounds: usize,
     actual_keys: &[GraphKey],
     transcript_segments: usize,
 ) -> Result<usize, ResidentRuntimeError> {
-    let mut expected_segments = Vec::with_capacity(
-        fri_rounds
-            .checked_add(6)
-            .ok_or(ResidentRuntimeError::SizeOverflow)?,
-    );
-    expected_segments.extend([
-        GraphSegment::IngestWitnessBaseCommit,
-        GraphSegment::InteractionCommit,
-        GraphSegment::CompositionQuotientCommit,
-        GraphSegment::OodsEvaluation,
-        GraphSegment::FriLayer(0),
-        GraphSegment::OodsQueriesDecommitAssemble,
-    ]);
-    for round in 0..fri_rounds {
-        expected_segments.push(fri_round_segment(round)?);
-    }
+    let expected_segments = graph_segments_for_topology(topology, fri_rounds)?;
     let expected = expected_segments.len();
     let actual = actual_keys.len();
-    if actual != expected
-        || actual
-            .checked_add(1)
-            .ok_or(ResidentRuntimeError::SizeOverflow)?
-            != transcript_segments
-    {
+    let transcript_shape_matches = match topology {
+        ResidentGraphTopology::Monolithic => {
+            actual
+                .checked_add(1)
+                .ok_or(ResidentRuntimeError::SizeOverflow)?
+                == transcript_segments
+        }
+        ResidentGraphTopology::FleetPowSplit => {
+            transcript_segments
+                .checked_add(1)
+                .ok_or(ResidentRuntimeError::SizeOverflow)?
+                == actual
+        }
+    };
+    if actual != expected || !transcript_shape_matches {
         return Err(ResidentRuntimeError::CapturedGraphTopology {
             fri_rounds,
             transcript_segments,
@@ -6869,16 +7113,39 @@ mod tests {
         };
 
         assert_eq!(
-            require_complete_captured_topology(shape, protocol, 8, &keys(8), 15).unwrap(),
+            require_complete_captured_topology(
+                ResidentGraphTopology::Monolithic,
+                shape,
+                protocol,
+                8,
+                &keys(8),
+                15,
+            )
+            .unwrap(),
             14
         );
         assert_eq!(
-            require_complete_captured_topology(shape, protocol, 23, &keys(23), 30).unwrap(),
+            require_complete_captured_topology(
+                ResidentGraphTopology::Monolithic,
+                shape,
+                protocol,
+                23,
+                &keys(23),
+                30,
+            )
+            .unwrap(),
             29
         );
         let incomplete = keys(8)[..13].to_vec();
         assert!(matches!(
-            require_complete_captured_topology(shape, protocol, 8, &incomplete, 15),
+            require_complete_captured_topology(
+                ResidentGraphTopology::Monolithic,
+                shape,
+                protocol,
+                8,
+                &incomplete,
+                15,
+            ),
             Err(ResidentRuntimeError::CapturedGraphTopology {
                 fri_rounds: 8,
                 transcript_segments: 15,
@@ -6887,7 +7154,14 @@ mod tests {
             })
         ));
         assert!(matches!(
-            require_complete_captured_topology(shape, protocol, 8, &keys(8), 14),
+            require_complete_captured_topology(
+                ResidentGraphTopology::Monolithic,
+                shape,
+                protocol,
+                8,
+                &keys(8),
+                14,
+            ),
             Err(ResidentRuntimeError::CapturedGraphTopology {
                 fri_rounds: 8,
                 transcript_segments: 14,
@@ -6899,7 +7173,14 @@ mod tests {
         let mut wrong_segment = keys(8);
         wrong_segment[0].segment = GraphSegment::FriLayer(200);
         assert!(matches!(
-            require_complete_captured_topology(shape, protocol, 8, &wrong_segment, 15),
+            require_complete_captured_topology(
+                ResidentGraphTopology::Monolithic,
+                shape,
+                protocol,
+                8,
+                &wrong_segment,
+                15,
+            ),
             Err(ResidentRuntimeError::MissingCapturedGraphKey(GraphKey {
                 segment: GraphSegment::IngestWitnessBaseCommit,
                 ..
@@ -6909,7 +7190,14 @@ mod tests {
         let mut wrong_identity = keys(8);
         wrong_identity[0].shape = ProofShapeKey(8);
         assert!(matches!(
-            require_complete_captured_topology(shape, protocol, 8, &wrong_identity, 15),
+            require_complete_captured_topology(
+                ResidentGraphTopology::Monolithic,
+                shape,
+                protocol,
+                8,
+                &wrong_identity,
+                15,
+            ),
             Err(ResidentRuntimeError::MissingCapturedGraphKey(GraphKey {
                 shape: ProofShapeKey(7),
                 segment: GraphSegment::IngestWitnessBaseCommit,
@@ -6924,13 +7212,74 @@ mod tests {
             segment: GraphSegment::FriLayer(200),
         });
         assert!(matches!(
-            require_complete_captured_topology(shape, protocol, 8, &extra, 15),
+            require_complete_captured_topology(
+                ResidentGraphTopology::Monolithic,
+                shape,
+                protocol,
+                8,
+                &extra,
+                15,
+            ),
             Err(ResidentRuntimeError::CapturedGraphTopology {
                 expected: 14,
                 actual: 15,
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn fleet_pow_topology_splits_only_the_two_pow_boundaries() {
+        let shape = ProofShapeKey(7);
+        let protocol = 11;
+        let segments =
+            graph_segments_for_topology(ResidentGraphTopology::FleetPowSplit, 8).unwrap();
+        assert_eq!(segments.len(), 16);
+        assert_eq!(
+            &segments[..6],
+            &[
+                GraphSegment::BasePrefix,
+                GraphSegment::BaseResume,
+                GraphSegment::InteractionCommit,
+                GraphSegment::CompositionQuotientCommit,
+                GraphSegment::OodsEvaluation,
+                GraphSegment::FriLayer(0),
+            ]
+        );
+        assert_eq!(
+            &segments[14..],
+            &[GraphSegment::FinalPrefix, GraphSegment::FinalResume]
+        );
+        let keys = segments
+            .iter()
+            .copied()
+            .map(|segment| GraphKey {
+                shape,
+                protocol_key: protocol,
+                segment,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            require_complete_captured_topology(
+                ResidentGraphTopology::FleetPowSplit,
+                shape,
+                protocol,
+                8,
+                &keys,
+                15,
+            )
+            .unwrap(),
+            16
+        );
+        assert!(require_complete_captured_topology(
+            ResidentGraphTopology::Monolithic,
+            shape,
+            protocol,
+            8,
+            &keys,
+            15,
+        )
+        .is_err());
     }
 
     #[test]
@@ -6978,6 +7327,24 @@ mod tests {
         assert_eq!(membership[13].len(), 2);
         assert_eq!(
             membership.into_iter().flatten().collect::<Vec<_>>(),
+            semantics
+        );
+
+        let fleet_graphs =
+            graph_segments_for_topology(ResidentGraphTopology::FleetPowSplit, 8).unwrap();
+        let fleet_membership = fleet_graphs
+            .iter()
+            .copied()
+            .map(|graph| graph_transcript_membership_for(graph, &plans))
+            .collect::<Vec<_>>();
+        assert_eq!(fleet_graphs.len(), 16);
+        assert_eq!(fleet_membership[0].len(), 1);
+        assert_eq!(fleet_membership[1].len(), 1);
+        assert!(fleet_membership[13].is_empty());
+        assert_eq!(fleet_membership[14].len(), 1);
+        assert_eq!(fleet_membership[15].len(), 1);
+        assert_eq!(
+            fleet_membership.into_iter().flatten().collect::<Vec<_>>(),
             semantics
         );
     }

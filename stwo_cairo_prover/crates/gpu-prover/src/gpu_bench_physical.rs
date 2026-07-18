@@ -433,11 +433,15 @@ pub(crate) fn resident_session_telemetry_json(
 fn graph_segment_name(segment: GraphSegment) -> String {
     match segment {
         GraphSegment::IngestWitnessBaseCommit => "ingest-witness-base-commit".to_owned(),
+        GraphSegment::BasePrefix => "base-prefix".to_owned(),
+        GraphSegment::BaseResume => "base-resume".to_owned(),
         GraphSegment::InteractionCommit => "interaction-commit".to_owned(),
         GraphSegment::CompositionQuotientCommit => "composition-quotient-commit".to_owned(),
         GraphSegment::OodsEvaluation => "oods-evaluation".to_owned(),
         GraphSegment::FriLayer(layer) => format!("fri-layer-{layer}"),
         GraphSegment::OodsQueriesDecommitAssemble => "oods-queries-decommit-assemble".to_owned(),
+        GraphSegment::FinalPrefix => "final-prefix".to_owned(),
+        GraphSegment::FinalResume => "final-resume".to_owned(),
     }
 }
 
