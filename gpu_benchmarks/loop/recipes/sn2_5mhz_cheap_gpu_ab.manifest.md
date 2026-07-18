@@ -1,10 +1,12 @@
 # SN2 5 MHz cheap-GPU A/B manifest
 
-Status: **READY FOR DRY-RUN — no pod has been provisioned.**
+Status: **EXECUTED FAIL-CLOSED — Relation and Quotient rejected; Composition
+unmeasured.**
 
-This is the fail-closed contract for the last cheap-hardware checkpoint before
-an SN2 H100 promotion run. It is an A40 `sm_86` microbenchmark proxy, not an
-SN2 proof-time claim. The target remains:
+This is the fail-closed contract and retained outcome of the first cheap
+hardware screen for the 5 MHz checkpoint. It is an A40 `sm_86`
+microbenchmark proxy, not an SN2 proof-time claim. No H100 run follows until a
+new candidate passes its cheap same-source gate. The target remains:
 
 - SN2 useful steps: `7,706,864`
 - 5 MHz ceiling: `1.5413728 s`
@@ -39,9 +41,9 @@ milliseconds. Eager and captured replay are separate measurements.
 
 | Candidate | Same-source correctness | Same-source timing | Remaining blocker |
 |---|---|---|---|
-| Restored adaptive relation lane | **Ready.** `stwo` commits `b79eb515` and `93c59874` provide a same-binary historical selector, host/eager/captured/mutated bytes, selector-changing zero-denominator poison, raw guards, and exact loaded-function facts | **Ready.** Schema `stwo.prepared-relation.same-binary-ab.v2` reports eager and captured alternating CUDA-event samples and must show `>1.0×` median speedup | A40 is first-characterization-only for resources; its result grants no SN2/H100 timing credit |
-| Resource-bounded Composition stripes | **Ready as a diagnostic proxy.** `stwo-cairo` commits `6713163d`, `ba1e5bef`, and `12a13606` compare direct-retained eager and mutated captured bytes on one arena/context/stream, bind exact installed functions, and require zero strict-AOT rejections | **Ready as diagnostic only.** Eager and captured ABBA timing is recorded, but the source-JIT Wave arm is not a promotable production baseline | Real SN2/153 with an installed same-pack Wave baseline remains required before any budget credit |
-| Prepacked quotient | **Ready.** `stwo` commit `7bc2fc00` selects only the staged/prepacked boundary and covers independent CPU bytes, eager, captured mutation, status reset/recovery, stale-output rejection, sources, and guards | **Ready.** Exactly eager/captured × logs 18/20, one stream/source set, status fence outside timing, four exact loaded functions, and `>1.0×` median speedup | A40 result is a same-source candidate screen, not an SN2/H100 timing delta |
+| Restored adaptive relation lane | **Passed.** Every host/device byte, eager/captured mutation, zero-denominator, guard, ABI and resource-policy check passed | **Rejected.** `0.925714×` eager and `0.925448×` captured; about 8.0% slower | Do not promote on `sm_86`; remove its modeled 100–120 ms credit |
+| Resource-bounded Composition stripes | **Unmeasured.** The test binary did not compile because two `stwo-cairo` exhaustive consumers lacked the hidden prepacked schedule | **Unmeasured.** No CUDA launch or timing sample occurred | Drift repaired in `8ca6975c`; run a Composition-only cheap differential, then real SN2/153 if it passes |
+| Prepacked quotient | **Passed.** All seven correctness checks passed over four cases, with mutation, guards and recovery intact | **Rejected.** `0.273083–0.318238×` across eager/captured logs 18/20; 3.14–3.66× slower | Leave dormant; remove its assumed 80.459 ms planning credit |
 
 ## Execution and verdict
 
@@ -64,7 +66,7 @@ Each candidate phase is fail-soft: its raw exit status, phase log, binary
 identity, and any receipt survive even when it fails. All three candidate
 phases therefore run. `validate_sn2_5mhz_cheap_gpu_ab.py` is the only
 fail-closed phase and rejects any raw failure, missing receipt, schema/check
-omission, nonpositive relation/quotient speedup, resource/SM drift, identity
+omission, relation/quotient speedup not above one, resource/SM drift, identity
 drift, swallowed quotient performance failure, or dishonest Composition
 promotion label.
 
@@ -95,3 +97,9 @@ speedups, but sets direct promotion credit to false for every row. No A40
 result is an end-to-end SN2 proof-time number or evidence that the 5 MHz wall
 has been met. It only decides whether these candidates are safe and useful
 enough to carry into the exact SN2 integration gate.
+
+The executed bundle is
+`gpu_benchmarks/loop/results/sn2_5mhz_a40_ab_20260718/`. The one-shot pod
+`72ajgrz5n590t8` was absence-confirmed after 21m39s, at an estimated $0.159.
+The detailed interpretation is in the
+[A40 differential report](../../../../evidence/gpu-prover-backend-redesign-2026-07-13/stage4/A40-SN2-5MHZ-CANDIDATE-DIFFERENTIAL-2026-07-18.md).
