@@ -56,6 +56,7 @@ mod producer_prefix;
 mod recorded_deduce_authority;
 #[cfg(test)]
 mod recorded_deduce_tests;
+mod relation_projection;
 mod resolved_recorded_build_authority;
 mod schedule_prefix;
 mod static_wrapper_invocation;
@@ -280,6 +281,8 @@ enum InvocationShapeError {
     InvalidBaseCommitBinding,
     InvalidInteractionCommitAuthority,
     InvalidInteractionCommitBinding,
+    InvalidRelationAuthority,
+    InvalidRelationBinding,
 }
 
 fn validate_invocation(
