@@ -11,6 +11,7 @@ use crate::transcript_plan::{CairoBlake2sTranscriptPlan, CairoTranscriptSegment}
 mod effect;
 mod finalizer;
 mod identity;
+mod invocation_contract;
 mod partition_authority;
 mod registered_fixed_source;
 mod static_wrapper;
@@ -22,6 +23,8 @@ pub use finalizer::*;
 #[cfg(test)]
 pub(crate) use identity::module_global_initializer_structure_identity_for_test;
 pub use identity::{CompiledProofIdentity, ProofCodecIdentity, ProofIdentity};
+pub(crate) use invocation_contract::encode_invocation_payload;
+pub use invocation_contract::InvocationContractId;
 pub use partition_authority::*;
 pub use registered_fixed_source::*;
 pub use static_wrapper::*;
@@ -186,6 +189,15 @@ pub enum AotArgumentValue {
     Usize(u64),
     DevicePointer(Option<EffectBindingId>),
     DevicePointerTable(Vec<Option<EffectBindingId>>),
+    /// Ordered table of pointers resolved from checked process registrations.
+    /// Every entry must have one exact immutable read in the operation effect;
+    /// normal value bindings and module-global relocations cannot substitute
+    /// for this authority.
+    DeviceRegisteredFixedSourcePointerTable(Vec<RegisteredFixedSourceRead>),
+    /// Ordered heterogeneous pointer table whose ordinary entries are exact
+    /// effect bindings and whose process-owned entries are exact registered
+    /// immutable reads.
+    DeviceMixedFixedSourcePointerTable(Vec<FixedSourcePointerEntry>),
     /// Full immutable u32 value installed with the executable. Literal bytes
     /// live only in its [`FixedValueInitializer`]; the invocation carries no
     /// second allocation or content channel.
@@ -193,6 +205,12 @@ pub enum AotArgumentValue {
         value: ValueVersion,
         binding: EffectBindingId,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FixedSourcePointerEntry {
+    EffectBinding(EffectBindingId),
+    Registered(RegisteredFixedSourceRead),
 }
 
 impl AotArgumentValue {
@@ -236,7 +254,8 @@ pub struct OpNode {
     pub primitive: ExecutionPrimitive,
     /// Present exactly for [`ExecutionPrimitive::AotKernel`] and
     /// [`ExecutionPrimitive::StaticCudaWrapper`]. Every effect binding must
-    /// occur once in this ABI map; other primitives have no invocation.
+    /// occur once in this ABI map, as must every registered fixed-source read;
+    /// other primitives have no invocation.
     pub invocation: Option<AotInvocation>,
     pub effect: EffectContractId,
     pub partition: PartitionAuthorityId,
@@ -504,6 +523,8 @@ pub enum CompiledProofError {
     NonCanonicalFixedValues,
     InvalidModuleGlobalInitializer,
     InvalidRegisteredFixedSource,
+    InvalidRegisteredFixedSourceRead,
+    NonCanonicalRegisteredFixedSourceReads,
     NonCanonicalModuleGlobalInitializers,
     UnknownModuleGlobalInitializer(ModuleGlobalInitializerId),
     InvalidPartitionAuthority,
@@ -564,10 +585,16 @@ pub enum CompiledProofError {
     KernelEffectNotAccepted {
         operation: OpId,
     },
+    KernelInvocationNotAccepted {
+        operation: OpId,
+    },
     UnknownStaticWrapper {
         operation: OpId,
     },
     StaticWrapperEffectNotAccepted {
+        operation: OpId,
+    },
+    StaticWrapperInvocationNotAccepted {
         operation: OpId,
     },
     StaticWrapperRequiresMonolithic {

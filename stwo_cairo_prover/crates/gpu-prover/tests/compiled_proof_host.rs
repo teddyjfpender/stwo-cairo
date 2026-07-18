@@ -18,6 +18,8 @@ mod ordered_composite;
 mod partition_authority;
 #[path = "compiled_proof_host/primitive.rs"]
 mod primitive;
+#[path = "compiled_proof_host/registered_fixed_source_read.rs"]
+mod registered_fixed_source_read;
 #[path = "compiled_proof_host/static_wrapper.rs"]
 mod static_wrapper;
 #[path = "compiled_proof_host/structural_authority.rs"]
@@ -113,7 +115,7 @@ fn module_initializer(
 
 fn kernel(
     module: ModuleIdentity,
-    accepted_effects: Vec<EffectContractId>,
+    accepted_executions: Vec<(EffectContractId, AotInvocation)>,
     build: &[u8],
 ) -> AotKernelAuthority {
     AotKernelAuthority::new(
@@ -121,7 +123,10 @@ fn kernel(
         module,
         b"terminal-proof-assembly-semantics-v1".to_vec(),
         build.to_vec(),
-        accepted_effects,
+        accepted_executions
+            .into_iter()
+            .map(|(effect, invocation)| (effect, invocation.contract_id().unwrap()))
+            .collect(),
     )
     .unwrap()
 }
@@ -160,10 +165,56 @@ fn layout_ranges(layout: &ResidentProofBundleLayout) -> [std::ops::Range<usize>;
 
 fn install_effect(input: &mut CompiledProofInput, contract: EffectContract) {
     let effect_id = contract.id();
-    input.operations[0].invocation = invocation(&contract);
+    let invocation = invocation(&contract).unwrap();
+    input.operations[0].invocation = Some(invocation.clone());
     input.effects = vec![contract];
     input.operations[0].effect = effect_id;
-    input.kernels = vec![kernel(module(), vec![effect_id], b"assembly-build-v1")];
+    input.kernels = vec![kernel(
+        module(),
+        vec![(effect_id, invocation)],
+        b"assembly-build-v1",
+    )];
+}
+
+fn refresh_kernel_invocation_authorities(input: &mut CompiledProofInput) {
+    let kernels = input.kernels.clone();
+    input.kernels = kernels
+        .into_iter()
+        .map(|kernel| {
+            let mut accepted = Vec::new();
+            for operation in &input.operations {
+                let steps: Vec<_> = match &operation.primitive {
+                    ExecutionPrimitive::OrderedComposite { children } => children
+                        .iter()
+                        .map(|child| (&child.primitive, child.invocation.as_ref(), child.effect))
+                        .collect(),
+                    primitive => vec![(primitive, operation.invocation.as_ref(), operation.effect)],
+                };
+                for (primitive, invocation, effect) in steps {
+                    if matches!(
+                        primitive,
+                        ExecutionPrimitive::AotKernel { kernel: id, .. } if *id == kernel.id()
+                    ) {
+                        accepted.push((
+                            effect,
+                            operation.partition,
+                            invocation.unwrap().contract_id().unwrap(),
+                        ));
+                    }
+                }
+            }
+            accepted.sort_unstable();
+            accepted.dedup();
+            AotKernelAuthority::new_with_accepted_executions(
+                kernel.id(),
+                kernel.module().clone(),
+                kernel.semantic_encoding().to_vec(),
+                kernel.execution_build_encoding().to_vec(),
+                accepted,
+            )
+            .unwrap()
+        })
+        .collect();
 }
 
 fn valid_input() -> CompiledProofInput {
@@ -230,7 +281,7 @@ fn valid_input() -> CompiledProofInput {
     });
     let contract = EffectContract::new(accesses, vec![]).unwrap();
     let effect_id = contract.id();
-    let invocation = invocation(&contract);
+    let invocation = invocation(&contract).unwrap();
 
     let sections = ProofBundleSection::CANONICAL
         .into_iter()
@@ -268,7 +319,11 @@ fn valid_input() -> CompiledProofInput {
         identity,
         fixed_values: vec![],
         module_global_initializers: vec![],
-        kernels: vec![kernel(module(), vec![effect_id], b"assembly-build-v1")],
+        kernels: vec![kernel(
+            module(),
+            vec![(effect_id, invocation.clone())],
+            b"assembly-build-v1",
+        )],
         static_wrappers: vec![],
         effects: vec![contract],
         partitions: vec![partition.clone()],
@@ -285,7 +340,7 @@ fn valid_input() -> CompiledProofInput {
                     cooperative: false,
                 },
             },
-            invocation,
+            invocation: Some(invocation),
             effect: effect_id,
             partition: partition.id(),
             stage: ProofStage::AfterTranscript,
@@ -330,15 +385,18 @@ fn complete_authority_compiles_and_retains_exact_bytes() {
 
     let mut different_build = valid_input();
     let effect_id = different_build.effects[0].id();
-    different_build.kernels = vec![kernel(module(), vec![effect_id], b"assembly-build-v2")];
+    let invocation = different_build.operations[0].invocation.clone().unwrap();
+    different_build.kernels = vec![kernel(
+        module(),
+        vec![(effect_id, invocation)],
+        b"assembly-build-v2",
+    )];
     let different = CompiledProof::compile(different_build, transcript()).unwrap();
     assert_ne!(compiled.identity(), different.identity());
 }
 
 #[test]
 fn aot_invocation_binds_every_effect_range_to_one_exact_abi_ordinal() {
-    let baseline = CompiledProof::compile(valid_input(), transcript()).unwrap();
-
     let mut permuted = valid_input();
     let AotArgumentValue::DevicePointerTable(entries) = &mut permuted.operations[0]
         .invocation
@@ -350,8 +408,10 @@ fn aot_invocation_binds_every_effect_range_to_one_exact_abi_ordinal() {
         panic!("fixture must use one pointer table")
     };
     entries.swap(0, 1);
-    let permuted = CompiledProof::compile(permuted, transcript()).unwrap();
-    assert_ne!(baseline.identity(), permuted.identity());
+    assert_eq!(
+        CompiledProof::compile(permuted, transcript()).unwrap_err(),
+        CompiledProofError::KernelInvocationNotAccepted { operation: OpId(0) }
+    );
 
     let mut missing = valid_input();
     let AotArgumentValue::DevicePointerTable(entries) =
@@ -395,6 +455,65 @@ fn aot_invocation_binds_every_effect_range_to_one_exact_abi_ordinal() {
 }
 
 #[test]
+fn aot_invocation_authority_rejects_shape_valid_scalar_drift() {
+    let mut input = valid_input();
+    input.operations[0]
+        .invocation
+        .as_mut()
+        .unwrap()
+        .arguments
+        .push(AotArgumentBinding {
+            ordinal: 1,
+            value: AotArgumentValue::U32(7),
+        });
+    let effect = input.operations[0].effect;
+    let accepted = input.operations[0].invocation.clone().unwrap();
+    input.kernels = vec![kernel(
+        module(),
+        vec![(effect, accepted)],
+        b"assembly-build-v1",
+    )];
+    input.operations[0].invocation.as_mut().unwrap().arguments[1].value = AotArgumentValue::U32(8);
+    assert_eq!(
+        CompiledProof::compile(input, transcript()).unwrap_err(),
+        CompiledProofError::KernelInvocationNotAccepted { operation: OpId(0) }
+    );
+}
+
+#[test]
+fn kernel_execution_inventory_rejects_surplus_invocation_authority() {
+    let mut input = valid_input();
+    let kernel = input.kernels[0].clone();
+    let mut surplus = input.operations[0].invocation.clone().unwrap();
+    surplus.arguments.push(AotArgumentBinding {
+        ordinal: u8::try_from(surplus.arguments.len()).unwrap(),
+        value: AotArgumentValue::U32(7),
+    });
+    let mut accepted = kernel.accepted_executions().to_vec();
+    accepted.push((
+        input.operations[0].effect,
+        input.operations[0].partition,
+        surplus.contract_id().unwrap(),
+    ));
+    accepted.sort_unstable();
+    input.kernels = vec![
+        AotKernelAuthority::new_with_accepted_executions(
+            kernel.id(),
+            kernel.module().clone(),
+            kernel.semantic_encoding().to_vec(),
+            kernel.execution_build_encoding().to_vec(),
+            accepted,
+        )
+        .unwrap(),
+    ];
+
+    assert_eq!(
+        CompiledProof::compile(input, transcript()).unwrap_err(),
+        CompiledProofError::NonCanonicalKernelEffects(AotKernelId(1))
+    );
+}
+
+#[test]
 fn host_usize_argument_is_canonical_u64_identity() {
     let with_size = |value| {
         let mut input = valid_input();
@@ -407,6 +526,13 @@ fn host_usize_argument_is_canonical_u64_identity() {
                 ordinal: 1,
                 value: AotArgumentValue::Usize(value),
             });
+        let effect = input.operations[0].effect;
+        let invocation = input.operations[0].invocation.clone().unwrap();
+        input.kernels = vec![kernel(
+            module(),
+            vec![(effect, invocation)],
+            b"assembly-build-v1",
+        )];
         CompiledProof::compile(input, transcript()).unwrap()
     };
 
@@ -629,8 +755,7 @@ fn rejects_unknown_reads_incomplete_writes_and_unaccepted_effects() {
     )
     .unwrap();
     unaccepted.operations[0].effect = other.id();
-    unaccepted.effects.push(other);
-    unaccepted.effects.sort_by_key(EffectContract::id);
+    unaccepted.effects = vec![other];
     assert!(matches!(
         CompiledProof::compile(unaccepted, transcript()),
         Err(CompiledProofError::KernelEffectNotAccepted { .. })

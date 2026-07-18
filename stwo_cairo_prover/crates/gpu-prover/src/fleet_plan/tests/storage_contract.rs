@@ -16,8 +16,16 @@ fn kernel(
     semantic: &[u8],
     build: &[u8],
     effect: EffectContractId,
+    invocation: InvocationContractId,
 ) -> AotKernelAuthority {
-    AotKernelAuthority::new(id, module, semantic.to_vec(), build.to_vec(), vec![effect]).unwrap()
+    AotKernelAuthority::new(
+        id,
+        module,
+        semantic.to_vec(),
+        build.to_vec(),
+        vec![(effect, invocation)],
+    )
+    .unwrap()
 }
 
 fn alias_fixture(concurrent_consumer: bool) -> Fixture {
@@ -74,6 +82,11 @@ fn alias_fixture(concurrent_consumer: bool) -> Fixture {
             b"fleet-test-proof-assembly-v2",
             b"fleet-test-build-v2",
             assembly_effect.id(),
+            invocation(&assembly_effect)
+                .as_ref()
+                .unwrap()
+                .contract_id()
+                .unwrap(),
         ),
         kernel(
             AotKernelId(2),
@@ -81,6 +94,11 @@ fn alias_fixture(concurrent_consumer: bool) -> Fixture {
             b"fleet-test-required-alias-v2",
             b"fleet-test-alias-build-v2",
             alias_effect.id(),
+            invocation(&alias_effect)
+                .as_ref()
+                .unwrap()
+                .contract_id()
+                .unwrap(),
         ),
     ];
     input.effects = vec![alias_effect, assembly_effect];
@@ -251,6 +269,12 @@ fn distinct_output_fixture() -> Fixture {
         b"fleet-test-distinct-output-v2",
         b"fleet-test-output-build-v2",
         effect.id(),
+        input.operations[0]
+            .invocation
+            .as_ref()
+            .unwrap()
+            .contract_id()
+            .unwrap(),
     )];
     input.identity = ProofIdentity::new(
         b"fleet-distinct-output-semantics-v2".to_vec(),

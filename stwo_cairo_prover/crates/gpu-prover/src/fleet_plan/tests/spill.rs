@@ -1,10 +1,11 @@
+use stwo_backend_cuda::IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
+
 use super::*;
 use crate::fleet_spill::{
     DmaRing, HostSpillStore, RingSlot, RingSlotId, SpillChunk, SpillChunkId, SpillPlan,
     SpillPlanError, SpillTransition, SpillTransitionId, SpillTransitionKind, StoreExtent,
     StoreExtentId, VmmReclaim, VmmTransition,
 };
-use stwo_backend_cuda::IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
 
 fn spill_plan(
     value: ValueRange,
@@ -242,7 +243,15 @@ fn bind_spill_read(fixture: &mut Fixture) {
         input.kernels[0].module().clone(),
         b"fleet-spill-read-semantics-v2".to_vec(),
         b"fleet-spill-read-build-v2".to_vec(),
-        vec![effect.id()],
+        vec![(
+            effect.id(),
+            input.operations[0]
+                .invocation
+                .as_ref()
+                .unwrap()
+                .contract_id()
+                .unwrap(),
+        )],
     )
     .unwrap()];
     input.identity = ProofIdentity::new(

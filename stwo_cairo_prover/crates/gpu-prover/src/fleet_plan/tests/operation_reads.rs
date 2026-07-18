@@ -87,8 +87,29 @@ fn exact_read_fixture() -> (Fixture, ValueVersion, ValueVersion) {
     });
 
     let kernel = input.kernels[0].clone();
-    let monolithic = (input.operations[1].effect, input.operations[1].partition);
-    let mut accepted = vec![(effect.id(), partition.id()), monolithic];
+    let monolithic = (
+        input.operations[1].effect,
+        input.operations[1].partition,
+        input.operations[1]
+            .invocation
+            .as_ref()
+            .unwrap()
+            .contract_id()
+            .unwrap(),
+    );
+    let mut accepted = vec![
+        (
+            effect.id(),
+            partition.id(),
+            input.operations[0]
+                .invocation
+                .as_ref()
+                .unwrap()
+                .contract_id()
+                .unwrap(),
+        ),
+        monolithic,
+    ];
     accepted.sort_unstable();
     input.kernels[0] = AotKernelAuthority::new_with_accepted_executions(
         kernel.id(),
@@ -477,7 +498,15 @@ fn transcript_output_rejects_gap_free_union_across_distinct_storages() {
         kernel.module().clone(),
         kernel.semantic_encoding().to_vec(),
         kernel.execution_build_encoding().to_vec(),
-        vec![effect.id()],
+        vec![(
+            effect.id(),
+            operation
+                .invocation
+                .as_ref()
+                .unwrap()
+                .contract_id()
+                .unwrap(),
+        )],
     )
     .unwrap();
     input.effects = vec![effect];

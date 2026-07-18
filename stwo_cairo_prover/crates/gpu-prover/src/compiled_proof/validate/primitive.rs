@@ -42,10 +42,12 @@ fn validate_step(
                 .iter()
                 .find(|authority| authority.id() == *kernel)
                 .ok_or(CompiledProofError::UnknownKernel { operation })?;
-            if authority
+            if !authority
                 .accepted_executions()
-                .binary_search(&(effect_id, partition))
-                .is_err()
+                .iter()
+                .any(|&(effect, accepted_partition, _)| {
+                    effect == effect_id && accepted_partition == partition
+                })
             {
                 return Err(CompiledProofError::KernelEffectNotAccepted { operation });
             }
@@ -63,12 +65,19 @@ fn validate_step(
                     return Err(CompiledProofError::ModuleGlobalAuthorityMismatch { operation });
                 }
             }
-            validate_invocation(
+            let invocation = validate_invocation(
                 input,
                 invocation,
                 effect,
                 CompiledProofError::InvalidKernelInvocation(operation),
             )?;
+            if authority
+                .accepted_executions()
+                .binary_search(&(effect_id, partition, invocation))
+                .is_err()
+            {
+                return Err(CompiledProofError::KernelInvocationNotAccepted { operation });
+            }
         }
         ExecutionPrimitive::StaticCudaWrapper { wrapper } => {
             let authority = input
@@ -85,16 +94,20 @@ fn validate_step(
             if !effect.module_globals().is_empty() {
                 return Err(CompiledProofError::ModuleGlobalAuthorityMismatch { operation });
             }
-            validate_invocation(
+            let invocation = validate_invocation(
                 input,
                 invocation,
                 effect,
                 CompiledProofError::InvalidStaticWrapperInvocation(operation),
             )?;
+            if authority.accepted_invocation() != invocation {
+                return Err(CompiledProofError::StaticWrapperInvocationNotAccepted { operation });
+            }
         }
         ExecutionPrimitive::DeviceCopyD2D { bytes } => {
             if invocation.is_some()
                 || !effect.module_globals().is_empty()
+                || !effect.registered_fixed_source_reads().is_empty()
                 || *bytes == 0
                 || effect.accesses().len() != 2
             {
@@ -116,6 +129,7 @@ fn validate_step(
         ExecutionPrimitive::DeviceMemsetByte { bytes, .. } => {
             if invocation.is_some()
                 || !effect.module_globals().is_empty()
+                || !effect.registered_fixed_source_reads().is_empty()
                 || *bytes == 0
                 || effect.accesses().len() != 1
             {
@@ -174,6 +188,7 @@ fn validate_composite(
     let mut initialized = BTreeMap::<ValueVersion, Vec<ElementRange>>::new();
     let mut expected_boundary = BTreeSet::new();
     let mut expected_globals = Vec::new();
+    let mut expected_registered_fixed_source_reads = Vec::new();
     for (child_index, child) in children.iter().enumerate() {
         if matches!(
             child.primitive,
@@ -199,6 +214,8 @@ fn validate_composite(
             child_effect,
         )?;
         expected_globals.extend_from_slice(child_effect.module_globals());
+        expected_registered_fixed_source_reads
+            .extend_from_slice(child_effect.registered_fixed_source_reads());
 
         // Effect accesses are an unordered memory contract, not an execution
         // sequence. A write made by this child cannot initialize a separate
@@ -245,6 +262,7 @@ fn validate_composite(
         }
     }
     canonicalize_globals(&mut expected_globals);
+    canonicalize_registered_fixed_source_reads(&mut expected_registered_fixed_source_reads)?;
 
     let actual_boundary = effect
         .accesses()
@@ -257,6 +275,11 @@ fn validate_composite(
         ));
     }
     if effect.module_globals() != expected_globals {
+        return Err(CompiledProofError::CompositeBoundaryEffectMismatch(
+            operation.id,
+        ));
+    }
+    if effect.registered_fixed_source_reads() != expected_registered_fixed_source_reads {
         return Err(CompiledProofError::CompositeBoundaryEffectMismatch(
             operation.id,
         ));
@@ -308,6 +331,34 @@ fn canonicalize_globals(globals: &mut Vec<ModuleGlobalEffect>) {
     *globals = canonical;
 }
 
+fn canonicalize_registered_fixed_source_reads(
+    reads: &mut Vec<RegisteredFixedSourceRead>,
+) -> Result<(), CompiledProofError> {
+    reads.sort();
+    let mut canonical = Vec::<RegisteredFixedSourceRead>::with_capacity(reads.len());
+    for read in reads.drain(..) {
+        if let Some(previous) = canonical.last_mut() {
+            if previous.source() == read.source()
+                && previous.column() == read.column()
+                && previous.elements().overlaps(read.elements())
+            {
+                *previous = RegisteredFixedSourceRead::new(
+                    previous.source().clone(),
+                    previous.column(),
+                    ElementRange {
+                        start: previous.elements().start.min(read.elements().start),
+                        end: previous.elements().end.max(read.elements().end),
+                    },
+                )?;
+                continue;
+            }
+        }
+        canonical.push(read);
+    }
+    *reads = canonical;
+    Ok(())
+}
+
 fn range_is_initialized(ranges: Option<&Vec<ElementRange>>, required: ElementRange) -> bool {
     let mut cursor = required.start;
     for range in ranges.into_iter().flatten() {
@@ -330,7 +381,7 @@ fn validate_invocation(
     invocation: Option<&AotInvocation>,
     effect: &EffectContract,
     error: CompiledProofError,
-) -> Result<(), CompiledProofError> {
+) -> Result<InvocationContractId, CompiledProofError> {
     let invalid = || error.clone();
     let invocation = invocation.ok_or_else(invalid)?;
     if invocation.arguments.is_empty() {
@@ -345,6 +396,8 @@ fn validate_invocation(
         .map(|bound| bound.binding)
         .collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
+    let mut actual_registered_fixed_source_reads = Vec::new();
+    let mut seen_registered_fixed_source_reads = BTreeSet::new();
     for (ordinal, argument) in invocation.arguments.iter().enumerate() {
         if usize::from(argument.ordinal) != ordinal {
             return Err(invalid());
@@ -367,6 +420,33 @@ fn validate_invocation(
                 }
                 for &binding in entries.iter().flatten() {
                     insert(binding)?;
+                }
+            }
+            AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(reads) => {
+                if reads.is_empty() {
+                    return Err(invalid());
+                }
+                for read in reads {
+                    if !seen_registered_fixed_source_reads.insert(read.clone()) {
+                        return Err(invalid());
+                    }
+                    actual_registered_fixed_source_reads.push(read.clone());
+                }
+            }
+            AotArgumentValue::DeviceMixedFixedSourcePointerTable(entries) => {
+                if entries.is_empty() {
+                    return Err(invalid());
+                }
+                for entry in entries {
+                    match entry {
+                        FixedSourcePointerEntry::EffectBinding(binding) => insert(*binding)?,
+                        FixedSourcePointerEntry::Registered(read) => {
+                            if !seen_registered_fixed_source_reads.insert(read.clone()) {
+                                return Err(invalid());
+                            }
+                            actual_registered_fixed_source_reads.push(read.clone());
+                        }
+                    }
                 }
             }
             AotArgumentValue::DeviceFixedU32 {
@@ -405,7 +485,10 @@ fn validate_invocation(
     if actual != expected {
         return Err(invalid());
     }
-    Ok(())
+    if actual_registered_fixed_source_reads != effect.registered_fixed_source_reads() {
+        return Err(invalid());
+    }
+    invocation.contract_id().map_err(|_| invalid())
 }
 
 fn valid_launch(launch: LaunchGeometry) -> bool {

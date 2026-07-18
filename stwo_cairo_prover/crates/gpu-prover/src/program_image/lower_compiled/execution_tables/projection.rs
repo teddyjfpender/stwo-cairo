@@ -41,6 +41,10 @@ pub(super) fn linked(
         lowered.contract.identity(),
         linked.identity(),
         vec![launch],
+        lowered_stage
+            .invocation
+            .contract_id()
+            .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?,
         lowered_stage.effect.id(),
     )
     .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?;

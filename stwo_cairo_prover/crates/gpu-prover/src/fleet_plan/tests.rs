@@ -302,7 +302,10 @@ fn compiled_proof() -> (CompiledProof, ValueVersion, ValueVersion) {
         module,
         b"fleet-test-proof-assembly-v2".to_vec(),
         b"fleet-test-build-v2".to_vec(),
-        vec![effect_id],
+        vec![(
+            effect_id,
+            invocation.as_ref().unwrap().contract_id().unwrap(),
+        )],
     )
     .unwrap();
     let sections = ProofBundleSection::CANONICAL

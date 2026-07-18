@@ -68,7 +68,10 @@ fn with_early_operation(fixture: Fixture) -> Fixture {
         previous_kernel.module().clone(),
         previous_kernel.semantic_encoding().to_vec(),
         previous_kernel.execution_build_encoding().to_vec(),
-        vec![late_effect.id()],
+        vec![(
+            late_effect.id(),
+            late.invocation.as_ref().unwrap().contract_id().unwrap(),
+        )],
     )
     .unwrap();
     input.operations = vec![
@@ -141,7 +144,11 @@ fn with_required_alias(fixture: Fixture) -> Fixture {
     late.id = OpId(1);
     let previous_kernel = input.kernels[0].clone();
     let mut accepted = previous_kernel.accepted_executions().to_vec();
-    accepted.push((effect.id(), late.partition));
+    accepted.push((
+        effect.id(),
+        late.partition,
+        invocation(&effect).as_ref().unwrap().contract_id().unwrap(),
+    ));
     accepted.sort_unstable();
     input.kernels[0] = AotKernelAuthority::new_with_accepted_executions(
         previous_kernel.id(),
@@ -189,9 +196,18 @@ fn replace_aot_effect(fixture: Fixture, operation: OpId, effect: EffectContract)
     let mut accepted = authority.accepted_executions().to_vec();
     let previous = accepted
         .iter()
-        .position(|execution| *execution == (old_effect, partition))
+        .position(|execution| execution.0 == old_effect && execution.1 == partition)
         .unwrap();
-    accepted[previous] = (effect.id(), partition);
+    accepted[previous] = (
+        effect.id(),
+        partition,
+        input.operations[operation.0 as usize]
+            .invocation
+            .as_ref()
+            .unwrap()
+            .contract_id()
+            .unwrap(),
+    );
     accepted.sort_unstable();
     input.kernels.retain(|candidate| candidate.id() != kernel);
     input.kernels.push(

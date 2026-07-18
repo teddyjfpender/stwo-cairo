@@ -21,6 +21,12 @@ fn wrapper(
     effect: EffectContractId,
     launches: Vec<StaticCudaLaunchIdentity>,
 ) -> StaticCudaWrapperAuthority {
+    let invocation = valid_input().operations[0]
+        .invocation
+        .as_ref()
+        .unwrap()
+        .contract_id()
+        .unwrap();
     StaticCudaWrapperAuthority::new(
         id,
         [0x51; 32],
@@ -31,6 +37,7 @@ fn wrapper(
         [0xc5; 32],
         [0xd9; 32],
         launches,
+        invocation,
         effect,
     )
     .unwrap()
@@ -126,6 +133,12 @@ fn wrapper_ids_are_nonzero_canonical_and_exactly_used() {
             [0xc5; 32],
             [0xd9; 32],
             vec![launch(b"execute_kernel", 1)],
+            valid_input().operations[0]
+                .invocation
+                .as_ref()
+                .unwrap()
+                .contract_id()
+                .unwrap(),
             valid_input().effects[0].id(),
         ),
         Err(CompiledProofError::InvalidStaticWrapperAuthority(
@@ -221,6 +234,20 @@ fn malformed_wrapper_invocation_never_compiles() {
     assert_eq!(
         CompiledProof::compile(input, transcript()).unwrap_err(),
         CompiledProofError::InvalidStaticWrapperInvocation(OpId(0))
+    );
+}
+
+#[test]
+fn wrapper_rejects_shape_valid_invocation_authority_drift() {
+    let mut input = wrapper_input(vec![launch(b"execute_kernel", 1)]);
+    let invocation = input.operations[0].invocation.as_mut().unwrap();
+    let AotArgumentValue::DevicePointerTable(entries) = &mut invocation.arguments[0].value else {
+        panic!("expected pointer table");
+    };
+    entries.swap(0, 1);
+    assert_eq!(
+        CompiledProof::compile(input, transcript()).unwrap_err(),
+        CompiledProofError::StaticWrapperInvocationNotAccepted { operation: OpId(0) }
     );
 }
 

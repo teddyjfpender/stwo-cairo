@@ -346,6 +346,15 @@ pub(super) fn validate_exact_partition(
             return Err(CompiledProofError::InvalidPartitionAuthority);
         }
     }
+    // Registered fixed-source reads are immutable and remain exact replicated
+    // reads: shard derivation clones their ordered pointer-table arguments
+    // unchanged. They therefore have no value-binding projection, but their
+    // source/range authority must remain valid.
+    for read in effect.registered_fixed_source_reads() {
+        if !read.has_valid_identity()? {
+            return Err(CompiledProofError::InvalidPartitionAuthority);
+        }
+    }
 
     let expected = effect
         .accesses()

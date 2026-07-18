@@ -42,9 +42,29 @@ pub(super) fn exact_fixture() -> Fixture {
 
     let mut monolithic = input.operations[0].clone();
     monolithic.id = MONOLITHIC_OPERATION;
+    let exact_invocation = AotInvocation {
+        arguments: vec![
+            AotArgumentBinding {
+                ordinal: 0,
+                value: AotArgumentValue::DevicePointerTable(vec![Some(EffectBindingId(0))]),
+            },
+            AotArgumentBinding {
+                ordinal: 1,
+                value: AotArgumentValue::U32(0),
+            },
+            AotArgumentBinding {
+                ordinal: 2,
+                value: AotArgumentValue::U32(8),
+            },
+        ],
+    };
     let kernel = input.kernels[0].clone();
     let mut accepted = kernel.accepted_executions().to_vec();
-    accepted.push((exact_effect.id(), exact_partition.id()));
+    accepted.push((
+        exact_effect.id(),
+        exact_partition.id(),
+        exact_invocation.contract_id().unwrap(),
+    ));
     accepted.sort_unstable();
     input.kernels[0] = AotKernelAuthority::new_with_accepted_executions(
         kernel.id(),
@@ -68,22 +88,7 @@ pub(super) fn exact_fixture() -> Fixture {
                     cooperative: false,
                 },
             },
-            invocation: Some(AotInvocation {
-                arguments: vec![
-                    AotArgumentBinding {
-                        ordinal: 0,
-                        value: AotArgumentValue::DevicePointerTable(vec![Some(EffectBindingId(0))]),
-                    },
-                    AotArgumentBinding {
-                        ordinal: 1,
-                        value: AotArgumentValue::U32(0),
-                    },
-                    AotArgumentBinding {
-                        ordinal: 2,
-                        value: AotArgumentValue::U32(8),
-                    },
-                ],
-            }),
+            invocation: Some(exact_invocation),
             effect: exact_effect.id(),
             partition: exact_partition.id(),
             stage: ProofStage::BeforeTranscript(transcript().segments()[0].segment),
@@ -214,8 +219,29 @@ fn exact_required_alias_fixture() -> Fixture {
     });
 
     let kernel = input.kernels[0].clone();
-    let monolithic = (input.operations[1].effect, input.operations[1].partition);
-    let mut accepted = vec![(required.id(), partition.id()), monolithic];
+    let monolithic = (
+        input.operations[1].effect,
+        input.operations[1].partition,
+        input.operations[1]
+            .invocation
+            .as_ref()
+            .unwrap()
+            .contract_id()
+            .unwrap(),
+    );
+    let mut accepted = vec![
+        (
+            required.id(),
+            partition.id(),
+            input.operations[0]
+                .invocation
+                .as_ref()
+                .unwrap()
+                .contract_id()
+                .unwrap(),
+        ),
+        monolithic,
+    ];
     accepted.sort_unstable();
     input.kernels[0] = AotKernelAuthority::new_with_accepted_executions(
         kernel.id(),

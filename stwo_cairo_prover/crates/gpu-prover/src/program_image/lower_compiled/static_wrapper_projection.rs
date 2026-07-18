@@ -6,7 +6,7 @@
 
 use super::blake_g_direct_execution_authority::NativeBlakeGDirectLinkedModuleAuthority;
 use super::ec_op_execution_authority::NativeEcOpLinkedModuleAuthority;
-use super::{blake_g_direct_prefix, ec_op_prefix, InvocationShapeError};
+use super::{blake_g_direct_prefix, ec_op_prefix, static_wrapper_invocation, InvocationShapeError};
 use crate::compiled_proof::{
     LaunchGeometry, StaticCudaLaunchIdentity, StaticCudaWrapperAuthority, StaticCudaWrapperId,
 };
@@ -23,6 +23,8 @@ pub(super) fn ec_op(
     if execution.linked != *linked || execution.compiled_effect_identity != lowered.effect.id() {
         return Err(InvocationShapeError::InvalidNativeEcOpAuthority);
     }
+    let invocation = static_wrapper_invocation::ec_op(lowered)
+        .map_err(|_| InvocationShapeError::InvalidNativeEcOpAuthority)?;
     let launches = linked
         .launches
         .iter()
@@ -47,6 +49,9 @@ pub(super) fn ec_op(
         linked.contract_identity,
         linked.identity,
         launches,
+        invocation
+            .contract_id()
+            .map_err(|_| InvocationShapeError::InvalidNativeEcOpAuthority)?,
         lowered.effect.id(),
     )
     .map_err(|_| InvocationShapeError::InvalidNativeEcOpAuthority)
@@ -63,6 +68,8 @@ pub(super) fn blake_g_direct(
         &lowered.invocation,
         &lowered.effect,
     )?;
+    let invocation = static_wrapper_invocation::blake_g_direct(lowered)
+        .map_err(|_| InvocationShapeError::InvalidNativeBlakeGDirectAuthority)?;
     let contract = &linked.contract;
     let launch = contract.wrapper_launch();
     let launches = vec![static_launch(
@@ -83,6 +90,9 @@ pub(super) fn blake_g_direct(
         contract.identity(),
         linked.identity,
         launches,
+        invocation
+            .contract_id()
+            .map_err(|_| InvocationShapeError::InvalidNativeBlakeGDirectAuthority)?,
         lowered.effect.id(),
     )
     .map_err(|_| InvocationShapeError::InvalidNativeBlakeGDirectAuthority)

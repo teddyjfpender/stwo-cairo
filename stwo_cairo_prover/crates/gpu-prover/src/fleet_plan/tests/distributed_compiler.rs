@@ -75,9 +75,21 @@ fn transfer_fixture_with_reads(reads: Option<[ElementRange; 2]>) -> Fixture {
 
     let kernel = input.kernels[0].clone();
     let mut accepted = vec![
-        (exact.effect, exact.partition),
-        (consumer.effect, consumer.partition),
-        (observer.effect, observer.partition),
+        (
+            exact.effect,
+            exact.partition,
+            exact.invocation.as_ref().unwrap().contract_id().unwrap(),
+        ),
+        (
+            consumer.effect,
+            consumer.partition,
+            consumer.invocation.as_ref().unwrap().contract_id().unwrap(),
+        ),
+        (
+            observer.effect,
+            observer.partition,
+            observer.invocation.as_ref().unwrap().contract_id().unwrap(),
+        ),
     ];
     accepted.sort_unstable();
     input.kernels[0] = AotKernelAuthority::new_with_accepted_executions(
@@ -199,7 +211,18 @@ fn route_limited_tail_fixture() -> (Fixture, ValueVersion, usize) {
     let mut accepted = input
         .operations
         .iter()
-        .map(|operation| (operation.effect, operation.partition))
+        .map(|operation| {
+            (
+                operation.effect,
+                operation.partition,
+                operation
+                    .invocation
+                    .as_ref()
+                    .unwrap()
+                    .contract_id()
+                    .unwrap(),
+            )
+        })
         .collect::<Vec<_>>();
     accepted.sort_unstable();
     input.kernels[0] = AotKernelAuthority::new_with_accepted_executions(

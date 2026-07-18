@@ -256,6 +256,7 @@ fn compiled_kernel(
     id: AotKernelId,
     source: &RecordedWitnessInvocationShape,
     fields: &ResolvedRecordedBuildAuthority,
+    invocation: &AotInvocation,
     effect: EffectContractId,
 ) -> Result<AotKernelAuthority, ()> {
     let module = compiled_module(fields)?;
@@ -264,7 +265,7 @@ fn compiled_kernel(
         module,
         encode_semantic(source)?,
         encode_execution_build(fields)?,
-        vec![effect],
+        vec![(effect, invocation.contract_id().map_err(|_| ())?)],
     )
     .map_err(|_| ())
 }
@@ -278,11 +279,12 @@ fn install_recorded_kernel(
     kernel_by_build_authority: &mut BTreeMap<[u8; 32], usize>,
     source: &RecordedWitnessInvocationShape,
     fields: &ResolvedRecordedBuildAuthority,
+    invocation: &AotInvocation,
     effect: EffectContractId,
 ) -> Result<AotKernelId, ()> {
     let Some(&index) = kernel_by_build_authority.get(&fields.authority_identity) else {
         let id = AotKernelId(u32::try_from(kernels.len() + 1).map_err(|_| ())?);
-        let kernel = compiled_kernel(id, source, fields, effect)?;
+        let kernel = compiled_kernel(id, source, fields, invocation, effect)?;
         kernel_by_build_authority.insert(fields.authority_identity, kernels.len());
         kernels.push(kernel);
         return Ok(id);
@@ -290,7 +292,7 @@ fn install_recorded_kernel(
 
     let existing = kernels.get(index).ok_or(())?;
     let id = existing.id();
-    let candidate = compiled_kernel(id, source, fields, effect)?;
+    let candidate = compiled_kernel(id, source, fields, invocation, effect)?;
     if existing.module() != candidate.module()
         || existing.semantic_encoding() != candidate.semantic_encoding()
         || existing.execution_build_encoding() != candidate.execution_build_encoding()
@@ -301,13 +303,13 @@ fn install_recorded_kernel(
     let mut accepted = existing
         .accepted_executions()
         .iter()
-        .map(|&(accepted_effect, partition)| {
+        .map(|&(accepted_effect, partition, accepted_invocation)| {
             (partition == monolithic)
-                .then_some(accepted_effect)
+                .then_some((accepted_effect, accepted_invocation))
                 .ok_or(())
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
-    accepted.insert(effect);
+    accepted.insert((effect, invocation.contract_id().map_err(|_| ())?));
     let module = existing.module().clone();
     let semantic_encoding = existing.semantic_encoding().to_vec();
     let execution_build_encoding = existing.execution_build_encoding().to_vec();
@@ -326,9 +328,11 @@ fn install_recorded_kernel(
 pub(super) fn install_recorded_kernel_pair_for_test(
     first_source: &RecordedWitnessInvocationShape,
     first_fields: &ResolvedRecordedBuildAuthority,
+    first_invocation: &AotInvocation,
     first_effect: EffectContractId,
     second_source: &RecordedWitnessInvocationShape,
     second_fields: &ResolvedRecordedBuildAuthority,
+    second_invocation: &AotInvocation,
     second_effect: EffectContractId,
 ) -> Result<(Vec<AotKernelAuthority>, AotKernelId, AotKernelId), ()> {
     let mut kernels = Vec::new();
@@ -338,6 +342,7 @@ pub(super) fn install_recorded_kernel_pair_for_test(
         &mut by_authority,
         first_source,
         first_fields,
+        first_invocation,
         first_effect,
     )?;
     let second = install_recorded_kernel(
@@ -345,6 +350,7 @@ pub(super) fn install_recorded_kernel_pair_for_test(
         &mut by_authority,
         second_source,
         second_fields,
+        second_invocation,
         second_effect,
     )?;
     Ok((kernels, first, second))

@@ -83,7 +83,15 @@ fn install_exact(
         kernel.module().clone(),
         kernel.semantic_encoding().to_vec(),
         kernel.execution_build_encoding().to_vec(),
-        vec![(input.operations[0].effect, partition.id())],
+        vec![(
+            input.operations[0].effect,
+            partition.id(),
+            input.operations[0]
+                .invocation
+                .as_ref()
+                .unwrap()
+                .contract_id()?,
+        )],
     )?;
     input.partitions = vec![partition];
     Ok(())
@@ -290,6 +298,7 @@ fn exact_partition_binds_start_length_abi_and_grid_derivation() {
         .unwrap()
         .arguments[1]
         .value = AotArgumentValue::U32(1);
+    refresh_kernel_invocation_authorities(&mut wrong_start);
     assert!(matches!(
         CompiledProof::compile(wrong_start, transcript()),
         Err(CompiledProofError::InvalidPartitionAuthority)
@@ -321,7 +330,15 @@ fn exact_partition_requires_kernel_execution_pair_admission() {
         kernel.module().clone(),
         kernel.semantic_encoding().to_vec(),
         kernel.execution_build_encoding().to_vec(),
-        vec![input.operations[0].effect],
+        vec![(
+            input.operations[0].effect,
+            input.operations[0]
+                .invocation
+                .as_ref()
+                .unwrap()
+                .contract_id()
+                .unwrap(),
+        )],
     )
     .unwrap();
     assert!(matches!(
@@ -345,7 +362,13 @@ fn kernel_execution_pairs_do_not_admit_an_effect_partition_cross_product() {
     )
     .unwrap()
     .id();
-    let mut accepted = vec![(first, exact), (second, monolithic)];
+    let invocation = input.operations[0]
+        .invocation
+        .as_ref()
+        .unwrap()
+        .contract_id()
+        .unwrap();
+    let mut accepted = vec![(first, exact, invocation), (second, monolithic, invocation)];
     accepted.sort_unstable();
     let kernel = AotKernelAuthority::new_with_accepted_executions(
         AotKernelId(99),
@@ -357,7 +380,7 @@ fn kernel_execution_pairs_do_not_admit_an_effect_partition_cross_product() {
     .unwrap();
     assert!(kernel
         .accepted_executions()
-        .binary_search(&(second, exact))
+        .binary_search(&(second, exact, invocation))
         .is_err());
 }
 

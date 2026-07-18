@@ -166,6 +166,9 @@ fn validate_exact_bindings(
     invocation: &AotInvocation,
     effect: &EffectContract,
 ) -> Result<(), InvocationShapeError> {
+    if !effect.registered_fixed_source_reads().is_empty() {
+        return Err(InvocationShapeError::InvalidAdapterEffect);
+    }
     let expected = effect
         .accesses()
         .iter()
@@ -193,7 +196,10 @@ fn validate_exact_bindings(
                     insert(binding)?;
                 }
             }
-            AotArgumentValue::Usize(_) | AotArgumentValue::DeviceFixedU32 { .. } => {
+            AotArgumentValue::Usize(_)
+            | AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_)
+            | AotArgumentValue::DeviceMixedFixedSourcePointerTable(_)
+            | AotArgumentValue::DeviceFixedU32 { .. } => {
                 return Err(InvocationShapeError::InvalidAdapterEffect)
             }
         }

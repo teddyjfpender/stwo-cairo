@@ -323,7 +323,8 @@ fn to_u32(value: usize) -> Result<u32, InvocationShapeError> {
 }
 
 fn validate_exact_bindings(invocation: &AotInvocation, effect: &EffectContract) -> Result<(), ()> {
-    if invocation.arguments.is_empty()
+    if !effect.registered_fixed_source_reads().is_empty()
+        || invocation.arguments.is_empty()
         || invocation
             .arguments
             .iter()
@@ -354,7 +355,9 @@ fn validate_exact_bindings(invocation: &AotInvocation, effect: &EffectContract) 
                     insert(&mut actual, binding)?;
                 }
             }
-            AotArgumentValue::DeviceFixedU32 { .. } => return Err(()),
+            AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_)
+            | AotArgumentValue::DeviceMixedFixedSourcePointerTable(_)
+            | AotArgumentValue::DeviceFixedU32 { .. } => return Err(()),
         }
     }
     (actual == expected).then_some(()).ok_or(())

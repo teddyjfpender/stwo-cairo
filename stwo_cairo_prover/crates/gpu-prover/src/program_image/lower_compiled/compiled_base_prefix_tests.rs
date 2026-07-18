@@ -15,7 +15,7 @@ use super::resolved_recorded_build_authority::ResolvedRecordedBuildAuthority;
 use super::*;
 use crate::compiled_proof::{
     AotArgumentValue, EffectAccess, EffectBindingId, EffectContract, ExecutionPrimitive,
-    FixedValueInitializer, LaunchGeometry, PartitionAuthority, ProofStage,
+    FixedSourcePointerEntry, FixedValueInitializer, LaunchGeometry, PartitionAuthority, ProofStage,
     StaticCudaLaunchIdentity, StaticCudaWrapperAuthority, StaticCudaWrapperId, ValueVersion,
 };
 
@@ -78,6 +78,10 @@ fn fake_static_authority(
         [0x44; 32],
         [0x45; 32],
         vec![launch],
+        request
+            .invocation()?
+            .contract_id()
+            .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?,
         request.effect()?.id(),
     )
     .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)
@@ -268,21 +272,29 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
         super::compiled_base_prefix::install_recorded_kernel_pair_for_test(
             &recorded.source,
             &fields,
+            &recorded.invocation,
             recorded.effect.id(),
             &recorded.source,
             &fields,
+            &recorded.invocation,
             distinct_effect,
         )
         .unwrap();
     assert_eq!(first, second);
     assert_eq!(kernels.len(), 1);
-    let mut accepted = vec![recorded.effect.id(), distinct_effect];
+    let invocation = recorded.invocation.contract_id().unwrap();
+    let mut accepted = vec![
+        (recorded.effect.id(), invocation),
+        (distinct_effect, invocation),
+    ];
     accepted.sort_unstable();
     assert_eq!(
         kernels[0].accepted_executions(),
         accepted
             .into_iter()
-            .map(|effect| (effect, PartitionAuthority::monolithic().id()))
+            .map(|(effect, invocation)| {
+                (effect, PartitionAuthority::monolithic().id(), invocation)
+            })
             .collect::<Vec<_>>()
     );
     let mut drifted_source = recorded.source.clone();
@@ -291,9 +303,11 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
         super::compiled_base_prefix::install_recorded_kernel_pair_for_test(
             &recorded.source,
             &fields,
+            &recorded.invocation,
             recorded.effect.id(),
             &drifted_source,
             &fields,
+            &recorded.invocation,
             distinct_effect,
         )
         .is_err()
@@ -360,7 +374,16 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
                     .unwrap();
                 assert_eq!(
                     authority.accepted_executions(),
-                    &[(operation.effect, monolithic)]
+                    &[(
+                        operation.effect,
+                        monolithic,
+                        operation
+                            .invocation
+                            .as_ref()
+                            .unwrap()
+                            .contract_id()
+                            .unwrap(),
+                    )]
                 );
             }
             ExecutionPrimitive::StaticCudaWrapper { wrapper } => {
@@ -371,6 +394,15 @@ fn recorded_witness_writer_prefix_emits_real_ops_and_stops_at_first_native_wrapp
                     .find(|authority| authority.id() == *wrapper)
                     .unwrap();
                 assert_eq!(authority.accepted_effect(), operation.effect);
+                assert_eq!(
+                    authority.accepted_invocation(),
+                    operation
+                        .invocation
+                        .as_ref()
+                        .unwrap()
+                        .contract_id()
+                        .unwrap()
+                );
                 assert_eq!(authority.consumer_target_sm(), TARGET_SM);
             }
             _ => panic!("Base prefix operation has the wrong primitive"),
@@ -689,6 +721,14 @@ fn assert_invocation_covers_exact_bindings(
             AotArgumentValue::DevicePointerTable(entries) => {
                 entries.iter().flatten().copied().collect()
             }
+            AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_) => Vec::new(),
+            AotArgumentValue::DeviceMixedFixedSourcePointerTable(entries) => entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    FixedSourcePointerEntry::EffectBinding(binding) => Some(*binding),
+                    FixedSourcePointerEntry::Registered(_) => None,
+                })
+                .collect(),
             AotArgumentValue::DeviceFixedU32 { binding, .. } => vec![*binding],
         })
         .collect::<BTreeSet<_>>();

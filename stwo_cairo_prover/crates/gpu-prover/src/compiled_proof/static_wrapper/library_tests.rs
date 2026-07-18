@@ -31,6 +31,17 @@ fn effect() -> EffectContractId {
     .id()
 }
 
+fn invocation() -> InvocationContractId {
+    AotInvocation {
+        arguments: vec![AotArgumentBinding {
+            ordinal: 0,
+            value: AotArgumentValue::DevicePointer(Some(EffectBindingId(0))),
+        }],
+    }
+    .contract_id()
+    .unwrap()
+}
+
 fn sort(
     word: u32,
     indices_from: StaticCudaCubBuffer,
@@ -108,6 +119,7 @@ fn authority() -> StaticCudaWrapperAuthority {
         [13; 32],
         [15; 32],
         compact_steps(),
+        invocation(),
         effect(),
     )
     .unwrap()

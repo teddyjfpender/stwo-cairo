@@ -193,19 +193,24 @@ fn ordered_composite_preserves_child_effect_order() {
         vec![],
     )
     .unwrap();
+    let child_invocation = invocation(&child_effect);
     let authority = input.kernels[0].clone();
     input.kernels[0] = AotKernelAuthority::new_with_accepted_executions(
         authority.id(),
         authority.module().clone(),
         authority.semantic_encoding().to_vec(),
         authority.execution_build_encoding().to_vec(),
-        vec![(child_effect.id(), operation.partition)],
+        vec![(
+            child_effect.id(),
+            operation.partition,
+            child_invocation.as_ref().unwrap().contract_id().unwrap(),
+        )],
     )
     .unwrap();
     input.operations[0].primitive = ExecutionPrimitive::OrderedComposite {
         children: vec![ExecutableStep {
             primitive: operation.primitive,
-            invocation: invocation(&child_effect),
+            invocation: child_invocation,
             effect: child_effect.id(),
         }]
         .into_boxed_slice(),

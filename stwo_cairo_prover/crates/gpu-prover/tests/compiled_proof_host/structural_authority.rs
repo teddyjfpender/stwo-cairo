@@ -38,6 +38,7 @@ fn install_fixed_u32(input: &mut CompiledProofInput, words: Vec<u32>) -> ValueVe
             binding,
         },
     });
+    refresh_kernel_invocation_authorities(input);
     fixed
 }
 
@@ -78,6 +79,7 @@ fn fixed_values_are_bijective_content_bound_and_the_only_literal_channel() {
         panic!("fixture must bind the fixed u32 value")
     };
     *value = ValueVersion(0);
+    refresh_kernel_invocation_authorities(&mut wrong_reference);
     assert!(matches!(
         CompiledProof::compile(wrong_reference, transcript()),
         Err(CompiledProofError::InvalidKernelInvocation(OpId(0)))

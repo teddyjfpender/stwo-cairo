@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::CompiledProofError;
+use super::{CompiledProofError, ElementRange};
 
 const REGISTERED_FIXED_SOURCE_DOMAIN: &[u8] =
     b"stwo-cairo.compiled-proof.registered-fixed-source.v1\0";
@@ -103,6 +103,58 @@ impl RegisteredFixedSourceAuthority {
             &self.columns,
         )?;
         Ok(canonical == self.canonical_encoding.as_ref() && self.identity == digest(&canonical))
+    }
+}
+
+/// Exact immutable range read from one process-registered fixed-source column.
+///
+/// The authority is address-free. Runtime admission must resolve it through
+/// the checked process registration rather than accepting a serialized device
+/// pointer or a module-global relocation as a substitute.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RegisteredFixedSourceRead {
+    source: RegisteredFixedSourceAuthority,
+    column: usize,
+    elements: ElementRange,
+}
+
+impl RegisteredFixedSourceRead {
+    pub fn new(
+        source: RegisteredFixedSourceAuthority,
+        column: usize,
+        elements: ElementRange,
+    ) -> Result<Self, CompiledProofError> {
+        if !source.has_valid_identity()?
+            || column >= source.columns().len()
+            || elements.is_empty()
+            || elements.end > source.padded_rows()
+        {
+            return Err(CompiledProofError::InvalidRegisteredFixedSourceRead);
+        }
+        Ok(Self {
+            source,
+            column,
+            elements,
+        })
+    }
+
+    pub const fn source(&self) -> &RegisteredFixedSourceAuthority {
+        &self.source
+    }
+
+    pub const fn column(&self) -> usize {
+        self.column
+    }
+
+    pub const fn elements(&self) -> ElementRange {
+        self.elements
+    }
+
+    pub(crate) fn has_valid_identity(&self) -> Result<bool, CompiledProofError> {
+        Ok(self.source.has_valid_identity()?
+            && self.column < self.source.columns().len()
+            && !self.elements.is_empty()
+            && self.elements.end <= self.source.padded_rows())
     }
 }
 

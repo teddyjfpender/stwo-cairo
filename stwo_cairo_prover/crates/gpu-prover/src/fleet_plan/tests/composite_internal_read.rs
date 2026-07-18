@@ -123,7 +123,21 @@ fn composite_input(tail: Tail) -> (CompiledProofInput, ValueVersion, ValueVersio
     input.operations[0].effect = outer.id();
     if matches!(tail, Tail::RequiredAlias) {
         let kernel = &input.kernels[0];
-        let mut accepted = vec![operation.effect, tail_effect.id()];
+        let ExecutionPrimitive::OrderedComposite { children } = &input.operations[0].primitive
+        else {
+            unreachable!()
+        };
+        let mut accepted = children
+            .iter()
+            .filter_map(|child| {
+                matches!(child.primitive, ExecutionPrimitive::AotKernel { .. }).then(|| {
+                    (
+                        child.effect,
+                        child.invocation.as_ref().unwrap().contract_id().unwrap(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         accepted.sort_unstable();
         input.kernels[0] = AotKernelAuthority::new(
             kernel.id(),
@@ -295,7 +309,14 @@ fn external_alias_then_read_fixture(requirement: InPlaceAliasRequirement) -> Fix
         authority.module().clone(),
         authority.semantic_encoding().to_vec(),
         authority.execution_build_encoding().to_vec(),
-        vec![alias_effect.id()],
+        vec![(
+            alias_effect.id(),
+            invocation(&alias_effect)
+                .as_ref()
+                .unwrap()
+                .contract_id()
+                .unwrap(),
+        )],
     )
     .unwrap();
     input.effects = vec![alias_effect, copy_effect, outer];

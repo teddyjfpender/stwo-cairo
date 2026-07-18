@@ -18,6 +18,7 @@ pub(super) fn validate(
     structural_authority::validate(input)?;
     validate_authorities(input)?;
     validate_operations(input, transcript)?;
+    validate_kernel_execution_inventory(input)?;
     validate_transcript(input, transcript)?;
     transcript_segments::validate(input, transcript)?;
     output::validate(input)?;
@@ -111,31 +112,6 @@ fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofE
         if !kernel.has_valid_identity()? {
             return Err(CompiledProofError::NonCanonicalKernelAuthority);
         }
-        let mut used = BTreeSet::new();
-        for operation in &input.operations {
-            for_each_leaf_step(operation, |primitive, effect| {
-                if matches!(
-                    primitive,
-                    ExecutionPrimitive::AotKernel { kernel: id, .. } if *id == kernel.id()
-                ) {
-                    let execution = (effect, operation.partition);
-                    if kernel
-                        .accepted_executions()
-                        .binary_search(&execution)
-                        .is_err()
-                    {
-                        return Err(CompiledProofError::KernelEffectNotAccepted {
-                            operation: operation.id,
-                        });
-                    }
-                    used.insert(execution);
-                }
-                Ok(())
-            })?;
-        }
-        if kernel.accepted_executions().iter().copied().ne(used) {
-            return Err(CompiledProofError::NonCanonicalKernelEffects(kernel.id()));
-        }
     }
 
     if input
@@ -159,7 +135,7 @@ fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofE
         .collect::<Vec<_>>();
     let mut used_wrappers = BTreeSet::new();
     for operation in &input.operations {
-        for_each_leaf_step(operation, |primitive, _| {
+        for_each_leaf_step(operation, |primitive, _, _| {
             if let ExecutionPrimitive::StaticCudaWrapper { wrapper } = primitive {
                 if input
                     .static_wrappers
@@ -191,7 +167,7 @@ fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofE
     let mut used_effects = BTreeSet::new();
     for operation in &input.operations {
         used_effects.insert(operation.effect);
-        for_each_leaf_step(operation, |_, effect| {
+        for_each_leaf_step(operation, |_, _, effect| {
             used_effects.insert(effect);
             Ok(())
         })?;
@@ -211,7 +187,7 @@ fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofE
         .collect::<Vec<_>>();
     let mut used_kernels = BTreeSet::new();
     for operation in &input.operations {
-        for_each_leaf_step(operation, |primitive, _| {
+        for_each_leaf_step(operation, |primitive, _, _| {
             if let ExecutionPrimitive::AotKernel { kernel, .. } = primitive {
                 used_kernels.insert(*kernel);
             }
@@ -228,17 +204,48 @@ fn validate_authorities(input: &CompiledProofInput) -> Result<(), CompiledProofE
     Ok(())
 }
 
+fn validate_kernel_execution_inventory(
+    input: &CompiledProofInput,
+) -> Result<(), CompiledProofError> {
+    for kernel in &input.kernels {
+        let mut used = BTreeSet::new();
+        for operation in &input.operations {
+            for_each_leaf_step(operation, |primitive, invocation, effect| {
+                if matches!(
+                    primitive,
+                    ExecutionPrimitive::AotKernel { kernel: id, .. } if *id == kernel.id()
+                ) {
+                    let invocation = invocation
+                        .ok_or(CompiledProofError::InvalidKernelInvocation(operation.id))?
+                        .contract_id()?;
+                    let execution = (effect, operation.partition, invocation);
+                    used.insert(execution);
+                }
+                Ok(())
+            })?;
+        }
+        if kernel.accepted_executions().iter().copied().ne(used) {
+            return Err(CompiledProofError::NonCanonicalKernelEffects(kernel.id()));
+        }
+    }
+    Ok(())
+}
+
 fn for_each_leaf_step(
     operation: &OpNode,
-    mut visit: impl FnMut(&ExecutionPrimitive, EffectContractId) -> Result<(), CompiledProofError>,
+    mut visit: impl FnMut(
+        &ExecutionPrimitive,
+        Option<&AotInvocation>,
+        EffectContractId,
+    ) -> Result<(), CompiledProofError>,
 ) -> Result<(), CompiledProofError> {
     match &operation.primitive {
         ExecutionPrimitive::OrderedComposite { children } => {
             for child in children {
-                visit(&child.primitive, child.effect)?;
+                visit(&child.primitive, child.invocation.as_ref(), child.effect)?;
             }
         }
-        primitive => visit(primitive, operation.effect)?,
+        primitive => visit(primitive, operation.invocation.as_ref(), operation.effect)?,
     }
     Ok(())
 }

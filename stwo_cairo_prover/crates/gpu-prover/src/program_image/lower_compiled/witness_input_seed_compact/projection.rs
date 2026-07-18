@@ -34,6 +34,10 @@ pub(super) fn seed(
         lowered.contract.identity(),
         linked.identity(),
         vec![seed_launch(launch.symbol(), launch)?],
+        lowered
+            .invocation
+            .contract_id()
+            .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?,
         lowered.effect.id(),
     )
     .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?;
@@ -75,6 +79,9 @@ pub(super) fn compact(
         lowered.contract.identity(),
         linked.identity(),
         steps,
+        invocation
+            .contract_id()
+            .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?,
         lowered.effect.id(),
     )
     .map_err(|_| InvocationShapeError::InvalidProductionBaseAuthority)?;

@@ -82,7 +82,9 @@ impl<'a> StaticWrapperRequest<'a> {
         }
     }
 
-    fn invocation(self) -> Result<AotInvocation, InvocationShapeError> {
+    pub(in crate::program_image::lower_compiled) fn invocation(
+        self,
+    ) -> Result<AotInvocation, InvocationShapeError> {
         match self {
             Self::ExecutionTable { lowered, stage } => lowered
                 .stages
@@ -411,6 +413,7 @@ fn append_event(
                 &mut buffers.kernel_by_build_authority,
                 &recorded.source,
                 &fields,
+                &recorded.invocation,
                 effect.id(),
             )
             .map_err(|_| CompiledWitnessWriterPrefixError::InvalidRecordedAotAuthority(producer))?;
@@ -429,9 +432,16 @@ fn append_event(
             let effect = request
                 .effect()
                 .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
+            let invocation = request
+                .invocation()
+                .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
             let expected_id = wrapper_id(buffers.static_wrappers.len())?;
             if wrapper.id() != expected_id
                 || wrapper.consumer_target_sm() != target_sm
+                || wrapper.accepted_invocation()
+                    != invocation
+                        .contract_id()
+                        .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?
                 || wrapper.accepted_effect() != effect.id()
                 || !wrapper
                     .has_valid_identity()
@@ -439,9 +449,6 @@ fn append_event(
             {
                 return Err(CompiledWitnessWriterPrefixError::Lowering);
             }
-            let invocation = request
-                .invocation()
-                .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
             insert_effect(&mut buffers.effects, effect.clone())
                 .map_err(|_| CompiledWitnessWriterPrefixError::Lowering)?;
             buffers.static_wrappers.push(wrapper);
@@ -643,17 +650,27 @@ pub(super) fn validate_sealed_prefix(
                         .iter()
                         .map(|global| global.initializer),
                 );
-                used_kernels
-                    .entry(*kernel)
-                    .or_default()
-                    .insert((operation.effect, operation.partition));
+                used_kernels.entry(*kernel).or_default().insert((
+                    operation.effect,
+                    operation.partition,
+                    operation
+                        .invocation
+                        .as_ref()
+                        .ok_or(())?
+                        .contract_id()
+                        .map_err(|_| ())?,
+                ));
             }
             (BaseEvent::Static(request), ExecutionPrimitive::StaticCudaWrapper { wrapper })
                 if wrapper.0 as usize == next_wrapper =>
             {
                 let authority = static_wrappers.get(next_wrapper - 1).ok_or(())?;
+                let invocation = operation.invocation.as_ref().ok_or(())?;
                 if authority.id() != *wrapper
                     || authority.accepted_effect() != operation.effect
+                    || authority.accepted_invocation()
+                        != invocation.contract_id().map_err(|_| ())?
+                    || invocation != &request.invocation().map_err(|_| ())?
                     || effect != request.effect().map_err(|_| ())?
                 {
                     return Err(());

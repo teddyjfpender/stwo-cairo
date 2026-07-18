@@ -212,8 +212,14 @@ fn composite_input() -> CompiledProofInput {
     };
     input.operations[0].invocation = None;
     input.operations[0].effect = boundary.id();
-    let mut accepted = vec![aot_effect.id(), read_write_effect.id(), atomic_effect.id()];
-    accepted.sort_unstable();
+    let mut accepted = children(&input)
+        .iter()
+        .filter_map(|child| {
+            matches!(&child.primitive, ExecutionPrimitive::AotKernel { .. })
+                .then(|| (child.effect, child.invocation.clone().unwrap()))
+        })
+        .collect::<Vec<_>>();
+    accepted.sort_by_key(|(effect, invocation)| (*effect, invocation.contract_id().unwrap()));
     input.kernels = vec![kernel(module(), accepted, b"ordered-composite-aot-v1")];
     input.effects = vec![
         memset_a,
@@ -261,6 +267,31 @@ fn ordered_composite_binds_exact_child_order_and_leaf_authority() {
     children_mut(&mut reordered).swap(0, 1);
     let reordered = CompiledProof::compile(reordered, transcript()).unwrap();
     assert_ne!(compiled.identity(), reordered.identity());
+}
+
+#[test]
+fn ordered_composite_rejects_shape_valid_leaf_invocation_drift() {
+    let mut input = composite_input();
+    let child = children_mut(&mut input)
+        .iter_mut()
+        .find(|child| matches!(child.primitive, ExecutionPrimitive::AotKernel { .. }))
+        .unwrap();
+    let table = child
+        .invocation
+        .as_mut()
+        .unwrap()
+        .arguments
+        .iter_mut()
+        .find_map(|argument| match &mut argument.value {
+            AotArgumentValue::DevicePointerTable(entries) if entries.len() > 1 => Some(entries),
+            _ => None,
+        })
+        .unwrap();
+    table.swap(0, 1);
+    assert_eq!(
+        CompiledProof::compile(input, transcript()).unwrap_err(),
+        CompiledProofError::KernelInvocationNotAccepted { operation: OpId(0) }
+    );
 }
 
 #[test]
@@ -348,10 +379,11 @@ fn ordered_composite_does_not_infer_order_between_one_childs_effect_accesses() {
     let mut accepted = children(&input)
         .iter()
         .filter_map(|child| {
-            matches!(&child.primitive, ExecutionPrimitive::AotKernel { .. }).then_some(child.effect)
+            matches!(&child.primitive, ExecutionPrimitive::AotKernel { .. })
+                .then(|| (child.effect, child.invocation.clone().unwrap()))
         })
         .collect::<Vec<_>>();
-    accepted.sort_unstable();
+    accepted.sort_by_key(|(effect, invocation)| (*effect, invocation.contract_id().unwrap()));
     input.kernels = vec![kernel(
         module(),
         accepted,
@@ -435,10 +467,11 @@ fn ordered_composite_rejects_nested_steps_hidden_globals_and_stage_bypass() {
     let mut accepted = children(&global)
         .iter()
         .filter_map(|child| {
-            matches!(&child.primitive, ExecutionPrimitive::AotKernel { .. }).then_some(child.effect)
+            matches!(&child.primitive, ExecutionPrimitive::AotKernel { .. })
+                .then(|| (child.effect, child.invocation.clone().unwrap()))
         })
         .collect::<Vec<_>>();
-    accepted.sort_unstable();
+    accepted.sort_by_key(|(effect, invocation)| (*effect, invocation.contract_id().unwrap()));
     global.kernels = vec![kernel(
         module(),
         accepted,

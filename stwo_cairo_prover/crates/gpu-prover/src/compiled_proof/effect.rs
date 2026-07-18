@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use super::*;
 
 const MODULE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.module.v2\0";
-const EFFECT_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.effect.v2\0";
-const KERNEL_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.kernel.v3\0";
+const EFFECT_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.effect.v3\0";
+const KERNEL_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.kernel.v4\0";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ModuleIdentity {
@@ -184,6 +184,7 @@ pub struct EffectContract {
     id: EffectContractId,
     accesses: Box<[EffectAccess]>,
     module_globals: Box<[ModuleGlobalEffect]>,
+    registered_fixed_source_reads: Box<[RegisteredFixedSourceRead]>,
     canonical_encoding: Box<[u8]>,
 }
 
@@ -192,14 +193,29 @@ impl EffectContract {
         accesses: Vec<EffectAccess>,
         module_globals: Vec<ModuleGlobalEffect>,
     ) -> Result<Self, CompiledProofError> {
+        Self::new_with_registered_fixed_source_reads(accesses, module_globals, Vec::new())
+    }
+
+    /// Builds an effect with direct process-registered immutable reads.
+    ///
+    /// Reads must be sorted by source, column, and range, with no duplicate or
+    /// overlapping ranges for one source column.
+    pub fn new_with_registered_fixed_source_reads(
+        accesses: Vec<EffectAccess>,
+        module_globals: Vec<ModuleGlobalEffect>,
+        registered_fixed_source_reads: Vec<RegisteredFixedSourceRead>,
+    ) -> Result<Self, CompiledProofError> {
         validate_accesses(&accesses)?;
         validate_module_globals(&module_globals)?;
-        let canonical_encoding = encode_effect(&accesses, &module_globals)?;
+        validate_registered_fixed_source_reads(&registered_fixed_source_reads)?;
+        let canonical_encoding =
+            encode_effect(&accesses, &module_globals, &registered_fixed_source_reads)?;
         let id = EffectContractId(digest(EFFECT_DOMAIN, &canonical_encoding)?);
         Ok(Self {
             id,
             accesses: accesses.into_boxed_slice(),
             module_globals: module_globals.into_boxed_slice(),
+            registered_fixed_source_reads: registered_fixed_source_reads.into_boxed_slice(),
             canonical_encoding: canonical_encoding.into_boxed_slice(),
         })
     }
@@ -216,6 +232,10 @@ impl EffectContract {
         &self.module_globals
     }
 
+    pub fn registered_fixed_source_reads(&self) -> &[RegisteredFixedSourceRead] {
+        &self.registered_fixed_source_reads
+    }
+
     pub fn canonical_encoding(&self) -> &[u8] {
         &self.canonical_encoding
     }
@@ -227,7 +247,14 @@ impl EffectContract {
     }
 
     pub(crate) fn has_valid_identity(&self) -> Result<bool, CompiledProofError> {
-        let canonical = encode_effect(&self.accesses, &self.module_globals)?;
+        if validate_registered_fixed_source_reads(&self.registered_fixed_source_reads).is_err() {
+            return Ok(false);
+        }
+        let canonical = encode_effect(
+            &self.accesses,
+            &self.module_globals,
+            &self.registered_fixed_source_reads,
+        )?;
         Ok(canonical == self.canonical_encoding.as_ref()
             && self.id.0 == digest(EFFECT_DOMAIN, &canonical)?)
     }
@@ -239,7 +266,7 @@ pub struct AotKernelAuthority {
     module: ModuleIdentity,
     semantic_encoding: Box<[u8]>,
     execution_build_encoding: Box<[u8]>,
-    accepted_executions: Box<[(EffectContractId, PartitionAuthorityId)]>,
+    accepted_executions: Box<[(EffectContractId, PartitionAuthorityId, InvocationContractId)]>,
     canonical_encoding: Box<[u8]>,
     digest: [u8; 32],
 }
@@ -250,7 +277,7 @@ impl AotKernelAuthority {
         module: ModuleIdentity,
         semantic_encoding: Vec<u8>,
         execution_build_encoding: Vec<u8>,
-        accepted_effects: Vec<EffectContractId>,
+        accepted_executions: Vec<(EffectContractId, InvocationContractId)>,
     ) -> Result<Self, CompiledProofError> {
         let monolithic = PartitionAuthority::monolithic().id();
         Self::new_with_accepted_executions(
@@ -258,9 +285,9 @@ impl AotKernelAuthority {
             module,
             semantic_encoding,
             execution_build_encoding,
-            accepted_effects
+            accepted_executions
                 .into_iter()
-                .map(|effect| (effect, monolithic))
+                .map(|(effect, invocation)| (effect, monolithic, invocation))
                 .collect(),
         )
     }
@@ -270,7 +297,7 @@ impl AotKernelAuthority {
         module: ModuleIdentity,
         semantic_encoding: Vec<u8>,
         execution_build_encoding: Vec<u8>,
-        accepted_executions: Vec<(EffectContractId, PartitionAuthorityId)>,
+        accepted_executions: Vec<(EffectContractId, PartitionAuthorityId, InvocationContractId)>,
     ) -> Result<Self, CompiledProofError> {
         if id.0 == 0 || semantic_encoding.is_empty() || execution_build_encoding.is_empty() {
             return Err(CompiledProofError::EmptyKernelIdentity(id));
@@ -319,7 +346,9 @@ impl AotKernelAuthority {
         &self.execution_build_encoding
     }
 
-    pub fn accepted_executions(&self) -> &[(EffectContractId, PartitionAuthorityId)] {
+    pub fn accepted_executions(
+        &self,
+    ) -> &[(EffectContractId, PartitionAuthorityId, InvocationContractId)] {
         &self.accepted_executions
     }
 
@@ -332,6 +361,17 @@ impl AotKernelAuthority {
     }
 
     pub(crate) fn has_valid_identity(&self) -> Result<bool, CompiledProofError> {
+        if self.id.0 == 0
+            || self.semantic_encoding.is_empty()
+            || self.execution_build_encoding.is_empty()
+            || self.accepted_executions.is_empty()
+            || self
+                .accepted_executions
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Ok(false);
+        }
         let canonical = encode_kernel(
             self.id,
             &self.module,
@@ -454,9 +494,29 @@ fn validate_module_globals(globals: &[ModuleGlobalEffect]) -> Result<(), Compile
     Ok(())
 }
 
+fn validate_registered_fixed_source_reads(
+    reads: &[RegisteredFixedSourceRead],
+) -> Result<(), CompiledProofError> {
+    for read in reads {
+        if !read.has_valid_identity()? {
+            return Err(CompiledProofError::InvalidRegisteredFixedSourceRead);
+        }
+    }
+    if reads.windows(2).any(|pair| {
+        pair[0] >= pair[1]
+            || (pair[0].source() == pair[1].source()
+                && pair[0].column() == pair[1].column()
+                && pair[0].elements().overlaps(pair[1].elements()))
+    }) {
+        return Err(CompiledProofError::NonCanonicalRegisteredFixedSourceReads);
+    }
+    Ok(())
+}
+
 fn encode_effect(
     accesses: &[EffectAccess],
     globals: &[ModuleGlobalEffect],
+    registered_fixed_source_reads: &[RegisteredFixedSourceRead],
 ) -> Result<Vec<u8>, CompiledProofError> {
     let mut out = Encoder::new(EFFECT_DOMAIN);
     out.count(accesses.len())?;
@@ -469,6 +529,10 @@ fn encode_effect(
         out.byte_range(global.bytes)?;
         out.byte(0); // immutable module-global Read
     }
+    out.count(registered_fixed_source_reads.len())?;
+    for read in registered_fixed_source_reads {
+        out.registered_fixed_source_read(read)?;
+    }
     Ok(out.finish())
 }
 
@@ -477,7 +541,7 @@ fn encode_kernel(
     module: &ModuleIdentity,
     semantics: &[u8],
     build: &[u8],
-    executions: &[(EffectContractId, PartitionAuthorityId)],
+    executions: &[(EffectContractId, PartitionAuthorityId, InvocationContractId)],
 ) -> Result<Vec<u8>, CompiledProofError> {
     let mut out = Encoder::new(KERNEL_DOMAIN);
     out.u32(id.0);
@@ -486,9 +550,10 @@ fn encode_kernel(
     out.bytes(semantics)?;
     out.bytes(build)?;
     out.count(executions.len())?;
-    for (effect, partition) in executions {
+    for (effect, partition, invocation) in executions {
         out.raw(effect.as_bytes());
         out.raw(partition.as_bytes());
+        out.raw(invocation.as_bytes());
     }
     Ok(out.finish())
 }
@@ -557,6 +622,16 @@ impl Encoder {
         self.size(range.end)
     }
 
+    fn registered_fixed_source_read(
+        &mut self,
+        read: &RegisteredFixedSourceRead,
+    ) -> Result<(), CompiledProofError> {
+        self.bytes(read.source().canonical_encoding())?;
+        self.raw(read.source().identity());
+        self.size(read.column())?;
+        self.elements(read.elements())
+    }
+
     fn bound(&mut self, range: BoundValueRange) -> Result<(), CompiledProofError> {
         self.u32(range.binding.0);
         self.u32(range.value.version.0);
@@ -617,5 +692,52 @@ impl Encoder {
             InPlaceDiscipline::BlockBarrierPhases => 1,
             InPlaceDiscipline::CooperativeGridPhases => 2,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invocation(value: u32) -> InvocationContractId {
+        AotInvocation {
+            arguments: vec![AotArgumentBinding {
+                ordinal: 0,
+                value: AotArgumentValue::U32(value),
+            }],
+        }
+        .contract_id()
+        .unwrap()
+    }
+
+    #[test]
+    fn kernel_identity_revalidates_exact_invocation_authority() {
+        let exact = invocation(7);
+        let effect = EffectContract::new(
+            vec![EffectAccess::Read {
+                source: BoundValueRange {
+                    binding: EffectBindingId(0),
+                    value: ValueRange {
+                        version: ValueVersion(0),
+                        elements: ElementRange::new(0, 1).unwrap(),
+                    },
+                },
+            }],
+            vec![],
+        )
+        .unwrap();
+        let baseline = AotKernelAuthority::new(
+            AotKernelId(1),
+            ModuleIdentity::new(b"test-module".to_vec()).unwrap(),
+            b"test-semantics".to_vec(),
+            b"test-build".to_vec(),
+            vec![(effect.id(), exact)],
+        )
+        .unwrap();
+        assert!(baseline.has_valid_identity().unwrap());
+
+        let mut changed = baseline;
+        changed.accepted_executions[0].2 = invocation(8);
+        assert!(!changed.has_valid_identity().unwrap());
     }
 }

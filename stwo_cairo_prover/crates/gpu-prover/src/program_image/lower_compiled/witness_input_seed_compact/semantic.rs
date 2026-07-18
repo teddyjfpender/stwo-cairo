@@ -167,7 +167,8 @@ pub(super) fn validate_exact_bindings(
     effect: &EffectContract,
     fixed: Option<(ValueVersion, EffectBindingId)>,
 ) -> Result<(), InvocationShapeError> {
-    if invocation.arguments.is_empty()
+    if !effect.registered_fixed_source_reads().is_empty()
+        || invocation.arguments.is_empty()
         || invocation
             .arguments
             .iter()
@@ -203,6 +204,12 @@ pub(super) fn validate_exact_bindings(
                 for &binding in entries.iter().flatten() {
                     insert(binding)?;
                 }
+            }
+            AotArgumentValue::DeviceRegisteredFixedSourcePointerTable(_) => {
+                return Err(InvocationShapeError::InvalidAdapterEffect)
+            }
+            AotArgumentValue::DeviceMixedFixedSourcePointerTable(_) => {
+                return Err(InvocationShapeError::InvalidAdapterEffect)
             }
             AotArgumentValue::DeviceFixedU32 { value, binding } => {
                 if fixed != Some((*value, *binding)) {

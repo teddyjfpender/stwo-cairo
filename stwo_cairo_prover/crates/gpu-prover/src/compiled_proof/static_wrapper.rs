@@ -14,7 +14,7 @@ use super::*;
 mod library;
 pub use library::*;
 
-const WRAPPER_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-wrapper.v2\0";
+const WRAPPER_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-wrapper.v3\0";
 const AGGREGATE_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-execution.v2\0";
 const ZERO_IDENTITY: [u8; 32] = [0; 32];
 
@@ -81,6 +81,7 @@ pub struct StaticCudaWrapperAuthority {
     linked_module_identity: [u8; 32],
     execution_steps: Box<[StaticCudaExecutionStepIdentity]>,
     aggregate_execution_identity: [u8; 32],
+    accepted_invocation: InvocationContractId,
     accepted_effect: EffectContractId,
     canonical_encoding: Box<[u8]>,
     digest: [u8; 32],
@@ -97,6 +98,7 @@ impl StaticCudaWrapperAuthority {
         aggregate_contract_identity: [u8; 32],
         linked_module_identity: [u8; 32],
         launches: Vec<StaticCudaLaunchIdentity>,
+        accepted_invocation: InvocationContractId,
         accepted_effect: EffectContractId,
     ) -> Result<Self, CompiledProofError> {
         Self::new_with_execution_steps(
@@ -112,6 +114,7 @@ impl StaticCudaWrapperAuthority {
                 .into_iter()
                 .map(StaticCudaExecutionStepIdentity::KernelLaunch)
                 .collect(),
+            accepted_invocation,
             accepted_effect,
         )
     }
@@ -127,6 +130,7 @@ impl StaticCudaWrapperAuthority {
         aggregate_contract_identity: [u8; 32],
         linked_module_identity: [u8; 32],
         execution_steps: Vec<StaticCudaExecutionStepIdentity>,
+        accepted_invocation: InvocationContractId,
         accepted_effect: EffectContractId,
     ) -> Result<Self, CompiledProofError> {
         if id.0 == 0
@@ -155,6 +159,7 @@ impl StaticCudaWrapperAuthority {
             linked_module_identity,
             &execution_encoding,
             aggregate_execution_identity,
+            accepted_invocation,
             accepted_effect,
         )?;
         let digest = digest(WRAPPER_DOMAIN, &canonical_encoding)?;
@@ -169,6 +174,7 @@ impl StaticCudaWrapperAuthority {
             linked_module_identity,
             execution_steps: execution_steps.into_boxed_slice(),
             aggregate_execution_identity,
+            accepted_invocation,
             accepted_effect,
             canonical_encoding: canonical_encoding.into_boxed_slice(),
             digest,
@@ -228,6 +234,10 @@ impl StaticCudaWrapperAuthority {
         &self.aggregate_execution_identity
     }
 
+    pub const fn accepted_invocation(&self) -> InvocationContractId {
+        self.accepted_invocation
+    }
+
     pub const fn accepted_effect(&self) -> EffectContractId {
         self.accepted_effect
     }
@@ -267,6 +277,7 @@ impl StaticCudaWrapperAuthority {
             self.linked_module_identity,
             &execution_encoding,
             aggregate_execution_identity,
+            self.accepted_invocation,
             self.accepted_effect,
         )?;
         Ok(
@@ -309,6 +320,7 @@ fn encode_wrapper(
     linked_module: [u8; 32],
     execution_steps: &[u8],
     aggregate: [u8; 32],
+    invocation: InvocationContractId,
     effect: EffectContractId,
 ) -> Result<Vec<u8>, CompiledProofError> {
     let mut out = Vec::from(WRAPPER_DOMAIN);
@@ -322,6 +334,7 @@ fn encode_wrapper(
     out.extend_from_slice(&linked_module);
     push_bytes(&mut out, execution_steps)?;
     out.extend_from_slice(&aggregate);
+    out.extend_from_slice(invocation.as_bytes());
     out.extend_from_slice(effect.as_bytes());
     Ok(out)
 }
@@ -395,7 +408,7 @@ fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CompiledProofError>
 mod tests {
     use super::*;
 
-    const GOLDEN_WRAPPER_DOMAIN_V2: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-wrapper.v2\0";
+    const GOLDEN_WRAPPER_DOMAIN_V3: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-wrapper.v3\0";
     const GOLDEN_AGGREGATE_DOMAIN_V2: &[u8] =
         b"stwo-cairo.compiled-proof.static-cuda-execution.v2\0";
     const LEGACY_WRAPPER_DOMAIN: &[u8] = b"stwo-cairo.compiled-proof.static-cuda-wrapper.v1\0";
@@ -431,6 +444,17 @@ mod tests {
         .unwrap()
     }
 
+    fn invocation() -> InvocationContractId {
+        AotInvocation {
+            arguments: vec![AotArgumentBinding {
+                ordinal: 0,
+                value: AotArgumentValue::DevicePointer(Some(EffectBindingId(0))),
+            }],
+        }
+        .contract_id()
+        .unwrap()
+    }
+
     fn authority_with_receipts(
         id: StaticCudaWrapperId,
         target_sm: u32,
@@ -450,6 +474,7 @@ mod tests {
             aggregate_contract,
             linked_module,
             launches,
+            invocation(),
             effect().id(),
         )
     }
@@ -507,6 +532,7 @@ mod tests {
         canonical.extend_from_slice(&(execution.len() as u64).to_le_bytes());
         canonical.extend_from_slice(&execution);
         canonical.extend_from_slice(&aggregate);
+        canonical.extend_from_slice(invocation().as_bytes());
         canonical.extend_from_slice(effect().id().as_bytes());
         canonical
     }
@@ -528,7 +554,7 @@ mod tests {
             + core::mem::size_of::<u8>();
         let canonical_bytes = WRAPPER_DOMAIN.len()
             + 2 * core::mem::size_of::<u32>()
-            + 7 * 32
+            + 8 * 32
             + core::mem::size_of::<u64>()
             + b"stwo_static_wrapper".len()
             + core::mem::size_of::<u64>()
@@ -537,22 +563,22 @@ mod tests {
     }
 
     #[test]
-    fn kernel_only_v2_identity_migration_is_explicit_and_deterministic() {
+    fn kernel_only_v3_identity_migration_is_explicit_and_deterministic() {
         let baseline = authority(vec![launch(b"kernel_a", 4)]);
-        assert_eq!(WRAPPER_DOMAIN, GOLDEN_WRAPPER_DOMAIN_V2);
+        assert_eq!(WRAPPER_DOMAIN, GOLDEN_WRAPPER_DOMAIN_V3);
         assert_eq!(AGGREGATE_DOMAIN, GOLDEN_AGGREGATE_DOMAIN_V2);
-        let expected_v2 = expected_kernel_only_canonical(
-            GOLDEN_WRAPPER_DOMAIN_V2,
+        let expected_v3 = expected_kernel_only_canonical(
+            GOLDEN_WRAPPER_DOMAIN_V3,
             GOLDEN_AGGREGATE_DOMAIN_V2,
             true,
         );
         let legacy_v1 =
             expected_kernel_only_canonical(LEGACY_WRAPPER_DOMAIN, LEGACY_AGGREGATE_DOMAIN, false);
 
-        assert_eq!(baseline.canonical_encoding(), expected_v2);
+        assert_eq!(baseline.canonical_encoding(), expected_v3);
         assert_eq!(
             baseline.digest(),
-            &digest(WRAPPER_DOMAIN, &expected_v2).unwrap()
+            &digest(WRAPPER_DOMAIN, &expected_v3).unwrap()
         );
         assert_ne!(baseline.canonical_encoding(), legacy_v1);
         assert_ne!(
@@ -615,7 +641,7 @@ mod tests {
             launch(b"kernel_c", 1),
         ]);
         let mut mutations = Vec::new();
-        let authority_mutations: [fn(&mut StaticCudaWrapperAuthority); 8] = [
+        let authority_mutations: [fn(&mut StaticCudaWrapperAuthority); 9] = [
             |changed: &mut StaticCudaWrapperAuthority| changed.static_module_build_identity[0] ^= 1,
             |changed: &mut StaticCudaWrapperAuthority| changed.consumer_target_sm += 1,
             |changed: &mut StaticCudaWrapperAuthority| changed.wrapper_symbol[0] ^= 1,
@@ -624,6 +650,16 @@ mod tests {
             |changed: &mut StaticCudaWrapperAuthority| changed.aggregate_contract_identity[0] ^= 1,
             |changed: &mut StaticCudaWrapperAuthority| changed.linked_module_identity[0] ^= 1,
             |changed: &mut StaticCudaWrapperAuthority| changed.aggregate_execution_identity[0] ^= 1,
+            |changed: &mut StaticCudaWrapperAuthority| {
+                changed.accepted_invocation = AotInvocation {
+                    arguments: vec![AotArgumentBinding {
+                        ordinal: 0,
+                        value: AotArgumentValue::U32(1),
+                    }],
+                }
+                .contract_id()
+                .unwrap()
+            },
         ];
         for mutate in authority_mutations {
             let mut changed = baseline.clone();
