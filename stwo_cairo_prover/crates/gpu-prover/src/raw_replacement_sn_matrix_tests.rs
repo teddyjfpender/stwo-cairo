@@ -16,8 +16,10 @@ use cairo_air::claims::CairoClaim;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo_backend_cuda::{
-    direct_terminal_expand_absorb_arena_slot_requirements, ModeAwareCommitWorkspaceRequirements,
-    ModeAwareCommitWorkspaceSlots, PreparedProgressiveCommitError, ProgressiveCommitStorageMode,
+    direct_terminal_expand_absorb_arena_slot_requirements, DirectCompactTerminalBatchMode,
+    DirectCompactTerminalProgram, DirectTerminalExpandAbsorbProgram, FusedCompactDomainProgram,
+    ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
+    PreparedProgressiveCommitError, ProgressiveCommitStorageMode,
 };
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
@@ -157,7 +159,7 @@ fn execution_geometry(
     .with_public_memory_entries(public_memory_entries)
 }
 
-fn assert_sn_terminal_fusion(profile: &str, arena: &ProofArenaPlan) {
+fn assert_sn_terminal_policy(profile: &str, arena: &ProofArenaPlan) {
     let (expected, expected_fused_materialized_rises, expected_fixed16_sinks) = match profile {
         "SN1" => (
             [
@@ -193,6 +195,8 @@ fn assert_sn_terminal_fusion(profile: &str, arena: &ProofArenaPlan) {
         ),
         _ => panic!("unknown sealed SN profile {profile}"),
     };
+    let mut fused_materialized_rises = 0;
+    let mut fixed16_sinks = 0;
     for (tree, fixed16_batches, materialized_batches, net_device_bytes, net_cuda_launches) in
         expected
     {
@@ -203,31 +207,28 @@ fn assert_sn_terminal_fusion(profile: &str, arena: &ProofArenaPlan) {
             .direct_compact_terminal
             .as_ref()
             .unwrap_or_else(|| panic!("{profile}/{tree:?}: terminal plan missing"));
-        let receipt = selection
-            .receipt()
-            .unwrap_or_else(|| panic!("{profile}/{tree:?}: zero terminal-fusion execution"));
         assert_eq!(
-            receipt.fixed_terminal_launches, fixed16_batches,
-            "{profile}/{tree:?}: exact fixed16 terminal batches"
+            selection,
+            &DirectCompactTerminalPlan::Materialized {
+                batches: fixed16_batches + materialized_batches,
+            },
+            "{profile}/{tree:?}: uncredited Fixed16 candidate reached production"
         );
-        assert_eq!(
-            selection.materialized_batches(),
-            materialized_batches,
-            "{profile}/{tree:?}: exact explicit materialized batches"
+        assert!(
+            selection.receipt().is_none(),
+            "{profile}/{tree:?}: materialized selection exposed a fusion receipt"
         );
-        assert_eq!(
-            receipt.net_device_bytes_removed, net_device_bytes,
-            "{profile}/{tree:?}: exact retired device traffic"
-        );
-        assert_eq!(
-            receipt.net_cuda_launches_removed, net_cuda_launches,
-            "{profile}/{tree:?}: exact signed launch delta"
+        assert!(
+            commitment.direct_terminal_expand_absorb.is_none(),
+            "{profile}/{tree:?}: uncredited terminal successor reached production"
         );
 
-        let successor = commitment
-            .direct_terminal_expand_absorb
+        // Preserve exact compiler and workspace coverage for the dormant A/B
+        // candidate without allocating its larger slab in production.
+        let base = commitment
+            .commit_program
             .as_ref()
-            .unwrap_or_else(|| panic!("{profile}/{tree:?}: composed terminal plan missing"));
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: base program missing"));
         let domain = commitment
             .domain_cooperative_program
             .as_ref()
@@ -236,90 +237,109 @@ fn assert_sn_terminal_fusion(profile: &str, arena: &ProofArenaPlan) {
             .compact_domain_program
             .as_ref()
             .unwrap_or_else(|| panic!("{profile}/{tree:?}: compact program missing"));
-        let DirectCompactTerminalPlan::Fused(terminal) = selection else {
-            panic!("{profile}/{tree:?}: composed successor requires fused terminal");
-        };
-        let ModeAwareCommitWorkspaceSlots::DomainProgressive(slots) = &commitment.slots else {
-            panic!("{profile}/{tree:?}: composed successor requires progressive slots");
-        };
-        let qualified = successor.program.receipt().qualified_slab_capacity_words;
+        let direct = commitment
+            .direct_retained_b2n_program
+            .as_ref()
+            .unwrap_or_else(|| panic!("{profile}/{tree:?}: direct program missing"));
+        let terminal = DirectCompactTerminalProgram::compile(compact, direct)
+            .unwrap_or_else(|error| panic!("{profile}/{tree:?}: terminal candidate: {error}"));
+        let terminal_receipt = terminal.receipt();
+        assert_eq!(
+            terminal_receipt.fixed_terminal_launches, fixed16_batches,
+            "{profile}/{tree:?}: exact dormant fixed16 batches"
+        );
+        assert_eq!(
+            terminal_receipt
+                .batches
+                .iter()
+                .filter(|batch| batch.mode == DirectCompactTerminalBatchMode::Materialized)
+                .count() as u32,
+            materialized_batches,
+            "{profile}/{tree:?}: exact dormant materialized batches"
+        );
+        assert_eq!(
+            terminal_receipt.net_device_bytes_removed, net_device_bytes,
+            "{profile}/{tree:?}: exact dormant traffic model"
+        );
+        assert_eq!(
+            terminal_receipt.net_cuda_launches_removed, net_cuda_launches,
+            "{profile}/{tree:?}: exact dormant launch model"
+        );
+        assert!(!terminal_receipt.same_gpu_timing_credit_applied);
+
+        let fused_compact = FusedCompactDomainProgram::compile(base, domain, compact)
+            .unwrap_or_else(|error| panic!("{profile}/{tree:?}: fused compact candidate: {error}"));
+        let successor = DirectTerminalExpandAbsorbProgram::compile(
+            base,
+            domain,
+            compact,
+            &fused_compact,
+            direct,
+            &terminal,
+        )
+        .unwrap_or_else(|error| panic!("{profile}/{tree:?}: successor candidate: {error}"));
+        let successor_receipt = successor.receipt();
+        let qualified = successor_receipt.qualified_slab_capacity_words;
         assert_eq!(
             qualified,
             domain.slab_words(),
-            "{profile}/{tree:?}: exact qualified domain slab"
+            "{profile}/{tree:?}: exact dormant qualified slab"
         );
         assert!(
             qualified > compact.slab_words(),
-            "{profile}/{tree:?}: materialized rises require the second state bank"
+            "{profile}/{tree:?}: dormant successor must not fit the production compact slab"
         );
+
+        let ModeAwareCommitWorkspaceSlots::DomainProgressive(slots) = &commitment.slots else {
+            panic!("{profile}/{tree:?}: dormant successor requires progressive slots");
+        };
         let workspace = direct_terminal_expand_absorb_arena_slot_requirements(
-            &successor.program,
-            commitment.commit_program.as_ref().unwrap(),
+            &successor,
+            base,
             domain,
             compact,
-            &successor.fused_compact_domain,
-            commitment.direct_retained_b2n_program.as_ref().unwrap(),
-            terminal,
+            &fused_compact,
+            direct,
+            &terminal,
             slots,
         )
-        .unwrap_or_else(|error| panic!("{profile}/{tree:?}: successor slots: {error}"));
+        .unwrap_or_else(|error| panic!("{profile}/{tree:?}: dormant successor slots: {error}"));
         let required_slab = workspace
             .iter()
             .find(|requirement| requirement.id == slots.leaves.state_ping)
-            .unwrap_or_else(|| panic!("{profile}/{tree:?}: successor slab requirement missing"));
+            .unwrap_or_else(|| {
+                panic!("{profile}/{tree:?}: dormant successor slab requirement missing")
+            });
         assert_eq!(required_slab.len_words, qualified);
-        let physical_slab = arena
-            .layout()
-            .slot(slots.leaves.state_ping)
-            .unwrap_or_else(|| panic!("{profile}/{tree:?}: physical successor slab missing"));
-        assert!(
-            physical_slab.len_words >= qualified,
-            "{profile}/{tree:?}: physical successor slab was undersized"
-        );
         assert!(
             arena
                 .logical_buffers()
                 .iter()
                 .filter(|buffer| buffer.purpose == BufferPurpose::CommitProgressiveStatePing)
                 .any(|buffer| {
-                    buffer.len_words == qualified
+                    buffer.len_words == compact.slab_words()
                         && arena.binding(buffer.id).is_some_and(|binding| {
                             binding.physical == slots.leaves.state_ping
-                                && binding.len_words == qualified
+                                && binding.len_words == compact.slab_words()
                         })
                 }),
-            "{profile}/{tree:?}: exact qualified logical slab owner missing"
+            "{profile}/{tree:?}: exact production compact slab owner missing"
         );
+
+        fused_materialized_rises += successor_receipt.fused_materialized_rises;
+        fixed16_sinks += successor_receipt.fixed16_batches;
+        assert!(successor_receipt.fixed16_terminal_receipt_unchanged);
+        assert!(successor_receipt.final_state_at_slab_zero);
+        assert!(!successor_receipt.same_gpu_timing_credit_applied);
     }
-    let composed = [CommitmentTreeId::Base, CommitmentTreeId::Interaction].map(|tree| {
-        arena
-            .commitment(tree)
-            .and_then(|commitment| commitment.direct_terminal_expand_absorb.as_ref())
-            .unwrap_or_else(|| panic!("{profile}/{tree:?}: composed terminal plan missing"))
-            .program
-            .receipt()
-    });
     assert_eq!(
-        composed
-            .iter()
-            .map(|receipt| receipt.fused_materialized_rises)
-            .sum::<u32>(),
-        expected_fused_materialized_rises,
-        "{profile}: exact materialized expand-absorb rises"
+        fused_materialized_rises, expected_fused_materialized_rises,
+        "{profile}: exact dormant materialized expand-absorb rises"
     );
     assert_eq!(
-        composed
-            .iter()
-            .map(|receipt| receipt.fixed16_batches)
-            .sum::<u32>(),
-        expected_fixed16_sinks,
-        "{profile}: exact preserved fixed16 terminal sinks"
+        fixed16_sinks, expected_fixed16_sinks,
+        "{profile}: exact dormant fixed16 terminal sinks"
     );
-    assert!(composed.iter().all(|receipt| {
-        receipt.fixed16_terminal_receipt_unchanged
-            && receipt.final_state_at_slab_zero
-            && !receipt.same_gpu_timing_credit_applied
-    }));
 }
 
 fn assert_sn_blake_g_direct(profile: &str, arena: &ProofArenaPlan) {
@@ -752,7 +772,7 @@ fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
         ShapeExecutableMaterialization::Reused
     );
     assert!(Arc::ptr_eq(&cold_shape.executable, &warm_shape.executable));
-    assert_sn_terminal_fusion(fixture.profile, cold_shape.executable.arena());
+    assert_sn_terminal_policy(fixture.profile, cold_shape.executable.arena());
     assert_sn_blake_g_direct(fixture.profile, cold_shape.executable.arena());
     assert_ne!(
         cold_shape.bindings, warm_shape.bindings,

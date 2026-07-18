@@ -35,7 +35,7 @@ use stwo_backend_cuda::{
     DecommitSourceMode, DecommitTreeGeometry, DecommitTreeRequirements, DecommitTreeSlots,
     DecommitWorkspaceConfig, DecommitWorkspaceRequirements, DecommitWorkspaceSlots, DeviceArena,
     DeviceTranscriptError, DirectCompactDomainBindingError, DirectCompactTerminalError,
-    DirectCompactTerminalFallbackReason, DirectCompactTerminalProgram, DirectRetainedB2nError,
+    DirectCompactTerminalProgram, DirectRetainedB2nError,
     DirectRetainedB2nProgram, DirectTerminalExpandAbsorbError, DirectTerminalExpandAbsorbProgram,
     DomainCooperativeProgram, DomainCooperativeProgramError, EcOpMultiplicityGeometry,
     EcOpWorkspaceRequirements, EcOpWorkspaceSlots, ExecutionTablesWorkspaceRequirements,
@@ -3442,11 +3442,11 @@ pub struct PlannedCommitment {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DirectCompactTerminalPlan {
-    /// The exact shape has no profitable qualified terminal batch, or the
-    /// pure compiler rejected it as an explicitly unsupported topology.
+    /// The exact shape has no timing-qualified terminal batch, or the pure
+    /// compiler rejected it as an explicitly unsupported topology.
     Materialized { batches: u32 },
-    /// At least one batch uses the qualified fixed16 terminal path. The
-    /// program also seals every mixed-shape materialized batch in order.
+    /// At least one batch uses a byte- and same-GPU-timing-qualified fixed16
+    /// terminal path. The program also seals every mixed materialized batch.
     Fused(DirectCompactTerminalProgram),
 }
 
@@ -7424,30 +7424,23 @@ fn direct_compact_terminal_plan(
     {
         return Ok(None);
     }
-    let compact = compact.ok_or(ArenaPlanError::InvalidProtocolGeometry(
+    compact.ok_or(ArenaPlanError::InvalidProtocolGeometry(
         "replacement direct terminal selection is missing its compact program",
     ))?;
     let direct = direct.ok_or(ArenaPlanError::InvalidProtocolGeometry(
         "replacement direct terminal selection is missing its direct program",
     ))?;
-    match DirectCompactTerminalProgram::compile(compact, direct) {
-        Ok(program) if program.receipt().fixed_terminal_launches != 0 => {
-            Ok(Some(DirectCompactTerminalPlan::Fused(program)))
-        }
-        Ok(_)
-        | Err(DirectCompactTerminalError::Fallback(
-            DirectCompactTerminalFallbackReason::UnsupportedLogSize(_)
-            | DirectCompactTerminalFallbackReason::UnsupportedBatchWidth(_)
-            | DirectCompactTerminalFallbackReason::CounterOverflow,
-        )) => Ok(Some(DirectCompactTerminalPlan::Materialized {
-            batches: direct
-                .batches()
-                .len()
-                .try_into()
-                .map_err(|_| ArenaPlanError::SizeOverflow)?,
-        })),
-        Err(error) => Err(ArenaPlanError::DirectCompactTerminal(error)),
-    }
+    // Production executes a larger composed successor, not this terminal
+    // candidate in isolation. Keep the already-qualified materialized executor
+    // until that exact composed path has byte, resource, and same-GPU timing
+    // qualification of its own.
+    Ok(Some(DirectCompactTerminalPlan::Materialized {
+        batches: direct
+            .batches()
+            .len()
+            .try_into()
+            .map_err(|_| ArenaPlanError::SizeOverflow)?,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11563,7 +11556,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_direct_terminal_selection_is_compiled_not_probed() {
+    fn replacement_direct_terminal_candidate_stays_off_the_production_path() {
         let (compact, direct) = direct_terminal_programs(vec![3; 5]);
         assert_eq!(
             direct_compact_terminal_plan(
@@ -11590,22 +11583,26 @@ mod tests {
             Some(DirectCompactTerminalPlan::Materialized { batches: 1 })
         );
 
-        // The exact fixed-16 shape has no remainder and must select the fused
-        // binder. This is the profitable path the production receipt gates.
+        // Width 16 compiles a byte-qualified fusion candidate, but accounting
+        // deliberately grants no same-GPU timing credit. Production must keep
+        // the existing materialized executor until a hardware receipt does.
         let (compact, direct) = direct_terminal_programs(vec![12; 16]);
-        let selected = direct_compact_terminal_plan(
-            ResidentBackend::ReplacementV1,
-            CommitmentTreeId::Base,
-            Some(&compact),
-            Some(&direct),
-        )
-        .unwrap()
-        .unwrap();
-        let receipt = selected.receipt().expect("log13 width16 must fuse");
-        assert_eq!(receipt.fixed_terminal_launches, 1);
-        assert_eq!(receipt.batches.len(), 1);
-        assert!(receipt.net_device_bytes_removed > 0);
-        assert!(receipt.net_cuda_launches_removed > 0);
+        let candidate = DirectCompactTerminalProgram::compile(&compact, &direct).unwrap();
+        assert_eq!(candidate.receipt().fixed_terminal_launches, 1);
+        assert_eq!(candidate.receipt().batches.len(), 1);
+        assert!(candidate.receipt().net_device_bytes_removed > 0);
+        assert!(candidate.receipt().net_cuda_launches_removed > 0);
+        assert!(!candidate.receipt().same_gpu_timing_credit_applied);
+        assert_eq!(
+            direct_compact_terminal_plan(
+                ResidentBackend::ReplacementV1,
+                CommitmentTreeId::Base,
+                Some(&compact),
+                Some(&direct),
+            )
+            .unwrap(),
+            Some(DirectCompactTerminalPlan::Materialized { batches: 1 })
+        );
 
         assert_eq!(
             direct_compact_terminal_plan(
