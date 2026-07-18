@@ -47,18 +47,26 @@ impl FleetProofPlan {
             .sort_unstable_by_key(|capacity| capacity.numa_node);
         pow.validate(topology.workers.len())
             .map_err(FleetCompileError::Pow)?;
-        reject_required_aliases(&compiled)?;
 
         let schedule = DistributedSchedule::compile(&compiled, &topology, transcript)?;
-        let owners = compile_partitioned_owners(&compiled, &topology, &schedule)?;
-        let materialized = materialize_remote_demands(&compiled, &topology, &schedule, &owners)?;
-        let (storages, storage_bindings, output_storage) = compile_partitioned_storage(
+        let mut owners = compile_partitioned_owners(&compiled, &topology, &schedule)?;
+        prepare_required_alias_lifetimes(
             &compiled,
             topology.coordinator,
-            &owners,
-            &materialized.replicas,
-            &materialized.output_bindings,
+            &mut owners,
+            &schedule.operations,
         )?;
+        let required_aliases = compile_required_aliases(&compiled, &owners, &schedule.operations)?;
+        let materialized = materialize_remote_demands(&compiled, &topology, &schedule, &owners)?;
+        let (storages, storage_bindings, in_place_aliases, output_storage) =
+            compile_partitioned_storage(
+                &compiled,
+                topology.coordinator,
+                &owners,
+                &materialized.replicas,
+                &materialized.output_bindings,
+                &required_aliases,
+            )?;
         let placement = FleetPlacementInput {
             topology,
             pow,
@@ -72,12 +80,70 @@ impl FleetProofPlan {
             spills: vec![],
             storages,
             storage_bindings,
-            in_place_aliases: vec![],
+            in_place_aliases,
             output_storage,
         };
         Self::lower_compiled(compiled, shape, placement, transcript)
             .map_err(FleetCompileError::Lowering)
     }
+}
+
+fn prepare_required_alias_lifetimes(
+    compiled: &CompiledProof,
+    coordinator: WorkerId,
+    owners: &mut [FleetOwnerPlacement],
+    operations: &[FleetOperationPlacement],
+) -> Result<(), FleetCompileError> {
+    for operation in compiled.operations() {
+        let effect = compiled
+            .effect_for(operation.id)
+            .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+        let placement = operation_placement(operations, operation.id)?;
+        for access in effect.accesses() {
+            let Some(alias) = access
+                .in_place()
+                .filter(|alias| alias.requirement == InPlaceAliasRequirement::Required)
+            else {
+                continue;
+            };
+            if !matches!(
+                placement.executions.as_slice(),
+                [FleetOperationExecution {
+                    worker,
+                    domain: OperationDomain::Monolithic,
+                }] if *worker == coordinator
+            ) {
+                continue;
+            }
+            let invalid = || FleetCompileError::RequiredAlias {
+                operation: operation.id,
+                alias: alias.id,
+            };
+            let source = access.source().ok_or_else(invalid)?.value;
+            let destination = access.destination().ok_or_else(invalid)?.value;
+            for range in [source, destination] {
+                let value = compiled.value(range.version).ok_or_else(invalid)?;
+                let full = full_range(value)?;
+                let matching = owners
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, owner)| {
+                        (owner.value.version == range.version).then_some((index, owner))
+                    })
+                    .collect::<Vec<_>>();
+                let [(index, owner)] = matching.as_slice() else {
+                    return Err(invalid());
+                };
+                if owner.worker != coordinator || owner.value.elements != full {
+                    return Err(invalid());
+                }
+                if range.version == source.version {
+                    owners[*index].live.end = placement.during.end;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compile_partitioned_owners(
@@ -153,11 +219,10 @@ fn output_owner_ranges(
         .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
     let mut ranges = Vec::new();
     for execution in &placement.executions {
-        for destination in effect
-            .accesses()
-            .iter()
-            .filter_map(|access| access.destination())
-        {
+        for access in effect.accesses() {
+            let Some(destination) = access.destination() else {
+                continue;
+            };
             let range = crate::fleet_plan::validate::projected_range(
                 compiled,
                 operation,
@@ -165,7 +230,13 @@ fn output_owner_ranges(
                 execution,
             )
             .map_err(FleetCompileError::Projection)?;
-            if range.version == value.version {
+            let carried = (execution.domain == OperationDomain::Monolithic)
+                .then(|| exact_partial_atomic_carry_forward(compiled.values(), access))
+                .flatten()
+                .filter(|carry| carry.full_destination.version == value.version);
+            if let Some(carry) = carried {
+                ranges.push((execution.worker, carry.full_destination.elements));
+            } else if range.version == value.version {
                 ranges.push((execution.worker, range.elements));
             }
         }

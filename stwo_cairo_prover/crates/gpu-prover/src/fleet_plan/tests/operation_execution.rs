@@ -517,6 +517,24 @@ fn exact_execution_rejects_required_in_place_alias() {
 }
 
 #[test]
+fn partitioned_compiler_keeps_exact_sharded_required_alias_fail_closed() {
+    let fixture = exact_required_alias_fixture();
+    assert!(matches!(
+        FleetProofPlan::compile_track_a_partitioned(
+            fixture.compiled,
+            fixture.shape,
+            fixture.placement.topology,
+            fixture.placement.pow,
+            transcript(),
+        ),
+        Err(FleetCompileError::RequiredAlias {
+            operation: EXACT_OPERATION,
+            alias: InPlaceAliasId(0),
+        })
+    ));
+}
+
+#[test]
 fn exact_spill_reclaim_conflicts_are_projected_to_each_worker_shard() {
     let plan = compile(exact_fixture()).unwrap();
     let operation = &plan.placement().operations[EXACT_OPERATION.0 as usize];

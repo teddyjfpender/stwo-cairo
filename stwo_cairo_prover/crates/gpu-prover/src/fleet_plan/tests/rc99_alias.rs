@@ -133,6 +133,21 @@ fn compile_rc99(fixture: Fixture) -> Result<FleetProofPlan, FleetCompileError> {
     )
 }
 
+fn compile_rc99_partitioned(mut fixture: Fixture) -> Result<FleetProofPlan, FleetCompileError> {
+    fixture.placement.topology.workers.push(WorkerSpec {
+        id: WorkerId(1),
+        capacity_bytes: 1 << 30,
+        exchange_reserve_bytes: 0,
+    });
+    FleetProofPlan::compile_track_a_partitioned(
+        fixture.compiled,
+        fixture.shape,
+        fixture.placement.topology,
+        fixture.placement.pow,
+        transcript(),
+    )
+}
+
 fn generated_sn2_chain() -> (Fixture, Vec<ValueVersion>) {
     rc99_fixture(&[
         AliasStep {
@@ -194,6 +209,44 @@ fn generated_sn2_big_then_small_rc99_is_one_linear_whole_storage_chain() {
         small.destination.unwrap().elements,
         range(0, SN2_SMALL_RC99_WORDS)
     );
+}
+
+#[test]
+fn partitioned_rc99_carry_forward_owns_and_aliases_each_full_destination() {
+    let (fixture, versions) = generated_sn2_chain();
+    let plan = compile_rc99_partitioned(fixture).unwrap();
+    let aliases = &plan.placement().in_place_aliases;
+    assert_eq!(aliases.len(), 2);
+    assert_eq!(aliases[0].storage, aliases[1].storage);
+    for version in versions {
+        let value = plan.compiled().value(version).unwrap();
+        let owners = plan
+            .placement()
+            .owners
+            .iter()
+            .filter(|owner| owner.value.version == version)
+            .collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].worker, WorkerId(0));
+        assert_eq!(
+            owners[0].value.elements,
+            range(0, value.layout.element_count().unwrap())
+        );
+        let bindings = plan
+            .placement()
+            .storage_bindings
+            .iter()
+            .filter(|binding| binding.value.version == version)
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].storage, aliases[0].storage);
+        assert_eq!(bindings[0].offset_bytes, 0);
+    }
+    assert_eq!(
+        plan.placement().storages[aliases[0].storage.0 as usize].bytes,
+        SN2_RC99_WORDS * size_of::<u32>()
+    );
+    plan.validate(transcript()).unwrap();
 }
 
 #[test]

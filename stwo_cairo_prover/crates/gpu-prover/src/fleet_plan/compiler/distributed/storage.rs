@@ -10,7 +10,16 @@ pub(super) fn compile_partitioned_storage(
     owners: &[FleetOwnerPlacement],
     replicas: &[FleetReplicaPlacement],
     output: &[OutputBinding],
-) -> Result<(Vec<StorageDesc>, Vec<FleetStoragePlacement>, StorageId), FleetCompileError> {
+    required_aliases: &[RequiredAlias],
+) -> Result<
+    (
+        Vec<StorageDesc>,
+        Vec<FleetStoragePlacement>,
+        Vec<InPlaceAliasPlacement>,
+        StorageId,
+    ),
+    FleetCompileError,
+> {
     let mut storages = Vec::new();
     let mut bindings = Vec::new();
     let mut locations = BTreeMap::<(WorkerId, ValueVersion), Vec<ElementRange>>::new();
@@ -28,6 +37,14 @@ pub(super) fn compile_partitioned_storage(
             .or_default()
             .push(value.elements);
     }
+    let alias_storages = allocate_alias_lineages(
+        compiled,
+        coordinator,
+        required_aliases,
+        &mut locations,
+        &mut storages,
+        &mut bindings,
+    )?;
     allocate_statement_lineages(
         compiled,
         coordinator,
@@ -57,6 +74,33 @@ pub(super) fn compile_partitioned_storage(
             .ok_or(FleetCompileError::InvalidOwnership(version))?;
         allocate_affine_locations(&mut storages, &mut bindings, worker, desc, &remainder)?;
     }
+    let in_place_aliases = required_aliases
+        .iter()
+        .map(|alias| {
+            Ok(InPlaceAliasPlacement {
+                operation: alias.operation,
+                alias: alias.alias,
+                storage: alias_storages
+                    .get(alias.source.version.0 as usize)
+                    .copied()
+                    .flatten()
+                    .ok_or(FleetCompileError::InvalidSemanticSchedule)?,
+                offset_bytes: alias
+                    .source
+                    .elements
+                    .start
+                    .checked_mul(
+                        compiled
+                            .value(alias.source.version)
+                            .ok_or(FleetCompileError::InvalidSemanticSchedule)?
+                            .layout
+                            .element
+                            .bytes,
+                    )
+                    .ok_or(FleetCompileError::SizeOverflow)?,
+            })
+        })
+        .collect::<Result<Vec<_>, FleetCompileError>>()?;
 
     let output_storage =
         StorageId(u32::try_from(storages.len()).map_err(|_| FleetCompileError::SizeOverflow)?);
@@ -87,7 +131,77 @@ pub(super) fn compile_partitioned_storage(
             offset_bytes: binding.offset_bytes,
         });
     }
-    Ok((storages, bindings, output_storage))
+    Ok((storages, bindings, in_place_aliases, output_storage))
+}
+
+fn allocate_alias_lineages(
+    compiled: &CompiledProof,
+    coordinator: WorkerId,
+    aliases: &[RequiredAlias],
+    locations: &mut BTreeMap<(WorkerId, ValueVersion), Vec<ElementRange>>,
+    storages: &mut Vec<StorageDesc>,
+    bindings: &mut Vec<FleetStoragePlacement>,
+) -> Result<Vec<Option<StorageId>>, FleetCompileError> {
+    let components = compile_alias_components(compiled.values().len(), aliases)?;
+    let component_count = components
+        .iter()
+        .flatten()
+        .max()
+        .map_or(0, |value| value + 1);
+    let mut value_storages = vec![None; compiled.values().len()];
+    for component in 0..component_count {
+        let versions = components
+            .iter()
+            .enumerate()
+            .filter_map(|(version, candidate)| (*candidate == Some(component)).then_some(version))
+            .map(|version| {
+                u32::try_from(version)
+                    .map(ValueVersion)
+                    .map_err(|_| FleetCompileError::SizeOverflow)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let storage =
+            StorageId(u32::try_from(storages.len()).map_err(|_| FleetCompileError::SizeOverflow)?);
+        let mut bytes = 0;
+        let mut alignment = 0;
+        for &version in &versions {
+            let value = compiled
+                .value(version)
+                .ok_or(FleetCompileError::InvalidOwnership(version))?;
+            bytes = bytes.max(
+                value
+                    .layout
+                    .logical_bytes()
+                    .map_err(|_| FleetCompileError::SizeOverflow)?,
+            );
+            alignment = alignment.max(value.alignment);
+        }
+        storages.push(StorageDesc {
+            id: storage,
+            worker: coordinator,
+            bytes,
+            alignment_bytes: alignment,
+        });
+        for version in versions {
+            let value = compiled
+                .value(version)
+                .ok_or(FleetCompileError::InvalidOwnership(version))?;
+            let full = full_range(value)?;
+            if locations.remove(&(coordinator, version)) != Some(vec![full]) {
+                return Err(FleetCompileError::InvalidOwnership(version));
+            }
+            value_storages[version.0 as usize] = Some(storage);
+            bindings.push(FleetStoragePlacement {
+                storage,
+                value: ValueRange {
+                    version,
+                    elements: full,
+                },
+                offset_bytes: 0,
+            });
+        }
+    }
+    Ok(value_storages)
 }
 
 fn allocate_statement_lineages(

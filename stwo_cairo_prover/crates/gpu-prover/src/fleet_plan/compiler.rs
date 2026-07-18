@@ -637,26 +637,6 @@ fn required_alias_error(alias: &RequiredAlias) -> FleetCompileError {
     }
 }
 
-fn reject_required_aliases(compiled: &CompiledProof) -> Result<(), FleetCompileError> {
-    for operation in compiled.operations() {
-        let effect = compiled
-            .effect_for(operation.id)
-            .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
-        for access in effect.accesses() {
-            if let Some(alias) = access
-                .in_place()
-                .filter(|alias| alias.requirement == InPlaceAliasRequirement::Required)
-            {
-                return Err(FleetCompileError::RequiredAlias {
-                    operation: operation.id,
-                    alias: alias.id,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 fn owner(owners: &[FleetOwnerPlacement], version: ValueVersion) -> Option<&FleetOwnerPlacement> {
     owners.iter().find(|owner| owner.value.version == version)
 }

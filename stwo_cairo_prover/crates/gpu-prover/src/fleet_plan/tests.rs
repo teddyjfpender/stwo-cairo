@@ -29,6 +29,7 @@ mod ipc_cursor;
 mod ipc_rank_install;
 mod operation_execution;
 mod operation_reads;
+mod partitioned_coordinator_alias;
 mod pow;
 mod rc99_alias;
 mod runtime_view;
