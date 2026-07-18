@@ -12,8 +12,11 @@ use stwo_backend_cuda::{
 
 use super::*;
 use crate::arena_plan::ProofArenaPlan;
-use crate::compiled_proof::ValueVersion;
+use crate::compiled_proof::{
+    AotInvocation, EffectContract, StaticCudaWrapperAuthority, StaticCudaWrapperId, ValueVersion,
+};
 
+mod challenge_execution;
 mod inventory;
 mod semantic;
 #[cfg(test)]
@@ -45,6 +48,8 @@ pub(super) struct LoweredRelationAccess {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct LoweredRelationChallenge {
     authority: RelationChallengeExpansionAuthority,
+    invocation: AotInvocation,
+    effect: EffectContract,
     drawn: RelationArenaRange,
     drawn_version: ValueVersion,
     alpha: RelationArenaRange,
@@ -56,6 +61,14 @@ pub(super) struct LoweredRelationChallenge {
 impl LoweredRelationChallenge {
     pub(super) const fn authority(&self) -> &RelationChallengeExpansionAuthority {
         &self.authority
+    }
+
+    pub(super) const fn invocation(&self) -> &AotInvocation {
+        &self.invocation
+    }
+
+    pub(super) const fn effect(&self) -> &EffectContract {
+        &self.effect
     }
 
     pub(super) const fn drawn_version(&self) -> ValueVersion {
@@ -174,16 +187,21 @@ pub(super) fn validate_from(
     }
 }
 
+pub(super) fn resolve_challenge_static_wrapper(
+    id: StaticCudaWrapperId,
+    target_sm: u32,
+    lowered: &LoweredRelation,
+) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError> {
+    validate_receipt(lowered)?;
+    challenge_execution::resolve_static_wrapper(id, target_sm, &lowered.challenge)
+}
+
 fn validate_receipt(lowered: &LoweredRelation) -> Result<(), InvocationShapeError> {
     lowered
         .authority
         .validate()
         .map_err(|_| InvocationShapeError::InvalidRelationAuthority)?;
-    lowered
-        .challenge
-        .authority
-        .validate()
-        .map_err(|_| InvocationShapeError::InvalidRelationAuthority)?;
+    challenge_execution::validate(&lowered.challenge)?;
     if lowered.challenge.authority.max_alpha_powers()
         != lowered.authority.program().max_alpha_powers
         || lowered.roles.len() != lowered.authority.values().len()
@@ -215,6 +233,15 @@ fn receipt_digest(lowered: &LoweredRelation) -> Result<[u8; 32], InvocationShape
     hasher.update(RECEIPT_DOMAIN);
     hasher.update(&lowered.authority.identity());
     hasher.update(&lowered.challenge.authority.identity());
+    hasher.update(
+        lowered
+            .challenge
+            .invocation
+            .contract_id()
+            .map_err(|_| InvocationShapeError::InvalidRelationBinding)?
+            .as_bytes(),
+    );
+    hasher.update(lowered.challenge.effect.id().as_bytes());
     hash_range(&mut hasher, lowered.challenge.drawn);
     hash_version(&mut hasher, Some(lowered.challenge.drawn_version));
     hash_range(&mut hasher, lowered.challenge.alpha);

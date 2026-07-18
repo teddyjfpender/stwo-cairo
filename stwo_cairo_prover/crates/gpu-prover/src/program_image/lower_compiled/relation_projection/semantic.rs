@@ -30,34 +30,12 @@ pub(super) fn lower(
     ),
     InvocationShapeError,
 > {
-    let challenge = lower_challenge(challenge_authority, inventory, values)?;
+    let challenge = challenge_execution::lower(challenge_authority, inventory, values)?;
     let mut states = initial_states(authority, inventory, &challenge, values)?;
     let body = lower_wrapper(&authority.wrappers()[0], inventory, values, &mut states)?;
     let tail = lower_wrapper(&authority.wrappers()[1], inventory, values, &mut states)?;
     let roles = finish_roles(authority, states)?;
     Ok((challenge, roles, [body, tail]))
-}
-
-fn lower_challenge(
-    authority: &RelationChallengeExpansionAuthority,
-    inventory: &RelationInventory,
-    values: &mut adapter::SemanticValueMap,
-) -> Result<LoweredRelationChallenge, InvocationShapeError> {
-    let drawn = inventory.drawn();
-    let drawn_version = values.version(drawn.catalog)?;
-    let alpha = inventory.role(RelationValueRole::AlphaPowers)?;
-    let z = inventory.role(RelationValueRole::ChallengeZ)?;
-    let alpha_version = values.allocate_output(alpha.catalog)?;
-    let z_version = values.allocate_output(z.catalog)?;
-    Ok(LoweredRelationChallenge {
-        authority: authority.clone(),
-        drawn,
-        drawn_version,
-        alpha,
-        alpha_version,
-        z,
-        z_version,
-    })
 }
 
 fn initial_states(

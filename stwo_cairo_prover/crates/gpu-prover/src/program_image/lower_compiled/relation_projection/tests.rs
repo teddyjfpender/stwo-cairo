@@ -7,6 +7,7 @@ use stwo_backend_cuda::{
 };
 
 use super::*;
+use crate::compiled_proof::{AotArgumentBinding, AotArgumentValue, EffectAccess, EffectBindingId};
 use crate::shape_executable::ShapeExecutable;
 
 struct Fixture {
@@ -81,6 +82,35 @@ fn generated_sn2_transaction_is_expansion_body_tail_exact() {
     );
     assert_eq!(expansion.child().grid, [1, 1, 1]);
     assert_eq!(expansion.child().block, [1, 1, 1]);
+    assert_eq!(
+        fixture.lowered.challenge().invocation().arguments,
+        vec![
+            AotArgumentBinding {
+                ordinal: 0,
+                value: AotArgumentValue::DevicePointer(Some(EffectBindingId(0))),
+            },
+            AotArgumentBinding {
+                ordinal: 1,
+                value: AotArgumentValue::DevicePointer(Some(EffectBindingId(1))),
+            },
+            AotArgumentBinding {
+                ordinal: 2,
+                value: AotArgumentValue::U32(expansion.max_alpha_powers()),
+            },
+            AotArgumentBinding {
+                ordinal: 3,
+                value: AotArgumentValue::DevicePointer(Some(EffectBindingId(2))),
+            },
+        ]
+    );
+    assert!(matches!(
+        fixture.lowered.challenge().effect().accesses(),
+        [
+            EffectAccess::Read { .. },
+            EffectAccess::Write { .. },
+            EffectAccess::Write { .. }
+        ]
+    ));
 
     let [body, tail] = fixture.lowered.wrappers();
     assert_eq!(body.authority().stage, RelationExecutionStage::FusedBody);
@@ -218,4 +248,13 @@ fn failure_and_validation_are_whole_transaction_atomic() {
         &changed,
     )
     .is_err());
+}
+
+#[test]
+fn challenge_invocation_tamper_fails_even_with_a_rehashed_receipt() {
+    let fixture = fixture();
+    let mut changed = fixture.lowered.clone();
+    changed.challenge.invocation.arguments[0].value = AotArgumentValue::U32(0);
+    changed.digest = receipt_digest(&changed).unwrap();
+    assert!(validate_receipt(&changed).is_err());
 }
