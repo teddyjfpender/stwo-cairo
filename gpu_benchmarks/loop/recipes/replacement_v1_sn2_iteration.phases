@@ -4,6 +4,7 @@
 # caches; then runs one six-repetition, byte-identical, verifier-backed SN2
 # checkpoint. Promotion-only carry, Stage-4, counter, and profiler gates stay in
 # replacement_v1_sn2_{sealed,timing_only}.phases.
+# pod_run: lease one_shot=false final_action=stop gpu=h100 gpu_count=1 min_vcpu=16 min_mem_gb=62 max_usd_hr=3.00 name_prefix=replacement-v1-sn2- ttl_hours=1.5 idle_min=15
 
 # shellcheck disable=SC2034 # Consumed by the sourced common recipe.
 REPLACEMENT_SN2_COUNTER_POLICY='timing-only'
