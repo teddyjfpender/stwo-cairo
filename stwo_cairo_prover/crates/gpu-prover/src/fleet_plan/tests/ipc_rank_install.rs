@@ -11,6 +11,72 @@ fn view() -> FleetRuntimeView {
     compile(transfer_fixture()).unwrap().runtime_view().unwrap()
 }
 
+fn four_rank_view() -> FleetRuntimeView {
+    let mut fixture = transfer_fixture();
+    let releases = fixture.placement.barrier_steps.clone();
+    for rank in 2u16..4 {
+        let worker = WorkerId(rank);
+        let edge = u32::from(rank - 1);
+        fixture.placement.topology.workers.push(WorkerSpec {
+            id: worker,
+            capacity_bytes: 1024,
+            exchange_reserve_bytes: 0,
+        });
+        fixture
+            .placement
+            .barrier_arrivals
+            .extend(
+                releases
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, release)| BarrierArrival {
+                        barrier_ordinal: ordinal as u32,
+                        worker,
+                        ready_step: ScheduleStep(release.0 - 1),
+                    }),
+            );
+        fixture.placement.barrier_arrivals.push(BarrierArrival {
+            barrier_ordinal: releases.len() as u32,
+            worker,
+            ready_step: *releases.last().unwrap(),
+        });
+
+        let mut link = fixture.placement.topology.links[0];
+        link.id = FleetLinkId(rank - 1);
+        link.destination = worker;
+        fixture.placement.topology.links.push(link);
+
+        let mut replica = fixture.placement.replicas[0].clone();
+        replica.id = ReplicaId(edge);
+        replica.worker = worker;
+        replica.origin = ReplicaOrigin::Transition(LayoutTransitionId(edge));
+        fixture.placement.replicas.push(replica);
+
+        let mut transition = fixture.placement.transitions[0].clone();
+        transition.id = LayoutTransitionId(edge);
+        transition.destination_replica = ReplicaId(edge);
+        transition.scratch_worker = worker;
+        transition.route = FleetLinkId(rank - 1);
+        fixture.placement.transitions.push(transition);
+
+        let template = *fixture.placement.storages.last().unwrap();
+        let storage = StorageId(fixture.placement.storages.len() as u32);
+        fixture.placement.storages.push(StorageDesc {
+            id: storage,
+            worker,
+            ..template
+        });
+        let mut binding = *fixture.placement.storage_bindings.last().unwrap();
+        binding.storage = storage;
+        fixture.placement.storage_bindings.push(binding);
+    }
+    let owner = &mut fixture.placement.topology.workers[0];
+    let reserve = 3 * stwo_backend_cuda::IPC_EXCHANGE_ALLOCATION_ALIGNMENT;
+    owner.capacity_bytes += reserve - owner.exchange_reserve_bytes;
+    owner.exchange_reserve_bytes = reserve;
+    compile(fixture).unwrap().runtime_view().unwrap()
+}
+
 fn domain(byte: u8) -> IpcExchangeInstallDomain {
     IpcExchangeInstallDomain::from_digest([byte; 32]).unwrap()
 }
@@ -110,6 +176,59 @@ fn two_rank_bundle_is_dense_plan_bound_and_digest_stable() {
     assert!(statements[1].descriptors().is_empty());
     assert_eq!(bundle.descriptors().len(), view.spans().len());
     assert_eq!(bundle.descriptor_digest(), repeat.descriptor_digest());
+}
+
+#[test]
+fn four_rank_bundle_binds_every_rank_and_multi_edge_owner() {
+    let view = four_rank_view();
+    let install_domain = domain(0x79);
+    let descriptors = view
+        .spans()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, span)| {
+            descriptor(
+                &view,
+                install_domain,
+                GENERATION,
+                span.edge_ordinal,
+                u32::from(span.owner.0),
+                u32::from(span.peer.0),
+                span.logical_bytes(),
+                0x50 + ordinal as u8,
+            )
+        })
+        .collect::<Vec<_>>();
+    let statements = (0u16..4)
+        .map(|rank| {
+            FleetIpcRankDescriptorStatement::test_only(
+                view.plan_identity(),
+                WorkerId(rank),
+                GENERATION,
+                install_domain,
+                if rank == 0 {
+                    descriptors.clone()
+                } else {
+                    vec![]
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let references = statements.iter().collect::<Vec<_>>();
+    let bundle = FleetIpcDescriptorBundle::join(&view, &references).unwrap();
+    let repeat = FleetIpcDescriptorBundle::join(&view, &references).unwrap();
+
+    assert_eq!(view.exchange_reserves().len(), 4);
+    assert_eq!(view.spans().len(), 3);
+    assert_eq!(bundle.descriptors(), descriptors);
+    assert_eq!(bundle.descriptor_digest(), repeat.descriptor_digest());
+    assert!(matches!(
+        FleetIpcDescriptorBundle::join(&view, &references[..3]),
+        Err(FleetIpcRankInstallError::DescriptorStatementCount {
+            expected: 4,
+            actual: 3
+        })
+    ));
 }
 
 #[test]

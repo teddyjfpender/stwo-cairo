@@ -1,4 +1,4 @@
-//! Rank-local live CUDA-IPC installation for one exact two-worker plan.
+//! Rank-local live CUDA-IPC installation for one exact multi-worker plan.
 //!
 //! CUDA context authority never leaves this process. Copyable descriptor and
 //! acknowledgement statements are transport payloads only; the controller must
@@ -19,7 +19,11 @@ const DESCRIPTOR_DIGEST_TAG: &[u8] = b"stwo-cairo.fleet-ipc-descriptors.v1\0";
 pub(crate) enum FleetIpcRankInstallError {
     Cursor(FleetIpcCursorError),
     Cuda(IpcExchangeError),
-    ExpectedTwoWorkers(usize),
+    ExpectedMultiWorker(usize),
+    DescriptorStatementCount {
+        expected: usize,
+        actual: usize,
+    },
     MissingRuntimeDevice(WorkerId),
     DescriptorStatementOrder {
         expected: WorkerId,
@@ -113,18 +117,31 @@ impl FleetIpcDescriptorBundle {
         view: &FleetRuntimeView,
         statements: [&FleetIpcRankDescriptorStatement; 2],
     ) -> Result<Self, FleetIpcRankInstallError> {
-        require_two_workers(view)?;
-        for (ordinal, statement) in statements.iter().enumerate() {
-            let expected = WorkerId(ordinal as u16);
-            if statement.worker != expected {
+        Self::join(view, &statements)
+    }
+
+    pub(crate) fn join(
+        view: &FleetRuntimeView,
+        statements: &[&FleetIpcRankDescriptorStatement],
+    ) -> Result<Self, FleetIpcRankInstallError> {
+        require_multi_worker(view)?;
+        if statements.len() != view.exchange_reserves().len() {
+            return Err(FleetIpcRankInstallError::DescriptorStatementCount {
+                expected: view.exchange_reserves().len(),
+                actual: statements.len(),
+            });
+        }
+        let first = statements[0];
+        for (reserve, statement) in view.exchange_reserves().iter().zip(statements) {
+            if statement.worker != reserve.worker {
                 return Err(FleetIpcRankInstallError::DescriptorStatementOrder {
-                    expected,
+                    expected: reserve.worker,
                     actual: statement.worker,
                 });
             }
             if statement.plan_identity != view.plan_identity()
-                || statement.proof_generation != statements[0].proof_generation
-                || statement.install_domain != statements[0].install_domain
+                || statement.proof_generation != first.proof_generation
+                || statement.install_domain != first.install_domain
             {
                 return Err(FleetIpcRankInstallError::DescriptorStatementMismatch(
                     statement.worker,
@@ -139,35 +156,40 @@ impl FleetIpcDescriptorBundle {
         descriptors.sort_unstable_by_key(|descriptor| descriptor.key().edge_id());
         validate_descriptor_geometry(
             view,
-            statements[0].proof_generation,
-            statements[0].install_domain,
+            first.proof_generation,
+            first.install_domain,
             &descriptors,
         )?;
         for descriptor in &descriptors {
-            let owner = WorkerId(descriptor.key().owner_rank() as u16);
-            let statement = &statements[usize::from(owner.0)];
-            if statement.worker != owner
-                || !statement
-                    .descriptors
-                    .iter()
-                    .any(|candidate| candidate.encode() == descriptor.encode())
-            {
-                return Err(FleetIpcRankInstallError::DescriptorKeyMismatch(
-                    descriptor.key().edge_id(),
-                ));
+            let edge = descriptor.key().edge_id();
+            let owner = WorkerId(
+                u16::try_from(descriptor.key().owner_rank())
+                    .map_err(|_| FleetIpcRankInstallError::DescriptorKeyMismatch(edge))?,
+            );
+            let statement = statements
+                .iter()
+                .find(|statement| statement.worker == owner);
+            if statement.is_none_or(|statement| {
+                statement.worker != owner
+                    || !statement
+                        .descriptors
+                        .iter()
+                        .any(|candidate| candidate.encode() == descriptor.encode())
+            }) {
+                return Err(FleetIpcRankInstallError::DescriptorKeyMismatch(edge));
             }
         }
 
         let descriptor_digest = descriptor_digest(
             view.plan_identity(),
-            statements[0].proof_generation,
-            statements[0].install_domain,
+            first.proof_generation,
+            first.install_domain,
             &descriptors,
         );
         Ok(Self {
             plan_identity: view.plan_identity(),
-            proof_generation: statements[0].proof_generation,
-            install_domain: statements[0].install_domain,
+            proof_generation: first.proof_generation,
+            install_domain: first.install_domain,
             descriptor_digest,
             descriptors: descriptors.into_boxed_slice(),
         })
@@ -213,7 +235,7 @@ impl<'context> FleetIpcRankOwnerExports<'context> {
         context: &'context CudaExecContext,
         roster: &[(WorkerId, CudaDeviceUuid)],
     ) -> Result<Self, FleetIpcRankInstallError> {
-        require_two_workers(view)?;
+        require_multi_worker(view)?;
         let identity = cuda_context_device_identity(context)?;
         let binding = FleetIpcRuntimeRosterBinding::bind_local(
             view,
@@ -410,12 +432,12 @@ impl FleetIpcRankInstallAcknowledgement {
     }
 }
 
-fn require_two_workers(view: &FleetRuntimeView) -> Result<(), FleetIpcRankInstallError> {
+fn require_multi_worker(view: &FleetRuntimeView) -> Result<(), FleetIpcRankInstallError> {
     let actual = view.exchange_reserves().len();
-    if actual == 2 {
+    if matches!(actual, 2 | 4 | 8 | 16) {
         Ok(())
     } else {
-        Err(FleetIpcRankInstallError::ExpectedTwoWorkers(actual))
+        Err(FleetIpcRankInstallError::ExpectedMultiWorker(actual))
     }
 }
 
