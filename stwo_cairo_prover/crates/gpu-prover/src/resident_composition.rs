@@ -72,6 +72,49 @@ pub(crate) fn prepare_resident_composition<'a>(
     current_plan: &CompositionPlan,
     proof_bindings: &CompositionProofBindings,
 ) -> Result<PreparedCompositionGraph<'a>, ResidentCompositionError> {
+    prepare_resident_composition_with_admission(
+        workspace,
+        relation,
+        current_plan,
+        proof_bindings,
+        ResidentCompositionAdmission::ProductionWave,
+    )
+}
+
+/// Diagnostic-only resident binder for the resource-bounded ordinary-stripe
+/// candidate. It shares every production input and the exact direct-split
+/// output boundary; only the constraint-body launch topology changes.
+#[cfg(feature = "direct-retention-test-api")]
+#[doc(hidden)]
+pub fn prepare_resident_composition_resource_bounded_stripes_for_test<'a>(
+    workspace: &'a GraphWorkspace,
+    relation: &PreparedRelationGraph<'a>,
+    current_plan: &CompositionPlan,
+    proof_bindings: &CompositionProofBindings,
+) -> Result<PreparedCompositionGraph<'a>, ResidentCompositionError> {
+    prepare_resident_composition_with_admission(
+        workspace,
+        relation,
+        current_plan,
+        proof_bindings,
+        ResidentCompositionAdmission::ResourceBoundedStripes,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ResidentCompositionAdmission {
+    ProductionWave,
+    #[cfg(feature = "direct-retention-test-api")]
+    ResourceBoundedStripes,
+}
+
+fn prepare_resident_composition_with_admission<'a>(
+    workspace: &'a GraphWorkspace,
+    relation: &PreparedRelationGraph<'a>,
+    current_plan: &CompositionPlan,
+    proof_bindings: &CompositionProofBindings,
+    admission: ResidentCompositionAdmission,
+) -> Result<PreparedCompositionGraph<'a>, ResidentCompositionError> {
     let cached = workspace.plan().composition();
     let current_plan = require_current_composition_plan(&cached.plan, current_plan)?;
     let claimed_sums = current_plan
@@ -152,20 +195,47 @@ pub(crate) fn prepare_resident_composition<'a>(
             })
             .collect::<Result<Vec<_>, ResidentCompositionError>>()?;
     let direct_split = composition_direct_split_binding(workspace, cached)?;
-    Ok(
-        PreparedCompositionGraph::prepare_with_proof_bindings_and_direct_split(
-            workspace.arena(),
-            &cached.plan,
-            proof_bindings,
-            &cached.trace_topology(),
-            &inputs,
-            &cached.slots,
-            cached.requirements.mode,
-            cached.direct_retention.as_ref(),
-            &direct_evaluations,
-            direct_split,
-        )?,
-    )
+    match admission {
+        ResidentCompositionAdmission::ProductionWave => Ok(
+            PreparedCompositionGraph::prepare_with_proof_bindings_and_direct_split(
+                workspace.arena(),
+                &cached.plan,
+                proof_bindings,
+                &cached.trace_topology(),
+                &inputs,
+                &cached.slots,
+                cached.requirements.mode,
+                cached.direct_retention.as_ref(),
+                &direct_evaluations,
+                direct_split,
+            )?,
+        ),
+        #[cfg(feature = "direct-retention-test-api")]
+        ResidentCompositionAdmission::ResourceBoundedStripes => {
+            let retention = cached.direct_retention.as_ref().ok_or(
+                ResidentCompositionError::DirectSplitTopology(
+                    "resource-bounded stripes require direct retention",
+                ),
+            )?;
+            let direct_split =
+                direct_split.ok_or(ResidentCompositionError::DirectSplitTopology(
+                    "resource-bounded stripes require direct-split output",
+                ))?;
+            Ok(
+                PreparedCompositionGraph::prepare_resource_bounded_stripes_for_test(
+                    workspace.arena(),
+                    &cached.plan,
+                    proof_bindings,
+                    &cached.trace_topology(),
+                    &inputs,
+                    &cached.slots,
+                    retention,
+                    &direct_evaluations,
+                    direct_split,
+                )?,
+            )
+        }
+    }
 }
 
 fn composition_direct_split_binding(

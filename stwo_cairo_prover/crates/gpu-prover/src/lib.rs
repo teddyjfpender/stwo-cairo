@@ -86,6 +86,9 @@ pub use prover::{
     CairoBackend, FleetResidentBlake2sProof, FleetResidentProofTelemetry, GpuCairoProver,
     GpuProverConfig, MirroredResidentBlake2sProof, ResidentTranscriptMirrorTelemetry,
 };
+#[cfg(feature = "direct-retention-test-api")]
+#[doc(hidden)]
+pub use resident_composition::prepare_resident_composition_resource_bounded_stripes_for_test;
 pub use resident_composition::ResidentCompositionError;
 pub use resident_oods::{ResidentOodsError, ResidentQuotientNumeratorReceipt};
 pub use resident_session::{

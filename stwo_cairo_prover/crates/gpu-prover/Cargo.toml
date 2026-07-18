@@ -76,6 +76,10 @@ required-features = ["direct-retention-test-api"]
 name = "prepared_composition_wave_native"
 required-features = ["direct-retention-test-api"]
 
+[[test]]
+name = "prepared_composition_stripes_direct_native"
+required-features = ["direct-retention-test-api"]
+
 [dependencies.stwo-cairo-dev-utils]
 path = "../dev_utils"
 optional = true

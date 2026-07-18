@@ -39,6 +39,7 @@ pub(super) fn prepare_aot_kernel<'a>(
             kernel: kernel_index,
         }
     })?;
+    let source_identity = aot::emitted_source_identity(&kernel.source);
     let name = CString::new(kernel.kernel_name.as_bytes()).map_err(|_| {
         PreparedCompositionError::KernelNameContainsNul {
             component,
@@ -64,10 +65,12 @@ pub(super) fn prepare_aot_kernel<'a>(
             kernel_index,
             u32::try_from(row_count).map_err(|_| PreparedCompositionError::SizeOverflow)?,
             kernel,
+            source_identity,
         )?),
     };
     Ok(PreparedKernel {
         source,
+        source_identity,
         name,
         cache_key: kernel.cache_key,
         semantic_hash: kernel.semantic_hash,
@@ -162,6 +165,7 @@ fn install_resource_bounded<'a>(
     kernel_index: usize,
     row_count: u32,
     kernel: &CompositionKernelPart,
+    source_identity: [u8; 32],
 ) -> Result<aot::InstalledAotFunction<'a>, PreparedCompositionError> {
     let snapshot = cuda_device_snapshot()?;
     let target_sm = current_target_sm(snapshot).ok_or(
@@ -180,7 +184,14 @@ fn install_resource_bounded<'a>(
                 target_sm,
             },
         )?;
-    validate_authority(component, kernel_index, kernel, target_sm, authority)?;
+    validate_authority(
+        component,
+        kernel_index,
+        kernel,
+        source_identity,
+        target_sm,
+        authority,
+    )?;
     let launch = stripe_launch_facts(row_count)?;
     let installed = aot::InstalledAotFunction::install(arena.context(), authority, launch)
         .map_err(
@@ -209,6 +220,7 @@ fn validate_authority(
     component: usize,
     kernel_index: usize,
     kernel: &CompositionKernelPart,
+    source_identity: [u8; 32],
     target_sm: u32,
     authority: aot::AotKernelAuthority,
 ) -> Result<(), PreparedCompositionError> {
@@ -219,7 +231,7 @@ fn validate_authority(
             "manifest identity",
         ),
         (
-            authority.source_identity() == aot::emitted_source_identity(&kernel.source),
+            authority.source_identity() == source_identity,
             "source identity",
         ),
         (
@@ -432,14 +444,7 @@ fn require_resource_bounded(
             "semantic hash",
         ),
         (
-            receipt.source_identity()
-                == aot::emitted_source_identity(kernel.source.to_str().map_err(|_| {
-                    PreparedCompositionError::CompositionStripeAotReceiptDrift {
-                        component,
-                        kernel: kernel_index,
-                        field: "source UTF-8",
-                    }
-                })?),
+            receipt.source_identity() == kernel.source_identity,
             "source identity",
         ),
         (receipt.cubin_identity() != [0; 32], "cubin identity"),

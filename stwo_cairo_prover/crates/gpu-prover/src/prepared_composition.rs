@@ -354,6 +354,7 @@ pub struct CompositionStripeResourceReceipt {
     pub cache_key: u64,
     pub semantic_hash: u64,
     pub target_sm: u32,
+    pub source_identity: [u8; 32],
     pub cubin_identity: [u8; 32],
     pub launch: aot::InstalledAotLaunchFacts,
     pub resources: aot::InstalledAotFunctionResources,
@@ -1668,6 +1669,7 @@ impl DescriptorAllocator {
 
 struct PreparedKernel<'a> {
     source: CString,
+    source_identity: [u8; 32],
     name: CString,
     cache_key: u64,
     semantic_hash: u64,
@@ -2119,6 +2121,41 @@ impl<'a> PreparedCompositionGraph<'a> {
         let boundary = graph.resource_bounded_stripe_boundary_receipt_for_test()?;
         require_resource_bounded_direct_boundary(&boundary)?;
         Ok(graph)
+    }
+
+    /// Source-JIT wave baseline at the exact direct-retained output boundary.
+    ///
+    /// This exists only so a diagnostic can compare wave and stripe constraint
+    /// bodies without changing production selection. It grants no AOT-pack or
+    /// performance-promotion credit.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "direct-retention-test-api")]
+    #[doc(hidden)]
+    pub fn prepare_wave_direct_retained_jit_for_test(
+        arena: &'a DeviceArena,
+        plan: &CompositionPlan,
+        proof_bindings: &CompositionProofBindings,
+        trace: &CompositionTraceTopology,
+        inputs: &CompositionDeviceInputs,
+        slots: &CompositionWorkspaceSlots,
+        direct_retention: &DirectCompositionRetentionPlan,
+        direct_evaluations: &[CompositionDirectEvaluationBinding],
+        direct_split: CompositionDirectSplitBinding,
+    ) -> Result<Self, PreparedCompositionError> {
+        Self::prepare_impl(
+            arena,
+            plan,
+            Some(proof_bindings),
+            trace,
+            inputs,
+            slots,
+            CompositionLaunchMode::Wave,
+            Some(direct_retention),
+            direct_evaluations,
+            Some(direct_split),
+            CompositionAotAdmission::SourceJitTest,
+            CompositionStripeAdmission::Wrapper,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3003,6 +3040,7 @@ impl<'a> PreparedCompositionGraph<'a> {
                                 cache_key: receipt.cache_key(),
                                 semantic_hash: receipt.semantic_hash(),
                                 target_sm: receipt.target_sm(),
+                                source_identity: receipt.source_identity(),
                                 cubin_identity: receipt.cubin_identity(),
                                 launch: receipt.launch(),
                                 resources: receipt.resources(),
