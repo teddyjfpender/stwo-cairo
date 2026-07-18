@@ -20,25 +20,44 @@ pub(super) fn project_wrapper(
     linked
         .validate(&lowered.authority)
         .map_err(|_| InvocationShapeError::InvalidBaseCommitAuthority)?;
-    let local = lowered
-        .operations
+    project_wrapper_parts(
+        id,
+        linked.module_build_identity(),
+        linked.target_sm(),
+        linked.identity(),
+        &lowered.authority,
+        &lowered.operations,
+        operation_ordinal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in super::super) fn project_wrapper_parts(
+    id: StaticCudaWrapperId,
+    module_build_identity: [u8; 32],
+    target_sm: u32,
+    linked_identity: [u8; 32],
+    authority: &BaseCommitProgramAuthority,
+    operations: &[LoweredBaseCommitOperation],
+    operation_ordinal: usize,
+) -> Result<StaticCudaWrapperAuthority, InvocationShapeError> {
+    let local = operations
         .get(operation_ordinal)
         .ok_or(InvocationShapeError::InvalidBaseCommitBinding)?;
-    let exact = lowered
-        .authority
+    let exact = authority
         .operations()
         .get(operation_ordinal)
         .filter(|exact| local.ordinal as usize == operation_ordinal && *exact == &local.authority)
         .ok_or(InvocationShapeError::InvalidBaseCommitBinding)?;
     StaticCudaWrapperAuthority::new_with_execution_steps(
         id,
-        linked.module_build_identity(),
-        linked.target_sm(),
+        module_build_identity,
+        target_sm,
         exact.abi.wrapper_symbol().as_bytes().to_vec(),
         exact.abi_identity,
         exact.effect.identity,
         exact.identity,
-        linked.identity(),
+        linked_identity,
         project_steps(exact)?,
         local
             .invocation

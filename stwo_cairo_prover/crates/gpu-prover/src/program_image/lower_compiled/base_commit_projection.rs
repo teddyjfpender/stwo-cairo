@@ -22,7 +22,8 @@ mod static_execution;
 #[cfg(test)]
 mod tests;
 
-use bindings::BaseCommitInventory;
+pub(super) use bindings::{BaseCommitInventory, CommitInventoryKind};
+pub(super) use static_execution::project_wrapper_parts;
 
 const RECEIPT_DOMAIN: &[u8] = b"stwo-cairo.lowered-base-commit.v1\0";
 
@@ -122,11 +123,14 @@ pub(super) fn lower_stage(
     authority
         .validate()
         .map_err(|_| InvocationShapeError::InvalidBaseCommitAuthority)?;
-    let inventory = BaseCommitInventory::compile(arena, planned, &authority)?;
-
     let mut next_values = values.clone();
-    inventory.install_external_inputs(&mut next_values)?;
-    let operations = semantic::lower_operations(arena, &authority, &inventory, &mut next_values)?;
+    let operations = lower_semantics(
+        CommitInventoryKind::Base,
+        arena,
+        planned,
+        &authority,
+        &mut next_values,
+    )?;
     let digest = receipt_digest(&authority, &operations)?;
     let lowered = LoweredBaseCommit {
         authority,
@@ -136,6 +140,18 @@ pub(super) fn lower_stage(
     validate_receipt(&lowered)?;
     *values = next_values;
     Ok(lowered)
+}
+
+pub(super) fn lower_semantics(
+    kind: CommitInventoryKind,
+    arena: &ProofArenaPlan,
+    planned: &crate::arena_plan::PlannedCommitment,
+    authority: &BaseCommitProgramAuthority,
+    values: &mut adapter::SemanticValueMap,
+) -> Result<Vec<LoweredBaseCommitOperation>, InvocationShapeError> {
+    let inventory = BaseCommitInventory::compile_for(kind, arena, planned, authority)?;
+    inventory.install_external_inputs(values)?;
+    semantic::lower_operations(arena, authority, &inventory, values)
 }
 
 /// Rebuild from the pre-stage allocator. This is the append cursor's equality
@@ -204,9 +220,17 @@ fn receipt_digest(
     authority: &BaseCommitProgramAuthority,
     operations: &[LoweredBaseCommitOperation],
 ) -> Result<[u8; 32], InvocationShapeError> {
+    receipt_digest_parts(RECEIPT_DOMAIN, authority.identity(), operations)
+}
+
+pub(super) fn receipt_digest_parts(
+    domain: &[u8],
+    authority_identity: [u8; 32],
+    operations: &[LoweredBaseCommitOperation],
+) -> Result<[u8; 32], InvocationShapeError> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(RECEIPT_DOMAIN);
-    hasher.update(&authority.identity());
+    hasher.update(domain);
+    hasher.update(&authority_identity);
     hash_size(&mut hasher, operations.len())?;
     for operation in operations {
         hasher.update(&operation.ordinal.to_le_bytes());

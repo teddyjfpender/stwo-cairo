@@ -27,11 +27,11 @@ use crate::resident_runtime::producer_schedule::WitnessProducer;
 use crate::resident_runtime::producer_schedule::{BaseProducerSchedule, WitnessProducerKind};
 
 mod adapter;
+mod base_commit_projection;
 mod blake_g_direct_execution_authority;
 mod blake_g_direct_prefix;
 #[cfg(test)]
 mod blake_g_direct_tests;
-mod base_commit_projection;
 mod compiled_base_prefix;
 #[cfg(test)]
 mod compiled_base_prefix_tests;
@@ -42,6 +42,7 @@ mod ec_op_prefix;
 mod ec_op_setup_sources;
 mod execution_tables;
 mod fixed_table_materialization;
+mod interaction_commit_projection;
 mod loaded_authority;
 mod loaded_base_binding;
 mod loaded_writer_binding;
@@ -277,6 +278,8 @@ enum InvocationShapeError {
     InvalidFixedTableBinding,
     InvalidBaseCommitAuthority,
     InvalidBaseCommitBinding,
+    InvalidInteractionCommitAuthority,
+    InvalidInteractionCommitBinding,
 }
 
 fn validate_invocation(

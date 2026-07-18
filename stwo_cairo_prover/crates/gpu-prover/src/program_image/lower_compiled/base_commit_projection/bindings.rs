@@ -1,4 +1,4 @@
-//! Exact arena-role inventory for the BaseCommit authority.
+//! Exact arena-role inventory for canonical Base/Interaction commit semantics.
 
 use std::collections::BTreeMap;
 
@@ -9,9 +9,46 @@ use stwo_backend_cuda::{
 
 use super::*;
 use crate::arena_plan::{
-    BufferLifetime, BufferPurpose, CommitmentColumnSource, PlannedCommitment, ProofEpoch,
+    BufferLifetime, BufferPurpose, CommitmentColumnSource, CommitmentTreeId, PlannedCommitment,
+    ProofEpoch,
 };
 use crate::compiled_proof::ElementRange;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in super::super) enum CommitInventoryKind {
+    Base,
+    Interaction,
+}
+
+impl CommitInventoryKind {
+    const fn tree(self) -> CommitmentTreeId {
+        match self {
+            Self::Base => CommitmentTreeId::Base,
+            Self::Interaction => CommitmentTreeId::Interaction,
+        }
+    }
+
+    const fn epoch(self) -> ProofEpoch {
+        match self {
+            Self::Base => ProofEpoch::BaseCommit,
+            Self::Interaction => ProofEpoch::InteractionCommit,
+        }
+    }
+
+    const fn source_purpose(self) -> BufferPurpose {
+        match self {
+            Self::Base => BufferPurpose::BaseCoefficients,
+            Self::Interaction => BufferPurpose::InteractionCoefficients,
+        }
+    }
+
+    const fn trace_purpose(self) -> BufferPurpose {
+        match self {
+            Self::Base => BufferPurpose::BaseTrace,
+            Self::Interaction => BufferPurpose::InteractionTrace,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ExactArenaValue {
@@ -20,7 +57,7 @@ struct ExactArenaValue {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct BaseCommitInventory {
+pub(in super::super) struct BaseCommitInventory {
     roles: BTreeMap<BaseCommitValueRole, ExactArenaValue>,
     inverse_twiddles: ExactArenaValue,
     forward_twiddles: ExactArenaValue,
@@ -34,16 +71,26 @@ impl BaseCommitInventory {
         planned: &PlannedCommitment,
         authority: &BaseCommitProgramAuthority,
     ) -> Result<Self, InvocationShapeError> {
-        if planned.storage_mode != ProgressiveCommitStorageMode::InPlaceSlab
+        Self::compile_for(CommitInventoryKind::Base, arena, planned, authority)
+    }
+
+    pub(in super::super) fn compile_for(
+        kind: CommitInventoryKind,
+        arena: &ProofArenaPlan,
+        planned: &PlannedCommitment,
+        authority: &BaseCommitProgramAuthority,
+    ) -> Result<Self, InvocationShapeError> {
+        if planned.id != kind.tree()
+            || planned.storage_mode != ProgressiveCommitStorageMode::InPlaceSlab
             || planned.grouped_column_sources.len() != planned.grouped_column_log_sizes.len()
             || planned.grouped_column_sources.len() != planned.evaluation_output_groups.len()
         {
             return Err(InvocationShapeError::InvalidBaseCommitBinding);
         }
         let catalog = BaseProducerCatalog::compile(arena)?;
-        let mut roles = source_and_retained_roles(arena, &catalog, planned)?;
+        let mut roles = source_and_retained_roles(kind, arena, &catalog, planned)?;
         append_retained_hash_roles(arena, &catalog, planned, authority, &mut roles)?;
-        let (state, pointer_tables) = state_and_pointer_tables(arena, &catalog, planned)?;
+        let (state, pointer_tables) = state_and_pointer_tables(kind, arena, &catalog, planned)?;
         append_state_backed_roles(authority, &mut roles, &state)?;
         let (inverse_twiddles, forward_twiddles) = twiddles(arena, &catalog, planned)?;
         let state_slot = arena
@@ -61,7 +108,7 @@ impl BaseCommitInventory {
         Ok(inventory)
     }
 
-    pub(super) fn role(
+    pub(in super::super) fn role(
         &self,
         role: BaseCommitValueRole,
     ) -> Result<(ArenaCatalogValueId, ArenaBinding), InvocationShapeError> {
@@ -156,7 +203,7 @@ impl BaseCommitInventory {
     }
 
     #[cfg(test)]
-    pub(super) fn source_catalogs(&self) -> Vec<ArenaCatalogValueId> {
+    pub(in super::super) fn source_catalogs(&self) -> Vec<ArenaCatalogValueId> {
         self.roles
             .iter()
             .filter_map(|(&role, exact)| {
@@ -168,6 +215,7 @@ impl BaseCommitInventory {
 }
 
 fn source_and_retained_roles(
+    kind: CommitInventoryKind,
     arena: &ProofArenaPlan,
     catalog: &BaseProducerCatalog,
     planned: &PlannedCommitment,
@@ -187,7 +235,7 @@ fn source_and_retained_roles(
             return Err(InvocationShapeError::InvalidBaseCommitBinding);
         }
         for ((&source, &log_size), &output) in sources.iter().zip(logs).zip(outputs) {
-            let source = source_evaluation(arena, catalog, source, log_size)?;
+            let source = source_evaluation(kind, arena, catalog, source, log_size)?;
             let retained_words = pow2(
                 log_size
                     .checked_add(planned.config.log_blowup_factor)
@@ -291,6 +339,7 @@ fn append_state_backed_roles(
 }
 
 fn state_and_pointer_tables(
+    kind: CommitInventoryKind,
     arena: &ProofArenaPlan,
     catalog: &BaseProducerCatalog,
     planned: &PlannedCommitment,
@@ -307,7 +356,7 @@ fn state_and_pointer_tables(
     let mut state_candidates = arena.logical_buffers().iter().filter_map(|logical| {
         let binding = arena.binding(logical.id)?;
         (logical.purpose == BufferPurpose::CommitProgressiveStatePing
-            && logical.lifetime == BufferLifetime::at(ProofEpoch::BaseCommit)
+            && logical.lifetime == BufferLifetime::at(kind.epoch())
             && binding.physical == slots.leaves.state_ping)
             .then_some(binding)
     });
@@ -379,6 +428,7 @@ fn twiddles(
 }
 
 fn source_evaluation(
+    kind: CommitInventoryKind,
     arena: &ProofArenaPlan,
     catalog: &BaseProducerCatalog,
     source: CommitmentColumnSource,
@@ -387,17 +437,20 @@ fn source_evaluation(
     let CommitmentColumnSource::Trace {
         component,
         part,
-        purpose: BufferPurpose::BaseCoefficients,
+        purpose,
         ordinal,
     } = source
     else {
         return Err(InvocationShapeError::InvalidBaseCommitBinding);
     };
+    if purpose != kind.source_purpose() {
+        return Err(InvocationShapeError::InvalidBaseCommitBinding);
+    }
     let expected_words = pow2(log_size)?;
     let mut matches = catalog.values.iter().filter(|value| {
         value.component == Some(component)
             && value.part == Some(part)
-            && value.purpose == BufferPurpose::BaseTrace
+            && value.purpose == kind.trace_purpose()
             && value.ordinal == ordinal
             && value.words == expected_words
     });
@@ -413,7 +466,7 @@ fn source_evaluation(
         arena
             .binding(value.logical)
             .ok_or(InvocationShapeError::InvalidBaseCommitBinding)?,
-        BufferPurpose::BaseTrace,
+        kind.trace_purpose(),
         expected_words,
     )
 }
