@@ -146,6 +146,12 @@ fn digest_shape(
             update_usize(&mut hasher, eligible_groups)?;
             update_usize(&mut hasher, legacy_groups)?;
         }
+        PreparedNumeratorSchedule::StagedPrepackedSingleWrite { packed_output_rows } => {
+            // Receipt tags are append-only: changing 0..=3 would invalidate
+            // otherwise identical historical resident-output evidence.
+            hasher.update(&[4]);
+            hasher.update(&packed_output_rows.to_le_bytes());
+        }
     }
     update_usize(&mut hasher, requirements.groups.len())?;
     update_usize(&mut hasher, requirements.batches.len())?;

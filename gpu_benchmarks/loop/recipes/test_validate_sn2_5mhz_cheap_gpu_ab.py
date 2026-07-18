@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import pathlib
+import re
 import tempfile
 import unittest
 
@@ -20,6 +21,37 @@ from validate_sn2_5mhz_cheap_gpu_ab import (
 
 
 HEAD = "1" * 40
+
+
+def enum_variants(path: pathlib.Path, declaration: str) -> set[str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start = lines.index(declaration) + 1
+    variants: set[str] = set()
+    for line in lines[start:]:
+        if line == "}":
+            return variants
+        match = re.fullmatch(r"    ([A-Z][A-Za-z0-9_]*)(?:,| \{)", line)
+        if match:
+            variants.add(match.group(1))
+    raise AssertionError(f"unterminated enum in {path}")
+
+
+def match_variants(path: pathlib.Path, marker: str) -> set[str]:
+    source = path.read_text(encoding="utf-8")
+    start = source.index(marker)
+    opening = source.index("{", start)
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                block = source[opening : index + 1]
+                return set(
+                    re.findall(r"PreparedNumeratorSchedule::([A-Z][A-Za-z0-9_]*)", block)
+                )
+    raise AssertionError(f"unterminated match in {path}")
 
 
 def loaded_resource(role: str = "") -> dict:
@@ -235,6 +267,30 @@ def composition_receipt() -> dict:
 
 
 class ReceiptValidationTests(unittest.TestCase):
+    def test_cairo_exhaustive_schedule_consumers_cover_stwo_enum(self) -> None:
+        stwo_cairo = pathlib.Path(__file__).resolve().parents[3]
+        stwo = stwo_cairo.parent / "stwo"
+        variants = enum_variants(
+            stwo
+            / "crates/backend-cuda/src/backend/prepared_quotient_numerator.rs",
+            "pub enum PreparedNumeratorSchedule {",
+        )
+        consumers = (
+            (
+                stwo_cairo
+                / "stwo_cairo_prover/crates/gpu-prover/src/resident_oods/receipt.rs",
+                "match schedule {",
+            ),
+            (
+                stwo_cairo
+                / "stwo_cairo_prover/crates/gpu-prover/src/gpu_bench_physical.rs",
+                "match telemetry.prepared_numerator_schedule {",
+            ),
+        )
+        self.assertIn("StagedPrepackedSingleWrite", variants)
+        for path, marker in consumers:
+            self.assertEqual(match_variants(path, marker), variants, path)
+
     def test_relation_accepts_exact_shape_and_rejects_poison_policy_and_speedup(self) -> None:
         checks = Checks()
         self.assertEqual(set(relation(checks, relation_receipt(), HEAD)), {"eager", "captured"})
@@ -244,12 +300,23 @@ class ReceiptValidationTests(unittest.TestCase):
         value["zero_denominator_fixture"]["batch_index"] = 1
         value["adaptive_resource_policy"]["mode"] = "qualified_sm_90_envelope"
         value["eager"]["candidate_speedup"] = 0.9
+        value["checks"]["eager_positive_median_speedup"] = False
         checks = Checks()
-        admitted = relation(checks, value, HEAD)
+        observed = relation(checks, value, HEAD)
         self.assertGreaterEqual(len(checks.errors), 3)
-        self.assertNotIn("eager", admitted)
+        self.assertEqual(observed["eager"], 0.9)
+        self.assertTrue(any("relation eager speedup" in error for error in checks.errors))
+        self.assertFalse(any("relation correctness checks" in error for error in checks.errors))
 
-    def test_quotient_rejects_failure_missing_cell_and_nonpositive_speedup(self) -> None:
+        value = relation_receipt()
+        value["checks"]["eager_positive_median_speedup"] = False
+        checks = Checks()
+        relation(checks, value, HEAD)
+        self.assertTrue(
+            any("relation eager performance-check drift" in error for error in checks.errors)
+        )
+
+    def test_quotient_rejects_failure_missing_cell_and_losing_speedup(self) -> None:
         checks = Checks()
         self.assertEqual(len(quotient(checks, quotient_receipt(), HEAD)), 4)
         self.assertEqual(checks.errors, [])
@@ -259,9 +326,16 @@ class ReceiptValidationTests(unittest.TestCase):
         value["performance"].pop()
         value["performance"][0]["speedup"] = 0.9
         checks = Checks()
-        admitted = quotient(checks, value, HEAD)
+        observed = quotient(checks, value, HEAD)
         self.assertGreaterEqual(len(checks.errors), 3)
-        self.assertEqual(len(admitted), 2)
+        self.assertEqual(len(observed), 3)
+        self.assertEqual(
+            observed["staged-prepacked-quotient-eager-log18"],
+            0.9,
+        )
+        self.assertTrue(
+            any("candidate did not exceed baseline" in error for error in checks.errors)
+        )
 
     def test_composition_is_diagnostic_and_does_not_require_speedup(self) -> None:
         checks = Checks()

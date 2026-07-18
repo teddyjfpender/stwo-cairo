@@ -40,6 +40,11 @@ RELATION_CHECKS = {
     "eager_positive_median_speedup",
     "captured_positive_median_speedup",
 }
+RELATION_PERFORMANCE_CHECKS = {
+    "eager_positive_median_speedup",
+    "captured_positive_median_speedup",
+}
+RELATION_CORRECTNESS_CHECKS = RELATION_CHECKS - RELATION_PERFORMANCE_CHECKS
 QUOTIENT_CHECKS = {
     "exact_plan_receipt",
     "dense_native_independent_cpu_oracle",
@@ -332,8 +337,12 @@ def relation(checks: Checks, value: dict, stwo_head: str) -> dict:
     checks.require(poison.get("adaptive_lane") == "suffix_recompute", "relation poison candidate lane")
     named_checks = value.get("checks", {})
     checks.require(
-        set(named_checks) == RELATION_CHECKS and all(named_checks.values()),
-        "relation correctness-check set",
+        set(named_checks) == RELATION_CHECKS,
+        "relation check set",
+    )
+    checks.require(
+        all(named_checks.get(name) is True for name in RELATION_CORRECTNESS_CHECKS),
+        "relation correctness checks",
     )
     loaded = value.get("loaded_functions", {})
     checks.require(
@@ -363,12 +372,17 @@ def relation(checks: Checks, value: dict, stwo_head: str) -> dict:
         checks.require(timing.get("iterations") == 30, f"relation {mode} iterations")
         speedup = timing.get("candidate_speedup")
         checks.require(positive(speedup) and speedup > 1.0, f"relation {mode} speedup")
+        checks.require(
+            named_checks.get(f"{mode}_positive_median_speedup")
+            is (positive(speedup) and speedup > 1.0),
+            f"relation {mode} performance-check drift",
+        )
         for arm in ("baseline", "candidate"):
             stats = timing.get(arm, {})
             checks.require(len(stats.get("samples_ms", [])) == 30, f"relation {mode} {arm} samples")
             for field in ("median_ms", "p10_ms", "p90_ms"):
                 checks.require(positive(stats.get(field)), f"relation {mode} {arm} {field}")
-        if positive(speedup) and speedup > 1.0:
+        if positive(speedup):
             speedups[mode] = speedup
     return speedups
 
@@ -471,8 +485,11 @@ def quotient(checks: Checks, value: dict, stwo_head: str) -> dict:
             for field in ("median_ms", "p10_ms", "p90_ms"):
                 checks.require(positive(timing.get(field)), f"{name}: {arm} {field}")
         speedup = entry.get("speedup")
-        checks.require(positive(speedup) and speedup > 1.0, f"{name}: non-positive speedup")
-        if positive(speedup) and speedup > 1.0:
+        checks.require(
+            positive(speedup) and speedup > 1.0,
+            f"{name}: candidate did not exceed baseline",
+        )
+        if positive(speedup):
             speedups[name] = speedup
     return speedups
 
@@ -643,8 +660,10 @@ def validate_run(run: pathlib.Path) -> dict:
         "composition_diagnostic_candidate_over_wave": composition(checks, composition_value),
     }
     same_source_positive_speedup = {
-        "relation": set(metrics["relation_speedups"]) == {"eager", "captured"},
-        "quotient": len(metrics["quotient_speedups"]) == 4,
+        "relation": set(metrics["relation_speedups"]) == {"eager", "captured"}
+        and all(value > 1.0 for value in metrics["relation_speedups"].values()),
+        "quotient": len(metrics["quotient_speedups"]) == 4
+        and all(value > 1.0 for value in metrics["quotient_speedups"].values()),
         "composition": None,
     }
     return {

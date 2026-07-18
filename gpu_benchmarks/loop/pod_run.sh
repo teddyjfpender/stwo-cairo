@@ -189,6 +189,27 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ConnectTimeou
 note() { echo "[pod_run $(date -u +%H:%M:%S)] $*"; }
 pssh() { ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "root@$HOST" "$@"; }
 
+fetch_evidence() {
+  local attempt
+  for attempt in 1 2 3; do
+    if rsync -azc --partial --no-owner --no-group --no-times \
+      --include='/*.log' --include='/*.secs' --include='/*.rc' \
+      --include='/*.bin' --include='/*.csv' --include='/*.json' \
+      --include='/*.ncu-rep' --include='/*.nsys-rep' --include='/*.qdrep' \
+      --include='/*.sqlite' --include='/*.txt' --include='/*.xml' \
+      --include='/divergence/***' --exclude='*' \
+      -e "ssh ${SSH_OPTS[*]} -i $KEY_Q -p $PORT" \
+      "root@${HOST}:${RUN}/" "$RESULTS_DIR/$LABEL/"; then
+      return 0
+    fi
+    (( attempt == 3 )) || {
+      note "retrying complete evidence fetch ($attempt/3)"
+      sleep "$attempt"
+    }
+  done
+  return 1
+}
+
 source_head() {
   git -C "$1" rev-parse HEAD 2>/dev/null
 }
@@ -504,30 +525,13 @@ done
 # --- 8. fetch evidence ---
 note "fetching evidence to $RESULTS_DIR/$LABEL"
 mkdir -p "$RESULTS_DIR/$LABEL"
-scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" "root@${HOST}:$RUN/*.log" "root@${HOST}:$RUN/*.secs" \
-  "$RESULTS_DIR/$LABEL/" 2>/dev/null \
-  || { note "ERROR: phase log/secs fetch failed"; RUN_RC=1; }
-scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" "root@${HOST}:$RUN/*.rc" \
-  "$RESULTS_DIR/$LABEL/" 2>/dev/null \
-  || { note "ERROR: phase rc fetch failed"; RUN_RC=1; }
-# Profiling recipes and formal checkpoints keep raw reports/proofs alongside
-# the phase logs. Fetch every present optional artifact before the pod stops;
-# absence is expected for ordinary benchmark recipes.
-for suffix in bin csv json ncu-rep nsys-rep qdrep sqlite txt xml; do
-  if pssh "compgen -G '$RUN/*.$suffix' >/dev/null" 2>/dev/null; then
-    scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" "root@${HOST}:$RUN/*.$suffix" \
-      "$RESULTS_DIR/$LABEL/" 2>/dev/null \
-      || { note "ERROR: optional *.$suffix artifact fetch failed"; RUN_RC=1; }
-  fi
-done
+fetch_evidence || { note "ERROR: complete evidence fetch failed"; RUN_RC=1; }
 for p in $OBSERVED_PHASES; do
   for suffix in log secs rc; do
     [[ -f "$RESULTS_DIR/$LABEL/$p.$suffix" ]] \
       || { note "ERROR: missing local evidence $p.$suffix"; RUN_RC=1; }
   done
 done
-pssh "test -d '$RUN/divergence'" 2>/dev/null \
-  && scp "${SSH_OPTS[@]}" -i "$KEY" -P "$PORT" -r "root@${HOST}:$RUN/divergence" "$RESULTS_DIR/$LABEL/" 2>/dev/null
 
 # --- 9. confirmed final lifecycle action (also via trap) ---
 finalize_pod || RUN_RC=1

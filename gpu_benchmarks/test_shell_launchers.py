@@ -1466,6 +1466,47 @@ checkpoint_counter_timing_only
         self.assertIn("requires canonical stwo/stwo-cairo roots", result.stderr)
         self.assertNotIn("admitting provider lease", result.stdout + result.stderr)
 
+    def test_pod_run_retries_one_whitelisted_evidence_sync(self) -> None:
+        pod_run = (ROOT / "loop" / "pod_run.sh").read_text(encoding="utf-8")
+        section = pod_run[
+            pod_run.index("# --- 8. fetch evidence ---") :
+            pod_run.index("# --- 9. confirmed final lifecycle action")
+        ]
+        helper = pod_run[
+            pod_run.index("fetch_evidence() {") :
+            pod_run.index("source_head() {")
+        ]
+        self.assertIn("for attempt in 1 2 3; do", helper)
+        self.assertIn("rsync -azc --partial", helper)
+        for pattern in (
+            "/*.log",
+            "/*.secs",
+            "/*.rc",
+            "/*.bin",
+            "/*.csv",
+            "/*.json",
+            "/*.ncu-rep",
+            "/*.nsys-rep",
+            "/*.qdrep",
+            "/*.sqlite",
+            "/*.txt",
+            "/*.xml",
+            "/divergence/***",
+        ):
+            self.assertIn(f"--include='{pattern}'", helper)
+        self.assertIn("--exclude='*'", helper)
+        self.assertNotIn("scp ", helper)
+        self.assertNotIn("compgen", helper)
+        self.assertNotIn("scp ", section)
+        self.assertNotIn("compgen", section)
+        self.assertIn(
+            'fetch_evidence || { note "ERROR: complete evidence fetch failed"; RUN_RC=1; }',
+            section,
+        )
+        transfer = section.index("fetch_evidence")
+        verify = section.index("ERROR: missing local evidence")
+        self.assertLess(transfer, verify)
+
     def test_generated_heredocs_are_not_captured_by_command_substitution(self) -> None:
         source = (ROOT / "loop" / "perf_gates.sh").read_text(encoding="utf-8")
         self.assertNotIn('="$(cat <<EOF', source)

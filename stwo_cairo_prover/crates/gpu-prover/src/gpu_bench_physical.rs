@@ -278,6 +278,12 @@ pub(crate) fn resident_session_telemetry_json(
                 Some(0),
                 Some(packed_output_rows),
             ),
+            Some(PreparedNumeratorSchedule::StagedPrepackedSingleWrite { packed_output_rows }) => (
+                Some("staged-prepacked-single-write"),
+                None,
+                Some(0),
+                Some(packed_output_rows),
+            ),
             None => (None, None, None, None),
         };
     let quotient_producer_b2n = telemetry.quotient_producer_b2n.program;
