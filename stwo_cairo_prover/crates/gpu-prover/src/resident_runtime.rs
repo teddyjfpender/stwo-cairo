@@ -3197,6 +3197,7 @@ impl<'a> ResidentGraphRuntime<'a> {
         }
         let context = self.workspace.arena().context();
         let mut fence = SetupFence::new(context);
+        let mut pending_casm_ingress = Vec::new();
         let ingest = (|| {
             let mut seen = Vec::with_capacity(inputs.len());
             let mut report = ResidentWitnessIngestReport {
@@ -3271,7 +3272,8 @@ impl<'a> ResidentGraphRuntime<'a> {
                         // `inputs` remains borrowed until the one fence below, so
                         // the prepared stage's immutable-address DMA contract is
                         // upheld for the complete upload/scatter sequence.
-                        unsafe { casm.ingest_and_launch(words)? };
+                        let pending = unsafe { casm.ingest_and_launch(words)? };
+                        pending_casm_ingress.push((casm, pending));
                         let bytes = words
                             .len()
                             .checked_mul(core::mem::size_of::<u32>())
@@ -3363,6 +3365,12 @@ impl<'a> ResidentGraphRuntime<'a> {
         let fence_result = fence.drain();
         let mut report = ingest?;
         fence_result?;
+        for (casm, pending) in pending_casm_ingress {
+            // The one successful setup fence above covers every CASM upload and
+            // scatter in this batch. Only now may those statement sources be
+            // published as current runtime evidence.
+            unsafe { casm.acknowledge_ingress_fence(pending)? };
+        }
         report.sync_calls = 1;
         Ok(report)
     }
