@@ -5,12 +5,10 @@
 //! one external F252 root, calls the linked static wrapper, and checks every
 //! output word against the scalar split.
 
-use core::ffi::c_void;
-
 use stwo_backend_cuda::{
-    cuda_device_snapshot, ArenaError, ArenaLayout, ArenaSlotSpec, CudaRuntimeError, DeviceArena,
-    ExecutionTablesStage, PreparedExecutionTablesError, PreparedExecutionTablesGraph,
-    EXECUTION_TABLE_BIG_LIMBS,
+    cuda_device_snapshot, ArenaError, ArenaLayout, ArenaSlice, ArenaSlotSpec, CudaRuntimeError,
+    DeviceArena, ExecutionTablesHostData, ExecutionTablesStage, PreparedExecutionTablesError,
+    PreparedExecutionTablesGraph, EXECUTION_TABLE_BIG_LIMBS, EXECUTION_TABLE_SMALL_LIMBS,
 };
 
 use super::super::{adapter, execution_tables};
@@ -19,20 +17,26 @@ use crate::arena_plan::ProofArenaPlan;
 use crate::compiled_proof::{ExecutionPrimitive, LaunchGeometry, OpId};
 use crate::resident_input::ResidentProverInputOwner;
 
-const OUTPUT_DIGEST_DOMAIN: &[u8] = b"stwo-cairo.compiled-prefix.execution-table-big.output.v1\0";
-const INPUT_DIGEST_DOMAIN: &[u8] = b"stwo-cairo.compiled-prefix.execution-table-big.input.v1\0";
-const WRAPPER_SYMBOL: &[u8] = b"memory_limb_split_big_columns_on";
+const OUTPUT_DIGEST_DOMAIN: &[u8] = b"stwo-cairo.compiled-prefix.execution-tables.output.v1\0";
+const INPUT_DIGEST_DOMAIN: &[u8] = b"stwo-cairo.compiled-prefix.execution-tables.input.v1\0";
+const WRAPPER_SYMBOLS: [&[u8]; 2] = [
+    b"memory_limb_split_big_columns_on",
+    b"memory_limb_split_small_columns_on",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::program_image::lower_compiled) struct FirstExecutionTableBigReceipt {
-    pub(super) operation: OpId,
-    pub(super) wrapper_symbol: Box<[u8]>,
-    pub(super) real_rows: usize,
-    pub(super) column_rows: usize,
-    pub(super) input_h2d_bytes: usize,
+    pub(super) operations: [OpId; 2],
+    pub(super) wrapper_symbols: [Box<[u8]>; 2],
+    pub(super) rows: [usize; 3],
+    pub(super) column_rows: [usize; 2],
+    pub(super) root_h2d_bytes: usize,
+    pub(super) metadata_h2d_bytes: usize,
     pub(super) validation_d2h_bytes: usize,
     pub(super) input_digest: [u8; 32],
     pub(super) output_digest: [u8; 32],
+    pub(super) next_unsupported_operation: OpId,
+    pub(super) next_unsupported_wrapper_symbol: Box<[u8]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,7 +51,8 @@ pub(in crate::program_image::lower_compiled) enum FirstExecutionTableBigError {
     Prepared(PreparedExecutionTablesError),
     Cuda(CudaRuntimeError),
     OutputMismatch {
-        limb: usize,
+        role: &'static str,
+        column: usize,
         row: usize,
         expected: u32,
         actual: u32,
@@ -133,7 +138,8 @@ pub(in crate::program_image::lower_compiled) fn execute_first_execution_table_bi
     let planned = plan
         .execution_tables()
         .ok_or(FirstExecutionTableBigError::InvalidPrefixAuthority)?;
-    let (lowered, operation, wrapper) = exact_first_operation(prefix, plan)?;
+    let (lowered, operations, wrappers, next_operation, next_wrapper) =
+        exact_execution_table_frontier(prefix, plan)?;
     let active = cuda_device_snapshot()?;
     let active_sm = active
         .sm_major
@@ -151,72 +157,52 @@ pub(in crate::program_image::lower_compiled) fn execute_first_execution_table_bi
         PreparedExecutionTablesGraph::prepare(arena, &planned.requirements, &planned.slots)?;
     validate_loaded_ranges(&lowered, &prepared)?;
     let host = owner.execution_tables_host_data();
-    if host.f252_values.len() != planned.requirements.n_big {
+    let ingest = prepared.ingest(host)?;
+    let launch = prepared.launch()?;
+    if launch.kernel_launches != 2
+        || launch.allocations != 0
+        || launch.h2d_bytes != 0
+        || launch.d2h_bytes != 0
+        || launch.d2d_bytes != 0
+        || launch.sync_calls != 0
+    {
         return Err(FirstExecutionTableBigError::InvalidPrefixAuthority);
     }
-    let input_words = host
-        .f252_values
-        .len()
-        .checked_mul(8)
-        .ok_or(FirstExecutionTableBigError::SizeOverflow)?;
-    let input_h2d_bytes = input_words
-        .checked_mul(core::mem::size_of::<u32>())
-        .ok_or(FirstExecutionTableBigError::SizeOverflow)?;
-    if input_h2d_bytes != 0 {
-        unsafe {
-            arena.context().memcpy_h2d_async(
-                prepared.raw_f252_words().as_void_ptr(),
-                host.f252_values.as_ptr().cast::<c_void>(),
-                input_h2d_bytes,
-            )?;
-        }
-        arena.context().sync()?;
-    }
-
-    let output_pointers = prepared
-        .big_limbs()
-        .iter()
-        .map(|column| column.as_u32_ptr())
-        .collect::<Vec<_>>();
-    let code = unsafe {
-        stwo_backend_cuda_kernels::raw::memory_limb_split_big_columns_on(
-            prepared.raw_f252_words().as_u32_ptr(),
-            u32::try_from(planned.requirements.n_big)
-                .map_err(|_| FirstExecutionTableBigError::SizeOverflow)?,
-            u32::try_from(planned.requirements.big_column_words)
-                .map_err(|_| FirstExecutionTableBigError::SizeOverflow)?,
-            output_pointers.as_ptr(),
-            arena.context().launch_context().stream_raw().as_ptr(),
-        )
-    };
-    if code != 0 {
-        return Err(CudaRuntimeError::Cuda {
-            operation: "memory_limb_split_big_columns_on",
-            code,
-        }
-        .into());
-    }
-
-    let (output_digest, validation_d2h_bytes) =
-        validate_outputs(arena, &prepared, host.f252_values)?;
+    let (output_digest, validation_d2h_bytes) = validate_outputs(arena, &prepared, host)?;
+    let root_h2d_bytes = usize::try_from(ingest.compact_h2d_bytes)
+        .map_err(|_| FirstExecutionTableBigError::SizeOverflow)?;
+    let metadata_h2d_bytes = usize::try_from(ingest.descriptor_h2d_bytes)
+        .map_err(|_| FirstExecutionTableBigError::SizeOverflow)?;
     Ok(FirstExecutionTableBigReceipt {
-        operation: operation.id,
-        wrapper_symbol: wrapper.wrapper_symbol().into(),
-        real_rows: planned.requirements.n_big,
-        column_rows: planned.requirements.big_column_words,
-        input_h2d_bytes,
+        operations: operations.map(|operation| operation.id),
+        wrapper_symbols: wrappers.map(|wrapper| wrapper.wrapper_symbol().into()),
+        rows: [
+            planned.requirements.n_addrs,
+            planned.requirements.n_big,
+            planned.requirements.n_small,
+        ],
+        column_rows: [
+            planned.requirements.big_column_words,
+            planned.requirements.small_column_words,
+        ],
+        root_h2d_bytes,
+        metadata_h2d_bytes,
         validation_d2h_bytes,
-        input_digest: input_digest(host.f252_values),
+        input_digest: input_digest(host)?,
         output_digest,
+        next_unsupported_operation: next_operation.id,
+        next_unsupported_wrapper_symbol: next_wrapper.wrapper_symbol().into(),
     })
 }
 
-fn exact_first_operation<'a>(
+fn exact_execution_table_frontier<'a>(
     prefix: &'a CompiledWitnessWriterPrefix,
     plan: &ProofArenaPlan,
 ) -> Result<
     (
         execution_tables::LoweredExecutionTables,
+        [&'a crate::compiled_proof::OpNode; 2],
+        [&'a crate::compiled_proof::StaticCudaWrapperAuthority; 2],
         &'a crate::compiled_proof::OpNode,
         &'a crate::compiled_proof::StaticCudaWrapperAuthority,
     ),
@@ -226,11 +212,54 @@ fn exact_first_operation<'a>(
         .map_err(|_| FirstExecutionTableBigError::InvalidPrefixAuthority)?;
     let lowered = execution_tables::lower_stage(plan, &mut values)
         .map_err(|_| FirstExecutionTableBigError::InvalidPrefixAuthority)?;
-    let stage = &lowered.stages[0];
+    let operations = [
+        exact_static_operation(prefix, &lowered, 0)?,
+        exact_static_operation(prefix, &lowered, 1)?,
+    ];
+    let next_operation = prefix
+        .operations
+        .get(2)
+        .filter(|operation| operation.id == OpId(2))
+        .ok_or(FirstExecutionTableBigError::InvalidPrefixAuthority)?;
+    let ExecutionPrimitive::StaticCudaWrapper {
+        wrapper: next_wrapper_id,
+    } = next_operation.primitive
+    else {
+        return Err(FirstExecutionTableBigError::InvalidPrefixAuthority);
+    };
+    let next_wrapper = prefix
+        .static_wrappers
+        .iter()
+        .find(|wrapper| wrapper.id() == next_wrapper_id)
+        .ok_or(FirstExecutionTableBigError::InvalidPrefixAuthority)?;
+    Ok((
+        lowered,
+        [operations[0].0, operations[1].0],
+        [operations[0].1, operations[1].1],
+        next_operation,
+        next_wrapper,
+    ))
+}
+
+fn exact_static_operation<'a>(
+    prefix: &'a CompiledWitnessWriterPrefix,
+    lowered: &execution_tables::LoweredExecutionTables,
+    index: usize,
+) -> Result<
+    (
+        &'a crate::compiled_proof::OpNode,
+        &'a crate::compiled_proof::StaticCudaWrapperAuthority,
+    ),
+    FirstExecutionTableBigError,
+> {
+    let stage = lowered
+        .stages
+        .get(index)
+        .ok_or(FirstExecutionTableBigError::InvalidPrefixAuthority)?;
     let operation = prefix
         .operations
-        .first()
-        .filter(|operation| operation.id == OpId(0))
+        .get(index)
+        .filter(|operation| operation.id == OpId(index as u32))
         .ok_or(FirstExecutionTableBigError::InvalidPrefixAuthority)?;
     let ExecutionPrimitive::StaticCudaWrapper {
         wrapper: wrapper_id,
@@ -251,8 +280,8 @@ fn exact_first_operation<'a>(
     let contract_stage = lowered
         .contract
         .stages()
-        .first()
-        .filter(|stage| stage.stage() == ExecutionTablesStage::Big)
+        .get(index)
+        .filter(|contract| contract.stage() == stage.stage)
         .ok_or(FirstExecutionTableBigError::InvalidPrefixAuthority)?;
     let launch = contract_stage.launch();
     let expected_launch = LaunchGeometry {
@@ -263,10 +292,10 @@ fn exact_first_operation<'a>(
         cooperative: launch.cooperative,
     };
     let launches = wrapper.kernel_launches().collect::<Vec<_>>();
-    let exact = stage.stage == ExecutionTablesStage::Big
+    let exact = stage.stage == [ExecutionTablesStage::Big, ExecutionTablesStage::Small][index]
         && operation.invocation.as_ref() == Some(&stage.invocation)
         && effect == &stage.effect
-        && wrapper.wrapper_symbol() == WRAPPER_SYMBOL
+        && wrapper.wrapper_symbol() == WRAPPER_SYMBOLS[index]
         && wrapper.consumer_target_sm() == prefix.target_sm
         && wrapper.semantic_abi_identity() == &lowered.contract.abi_identity()
         && wrapper.semantic_effect_identity() == &lowered.contract.effect_identity()
@@ -281,28 +310,48 @@ fn exact_first_operation<'a>(
         && launches.len() == 1
         && launches[0].symbol() == launch.symbol().as_bytes()
         && launches[0].launch() == expected_launch;
-    if !exact {
-        return Err(FirstExecutionTableBigError::InvalidPrefixAuthority);
+    if exact {
+        Ok((operation, wrapper))
+    } else {
+        Err(FirstExecutionTableBigError::InvalidPrefixAuthority)
     }
-    Ok((lowered, operation, wrapper))
 }
 
 fn validate_loaded_ranges(
     lowered: &execution_tables::LoweredExecutionTables,
     prepared: &PreparedExecutionTablesGraph<'_>,
 ) -> Result<(), FirstExecutionTableBigError> {
-    let stage = &lowered.stages[0];
-    let source = prepared.raw_f252_words();
-    let outputs = prepared.big_limbs();
-    let exact = source.id() == lowered.host_ingress[1].arena.physical
-        && source.len_words() == lowered.host_ingress[1].arena.len_words
-        && outputs.len() == stage.outputs.len()
-        && outputs
+    let raw = [
+        prepared.raw_addr_to_id(),
+        prepared.raw_f252_words(),
+        prepared.raw_small_words(),
+    ];
+    let exact = raw
+        .iter()
+        .zip(&lowered.host_ingress)
+        .all(|(actual, expected)| {
+            actual.id() == expected.arena.physical && actual.len_words() == expected.arena.len_words
+        })
+        && [
+            (
+                prepared.table_pointers(),
+                lowered.relocations.table_pointers,
+            ),
+            (prepared.table_strides(), lowered.relocations.table_strides),
+        ]
+        .iter()
+        .all(|(actual, expected)| {
+            actual.id() == expected.physical && actual.len_words() == expected.len_words
+        })
+        && [prepared.big_limbs(), prepared.small_limbs()]
             .iter()
-            .zip(&stage.outputs)
-            .all(|(actual, expected)| {
-                actual.id() == expected.arena.physical
-                    && actual.len_words() == expected.arena.len_words
+            .zip(&lowered.stages)
+            .all(|(actual, stage)| {
+                actual.len() == stage.outputs.len()
+                    && actual.iter().zip(&stage.outputs).all(|(actual, expected)| {
+                        actual.id() == expected.arena.physical
+                            && actual.len_words() == expected.arena.len_words
+                    })
             });
     if exact {
         Ok(())
@@ -314,57 +363,141 @@ fn validate_loaded_ranges(
 fn validate_outputs(
     arena: &DeviceArena,
     prepared: &PreparedExecutionTablesGraph<'_>,
-    values: &[[u32; 8]],
+    host: ExecutionTablesHostData<'_>,
 ) -> Result<([u8; 32], usize), FirstExecutionTableBigError> {
-    let column_rows = prepared.requirements().big_column_words;
-    let column_bytes = column_rows
-        .checked_mul(core::mem::size_of::<u32>())
-        .ok_or(FirstExecutionTableBigError::SizeOverflow)?;
-    let validation_d2h_bytes = column_bytes
-        .checked_mul(EXECUTION_TABLE_BIG_LIMBS)
-        .ok_or(FirstExecutionTableBigError::SizeOverflow)?;
-    let mut column = vec![0u32; column_rows];
+    let requirements = prepared.requirements();
     let mut hasher = blake3::Hasher::new();
     hasher.update(OUTPUT_DIGEST_DOMAIN);
-    hasher.update(
-        &u64::try_from(values.len())
-            .map_err(|_| FirstExecutionTableBigError::SizeOverflow)?
-            .to_le_bytes(),
-    );
-    hasher.update(
-        &u64::try_from(column_rows)
-            .map_err(|_| FirstExecutionTableBigError::SizeOverflow)?
-            .to_le_bytes(),
-    );
-    for (limb, source) in prepared.big_limbs().iter().copied().enumerate() {
+    for size in [
+        requirements.n_addrs,
+        requirements.n_big,
+        requirements.n_small,
+        requirements.big_column_words,
+        requirements.small_column_words,
+    ] {
+        hash_size(&mut hasher, size)?;
+    }
+
+    let address_bytes = host
+        .addr_to_id
+        .len()
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(FirstExecutionTableBigError::SizeOverflow)?;
+    if address_bytes != 0 {
+        let mut actual = vec![0u32; host.addr_to_id.len()];
+        let source = prepared
+            .raw_addr_to_id()
+            .checked_subslice(0, actual.len())
+            .map_err(|_| FirstExecutionTableBigError::InvalidPrefixAuthority)?;
         unsafe {
             arena.context().memcpy_d2h_async(
-                column.as_mut_ptr().cast(),
+                actual.as_mut_ptr().cast(),
                 source.as_void_ptr().cast_const(),
-                column_bytes,
+                address_bytes,
             )?;
         }
         arena.context().sync()?;
-        for (row, &actual) in column.iter().enumerate() {
-            let expected = expected_limb(values, row, limb);
+        for (row, (&actual, &expected)) in actual.iter().zip(host.addr_to_id).enumerate() {
             if actual != expected {
                 return Err(FirstExecutionTableBigError::OutputMismatch {
-                    limb,
+                    role: "addr_to_id",
+                    column: 0,
                     row,
                     expected,
                     actual,
                 });
             }
         }
-        hasher.update(bytemuck::cast_slice(&column));
+        hasher.update(bytemuck::cast_slice(&actual));
     }
+
+    let big_bytes = validate_columns(
+        arena,
+        prepared.big_limbs(),
+        requirements.big_column_words,
+        "f252_limbs",
+        |row, limb| expected_big_limb(host.f252_values, row, limb),
+        &mut hasher,
+    )?;
+    let small_bytes = validate_columns(
+        arena,
+        prepared.small_limbs(),
+        requirements.small_column_words,
+        "small_limbs",
+        |row, limb| expected_small_limb(host.small_values, row, limb),
+        &mut hasher,
+    )?;
+    let validation_d2h_bytes = address_bytes
+        .checked_add(big_bytes)
+        .and_then(|bytes| bytes.checked_add(small_bytes))
+        .ok_or(FirstExecutionTableBigError::SizeOverflow)?;
     Ok((*hasher.finalize().as_bytes(), validation_d2h_bytes))
 }
 
-fn expected_limb(values: &[[u32; 8]], row: usize, limb: usize) -> u32 {
+fn validate_columns(
+    arena: &DeviceArena,
+    sources: &[ArenaSlice],
+    column_rows: usize,
+    role: &'static str,
+    expected: impl Fn(usize, usize) -> u32,
+    hasher: &mut blake3::Hasher,
+) -> Result<usize, FirstExecutionTableBigError> {
+    let column_bytes = column_rows
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(FirstExecutionTableBigError::SizeOverflow)?;
+    let total_bytes = column_bytes
+        .checked_mul(sources.len())
+        .ok_or(FirstExecutionTableBigError::SizeOverflow)?;
+    let mut values = vec![0u32; column_rows];
+    for (column, source) in sources.iter().copied().enumerate() {
+        unsafe {
+            arena.context().memcpy_d2h_async(
+                values.as_mut_ptr().cast(),
+                source.as_void_ptr().cast_const(),
+                column_bytes,
+            )?;
+        }
+        arena.context().sync()?;
+        for (row, &actual) in values.iter().enumerate() {
+            let expected = expected(row, column);
+            if actual != expected {
+                return Err(FirstExecutionTableBigError::OutputMismatch {
+                    role,
+                    column,
+                    row,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        hasher.update(bytemuck::cast_slice(&values));
+    }
+    Ok(total_bytes)
+}
+
+fn expected_big_limb(values: &[[u32; 8]], row: usize, limb: usize) -> u32 {
     let Some(words) = values.get(row) else {
         return 0;
     };
+    expected_limb(words, limb)
+}
+
+fn expected_small_limb(values: &[u128], row: usize, limb: usize) -> u32 {
+    let Some(&value) = values.get(row) else {
+        return 0;
+    };
+    expected_limb(
+        &[
+            value as u32,
+            (value >> 32) as u32,
+            (value >> 64) as u32,
+            (value >> 96) as u32,
+        ],
+        limb,
+    )
+}
+
+fn expected_limb(words: &[u32], limb: usize) -> u32 {
     let bit = limb * 9;
     let word = bit / 32;
     let shift = bit % 32;
@@ -377,11 +510,33 @@ fn expected_limb(values: &[[u32; 8]], row: usize, limb: usize) -> u32 {
     (low | high) & 0x1ff
 }
 
-fn input_digest(values: &[[u32; 8]]) -> [u8; 32] {
+fn input_digest(
+    host: ExecutionTablesHostData<'_>,
+) -> Result<[u8; 32], FirstExecutionTableBigError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(INPUT_DIGEST_DOMAIN);
-    hasher.update(bytemuck::cast_slice(values));
-    *hasher.finalize().as_bytes()
+    for size in [
+        host.addr_to_id.len(),
+        host.f252_values.len(),
+        host.small_values.len(),
+    ] {
+        hash_size(&mut hasher, size)?;
+    }
+    hasher.update(bytemuck::cast_slice(host.addr_to_id));
+    hasher.update(bytemuck::cast_slice(host.f252_values));
+    for value in host.small_values {
+        hasher.update(&value.to_le_bytes());
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn hash_size(hasher: &mut blake3::Hasher, size: usize) -> Result<(), FirstExecutionTableBigError> {
+    hasher.update(
+        &u64::try_from(size)
+            .map_err(|_| FirstExecutionTableBigError::SizeOverflow)?
+            .to_le_bytes(),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -402,9 +557,23 @@ mod tests {
         ]];
         let expected = split_nine_bit(&values[0]);
         for (limb, &value) in expected.iter().enumerate() {
-            assert_eq!(expected_limb(&values, 0, limb), value);
+            assert_eq!(expected_big_limb(&values, 0, limb), value);
         }
-        assert_eq!(expected_limb(&values, 1, 0), 0);
+        assert_eq!(expected_big_limb(&values, 1, 0), 0);
+
+        let small = [0x0123_4567_89ab_cdef_fedc_ba98_7654_3210_u128];
+        let words = [
+            small[0] as u32,
+            (small[0] >> 32) as u32,
+            (small[0] >> 64) as u32,
+            (small[0] >> 96) as u32,
+        ];
+        for (limb, &value) in split_nine_bit(&words)[..EXECUTION_TABLE_SMALL_LIMBS]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(expected_small_limb(&small, 0, limb), value);
+        }
     }
 
     #[test]
@@ -424,7 +593,7 @@ mod tests {
         assert_ne!(layout.total_words(), 0);
     }
 
-    fn split_nine_bit(words: &[u32; 8]) -> [u32; EXECUTION_TABLE_BIG_LIMBS] {
+    fn split_nine_bit(words: &[u32]) -> [u32; EXECUTION_TABLE_BIG_LIMBS] {
         let mut result = [0; EXECUTION_TABLE_BIG_LIMBS];
         let mut bits_left = 32u32;
         let mut word_index = 0usize;

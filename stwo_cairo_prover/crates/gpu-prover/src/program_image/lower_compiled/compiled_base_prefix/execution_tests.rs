@@ -43,10 +43,25 @@ fn generated_sn2_profile_executes_first_real_compiled_cuda_operation() {
 
     assert_eq!(first, repeated);
     assert_eq!(
-        first.wrapper_symbol.as_ref(),
-        b"memory_limb_split_big_columns_on"
+        first.wrapper_symbols.each_ref().map(AsRef::as_ref),
+        [
+            b"memory_limb_split_big_columns_on".as_slice(),
+            b"memory_limb_split_small_columns_on".as_slice(),
+        ]
     );
-    assert_eq!(first.real_rows, owner.execution_memory().f252_values.len());
+    assert_eq!(
+        first.rows,
+        [
+            owner.execution_memory().address_to_id.len(),
+            owner.execution_memory().f252_values.len(),
+            owner.execution_memory().small_values.len(),
+        ]
+    );
+    assert_eq!(first.next_unsupported_operation.0, 2);
+    assert_eq!(
+        first.next_unsupported_wrapper_symbol.as_ref(),
+        b"stwo_witness_feed_clear_on"
+    );
     assert_ne!(first.input_digest, [0; 32]);
     assert_ne!(first.output_digest, [0; 32]);
     report("generated_sn2_profile", &first);
@@ -73,15 +88,19 @@ fn sealed_sn2_executes_first_real_compiled_cuda_operation() {
 
 fn report(label: &str, receipt: &FirstExecutionTableBigReceipt) {
     eprintln!(
-        "{label}_first_cuda_op={} rows={} column_rows={} h2d_bytes={} d2h_bytes={} \
-         input_blake3={} output_blake3={}",
-        receipt.operation.0,
-        receipt.real_rows,
+        "{label}_cuda_ops={:?} rows={:?} column_rows={:?} root_h2d_bytes={} \
+         metadata_h2d_bytes={} d2h_bytes={} input_blake3={} output_blake3={} \
+         next_unsupported_op={} next_unsupported_wrapper={}",
+        receipt.operations.map(|operation| operation.0),
+        receipt.rows,
         receipt.column_rows,
-        receipt.input_h2d_bytes,
+        receipt.root_h2d_bytes,
+        receipt.metadata_h2d_bytes,
         receipt.validation_d2h_bytes,
         hex::encode(receipt.input_digest),
         hex::encode(receipt.output_digest),
+        receipt.next_unsupported_operation.0,
+        String::from_utf8_lossy(&receipt.next_unsupported_wrapper_symbol),
     );
 }
 
