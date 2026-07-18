@@ -20,7 +20,8 @@ fn multidomain_direct_split_wave_and_installed_stripes_match_eager_and_replay() 
     let ready = ready(&fixture, &twiddles, 11);
     let proof_bindings = CompositionProofBindings::from_plan(&fixture.plan);
 
-    // Runtime-origin wave functions must be resolved before strict AOT closes.
+    // Resolve the runtime-origin Wave functions first; the diagnostic stripe
+    // arm installs exact AOT without closing process-wide strict admission.
     install_wave_sources(&fixture.plan);
     let wave = PreparedCompositionGraph::prepare_wave_direct_retained_jit_for_test(
         &ready.arena,
@@ -39,8 +40,8 @@ fn multidomain_direct_split_wave_and_installed_stripes_match_eager_and_replay() 
     wave.launch().unwrap();
     let wave_graph = wave_capture.finish().unwrap();
 
-    // This constructor closes strict AOT and retains every exact installed
-    // ordinary-function receipt before the first stripe may launch.
+    // This diagnostic constructor retains every exact installed ordinary
+    // function receipt without invalidating the runtime-origin Wave baseline.
     let stripes = PreparedCompositionGraph::prepare_resource_bounded_stripes_for_test(
         &ready.arena,
         &fixture.plan,
