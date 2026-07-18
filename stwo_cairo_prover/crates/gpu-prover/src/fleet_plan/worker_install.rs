@@ -9,6 +9,12 @@ use crate::compiled_proof::{
     PartitionEffectProjection, TranscriptInputId, TranscriptOutputId, ValueRange,
 };
 
+mod error;
+mod statement_host_ingress;
+
+pub use error::FleetWorkerInstallError;
+pub use statement_host_ingress::FleetStatementHostIngress;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FleetWorkerStorage {
     pub storage: StorageId,
@@ -38,6 +44,7 @@ pub struct FleetWorkerExecutable {
     /// Composite children carry a stable ordinal; ordinary operations do not.
     pub child_ordinal: Option<u32>,
     pub effects: Vec<FleetEffectBinding>,
+    pub statement_host_ingress: Option<FleetStatementHostIngress>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,19 +312,23 @@ fn worker_executions(
                                 u32::try_from(ordinal)
                                     .map_err(|_| FleetWorkerInstallError::SizeOverflow)?,
                             ),
+                            &child.primitive,
                             child.effect,
                         ))
                     })
                     .collect::<Result<Vec<_>, FleetWorkerInstallError>>()?,
-                _ => vec![(None, operation.effect)],
+                primitive => vec![(None, primitive, operation.effect)],
             };
             let executables = executable_effects
                 .into_iter()
-                .map(|(child_ordinal, effect)| {
+                .map(|(child_ordinal, primitive, effect)| {
                     Ok(FleetWorkerExecutable {
                         child_ordinal,
                         effects: effect_bindings(
                             plan, worker, operation, execution, effect, storages,
+                        )?,
+                        statement_host_ingress: statement_host_ingress::project(
+                            plan, worker, operation, execution, primitive, storages,
                         )?,
                     })
                 })
@@ -698,53 +709,4 @@ fn align_up(value: usize, alignment: usize) -> Result<usize, FleetWorkerInstallE
         .checked_add(alignment - 1)
         .map(|value| value & !(alignment - 1))
         .ok_or(FleetWorkerInstallError::SizeOverflow)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FleetWorkerInstallError {
-    UnknownWorker(WorkerId),
-    UnsupportedSpill,
-    UnsupportedScratch(LayoutTransitionId),
-    UnsupportedElement(ValueVersion),
-    InvalidStorage(StorageId),
-    InvalidOperation(OpId),
-    MissingEffectWindow {
-        worker: WorkerId,
-        value: ValueRange,
-    },
-    AmbiguousEffectWindow {
-        worker: WorkerId,
-        value: ValueRange,
-    },
-    AmbiguousEffect {
-        operation: OpId,
-        binding: EffectBindingId,
-    },
-    MisalignedEffect {
-        operation: OpId,
-        binding: EffectBindingId,
-    },
-    InvalidCoordinator,
-    CapacityExceeded {
-        worker: WorkerId,
-        required: usize,
-        capacity: usize,
-    },
-    RuntimeView(FleetRuntimeViewError),
-    Plan(FleetPlanError),
-    SizeOverflow,
-}
-
-impl core::fmt::Display for FleetWorkerInstallError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "invalid fleet worker install plan: {self:?}")
-    }
-}
-
-impl std::error::Error for FleetWorkerInstallError {}
-
-impl From<FleetRuntimeViewError> for FleetWorkerInstallError {
-    fn from(value: FleetRuntimeViewError) -> Self {
-        Self::RuntimeView(value)
-    }
 }

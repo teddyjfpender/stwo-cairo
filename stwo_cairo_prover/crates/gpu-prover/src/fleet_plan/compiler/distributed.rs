@@ -2,9 +2,9 @@
 //! by a homogeneous worker set.
 //!
 //! This compiler deliberately spends memory to keep the first distributed
-//! authority simple: one affine storage window per worker/value, exact
-//! contiguous shards, explicit point-to-point transfers, and no host bounce or
-//! reuse.
+//! authority simple: one affine storage window per worker/value, except for
+//! validated coordinator statement-ingress lineages; exact contiguous shards;
+//! explicit point-to-point transfers; and no host bounce.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -115,6 +115,25 @@ fn compile_partitioned_owners(
                     .ok_or(FleetCompileError::InvalidSemanticSchedule)?,
             });
         }
+    }
+    for reuse in statement_host_reuses(compiled)? {
+        let overwrite = operation_placement(&schedule.operations, reuse.operation)?
+            .during
+            .start;
+        let matching = owners
+            .iter()
+            .enumerate()
+            .filter_map(|(index, owner)| {
+                (owner.value == reuse.predecessor && owner.worker == topology.coordinator)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let [owner] = matching.as_slice() else {
+            return Err(FleetCompileError::InvalidOwnership(
+                reuse.predecessor.version,
+            ));
+        };
+        owners[*owner].live.end = overwrite;
     }
     Ok(owners)
 }

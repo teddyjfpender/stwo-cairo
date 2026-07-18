@@ -384,6 +384,20 @@ impl Encoder {
                 self.size(*bytes)?;
                 self.byte(*value);
             }
+            ExecutionPrimitive::StatementHostIngress {
+                source,
+                predecessor,
+            } => {
+                self.byte(5);
+                self.statement_host_source(source)?;
+                match predecessor {
+                    Some(predecessor) => {
+                        self.byte(1);
+                        self.value_range(*predecessor)?;
+                    }
+                    None => self.byte(0),
+                }
+            }
             ExecutionPrimitive::OrderedComposite { children } => {
                 self.byte(3);
                 self.count(children.len())?;
@@ -394,6 +408,34 @@ impl Encoder {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn statement_host_source(
+        &mut self,
+        source: &StatementHostSource,
+    ) -> Result<(), CompiledProofError> {
+        self.byte(match source.kind {
+            StatementHostSourceKind::WitnessCasm => 0,
+        });
+        self.u32(source.producer_ordinal);
+        self.bytes(source.component.as_bytes())?;
+        match source.part {
+            StatementHostPart::Main => self.byte(0),
+            StatementHostPart::MemoryBig(index) => {
+                self.byte(1);
+                self.u32(index);
+            }
+            StatementHostPart::MemorySmall => self.byte(2),
+        }
+        self.byte(match source.encoding {
+            StatementHostEncoding::RowMajorU32 => 0,
+        });
+        self.size(source.words)?;
+        self.size(source.real_rows)?;
+        self.size(source.consumer_rows)?;
+        self.byte(u8::from(source.include_iota));
+        self.raw(&source.casm_contract_identity);
         Ok(())
     }
 

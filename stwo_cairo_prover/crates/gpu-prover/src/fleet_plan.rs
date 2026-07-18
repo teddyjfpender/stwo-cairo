@@ -59,8 +59,8 @@ pub use two_rank_closure::{
     FleetTwoRankStructuralClosureError, FleetTwoRankStructuralClosureReceipt,
 };
 pub use worker_install::{
-    FleetCoordinatorInstall, FleetEffectBinding, FleetInstallWindow, FleetTranscriptBinding,
-    FleetTranscriptInstall, FleetWorkerExecutable, FleetWorkerExecution,
+    FleetCoordinatorInstall, FleetEffectBinding, FleetInstallWindow, FleetStatementHostIngress,
+    FleetTranscriptBinding, FleetTranscriptInstall, FleetWorkerExecutable, FleetWorkerExecution,
     FleetWorkerInstallCapacity, FleetWorkerInstallError, FleetWorkerInstallPlan,
     FleetWorkerInstallTarget, FleetWorkerStorage,
 };

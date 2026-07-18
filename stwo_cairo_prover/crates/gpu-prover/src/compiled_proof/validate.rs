@@ -7,6 +7,7 @@ use super::*;
 mod finalizer;
 mod output;
 mod primitive;
+mod statement_host_ingress;
 mod structural_authority;
 mod transcript_segments;
 
@@ -320,6 +321,7 @@ fn validate_operations(
             }
         }
     }
+    statement_host_ingress::validate_lineages(input)?;
     super::carry_forward::validate_write_coverage(input, &mut writes)
 }
 

@@ -15,6 +15,7 @@ mod identity;
 mod invocation_contract;
 mod partition_authority;
 mod registered_fixed_source;
+mod statement_host_ingress;
 mod static_wrapper;
 mod structural_authority;
 mod validate;
@@ -29,6 +30,7 @@ pub(crate) use invocation_contract::encode_invocation_payload;
 pub use invocation_contract::InvocationContractId;
 pub use partition_authority::*;
 pub use registered_fixed_source::*;
+pub use statement_host_ingress::*;
 pub use static_wrapper::*;
 pub use structural_authority::*;
 pub use stwo_backend_cuda::{TranscriptInputId, TranscriptOutputId};
@@ -169,6 +171,14 @@ pub enum ExecutionPrimitive {
     DeviceCopyD2D { bytes: usize },
     /// CUDA byte-pattern memset; `value` is one repeated byte, not a word.
     DeviceMemsetByte { bytes: usize, value: u8 },
+    /// One eager, shape-bound host upload into a proof-local dynamic value.
+    /// Host addresses and payload bytes are runtime receipts, never program
+    /// identity. `predecessor` names only the dead semantic value whose exact
+    /// storage may be reused; it is not a fabricated device read.
+    StatementHostIngress {
+        source: StatementHostSource,
+        predecessor: Option<ValueRange>,
+    },
     /// One transcript-free, monolithic operation whose children execute in
     /// this exact order. Children reuse the same typed execution authority as
     /// ordinary operations but do not introduce stages or partitions.
@@ -609,6 +619,12 @@ pub enum CompiledProofError {
     PrimitiveEffectMismatch(OpId),
     InvalidKernelInvocation(OpId),
     InvalidStaticWrapperInvocation(OpId),
+    InvalidStatementHostIngress {
+        operation: OpId,
+    },
+    InvalidStatementHostLineage {
+        operation: OpId,
+    },
     InvalidOrderedComposite {
         operation: OpId,
         child: Option<usize>,

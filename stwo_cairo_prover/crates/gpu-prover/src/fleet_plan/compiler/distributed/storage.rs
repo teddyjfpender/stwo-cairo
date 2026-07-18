@@ -28,6 +28,13 @@ pub(super) fn compile_partitioned_storage(
             .or_default()
             .push(value.elements);
     }
+    allocate_statement_lineages(
+        compiled,
+        coordinator,
+        &mut locations,
+        &mut storages,
+        &mut bindings,
+    )?;
     for ((worker, version), mut remainder) in locations {
         if worker == coordinator {
             for reserved in output
@@ -81,6 +88,67 @@ pub(super) fn compile_partitioned_storage(
         });
     }
     Ok((storages, bindings, output_storage))
+}
+
+fn allocate_statement_lineages(
+    compiled: &CompiledProof,
+    coordinator: WorkerId,
+    locations: &mut BTreeMap<(WorkerId, ValueVersion), Vec<ElementRange>>,
+    storages: &mut Vec<StorageDesc>,
+    bindings: &mut Vec<FleetStoragePlacement>,
+) -> Result<(), FleetCompileError> {
+    let reuses = statement_host_reuses(compiled)?;
+    let components = compile_ingress_components(compiled.values().len(), &reuses)?;
+    let component_count = components
+        .iter()
+        .flatten()
+        .max()
+        .map_or(0, |value| value + 1);
+    for component in 0..component_count {
+        let versions = components
+            .iter()
+            .enumerate()
+            .filter_map(|(version, candidate)| (*candidate == Some(component)).then_some(version))
+            .map(|version| {
+                u32::try_from(version)
+                    .map(ValueVersion)
+                    .map_err(|_| FleetCompileError::SizeOverflow)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let first = versions
+            .first()
+            .and_then(|version| compiled.value(*version))
+            .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+        let storage =
+            StorageId(u32::try_from(storages.len()).map_err(|_| FleetCompileError::SizeOverflow)?);
+        storages.push(StorageDesc {
+            id: storage,
+            worker: coordinator,
+            bytes: first
+                .layout
+                .logical_bytes()
+                .map_err(|_| FleetCompileError::SizeOverflow)?,
+            alignment_bytes: first.alignment,
+        });
+        for version in versions {
+            let value = compiled
+                .value(version)
+                .ok_or(FleetCompileError::InvalidOwnership(version))?;
+            let full = full_range(value)?;
+            if locations.remove(&(coordinator, version)) != Some(vec![full]) {
+                return Err(FleetCompileError::InvalidOwnership(version));
+            }
+            bindings.push(FleetStoragePlacement {
+                storage,
+                value: ValueRange {
+                    version,
+                    elements: full,
+                },
+                offset_bytes: 0,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn allocate_affine_locations(

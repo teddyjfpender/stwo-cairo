@@ -33,6 +33,7 @@ mod pow;
 mod rc99_alias;
 mod runtime_view;
 mod spill;
+mod statement_host_ingress;
 mod storage_contract;
 mod two_rank_closure;
 mod worker_install;

@@ -19,12 +19,18 @@ use crate::shape_executable::ShapeExecutableIdentity;
 use crate::transcript_plan::CairoBlake2sTranscriptPlan;
 
 mod distributed;
+mod statement_host_ingress;
+
+use statement_host_ingress::{
+    compile_components as compile_ingress_components, statement_host_destination,
+    statement_host_reuses,
+};
 
 impl FleetProofPlan {
     /// Compile one validated semantic proof into a deterministic, fail-closed
     /// single-rank physical plan. Use `compile_track_a_partitioned` for
-    /// conservative multi-worker exact shards. Only exact whole-value required
-    /// aliases with sound one-operation overwrite timing share storage.
+    /// conservative multi-worker exact shards. Storage sharing is limited to
+    /// exact required aliases and validated statement-ingress lineages.
     pub fn compile_track_a_monolithic(
         compiled: Arc<CompiledProof>,
         shape: ShapeExecutableIdentity,
@@ -99,6 +105,7 @@ fn compile_schedule(
             .iter()
             .filter(|operation| operation.stage == ProofStage::BeforeTranscript(segment.segment))
         {
+            reserve_statement_overwrite_epoch(operation, &mut cursor)?;
             operations.push(FleetOperationPlacement {
                 operation: operation.id,
                 during: take_step(&mut cursor)?,
@@ -116,6 +123,7 @@ fn compile_schedule(
         .iter()
         .filter(|operation| operation.stage == ProofStage::AfterTranscript)
     {
+        reserve_statement_overwrite_epoch(operation, &mut cursor)?;
         operations.push(FleetOperationPlacement {
             operation: operation.id,
             during: take_step(&mut cursor)?,
@@ -190,6 +198,24 @@ fn operation_domain(
     })
 }
 
+fn reserve_statement_overwrite_epoch(
+    operation: &OpNode,
+    cursor: &mut ScheduleStep,
+) -> Result<(), FleetCompileError> {
+    // A predecessor dies at this operation's start. Keep one logical epoch
+    // between its producer-ready edge and the overwrite edge.
+    if matches!(
+        operation.primitive,
+        ExecutionPrimitive::StatementHostIngress {
+            predecessor: Some(_),
+            ..
+        }
+    ) {
+        *cursor = increment(*cursor)?;
+    }
+    Ok(())
+}
+
 fn compile_storage(
     compiled: &CompiledProof,
     coordinator: WorkerId,
@@ -215,11 +241,14 @@ fn compile_storage(
     )?;
     let required_aliases = compile_required_aliases(compiled, &owners, operations)?;
     let alias_components = compile_alias_components(compiled.values().len(), &required_aliases)?;
+    let ingress_reuses = statement_host_reuses(compiled)?;
+    let ingress_components = compile_ingress_components(compiled.values().len(), &ingress_reuses)?;
 
     let mut storages = Vec::new();
     let mut bindings = Vec::new();
     let mut value_storages = vec![None; compiled.values().len()];
     let mut component_storages = vec![None; required_aliases.len()];
+    let mut ingress_storages = vec![None; ingress_reuses.len()];
     for value in compiled
         .values()
         .iter()
@@ -227,7 +256,14 @@ fn compile_storage(
     {
         let value_index = value.version.0 as usize;
         let component = alias_components[value_index];
-        let id = match component.and_then(|component| component_storages[component]) {
+        let ingress_component = ingress_components[value_index];
+        if component.is_some() && ingress_component.is_some() {
+            return Err(FleetCompileError::InvalidSemanticSchedule);
+        }
+        let existing = component
+            .and_then(|component| component_storages[component])
+            .or_else(|| ingress_component.and_then(|component| ingress_storages[component]));
+        let id = match existing {
             Some(id) => id,
             None => {
                 let id = next_storage_id(storages.len())?;
@@ -242,6 +278,9 @@ fn compile_storage(
                 });
                 if let Some(component) = component {
                     component_storages[component] = Some(id);
+                }
+                if let Some(component) = ingress_component {
+                    ingress_storages[component] = Some(id);
                 }
                 id
             }
@@ -369,6 +408,27 @@ fn compile_owners(
     }
     for fragment in &compiled.output().fragments {
         extend_live_end(&mut lives, fragment.source.version, terminal_step)?;
+    }
+    for operation in compiled.operations().iter().filter(|operation| {
+        matches!(
+            operation.primitive,
+            ExecutionPrimitive::StatementHostIngress { .. }
+        )
+    }) {
+        let destination = statement_host_destination(compiled, operation.id)?;
+        let live = lives
+            .get_mut(destination.version.0 as usize)
+            .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+        live.1 = terminal_step;
+    }
+    for reuse in statement_host_reuses(compiled)? {
+        let overwrite = operation_placement(operations, reuse.operation)?
+            .during
+            .start;
+        let live = lives
+            .get_mut(reuse.predecessor.version.0 as usize)
+            .ok_or(FleetCompileError::InvalidSemanticSchedule)?;
+        live.1 = overwrite;
     }
 
     compiled

@@ -22,6 +22,8 @@ mod partition_authority;
 mod primitive;
 #[path = "compiled_proof_host/registered_fixed_source_read.rs"]
 mod registered_fixed_source_read;
+#[path = "compiled_proof_host/statement_host_ingress.rs"]
+mod statement_host_ingress;
 #[path = "compiled_proof_host/static_wrapper.rs"]
 mod static_wrapper;
 #[path = "compiled_proof_host/structural_authority.rs"]

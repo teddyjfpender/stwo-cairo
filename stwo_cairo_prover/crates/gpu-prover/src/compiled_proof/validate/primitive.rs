@@ -142,6 +142,33 @@ fn validate_step(
                 return Err(CompiledProofError::PrimitiveEffectMismatch(operation));
             }
         }
+        ExecutionPrimitive::StatementHostIngress { source, .. } => {
+            let invalid = || CompiledProofError::InvalidStatementHostIngress { operation };
+            if invocation.is_some()
+                || partition != PartitionAuthority::monolithic().id()
+                || !source.has_valid_shape()
+                || !effect.module_globals().is_empty()
+                || !effect.registered_fixed_source_reads().is_empty()
+                || effect.accesses().len() != 1
+            {
+                return Err(invalid());
+            }
+            let EffectAccess::Write { destination } = effect.accesses()[0] else {
+                return Err(invalid());
+            };
+            let value = super::value(input, destination.value.version).map_err(|_| invalid())?;
+            let full = ElementRange::new(0, value.layout.element_count().map_err(|_| invalid())?)
+                .ok_or_else(invalid)?;
+            if destination.value.elements != full
+                || value.layout.element != ElementType::U32
+                || value.alignment < core::mem::align_of::<u32>()
+                || value.region != Region::Dynamic
+                || value.origin != ValueOrigin::OpOutput(operation)
+                || full.len() != source.words
+            {
+                return Err(invalid());
+            }
+        }
         ExecutionPrimitive::OrderedComposite { .. } => {
             return Err(CompiledProofError::InvalidOrderedComposite {
                 operation,
@@ -194,6 +221,7 @@ fn validate_composite(
             child.primitive,
             ExecutionPrimitive::OrderedComposite { .. }
                 | ExecutionPrimitive::StaticCudaWrapper { .. }
+                | ExecutionPrimitive::StatementHostIngress { .. }
         ) {
             return Err(CompiledProofError::InvalidOrderedComposite {
                 operation: operation.id,
