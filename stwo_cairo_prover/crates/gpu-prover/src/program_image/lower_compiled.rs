@@ -65,6 +65,7 @@ mod static_wrapper_invocation;
 mod static_wrapper_projection;
 #[cfg(test)]
 mod static_wrapper_projection_tests;
+mod transcript_semantic_projection;
 mod witness_casm_input;
 mod witness_input_gather;
 #[cfg(test)]
@@ -287,6 +288,7 @@ enum InvocationShapeError {
     InvalidInteractionRootStaging,
     InvalidRelationAuthority,
     InvalidRelationBinding,
+    InvalidTranscriptSemanticProjection,
 }
 
 fn validate_invocation(
