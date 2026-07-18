@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 
 use stwo_backend_cuda::aot;
 use stwo_backend_cuda::pedersen_table::{
-    registered_borrowed_pedersen_table, PedersenTableContentDigest, RegisteredPedersenTable,
-    PEDERSEN_TABLE_REGISTRATION_GENERATION,
+    registered_borrowed_pedersen_table, PedersenTableContentDigest, RegisteredPedersenColumn,
+    RegisteredPedersenTable, PEDERSEN_TABLE_REGISTRATION_GENERATION,
 };
 
 use super::super::compiled_base_prefix::module_globals::{
@@ -24,7 +24,7 @@ use super::super::resolved_recorded_build_authority::ResolvedRecordedBuildAuthor
 use super::super::InvocationShapeError;
 use crate::compiled_proof::{
     ByteRange, ModuleGlobalInitializer, ModuleGlobalInitializerAtom, ModuleGlobalInitializerId,
-    ModuleIdentity, RegisteredFixedSourceAuthority,
+    ModuleIdentity, RegisteredFixedSourceAuthority, RegisteredFixedSourceRead,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,6 +97,45 @@ impl PreparedRegisteredFixedSource {
             registered: RegisteredSourceSnapshot::from_pedersen(registered)?,
             canonical: RegisteredSourceSnapshot::from_pedersen(canonical)?,
         })
+    }
+
+    /// Bind one direct fixed-table read to the exact checked registration and
+    /// the live column borrowed by the prepared graph.
+    pub(in crate::program_image::lower_compiled) fn validate_read_column(
+        &self,
+        read: &RegisteredFixedSourceRead,
+        column: RegisteredPedersenColumn,
+    ) -> Result<(), InvocationShapeError> {
+        let canonical = registered_pedersen_source(PedersenTableColumnsAndRowsV1::CANONICAL)
+            .map_err(|_| InvocationShapeError::LoadedModuleStateAuthorityMismatch)?;
+        bind_source(canonical.clone(), self)?;
+        let column_address = u64::try_from(column.as_u32_ptr() as usize)
+            .map_err(|_| InvocationShapeError::SizeOverflow)?;
+        if read.source() != &canonical
+            || read.column() != column.index()
+            || read.elements().start != 0
+            || read.elements().end != canonical.padded_rows()
+            || self.registered != self.canonical
+            || self.canonical.generation != PEDERSEN_TABLE_REGISTRATION_GENERATION
+        {
+            return Err(InvocationShapeError::LoadedModuleStateAuthorityMismatch);
+        }
+        let snapshot = self
+            .canonical
+            .columns
+            .get(read.column())
+            .filter(|snapshot| {
+                snapshot.index == read.column()
+                    && snapshot.elements == read.elements().end
+                    && snapshot.address != 0
+                    && snapshot.address == column_address
+                    && column.len_words() == read.elements().len()
+            })
+            .ok_or(InvocationShapeError::LoadedModuleStateAuthorityMismatch)?;
+        if snapshot.address % self.canonical.element_bytes as u64 != 0 {
+            return Err(InvocationShapeError::LoadedModuleStateAuthorityMismatch);
+        }
+        Ok(())
     }
 }
 
