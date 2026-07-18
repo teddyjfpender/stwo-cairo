@@ -17,7 +17,7 @@ pub(super) fn require_supported_topology(
     plan: &FleetProofPlan,
 ) -> Result<usize, FleetTwoRankStructuralClosureError> {
     let workers = &plan.placement().topology.workers;
-    if !matches!(workers.len(), 2 | 4 | 8 | 16) {
+    if !supported_multi_worker_count(workers.len()) {
         return Err(FleetTwoRankStructuralClosureError::WorkerCount {
             actual: workers.len(),
         });

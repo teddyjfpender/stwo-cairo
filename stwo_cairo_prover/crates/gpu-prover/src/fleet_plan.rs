@@ -75,6 +75,14 @@ pub use worker_install::{
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct WorkerId(pub u16);
 
+const fn supported_worker_count(count: usize) -> bool {
+    matches!(count, 1 | 2 | 4 | 8 | 16)
+}
+
+const fn supported_multi_worker_count(count: usize) -> bool {
+    count != 1 && supported_worker_count(count)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ReplicaId(pub u32);
 

@@ -434,7 +434,7 @@ impl FleetIpcRankInstallAcknowledgement {
 
 fn require_multi_worker(view: &FleetRuntimeView) -> Result<(), FleetIpcRankInstallError> {
     let actual = view.exchange_reserves().len();
-    if matches!(actual, 2 | 4 | 8 | 16) {
+    if supported_multi_worker_count(actual) {
         Ok(())
     } else {
         Err(FleetIpcRankInstallError::ExpectedMultiWorker(actual))

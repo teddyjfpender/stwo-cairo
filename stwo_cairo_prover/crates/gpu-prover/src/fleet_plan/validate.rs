@@ -303,7 +303,7 @@ fn worker_interval_completion(
 fn validate_topology(
     topology: &FleetPlacementTopology,
 ) -> Result<BTreeMap<WorkerId, &WorkerSpec>, FleetPlanError> {
-    if !matches!(topology.workers.len(), 1 | 2 | 4 | 8 | 16) {
+    if !supported_worker_count(topology.workers.len()) {
         return Err(FleetPlanError::EmptyTopology);
     }
     if topology.module_pack_identity == [0; 32] || topology.fixed_image_identity == [0; 32] {
