@@ -187,6 +187,20 @@ class VerticalAbbaTests(unittest.TestCase):
         self.assertIn("line.split(prefix, 1)[1]", receipt_parser)
         self.assertIn("if prefix in line", receipt_parser)
         self.assertNotIn("line.startswith(prefix)", receipt_parser)
+        self.assertIn(
+            'receipt.get("semantic_equivalence_boundary") != "retained-evaluations"',
+            receipt_parser,
+        )
+        self.assertIn(
+            'receipt.get("candidate_terminal_coefficients_materialized") is not False',
+            receipt_parser,
+        )
+        self.assertNotIn('"source_postimages_equal"', receipt_parser)
+        self.assertNotIn('"coefficient_halves_equal"', receipt_parser)
+        self.assertIn(
+            "stwo.composition-split-commit-native.v2",
+            functions["vertical_abba_split_commit_native_gate"],
+        )
 
         spec = pregate._SN2_VERTICAL_RECIPES[pregate.SN2_VERTICAL_ABBA_RECIPE]
         for fragment in (

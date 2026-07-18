@@ -73,8 +73,6 @@ if marker == "STWO_COMPOSITION_SPLIT_NATIVE_RECEIPT_JSON":
         raise SystemExit(f"{marker}: fallback/fused differential contract failed")
 else:
     required = (
-        "source_postimages_equal",
-        "coefficient_halves_equal",
         "retained_evaluations_equal",
         "leaf_hashes_equal",
         "retained_merkle_layers_equal",
@@ -87,6 +85,8 @@ else:
     if (cases[0].get("candidate_launch_mode") != "FusedFirstForward"
             or cases[0].get("modeled_candidate_logical_bytes") != 4_026_531_840
             or receipt.get("log24_candidate_launch_mode") != "FusedFirstForward"
+            or receipt.get("semantic_equivalence_boundary") != "retained-evaluations"
+            or receipt.get("candidate_terminal_coefficients_materialized") is not False
             or any(receipt.get(field) is not True for field in required)):
         raise SystemExit(f"{marker}: fused commit/root contract failed")
 out.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -128,7 +128,7 @@ vertical_abba_split_commit_native_gate() {
   [[ $rc -eq 0 ]] || return "$rc"
   vertical_abba_require_native_receipt \
     "$log" STWO_COMPOSITION_SPLIT_COMMIT_NATIVE_RECEIPT_JSON \
-    stwo.composition-split-commit-native.v1 \
+    stwo.composition-split-commit-native.v2 \
     "$(checkpoint_artifact composition_split_commit_log24_native.receipt.json)"
 }
 
