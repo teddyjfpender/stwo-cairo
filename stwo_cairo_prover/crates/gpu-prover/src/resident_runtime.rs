@@ -92,10 +92,12 @@ use crate::transcript_plan::{
 };
 use crate::{PreparedCompositionError, PreparedCompositionGraph};
 
+mod eager_vertical;
 mod loaded_composition;
 pub(crate) mod producer_schedule;
 
-use loaded_composition::AdmittedCompositionExecution;
+use eager_vertical::{EagerVerticalOrder, EagerVerticalStep};
+use loaded_composition::{AdmittedCompositionExecution, CompiledCompositionAdmission};
 use producer_schedule::{BaseProducerSchedule, BaseProducerStep, ProducerScheduleError};
 
 /// One setup drain even through ordinary errors or unwinding. Host buffers
@@ -467,6 +469,7 @@ pub enum ResidentRuntimeError {
     MissingPreparedCommitment(CommitmentTreeId),
     DirectRetainedOutputMismatch(CommitmentTreeId),
     CompiledCompositionAdmission(&'static str),
+    CompiledEagerVertical(&'static str),
     PostCompiledCompositionHandoff(&'static str),
     FixedPreprocessedCommitmentNotReady,
     TranscriptScheduleMismatch {
@@ -1789,7 +1792,7 @@ pub struct ResidentGraphRuntime<'a> {
     interaction_commit_input: PreparedTraceCommitInput<'a>,
     interaction_claim_sources: Vec<ArenaSlice>,
     composition: PreparedCompositionGraph<'a>,
-    loaded_composition: Option<AdmittedCompositionExecution>,
+    loaded_composition: CompiledCompositionAdmission,
     oods: ResidentOodsPipeline<'a>,
     fri: PreparedFriGraph<'a>,
     fri_final: PreparedFriFinalGraph<'a>,
@@ -3056,7 +3059,7 @@ impl<'a> ResidentGraphRuntime<'a> {
             interaction_commit_input,
             interaction_claim_sources,
             composition,
-            loaded_composition: None,
+            loaded_composition: CompiledCompositionAdmission::default(),
             oods,
             fri,
             fri_final,
@@ -3112,6 +3115,13 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// replay window. This is opt-in until the replacement-path selector owns
     /// the vertical execution lane.
     pub fn admit_compiled_composition_eager(&mut self) -> Result<(), ResidentRuntimeError> {
+        if !self
+            .loaded_composition
+            .needs_publish()
+            .map_err(ResidentRuntimeError::CompiledCompositionAdmission)?
+        {
+            return Ok(());
+        }
         if self.workspace.plan().protocol_identity().resident_backend
             != ResidentBackend::ReplacementV1
         {
@@ -3122,14 +3132,15 @@ impl<'a> ResidentGraphRuntime<'a> {
         let target_sm = replacement_target_sm(cuda_device_snapshot()?).ok_or(
             ResidentRuntimeError::CompiledCompositionAdmission("current CUDA target"),
         )?;
-        self.loaded_composition = Some(
-            AdmittedCompositionExecution::admit(
-                self.workspace.plan(),
-                &self.composition,
-                target_sm,
-            )
-            .map_err(ResidentRuntimeError::CompiledCompositionAdmission)?,
-        );
+        let admitted = AdmittedCompositionExecution::admit(
+            self.workspace.plan(),
+            &self.composition,
+            target_sm,
+        )
+        .map_err(ResidentRuntimeError::CompiledCompositionAdmission)?;
+        self.loaded_composition
+            .publish(admitted)
+            .map_err(ResidentRuntimeError::CompiledCompositionAdmission)?;
         Ok(())
     }
 
@@ -5373,12 +5384,24 @@ impl<'a> ResidentGraphRuntime<'a> {
     /// Execute the prepare-time-admitted complete Composition program and its
     /// existing commitment/transcript/OODS continuation.
     pub fn launch_compiled_composition_commit_eager(&mut self) -> Result<(), ResidentRuntimeError> {
-        self.loaded_composition
-            .as_ref()
-            .ok_or(ResidentRuntimeError::CompiledCompositionAdmission(
-                "compiled Composition was not admitted before replay",
-            ))?
-            .launch_eager(&self.composition)?;
+        let admitted = self
+            .loaded_composition
+            .begin_run()
+            .map_err(ResidentRuntimeError::CompiledCompositionAdmission)?;
+        let result = self.launch_admitted_composition_commit_eager(admitted);
+        if result.is_ok() {
+            self.loaded_composition
+                .complete_run(admitted)
+                .map_err(ResidentRuntimeError::CompiledCompositionAdmission)?;
+        }
+        result
+    }
+
+    fn launch_admitted_composition_commit_eager(
+        &mut self,
+        admitted: AdmittedCompositionExecution,
+    ) -> Result<(), ResidentRuntimeError> {
+        admitted.launch_eager(&self.composition)?;
         self.launch_post_compiled_composition_handoff_eager()?;
         let requirements = self.composition.requirements();
         self.composition_replay_receipt = Some(CompositionReplayReceipt {
@@ -5388,6 +5411,75 @@ impl<'a> ResidentGraphRuntime<'a> {
                 .map_or(0, |receipt| receipt.wave_count),
         });
         Ok(())
+    }
+
+    /// Execute one complete eager resident proof generation through the
+    /// canonical proof-bundle enqueue.
+    ///
+    /// [`Self::admit_compiled_composition_eager`] must be called before the
+    /// caller begins timing. Any partial failure poisons this runtime, so a
+    /// retry must rebuild it rather than resume from ambiguous device state.
+    /// On success the transcript is complete and [`Self::read_proof_bundle_once`]
+    /// is the sole remaining host boundary.
+    pub fn launch_compiled_eager_vertical(&mut self) -> Result<(), ResidentRuntimeError> {
+        let fri_rounds = self.fri_round_count();
+        let mut order = EagerVerticalOrder::new(fri_rounds)
+            .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+        let admitted = self
+            .loaded_composition
+            .begin_run()
+            .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+        let result = (|| {
+            order
+                .admit(EagerVerticalStep::BeginTranscript)
+                .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+            self.begin_next_transcript_generation()?;
+
+            order
+                .admit(EagerVerticalStep::Base)
+                .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+            self.launch_base_commit_eager()?;
+
+            order
+                .admit(EagerVerticalStep::Interaction)
+                .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+            self.launch_interaction_eager()?;
+
+            order
+                .admit(EagerVerticalStep::Composition)
+                .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+            self.launch_admitted_composition_commit_eager(admitted)?;
+
+            order
+                .admit(EagerVerticalStep::OodsAndQuotient)
+                .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+            self.launch_oods_transcript_boundary_eager()?;
+
+            order
+                .admit(EagerVerticalStep::FriFirstTree)
+                .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+            self.launch_fri_first_tree_eager()?;
+            for round in 0..fri_rounds {
+                order
+                    .admit(EagerVerticalStep::FriRound(round))
+                    .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+                self.launch_fri_round_eager(round)?;
+            }
+
+            order
+                .admit(EagerVerticalStep::FinalPowAndBundle)
+                .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+            self.launch_final_transcript_boundary_eager()?;
+            order
+                .finish()
+                .map_err(ResidentRuntimeError::CompiledEagerVertical)
+        })();
+        if result.is_ok() {
+            self.loaded_composition
+                .complete_run(admitted)
+                .map_err(ResidentRuntimeError::CompiledEagerVertical)?;
+        }
+        result
     }
 
     /// Continue the resident proof after an externally executed, complete

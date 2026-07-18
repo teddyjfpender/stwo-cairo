@@ -19,11 +19,70 @@ const TERMINAL_CHILDREN: usize = 5;
 
 /// Immutable evidence that one prepared Composition graph was admitted against
 /// the exact structural program and target-specific module pack.
+#[derive(Clone, Copy)]
 pub(super) struct AdmittedCompositionExecution {
     _program_identity: [u8; 32],
     _linked_identity: [u8; 32],
     _static_module_build_identity: [u8; 32],
     _target_sm: u32,
+}
+
+/// Fail-closed lifecycle for the opt-in eager vertical path. A partial run
+/// poisons the runtime; rebuilding it is the only sound retry.
+#[derive(Clone, Copy)]
+pub(super) enum CompiledCompositionAdmission {
+    Unadmitted,
+    Ready(AdmittedCompositionExecution),
+    Poisoned,
+}
+
+impl Default for CompiledCompositionAdmission {
+    fn default() -> Self {
+        Self::Unadmitted
+    }
+}
+
+impl CompiledCompositionAdmission {
+    pub(super) fn needs_publish(&self) -> Result<bool, &'static str> {
+        match self {
+            Self::Unadmitted => Ok(true),
+            Self::Ready(_) => Ok(false),
+            Self::Poisoned => Err("compiled eager runtime is poisoned"),
+        }
+    }
+
+    pub(super) fn publish(
+        &mut self,
+        admitted: AdmittedCompositionExecution,
+    ) -> Result<(), &'static str> {
+        if matches!(self, Self::Poisoned) {
+            return Err("compiled eager runtime is poisoned");
+        }
+        *self = Self::Ready(admitted);
+        Ok(())
+    }
+
+    pub(super) fn begin_run(&mut self) -> Result<AdmittedCompositionExecution, &'static str> {
+        match *self {
+            Self::Ready(admitted) => {
+                *self = Self::Poisoned;
+                Ok(admitted)
+            }
+            Self::Unadmitted => Err("compiled Composition was not admitted before replay"),
+            Self::Poisoned => Err("compiled eager runtime is poisoned"),
+        }
+    }
+
+    pub(super) fn complete_run(
+        &mut self,
+        admitted: AdmittedCompositionExecution,
+    ) -> Result<(), &'static str> {
+        if !matches!(self, Self::Poisoned) {
+            return Err("compiled eager runtime did not own the active run");
+        }
+        *self = Self::Ready(admitted);
+        Ok(())
+    }
 }
 
 impl AdmittedCompositionExecution {
@@ -280,5 +339,28 @@ mod tests {
             plan.composition().output_plan.mode(),
             CompositionOutputMode::DirectRetainedEvaluations
         );
+    }
+
+    #[test]
+    fn partial_eager_run_poison_is_fail_closed() {
+        let admitted = AdmittedCompositionExecution {
+            _program_identity: [1; 32],
+            _linked_identity: [2; 32],
+            _static_module_build_identity: [3; 32],
+            _target_sm: 89,
+        };
+        let mut state = CompiledCompositionAdmission::default();
+        assert_eq!(state.needs_publish(), Ok(true));
+        assert!(state.begin_run().is_err());
+        state.publish(admitted).unwrap();
+        assert_eq!(state.needs_publish(), Ok(false));
+        state.publish(admitted).unwrap();
+        let active = state.begin_run().unwrap();
+        assert!(state.begin_run().is_err());
+        assert!(state.needs_publish().is_err());
+        assert!(state.publish(admitted).is_err());
+        state.complete_run(active).unwrap();
+        assert!(state.begin_run().is_ok());
+        assert!(state.publish(admitted).is_err());
     }
 }
