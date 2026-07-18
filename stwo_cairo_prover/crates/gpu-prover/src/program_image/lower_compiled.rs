@@ -44,6 +44,7 @@ mod execution_tables;
 mod fixed_table_materialization;
 mod interaction_claim_staging;
 mod interaction_commit_projection;
+mod interaction_root_staging;
 mod loaded_authority;
 mod loaded_base_binding;
 mod loaded_writer_binding;
@@ -283,6 +284,7 @@ enum InvocationShapeError {
     InvalidInteractionCommitAuthority,
     InvalidInteractionCommitBinding,
     InvalidInteractionClaimStaging,
+    InvalidInteractionRootStaging,
     InvalidRelationAuthority,
     InvalidRelationBinding,
 }

@@ -5,9 +5,13 @@
 //! Interaction-owned arena values, the InteractionCommit lifetime, and the
 //! exact transcript segment which absorbs the resulting root.
 
-use stwo_backend_cuda::{InteractionCommitProgramAuthority, TraceTreeRole, TranscriptOperation};
+use stwo_backend_cuda::{
+    BaseCommitAccessKind, InteractionCommitProgramAuthority, TraceTreeRole, TranscriptOperation,
+};
 
-use super::base_commit_projection::{self, CommitInventoryKind, LoweredBaseCommitOperation};
+use super::base_commit_projection::{
+    self, CommitInventoryKind, LoweredBaseCommitAccess, LoweredBaseCommitOperation,
+};
 use super::*;
 use crate::arena_plan::{CommitmentTreeId, ProofArenaPlan};
 use crate::compiled_proof::{StaticCudaWrapperAuthority, StaticCudaWrapperId};
@@ -53,6 +57,48 @@ impl LoweredInteractionCommit {
 
     pub(super) const fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    /// Exact final write which owns the Interaction Merkle root.
+    pub(super) fn final_root_output(
+        &self,
+    ) -> Result<&LoweredBaseCommitAccess, InvocationShapeError> {
+        let (last, prefix) = self
+            .operations
+            .split_last()
+            .ok_or(InvocationShapeError::InvalidInteractionCommitBinding)?;
+        let root_role = self.authority.root();
+        if prefix
+            .iter()
+            .flat_map(|operation| operation.accesses())
+            .any(|access| access.role == root_role && access.kind == BaseCommitAccessKind::Write)
+        {
+            return Err(InvocationShapeError::InvalidInteractionCommitBinding);
+        }
+        let mut roots = last.accesses().iter().filter(|access| {
+            access.role == root_role && access.kind == BaseCommitAccessKind::Write
+        });
+        let root = roots
+            .next()
+            .ok_or(InvocationShapeError::InvalidInteractionCommitBinding)?;
+        let authority = last
+            .authority()
+            .effect
+            .accesses
+            .get(
+                usize::try_from(root.authority_index)
+                    .map_err(|_| InvocationShapeError::SizeOverflow)?,
+            )
+            .ok_or(InvocationShapeError::InvalidInteractionCommitBinding)?;
+        if roots.next().is_some()
+            || authority.kind != BaseCommitAccessKind::Write
+            || authority.role != root_role
+            || authority.first_word != 0
+            || authority.word_len != 8
+        {
+            return Err(InvocationShapeError::InvalidInteractionCommitBinding);
+        }
+        Ok(root)
     }
 }
 
@@ -151,7 +197,7 @@ pub(super) fn resolve_static_wrapper(
     .map_err(interaction_projection_error)
 }
 
-fn validate_receipt(
+pub(super) fn validate_receipt(
     arena: &ProofArenaPlan,
     transcript: &CairoBlake2sTranscriptPlan,
     lowered: &LoweredInteractionCommit,
@@ -241,6 +287,10 @@ impl InteractionCommitTranscriptStage {
 
     pub(super) const fn interaction_claim_operation(self) -> u32 {
         self.interaction_claim
+    }
+
+    pub(super) const fn interaction_root_operation(self) -> u32 {
+        self.interaction_root
     }
 
     fn compile_segment(
@@ -424,6 +474,11 @@ fn interaction_projection_error(error: InvocationShapeError) -> InvocationShapeE
         InvocationShapeError::SizeOverflow => InvocationShapeError::SizeOverflow,
         _ => InvocationShapeError::InvalidInteractionCommitBinding,
     }
+}
+
+#[cfg(test)]
+pub(super) fn tamper_receipt_digest_for_test(lowered: &mut LoweredInteractionCommit) {
+    lowered.digest[0] ^= 1;
 }
 
 #[cfg(test)]
