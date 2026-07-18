@@ -85,6 +85,12 @@ pub enum InPlaceDiscipline {
     ElementWiseReadBeforeWrite,
     BlockBarrierPhases,
     CooperativeGridPhases,
+    /// An aliased destination is a strict extension of the source and the
+    /// wrapper consumes the complete lower prefix before overwriting it.
+    ExactLowerPrefixReadBeforeWrite,
+    /// One ordered wrapper composite may reuse the same storage across its
+    /// child steps; the sealed child manifest is the synchronization proof.
+    OrderedCompositeInPlace,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -692,6 +698,8 @@ impl Encoder {
             InPlaceDiscipline::ElementWiseReadBeforeWrite => 0,
             InPlaceDiscipline::BlockBarrierPhases => 1,
             InPlaceDiscipline::CooperativeGridPhases => 2,
+            InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite => 3,
+            InPlaceDiscipline::OrderedCompositeInPlace => 4,
         });
     }
 }
@@ -740,5 +748,45 @@ mod tests {
         let mut changed = baseline;
         changed.accepted_executions[0].2 = invocation(8);
         assert!(!changed.has_valid_identity().unwrap());
+    }
+
+    #[test]
+    fn every_in_place_discipline_has_distinct_identity() {
+        let effects = [
+            InPlaceDiscipline::ElementWiseReadBeforeWrite,
+            InPlaceDiscipline::BlockBarrierPhases,
+            InPlaceDiscipline::CooperativeGridPhases,
+            InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite,
+            InPlaceDiscipline::OrderedCompositeInPlace,
+        ]
+        .map(|discipline| {
+            EffectContract::new(
+                vec![EffectAccess::ReadWrite {
+                    source: BoundValueRange {
+                        binding: EffectBindingId(0),
+                        value: ValueRange {
+                            version: ValueVersion(0),
+                            elements: ElementRange::new(0, 4).unwrap(),
+                        },
+                    },
+                    destination: BoundValueRange {
+                        binding: EffectBindingId(0),
+                        value: ValueRange {
+                            version: ValueVersion(1),
+                            elements: ElementRange::new(0, 4).unwrap(),
+                        },
+                    },
+                    in_place: Some(InPlaceAliasAuthority {
+                        id: InPlaceAliasId(0),
+                        requirement: InPlaceAliasRequirement::Required,
+                        discipline,
+                    }),
+                }],
+                Vec::new(),
+            )
+            .unwrap()
+            .id()
+        });
+        assert_eq!(effects.into_iter().collect::<BTreeSet<_>>().len(), 5);
     }
 }

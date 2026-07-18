@@ -454,6 +454,8 @@ impl InvocationEncoder {
                 InPlaceDiscipline::ElementWiseReadBeforeWrite => 0,
                 InPlaceDiscipline::BlockBarrierPhases => 1,
                 InPlaceDiscipline::CooperativeGridPhases => 2,
+                InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite => 3,
+                InPlaceDiscipline::OrderedCompositeInPlace => 4,
             });
         }
         Ok(())
