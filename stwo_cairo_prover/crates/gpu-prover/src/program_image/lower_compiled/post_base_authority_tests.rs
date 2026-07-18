@@ -10,7 +10,7 @@ use stwo_backend_cuda::{
     RelationTailMode, TraceTreeRole,
 };
 
-use crate::arena_plan::{CommitmentTreeId, QuotientNumeratorSchedule};
+use crate::arena_plan::{BufferPurpose, CommitmentTreeId, QuotientNumeratorSchedule};
 use crate::prepared_composition::{
     CompositionExecutionReceipt, CompositionLaunchMode, CompositionOutputMode,
 };
@@ -126,6 +126,15 @@ fn generated_sn2_post_base_shape_receipt_is_exact() {
     assert_eq!(receipt.logical_bytes_removed, 4_400_328_576);
     assert_eq!(receipt.workspace_bytes_removed, 268_435_360);
     assert_eq!(receipt.retained_weight_bytes, 268_435_456);
+    let descriptor_offsets = arena
+        .find(None, None, BufferPurpose::OodsBarycentricScales, 0)
+        .expect("collapsed OODS descriptor storage must be planned")
+        .1;
+    assert_eq!(
+        descriptor_offsets.len_words,
+        collapse.collapsed_requirements().barycentric_scale_words
+    );
+    assert_eq!(descriptor_offsets.len_words, 28);
 
     let numerator = arena.quotient_numerator();
     assert_eq!(

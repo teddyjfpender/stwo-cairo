@@ -7665,6 +7665,10 @@ fn append_protocol_buffers(
             "selected OODS pass-collapse program changed ordinary requirements",
         ));
     }
+    let oods_runtime_requirements = oods_pass_collapse
+        .as_ref()
+        .map(|program| program.collapsed_requirements())
+        .unwrap_or(&oods_requirements);
     let quotient_numerator_config = protocol.quotient_numerator_workspace_config()?;
     let quotient_numerator_topologies = protocol.quotient_numerator_topologies()?;
     let quotient_numerator_requirements = quotient_numerator_workspace_requirements(
@@ -8962,79 +8966,79 @@ fn append_protocol_buffers(
     let oods_source_pointers = oods_slot(
         BufferPurpose::OodsSourcePointers,
         0,
-        oods_requirements.source_pointer_words,
+        oods_runtime_requirements.source_pointer_words,
         oods_descriptor,
     )?;
     let oods_offset_points = oods_slot(
         BufferPurpose::OodsOffsetPoints,
         0,
-        oods_requirements.offset_point_words,
+        oods_runtime_requirements.offset_point_words,
         oods_descriptor,
     )?;
     let oods_fold_counts = oods_slot(
         BufferPurpose::OodsFoldCounts,
         0,
-        oods_requirements.fold_count_words,
+        oods_runtime_requirements.fold_count_words,
         oods_descriptor,
     )?;
     let oods_output_indices = oods_slot(
         BufferPurpose::OodsOutputIndices,
         0,
-        oods_requirements.output_index_words,
+        oods_runtime_requirements.output_index_words,
         oods_descriptor,
     )?;
     let oods_folding_factors = oods_slot(
         BufferPurpose::OodsFoldingFactors,
         0,
-        oods_requirements.factor_words,
+        oods_runtime_requirements.factor_words,
         oods_live,
     )?;
     let oods_scratch_a = oods_slot(
         BufferPurpose::OodsScratchA,
         0,
-        oods_requirements.scratch_a_words,
+        oods_runtime_requirements.scratch_a_words,
         oods_live,
     )?;
     let oods_scratch_b = oods_slot(
         BufferPurpose::OodsScratchB,
         0,
-        oods_requirements.scratch_b_words,
+        oods_runtime_requirements.scratch_b_words,
         oods_live,
     )?;
     let oods_sample_points = oods_slot(
         BufferPurpose::OodsSamplePoints,
         0,
-        oods_requirements.sample_point_words,
+        oods_runtime_requirements.sample_point_words,
         oods_sample_points_live,
     )?;
     let oods_evaluation_points = oods_slot(
         BufferPurpose::OodsEvaluationPoints,
         0,
-        oods_requirements.evaluation_point_words,
+        oods_runtime_requirements.evaluation_point_words,
         oods_live,
     )?;
     let oods_barycentric_numerators = oods_slot(
         BufferPurpose::OodsBarycentricNumerators,
         0,
-        oods_requirements.barycentric_numerator_words,
+        oods_runtime_requirements.barycentric_numerator_words,
         oods_live,
     )?;
     let oods_barycentric_weights = oods_slot(
         BufferPurpose::OodsBarycentricWeights,
         0,
-        oods_requirements.barycentric_weight_words,
+        oods_runtime_requirements.barycentric_weight_words,
         oods_live,
     )?;
     let oods_barycentric_scales = oods_slot(
         BufferPurpose::OodsBarycentricScales,
         0,
-        oods_requirements.barycentric_scale_words,
+        oods_runtime_requirements.barycentric_scale_words,
         oods_live,
     )?;
     let oods_barycentric_partials = oods_slot(
         BufferPurpose::OodsBarycentricPartials,
         0,
-        oods_requirements.barycentric_partial_words,
+        oods_runtime_requirements.barycentric_partial_words,
         oods_live,
     )?;
     let logical_oods = LogicalOodsWorkspace {
