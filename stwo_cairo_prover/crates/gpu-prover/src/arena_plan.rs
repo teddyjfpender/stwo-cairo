@@ -10002,17 +10002,7 @@ fn resolve_composition_slots(
         logical.direct_retention.as_ref(),
     )
     .map_err(ArenaPlanError::Composition)?;
-    let address_free = |mut requirements: CompositionWorkspaceRequirements| {
-        for source in requirements
-            .components
-            .iter_mut()
-            .flat_map(|component| &mut component.sources)
-        {
-            source.source.slot = ArenaSlotId(0);
-        }
-        requirements
-    };
-    if address_free(rebound_requirements) != address_free(logical.requirements.clone()) {
+    if !rebound_requirements.same_address_free_structure(&logical.requirements) {
         return Err(ArenaPlanError::InvalidProtocolGeometry(
             "composition workspace changed while binding physical trace sources",
         ));

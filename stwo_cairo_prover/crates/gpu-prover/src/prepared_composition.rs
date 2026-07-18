@@ -396,6 +396,23 @@ pub struct CompositionWorkspaceRequirements {
 }
 
 impl CompositionWorkspaceRequirements {
+    /// Compares the complete prepared shape while ignoring only rebound trace
+    /// source slots. Every sizing, topology, receipt, and source-log field
+    /// remains exact.
+    pub(crate) fn same_address_free_structure(&self, other: &Self) -> bool {
+        let without_source_slots = |mut requirements: Self| {
+            for source in requirements
+                .components
+                .iter_mut()
+                .flat_map(|component| &mut component.sources)
+            {
+                source.source.slot = ArenaSlotId(0);
+            }
+            requirements
+        };
+        without_source_slots(self.clone()) == without_source_slots(other.clone())
+    }
+
     pub fn arena_slot_requirements(
         &self,
         slots: &CompositionWorkspaceSlots,
@@ -4481,6 +4498,24 @@ mod tests {
                 .unwrap_err(),
             PreparedCompositionError::DuplicateSlot(duplicate.descriptors)
         );
+    }
+
+    #[test]
+    fn address_free_structure_ignores_only_rebound_source_slots() {
+        let requirements =
+            composition_workspace_requirements(&one_component_plan(vec![0]), &trace()).unwrap();
+        let mut rebound = requirements.clone();
+        for (index, source) in rebound.components[0].sources.iter_mut().enumerate() {
+            source.source.slot = ArenaSlotId(1_000 + index as u32);
+        }
+        assert!(requirements.same_address_free_structure(&rebound));
+
+        rebound.components[0].sources[0].source.log_size += 1;
+        assert!(!requirements.same_address_free_structure(&rebound));
+
+        let mut drifted = requirements.clone();
+        drifted.total_constraints += 1;
+        assert!(!requirements.same_address_free_structure(&drifted));
     }
 
     #[test]

@@ -277,7 +277,7 @@ fn validate_prepared_graph(
     let receipt = actual
         .execution_receipt
         .ok_or("prepared Composition execution receipt")?;
-    if actual != planned
+    if !actual.same_address_free_structure(planned)
         || actual.mode != crate::prepared_composition::CompositionLaunchMode::Wave
         || receipt.wave_count == 0
         || receipt.part_count < receipt.wave_count
