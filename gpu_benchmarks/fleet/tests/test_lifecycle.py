@@ -375,6 +375,25 @@ class FleetCliTests(unittest.TestCase):
         current.assert_called_once_with(receipt, recipe, cli.STWO, cli.STWO_CAIRO)
         formal.assert_not_called()
 
+    def test_sn2_5mhz_up_rejects_noncanonical_name_before_provider(self) -> None:
+        recipe = cli.STWO_CAIRO / cli.pregate.SN2_5MHZ_CHEAP_RECIPE
+        with (
+            mock.patch.object(cli, "_require_provider_admission") as admission,
+            mock.patch.object(cli.api, "secure_offer") as offer,
+            mock.patch.object(cli.api, "create_pod") as create,
+        ):
+            with self.assertRaisesRegex(ValueError, "eight lowercase hex"):
+                cli.do_up(
+                    up_args(
+                        recipe=str(recipe),
+                        name="stwo-sn2-5mhz-ab-a40-nothex",
+                        volume_id=None,
+                    )
+                )
+        admission.assert_not_called()
+        offer.assert_not_called()
+        create.assert_not_called()
+
     def test_sn2_5mhz_up_drift_after_bootstrap_terminates_created_pod(self) -> None:
         recipe = cli.STWO_CAIRO / cli.pregate.SN2_5MHZ_CHEAP_RECIPE
         created = pod(name="stwo-sn2-5mhz-ab-a40-deadbeef")

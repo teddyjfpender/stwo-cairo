@@ -280,6 +280,12 @@ def _apply_recipe_lease(args) -> LeasePolicy:
         args.name = f"{policy.name_prefix}{secrets.token_hex(4)}"
     if not args.name.startswith(policy.name_prefix):
         raise ValueError("--name does not match the recipe lease prefix")
+    if (
+        policy == pregate.SN2_5MHZ_CHEAP_POLICY
+        and re.fullmatch(re.escape(policy.name_prefix) + r"[0-9a-f]{8}", args.name)
+        is None
+    ):
+        raise ValueError("SN2 5 MHz --name must be its prefix plus eight lowercase hex")
     if policy.one_shot and args.volume_id:
         raise ValueError("one-shot leases cannot attach a persistent network volume")
     return policy
