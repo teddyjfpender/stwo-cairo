@@ -25,29 +25,21 @@ const SCRATCH: Blake2sPowWorkspaceSlots = Blake2sPowWorkspaceSlots {
 pub struct FleetPowWorker {
     arena: DeviceArena,
     logical_rank: WorkerId,
-    pow_bits: u32,
 }
 
 impl FleetPowWorker {
-    pub fn new(logical_rank: WorkerId, pow_bits: u32) -> Result<Self, FleetPowWorkerError> {
+    pub fn new(logical_rank: WorkerId) -> Result<Self, FleetPowWorkerError> {
         admit_device(cuda_device_snapshot()?)?;
 
         let layout = worker_layout()?;
-        let worker = Self {
+        Ok(Self {
             arena: DeviceArena::new(CudaExecContext::new()?, layout)?,
             logical_rank,
-            pow_bits,
-        };
-        worker.graph()?;
-        Ok(worker)
+        })
     }
 
     pub const fn logical_rank(&self) -> WorkerId {
         self.logical_rank
-    }
-
-    pub const fn pow_bits(&self) -> u32 {
-        self.pow_bits
     }
 
     /// Execute one fixed request on the persistent stream and return only the
@@ -56,13 +48,7 @@ impl FleetPowWorker {
         &mut self,
         request: &FleetPowRankRequest,
     ) -> Result<FleetPowRankResponse, FleetPowWorkerError> {
-        let graph = self.graph()?;
-        if request.pow_bits() != graph.pow_bits() {
-            return Err(FleetPowWorkerError::PowBitsMismatch {
-                worker: graph.pow_bits(),
-                request: request.pow_bits(),
-            });
-        }
+        let graph = self.graph(request.pow_bits())?;
         if request.rank() != self.logical_rank {
             return Err(FleetPowWorkerError::RankMismatch {
                 worker: self.logical_rank,
@@ -78,11 +64,11 @@ impl FleetPowWorker {
         ))
     }
 
-    fn graph(&self) -> Result<PreparedBlake2sPowGraph<'_>, PreparedBlake2sPowError> {
+    fn graph(&self, pow_bits: u32) -> Result<PreparedBlake2sPowGraph<'_>, PreparedBlake2sPowError> {
         PreparedBlake2sPowGraph::prepare(
             &self.arena,
             self.arena.bind(STATE)?,
-            self.pow_bits,
+            pow_bits,
             self.arena.bind(NONCE)?,
             SCRATCH,
         )
@@ -104,7 +90,6 @@ pub enum FleetPowWorkerError {
     VisibleDeviceCount(u32),
     CurrentDevice(u32),
     RankMismatch { worker: WorkerId, request: WorkerId },
-    PowBitsMismatch { worker: u32, request: u32 },
     Runtime(FleetPowRuntimeError),
     Pow(PreparedBlake2sPowError),
     Arena(ArenaError),

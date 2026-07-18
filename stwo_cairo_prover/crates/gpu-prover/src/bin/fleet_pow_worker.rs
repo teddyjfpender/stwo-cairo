@@ -19,18 +19,12 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let socket = args
         .next()
-        .ok_or_else(|| "usage: fleet_pow_worker <socket> <pow-bits>".to_owned())?;
-    let pow_bits = args
-        .next()
-        .ok_or_else(|| "usage: fleet_pow_worker <socket> <pow-bits>".to_owned())?
-        .parse::<u32>()
-        .map_err(|error| format!("invalid pow bits: {error}"))?;
+        .ok_or_else(|| "usage: fleet_pow_worker <socket>".to_owned())?;
     if args.next().is_some() {
-        return Err("usage: fleet_pow_worker <socket> <pow-bits>".to_owned());
+        return Err("usage: fleet_pow_worker <socket>".to_owned());
     }
 
-    let mut worker =
-        FleetPowWorker::new(WorkerId(1), pow_bits).map_err(|error| error.to_string())?;
+    let mut worker = FleetPowWorker::new(WorkerId(1)).map_err(|error| error.to_string())?;
     let listener = UnixListener::bind(&socket).map_err(|error| error.to_string())?;
     let result = serve_pow_worker(listener, &mut worker).map_err(|error| error.to_string());
     let _ = std::fs::remove_file(socket);
