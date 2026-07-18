@@ -4,12 +4,15 @@
 //! before executable operations are appended, and missing linked authority
 //! leaves that receipt retryable without publishing a partial operation list.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use stwo_backend_cuda::MemoryBaseTraceStepKind;
 
 use super::super::producer_prefix::BaseProducerAuthority;
-use super::super::{fixed_table_materialization, memory_base_trace, InvocationShapeError};
+use super::super::{
+    adapter, base_commit_projection, fixed_table_materialization, memory_base_trace,
+    InvocationShapeError,
+};
 use super::{
     emission, insert_effect, push_operation, validate_causal_value_closure, wrapper_id,
     CompiledWitnessWriterPrefix,
@@ -17,13 +20,14 @@ use super::{
 use crate::arena_plan::ProofArenaPlan;
 use crate::compiled_proof::{
     EffectContract, EffectContractId, ExecutionPrimitive, PartitionAuthority,
-    StaticCudaWrapperAuthority, StaticCudaWrapperId,
+    StaticCudaWrapperAuthority, StaticCudaWrapperId, ValueVersion,
 };
 
 mod validation;
 
 use validation::{
-    seal_fixed_image_roots, validate_published_base_dag, FixedImageRootReceipt, PublishedBaseStage,
+    seal_base_commit_checkpoint, seal_base_commit_external_roots, seal_fixed_image_roots,
+    validate_published_base_dag, FixedImageRootReceipt, PublishedBaseStage,
 };
 
 type MemoryStaticResolver = fn(
@@ -38,6 +42,14 @@ type FixedTableStaticResolver =
         StaticCudaWrapperId,
         u32,
         &fixed_table_materialization::LoweredFixedTableStage,
+        usize,
+    ) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError>;
+
+type BaseCommitStaticResolver =
+    fn(
+        StaticCudaWrapperId,
+        u32,
+        &base_commit_projection::LoweredBaseCommit,
         usize,
     ) -> Result<Option<StaticCudaWrapperAuthority>, InvocationShapeError>;
 
@@ -62,6 +74,9 @@ pub(super) enum CompiledBaseDagAppendError {
         table_ordinal: u32,
         component: &'static str,
     },
+    MissingBaseCommitStaticWrapper {
+        operation_ordinal: u32,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -78,10 +93,20 @@ struct SealedFixedTables {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+struct SealedBaseCommit {
+    before: adapter::SemanticValueMap,
+    lowered: base_commit_projection::LoweredBaseCommit,
+    external_roots: BTreeSet<ValueVersion>,
+    checkpoint_digest: Option<[u8; 32]>,
+    emitted: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(super) struct CompiledBaseDagBuilder {
     prefix: CompiledWitnessWriterPrefix,
     memory: Option<SealedMemoryBaseTrace>,
     fixed_tables: Option<SealedFixedTables>,
+    base_commit: Option<SealedBaseCommit>,
 }
 
 impl CompiledBaseDagBuilder {
@@ -117,6 +142,7 @@ impl CompiledBaseDagBuilder {
             prefix,
             memory: None,
             fixed_tables: None,
+            base_commit: None,
         })
     }
 
@@ -161,6 +187,7 @@ impl CompiledBaseDagBuilder {
             let roots = validate_published_base_dag(
                 &self.prefix,
                 self.memory.as_ref(),
+                None,
                 None,
                 &self.prefix.values,
                 &self.prefix.effects,
@@ -235,6 +262,7 @@ impl CompiledBaseDagBuilder {
         let roots = validate_published_base_dag(
             &self.prefix,
             self.memory.as_ref(),
+            None,
             None,
             &self.prefix.values,
             &effects,
@@ -355,6 +383,7 @@ impl CompiledBaseDagBuilder {
             &self.prefix,
             self.memory.as_ref(),
             self.fixed_tables.as_ref(),
+            None,
             &self.prefix.values,
             &effects,
             &operations,
@@ -389,6 +418,170 @@ impl CompiledBaseDagBuilder {
         self.fixed_tables
             .as_ref()
             .is_some_and(|fixed| fixed.emitted)
+    }
+
+    /// Seal the complete generated BaseCommit after the exact fixed prefix.
+    pub(super) fn append_base_commit_semantics(
+        &mut self,
+        arena: &ProofArenaPlan,
+    ) -> Result<(), CompiledBaseDagAppendError> {
+        if self.base_commit.is_some() || !self.has_complete_fixed_table_stage() {
+            return Err(CompiledBaseDagAppendError::InvalidStage);
+        }
+        self.validate_arena_authority(arena)?;
+        let before = self.prefix.values.clone();
+        let mut after = before.clone();
+        let lowered = base_commit_projection::lower_stage(arena, &mut after)
+            .map_err(|_| CompiledBaseDagAppendError::Lowering)?;
+        base_commit_projection::validate_from(arena, &before, &after, &lowered)
+            .map_err(|_| CompiledBaseDagAppendError::Lowering)?;
+        let external_roots = seal_base_commit_external_roots(&before, &after, &lowered)?;
+        self.prefix.values = after;
+        self.base_commit = Some(SealedBaseCommit {
+            before,
+            lowered,
+            external_roots,
+            checkpoint_digest: None,
+            emitted: false,
+        });
+        Ok(())
+    }
+
+    /// Resolve and append all generated BaseCommit operations or none.
+    pub(super) fn emit_base_commit_operations(
+        &mut self,
+        arena: &ProofArenaPlan,
+    ) -> Result<(), CompiledBaseDagAppendError> {
+        self.emit_base_commit_operations_using(
+            arena,
+            base_commit_projection::resolve_static_wrapper,
+        )
+    }
+
+    fn emit_base_commit_operations_using(
+        &mut self,
+        arena: &ProofArenaPlan,
+        resolve: BaseCommitStaticResolver,
+    ) -> Result<(), CompiledBaseDagAppendError> {
+        let sealed = self
+            .base_commit
+            .as_ref()
+            .filter(|base| !base.emitted)
+            .ok_or(CompiledBaseDagAppendError::InvalidStage)?;
+        if self.prefix.partitions != vec![PartitionAuthority::monolithic()]
+            || !self.has_complete_fixed_table_stage()
+        {
+            return Err(CompiledBaseDagAppendError::Lowering);
+        }
+        self.validate_arena_authority(arena)?;
+        base_commit_projection::validate_from(
+            arena,
+            &sealed.before,
+            &self.prefix.values,
+            &sealed.lowered,
+        )
+        .map_err(|_| CompiledBaseDagAppendError::Lowering)?;
+        if seal_base_commit_external_roots(&sealed.before, &self.prefix.values, &sealed.lowered)?
+            != sealed.external_roots
+        {
+            return Err(CompiledBaseDagAppendError::Lowering);
+        }
+
+        let mut effects = exact_effect_map(&self.prefix.effects)?;
+        let mut operations = self.prefix.operations.clone();
+        let mut wrappers = Vec::with_capacity(sealed.lowered.operations().len());
+        let monolithic = PartitionAuthority::monolithic();
+        for (operation_ordinal, operation) in sealed.lowered.operations().iter().enumerate() {
+            let existing = self
+                .prefix
+                .static_wrappers
+                .len()
+                .checked_add(wrappers.len())
+                .ok_or(CompiledBaseDagAppendError::Lowering)?;
+            let id = wrapper_id(existing).map_err(|_| CompiledBaseDagAppendError::Lowering)?;
+            let Some(wrapper) = resolve(
+                id,
+                self.prefix.target_sm,
+                &sealed.lowered,
+                operation_ordinal,
+            )
+            .map_err(|_| CompiledBaseDagAppendError::Lowering)?
+            else {
+                return Err(CompiledBaseDagAppendError::MissingBaseCommitStaticWrapper {
+                    operation_ordinal: u32::try_from(operation_ordinal)
+                        .map_err(|_| CompiledBaseDagAppendError::Lowering)?,
+                });
+            };
+            if wrapper.id() != id
+                || wrapper.consumer_target_sm() != self.prefix.target_sm
+                || wrapper.accepted_invocation()
+                    != operation
+                        .invocation()
+                        .contract_id()
+                        .map_err(|_| CompiledBaseDagAppendError::Lowering)?
+                || wrapper.accepted_effect() != operation.effect().id()
+                || !wrapper
+                    .has_valid_identity()
+                    .map_err(|_| CompiledBaseDagAppendError::Lowering)?
+            {
+                return Err(CompiledBaseDagAppendError::Lowering);
+            }
+            insert_effect(&mut effects, operation.effect().clone())
+                .map_err(|_| CompiledBaseDagAppendError::Lowering)?;
+            push_operation(
+                ExecutionPrimitive::StaticCudaWrapper { wrapper: id },
+                Some(operation.invocation().clone()),
+                operation.effect().id(),
+                &monolithic,
+                &mut operations,
+            )
+            .map_err(|_| CompiledBaseDagAppendError::Lowering)?;
+            wrappers.push(wrapper);
+        }
+
+        let effects = effects.into_values().collect::<Vec<_>>();
+        let mut static_wrappers = self.prefix.static_wrappers.clone();
+        static_wrappers.extend(wrappers);
+        let roots = validate_published_base_dag(
+            &self.prefix,
+            self.memory.as_ref(),
+            self.fixed_tables.as_ref(),
+            self.base_commit.as_ref(),
+            &self.prefix.values,
+            &effects,
+            &operations,
+            &static_wrappers,
+            PublishedBaseStage::BaseCommit,
+        )?;
+        let mut expected_roots = self
+            .prefix
+            .causal_external_roots
+            .clone()
+            .ok_or(CompiledBaseDagAppendError::Lowering)?;
+        expected_roots.extend(sealed.external_roots.iter().copied());
+        if roots != expected_roots {
+            return Err(CompiledBaseDagAppendError::Lowering);
+        }
+        let checkpoint_digest =
+            seal_base_commit_checkpoint(&sealed.lowered, &operations, &static_wrappers, &roots)?;
+
+        let base = self
+            .base_commit
+            .as_mut()
+            .ok_or(CompiledBaseDagAppendError::InvalidStage)?;
+        base.checkpoint_digest = Some(checkpoint_digest);
+        base.emitted = true;
+        self.prefix.static_wrappers = static_wrappers;
+        self.prefix.effects = effects;
+        self.prefix.operations = operations;
+        self.prefix.causal_external_roots = Some(roots);
+        Ok(())
+    }
+
+    pub(super) fn has_complete_base_commit_stage(&self) -> bool {
+        self.base_commit
+            .as_ref()
+            .is_some_and(|base| base.emitted && base.checkpoint_digest.is_some())
     }
 
     fn validate_arena_authority(

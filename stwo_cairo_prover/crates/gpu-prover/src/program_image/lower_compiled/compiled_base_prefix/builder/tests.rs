@@ -12,6 +12,8 @@ use crate::program_image::lower_compiled::compiled_base_prefix_tests::{
 };
 use crate::transcript_plan::CairoTranscriptSegment;
 
+mod base_commit;
+
 fn complete_prefix() -> CompiledWitnessWriterPrefix {
     let executable = crate::program_image::lower_compiled::tests::generated_sn2_replacement();
     emit_recorded_witness_writer_prefix_for_test(

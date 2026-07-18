@@ -174,7 +174,7 @@ pub(super) fn resolve_static_wrapper(
     static_execution::project_wrapper(id, &linked, lowered, operation_ordinal).map(Some)
 }
 
-fn validate_receipt(lowered: &LoweredBaseCommit) -> Result<(), InvocationShapeError> {
+pub(super) fn validate_receipt(lowered: &LoweredBaseCommit) -> Result<(), InvocationShapeError> {
     lowered
         .authority
         .validate()
@@ -193,6 +193,11 @@ fn validate_receipt(lowered: &LoweredBaseCommit) -> Result<(), InvocationShapeEr
         return Err(InvocationShapeError::InvalidBaseCommitBinding);
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn tamper_receipt_digest_for_test(lowered: &mut LoweredBaseCommit) {
+    lowered.digest[0] ^= 1;
 }
 
 fn receipt_digest(
