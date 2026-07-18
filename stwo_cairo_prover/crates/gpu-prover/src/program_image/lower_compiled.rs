@@ -49,6 +49,8 @@ mod memory_base_trace;
 mod multiplicity_clear;
 mod multiplicity_coordinator;
 mod multiplicity_feed;
+#[cfg(test)]
+mod post_base_authority_tests;
 mod producer_prefix;
 mod recorded_deduce_authority;
 #[cfg(test)]
