@@ -8,12 +8,12 @@ use stwo_backend_cuda::{
 
 use super::{CompositionWorkspaceRequirements, PreparedCompositionError, SECURE_COORDINATES};
 
-// The exact log-24 10+8+6 inverse partition and the log-25 7+6+6+6 partition
-// both reach the spill-free 256-thread LOG3 fused boundary. Unknown shapes keep
-// the checked terminal fallback and are rejected earlier by program compilation.
+// The SM90 log-24 fused boundary is not yet hardware-qualified in a complete
+// proof graph. Keep that shape on the last byte-identical terminal path; log 25
+// retains its existing 256-thread specialization.
 const fn production_split_mode(evaluation_log_size: u32) -> CompositionSplitLaunchMode {
     match evaluation_log_size {
-        24 | 25 => CompositionSplitLaunchMode::FusedFirstForward,
+        25 => CompositionSplitLaunchMode::FusedFirstForward,
         _ => CompositionSplitLaunchMode::TerminalFallback,
     }
 }
@@ -126,7 +126,7 @@ mod tests {
     fn production_split_mode_respects_the_sm90_launch_budget() {
         assert_eq!(
             production_split_mode(24),
-            CompositionSplitLaunchMode::FusedFirstForward
+            CompositionSplitLaunchMode::TerminalFallback
         );
         assert_eq!(
             production_split_mode(25),
