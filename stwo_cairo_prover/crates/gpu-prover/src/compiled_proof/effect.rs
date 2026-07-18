@@ -425,7 +425,7 @@ fn validate_accesses(accesses: &[EffectAccess]) -> Result<(), CompiledProofError
                 destination,
                 in_place,
             } => {
-                validate_transition(*source, *destination)?;
+                validate_transition(*source, *destination, in_place.as_ref())?;
                 if source.binding == destination.binding
                     && !in_place
                         .is_some_and(|alias| alias.requirement == InPlaceAliasRequirement::Required)
@@ -444,7 +444,7 @@ fn validate_accesses(accesses: &[EffectAccess]) -> Result<(), CompiledProofError
                 in_place,
                 ..
             } => {
-                validate_transition(*source, *destination)?;
+                validate_transition(*source, *destination, Some(in_place))?;
                 if source.binding != destination.binding
                     || in_place.requirement != InPlaceAliasRequirement::Required
                     || !aliases.insert(in_place.id)
@@ -474,10 +474,21 @@ fn validate_accesses(accesses: &[EffectAccess]) -> Result<(), CompiledProofError
 fn validate_transition(
     source: BoundValueRange,
     destination: BoundValueRange,
+    in_place: Option<&InPlaceAliasAuthority>,
 ) -> Result<(), CompiledProofError> {
-    if source.value.version == destination.value.version
-        || source.value.elements.len() != destination.value.elements.len()
-    {
+    if source.value.version == destination.value.version {
+        return Err(CompiledProofError::InvalidValueTransition);
+    }
+    let source_elements = source.value.elements;
+    let destination_elements = destination.value.elements;
+    let valid_extent = match in_place.map(|alias| alias.discipline) {
+        Some(InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite) => {
+            source_elements.start == destination_elements.start
+                && source_elements.end < destination_elements.end
+        }
+        _ => source_elements.len() == destination_elements.len(),
+    };
+    if !valid_extent {
         return Err(CompiledProofError::InvalidValueTransition);
     }
     Ok(())
@@ -760,6 +771,12 @@ mod tests {
             InPlaceDiscipline::OrderedCompositeInPlace,
         ]
         .map(|discipline| {
+            let destination_end =
+                if discipline == InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite {
+                    8
+                } else {
+                    4
+                };
             EffectContract::new(
                 vec![EffectAccess::ReadWrite {
                     source: BoundValueRange {
@@ -773,7 +790,7 @@ mod tests {
                         binding: EffectBindingId(0),
                         value: ValueRange {
                             version: ValueVersion(1),
-                            elements: ElementRange::new(0, 4).unwrap(),
+                            elements: ElementRange::new(0, destination_end).unwrap(),
                         },
                     },
                     in_place: Some(InPlaceAliasAuthority {
@@ -788,5 +805,67 @@ mod tests {
             .id()
         });
         assert_eq!(effects.into_iter().collect::<BTreeSet<_>>().len(), 5);
+    }
+
+    #[test]
+    fn exact_lower_prefix_discipline_is_the_only_widening_transition() {
+        let transition =
+            |source: ElementRange, destination: ElementRange, discipline: InPlaceDiscipline| {
+                EffectContract::new(
+                    vec![EffectAccess::ReadWrite {
+                        source: BoundValueRange {
+                            binding: EffectBindingId(0),
+                            value: ValueRange {
+                                version: ValueVersion(0),
+                                elements: source,
+                            },
+                        },
+                        destination: BoundValueRange {
+                            binding: EffectBindingId(1),
+                            value: ValueRange {
+                                version: ValueVersion(1),
+                                elements: destination,
+                            },
+                        },
+                        in_place: Some(InPlaceAliasAuthority {
+                            id: InPlaceAliasId(0),
+                            requirement: InPlaceAliasRequirement::Permitted,
+                            discipline,
+                        }),
+                    }],
+                    Vec::new(),
+                )
+            };
+        let lower = ElementRange::new(0, 4).unwrap();
+        let wider = ElementRange::new(0, 8).unwrap();
+        assert!(transition(
+            lower,
+            wider,
+            InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite
+        )
+        .is_ok());
+        for (source, destination, discipline) in [
+            (lower, wider, InPlaceDiscipline::ElementWiseReadBeforeWrite),
+            (
+                ElementRange::new(1, 4).unwrap(),
+                wider,
+                InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite,
+            ),
+            (
+                lower,
+                lower,
+                InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite,
+            ),
+            (
+                wider,
+                lower,
+                InPlaceDiscipline::ExactLowerPrefixReadBeforeWrite,
+            ),
+        ] {
+            assert_eq!(
+                transition(source, destination, discipline),
+                Err(CompiledProofError::InvalidValueTransition)
+            );
+        }
     }
 }

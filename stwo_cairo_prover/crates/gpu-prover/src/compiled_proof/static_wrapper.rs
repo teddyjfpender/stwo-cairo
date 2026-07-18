@@ -26,7 +26,7 @@ pub struct StaticCudaLaunchIdentity {
 
 impl StaticCudaLaunchIdentity {
     pub fn new(symbol: Vec<u8>, launch: LaunchGeometry) -> Result<Self, CompiledProofError> {
-        if !valid_symbol(&symbol) || !valid_launch(launch) {
+        if !valid_execution_name(&symbol) || !valid_launch(launch) {
             return Err(CompiledProofError::InvalidStaticWrapperManifest);
         }
         Ok(Self {
@@ -44,7 +44,7 @@ impl StaticCudaLaunchIdentity {
     }
 
     fn is_valid(&self) -> bool {
-        valid_symbol(&self.symbol) && valid_launch(self.launch)
+        valid_execution_name(&self.symbol) && valid_launch(self.launch)
     }
 }
 
@@ -356,6 +356,44 @@ fn valid_symbol(symbol: &[u8]) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
 }
 
+/// Canonical identity spelling for one internally launched CUDA kernel.
+///
+/// Unlike a wrapper entry symbol, this is manifest metadata rather than a
+/// Driver-API lookup name. It therefore admits the exact C++ template
+/// instantiations emitted by the audited wrapper, while rejecting alternate
+/// spellings of the same integer argument.
+fn valid_execution_name(name: &[u8]) -> bool {
+    if valid_symbol(name) {
+        return true;
+    }
+    let Some(open) = name.iter().position(|byte| *byte == b'<') else {
+        return false;
+    };
+    if !name.ends_with(b">")
+        || !valid_symbol(&name[..open])
+        || name[open + 1..name.len() - 1]
+            .iter()
+            .any(|byte| matches!(byte, b'<' | b'>'))
+    {
+        return false;
+    }
+    let arguments = &name[open + 1..name.len() - 1];
+    !arguments.is_empty()
+        && arguments
+            .split(|byte| *byte == b',')
+            .all(valid_template_argument)
+}
+
+fn valid_template_argument(argument: &[u8]) -> bool {
+    if matches!(argument, b"true" | b"false" | b"0") {
+        return true;
+    }
+    matches!(
+        argument,
+        [b'1'..=b'9', rest @ ..] if rest.iter().all(u8::is_ascii_digit)
+    )
+}
+
 fn valid_launch(launch: LaunchGeometry) -> bool {
     let block_threads = launch
         .block
@@ -560,6 +598,53 @@ mod tests {
             + core::mem::size_of::<u64>()
             + launch_encoding_bytes;
         assert_eq!(authority.canonical_encoding().len(), canonical_bytes);
+    }
+
+    #[test]
+    fn child_template_names_are_exact_and_canonical() {
+        for name in [
+            b"b2n_init_warp_batch<3>".as_slice(),
+            b"b2n_noinit_block_batch<4,true>",
+            b"n2b_nofinal_block_batch<3,2>",
+            b"ntt_b2n_stage_batch<false>",
+        ] {
+            assert!(StaticCudaLaunchIdentity::new(
+                name.to_vec(),
+                LaunchGeometry {
+                    grid: [1, 1, 1],
+                    block: [1, 1, 1],
+                    cluster: None,
+                    dynamic_shared_bytes: 0,
+                    cooperative: false,
+                },
+            )
+            .is_ok());
+        }
+        for name in [
+            b"kernel<>".as_slice(),
+            b"kernel<02>",
+            b"kernel<True>",
+            b"kernel<1,>",
+            b"kernel<,1>",
+            b"kernel<1><2>",
+            b"kernel<-1>",
+            b"kernel<1u>",
+            b"1kernel<1>",
+        ] {
+            assert_eq!(
+                StaticCudaLaunchIdentity::new(
+                    name.to_vec(),
+                    LaunchGeometry {
+                        grid: [1, 1, 1],
+                        block: [1, 1, 1],
+                        cluster: None,
+                        dynamic_shared_bytes: 0,
+                        cooperative: false,
+                    },
+                ),
+                Err(CompiledProofError::InvalidStaticWrapperManifest)
+            );
+        }
     }
 
     #[test]
