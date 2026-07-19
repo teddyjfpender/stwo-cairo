@@ -4,7 +4,53 @@ use serde_json::{json, Value};
 use stwo_backend_cuda::QuotientNumeratorStagingRole;
 use stwo_cairo_gpu_prover::arena_plan::{
     ArenaBinding, BufferPurpose, PlannedStagedQuotientOverflow, ProofArenaPlan, ProofEpoch,
+    QuotientNumeratorSchedule,
 };
+
+pub(super) fn production_constructor(schedule: QuotientNumeratorSchedule) -> &'static str {
+    match schedule {
+        QuotientNumeratorSchedule::StagedPackedSingleWrite => {
+            "prepare_staged_packed_single_write"
+        }
+        QuotientNumeratorSchedule::StagedRunSumOrPacked => {
+            "prepare_staged_group_direct; prepare_staged_packed_single_write only after successful direct preparation without a run-sum receipt; errors fail closed"
+        }
+        QuotientNumeratorSchedule::LegacyBatches
+        | QuotientNumeratorSchedule::HybridSingleWrite => {
+            unreachable!("a staged manifest requires a staged numerator schedule")
+        }
+    }
+}
+
+pub(super) fn production_selection(schedule: QuotientNumeratorSchedule) -> Value {
+    match schedule {
+        QuotientNumeratorSchedule::StagedPackedSingleWrite => json!({
+            "initial_constructor": "prepare_staged_packed_single_write",
+            "selection_time": "preflight-plan",
+            "selected_runtime_constructor": "prepare_staged_packed_single_write",
+            "retain_direct_when": null,
+            "fallback_constructor": null,
+            "fallback_when": null,
+            "missing_receipt_policy": "not-applicable",
+            "incomplete_receipt_policy": "not-applicable",
+            "error_policy": "fail-closed",
+        }),
+        QuotientNumeratorSchedule::StagedRunSumOrPacked => json!({
+            "initial_constructor": "prepare_staged_group_direct",
+            "selection_time": "runtime-preparation",
+            "selected_runtime_constructor": null,
+            "retain_direct_when": "complete-sealed-run-sum-receipt",
+            "fallback_constructor": "prepare_staged_packed_single_write",
+            "fallback_when": "direct-preparation-succeeded-without-run-sum-receipt",
+            "missing_receipt_policy": "prepare-staged-packed-single-write",
+            "incomplete_receipt_policy": "fail-closed",
+            "error_policy": "fail-closed-no-packed-fallback",
+        }),
+        QuotientNumeratorSchedule::LegacyBatches | QuotientNumeratorSchedule::HybridSingleWrite => {
+            unreachable!("a staged manifest requires a staged numerator schedule")
+        }
+    }
+}
 
 fn binding_json(arena: &ProofArenaPlan, binding: ArenaBinding) -> Value {
     let logical = arena
@@ -54,9 +100,11 @@ fn overflow_role_json(
 
 pub(super) fn json(arena: &ProofArenaPlan) -> Value {
     let workspace = arena.quotient_numerator();
+    let schedule = workspace.schedule;
     let Some(plan) = workspace.staged_single_write.as_ref() else {
         return json!({
             "enabled": false,
+            "planned_schedule": schedule.cli_name(),
             "reason": "selected resident backend has no coefficient-inclusive staged manifest",
         });
     };
@@ -169,8 +217,9 @@ pub(super) fn json(arena: &ProofArenaPlan) -> Value {
 
     json!({
         "enabled": true,
-        "planned_schedule": "staged-packed-single-write",
-        "production_constructor": "prepare_staged_packed_single_write",
+        "planned_schedule": schedule.cli_name(),
+        "production_constructor": production_constructor(schedule),
+        "production_selection": production_selection(schedule),
         "arena_total_words": arena.total_words(),
         "arena_raw_peak_words": arena.raw_peak_words(),
         "quotient_high_water_words": arena.high_water_words(ProofEpoch::Quotient),
@@ -188,6 +237,41 @@ pub(super) fn json(arena: &ProofArenaPlan) -> Value {
         "candidate_logical_output_bytes": report.candidate_logical_output_bytes,
         "logical_output_bytes_saved": report.logical_output_bytes_saved,
         "packed_output_rows": packed_output_rows,
+        "fallback_packed_geometry_scope": match schedule {
+            QuotientNumeratorSchedule::StagedPackedSingleWrite =>
+                "selected packed execution model; no adaptive runtime selection",
+            QuotientNumeratorSchedule::StagedRunSumOrPacked =>
+                "fallback model only; selected runtime execution requires the prepared receipt",
+            QuotientNumeratorSchedule::LegacyBatches
+            | QuotientNumeratorSchedule::HybridSingleWrite =>
+                unreachable!("a staged manifest requires a staged numerator schedule"),
+        },
+        "fallback_packed_output_passes": report.candidate_output_passes,
+        "fallback_packed_output_rows": packed_output_rows,
+        "fallback_packed_coefficient_output_rows": report.coefficient_output_rows,
+        "fallback_packed_logical_output_bytes": report.candidate_logical_output_bytes,
+        "fallback_packed_logical_output_bytes_saved_vs_factor32":
+            report.logical_output_bytes_saved,
+        "fallback_packed_rectangular_launch_rows": report.rectangular_launch_rows,
+        "fallback_packed_inactive_rectangular_launch_rows":
+            report.inactive_rectangular_launch_rows,
+        "fallback_packed_inactive_rectangular_launch_percent":
+            inactive_rectangular_launch_percent,
+        "fallback_packed_inactive_rectangular_launch_ratio": {
+            "numerator": report.inactive_rectangular_launch_rows,
+            "denominator": report.rectangular_launch_rows,
+        },
+        "fallback_packed_useful_row_terms": report.useful_row_terms,
+        "fallback_packed_rectangular_row_term_capacity":
+            report.rectangular_row_term_capacity,
+        "fallback_packed_rectangular_inactive_rows_return_before_term_loop": true,
+        "fallback_packed_rectangular_row_term_capacity_scope":
+            "shape upper bound only; inactive rectangular rows do not execute descriptors",
+        "fallback_packed_binary_search_comparisons_per_row_max":
+            report.packed_binary_search_comparisons_per_row_max,
+        "fallback_packed_binary_search_comparisons_max":
+            report.packed_binary_search_comparisons_max,
+        "deprecated_packed_geometry_aliases_retained": true,
         "rectangular_launch_rows": report.rectangular_launch_rows,
         "inactive_rectangular_launch_rows": report.inactive_rectangular_launch_rows,
         "inactive_rectangular_launch_percent": inactive_rectangular_launch_percent,

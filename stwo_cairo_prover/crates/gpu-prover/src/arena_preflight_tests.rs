@@ -11,6 +11,57 @@ use stwo_cairo_gpu_prover::arena_plan::{ProtocolIdentity, ResidentBackend};
 use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
 
 #[test]
+fn staged_preflight_reports_exact_packed_and_adaptive_constructor_selection() {
+    use stwo_cairo_gpu_prover::arena_plan::QuotientNumeratorSchedule;
+
+    assert_eq!(
+        super::arena_preflight_staged::production_constructor(
+            QuotientNumeratorSchedule::StagedPackedSingleWrite,
+        ),
+        "prepare_staged_packed_single_write"
+    );
+    assert_eq!(
+        super::arena_preflight_staged::production_selection(
+            QuotientNumeratorSchedule::StagedPackedSingleWrite,
+        ),
+        serde_json::json!({
+            "initial_constructor": "prepare_staged_packed_single_write",
+            "selection_time": "preflight-plan",
+            "selected_runtime_constructor": "prepare_staged_packed_single_write",
+            "retain_direct_when": null,
+            "fallback_constructor": null,
+            "fallback_when": null,
+            "missing_receipt_policy": "not-applicable",
+            "incomplete_receipt_policy": "not-applicable",
+            "error_policy": "fail-closed",
+        })
+    );
+
+    assert_eq!(
+        super::arena_preflight_staged::production_constructor(
+            QuotientNumeratorSchedule::StagedRunSumOrPacked,
+        ),
+        "prepare_staged_group_direct; prepare_staged_packed_single_write only after successful direct preparation without a run-sum receipt; errors fail closed"
+    );
+    assert_eq!(
+        super::arena_preflight_staged::production_selection(
+            QuotientNumeratorSchedule::StagedRunSumOrPacked,
+        ),
+        serde_json::json!({
+            "initial_constructor": "prepare_staged_group_direct",
+            "selection_time": "runtime-preparation",
+            "selected_runtime_constructor": null,
+            "retain_direct_when": "complete-sealed-run-sum-receipt",
+            "fallback_constructor": "prepare_staged_packed_single_write",
+            "fallback_when": "direct-preparation-succeeded-without-run-sum-receipt",
+            "missing_receipt_policy": "prepare-staged-packed-single-write",
+            "incomplete_receipt_policy": "fail-closed",
+            "error_policy": "fail-closed-no-packed-fallback",
+        })
+    );
+}
+
+#[test]
 fn budget_bytes_is_gib_scaled() {
     assert_eq!(budget_bytes_of(1.0), 1024 * 1024 * 1024);
     assert_eq!(budget_bytes_of(79.0), 79 * 1024 * 1024 * 1024);
@@ -80,7 +131,7 @@ fn replacement_policy_json_reports_the_exact_planned_tuple() {
     );
     assert_eq!(
         value["quotient_numerator_schedule"],
-        "staged-packed-single-write"
+        "staged-run-sum-or-packed"
     );
     assert_eq!(value["kernel_manifest_hash"], "0000000000001234");
     assert_eq!(value["composition_max_kernel_instrs"], 2048);
