@@ -694,6 +694,8 @@ pub enum QuotientNumeratorSchedule {
     /// Coefficient-inclusive replacement schedule: materialize each required
     /// LDE into arena-owned epoch roles, then write every useful row once.
     StagedPackedSingleWrite = 2,
+    /// One launch owns each exact denominator group and writes its rows once.
+    StagedGroupDirect = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1663,12 +1665,16 @@ impl ProtocolGeometry {
             &numerator_topologies,
         )
         .map_err(ArenaPlanError::QuotientNumerator)?;
+        let replacement_staged = matches!(
+            self.identity.quotient_numerator_schedule,
+            QuotientNumeratorSchedule::StagedPackedSingleWrite
+                | QuotientNumeratorSchedule::StagedGroupDirect
+        );
         if (self.identity.resident_backend == ResidentBackend::ReplacementV1)
-            != (self.identity.quotient_numerator_schedule
-                == QuotientNumeratorSchedule::StagedPackedSingleWrite)
+            != replacement_staged
         {
             return Err(ArenaPlanError::InvalidProtocolGeometry(
-                "replacement-v1 and staged packed numerator identities must be selected together",
+                "replacement-v1 and staged numerator identities must be selected together",
             ));
         }
         match self.identity.quotient_numerator_schedule {
@@ -1685,10 +1691,11 @@ impl ProtocolGeometry {
                     ));
                 }
             }
-            QuotientNumeratorSchedule::StagedPackedSingleWrite => {
+            QuotientNumeratorSchedule::StagedPackedSingleWrite
+            | QuotientNumeratorSchedule::StagedGroupDirect => {
                 if self.identity.resident_backend != ResidentBackend::ReplacementV1 {
                     return Err(ArenaPlanError::InvalidProtocolGeometry(
-                        "staged packed numerator is restricted to replacement-v1",
+                        "staged numerator is restricted to replacement-v1",
                     ));
                 }
                 let staged = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
@@ -9182,8 +9189,11 @@ fn append_protocol_buffers(
         .iter()
         .map(|&(_, _, words)| words)
         .collect::<Vec<_>>();
-    let staged_single_write = (protocol.identity.quotient_numerator_schedule
-        == QuotientNumeratorSchedule::StagedPackedSingleWrite)
+    let staged_single_write = matches!(
+        protocol.identity.quotient_numerator_schedule,
+        QuotientNumeratorSchedule::StagedPackedSingleWrite
+            | QuotientNumeratorSchedule::StagedGroupDirect
+    )
         .then(|| {
             quotient_numerator_staged_single_write_plan_with_overflow_capacities(
                 quotient_numerator_config,

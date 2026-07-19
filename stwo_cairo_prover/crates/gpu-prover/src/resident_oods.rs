@@ -339,9 +339,12 @@ impl<'a> ResidentOodsPipeline<'a> {
         let first_linear_terms_destination =
             bind_logical(workspace, numerator_plan.first_linear_terms_destination)?;
         let forward_twiddles = bind_logical(workspace, numerator_plan.forward_twiddles)?;
-        if (numerator_plan.schedule == QuotientNumeratorSchedule::StagedPackedSingleWrite)
-            != numerator_plan.staged_single_write.is_some()
-        {
+        let staged_schedule = matches!(
+            numerator_plan.schedule,
+            QuotientNumeratorSchedule::StagedPackedSingleWrite
+                | QuotientNumeratorSchedule::StagedGroupDirect
+        );
+        if staged_schedule != numerator_plan.staged_single_write.is_some() {
             return Err(ResidentOodsError::StagedNumeratorBinding(
                 "planned schedule and staged quotient manifest presence differ",
             ));
@@ -375,7 +378,8 @@ impl<'a> ResidentOodsPipeline<'a> {
                     &numerator_plan.slots,
                 )?
             }
-            QuotientNumeratorSchedule::StagedPackedSingleWrite => {
+            QuotientNumeratorSchedule::StagedPackedSingleWrite
+            | QuotientNumeratorSchedule::StagedGroupDirect => {
                 let staged = numerator_plan.staged_single_write.as_ref().ok_or(
                     ResidentOodsError::StagedNumeratorBinding(
                         "replacement schedule has no staged quotient manifest",
@@ -434,7 +438,16 @@ impl<'a> ResidentOodsPipeline<'a> {
                         )
                     })
                     .collect::<Result<Vec<_>, ResidentOodsError>>()?;
-                PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
+                let prepare_staged = match numerator_plan.schedule {
+                    QuotientNumeratorSchedule::StagedPackedSingleWrite => {
+                        PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write
+                    }
+                    QuotientNumeratorSchedule::StagedGroupDirect => {
+                        PreparedQuotientNumeratorGraph::prepare_staged_group_direct
+                    }
+                    _ => unreachable!("staged schedule was validated above"),
+                };
+                prepare_staged(
                     arena,
                     numerator_plan.config,
                     &numerator_columns,
@@ -461,16 +474,22 @@ impl<'a> ResidentOodsPipeline<'a> {
             ) | (
                 QuotientNumeratorSchedule::StagedPackedSingleWrite,
                 PreparedNumeratorSchedule::StagedPackedSingleWrite { .. }
+            ) | (
+                QuotientNumeratorSchedule::StagedGroupDirect,
+                PreparedNumeratorSchedule::StagedGroupDirect { .. }
             )
         );
-        if let (
-            Some(staged),
-            PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows },
-        ) = (&numerator_plan.staged_single_write, numerator.schedule())
-        {
-            if packed_output_rows != staged.packed_output_rows() {
+        if let Some(staged) = &numerator_plan.staged_single_write {
+            let prepared_output_rows = match numerator.schedule() {
+                PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows } => {
+                    Some(packed_output_rows)
+                }
+                PreparedNumeratorSchedule::StagedGroupDirect { output_rows } => Some(output_rows),
+                _ => None,
+            };
+            if prepared_output_rows != Some(staged.packed_output_rows()) {
                 return Err(ResidentOodsError::StagedNumeratorBinding(
-                    "prepared packed row count differs from the sealed arena manifest",
+                    "prepared staged output row count differs from the sealed arena manifest",
                 ));
             }
         }

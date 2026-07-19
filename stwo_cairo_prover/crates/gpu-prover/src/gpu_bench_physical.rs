@@ -70,6 +70,7 @@ pub(crate) fn gpu_native_session_context(
             "gpu_prepared_numerator_eligible_groups": null,
             "gpu_prepared_numerator_legacy_groups": null,
             "gpu_prepared_numerator_packed_output_rows": null,
+            "gpu_prepared_numerator_group_direct_output_rows": null,
             "gpu_quotient_producer_b2n": null,
             "gpu_quotient_producer_b2n_production_selected": null,
             "gpu_quotient_producer_b2n_eliminated_logical_bytes": null,
@@ -255,37 +256,52 @@ pub(crate) fn resident_session_telemetry_json(
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     });
-    let (prepared_schedule, eligible_groups, legacy_groups, packed_output_rows) =
-        match telemetry.prepared_numerator_schedule {
-            Some(PreparedNumeratorSchedule::LegacyBatches) => {
-                (Some("legacy-batches"), None, None, None)
-            }
-            Some(PreparedNumeratorSchedule::SingleWriteCandidate) => {
-                (Some("single-write"), None, Some(0), None)
-            }
-            Some(PreparedNumeratorSchedule::HybridCandidate {
-                eligible_groups,
-                legacy_groups,
-            }) => (
-                Some("hybrid-single-write"),
-                Some(eligible_groups),
-                Some(legacy_groups),
-                None,
-            ),
-            Some(PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows }) => (
-                Some("staged-packed-single-write"),
-                None,
-                Some(0),
-                Some(packed_output_rows),
-            ),
-            Some(PreparedNumeratorSchedule::StagedPrepackedSingleWrite { packed_output_rows }) => (
-                Some("staged-prepacked-single-write"),
-                None,
-                Some(0),
-                Some(packed_output_rows),
-            ),
-            None => (None, None, None, None),
-        };
+    let (
+        prepared_schedule,
+        eligible_groups,
+        legacy_groups,
+        packed_output_rows,
+        group_direct_output_rows,
+    ) = match telemetry.prepared_numerator_schedule {
+        Some(PreparedNumeratorSchedule::LegacyBatches) => {
+            (Some("legacy-batches"), None, None, None, None)
+        }
+        Some(PreparedNumeratorSchedule::SingleWriteCandidate) => {
+            (Some("single-write"), None, Some(0), None, None)
+        }
+        Some(PreparedNumeratorSchedule::HybridCandidate {
+            eligible_groups,
+            legacy_groups,
+        }) => (
+            Some("hybrid-single-write"),
+            Some(eligible_groups),
+            Some(legacy_groups),
+            None,
+            None,
+        ),
+        Some(PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows }) => (
+            Some("staged-packed-single-write"),
+            None,
+            Some(0),
+            Some(packed_output_rows),
+            None,
+        ),
+        Some(PreparedNumeratorSchedule::StagedPrepackedSingleWrite { packed_output_rows }) => (
+            Some("staged-prepacked-single-write"),
+            None,
+            Some(0),
+            Some(packed_output_rows),
+            None,
+        ),
+        Some(PreparedNumeratorSchedule::StagedGroupDirect { output_rows }) => (
+            Some("staged-group-direct"),
+            None,
+            Some(0),
+            None,
+            Some(output_rows),
+        ),
+        None => (None, None, None, None, None),
+    };
     let quotient_producer_b2n = telemetry.quotient_producer_b2n.program;
     json!({
         "gpu_graph_a_setup_gate_passed": telemetry.require_strict_graph_a().is_ok(),
@@ -337,6 +353,7 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_prepared_numerator_eligible_groups": eligible_groups,
         "gpu_prepared_numerator_legacy_groups": legacy_groups,
         "gpu_prepared_numerator_packed_output_rows": packed_output_rows,
+        "gpu_prepared_numerator_group_direct_output_rows": group_direct_output_rows,
         "gpu_quotient_producer_b2n": quotient_producer_b2n_receipt_json(telemetry.quotient_producer_b2n),
         "gpu_quotient_producer_b2n_production_selected": telemetry.quotient_producer_b2n.production_selected,
         "gpu_quotient_producer_b2n_eliminated_logical_bytes": quotient_producer_b2n.map(|value| value.traffic.eliminated_logical_bytes),
@@ -481,6 +498,7 @@ fn numerator_schedule_name(schedule: QuotientNumeratorSchedule) -> &'static str 
         QuotientNumeratorSchedule::LegacyBatches => "legacy-batches",
         QuotientNumeratorSchedule::HybridSingleWrite => "hybrid-single-write",
         QuotientNumeratorSchedule::StagedPackedSingleWrite => "staged-packed-single-write",
+        QuotientNumeratorSchedule::StagedGroupDirect => "staged-group-direct",
     }
 }
 
@@ -840,8 +858,8 @@ mod tests {
     fn replacement_policy_and_actual_schedule_are_machine_readable() {
         let telemetry = ResidentSessionTelemetry {
             protocol_policy: Some(ProtocolPlanPolicy::replacement_v1(0x1234, 2048)),
-            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::StagedPackedSingleWrite {
-                packed_output_rows: 50_331_088,
+            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::StagedGroupDirect {
+                output_rows: 50_331_088,
             }),
             trace_commit_inputs: Some(
                 stwo_cairo_gpu_prover::resident_runtime::ResidentTraceCommitInputTelemetry {
@@ -877,16 +895,17 @@ mod tests {
         assert_eq!(value["gpu_protocol_key"], 0x5678);
         assert_eq!(
             value["gpu_planned_numerator_schedule"],
-            "staged-packed-single-write"
+            "staged-group-direct"
         );
         assert_eq!(
             value["gpu_prepared_numerator_schedule"],
-            "staged-packed-single-write"
+            "staged-group-direct"
         );
         assert!(value["gpu_prepared_numerator_eligible_groups"].is_null());
         assert_eq!(value["gpu_prepared_numerator_legacy_groups"], 0);
+        assert!(value["gpu_prepared_numerator_packed_output_rows"].is_null());
         assert_eq!(
-            value["gpu_prepared_numerator_packed_output_rows"],
+            value["gpu_prepared_numerator_group_direct_output_rows"],
             50_331_088
         );
         assert_eq!(value["gpu_trace_commit_direct_commitments"], 2);
@@ -948,6 +967,7 @@ mod tests {
             "gpu_composition_part_count",
             "gpu_composition_wave_count",
             "gpu_prepared_numerator_packed_output_rows",
+            "gpu_prepared_numerator_group_direct_output_rows",
         ] {
             assert!(null_schema[key].is_null(), "{key}");
         }

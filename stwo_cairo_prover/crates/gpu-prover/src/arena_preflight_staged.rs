@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use stwo_backend_cuda::QuotientNumeratorStagingRole;
 use stwo_cairo_gpu_prover::arena_plan::{
     ArenaBinding, BufferPurpose, PlannedStagedQuotientOverflow, ProofArenaPlan, ProofEpoch,
+    QuotientNumeratorSchedule,
 };
 
 fn binding_json(arena: &ProofArenaPlan, binding: ArenaBinding) -> Value {
@@ -167,10 +168,20 @@ pub(super) fn json(arena: &ProofArenaPlan) -> Value {
         .map(|(index, role)| overflow_role_json(arena, index, role))
         .collect::<Vec<_>>();
 
+    let (planned_schedule, production_constructor) = match workspace.schedule {
+        QuotientNumeratorSchedule::StagedPackedSingleWrite => (
+            "staged-packed-single-write",
+            "prepare_staged_packed_single_write",
+        ),
+        QuotientNumeratorSchedule::StagedGroupDirect => {
+            ("staged-group-direct", "prepare_staged_group_direct")
+        }
+        _ => unreachable!("only staged schedules own a staged manifest"),
+    };
     json!({
         "enabled": true,
-        "planned_schedule": "staged-packed-single-write",
-        "production_constructor": "prepare_staged_packed_single_write",
+        "planned_schedule": planned_schedule,
+        "production_constructor": production_constructor,
         "arena_total_words": arena.total_words(),
         "arena_raw_peak_words": arena.raw_peak_words(),
         "quotient_high_water_words": arena.high_water_words(ProofEpoch::Quotient),

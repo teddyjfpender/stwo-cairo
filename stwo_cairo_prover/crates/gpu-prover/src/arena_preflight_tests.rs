@@ -80,7 +80,7 @@ fn replacement_policy_json_reports_the_exact_planned_tuple() {
     );
     assert_eq!(
         value["quotient_numerator_schedule"],
-        "staged-packed-single-write"
+        "staged-group-direct"
     );
     assert_eq!(value["kernel_manifest_hash"], "0000000000001234");
     assert_eq!(value["composition_max_kernel_instrs"], 2048);

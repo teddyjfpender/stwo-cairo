@@ -568,6 +568,10 @@ impl ResidentSessionTelemetry {
                 crate::arena_plan::QuotientNumeratorSchedule::StagedPackedSingleWrite,
                 PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows },
             ) => packed_output_rows != 0,
+            (
+                crate::arena_plan::QuotientNumeratorSchedule::StagedGroupDirect,
+                PreparedNumeratorSchedule::StagedGroupDirect { output_rows },
+            ) => output_rows != 0,
             _ => false,
         };
         if !schedule_matches {
@@ -3242,8 +3246,8 @@ mod tests {
             prepared_runtime_capture_ready_at_entry: Some(false),
             prepared_runtime_capture_ready_at_exit: Some(true),
             protocol_policy: Some(policy),
-            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::StagedPackedSingleWrite {
-                packed_output_rows: 1,
+            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::StagedGroupDirect {
+                output_rows: 1,
             }),
             trace_commit_inputs: Some(ResidentTraceCommitInputTelemetry {
                 direct_commitments: 2,

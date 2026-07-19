@@ -349,8 +349,8 @@ fn smoke_quotient_numerator_vertical_eager() {
     assert_eq!(receipt.validation_d2h_bytes, 291_372_288);
     assert!(matches!(
         receipt.schedule,
-        PreparedNumeratorSchedule::StagedPackedSingleWrite {
-            packed_output_rows: 18_210_768
+        PreparedNumeratorSchedule::StagedGroupDirect {
+            output_rows: 18_210_768
         }
     ));
     assert_ne!(receipt.shape_digest, [0; 32]);
