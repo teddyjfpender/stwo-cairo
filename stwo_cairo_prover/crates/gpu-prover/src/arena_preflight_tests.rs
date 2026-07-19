@@ -169,6 +169,17 @@ fn replacement_preflight_rejects_policy_or_identity_drift() {
     let identity = protocol_identity_for(policy);
     assert_eq!(validate_protocol_identity(policy, identity), Ok(()));
 
+    let packed_control =
+        ProtocolPlanPolicy::replacement_v1_packed_numerator_measurement_control(0x1234, 2048);
+    assert_eq!(
+        validate_selected_policy(ResidentBackend::ReplacementV1, packed_control),
+        Ok(())
+    );
+    assert_eq!(
+        validate_protocol_identity(packed_control, protocol_identity_for(packed_control)),
+        Ok(())
+    );
+
     let mut drifted_policy = policy;
     drifted_policy.retained_lde_budget_bytes -= 1;
     assert!(validate_selected_policy(ResidentBackend::ReplacementV1, drifted_policy).is_err());

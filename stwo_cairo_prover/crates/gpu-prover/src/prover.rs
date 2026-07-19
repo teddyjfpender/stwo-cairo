@@ -661,6 +661,27 @@ fn replacement_execution_config_from_environment(
     Ok(SealedResidentExecutionConfig::replacement_v1())
 }
 
+fn packed_numerator_measurement_policy(
+    loaded: ProtocolPlanPolicy,
+) -> Result<ProtocolPlanPolicy, GpuError> {
+    let expected = ProtocolPlanPolicy::replacement_v1(
+        loaded.kernel_manifest_hash,
+        loaded.composition_max_kernel_instrs,
+    );
+    if loaded != expected {
+        return Err(GpuError::Config(
+            "packed numerator measurement control requires the exact loaded replacement-v1 tuple"
+                .to_string(),
+        ));
+    }
+    Ok(
+        ProtocolPlanPolicy::replacement_v1_packed_numerator_measurement_control(
+            loaded.kernel_manifest_hash,
+            loaded.composition_max_kernel_instrs,
+        ),
+    )
+}
+
 fn validate_replacement_device_admission(
     configured: u32,
     snapshot: CudaDeviceSnapshot,
@@ -874,6 +895,28 @@ where
     MC: MerkleChannel + 'static,
     CudaBackend: CairoBackend<MC>,
 {
+    /// Construct the exact packed numerator baseline used for replacement-v1
+    /// A/B measurements. The normal constructor and production selector remain
+    /// group-direct; this path accepts no caller-supplied policy.
+    pub fn new_packed_numerator_measurement_control(
+        config: GpuProverConfig,
+    ) -> Result<Self, GpuError> {
+        if config.resident_backend != ResidentBackend::ReplacementV1 || !config.strict {
+            return Err(GpuError::Config(
+                "packed numerator measurement control requires strict replacement-v1".to_string(),
+            ));
+        }
+        let mut prover = Self::new(config)?;
+        let loaded = prover.resident_protocol_policy.ok_or_else(|| {
+            GpuError::Config(
+                "packed numerator measurement control requires a loaded replacement policy"
+                    .to_string(),
+            )
+        })?;
+        prover.resident_protocol_policy = Some(packed_numerator_measurement_policy(loaded)?);
+        Ok(prover)
+    }
+
     pub fn new(config: GpuProverConfig) -> Result<Self, GpuError> {
         if config.pipeline_depth != 1 {
             return Err(GpuError::Config(format!(
@@ -2020,6 +2063,45 @@ mod resident_transcript_mirror_tests {
         ] {
             assert!(validate_resident_proof_execution_config(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn packed_numerator_measurement_policy_accepts_only_loaded_direct_tuple() {
+        let direct = ProtocolPlanPolicy::replacement_v1(0x1234, 2048);
+        let packed = packed_numerator_measurement_policy(direct).unwrap();
+        assert_eq!(
+            packed,
+            ProtocolPlanPolicy::replacement_v1_packed_numerator_measurement_control(0x1234, 2048,)
+        );
+        assert_eq!(
+            ProtocolPlanPolicy::replacement_v1(0x1234, 2048).quotient_numerator_schedule,
+            crate::arena_plan::QuotientNumeratorSchedule::StagedGroupDirect
+        );
+
+        let mut drifted = direct;
+        drifted.retained_lde_budget_bytes -= 1;
+        assert!(packed_numerator_measurement_policy(drifted).is_err());
+    }
+
+    #[test]
+    fn packed_numerator_measurement_constructor_rejects_non_strict_or_legacy() {
+        let legacy = GpuProverConfig::default();
+        assert!(
+            GpuCairoProver::<Blake2sMerkleChannel>::new_packed_numerator_measurement_control(
+                legacy,
+            )
+            .is_err()
+        );
+        let non_strict = GpuProverConfig {
+            resident_backend: ResidentBackend::ReplacementV1,
+            ..legacy
+        };
+        assert!(
+            GpuCairoProver::<Blake2sMerkleChannel>::new_packed_numerator_measurement_control(
+                non_strict,
+            )
+            .is_err()
+        );
     }
 
     #[test]

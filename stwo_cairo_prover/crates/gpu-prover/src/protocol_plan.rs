@@ -141,6 +141,33 @@ impl ProtocolPlanPolicy {
         policy
     }
 
+    /// Exact packed baseline for measuring the replacement-v1 numerator
+    /// candidate. Production selection remains [`Self::replacement_v1`]; this
+    /// constructor exists only so a control can traverse the same planning and
+    /// strict-session gates as the candidate without opening arbitrary tuning.
+    pub const fn replacement_v1_packed_numerator_measurement_control(
+        kernel_manifest_hash: u64,
+        composition_max_kernel_instrs: usize,
+    ) -> Self {
+        let mut policy = Self::replacement_v1(kernel_manifest_hash, composition_max_kernel_instrs);
+        policy.quotient_numerator_schedule = QuotientNumeratorSchedule::StagedPackedSingleWrite;
+        policy
+    }
+
+    /// Admit only the production replacement tuple and its one packed
+    /// measurement control. Every other topology mutation remains fail-closed.
+    pub fn matches_replacement_v1_measurement_contract(self) -> bool {
+        let candidate = Self::replacement_v1(
+            self.kernel_manifest_hash,
+            self.composition_max_kernel_instrs,
+        );
+        let control = Self::replacement_v1_packed_numerator_measurement_control(
+            self.kernel_manifest_hash,
+            self.composition_max_kernel_instrs,
+        );
+        self == candidate || self == control
+    }
+
     /// Bind the plan to the AOT pack embedded in the running binary. Stub builds
     /// and binaries with no generated pack are rejected before CUDA allocation.
     pub fn loaded_starknet_blake2s() -> Result<Self, ProtocolPlanError> {
@@ -763,13 +790,7 @@ fn resident_backend_contract_matches(policy: ProtocolPlanPolicy) -> bool {
             policy.dynamic_commitment_leaf_schedule == DynamicCommitmentLeafSchedule::LegacyPerBatch
                 && policy.quotient_numerator_schedule == QuotientNumeratorSchedule::LegacyBatches
         }
-        ResidentBackend::ReplacementV1 => {
-            policy
-                == ProtocolPlanPolicy::replacement_v1(
-                    policy.kernel_manifest_hash,
-                    policy.composition_max_kernel_instrs,
-                )
-        }
+        ResidentBackend::ReplacementV1 => policy.matches_replacement_v1_measurement_contract(),
     }
 }
 
@@ -1722,6 +1743,15 @@ mod tests {
             WitnessFeedLaunchMode::GlobalAtomics
         );
         assert!(resident_backend_contract_matches(policy));
+
+        let packed_control =
+            ProtocolPlanPolicy::replacement_v1_packed_numerator_measurement_control(0x1234, 2048);
+        let mut expected_packed_control = policy;
+        expected_packed_control.quotient_numerator_schedule =
+            QuotientNumeratorSchedule::StagedPackedSingleWrite;
+        assert_eq!(packed_control, expected_packed_control);
+        assert!(resident_backend_contract_matches(packed_control));
+        assert_eq!(ProtocolPlanPolicy::replacement_v1(0x1234, 2048), policy);
 
         let mutations: [fn(&mut ProtocolPlanPolicy); 13] = [
             |policy| policy.retained_lde_budget_bytes -= 1,

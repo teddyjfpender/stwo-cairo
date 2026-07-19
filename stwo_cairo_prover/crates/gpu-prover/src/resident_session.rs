@@ -374,14 +374,10 @@ impl ResidentSessionTelemetry {
             ));
         }
         if policy.resident_backend == crate::arena_plan::ResidentBackend::ReplacementV1
-            && policy
-                != ProtocolPlanPolicy::replacement_v1(
-                    policy.kernel_manifest_hash,
-                    policy.composition_max_kernel_instrs,
-                )
+            && !policy.matches_replacement_v1_measurement_contract()
         {
             return Err(ResidentSessionError::StrictArchitectureTelemetry(
-                "replacement-v1 policy tuple drifted",
+                "replacement-v1 measurement contract drifted",
             ));
         }
         if policy.resident_backend == ResidentBackend::ReplacementV1 {
@@ -3292,6 +3288,25 @@ mod tests {
             ..ResidentSessionTelemetry::default()
         };
         assert!(valid.require_strict_graph_a().is_ok());
+
+        let mut packed_control = valid.clone();
+        packed_control.protocol_policy = Some(
+            ProtocolPlanPolicy::replacement_v1_packed_numerator_measurement_control(0x1234, 2048),
+        );
+        packed_control.prepared_numerator_schedule =
+            Some(PreparedNumeratorSchedule::StagedPackedSingleWrite {
+                packed_output_rows: 1,
+            });
+        assert!(packed_control.require_strict_graph_a().is_ok());
+
+        let mut direct_with_packed_receipt = valid.clone();
+        direct_with_packed_receipt.prepared_numerator_schedule =
+            packed_control.prepared_numerator_schedule;
+        assert!(direct_with_packed_receipt.require_strict_graph_a().is_err());
+
+        let mut packed_with_direct_receipt = packed_control;
+        packed_with_direct_receipt.prepared_numerator_schedule = valid.prepared_numerator_schedule;
+        assert!(packed_with_direct_receipt.require_strict_graph_a().is_err());
 
         let mut missing_composition_execution = valid.clone();
         missing_composition_execution
