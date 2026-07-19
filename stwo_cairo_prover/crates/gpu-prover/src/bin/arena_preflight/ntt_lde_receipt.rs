@@ -804,6 +804,10 @@ fn validate_coefficient_logical_words(
 
 fn validate_late_consumers(arena: &ProofArenaPlan) -> Result<(), String> {
     let ownership = arena.late_coefficient_ownership().entries();
+    let dynamic_ownership = ownership
+        .iter()
+        .filter(|entry| !matches!(entry.source, OpenedColumnSource::Preprocessed { .. }))
+        .collect::<Vec<_>>();
     let dynamic_columns = arena
         .commitments()
         .iter()
@@ -823,10 +827,10 @@ fn validate_late_consumers(arena: &ProofArenaPlan) -> Result<(), String> {
                 .sum::<usize>()
         })
         .sum::<usize>();
-    if ownership.len() != dynamic_columns {
+    if dynamic_ownership.len() != dynamic_columns {
         return Err("late coefficient ownership does not cover every dynamic column".to_owned());
     }
-    for entry in ownership {
+    for entry in dynamic_ownership {
         let expected_epoch = source_commit_epoch(entry.source)?;
         if entry.final_consumer != expected_epoch
             || entry.composition_reads_coefficients
@@ -864,7 +868,10 @@ fn validate_oods_and_numerator_sources(
 ) -> Result<(), String> {
     let dynamic = ownership
         .iter()
-        .map(|entry| entry.source)
+        .filter_map(|entry| {
+            (!matches!(entry.source, OpenedColumnSource::Preprocessed { .. }))
+                .then_some(entry.source)
+        })
         .collect::<Vec<_>>();
     let oods = arena
         .oods()
@@ -917,17 +924,44 @@ fn validate_oods_and_numerator_sources(
         .iter()
         .filter(|column| matches!(column.source, OpenedColumnSource::Preprocessed { .. }))
         .collect::<Vec<_>>();
-    if preprocessed_oods.is_empty()
-        || preprocessed_numerator.is_empty()
-        || preprocessed_oods
-            .iter()
-            .any(|column| column.source_kind != OodsSourceKind::Coefficients)
-        || preprocessed_numerator.iter().any(|column| {
-            column.topology.source_kind != QuotientNumeratorSourceKind::Coefficients
-                || column.coefficients.is_none()
-        })
+    let preprocessed_ownership = ownership
+        .iter()
+        .filter(|entry| matches!(entry.source, OpenedColumnSource::Preprocessed { .. }))
+        .collect::<Vec<_>>();
+    if preprocessed_ownership.is_empty()
+        || preprocessed_oods.len() != preprocessed_ownership.len()
+        || preprocessed_numerator.len() != preprocessed_ownership.len()
     {
-        return Err("preprocessed OODS/numerator ownership is not coefficient-backed".to_owned());
+        return Err("preprocessed OODS/numerator ownership coverage drifted".to_owned());
+    }
+    for entry in preprocessed_ownership {
+        let mut matching_oods = preprocessed_oods
+            .iter()
+            .filter(|column| column.source == entry.source);
+        let oods = matching_oods
+            .next()
+            .ok_or_else(|| "preprocessed OODS ownership source is missing".to_owned())?;
+        if matching_oods.next().is_some()
+            || entry.oods_reads_coefficients
+                != (!oods.shape_points.is_empty()
+                    && oods.source_kind == OodsSourceKind::Coefficients)
+        {
+            return Err("preprocessed OODS ownership representation drifted".to_owned());
+        }
+
+        let mut matching_numerator = preprocessed_numerator
+            .iter()
+            .filter(|column| column.source == entry.source);
+        let numerator = matching_numerator
+            .next()
+            .ok_or_else(|| "preprocessed numerator ownership source is missing".to_owned())?;
+        if matching_numerator.next().is_some()
+            || entry.quotient_reads_coefficients
+                != (!numerator.topology.samples.is_empty()
+                    && numerator.topology.source_kind == QuotientNumeratorSourceKind::Coefficients)
+        {
+            return Err("preprocessed numerator ownership representation drifted".to_owned());
+        }
     }
     Ok(())
 }
