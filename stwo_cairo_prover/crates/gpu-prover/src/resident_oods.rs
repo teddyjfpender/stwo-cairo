@@ -455,12 +455,9 @@ impl<'a> ResidentOodsPipeline<'a> {
                         &numerator_plan.slots,
                         &overflow_roles,
                     )?;
-                    if numerator_run_sum_telemetry(&direct)
-                        .is_some_and(ResidentNumeratorRunSumTelemetry::is_complete)
-                    {
-                        direct
-                    } else {
-                        PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
+                    match numerator_run_sum_telemetry(&direct) {
+                        Some(receipt) if receipt.is_complete() => direct,
+                        None => PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
                             arena,
                             numerator_plan.config,
                             &numerator_columns,
@@ -473,7 +470,12 @@ impl<'a> ResidentOodsPipeline<'a> {
                             forward_twiddles,
                             &numerator_plan.slots,
                             &overflow_roles,
-                        )?
+                        )?,
+                        Some(_) => {
+                            return Err(ResidentOodsError::StagedNumeratorBinding(
+                                "adaptive group-direct constructor returned an incomplete run-sum receipt",
+                            ))
+                        }
                     }
                 } else {
                     PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
