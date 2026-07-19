@@ -43,23 +43,27 @@ def valid_stage4_native_receipt(stwo_head: str) -> dict[str, object]:
         "performance": [],
         "fixtures": [
             {
-                "name": "staged-packed-quotient-mixed-topology",
+                "name": "staged-group-direct-quotient-mixed-topology",
                 "production_apis": [
                     "quotient_numerator_staged_single_write_plan_with_overflow_capacities",
-                    "PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write",
+                    "PreparedQuotientNumeratorGraph::prepare_staged_group_direct",
                 ],
-                "cases": 2,
+                "cases": 3,
                 "arena_bytes": 4096,
                 "checks": {
                     "eager_reference": True,
                     "legacy_candidate_byte_identity": True,
+                    "missing_run_sum_binding_fallback": True,
+                    "production_fallback_graph_topology": True,
                     "captured_graph_mutation": True,
+                    "third_generation_graph_replay": True,
                     "source_preservation": True,
                     "guard_preservation": True,
                 },
                 "hashes": {
                     "eager_outputs": digest,
                     "mutated_graph_outputs": digest,
+                    "third_generation_outputs": digest,
                 },
             },
             {
@@ -211,8 +215,16 @@ class ShellLauncherTests(unittest.TestCase):
                     "gpu_proof_blake3": "ab" * 32,
                     "gpu_protocol_key": "protocol-v1",
                     "gpu_shape_executable_topology_digest": "topology-v1",
+                    "gpu_planned_numerator_schedule": "staged-run-sum-or-packed",
                     "gpu_prepared_numerator_schedule": "staged-packed-single-write",
                     "gpu_prepared_numerator_packed_output_rows": 20_971_472,
+                    "gpu_prepared_numerator_group_direct_output_rows": None,
+                    "gpu_prepared_numerator_run_sum_bound": False,
+                    "gpu_prepared_numerator_run_sum_identity": None,
+                    "gpu_prepared_numerator_run_sum_target_group": None,
+                    "gpu_prepared_numerator_run_sum_victim_group": None,
+                    "gpu_prepared_numerator_run_sum_run_count": None,
+                    "gpu_prepared_numerator_run_sum_scratch_words_per_coordinate": None,
                     "gpu_composition_part_count": 153,
                     "gpu_composition_wave_count": 18,
                     "gpu_graph_submit_gap_ns_max_samples": [1_000_000, 2_000_000],
@@ -278,12 +290,76 @@ class ShellLauncherTests(unittest.TestCase):
                 {
                     "protocol_key": "protocol-v1",
                     "topology_digest": "topology-v1",
-                    "numerator_schedule": "staged-packed-single-write",
+                    "numerator_planned_schedule": "staged-run-sum-or-packed",
+                    "numerator_actual_schedule": "staged-packed-single-write",
+                    "numerator_selected_output_rows": 20_971_472,
                     "numerator_packed_output_rows": 20_971_472,
+                    "numerator_group_direct_output_rows": None,
+                    "numerator_run_sum_bound": False,
+                    "numerator_run_sum_identity": None,
+                    "numerator_run_sum_target_group": None,
+                    "numerator_run_sum_victim_group": None,
+                    "numerator_run_sum_run_count": None,
+                    "numerator_run_sum_scratch_words_per_coordinate": None,
                     "composition_part_count": 153,
                     "composition_wave_count": 18,
                 },
             )
+
+            record_path = root / "fixture.record.json"
+            direct = json.loads(record_path.read_text(encoding="utf-8"))
+            direct.update(
+                {
+                    "gpu_prepared_numerator_schedule": "staged-group-direct",
+                    "gpu_prepared_numerator_packed_output_rows": None,
+                    "gpu_prepared_numerator_group_direct_output_rows": 20_971_472,
+                    "gpu_prepared_numerator_run_sum_bound": True,
+                    "gpu_prepared_numerator_run_sum_identity": "78" * 32,
+                    "gpu_prepared_numerator_run_sum_target_group": 0,
+                    "gpu_prepared_numerator_run_sum_victim_group": 13,
+                    "gpu_prepared_numerator_run_sum_run_count": 17,
+                    "gpu_prepared_numerator_run_sum_scratch_words_per_coordinate": 4_194_256,
+                }
+            )
+            record_path.write_text(json.dumps(direct) + "\n", encoding="utf-8")
+            direct_result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$COMMON"; CHECKPOINT_PREFIX=fixture; '
+                    'CHECKPOINT_GPU_BENCH="$TEST_GPU_BENCH"; '
+                    'CHECKPOINT_AOT_CHECK="$TEST_AOT_CHECK"; '
+                    'CHECKPOINT_AOT_MANIFEST="$TEST_AOT_MANIFEST"; '
+                    'CHECKPOINT_SEAL="$TEST_SEAL"; checkpoint_seal_diagnostic',
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(direct_result.returncode, 0, direct_result.stderr)
+            direct_shape = json.loads(seal.read_text(encoding="utf-8"))["shape_receipt"]
+            self.assertEqual(
+                direct_shape,
+                {
+                    "protocol_key": "protocol-v1",
+                    "topology_digest": "topology-v1",
+                    "numerator_planned_schedule": "staged-run-sum-or-packed",
+                    "numerator_actual_schedule": "staged-group-direct",
+                    "numerator_selected_output_rows": 20_971_472,
+                    "numerator_packed_output_rows": None,
+                    "numerator_group_direct_output_rows": 20_971_472,
+                    "numerator_run_sum_bound": True,
+                    "numerator_run_sum_identity": "78" * 32,
+                    "numerator_run_sum_target_group": 0,
+                    "numerator_run_sum_victim_group": 13,
+                    "numerator_run_sum_run_count": 17,
+                    "numerator_run_sum_scratch_words_per_coordinate": 4_194_256,
+                    "composition_part_count": 153,
+                    "composition_wave_count": 18,
+                },
+            )
+            record_path.write_text(json.dumps(artifacts["record.json"]) + "\n", encoding="utf-8")
 
             counter_path = root / "fixture.counter_acceptance.json"
             valid_counter = json.loads(counter_path.read_text(encoding="utf-8"))
@@ -378,7 +454,7 @@ class ShellLauncherTests(unittest.TestCase):
             timing_only_seal = json.loads(seal.read_text(encoding="utf-8"))
             self.assertEqual(
                 timing_only_seal["schema"],
-                "stwo.replacement-v1-sn2.timing-only-seal.v1",
+                "stwo.replacement-v1-sn2.timing-only-seal.v2",
             )
             self.assertEqual(timing_only_seal["counter_policy"], "timing-only")
             self.assertFalse(timing_only_seal["counter_profile_admissible"])
@@ -732,7 +808,7 @@ checkpoint_counter_timing_only
             (root / "replacement_v1_sn2_timing_only_checkpoint.seal.json").write_text(
                 json.dumps(
                     {
-                        "schema": "stwo.replacement-v1-sn2.timing-only-seal.v1",
+                        "schema": "stwo.replacement-v1-sn2.timing-only-seal.v2",
                         "counter_policy": "timing-only",
                         "counter_profile_admissible": False,
                         "counter_status": "UNAVAILABLE",
@@ -992,6 +1068,43 @@ checkpoint_counter_timing_only
                 },
             )
 
+    def test_replacement_sn2_ncu_plan_tracks_sealed_actual_schedule(self) -> None:
+        common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            seal = Path(directory) / "seal.json"
+            env = {
+                **os.environ,
+                "COMMON": str(common),
+                "SEAL": str(seal),
+                "REPLACEMENT_SN2_MODE": "timing",
+            }
+            for schedule, expected_count, expected_kernel in (
+                ("staged-packed-single-write", "19", "packed_single_write_kernel"),
+                ("staged-group-direct", "50", "native_run_precompute_kernel"),
+            ):
+                seal.write_text(
+                    json.dumps(
+                        {"shape_receipt": {"numerator_actual_schedule": schedule}}
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'source "$COMMON"; CHECKPOINT_SEAL="$SEAL"; checkpoint_ncu_plan',
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                regex, count = result.stdout.strip().split("\t")
+                self.assertEqual(count, expected_count)
+                self.assertIn(expected_kernel, regex)
+
     def test_replacement_sn2_ncu_receipt_requires_exact_launch_topology(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"
         with tempfile.TemporaryDirectory() as directory:
@@ -1011,7 +1124,18 @@ checkpoint_counter_timing_only
                         "gpu_resident_backend": "replacement-v1",
                         "gpu_pcs_runtime_mode": "ArenaGraph",
                         "gpu_aot_provenance_gate_passed": True,
+                        "gpu_protocol_key": "protocol-v1",
+                        "gpu_shape_executable_topology_digest": "topology-v1",
+                        "gpu_planned_numerator_schedule": "staged-run-sum-or-packed",
                         "gpu_prepared_numerator_schedule": "staged-packed-single-write",
+                        "gpu_prepared_numerator_packed_output_rows": 20_971_472,
+                        "gpu_prepared_numerator_group_direct_output_rows": None,
+                        "gpu_prepared_numerator_run_sum_bound": False,
+                        "gpu_prepared_numerator_run_sum_identity": None,
+                        "gpu_prepared_numerator_run_sum_target_group": None,
+                        "gpu_prepared_numerator_run_sum_victim_group": None,
+                        "gpu_prepared_numerator_run_sum_run_count": None,
+                        "gpu_prepared_numerator_run_sum_scratch_words_per_coordinate": None,
                         "gpu_composition_part_count": 153,
                         "gpu_composition_wave_count": 18,
                         "gpu_proof_blake3": "ab" * 32,
@@ -1032,11 +1156,28 @@ checkpoint_counter_timing_only
             seal.write_text(
                 json.dumps(
                     {
-                        "schema": "stwo.replacement-v1-sn2.checkpoint-seal.v3",
+                        "schema": "stwo.replacement-v1-sn2.checkpoint-seal.v4",
                         "diagnostic_pass": True,
                         "gpu_bench_sha256": file_sha256(gpu_bench),
                         "proof_dump_sha256": proof_sha,
                         "proof_blake3": "ab" * 32,
+                        "shape_receipt": {
+                            "protocol_key": "protocol-v1",
+                            "topology_digest": "topology-v1",
+                            "numerator_planned_schedule": "staged-run-sum-or-packed",
+                            "numerator_actual_schedule": "staged-packed-single-write",
+                            "numerator_selected_output_rows": 20_971_472,
+                            "numerator_packed_output_rows": 20_971_472,
+                            "numerator_group_direct_output_rows": None,
+                            "numerator_run_sum_bound": False,
+                            "numerator_run_sum_identity": None,
+                            "numerator_run_sum_target_group": None,
+                            "numerator_run_sum_victim_group": None,
+                            "numerator_run_sum_run_count": None,
+                            "numerator_run_sum_scratch_words_per_coordinate": None,
+                            "composition_part_count": 153,
+                            "composition_wave_count": 18,
+                        },
                     }
                 )
                 + "\n",
@@ -1094,6 +1235,9 @@ checkpoint_counter_timing_only
                     "composition_wave_launch_count": 18,
                     "distinct_composition_wave_kernel_count": 18,
                     "packed_numerator_launch_count": 1,
+                    "group_direct_numerator_launch_count": 0,
+                    "run_sum_precompute_launch_count": 0,
+                    "run_sum_expand_launch_count": 0,
                 },
             )
             gpu_bench.write_bytes(b"substituted-gpu-bench")
@@ -1111,6 +1255,57 @@ checkpoint_counter_timing_only
             ):
                 with self.subTest(kernels=len(kernels)):
                     self.assertEqual(validate(kernels)["status"], "FAIL")
+
+            direct_record = json.loads(stdout.read_text(encoding="utf-8"))
+            direct_record.update(
+                {
+                    "gpu_prepared_numerator_schedule": "staged-group-direct",
+                    "gpu_prepared_numerator_packed_output_rows": None,
+                    "gpu_prepared_numerator_group_direct_output_rows": 20_971_472,
+                    "gpu_prepared_numerator_run_sum_bound": True,
+                    "gpu_prepared_numerator_run_sum_identity": "78" * 32,
+                    "gpu_prepared_numerator_run_sum_target_group": 0,
+                    "gpu_prepared_numerator_run_sum_victim_group": 13,
+                    "gpu_prepared_numerator_run_sum_run_count": 17,
+                    "gpu_prepared_numerator_run_sum_scratch_words_per_coordinate": 4_194_256,
+                }
+            )
+            stdout.write_text(json.dumps(direct_record) + "\n", encoding="utf-8")
+            direct_seal = json.loads(seal.read_text(encoding="utf-8"))
+            direct_seal["shape_receipt"].update(
+                {
+                    "numerator_actual_schedule": "staged-group-direct",
+                    "numerator_packed_output_rows": None,
+                    "numerator_group_direct_output_rows": 20_971_472,
+                    "numerator_run_sum_bound": True,
+                    "numerator_run_sum_identity": "78" * 32,
+                    "numerator_run_sum_target_group": 0,
+                    "numerator_run_sum_victim_group": 13,
+                    "numerator_run_sum_run_count": 17,
+                    "numerator_run_sum_scratch_words_per_coordinate": 4_194_256,
+                }
+            )
+            seal.write_text(json.dumps(direct_seal) + "\n", encoding="utf-8")
+            direct_kernels = [
+                *waves,
+                *(["stwo_quotient_numerator_group_direct_kernel"] * 14),
+                *(["stwo_quotient_numerator_native_run_precompute_kernel"] * 17),
+                "stwo_quotient_numerator_run_sum_expand_kernel",
+            ]
+            direct_receipt = validate(direct_kernels)
+            self.assertEqual(direct_receipt["status"], "PASS")
+            self.assertEqual(
+                direct_receipt["ncu_launch_topology"],
+                {
+                    "selected_launch_count": 50,
+                    "composition_wave_launch_count": 18,
+                    "distinct_composition_wave_kernel_count": 18,
+                    "packed_numerator_launch_count": 0,
+                    "group_direct_numerator_launch_count": 14,
+                    "run_sum_precompute_launch_count": 17,
+                    "run_sum_expand_launch_count": 1,
+                },
+            )
 
     def test_replacement_sn2_ecc_policy_is_explicit_and_sealed(self) -> None:
         common = ROOT / "loop" / "recipes" / "replacement_v1_sn2_common.sh"

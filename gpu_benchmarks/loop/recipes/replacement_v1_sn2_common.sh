@@ -63,10 +63,14 @@ fi
 CHECKPOINT_SN2_PACKED_OUTPUT_ROWS=20971472
 CHECKPOINT_SN2_COMPOSITION_PARTS=153
 CHECKPOINT_SN2_COMPOSITION_WAVES=18
+CHECKPOINT_SN2_RUN_SUM_TARGET_GROUP=0
+CHECKPOINT_SN2_RUN_SUM_VICTIM_GROUP=13
+CHECKPOINT_SN2_RUN_SUM_RUN_COUNT=17
+CHECKPOINT_SN2_RUN_SUM_SCRATCH_WORDS_PER_COORDINATE=4194256
 CHECKPOINT_PROMOTION_HOST_PREPARATION_NS=120000000
 CHECKPOINT_PROMOTION_USEFUL_MHZ=5.0
-CHECKPOINT_NCU_KERNEL_REGEX='regex:stwo_composition_wave_.*|stwo_quotient_numerator_packed_single_write_kernel'
-CHECKPOINT_NCU_LAUNCH_COUNT=19
+CHECKPOINT_NCU_PACKED_KERNEL_REGEX='regex:stwo_composition_wave_.*|stwo_quotient_numerator_packed_single_write_kernel'
+CHECKPOINT_NCU_DIRECT_KERNEL_REGEX='regex:stwo_composition_wave_.*|stwo_quotient_numerator_group_direct.*kernel|stwo_quotient_numerator_native_run_precompute_kernel|stwo_quotient_numerator_run_sum_expand_kernel'
 CHECKPOINT_NSYS_FALLBACK=/opt/nvidia/nsight-systems/2024.6.2/bin/nsys
 
 # One architecture, one compiler fingerprint, and one persistent target/cache line.
@@ -80,6 +84,23 @@ checkpoint_artifact() {
 
 checkpoint_sha256() {
   sha256sum "$1" | cut -d' ' -f1
+}
+
+checkpoint_ncu_plan() {
+  python3 - "$CHECKPOINT_SEAL" "$CHECKPOINT_NCU_PACKED_KERNEL_REGEX" \
+    "$CHECKPOINT_NCU_DIRECT_KERNEL_REGEX" <<'PY'
+import json, sys
+
+seal_path, packed_regex, direct_regex = sys.argv[1:]
+seal = json.load(open(seal_path, encoding="utf-8"))
+schedule = (seal.get("shape_receipt") or {}).get("numerator_actual_schedule")
+if schedule == "staged-packed-single-write":
+    print(f"{packed_regex}\t19")
+elif schedule == "staged-group-direct":
+    print(f"{direct_regex}\t50")
+else:
+    raise SystemExit(f"sealed numerator schedule has no NCU plan: {schedule!r}")
+PY
 }
 
 checkpoint_manifest_hash() {
@@ -571,15 +592,19 @@ if not isinstance(fixtures, list):
     raise SystemExit("Stage-4 fixture list is missing")
 by_name = {fixture.get("name"): fixture for fixture in fixtures if isinstance(fixture, dict)}
 expected = {
-    "staged-packed-quotient-mixed-topology": {
-        "cases": 2,
+    "staged-group-direct-quotient-mixed-topology": {
+        "cases": 3,
         "production_apis": [
             "quotient_numerator_staged_single_write_plan_with_overflow_capacities",
-            "PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write",
+            "PreparedQuotientNumeratorGraph::prepare_staged_group_direct",
         ],
         "checks": ["eager_reference", "legacy_candidate_byte_identity",
-                   "captured_graph_mutation", "source_preservation", "guard_preservation"],
-        "hashes": ["eager_outputs", "mutated_graph_outputs"],
+                   "missing_run_sum_binding_fallback",
+                   "production_fallback_graph_topology",
+                   "captured_graph_mutation", "third_generation_graph_replay",
+                   "source_preservation", "guard_preservation"],
+        "hashes": ["eager_outputs", "mutated_graph_outputs",
+                   "third_generation_outputs"],
     },
     "mode-a-domain-cooperative-commit": {
         "cases": 9,
@@ -834,6 +859,10 @@ checkpoint_validate_sn2() {
   PACKED_ROWS="$CHECKPOINT_SN2_PACKED_OUTPUT_ROWS" \
     COMPOSITION_PARTS="$CHECKPOINT_SN2_COMPOSITION_PARTS" \
     COMPOSITION_WAVES="$CHECKPOINT_SN2_COMPOSITION_WAVES" \
+    RUN_SUM_TARGET_GROUP="$CHECKPOINT_SN2_RUN_SUM_TARGET_GROUP" \
+    RUN_SUM_VICTIM_GROUP="$CHECKPOINT_SN2_RUN_SUM_VICTIM_GROUP" \
+    RUN_SUM_RUN_COUNT="$CHECKPOINT_SN2_RUN_SUM_RUN_COUNT" \
+    RUN_SUM_SCRATCH_WORDS="$CHECKPOINT_SN2_RUN_SUM_SCRATCH_WORDS_PER_COORDINATE" \
     COUNTER_POLICY="$REPLACEMENT_SN2_COUNTER_POLICY" \
     SOURCE_RECEIPT="$(checkpoint_artifact source_input_identity.json)" \
     HARDWARE_RECEIPT="$(checkpoint_artifact hardware_identity.json)" \
@@ -869,6 +898,60 @@ def require(condition, message):
 def hex64(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
+def numerator_shape_receipt(record):
+    actual = record.get("gpu_prepared_numerator_schedule")
+    packed_rows = record.get("gpu_prepared_numerator_packed_output_rows")
+    direct_rows = record.get("gpu_prepared_numerator_group_direct_output_rows")
+    run_sum_fields = {
+        "numerator_run_sum_bound": record.get("gpu_prepared_numerator_run_sum_bound"),
+        "numerator_run_sum_identity": record.get("gpu_prepared_numerator_run_sum_identity"),
+        "numerator_run_sum_target_group": record.get("gpu_prepared_numerator_run_sum_target_group"),
+        "numerator_run_sum_victim_group": record.get("gpu_prepared_numerator_run_sum_victim_group"),
+        "numerator_run_sum_run_count": record.get("gpu_prepared_numerator_run_sum_run_count"),
+        "numerator_run_sum_scratch_words_per_coordinate":
+            record.get("gpu_prepared_numerator_run_sum_scratch_words_per_coordinate"),
+    }
+    if actual == "staged-group-direct":
+        require(packed_rows is None, "group-direct numerator reported packed rows")
+        require(direct_rows == int(os.environ["PACKED_ROWS"]),
+                "group-direct numerator row count drifted")
+        require(run_sum_fields == {
+            "numerator_run_sum_bound": True,
+            "numerator_run_sum_identity": run_sum_fields["numerator_run_sum_identity"],
+            "numerator_run_sum_target_group": int(os.environ["RUN_SUM_TARGET_GROUP"]),
+            "numerator_run_sum_victim_group": int(os.environ["RUN_SUM_VICTIM_GROUP"]),
+            "numerator_run_sum_run_count": int(os.environ["RUN_SUM_RUN_COUNT"]),
+            "numerator_run_sum_scratch_words_per_coordinate":
+                int(os.environ["RUN_SUM_SCRATCH_WORDS"]),
+        }, "group-direct run-sum binding drifted")
+        require(hex64(run_sum_fields["numerator_run_sum_identity"])
+                and run_sum_fields["numerator_run_sum_identity"] != "0" * 64,
+                "group-direct run-sum identity is invalid")
+        selected_rows = direct_rows
+    elif actual == "staged-packed-single-write":
+        require(packed_rows == int(os.environ["PACKED_ROWS"]),
+                "packed fallback numerator row count drifted")
+        require(direct_rows is None, "packed fallback reported group-direct rows")
+        require(run_sum_fields == {
+            "numerator_run_sum_bound": False,
+            "numerator_run_sum_identity": None,
+            "numerator_run_sum_target_group": None,
+            "numerator_run_sum_victim_group": None,
+            "numerator_run_sum_run_count": None,
+            "numerator_run_sum_scratch_words_per_coordinate": None,
+        }, "packed fallback unexpectedly owns a run-sum binding")
+        selected_rows = packed_rows
+    else:
+        raise SystemExit(f"actual adaptive numerator schedule drifted: {actual!r}")
+    return {
+        "numerator_planned_schedule": record.get("gpu_planned_numerator_schedule"),
+        "numerator_actual_schedule": actual,
+        "numerator_selected_output_rows": selected_rows,
+        "numerator_packed_output_rows": packed_rows,
+        "numerator_group_direct_output_rows": direct_rows,
+        **run_sum_fields,
+    }
+
 require(r.get("engine") == "gpu-native" and r.get("n") == 1, "wrong engine or statement multiplicity")
 require(r.get("cycle_count") == 7977397 and r.get("pie_n_steps") == 7706864, "SN2 statement geometry drifted")
 require((r.get("security_bits"), r.get("n_queries"), r.get("pow_bits"), r.get("fold_step")) == (96, 70, 26, 3), "security configuration drifted")
@@ -885,11 +968,10 @@ for field in ("gpu_pcs_stage_started", "gpu_pcs_stage_finished"):
     stages = r.get(field)
     require(isinstance(stages, dict) and set(stages) == expected_stages and all(bool(value) for value in stages.values()), f"incomplete {field}")
 require(r.get("gpu_graph_a_setup_gate_passed") is True, "strict Graph-A setup gate failed")
-require(r.get("gpu_planned_numerator_schedule") == "staged-packed-single-write", "planned numerator schedule drifted")
-require(r.get("gpu_prepared_numerator_schedule") == "staged-packed-single-write", "actual numerator schedule fell back")
+require(r.get("gpu_planned_numerator_schedule") == "staged-run-sum-or-packed", "planned numerator schedule drifted")
+numerator_shape = numerator_shape_receipt(r)
 require(r.get("gpu_prepared_numerator_eligible_groups") is None, "staged numerator unexpectedly reported eligible groups")
 require(r.get("gpu_prepared_numerator_legacy_groups") == 0, "staged numerator executed legacy groups")
-require(r.get("gpu_prepared_numerator_packed_output_rows") == int(os.environ["PACKED_ROWS"]), "staged numerator packed-row count drifted")
 require(r.get("gpu_composition_part_count") == int(os.environ["COMPOSITION_PARTS"]), "composition part count drifted")
 require(r.get("gpu_composition_wave_count") == int(os.environ["COMPOSITION_WAVES"]), "composition wave count drifted")
 require(r.get("gpu_composition_replay_launch_mode") == "wave", "composition replay did not use the wave launch path")
@@ -1036,13 +1118,13 @@ elif mode in ("timing", "iteration"):
                 "iteration timing must remain outside the counter-qualified promotion lane")
     else:
         seal = json.load(open(seal_path, encoding="utf-8"))
-        expected_seal = ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_profile_admissible
-                         else "stwo.replacement-v1-sn2.timing-only-seal.v1")
+        expected_seal = ("stwo.replacement-v1-sn2.checkpoint-seal.v4" if counter_profile_admissible
+                         else "stwo.replacement-v1-sn2.timing-only-seal.v2")
         require(seal.get("schema") == expected_seal and seal.get("diagnostic_pass") is True,
                 "timing seal is not a passing diagnostic for the selected counter policy")
         if counter_profile_admissible:
             require("counter_policy" not in seal and "counter_profile_admissible" not in seal,
-                    "strict v3 seal was altered by a counter waiver")
+                    "strict v4 seal was altered by a counter waiver")
         else:
             require(seal.get("counter_policy") == "timing-only"
                     and seal.get("counter_profile_admissible") is False
@@ -1055,8 +1137,7 @@ elif mode in ("timing", "iteration"):
         require(shape == {
             "protocol_key": r["gpu_protocol_key"],
             "topology_digest": r["gpu_shape_executable_topology_digest"],
-            "numerator_schedule": r["gpu_prepared_numerator_schedule"],
-            "numerator_packed_output_rows": r["gpu_prepared_numerator_packed_output_rows"],
+            **numerator_shape,
             "composition_part_count": r["gpu_composition_part_count"],
             "composition_wave_count": r["gpu_composition_wave_count"],
         }, "timing shape/numerator receipt differs from diagnostic")
@@ -1134,6 +1215,11 @@ checkpoint_seal_diagnostic() {
     COUNTER_POLICY="$REPLACEMENT_SN2_COUNTER_POLICY" \
     BUILD="$build" ADAPTED="$adapted" CARRY="$carry" \
     STAGE4="$stage4" AOT="$aot" RECORD="$record" PROOF="$proof" PROOF_SHA="$proof_sha" \
+    PACKED_ROWS="$CHECKPOINT_SN2_PACKED_OUTPUT_ROWS" \
+    RUN_SUM_TARGET_GROUP="$CHECKPOINT_SN2_RUN_SUM_TARGET_GROUP" \
+    RUN_SUM_VICTIM_GROUP="$CHECKPOINT_SN2_RUN_SUM_VICTIM_GROUP" \
+    RUN_SUM_RUN_COUNT="$CHECKPOINT_SN2_RUN_SUM_RUN_COUNT" \
+    RUN_SUM_SCRATCH_WORDS="$CHECKPOINT_SN2_RUN_SUM_SCRATCH_WORDS_PER_COORDINATE" \
     GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
     AOT_CHECK_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_CHECK")" \
     AOT_MANIFEST_SHA="$(checkpoint_sha256 "$CHECKPOINT_AOT_MANIFEST")" \
@@ -1147,6 +1233,66 @@ source, hardware, counter, build, adapted = map(
     load, ("SOURCE", "HARDWARE", "COUNTER", "BUILD", "ADAPTED"))
 carry, stage4, aot, record = map(load, ("CARRY", "STAGE4", "AOT", "RECORD"))
 counter_policy = os.environ["COUNTER_POLICY"]
+
+def numerator_shape_receipt(value):
+    actual = value.get("gpu_prepared_numerator_schedule")
+    packed_rows = value.get("gpu_prepared_numerator_packed_output_rows")
+    direct_rows = value.get("gpu_prepared_numerator_group_direct_output_rows")
+    identity = value.get("gpu_prepared_numerator_run_sum_identity")
+    run_sum = {
+        "numerator_run_sum_bound": value.get("gpu_prepared_numerator_run_sum_bound"),
+        "numerator_run_sum_identity": identity,
+        "numerator_run_sum_target_group": value.get("gpu_prepared_numerator_run_sum_target_group"),
+        "numerator_run_sum_victim_group": value.get("gpu_prepared_numerator_run_sum_victim_group"),
+        "numerator_run_sum_run_count": value.get("gpu_prepared_numerator_run_sum_run_count"),
+        "numerator_run_sum_scratch_words_per_coordinate":
+            value.get("gpu_prepared_numerator_run_sum_scratch_words_per_coordinate"),
+    }
+    if actual == "staged-group-direct":
+        expected = {
+            "numerator_run_sum_bound": True,
+            "numerator_run_sum_identity": identity,
+            "numerator_run_sum_target_group": int(os.environ["RUN_SUM_TARGET_GROUP"]),
+            "numerator_run_sum_victim_group": int(os.environ["RUN_SUM_VICTIM_GROUP"]),
+            "numerator_run_sum_run_count": int(os.environ["RUN_SUM_RUN_COUNT"]),
+            "numerator_run_sum_scratch_words_per_coordinate":
+                int(os.environ["RUN_SUM_SCRATCH_WORDS"]),
+        }
+        if (packed_rows is not None
+                or direct_rows != int(os.environ["PACKED_ROWS"])
+                or run_sum != expected
+                or not isinstance(identity, str)
+                or re.fullmatch(r"[0-9a-f]{64}", identity) is None
+                or identity == "0" * 64):
+            raise SystemExit("diagnostic group-direct run-sum receipt is invalid")
+        selected_rows = direct_rows
+    elif actual == "staged-packed-single-write":
+        expected = {
+            "numerator_run_sum_bound": False,
+            "numerator_run_sum_identity": None,
+            "numerator_run_sum_target_group": None,
+            "numerator_run_sum_victim_group": None,
+            "numerator_run_sum_run_count": None,
+            "numerator_run_sum_scratch_words_per_coordinate": None,
+        }
+        if (packed_rows != int(os.environ["PACKED_ROWS"])
+                or direct_rows is not None or run_sum != expected):
+            raise SystemExit("diagnostic packed fallback receipt is invalid")
+        selected_rows = packed_rows
+    else:
+        raise SystemExit(f"diagnostic adaptive schedule is invalid: {actual!r}")
+    if value.get("gpu_planned_numerator_schedule") != "staged-run-sum-or-packed":
+        raise SystemExit("diagnostic planned adaptive schedule is invalid")
+    return {
+        "numerator_planned_schedule": value["gpu_planned_numerator_schedule"],
+        "numerator_actual_schedule": actual,
+        "numerator_selected_output_rows": selected_rows,
+        "numerator_packed_output_rows": packed_rows,
+        "numerator_group_direct_output_rows": direct_rows,
+        **run_sum,
+    }
+
+numerator_shape = numerator_shape_receipt(record)
 counter_log_text = open(os.environ["COUNTER_LOG"], encoding="utf-8", errors="replace").read()
 counter_raw_text = open(os.environ["COUNTER_RAW"], encoding="utf-8", errors="replace").read()
 columns = None
@@ -1235,8 +1381,8 @@ if (build.get("gpu_bench_sha256") != os.environ["GPU_BENCH_SHA"]
     raise SystemExit("diagnostic receipt/binary identity cross-check failed")
 if sha("PROOF") != os.environ["PROOF_SHA"]:
     raise SystemExit("diagnostic proof hash receipt differs from proof bytes")
-seal = {"schema": ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_policy == "required"
-                   else "stwo.replacement-v1-sn2.timing-only-seal.v1"),
+seal = {"schema": ("stwo.replacement-v1-sn2.checkpoint-seal.v4" if counter_policy == "required"
+                   else "stwo.replacement-v1-sn2.timing-only-seal.v2"),
         "diagnostic_pass": True,
         "source": source["source"], "inputs": source["inputs"], "hardware": hardware,
         "adapted_input_sha256": adapted["sha256"],
@@ -1256,8 +1402,7 @@ seal = {"schema": ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_polic
         "shape_receipt": {
             "protocol_key": record["gpu_protocol_key"],
             "topology_digest": record["gpu_shape_executable_topology_digest"],
-            "numerator_schedule": record["gpu_prepared_numerator_schedule"],
-            "numerator_packed_output_rows": record["gpu_prepared_numerator_packed_output_rows"],
+            **numerator_shape,
             "composition_part_count": record["gpu_composition_part_count"],
             "composition_wave_count": record["gpu_composition_wave_count"],
         },
@@ -1303,13 +1448,13 @@ checkpoint_verify_sealed_diagnostic() {
 import json, os, sys
 seal = json.load(open(sys.argv[1], encoding="utf-8"))
 counter_policy = os.environ["COUNTER_POLICY"]
-expected_schema = ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_policy == "required"
-                   else "stwo.replacement-v1-sn2.timing-only-seal.v1")
+expected_schema = ("stwo.replacement-v1-sn2.checkpoint-seal.v4" if counter_policy == "required"
+                   else "stwo.replacement-v1-sn2.timing-only-seal.v2")
 if seal.get("schema") != expected_schema or seal.get("diagnostic_pass") is not True:
     raise SystemExit("checkpoint seal is not a passing diagnostic")
 if counter_policy == "required":
     if "counter_policy" in seal or "counter_profile_admissible" in seal:
-        raise SystemExit("strict v3 checkpoint seal contains a counter waiver")
+        raise SystemExit("strict v4 checkpoint seal contains a counter waiver")
 elif (seal.get("counter_policy") != "timing-only"
       or seal.get("counter_profile_admissible") is not False
       or seal.get("counter_status") != "UNAVAILABLE"):
@@ -1348,7 +1493,6 @@ checkpoint_write_profile_receipt() {
   local stdout="$6" stderr="$7" out="$8"
   PROFILE="$profiler" RC="$rc" GPU_BENCH_SHA="$(checkpoint_sha256 "$CHECKPOINT_GPU_BENCH")" \
     COUNTER_POLICY="$REPLACEMENT_SN2_COUNTER_POLICY" \
-    NCU_LAUNCH_COUNT="$CHECKPOINT_NCU_LAUNCH_COUNT" \
     COMPOSITION_PARTS="$CHECKPOINT_SN2_COMPOSITION_PARTS" \
     COMPOSITION_WAVES="$CHECKPOINT_SN2_COMPOSITION_WAVES" \
     python3 - "$proof" "$report" "$table" "$stdout" "$stderr" "$CHECKPOINT_SEAL" "$out" <<'PY'
@@ -1379,13 +1523,13 @@ try:
 except (OSError, json.JSONDecodeError) as error:
     seal = {}
     reasons.append(f"unreadable diagnostic seal: {error}")
-expected_schema = ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if counter_profile_admissible
-                   else "stwo.replacement-v1-sn2.timing-only-seal.v1")
+expected_schema = ("stwo.replacement-v1-sn2.checkpoint-seal.v4" if counter_profile_admissible
+                   else "stwo.replacement-v1-sn2.timing-only-seal.v2")
 if seal.get("schema") != expected_schema or seal.get("diagnostic_pass") is not True:
     reasons.append("profile did not consume the selected policy's passing diagnostic seal")
 elif counter_profile_admissible:
     if "counter_policy" in seal or "counter_profile_admissible" in seal:
-        reasons.append("strict v3 diagnostic seal contains a counter waiver")
+        reasons.append("strict v4 diagnostic seal contains a counter waiver")
 elif (seal.get("counter_policy") != "timing-only"
       or seal.get("counter_profile_admissible") is not False
       or seal.get("counter_status") != "UNAVAILABLE"):
@@ -1414,7 +1558,8 @@ else:
             or record.get("gpu_resident_backend") != "replacement-v1"
             or record.get("gpu_pcs_runtime_mode") != "ArenaGraph"
             or record.get("gpu_aot_provenance_gate_passed") is not True
-            or record.get("gpu_prepared_numerator_schedule") != "staged-packed-single-write"
+            or record.get("gpu_planned_numerator_schedule") != "staged-run-sum-or-packed"
+            or record.get("gpu_prepared_numerator_schedule") not in {"staged-group-direct", "staged-packed-single-write"}
             or record.get("gpu_composition_part_count") != int(os.environ["COMPOSITION_PARTS"])
             or record.get("gpu_composition_wave_count") != int(os.environ["COMPOSITION_WAVES"])
             or record.get("verified_reps") != 2
@@ -1422,6 +1567,33 @@ else:
             or record.get("simd_reference_byte_equal") is not True
             or record.get("proof_mutation_rejected") is not True):
         reasons.append("profiled execution did not reproduce the sealed correctness identity")
+    profiled_shape = {
+        "protocol_key": record.get("gpu_protocol_key"),
+        "topology_digest": record.get("gpu_shape_executable_topology_digest"),
+        "numerator_planned_schedule": record.get("gpu_planned_numerator_schedule"),
+        "numerator_actual_schedule": record.get("gpu_prepared_numerator_schedule"),
+        "numerator_selected_output_rows": (
+            record.get("gpu_prepared_numerator_group_direct_output_rows")
+            if record.get("gpu_prepared_numerator_schedule") == "staged-group-direct"
+            else record.get("gpu_prepared_numerator_packed_output_rows")
+        ),
+        "numerator_packed_output_rows": record.get("gpu_prepared_numerator_packed_output_rows"),
+        "numerator_group_direct_output_rows":
+            record.get("gpu_prepared_numerator_group_direct_output_rows"),
+        "numerator_run_sum_bound": record.get("gpu_prepared_numerator_run_sum_bound"),
+        "numerator_run_sum_identity": record.get("gpu_prepared_numerator_run_sum_identity"),
+        "numerator_run_sum_target_group":
+            record.get("gpu_prepared_numerator_run_sum_target_group"),
+        "numerator_run_sum_victim_group":
+            record.get("gpu_prepared_numerator_run_sum_victim_group"),
+        "numerator_run_sum_run_count": record.get("gpu_prepared_numerator_run_sum_run_count"),
+        "numerator_run_sum_scratch_words_per_coordinate":
+            record.get("gpu_prepared_numerator_run_sum_scratch_words_per_coordinate"),
+        "composition_part_count": record.get("gpu_composition_part_count"),
+        "composition_wave_count": record.get("gpu_composition_wave_count"),
+    }
+    if profiled_shape != seal.get("shape_receipt"):
+        reasons.append("profiled adaptive numerator identity differs from the diagnostic seal")
 ncu_topology = None
 if profile == "ncu" and table.is_file():
     launches = {}
@@ -1434,8 +1606,12 @@ if profile == "ncu" and table.is_file():
         if columns is None or max(index for index in columns.values() if index is not None) >= len(row):
             continue
         kernel = row[columns["Kernel Name"]]
-        if ("stwo_composition_wave_" not in kernel
-                and "stwo_quotient_numerator_packed_single_write_kernel" not in kernel):
+        if not any(name in kernel for name in (
+                "stwo_composition_wave_",
+                "stwo_quotient_numerator_packed_single_write_kernel",
+                "stwo_quotient_numerator_group_direct",
+                "stwo_quotient_numerator_native_run_precompute_kernel",
+                "stwo_quotient_numerator_run_sum_expand_kernel")):
             continue
         launch_id = row[columns["ID"]]
         process_id = row[columns["Process ID"]] if columns["Process ID"] is not None else ""
@@ -1447,21 +1623,37 @@ if profile == "ncu" and table.is_file():
         launches[key] = kernel
     kernels = list(launches.values())
     waves = [kernel for kernel in kernels if "stwo_composition_wave_" in kernel]
-    numerator = [kernel for kernel in kernels
-                 if "stwo_quotient_numerator_packed_single_write_kernel" in kernel]
+    packed = [kernel for kernel in kernels
+              if "stwo_quotient_numerator_packed_single_write_kernel" in kernel]
+    direct = [kernel for kernel in kernels
+              if "stwo_quotient_numerator_group_direct" in kernel]
+    precompute = [kernel for kernel in kernels
+                  if "stwo_quotient_numerator_native_run_precompute_kernel" in kernel]
+    expand = [kernel for kernel in kernels
+              if "stwo_quotient_numerator_run_sum_expand_kernel" in kernel]
     ncu_topology = {
         "selected_launch_count": len(kernels),
         "composition_wave_launch_count": len(waves),
         "distinct_composition_wave_kernel_count": len(set(waves)),
-        "packed_numerator_launch_count": len(numerator),
+        "packed_numerator_launch_count": len(packed),
+        "group_direct_numerator_launch_count": len(direct),
+        "run_sum_precompute_launch_count": len(precompute),
+        "run_sum_expand_launch_count": len(expand),
     }
-    expected_launches = int(os.environ["NCU_LAUNCH_COUNT"])
     expected_waves = int(os.environ["COMPOSITION_WAVES"])
-    if (len(kernels) != expected_launches or len(waves) != expected_waves
-            or len(set(waves)) != expected_waves or len(numerator) != 1):
+    actual_schedule = (seal.get("shape_receipt") or {}).get("numerator_actual_schedule")
+    expected_numerator = ({
+        "staged-packed-single-write": (19, 1, 0, 0, 0),
+        "staged-group-direct": (50, 0, 14, 17, 1),
+    }).get(actual_schedule)
+    observed_numerator = (
+        len(kernels), len(packed), len(direct), len(precompute), len(expand)
+    )
+    if (expected_numerator is None or observed_numerator != expected_numerator
+            or len(waves) != expected_waves or len(set(waves)) != expected_waves):
         reasons.append(f"NCU selected-kernel topology drifted: {ncu_topology}")
 record = {
-    "schema": "stwo.replacement-v1-sn2.profile-receipt.v1",
+    "schema": "stwo.replacement-v1-sn2.profile-receipt.v2",
     "profiler": profile,
     "status": "PASS" if not reasons else "FAIL",
     "counter_profile_admissible": counter_profile_admissible,
@@ -1517,16 +1709,34 @@ paths = (binary, proof, report, table, stdout, stderr, seal_path)
 if any(not path.is_file() for path in paths) or any(
         path.stat().st_size == 0 for path in (binary, proof, report, table, stdout, seal_path)):
     raise SystemExit("profile receipt artifacts are missing or empty")
-expected_topology = ({
-    "selected_launch_count": 19,
-    "composition_wave_launch_count": 18,
-    "distinct_composition_wave_kernel_count": 18,
-    "packed_numerator_launch_count": 1,
-} if profiler == "ncu" else None)
-expected_seal = ("stwo.replacement-v1-sn2.checkpoint-seal.v3" if admissible
-                 else "stwo.replacement-v1-sn2.timing-only-seal.v1")
+actual_schedule = (seal.get("shape_receipt") or {}).get("numerator_actual_schedule")
+expected_topology_by_schedule = {
+    "staged-packed-single-write": {
+        "selected_launch_count": 19,
+        "composition_wave_launch_count": 18,
+        "distinct_composition_wave_kernel_count": 18,
+        "packed_numerator_launch_count": 1,
+        "group_direct_numerator_launch_count": 0,
+        "run_sum_precompute_launch_count": 0,
+        "run_sum_expand_launch_count": 0,
+    },
+    "staged-group-direct": {
+        "selected_launch_count": 50,
+        "composition_wave_launch_count": 18,
+        "distinct_composition_wave_kernel_count": 18,
+        "packed_numerator_launch_count": 0,
+        "group_direct_numerator_launch_count": 14,
+        "run_sum_precompute_launch_count": 17,
+        "run_sum_expand_launch_count": 1,
+    },
+}
+expected_topology = (
+    expected_topology_by_schedule.get(actual_schedule) if profiler == "ncu" else None
+)
+expected_seal = ("stwo.replacement-v1-sn2.checkpoint-seal.v4" if admissible
+                 else "stwo.replacement-v1-sn2.timing-only-seal.v2")
 checks = (
-    receipt.get("schema") == "stwo.replacement-v1-sn2.profile-receipt.v1",
+    receipt.get("schema") == "stwo.replacement-v1-sn2.profile-receipt.v2",
     receipt.get("profiler") == profiler,
     receipt.get("status") == "PASS",
     receipt.get("counter_profile_admissible") is admissible,
@@ -1598,8 +1808,14 @@ checkpoint_nsys_profile() {
 }
 
 checkpoint_ncu_profile() {
-  local base report table stdout stderr proof out rc table_rc
+  local base report table stdout stderr proof out rc table_rc ncu_plan ncu_regex ncu_launch_count
   checkpoint_reject_ambient_overrides
+  ncu_plan="$(checkpoint_ncu_plan)" || return $?
+  IFS=$'\t' read -r ncu_regex ncu_launch_count <<<"$ncu_plan"
+  [[ -n "$ncu_regex" && "$ncu_launch_count" =~ ^[0-9]+$ ]] || {
+    echo "invalid sealed NCU plan: $ncu_plan" >&2
+    return 1
+  }
   base="$(checkpoint_artifact ncu_profile)"
   report="$base.ncu-rep"
   table="$(checkpoint_artifact ncu_profile.csv)"
@@ -1609,8 +1825,8 @@ checkpoint_ncu_profile() {
   out="$(checkpoint_artifact ncu_profile.json)"
   rm -f "$report" "$table" "$stdout" "$stderr" "$proof" "$out"
   set +e
-  ncu --target-processes all --kernel-name "$CHECKPOINT_NCU_KERNEL_REGEX" \
-    --launch-count "$CHECKPOINT_NCU_LAUNCH_COUNT" --set basic -f -o "$base" \
+  ncu --target-processes all --kernel-name "$ncu_regex" \
+    --launch-count "$ncu_launch_count" --set basic -f -o "$base" \
     env STWO_BENCH_TRACE=json STWO_DUMP_PROOF="$proof" \
     "$CHECKPOINT_GPU_BENCH" --pie "$CHECKPOINT_PIE" --backend cuda --engine gpu-native \
     --resident-backend replacement-v1 --require-gpu-native-architecture \
@@ -1725,7 +1941,7 @@ completion_checks = {
         and positive_number(timing.get("useful_mhz_median"))
         and positive_number(timing.get("prove_s_warm_median")),
     "counter_denial_sealed":
-        seal.get("schema") == "stwo.replacement-v1-sn2.timing-only-seal.v1"
+        seal.get("schema") == "stwo.replacement-v1-sn2.timing-only-seal.v2"
         and seal.get("counter_policy") == "timing-only"
         and seal.get("counter_profile_admissible") is False
         and seal.get("counter_status") == "UNAVAILABLE",
