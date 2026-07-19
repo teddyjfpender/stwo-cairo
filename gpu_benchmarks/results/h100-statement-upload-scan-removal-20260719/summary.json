@@ -1,0 +1,73 @@
+{
+  "schema": "stwo.h100-sn2-statement-upload-scan-removal.v1",
+  "status": "PASS_ITERATION_NON_PROMOTABLE",
+  "date_utc": "2026-07-19",
+  "hardware": {
+    "name": "NVIDIA H100 80GB HBM3",
+    "uuid": "GPU-80ef4dbd-d519-8e2c-5371-e896869030cb",
+    "driver": "580.126.09",
+    "cuda": "11.8",
+    "max_sm_clock_mhz": 1980,
+    "max_memory_clock_mhz": 2619,
+    "power_limit_w": 700
+  },
+  "source": {
+    "stwo": "526b489db96a23fb9d044dc3fe61f839a6062f67",
+    "stwo_cairo": "be3e7e550f892909a912e04ebc0ac8fb65ed40cc",
+    "gpu_bench_sha256": "0a4051aa83fb3625ec8cc3a5803b9de841ae78a588164cf529ab1db2bb8cc504",
+    "sm90_aot_entries": 340,
+    "sm90_aot_missing": 0
+  },
+  "input": {
+    "useful_steps": 7706864,
+    "adapted_input_bytes": 162102412,
+    "adapted_input_sha256": "78b0995483a76e850c61cf7cb51861850f746ddf927344088014492b6752844c"
+  },
+  "result": {
+    "actual_schedule": "staged-group-direct",
+    "warm_samples_s": [
+      1.47947491,
+      1.467947317,
+      1.479955339,
+      1.477843392,
+      1.482114914
+    ],
+    "warm_median_raw_s": 1.47947491,
+    "warm_p95_raw_s": 1.482114914,
+    "useful_mhz_reported": 5.209,
+    "useful_mhz_at_p95_reported": 5.201,
+    "host_preparation_ms": 38.393575,
+    "session_preparation_ms": 34.584541,
+    "ingest_preparation_ms": 3.809034
+  },
+  "comparison": {
+    "previous_checkpoint_s": 1.597542116,
+    "previous_checkpoint_useful_mhz": 4.824,
+    "raw_wall_saved_ms": 118.067206,
+    "raw_wall_speedup": 1.079803453,
+    "reported_useful_mhz_increase_pct": 7.980929,
+    "host_preparation_saved_ms": 116.084474,
+    "session_preparation_saved_ms": 116.182616,
+    "prior_qualified_reference_s": 1.946,
+    "raw_wall_saved_from_prior_ms": 466.52509,
+    "five_mhz_wall_s": 1.5413728,
+    "raw_median_margin_below_five_mhz_wall_ms": 61.89789,
+    "same_physical_gpu": false
+  },
+  "correctness": {
+    "verified_reps": 6,
+    "reps": 6,
+    "fresh_simd_gpu_bytes_equal": true,
+    "structured_mutation_rejected": true,
+    "proof_bytes": 3078795,
+    "proof_sha256": "99bf0cd0863658742ada152caee238d888f5c901dc7e4df66f2748d49cea98da",
+    "proof_blake3": "253519717a2a742a211c994a57e0c2ff3eb5ad0a956933bd18235292d7bbc9f2"
+  },
+  "qualification": {
+    "iteration_only": true,
+    "formal_promotion_eligible": false,
+    "performance_counters_available": false,
+    "physical_memory_inputs_complete": false,
+    "headline": "5.209 useful MHz median"
+  }
+}

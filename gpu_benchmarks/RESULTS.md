@@ -896,3 +896,43 @@ than balanced ABBA, counters were unavailable, and the physical-memory ledger
 is incomplete. See
 [`results/h100-adaptive-packed-20260719/`](results/h100-adaptive-packed-20260719/)
 for the sealed summary.
+
+## 2026-07-19 — statement-upload scan removal: 5.209 useful MHz
+
+Removing redundant replay-time BLAKE3 scans from the production statement-upload
+receipts reduced the raw five-sample SN2 warm median from **1.597542116 s** to
+**1.479474910 s**. The production path selected `staged-group-direct`, reported
+**5.209 useful MHz** at the median and **5.201 useful MHz** at p95, and completed
+all six verified repetitions.
+
+The attribution is direct:
+
+| Metric | Previous checkpoint | This checkpoint | Delta |
+|---|---:|---:|---:|
+| Raw warm median | 1.597542116 s | **1.479474910 s** | **-118.067206 ms** |
+| Reported useful MHz | 4.824 | **5.209** | **+7.98%** |
+| Host preparation | 154.478049 ms | **38.393575 ms** | **-116.084474 ms** |
+| Session preparation | 150.767157 ms | **34.584541 ms** | **-116.182616 ms** |
+
+The exact 5-MHz wall is 1.5413728 seconds, so the new median clears it by
+**61.897890 ms**. The fresh SIMD and GPU proofs were byte-identical, the
+structured mutation was rejected, and the fetched 3,078,795-byte proof had
+SHA-256
+`99bf0cd0863658742ada152caee238d888f5c901dc7e4df66f2748d49cea98da`.
+
+Exact source identity:
+
+- `stwo` `526b489db96a23fb9d044dc3fe61f839a6062f67`;
+- `stwo-cairo` `be3e7e550f892909a912e04ebc0ac8fb65ed40cc`;
+- `gpu_bench` SHA-256
+  `0a4051aa83fb3625ec8cc3a5803b9de841ae78a588164cf529ab1db2bb8cc504`;
+- 340/340 required SM90 AOT entries present.
+
+This remains an iteration checkpoint rather than a formal promotion result:
+performance counters were unavailable, the physical-memory ledger was
+incomplete, and the preceding 4.824-MHz result used a different physical H100.
+It nevertheless seals the standalone correctness and timing boundary and moves
+the next performance owner from host receipt preparation to the GPU slab/pass
+architecture. See
+[`results/h100-statement-upload-scan-removal-20260719/`](results/h100-statement-upload-scan-removal-20260719/)
+for the machine-readable receipt.
