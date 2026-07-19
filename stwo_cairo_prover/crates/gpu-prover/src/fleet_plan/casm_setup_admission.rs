@@ -496,9 +496,7 @@ fn validate_receipts<S: StageAuthority>(
     for (index, candidate) in ingress.iter().enumerate() {
         let facts = candidate.stage.facts(candidate.receipt);
         if ingress[..index].iter().any(|prior| {
-            prior.source == candidate.source
-                || core::ptr::eq(prior.stage, candidate.stage)
-                || prior.stage.facts(prior.receipt) == facts
+            prior.source == candidate.source || core::ptr::eq(prior.stage, candidate.stage)
         }) {
             return Err(FleetCasmSetupAdmissionError::DuplicateReceipt(index));
         }
