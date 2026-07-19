@@ -81,6 +81,7 @@ use crate::resident_direct_commit::{
 use crate::resident_oods::{
     ResidentOodsError, ResidentOodsPipeline, ResidentQuotientNumeratorReceipt,
 };
+use crate::resident_session::ResidentNumeratorRunSumTelemetry;
 use crate::resident_sources::{
     commitment_group, commitment_groups, prepare_commitment_interpolation, ResidentSourceStageError,
 };
@@ -3330,6 +3331,10 @@ impl<'a> ResidentGraphRuntime<'a> {
 
     pub fn prepared_numerator_schedule(&self) -> PreparedNumeratorSchedule {
         self.oods.numerator_schedule()
+    }
+
+    pub fn prepared_numerator_run_sum_telemetry(&self) -> Option<ResidentNumeratorRunSumTelemetry> {
+        self.oods.numerator_run_sum_telemetry()
     }
 
     /// Upload the complete compact input set before capture/replay. Every copy

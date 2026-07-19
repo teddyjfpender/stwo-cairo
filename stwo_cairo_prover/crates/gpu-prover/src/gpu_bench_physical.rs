@@ -70,6 +70,13 @@ pub(crate) fn gpu_native_session_context(
             "gpu_prepared_numerator_eligible_groups": null,
             "gpu_prepared_numerator_legacy_groups": null,
             "gpu_prepared_numerator_packed_output_rows": null,
+            "gpu_prepared_numerator_group_direct_output_rows": null,
+            "gpu_prepared_numerator_run_sum_bound": null,
+            "gpu_prepared_numerator_run_sum_identity": null,
+            "gpu_prepared_numerator_run_sum_target_group": null,
+            "gpu_prepared_numerator_run_sum_victim_group": null,
+            "gpu_prepared_numerator_run_sum_run_count": null,
+            "gpu_prepared_numerator_run_sum_scratch_words_per_coordinate": null,
             "gpu_quotient_producer_b2n": null,
             "gpu_quotient_producer_b2n_production_selected": null,
             "gpu_quotient_producer_b2n_eliminated_logical_bytes": null,
@@ -255,37 +262,60 @@ pub(crate) fn resident_session_telemetry_json(
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     });
-    let (prepared_schedule, eligible_groups, legacy_groups, packed_output_rows) =
-        match telemetry.prepared_numerator_schedule {
-            Some(PreparedNumeratorSchedule::LegacyBatches) => {
-                (Some("legacy-batches"), None, None, None)
-            }
-            Some(PreparedNumeratorSchedule::SingleWriteCandidate) => {
-                (Some("single-write"), None, Some(0), None)
-            }
-            Some(PreparedNumeratorSchedule::HybridCandidate {
-                eligible_groups,
-                legacy_groups,
-            }) => (
-                Some("hybrid-single-write"),
-                Some(eligible_groups),
-                Some(legacy_groups),
-                None,
-            ),
-            Some(PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows }) => (
-                Some("staged-packed-single-write"),
-                None,
-                Some(0),
-                Some(packed_output_rows),
-            ),
-            Some(PreparedNumeratorSchedule::StagedPrepackedSingleWrite { packed_output_rows }) => (
-                Some("staged-prepacked-single-write"),
-                None,
-                Some(0),
-                Some(packed_output_rows),
-            ),
-            None => (None, None, None, None),
-        };
+    let (
+        prepared_schedule,
+        eligible_groups,
+        legacy_groups,
+        packed_output_rows,
+        group_direct_output_rows,
+    ) = match telemetry.prepared_numerator_schedule {
+        Some(PreparedNumeratorSchedule::LegacyBatches) => {
+            (Some("legacy-batches"), None, None, None, None)
+        }
+        Some(PreparedNumeratorSchedule::SingleWriteCandidate) => {
+            (Some("single-write"), None, Some(0), None, None)
+        }
+        Some(PreparedNumeratorSchedule::HybridCandidate {
+            eligible_groups,
+            legacy_groups,
+        }) => (
+            Some("hybrid-single-write"),
+            Some(eligible_groups),
+            Some(legacy_groups),
+            None,
+            None,
+        ),
+        Some(PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows }) => (
+            Some("staged-packed-single-write"),
+            None,
+            Some(0),
+            Some(packed_output_rows),
+            None,
+        ),
+        Some(PreparedNumeratorSchedule::StagedPrepackedSingleWrite { packed_output_rows }) => (
+            Some("staged-prepacked-single-write"),
+            None,
+            Some(0),
+            Some(packed_output_rows),
+            None,
+        ),
+        Some(PreparedNumeratorSchedule::StagedGroupDirect { output_rows }) => (
+            Some("staged-group-direct"),
+            None,
+            Some(0),
+            None,
+            Some(output_rows),
+        ),
+        None => (None, None, None, None, None),
+    };
+    let run_sum = telemetry.prepared_numerator_run_sum;
+    let run_sum_identity = run_sum.map(|receipt| {
+        receipt
+            .identity
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
     let quotient_producer_b2n = telemetry.quotient_producer_b2n.program;
     json!({
         "gpu_graph_a_setup_gate_passed": telemetry.require_strict_graph_a().is_ok(),
@@ -337,6 +367,13 @@ pub(crate) fn resident_session_telemetry_json(
         "gpu_prepared_numerator_eligible_groups": eligible_groups,
         "gpu_prepared_numerator_legacy_groups": legacy_groups,
         "gpu_prepared_numerator_packed_output_rows": packed_output_rows,
+        "gpu_prepared_numerator_group_direct_output_rows": group_direct_output_rows,
+        "gpu_prepared_numerator_run_sum_bound": run_sum.is_some_and(|receipt| receipt.is_complete()),
+        "gpu_prepared_numerator_run_sum_identity": run_sum_identity,
+        "gpu_prepared_numerator_run_sum_target_group": run_sum.map(|receipt| receipt.target_group),
+        "gpu_prepared_numerator_run_sum_victim_group": run_sum.map(|receipt| receipt.victim_group),
+        "gpu_prepared_numerator_run_sum_run_count": run_sum.map(|receipt| receipt.run_count),
+        "gpu_prepared_numerator_run_sum_scratch_words_per_coordinate": run_sum.map(|receipt| receipt.scratch_words_per_coordinate),
         "gpu_quotient_producer_b2n": quotient_producer_b2n_receipt_json(telemetry.quotient_producer_b2n),
         "gpu_quotient_producer_b2n_production_selected": telemetry.quotient_producer_b2n.production_selected,
         "gpu_quotient_producer_b2n_eliminated_logical_bytes": quotient_producer_b2n.map(|value| value.traffic.eliminated_logical_bytes),
@@ -481,6 +518,7 @@ fn numerator_schedule_name(schedule: QuotientNumeratorSchedule) -> &'static str 
         QuotientNumeratorSchedule::LegacyBatches => "legacy-batches",
         QuotientNumeratorSchedule::HybridSingleWrite => "hybrid-single-write",
         QuotientNumeratorSchedule::StagedPackedSingleWrite => "staged-packed-single-write",
+        QuotientNumeratorSchedule::StagedRunSumOrPacked => "staged-run-sum-or-packed",
     }
 }
 
@@ -877,7 +915,7 @@ mod tests {
         assert_eq!(value["gpu_protocol_key"], 0x5678);
         assert_eq!(
             value["gpu_planned_numerator_schedule"],
-            "staged-packed-single-write"
+            "staged-run-sum-or-packed"
         );
         assert_eq!(
             value["gpu_prepared_numerator_schedule"],
@@ -889,6 +927,8 @@ mod tests {
             value["gpu_prepared_numerator_packed_output_rows"],
             50_331_088
         );
+        assert!(value["gpu_prepared_numerator_group_direct_output_rows"].is_null());
+        assert_eq!(value["gpu_prepared_numerator_run_sum_bound"], false);
         assert_eq!(value["gpu_trace_commit_direct_commitments"], 2);
         assert_eq!(
             value["gpu_trace_commit_separate_interpolation_graph_invocations"],
@@ -939,6 +979,64 @@ mod tests {
             5
         );
 
+        let mut run_sum = telemetry.clone();
+        run_sum.prepared_numerator_schedule = Some(PreparedNumeratorSchedule::StagedGroupDirect {
+            output_rows: 50_331_088,
+        });
+        run_sum.prepared_numerator_run_sum = Some(
+            stwo_cairo_gpu_prover::resident_session::ResidentNumeratorRunSumTelemetry {
+                identity: [0xcd; 32],
+                target_group: 0,
+                victim_group: 12,
+                run_count: 17,
+                scratch_words_per_coordinate: 8_388_048,
+            },
+        );
+        let run_sum_value = resident_session_telemetry_json(&run_sum);
+        assert_eq!(
+            run_sum_value["gpu_prepared_numerator_schedule"],
+            "staged-group-direct"
+        );
+        assert!(run_sum_value["gpu_prepared_numerator_packed_output_rows"].is_null());
+        assert_eq!(
+            run_sum_value["gpu_prepared_numerator_group_direct_output_rows"],
+            50_331_088
+        );
+        assert_eq!(run_sum_value["gpu_prepared_numerator_run_sum_bound"], true);
+        assert_eq!(
+            run_sum_value["gpu_prepared_numerator_run_sum_identity"],
+            "cd".repeat(32)
+        );
+        assert_eq!(
+            run_sum_value["gpu_prepared_numerator_run_sum_target_group"],
+            0
+        );
+        assert_eq!(
+            run_sum_value["gpu_prepared_numerator_run_sum_victim_group"],
+            12
+        );
+        assert_eq!(
+            run_sum_value["gpu_prepared_numerator_run_sum_run_count"],
+            17
+        );
+        assert_eq!(
+            run_sum_value["gpu_prepared_numerator_run_sum_scratch_words_per_coordinate"],
+            8_388_048
+        );
+
+        let mut malformed_run_sum = run_sum;
+        malformed_run_sum
+            .prepared_numerator_run_sum
+            .as_mut()
+            .unwrap()
+            .identity = [0; 32];
+        let malformed_value = resident_session_telemetry_json(&malformed_run_sum);
+        assert_eq!(
+            malformed_value["gpu_prepared_numerator_run_sum_bound"],
+            false
+        );
+        assert_eq!(malformed_value["gpu_graph_a_setup_gate_passed"], false);
+
         let null_schema = gpu_native_session_context(None, false);
         for key in [
             "gpu_dynamic_commitment_leaf_schedule",
@@ -948,6 +1046,13 @@ mod tests {
             "gpu_composition_part_count",
             "gpu_composition_wave_count",
             "gpu_prepared_numerator_packed_output_rows",
+            "gpu_prepared_numerator_group_direct_output_rows",
+            "gpu_prepared_numerator_run_sum_bound",
+            "gpu_prepared_numerator_run_sum_identity",
+            "gpu_prepared_numerator_run_sum_target_group",
+            "gpu_prepared_numerator_run_sum_victim_group",
+            "gpu_prepared_numerator_run_sum_run_count",
+            "gpu_prepared_numerator_run_sum_scratch_words_per_coordinate",
         ] {
             assert!(null_schema[key].is_null(), "{key}");
         }

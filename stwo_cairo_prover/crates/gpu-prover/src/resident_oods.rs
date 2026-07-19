@@ -25,6 +25,7 @@ use crate::arena_plan::{
 };
 use crate::graphs::GraphWorkspace;
 use crate::prepared_composition::CompositionOutputMode;
+use crate::resident_session::ResidentNumeratorRunSumTelemetry;
 
 #[derive(Debug)]
 pub enum ResidentOodsError {
@@ -155,6 +156,7 @@ pub(crate) struct ResidentOodsPipeline<'a> {
     quotient: PreparedQuotientGraph<'a>,
     numerator: PreparedQuotientNumeratorGraph<'a>,
     oods: PreparedOodsGraph<'a>,
+    planned_numerator_schedule: QuotientNumeratorSchedule,
 }
 
 impl<'a> ResidentOodsPipeline<'a> {
@@ -339,9 +341,12 @@ impl<'a> ResidentOodsPipeline<'a> {
         let first_linear_terms_destination =
             bind_logical(workspace, numerator_plan.first_linear_terms_destination)?;
         let forward_twiddles = bind_logical(workspace, numerator_plan.forward_twiddles)?;
-        if (numerator_plan.schedule == QuotientNumeratorSchedule::StagedPackedSingleWrite)
-            != numerator_plan.staged_single_write.is_some()
-        {
+        let staged_schedule = matches!(
+            numerator_plan.schedule,
+            QuotientNumeratorSchedule::StagedPackedSingleWrite
+                | QuotientNumeratorSchedule::StagedRunSumOrPacked
+        );
+        if staged_schedule != numerator_plan.staged_single_write.is_some() {
             return Err(ResidentOodsError::StagedNumeratorBinding(
                 "planned schedule and staged quotient manifest presence differ",
             ));
@@ -375,7 +380,8 @@ impl<'a> ResidentOodsPipeline<'a> {
                     &numerator_plan.slots,
                 )?
             }
-            QuotientNumeratorSchedule::StagedPackedSingleWrite => {
+            QuotientNumeratorSchedule::StagedPackedSingleWrite
+            | QuotientNumeratorSchedule::StagedRunSumOrPacked => {
                 let staged = numerator_plan.staged_single_write.as_ref().ok_or(
                     ResidentOodsError::StagedNumeratorBinding(
                         "replacement schedule has no staged quotient manifest",
@@ -434,20 +440,57 @@ impl<'a> ResidentOodsPipeline<'a> {
                         )
                     })
                     .collect::<Result<Vec<_>, ResidentOodsError>>()?;
-                PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
-                    arena,
-                    numerator_plan.config,
-                    &numerator_columns,
-                    oods_sample_points,
-                    oods_sampled_values,
-                    random_coefficient,
-                    sample_points_destination,
-                    first_linear_terms_destination,
-                    &destinations,
-                    forward_twiddles,
-                    &numerator_plan.slots,
-                    &overflow_roles,
-                )?
+                if numerator_plan.schedule == QuotientNumeratorSchedule::StagedRunSumOrPacked {
+                    let direct = PreparedQuotientNumeratorGraph::prepare_staged_group_direct(
+                        arena,
+                        numerator_plan.config,
+                        &numerator_columns,
+                        oods_sample_points,
+                        oods_sampled_values,
+                        random_coefficient,
+                        sample_points_destination,
+                        first_linear_terms_destination,
+                        &destinations,
+                        forward_twiddles,
+                        &numerator_plan.slots,
+                        &overflow_roles,
+                    )?;
+                    if numerator_run_sum_telemetry(&direct)
+                        .is_some_and(ResidentNumeratorRunSumTelemetry::is_complete)
+                    {
+                        direct
+                    } else {
+                        PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
+                            arena,
+                            numerator_plan.config,
+                            &numerator_columns,
+                            oods_sample_points,
+                            oods_sampled_values,
+                            random_coefficient,
+                            sample_points_destination,
+                            first_linear_terms_destination,
+                            &destinations,
+                            forward_twiddles,
+                            &numerator_plan.slots,
+                            &overflow_roles,
+                        )?
+                    }
+                } else {
+                    PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
+                        arena,
+                        numerator_plan.config,
+                        &numerator_columns,
+                        oods_sample_points,
+                        oods_sampled_values,
+                        random_coefficient,
+                        sample_points_destination,
+                        first_linear_terms_destination,
+                        &destinations,
+                        forward_twiddles,
+                        &numerator_plan.slots,
+                        &overflow_roles,
+                    )?
+                }
             }
         };
         let schedule_matches = matches!(
@@ -461,18 +504,39 @@ impl<'a> ResidentOodsPipeline<'a> {
             ) | (
                 QuotientNumeratorSchedule::StagedPackedSingleWrite,
                 PreparedNumeratorSchedule::StagedPackedSingleWrite { .. }
+            ) | (
+                QuotientNumeratorSchedule::StagedRunSumOrPacked,
+                PreparedNumeratorSchedule::StagedGroupDirect { .. }
+            ) | (
+                QuotientNumeratorSchedule::StagedRunSumOrPacked,
+                PreparedNumeratorSchedule::StagedPackedSingleWrite { .. }
             )
         );
-        if let (
-            Some(staged),
-            PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows },
-        ) = (&numerator_plan.staged_single_write, numerator.schedule())
-        {
-            if packed_output_rows != staged.packed_output_rows() {
+        if let Some(staged) = &numerator_plan.staged_single_write {
+            let prepared_output_rows = match numerator.schedule() {
+                PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows } => {
+                    Some(packed_output_rows)
+                }
+                PreparedNumeratorSchedule::StagedGroupDirect { output_rows } => Some(output_rows),
+                _ => None,
+            };
+            if prepared_output_rows != Some(staged.packed_output_rows()) {
                 return Err(ResidentOodsError::StagedNumeratorBinding(
-                    "prepared packed row count differs from the sealed arena manifest",
+                    "prepared staged row count differs from the sealed arena manifest",
                 ));
             }
+        }
+        if numerator_plan.schedule == QuotientNumeratorSchedule::StagedRunSumOrPacked
+            && matches!(
+                numerator.schedule(),
+                PreparedNumeratorSchedule::StagedGroupDirect { .. }
+            )
+            && !numerator_run_sum_telemetry(&numerator)
+                .is_some_and(ResidentNumeratorRunSumTelemetry::is_complete)
+        {
+            return Err(ResidentOodsError::StagedNumeratorBinding(
+                "adaptive group-direct schedule has no complete run-sum receipt",
+            ));
         }
         if !schedule_matches {
             return Err(ResidentOodsError::NumeratorScheduleMismatch {
@@ -547,6 +611,7 @@ impl<'a> ResidentOodsPipeline<'a> {
             quotient,
             numerator,
             oods,
+            planned_numerator_schedule: numerator_plan.schedule,
         })
     }
 
@@ -564,7 +629,7 @@ impl<'a> ResidentOodsPipeline<'a> {
         &self,
         arena: &DeviceArena,
     ) -> Result<ResidentQuotientNumeratorReceipt, ResidentOodsError> {
-        receipt::read_numerator_receipt(arena, &self.numerator)
+        receipt::read_numerator_receipt(arena, self.planned_numerator_schedule, &self.numerator)
     }
 
     pub(crate) fn launch_quotient(&self) -> Result<(), ResidentOodsError> {
@@ -584,6 +649,24 @@ impl<'a> ResidentOodsPipeline<'a> {
     pub(crate) fn numerator_schedule(&self) -> PreparedNumeratorSchedule {
         self.numerator.schedule()
     }
+
+    pub(crate) fn numerator_run_sum_telemetry(&self) -> Option<ResidentNumeratorRunSumTelemetry> {
+        numerator_run_sum_telemetry(&self.numerator)
+    }
+}
+
+fn numerator_run_sum_telemetry(
+    numerator: &PreparedQuotientNumeratorGraph<'_>,
+) -> Option<ResidentNumeratorRunSumTelemetry> {
+    numerator
+        .group_direct_run_sum_receipt()
+        .map(|receipt| ResidentNumeratorRunSumTelemetry {
+            identity: receipt.identity,
+            target_group: receipt.target_group,
+            victim_group: receipt.victim_group,
+            run_count: receipt.manifest.run_count,
+            scratch_words_per_coordinate: receipt.scratch_words_per_coordinate,
+        })
 }
 
 fn words_for_log(log_size: u32) -> Result<usize, ResidentOodsError> {

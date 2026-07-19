@@ -258,6 +258,25 @@ pub struct ResidentPreparationState {
     pub readiness: ResidentExecutionReadiness,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentNumeratorRunSumTelemetry {
+    pub identity: [u8; 32],
+    pub target_group: usize,
+    pub victim_group: usize,
+    pub run_count: u32,
+    pub scratch_words_per_coordinate: usize,
+}
+
+impl ResidentNumeratorRunSumTelemetry {
+    /// Whether this receipt proves a usable ordered run-sum binding.
+    pub fn is_complete(self) -> bool {
+        self.identity != [0; 32]
+            && self.target_group < self.victim_group
+            && self.run_count != 0
+            && self.scratch_words_per_coordinate != 0
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResidentSessionTelemetry {
     pub host_preparation: Option<ResidentHostPreparationAudit>,
@@ -276,6 +295,7 @@ pub struct ResidentSessionTelemetry {
     pub protocol_policy: Option<ProtocolPlanPolicy>,
     pub quotient_producer_b2n: QuotientProducerB2nSelectionReceipt,
     pub prepared_numerator_schedule: Option<PreparedNumeratorSchedule>,
+    pub prepared_numerator_run_sum: Option<ResidentNumeratorRunSumTelemetry>,
     pub trace_commit_inputs: Option<ResidentTraceCommitInputTelemetry>,
     pub composition_commit: Option<ResidentCompositionCommitTelemetry>,
     pub graph_replay_timing: Option<ResidentGraphReplayTimingReport>,
@@ -553,21 +573,30 @@ impl ResidentSessionTelemetry {
                 "prepared quotient-numerator schedule was not reported",
             ),
         )?;
+        let run_sum = self.prepared_numerator_run_sum;
         let schedule_matches = match (policy.quotient_numerator_schedule, prepared) {
             (
                 crate::arena_plan::QuotientNumeratorSchedule::LegacyBatches,
                 PreparedNumeratorSchedule::LegacyBatches,
-            ) => true,
+            ) => run_sum.is_none(),
             (
                 crate::arena_plan::QuotientNumeratorSchedule::HybridSingleWrite,
                 PreparedNumeratorSchedule::HybridCandidate {
                     eligible_groups, ..
                 },
-            ) => eligible_groups != 0,
+            ) => eligible_groups != 0 && run_sum.is_none(),
             (
                 crate::arena_plan::QuotientNumeratorSchedule::StagedPackedSingleWrite,
                 PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows },
-            ) => packed_output_rows != 0,
+            ) => packed_output_rows != 0 && run_sum.is_none(),
+            (
+                crate::arena_plan::QuotientNumeratorSchedule::StagedRunSumOrPacked,
+                PreparedNumeratorSchedule::StagedGroupDirect { output_rows },
+            ) => output_rows != 0 && run_sum.is_some_and(|receipt| receipt.is_complete()),
+            (
+                crate::arena_plan::QuotientNumeratorSchedule::StagedRunSumOrPacked,
+                PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows },
+            ) => packed_output_rows != 0 && run_sum.is_none(),
             _ => false,
         };
         if !schedule_matches {
@@ -903,6 +932,7 @@ fn run_materialized_session<R>(
         protocol_policy: Some(executable.protocol_policy()),
         quotient_producer_b2n: workspace.plan().quotient_producer_b2n_selection_receipt(),
         prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
+        prepared_numerator_run_sum: runtime.prepared_numerator_run_sum_telemetry(),
         trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
         composition_commit: Some(runtime.composition_commit_telemetry()),
         graph_replay_timing: None,
@@ -1819,6 +1849,7 @@ pub fn with_resident_pre_witness_session_for_topology<R>(
                     protocol_policy: Some(executable.protocol_policy()),
                     quotient_producer_b2n,
                     prepared_numerator_schedule: Some(runtime.prepared_numerator_schedule()),
+                    prepared_numerator_run_sum: runtime.prepared_numerator_run_sum_telemetry(),
                     trace_commit_inputs: Some(runtime.trace_commit_input_telemetry()),
                     composition_commit: Some(runtime.composition_commit_telemetry()),
                     graph_replay_timing: None,
@@ -3288,6 +3319,43 @@ mod tests {
             ..ResidentSessionTelemetry::default()
         };
         assert!(valid.require_strict_graph_a().is_ok());
+
+        let mut run_sum = valid.clone();
+        run_sum.prepared_numerator_schedule =
+            Some(PreparedNumeratorSchedule::StagedGroupDirect { output_rows: 1 });
+        run_sum.prepared_numerator_run_sum = Some(ResidentNumeratorRunSumTelemetry {
+            identity: [0xcd; 32],
+            target_group: 0,
+            victim_group: 12,
+            run_count: 17,
+            scratch_words_per_coordinate: 8_388_048,
+        });
+        assert!(run_sum.require_strict_graph_a().is_ok());
+
+        let mut missing_run_sum = run_sum.clone();
+        missing_run_sum.prepared_numerator_run_sum = None;
+        assert!(missing_run_sum.require_strict_graph_a().is_err());
+
+        let mut incomplete_run_sum = run_sum.clone();
+        incomplete_run_sum
+            .prepared_numerator_run_sum
+            .as_mut()
+            .unwrap()
+            .identity = [0; 32];
+        assert!(incomplete_run_sum.require_strict_graph_a().is_err());
+
+        let mut reversed_run_sum = run_sum.clone();
+        let reversed_receipt = reversed_run_sum
+            .prepared_numerator_run_sum
+            .as_mut()
+            .unwrap();
+        reversed_receipt.target_group = 12;
+        reversed_receipt.victim_group = 0;
+        assert!(reversed_run_sum.require_strict_graph_a().is_err());
+
+        let mut packed_with_run_sum = valid.clone();
+        packed_with_run_sum.prepared_numerator_run_sum = run_sum.prepared_numerator_run_sum;
+        assert!(packed_with_run_sum.require_strict_graph_a().is_err());
 
         let mut missing_composition_execution = valid.clone();
         missing_composition_execution
