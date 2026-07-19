@@ -16,10 +16,11 @@ use cairo_air::claims::CairoClaim;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
 use stwo_backend_cuda::{
-    direct_terminal_expand_absorb_arena_slot_requirements, DirectCompactTerminalBatchMode,
-    DirectCompactTerminalProgram, DirectTerminalExpandAbsorbProgram, FusedCompactDomainProgram,
+    direct_terminal_expand_absorb_arena_slot_requirements, quotient_numerator_run_sum_plan,
+    DirectCompactTerminalBatchMode, DirectCompactTerminalProgram,
+    DirectTerminalExpandAbsorbProgram, FusedCompactDomainProgram,
     ModeAwareCommitWorkspaceRequirements, ModeAwareCommitWorkspaceSlots,
-    PreparedProgressiveCommitError, ProgressiveCommitStorageMode,
+    PreparedProgressiveCommitError, ProgressiveCommitStorageMode, QuotientNumeratorRunSumLiveness,
 };
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::{
@@ -30,6 +31,7 @@ use crate::arena_plan::{
     BlakeGWitnessContract, BufferLifetime, BufferPurpose, CommitmentTreeId,
     DirectCompactTerminalPlan, ExecutionTableGeometry, ProofArenaPlan, ProofEpoch, ResidentBackend,
 };
+use crate::phases;
 use crate::plan::ProofPlan;
 use crate::protocol_plan::ProtocolPlanPolicy;
 use crate::prover::prepare_resident_ingest;
@@ -45,8 +47,9 @@ use crate::replacement_host_cache::{
 };
 use crate::resident_input::ResidentProverInputOwner;
 use crate::resident_session::{
-    direct_blake_g_route_is_exact_for_test, resident_host_witness_input_route_shapes_for_test,
-    ResidentPreWitnessInput, ResidentSessionError,
+    direct_blake_g_route_is_exact_for_test, plan_raw_resident_preflight,
+    resident_host_witness_input_route_shapes_for_test, ResidentPreWitnessInput,
+    ResidentSessionError,
 };
 use crate::resident_shape::raw_replacement_proof_plan;
 use crate::resident_sources::{
@@ -618,6 +621,111 @@ fn admit_fixture_identities(directory: &Path) {
     );
 }
 
+fn assert_adaptive_run_sum_receipt(
+    arena: &ProofArenaPlan,
+    expected_target: usize,
+    expected_victim: usize,
+    expected_runs: u32,
+    expected_scratch_words: usize,
+    expected_margin_words: usize,
+) {
+    let workspace = arena.quotient_numerator();
+    assert_eq!(
+        workspace.schedule,
+        crate::arena_plan::QuotientNumeratorSchedule::StagedRunSumOrPacked
+    );
+    let staged = workspace
+        .staged_single_write
+        .as_ref()
+        .expect("adaptive numerator schedule must retain the staged plan");
+    let mut selected = None;
+    'selection: for target in 0..staged.requirements().groups.len() {
+        for victim in target + 1..staged.requirements().groups.len() {
+            let capacities = workspace.destinations[victim].coordinates.map(|binding| {
+                binding
+                    .len_words
+                    .min(staged.requirements().groups[victim].value_words)
+            });
+            let Ok(receipt) = quotient_numerator_run_sum_plan(
+                staged,
+                target,
+                victim,
+                QuotientNumeratorRunSumLiveness {
+                    same_stream_canonical_group_order: true,
+                    external_destination_ids_unique: true,
+                    victim_unread_before_own_producer: true,
+                    victim_fully_overwritten_by_own_producer: true,
+                    downstream_consumers_after_all_group_producers: true,
+                    victim_coordinate_capacity_words: capacities,
+                },
+            ) else {
+                continue;
+            };
+            if receipt.add_units_saved != 0 {
+                selected = Some(receipt);
+                break 'selection;
+            }
+        }
+    }
+    let receipt = selected.expect("exact SN shape must admit a run-sum binding");
+    assert_eq!(
+        (receipt.target_group, receipt.victim_group),
+        (expected_target, expected_victim)
+    );
+    assert_eq!(receipt.manifest.run_count, expected_runs);
+    assert_eq!(receipt.scratch_words_per_coordinate, expected_scratch_words);
+    assert_eq!(
+        receipt.margin_words_per_coordinate,
+        [expected_margin_words; 4]
+    );
+}
+
+fn assert_fixture_adaptive_run_sum(
+    directory: &Path,
+    fixture: &SealedSnFixture,
+    expected_victim: usize,
+    expected_runs: u32,
+    expected_scratch_words: usize,
+    expected_margin_words: usize,
+) {
+    let path = directory.join(fixture.file);
+    let encoded = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("read sealed {}: {error}", path.display()));
+    assert_eq!(
+        encoded.len(),
+        fixture.bytes,
+        "{}: byte length",
+        fixture.profile
+    );
+    assert_eq!(
+        blake3::hash(&encoded).to_hex().as_str(),
+        fixture.blake3,
+        "{}: sealed BLAKE3",
+        fixture.profile
+    );
+    let input: ProverInput = bincode::deserialize(&encoded)
+        .unwrap_or_else(|error| panic!("decode sealed {}: {error}", path.display()));
+    drop(encoded);
+    let ingest = phases::ingest::run_replacement(input, PreProcessedTraceVariant::Canonical, None)
+        .unwrap_or_else(|error| panic!("{} replacement ingest: {error}", fixture.profile));
+    let report = plan_raw_resident_preflight(
+        &ingest.input,
+        &ingest.proof_plan,
+        &ingest.preprocessed_trace,
+        PcsConfig::default(),
+        false,
+    )
+    .unwrap_or_else(|error| panic!("{} replacement preflight: {error:?}", fixture.profile));
+    assert_adaptive_run_sum_receipt(
+        &report.arena,
+        0,
+        expected_victim,
+        expected_runs,
+        expected_scratch_words,
+        expected_margin_words,
+    );
+}
+
 fn run_profile(directory: &Path, fixture: &SealedSnFixture) {
     let path = directory.join(fixture.file);
     let bytes = std::fs::read(&path)
@@ -1020,6 +1128,31 @@ fn raw_replacement_warm_template_and_shape_handle_on_sn1_through_sn4() {
     admit_fixture_identities(Path::new(&directory));
     for fixture in &SEALED_SN_FIXTURES {
         run_profile(Path::new(&directory), fixture);
+    }
+}
+
+#[test]
+#[ignore = "requires STWO_SN_ADAPTED_DIR containing sealed SN_PIE_2,4.adapted.bin"]
+fn raw_replacement_adaptive_run_sum_is_exact_on_sn2_and_sn4() {
+    let directory = std::env::var("STWO_SN_ADAPTED_DIR")
+        .expect("set STWO_SN_ADAPTED_DIR to the sealed adapted-input directory");
+    let directory = Path::new(&directory);
+    for (profile, victim, runs, scratch_words, margin_words) in [
+        ("SN2", 13, 17, 4_194_256, 4_194_352),
+        ("SN4", 12, 19, 16_777_168, 48),
+    ] {
+        let fixture = SEALED_SN_FIXTURES
+            .iter()
+            .find(|fixture| fixture.profile == profile)
+            .unwrap();
+        assert_fixture_adaptive_run_sum(
+            directory,
+            fixture,
+            victim,
+            runs,
+            scratch_words,
+            margin_words,
+        );
     }
 }
 
