@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! SN-scale resident-arena preflight — host-only, no CUDA required.
 //! gpu-lab-cohesion-review: one CLI owns exact admission planning and its single JSON contract;
 //! splitting that contract before Stage 3 stabilizes would obscure field-to-plan reconciliation.
