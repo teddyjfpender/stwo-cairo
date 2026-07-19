@@ -411,7 +411,6 @@ struct ReceiptFacts {
     real_rows: usize,
     consumer_rows: usize,
     include_iota: bool,
-    content_identity: [u8; 32],
     generation: u64,
 }
 
@@ -440,7 +439,6 @@ impl StageAuthority for PreparedWitnessCasmInputStage<'_> {
             real_rows: receipt.real_rows(),
             consumer_rows: receipt.consumer_rows(),
             include_iota: receipt.include_iota(),
-            content_identity: receipt.content_identity(),
             generation: receipt.generation(),
         }
     }
@@ -519,7 +517,6 @@ fn validate_receipts<S: StageAuthority>(
             || facts.real_rows != pair.source.real_rows
             || facts.consumer_rows != pair.source.consumer_rows
             || facts.include_iota != pair.source.include_iota
-            || facts.content_identity == [0; 32]
             || facts
                 .staging_words
                 .checked_mul(WORD_BYTES)

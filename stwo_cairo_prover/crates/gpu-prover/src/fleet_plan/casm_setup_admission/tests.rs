@@ -183,7 +183,7 @@ fn expected(lanes: usize) -> Result<ExpectedSetup, FleetCasmSetupAdmissionError>
     })
 }
 
-fn facts(pair: &ExpectedPair, lane: usize) -> ReceiptFacts {
+fn facts(pair: &ExpectedPair) -> ReceiptFacts {
     ReceiptFacts {
         contract_identity: pair.source.casm_contract_identity,
         arena_identity: BASE,
@@ -196,7 +196,6 @@ fn facts(pair: &ExpectedPair, lane: usize) -> ReceiptFacts {
         real_rows: pair.source.real_rows,
         consumer_rows: pair.source.consumer_rows,
         include_iota: pair.source.include_iota,
-        content_identity: [lane as u8 + 1; 32],
         generation: GENERATION,
     }
 }
@@ -214,8 +213,8 @@ fn begin(expected: &ExpectedSetup) -> (FleetCasmSetupAdmissionState, Vec<FakeSta
     state
         .begin_statement_with(PLAN_ID, GENERATION, &refs)
         .unwrap();
-    for (lane, (stage, pair)) in stages.iter().zip(&expected.pairs).enumerate() {
-        stage.publish(facts(pair, lane));
+    for (stage, pair) in stages.iter().zip(&expected.pairs) {
+        stage.publish(facts(pair));
     }
     (state, stages)
 }
@@ -520,7 +519,7 @@ fn validation_precedes_consumption_and_partial_consume_invalidates_every_stage()
         .map(|lane| GENERATION + 1 + u64::from(lane == 4))
         .collect::<Vec<_>>();
     for (lane, (stage, pair)) in stages.iter().zip(&expected.pairs).enumerate() {
-        let mut retry = facts(pair, lane);
+        let mut retry = facts(pair);
         retry.generation = retry_generations[lane];
         stage.publish(retry);
     }
