@@ -935,4 +935,18 @@ It nevertheless seals the standalone correctness and timing boundary and moves
 the next performance owner from host receipt preparation to the GPU slab/pass
 architecture. See
 [`results/h100-statement-upload-scan-removal-20260719/`](results/h100-statement-upload-scan-removal-20260719/)
-for the machine-readable receipt.
+for the machine-readable receipt and
+[`architecture/SN2-8-12MHZ-SLAB-REWRITE-2026-07-19.md`](architecture/SN2-8-12MHZ-SLAB-REWRITE-2026-07-19.md)
+for the evidence-backed rewrite specification.
+
+## 2026-07-19 — A40 development evidence retained locally
+
+The closed A40 round is indexed at
+[`results/a40-local-retention-20260719/`](results/a40-local-retention-20260719/).
+The local corpus contains **302 files / 51,891,263 bytes** with a path-sensitive
+tree SHA-256 of
+`9edc4c67c714eeae072d65164aa0c6ee15b50b15da8d6d5e752643ecd1f92b57`.
+It retains all source ancestry, patches, raw profiles, SASS/device objects,
+sanitizer logs, receipts, telemetry, and exact-output evidence. The A40 pod is
+`EXITED`; only reproducible executable/archive/AOT build products remain
+hash-only, as recorded explicitly in the manifest.

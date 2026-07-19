@@ -51,4 +51,12 @@ consistent with removing the two full statement-payload scans and leaves only
 longer the host receipt layer; it is the GPU slab/pass structure, beginning
 with Composition's high-register waves.
 
-See [`summary.json`](summary.json) for the machine-readable receipt.
+See [`summary.json`](summary.json) for the result receipt and
+[`architecture_receipt.json`](architecture_receipt.json) for the tracked
+projection of the current graph, ingress, Composition, commitment, quotient,
+policy, and physical-memory facts used by the rewrite specification.
+
+The evidence-backed next architecture is specified in
+[`../../architecture/SN2-8-12MHZ-SLAB-REWRITE-2026-07-19.md`](../../architecture/SN2-8-12MHZ-SLAB-REWRITE-2026-07-19.md).
+It defines the exact dominant slabs, required rewrites, correctness obligations,
+target wall budgets, skill requirements, and counter-backed go/no-go process.

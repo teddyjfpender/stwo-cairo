@@ -1,0 +1,219 @@
+{
+  "schema": "stwo.h100-sn2.architecture-receipt.v1",
+  "projection": {
+    "source_record_sha256": "8257360f0a0cb1b0cd8cceb391cd5954e08b3c5b4d2e1dce8b2e6e2bda68f717",
+    "description": "Selected immutable architecture facts projected from the ignored production record so the slab specification is independently auditable in Git.",
+    "units": {
+      "bytes": "bytes",
+      "time": "nanoseconds unless the field suffix says otherwise",
+      "arena_word_bytes": 4
+    }
+  },
+  "identity": {
+    "stwo": "526b489db96a23fb9d044dc3fe61f839a6062f67",
+    "stwo_cairo": "be3e7e550f892909a912e04ebc0ac8fb65ed40cc",
+    "gpu_bench_sha256": "0a4051aa83fb3625ec8cc3a5803b9de841ae78a588164cf529ab1db2bb8cc504",
+    "adapted_input_sha256": "78b0995483a76e850c61cf7cb51861850f746ddf927344088014492b6752844c",
+    "aot_manifest_sha256": "2f50601857640e1d20381f7ffe18db78d2ff752d78932c35de92a96755cabab8",
+    "proof_sha256": "99bf0cd0863658742ada152caee238d888f5c901dc7e4df66f2748d49cea98da",
+    "proof_blake3": "253519717a2a742a211c994a57e0c2ff3eb5ad0a956933bd18235292d7bbc9f2",
+    "gpu": {
+      "name": "NVIDIA H100 80GB HBM3",
+      "uuid": "GPU-80ef4dbd-d519-8e2c-5371-e896869030cb",
+      "compute_capability": "9.0",
+      "driver": "580.126.09",
+      "cuda": "11.8",
+      "ecc": "Enabled",
+      "mig": "Disabled",
+      "power_limit_w": 700,
+      "max_sm_clock_mhz": 1980,
+      "max_memory_clock_mhz": 2619
+    }
+  },
+  "proof": {
+    "useful_steps": 7706864,
+    "warm_samples_s": [
+      1.47947491,
+      1.467947317,
+      1.479955339,
+      1.477843392,
+      1.482114914
+    ],
+    "warm_median_raw_s": 1.47947491,
+    "warm_p95_raw_s": 1.482114914,
+    "useful_mhz_median_reported": 5.209,
+    "useful_mhz_p95_reported": 5.201,
+    "verified_reps": 6,
+    "reps": 6,
+    "fresh_simd_gpu_bytes_equal": true,
+    "structured_mutation_rejected": true,
+    "proof_bytes": 3078795
+  },
+  "execution": {
+    "resident_backend": "replacement-v1",
+    "pcs_runtime_mode": "ArenaGraph",
+    "planned_numerator_schedule": "staged-run-sum-or-packed",
+    "selected_numerator_schedule": "staged-group-direct",
+    "transcript_segments": 15,
+    "graph_launches": 14,
+    "kernel_launches": 2119,
+    "host_syncs": 1,
+    "hot_allocations": 0,
+    "hot_frees": 0,
+    "hot_allocation_bytes": 0,
+    "hot_h2d_bytes": 0,
+    "hot_d2d_bytes": 0,
+    "hot_d2h_bytes": 8410304,
+    "graph_submit_gap_ns_total_samples": [
+      1001055,
+      184938,
+      190857,
+      192218,
+      199593,
+      199704
+    ],
+    "graph_submit_gap_ns_max_samples": [
+      551666,
+      140077,
+      145268,
+      142617,
+      150163,
+      148692
+    ],
+    "max_warm_graph_submit_gap_ms": 0.150163
+  },
+  "host_preparation": {
+    "total_ns": 38393575,
+    "session_ns": 34584541,
+    "ingest_ns": 3809034,
+    "plan_cache_hits": 5,
+    "plan_cache_misses": 1,
+    "plan_cache_compilations": 1,
+    "shape_executable_cache_hits": 5,
+    "shape_executable_cache_misses": 1,
+    "shape_executable_cache_compilations": 1,
+    "source_generation_passes": 1,
+    "binding_recipe_compilations": 1
+  },
+  "ingress": {
+    "witness": {
+      "components": 33,
+      "h2d_bytes": 95728780,
+      "h2d_copies": 21,
+      "syncs": 1
+    },
+    "execution_tables": {
+      "h2d_bytes": 66355840,
+      "h2d_copies": 3,
+      "syncs": 1
+    },
+    "composition_refresh": {
+      "h2d_bytes": 14672,
+      "h2d_copies": 58,
+      "syncs": 1
+    },
+    "public_memory_seed": {
+      "h2d_bytes": 34896,
+      "h2d_copies": 1,
+      "syncs": 1
+    }
+  },
+  "composition": {
+    "wave_count": 18,
+    "replay_wave_launches": 18,
+    "replay_launch_mode": "wave",
+    "part_count": 153,
+    "direct_retained_evaluations": true,
+    "direct_split_graphs": 1,
+    "current": {
+      "kernel_launches": 7,
+      "d2d_nodes": 8,
+      "logical_bytes": 6174015488
+    },
+    "executed": {
+      "kernel_launches": 5,
+      "logical_bytes": 4026531840
+    },
+    "fused": {
+      "kernel_launches": 5,
+      "d2d_nodes": 0,
+      "logical_bytes": 4026531840
+    },
+    "terminal_fallback": {
+      "kernel_launches": 6,
+      "logical_bytes": 5100273664
+    },
+    "retained_image_bytes": 536870912,
+    "source_image_bytes": 268435456
+  },
+  "commitment": {
+    "policy": "domain-progressive",
+    "dynamic_leaf_schedule": "retained-domain-compact-h8",
+    "direct_commitments": 2,
+    "separate_interpolation_graph_invocations": 0,
+    "separate_interpolation_kernel_launches": 0,
+    "terminal_fixed16_batches": 0,
+    "terminal_fused_commitments": 0,
+    "terminal_materialized_batches": 36,
+    "terminal_materialized_commitments": 2
+  },
+  "quotient_producer_b2n": {
+    "production_selected": true,
+    "lifting_log_size": 24,
+    "subdomain_log_size": 23,
+    "sample_count": 19,
+    "producer_stages": 7,
+    "continuation_intervals": [
+      8,
+      8
+    ],
+    "traffic": {
+      "batch_inverse_calls": 25165824,
+      "denominator_factors": 159383552,
+      "coordinate_image_bytes": 134217728,
+      "eliminated_kernel_launches": 21,
+      "eliminated_logical_bytes": 5637144576,
+      "fallback_kernel_launches": 24,
+      "fallback_logical_bytes": 6308233216,
+      "fused_kernel_launches": 3,
+      "fused_logical_bytes": 671088640,
+      "unchanged_partial_read_bytes": 2550136832
+    }
+  },
+  "policies": {
+    "composition_launch_mode": "wave",
+    "direct_composition_retention": "exact-native",
+    "numerator_source": "reuse-retained-evaluations",
+    "relation_tail_mode": "segmented",
+    "witness_feed_launch_mode": "global-atomics",
+    "fri_fold_launch_mode": "per-fold",
+    "interpolation_mode": "stage-fused-out-of-place",
+    "fixed_image_incremental_lde_budget_bytes": 2147483648,
+    "retained_lde_budget_bytes": 68719476736
+  },
+  "memory": {
+    "arena_words": 10203919648,
+    "arena_bytes": 40815678592,
+    "process_vram_peak_gb_reported": 43.676,
+    "process_vram_end_gb_reported": 43.628,
+    "isolated_allocator_used_bytes": 40815678592,
+    "isolated_allocator_reserved_bytes": 40835743744,
+    "default_allocator_used_bytes": 1879048192,
+    "default_allocator_reserved_bytes": 1879048192,
+    "allocator_net_slack_bytes": 20065152,
+    "physical_inputs_complete": false,
+    "missing_physical_rows": [
+      "primary_context_driver_baseline",
+      "module_code_and_globals",
+      "graph_and_event_metadata",
+      "profiling_overhead",
+      "operational_safety_reserve"
+    ]
+  },
+  "qualification": {
+    "iteration_only": true,
+    "formal_promotion_eligible": false,
+    "performance_counters_available": false,
+    "physical_memory_inputs_complete": false
+  }
+}
