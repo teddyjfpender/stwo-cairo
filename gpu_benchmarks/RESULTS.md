@@ -869,3 +869,30 @@ counts and now includes native eager/capture/CPU gates for commit, quotient, OOD
 quotient numerator, final FRI/PoW, dynamic decommit, device transcript, composition,
 and (once compiled) relation. No local macOS run is recorded as native execution;
 these are mandatory counted gates for the next H100 admission.
+
+## 2026-07-19 — adaptive run-sum SN2 checkpoint: 4.824 useful MHz
+
+The production `ReplacementV1` path selected its sealed
+`staged-group-direct`/run-sum numerator on an H100 and completed six verified
+SN2 repetitions. Its raw five-sample warm median was **1.597542116 s**, reported
+as **1.598 s / 4.824 useful MHz**. The same binary's explicit packed control
+selected `staged-packed-single-write` and measured **1.903122776 s /
+4.050 useful MHz**. Adaptive therefore saved **305.580660 ms** and was
+**1.191282x** faster at the complete proof boundary.
+
+Both paths matched the fresh SIMD proof under the strict runtime gate, rejected
+the structured mutation, and produced byte-identical fetched proof files
+(3,078,795 bytes; SHA-256
+`99bf0cd0863658742ada152caee238d888f5c901dc7e4df66f2748d49cea98da`).
+All 340 SM90 AOT entries were present.
+
+Relative to the prior qualified **1.946 s / 3.961-MHz** checkpoint, the current
+raw median is **348.457884 ms** lower. Exact 5 MHz requires 1.5413728 seconds, so
+**56.169316 ms** remains. The next measured owner is shared production session
+preparation: **154.478049 ms** adaptive and **156.135752 ms** packed.
+
+This is iteration-only, not formal promotion: the A/B was fixed-order rather
+than balanced ABBA, counters were unavailable, and the physical-memory ledger
+is incomplete. See
+[`results/h100-adaptive-packed-20260719/`](results/h100-adaptive-packed-20260719/)
+for the sealed summary.

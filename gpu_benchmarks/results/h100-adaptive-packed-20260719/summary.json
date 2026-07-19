@@ -1,0 +1,70 @@
+{
+  "schema": "stwo.h100-sn2-adaptive-packed.v1",
+  "status": "PASS_ITERATION_NON_PROMOTABLE",
+  "date_utc": "2026-07-19",
+  "hardware": "NVIDIA H100 80GB HBM3",
+  "source": {
+    "stwo": "0d7b4cc2d6c18a29ffb7f16d3062d2304adb4cd9",
+    "stwo_cairo": "7312a192b90993b67710e12ea18612552f4d69d1",
+    "gpu_bench_sha256": "35769a50c20b5d71d3de4e8b455ee7d6314a8a577fc98f16220c219c2a770e07",
+    "sm90_aot_entries": 340,
+    "sm90_aot_missing": 0
+  },
+  "input": {
+    "useful_steps": 7706864,
+    "adapted_input_bytes": 162102412,
+    "adapted_input_sha256": "78b0995483a76e850c61cf7cb51861850f746ddf927344088014492b6752844c"
+  },
+  "adaptive": {
+    "planned_schedule": "staged-run-sum-or-packed",
+    "actual_schedule": "staged-group-direct",
+    "warm_samples_s": [
+      1.60047643,
+      1.603234911,
+      1.592517679,
+      1.593501407,
+      1.597542116
+    ],
+    "warm_median_raw_s": 1.597542116,
+    "useful_mhz_reported": 4.824,
+    "host_preparation_ms": 154.478049
+  },
+  "packed_control": {
+    "planned_schedule": "staged-packed-single-write",
+    "actual_schedule": "staged-packed-single-write",
+    "warm_samples_s": [
+      1.896844107,
+      1.907864059,
+      1.922499402,
+      1.892388487,
+      1.903122776
+    ],
+    "warm_median_raw_s": 1.903122776,
+    "useful_mhz_reported": 4.05,
+    "host_preparation_ms": 156.135752
+  },
+  "comparison": {
+    "raw_median_wall_saved_ms": 305.58066,
+    "raw_median_speedup": 1.1912817552,
+    "prior_qualified_reference_s": 1.946,
+    "raw_wall_saved_from_prior_ms": 348.457884,
+    "five_mhz_wall_s": 1.5413728,
+    "raw_median_remaining_to_five_mhz_ms": 56.169316
+  },
+  "correctness": {
+    "adaptive_verified_reps": 6,
+    "packed_verified_reps": 6,
+    "fresh_simd_gpu_bytes_equal": true,
+    "structured_mutation_rejected": true,
+    "adaptive_packed_proof_bytes_equal": true,
+    "proof_bytes": 3078795,
+    "proof_sha256": "99bf0cd0863658742ada152caee238d888f5c901dc7e4df66f2748d49cea98da"
+  },
+  "qualification": {
+    "iteration_only": true,
+    "formal_promotion_eligible": false,
+    "balanced_abba": false,
+    "performance_counters_available": false,
+    "headline": "4.824 useful MHz median"
+  }
+}

@@ -74,3 +74,6 @@
 {"ts": "2026-07-10T19:59:18+00:00", "event": "stop", "pod_id": "9wxsb3p361mtb1", "gpu": "H100 SXM", "usd_hr": 2.99}
 {"ts": "2026-07-10T20:58:25+00:00", "event": "create", "pod_id": "hmi6q8t4htnud2", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "phase-c gates + first SN2 resident bench"}
 {"ts": "2026-07-11T00:46:35+00:00", "event": "stop", "pod_id": "hmi6q8t4htnud2", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-19T17:51:27+00:00", "event": "stop", "pod_id": "wn3nd7oe1mzczc", "gpu": "A40", "usd_hr": 0.44}
+{"ts": "2026-07-19T17:53:12+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "current-source adaptive SN2 byte equality and same-binary packed control"}
+{"ts": "2026-07-19T18:09:21+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
