@@ -1,3 +1,16 @@
 .cursor
 target
 gpu_benchmarks/fleet/.pregate_ok.json
+/private
+/target-debug0/
+
+# Local CUDA development output. Durable receipts are promoted into the workspace evidence tree.
+/.cache/
+/profiles/
+/results/
+/tmp/
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite-wal
+*.sqlite-shm
