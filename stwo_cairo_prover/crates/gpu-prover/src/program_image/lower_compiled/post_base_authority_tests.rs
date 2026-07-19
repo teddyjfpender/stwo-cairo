@@ -153,7 +153,7 @@ fn generated_sn2_post_base_shape_receipt_is_exact() {
     let numerator = arena.quotient_numerator();
     assert_eq!(
         numerator.schedule,
-        QuotientNumeratorSchedule::StagedPackedSingleWrite
+        QuotientNumeratorSchedule::StagedRunSumOrPacked
     );
     assert_eq!(numerator.columns.len(), 4_524);
     assert_eq!(numerator.requirements.groups.len(), 15);

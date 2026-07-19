@@ -122,11 +122,7 @@ pub fn runtime_policy_json(
 }
 
 fn numerator_schedule_name(value: QuotientNumeratorSchedule) -> &'static str {
-    match value {
-        QuotientNumeratorSchedule::LegacyBatches => "legacy-batches",
-        QuotientNumeratorSchedule::HybridSingleWrite => "hybrid-single-write",
-        QuotientNumeratorSchedule::StagedPackedSingleWrite => "staged-packed-single-write",
-    }
+    value.cli_name()
 }
 
 fn decommit_strategy_name(value: DecommitStrategy) -> &'static str {
