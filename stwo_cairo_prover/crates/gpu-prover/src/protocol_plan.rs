@@ -127,7 +127,7 @@ impl ProtocolPlanPolicy {
         policy.resident_backend = ResidentBackend::ReplacementV1;
         policy.dynamic_commitment_leaf_schedule =
             DynamicCommitmentLeafSchedule::RetainedDomainCompactH8;
-        policy.quotient_numerator_schedule = QuotientNumeratorSchedule::StagedPackedSingleWrite;
+        policy.quotient_numerator_schedule = QuotientNumeratorSchedule::StagedRunSumOrPacked;
         policy.retained_lde_budget_bytes = 64 * 1024 * 1024 * 1024;
         policy.fixed_image_incremental_lde_budget_bytes =
             REPLACEMENT_FIXED_IMAGE_INCREMENTAL_LDE_BUDGET_BYTES;
@@ -1690,7 +1690,7 @@ mod tests {
         );
         assert_eq!(
             policy.quotient_numerator_schedule,
-            QuotientNumeratorSchedule::StagedPackedSingleWrite
+            QuotientNumeratorSchedule::StagedRunSumOrPacked
         );
         assert_eq!(policy.retained_lde_budget_bytes, 64 * 1024 * 1024 * 1024);
         assert_eq!(

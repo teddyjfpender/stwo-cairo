@@ -694,6 +694,28 @@ pub enum QuotientNumeratorSchedule {
     /// Coefficient-inclusive replacement schedule: materialize each required
     /// LDE into arena-owned epoch roles, then write every useful row once.
     StagedPackedSingleWrite = 2,
+    /// Replacement controller: use staged group-direct only when setup seals a
+    /// native run-sum binding; otherwise consume the same manifest and memory
+    /// through staged packed single-write.
+    StagedRunSumOrPacked = 3,
+}
+
+impl QuotientNumeratorSchedule {
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::LegacyBatches => "legacy-batches",
+            Self::HybridSingleWrite => "hybrid-single-write",
+            Self::StagedPackedSingleWrite => "staged-packed-single-write",
+            Self::StagedRunSumOrPacked => "staged-run-sum-or-packed",
+        }
+    }
+
+    const fn uses_staged_manifest(self) -> bool {
+        matches!(
+            self,
+            Self::StagedPackedSingleWrite | Self::StagedRunSumOrPacked
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1664,11 +1686,13 @@ impl ProtocolGeometry {
         )
         .map_err(ArenaPlanError::QuotientNumerator)?;
         if (self.identity.resident_backend == ResidentBackend::ReplacementV1)
-            != (self.identity.quotient_numerator_schedule
-                == QuotientNumeratorSchedule::StagedPackedSingleWrite)
+            != self
+                .identity
+                .quotient_numerator_schedule
+                .uses_staged_manifest()
         {
             return Err(ArenaPlanError::InvalidProtocolGeometry(
-                "replacement-v1 and staged packed numerator identities must be selected together",
+                "replacement-v1 and staged numerator identities must be selected together",
             ));
         }
         match self.identity.quotient_numerator_schedule {
@@ -1685,10 +1709,11 @@ impl ProtocolGeometry {
                     ));
                 }
             }
-            QuotientNumeratorSchedule::StagedPackedSingleWrite => {
+            QuotientNumeratorSchedule::StagedPackedSingleWrite
+            | QuotientNumeratorSchedule::StagedRunSumOrPacked => {
                 if self.identity.resident_backend != ResidentBackend::ReplacementV1 {
                     return Err(ArenaPlanError::InvalidProtocolGeometry(
-                        "staged packed numerator is restricted to replacement-v1",
+                        "staged numerator is restricted to replacement-v1",
                     ));
                 }
                 let staged = quotient_numerator_staged_single_write_plan_with_overflow_capacities(
@@ -3379,8 +3404,8 @@ pub struct PlannedQuotientNumeratorWorkspace {
     pub schedule: QuotientNumeratorSchedule,
     pub config: QuotientNumeratorWorkspaceConfig,
     pub requirements: QuotientNumeratorWorkspaceRequirements,
-    /// Replacement-v1 coefficient-inclusive single-write manifest. It stays
-    /// address-free; `staged_overflow` is the only additional arena binding.
+    /// Shared address-free staged manifest for packed execution and adaptive
+    /// run-sum selection; `staged_overflows` are its only extra bindings.
     pub staged_single_write: Option<QuotientNumeratorStagedSingleWritePlan>,
     pub staged_overflows: Vec<PlannedStagedQuotientOverflow>,
     pub columns: Vec<PlannedQuotientNumeratorColumn>,
@@ -9182,8 +9207,10 @@ fn append_protocol_buffers(
         .iter()
         .map(|&(_, _, words)| words)
         .collect::<Vec<_>>();
-    let staged_single_write = (protocol.identity.quotient_numerator_schedule
-        == QuotientNumeratorSchedule::StagedPackedSingleWrite)
+    let staged_single_write = protocol
+        .identity
+        .quotient_numerator_schedule
+        .uses_staged_manifest()
         .then(|| {
             quotient_numerator_staged_single_write_plan_with_overflow_capacities(
                 quotient_numerator_config,
@@ -11492,6 +11519,16 @@ mod tests {
     use super::*;
     use crate::relation_table::CAIRO_RELATION_GRAPH;
     use crate::schedule_table::CAIRO_SCHEDULE;
+
+    #[test]
+    fn adaptive_numerator_schedule_reuses_staged_manifest() {
+        let schedule = QuotientNumeratorSchedule::StagedRunSumOrPacked;
+        assert_eq!(schedule as u8, 3);
+        assert_eq!(schedule.cli_name(), "staged-run-sum-or-packed");
+        assert!(schedule.uses_staged_manifest());
+        assert!(QuotientNumeratorSchedule::StagedPackedSingleWrite.uses_staged_manifest());
+        assert!(!QuotientNumeratorSchedule::LegacyBatches.uses_staged_manifest());
+    }
 
     #[test]
     fn direct_blake_g_recorded_input_metadata_is_exact() {
