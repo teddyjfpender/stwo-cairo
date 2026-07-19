@@ -1076,6 +1076,39 @@ full_component_gates!(
     require_padding = true
 );
 
+// ------------------------ pedersen_builtin ------------------------------------------
+
+/// Source-of-truth seam for the gpu-lab's first replay slice: the recorded Pedersen
+/// builtin body is generated from the generic SIMD writer, so first pin that writer to
+/// the untouched production SIMD implementation across trace, lookup, sub-input, and
+/// interaction outputs.
+#[test]
+fn pedersen_builtin_generic_simd_byte_identical() {
+    use stwo_cairo_adapter::memory::{EncodedMemoryValueId, MemoryConfig};
+
+    use crate::witness::components::{
+        pedersen_aggregator_window_bits_18 as aggregator, pedersen_builtin as builtin,
+    };
+
+    let memory = Arc::new(Memory {
+        config: MemoryConfig::default(),
+        address_to_id: (0..64)
+            .map(|address| EncodedMemoryValueId(address * 17 + 5))
+            .collect(),
+        f252_values: Vec::new(),
+        small_values: Vec::new(),
+    });
+    let address_to_id = memory_address_to_id::ClaimGenerator::new(memory);
+    let aggregator = aggregator::ClaimGenerator::new();
+
+    assert_generic_diff_byte_identical!(builtin::generic_simd_diff(
+        LOG_N_LANES,
+        1,
+        &address_to_id,
+        &aggregator,
+    ));
+}
+
 // ------------------------ pedersen_aggregator_window_bits_18 ------------------------
 
 /// The BUILTIN-lane recording manifest (ISA-V3): the aggregator's generic body now
