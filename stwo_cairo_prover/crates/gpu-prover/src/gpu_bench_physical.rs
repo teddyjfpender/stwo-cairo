@@ -518,6 +518,7 @@ fn numerator_schedule_name(schedule: QuotientNumeratorSchedule) -> &'static str 
         QuotientNumeratorSchedule::LegacyBatches => "legacy-batches",
         QuotientNumeratorSchedule::HybridSingleWrite => "hybrid-single-write",
         QuotientNumeratorSchedule::StagedPackedSingleWrite => "staged-packed-single-write",
+        QuotientNumeratorSchedule::StagedGroupDirect => "staged-group-direct",
         QuotientNumeratorSchedule::StagedRunSumOrPacked => "staged-run-sum-or-packed",
     }
 }
@@ -977,6 +978,24 @@ mod tests {
         assert_eq!(
             value["gpu_shape_executable_cache_replacement_handle_lock_ops"],
             5
+        );
+
+        let mut packed_control = telemetry.clone();
+        packed_control.protocol_policy = Some(
+            ProtocolPlanPolicy::replacement_v1_packed_numerator_measurement_control(0x1234, 2048),
+        );
+        let packed_control_value = resident_session_telemetry_json(&packed_control);
+        assert_eq!(
+            packed_control_value["gpu_planned_numerator_schedule"],
+            "staged-packed-single-write"
+        );
+        assert_eq!(
+            packed_control_value["gpu_prepared_numerator_schedule"],
+            "staged-packed-single-write"
+        );
+        assert_eq!(
+            packed_control_value["gpu_prepared_numerator_run_sum_bound"],
+            false
         );
 
         let mut run_sum = telemetry.clone();

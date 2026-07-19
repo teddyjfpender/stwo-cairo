@@ -171,7 +171,17 @@ fn digest_shape(
         }
     } else {
         hasher.update(SHAPE_DOMAIN);
-        if run_sum.is_some() {
+        if planned_schedule == QuotientNumeratorSchedule::StagedGroupDirect {
+            if !matches!(
+                schedule,
+                PreparedNumeratorSchedule::StagedGroupDirect { .. }
+            ) || run_sum.is_some_and(|receipt| !receipt.is_complete())
+            {
+                return Err(ResidentOodsError::StagedNumeratorBinding(
+                    "explicit group-direct receipt is malformed",
+                ));
+            }
+        } else if run_sum.is_some() {
             return Err(ResidentOodsError::StagedNumeratorBinding(
                 "non-adaptive receipt unexpectedly owns a run-sum identity",
             ));
@@ -206,15 +216,14 @@ fn update_v1_schedule(
             update_usize(hasher, legacy_groups)?;
         }
         PreparedNumeratorSchedule::StagedPrepackedSingleWrite { packed_output_rows } => {
-            // Receipt tags are append-only: changing 0..=3 would invalidate
+            // Receipt tags are append-only: changing 0..=4 would invalidate
             // otherwise identical historical resident-output evidence.
             hasher.update(&[4]);
             hasher.update(&packed_output_rows.to_le_bytes());
         }
-        PreparedNumeratorSchedule::StagedGroupDirect { .. } => {
-            return Err(ResidentOodsError::StagedNumeratorBinding(
-                "group-direct receipt requires the adaptive planned schedule",
-            ))
+        PreparedNumeratorSchedule::StagedGroupDirect { output_rows } => {
+            hasher.update(&[5]);
+            hasher.update(&output_rows.to_le_bytes());
         }
     }
     Ok(())
@@ -330,8 +339,9 @@ mod tests {
                 hasher.update(&[4]);
                 hasher.update(&packed_output_rows.to_le_bytes());
             }
-            PreparedNumeratorSchedule::StagedGroupDirect { .. } => {
-                panic!("group-direct has no historical v1 encoding")
+            PreparedNumeratorSchedule::StagedGroupDirect { output_rows } => {
+                hasher.update(&[5]);
+                hasher.update(&output_rows.to_le_bytes());
             }
         }
         frozen_usize(&mut hasher, requirements.groups.len());
@@ -372,6 +382,9 @@ mod tests {
             },
             PreparedNumeratorSchedule::StagedPrepackedSingleWrite {
                 packed_output_rows: 0x1112_1314_1516_1718,
+            },
+            PreparedNumeratorSchedule::StagedGroupDirect {
+                output_rows: 0x2122_2324_2526_2728,
             },
         ] {
             assert_eq!(
@@ -448,5 +461,45 @@ mod tests {
             &requirements,
         )
         .is_err());
+        assert!(digest_shape(
+            QuotientNumeratorSchedule::StagedRunSumOrPacked,
+            PreparedNumeratorSchedule::StagedGroupDirect { output_rows: 64 },
+            None,
+            &requirements,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_group_direct_keeps_its_v1_digest() {
+        let requirements = deterministic_requirements();
+        let schedule = PreparedNumeratorSchedule::StagedGroupDirect { output_rows: 64 };
+        let expected = frozen_v1_digest(schedule, &requirements);
+        assert_eq!(
+            digest_shape(
+                QuotientNumeratorSchedule::StagedGroupDirect,
+                schedule,
+                None,
+                &requirements,
+            )
+            .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            digest_shape(
+                QuotientNumeratorSchedule::StagedGroupDirect,
+                schedule,
+                Some(ResidentNumeratorRunSumTelemetry {
+                    identity: [0x5a; 32],
+                    target_group: 0,
+                    victim_group: 12,
+                    run_count: 17,
+                    scratch_words_per_coordinate: 8_388_048,
+                }),
+                &requirements,
+            )
+            .unwrap(),
+            expected,
+        );
     }
 }

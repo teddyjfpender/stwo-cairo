@@ -11,7 +11,7 @@ use stwo_cairo_gpu_prover::arena_plan::{ProtocolIdentity, ResidentBackend};
 use stwo_cairo_gpu_prover::protocol_plan::ProtocolPlanPolicy;
 
 #[test]
-fn staged_preflight_reports_exact_packed_and_adaptive_constructor_selection() {
+fn staged_preflight_reports_exact_packed_direct_and_adaptive_selection() {
     use stwo_cairo_gpu_prover::arena_plan::QuotientNumeratorSchedule;
 
     assert_eq!(
@@ -34,6 +34,29 @@ fn staged_preflight_reports_exact_packed_and_adaptive_constructor_selection() {
             "missing_receipt_policy": "not-applicable",
             "incomplete_receipt_policy": "not-applicable",
             "error_policy": "fail-closed",
+        })
+    );
+
+    assert_eq!(
+        super::arena_preflight_staged::production_constructor(
+            QuotientNumeratorSchedule::StagedGroupDirect,
+        ),
+        "prepare_staged_group_direct"
+    );
+    assert_eq!(
+        super::arena_preflight_staged::production_selection(
+            QuotientNumeratorSchedule::StagedGroupDirect,
+        ),
+        serde_json::json!({
+            "initial_constructor": "prepare_staged_group_direct",
+            "selection_time": "preflight-plan",
+            "selected_runtime_constructor": "prepare_staged_group_direct",
+            "retain_direct_when": "explicit-staged-group-direct-policy",
+            "fallback_constructor": null,
+            "fallback_when": null,
+            "missing_receipt_policy": "retain-staged-group-direct",
+            "incomplete_receipt_policy": "fail-closed",
+            "error_policy": "fail-closed-no-packed-fallback",
         })
     );
 
@@ -157,6 +180,15 @@ fn replacement_policy_json_reports_the_exact_planned_tuple() {
     assert_eq!(value["fri_fold_launch_mode"], "per-fold");
     assert_eq!(value["witness_feed_launch_mode"], "global-atomics");
     assert_eq!(value["relation_launch_mode"], "fused");
+
+    let packed = runtime_policy_json(
+        ProtocolPlanPolicy::replacement_v1_packed_numerator_measurement_control(0x1234, 2048),
+        RelationLaunchMode::Fused,
+    );
+    assert_eq!(
+        packed["quotient_numerator_schedule"],
+        "staged-packed-single-write"
+    );
 }
 
 fn protocol_identity_for(policy: ProtocolPlanPolicy) -> ProtocolIdentity {
@@ -219,6 +251,17 @@ fn replacement_preflight_rejects_policy_or_identity_drift() {
     );
     let identity = protocol_identity_for(policy);
     assert_eq!(validate_protocol_identity(policy, identity), Ok(()));
+
+    let packed_control =
+        ProtocolPlanPolicy::replacement_v1_packed_numerator_measurement_control(0x1234, 2048);
+    assert_eq!(
+        validate_selected_policy(ResidentBackend::ReplacementV1, packed_control),
+        Ok(())
+    );
+    assert_eq!(
+        validate_protocol_identity(packed_control, protocol_identity_for(packed_control)),
+        Ok(())
+    );
 
     let mut drifted_policy = policy;
     drifted_policy.retained_lde_budget_bytes -= 1;

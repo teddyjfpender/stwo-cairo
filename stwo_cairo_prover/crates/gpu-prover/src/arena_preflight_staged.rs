@@ -15,6 +15,7 @@ pub(super) fn production_constructor(schedule: QuotientNumeratorSchedule) -> &'s
         QuotientNumeratorSchedule::StagedRunSumOrPacked => {
             "prepare_staged_group_direct; prepare_staged_packed_single_write only after successful direct preparation without a run-sum receipt; errors fail closed"
         }
+        QuotientNumeratorSchedule::StagedGroupDirect => "prepare_staged_group_direct",
         QuotientNumeratorSchedule::LegacyBatches
         | QuotientNumeratorSchedule::HybridSingleWrite => {
             unreachable!("a staged manifest requires a staged numerator schedule")
@@ -43,6 +44,17 @@ pub(super) fn production_selection(schedule: QuotientNumeratorSchedule) -> Value
             "fallback_constructor": "prepare_staged_packed_single_write",
             "fallback_when": "direct-preparation-succeeded-without-run-sum-receipt",
             "missing_receipt_policy": "prepare-staged-packed-single-write",
+            "incomplete_receipt_policy": "fail-closed",
+            "error_policy": "fail-closed-no-packed-fallback",
+        }),
+        QuotientNumeratorSchedule::StagedGroupDirect => json!({
+            "initial_constructor": "prepare_staged_group_direct",
+            "selection_time": "preflight-plan",
+            "selected_runtime_constructor": "prepare_staged_group_direct",
+            "retain_direct_when": "explicit-staged-group-direct-policy",
+            "fallback_constructor": null,
+            "fallback_when": null,
+            "missing_receipt_policy": "retain-staged-group-direct",
             "incomplete_receipt_policy": "fail-closed",
             "error_policy": "fail-closed-no-packed-fallback",
         }),
@@ -242,6 +254,8 @@ pub(super) fn json(arena: &ProofArenaPlan) -> Value {
                 "selected packed execution model; no adaptive runtime selection",
             QuotientNumeratorSchedule::StagedRunSumOrPacked =>
                 "fallback model only; selected runtime execution requires the prepared receipt",
+            QuotientNumeratorSchedule::StagedGroupDirect =>
+                "packed comparison model only; explicit group-direct execution does not select it",
             QuotientNumeratorSchedule::LegacyBatches
             | QuotientNumeratorSchedule::HybridSingleWrite =>
                 unreachable!("a staged manifest requires a staged numerator schedule"),

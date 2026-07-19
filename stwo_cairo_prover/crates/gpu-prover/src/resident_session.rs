@@ -394,14 +394,10 @@ impl ResidentSessionTelemetry {
             ));
         }
         if policy.resident_backend == crate::arena_plan::ResidentBackend::ReplacementV1
-            && policy
-                != ProtocolPlanPolicy::replacement_v1(
-                    policy.kernel_manifest_hash,
-                    policy.composition_max_kernel_instrs,
-                )
+            && !policy.matches_replacement_v1_measurement_contract()
         {
             return Err(ResidentSessionError::StrictArchitectureTelemetry(
-                "replacement-v1 policy tuple drifted",
+                "replacement-v1 measurement contract drifted",
             ));
         }
         if policy.resident_backend == ResidentBackend::ReplacementV1 {
@@ -589,6 +585,13 @@ impl ResidentSessionTelemetry {
                 crate::arena_plan::QuotientNumeratorSchedule::StagedPackedSingleWrite,
                 PreparedNumeratorSchedule::StagedPackedSingleWrite { packed_output_rows },
             ) => packed_output_rows != 0 && run_sum.is_none(),
+            (
+                crate::arena_plan::QuotientNumeratorSchedule::StagedGroupDirect,
+                PreparedNumeratorSchedule::StagedGroupDirect { output_rows },
+            ) => {
+                output_rows != 0
+                    && run_sum.is_none_or(ResidentNumeratorRunSumTelemetry::is_complete)
+            }
             (
                 crate::arena_plan::QuotientNumeratorSchedule::StagedRunSumOrPacked,
                 PreparedNumeratorSchedule::StagedGroupDirect { output_rows },
@@ -3273,8 +3276,15 @@ mod tests {
             prepared_runtime_capture_ready_at_entry: Some(false),
             prepared_runtime_capture_ready_at_exit: Some(true),
             protocol_policy: Some(policy),
-            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::StagedPackedSingleWrite {
-                packed_output_rows: 1,
+            prepared_numerator_schedule: Some(PreparedNumeratorSchedule::StagedGroupDirect {
+                output_rows: 1,
+            }),
+            prepared_numerator_run_sum: Some(ResidentNumeratorRunSumTelemetry {
+                identity: [0xcd; 32],
+                target_group: 0,
+                victim_group: 12,
+                run_count: 17,
+                scratch_words_per_coordinate: 8_388_048,
             }),
             trace_commit_inputs: Some(ResidentTraceCommitInputTelemetry {
                 direct_commitments: 2,
@@ -3320,23 +3330,11 @@ mod tests {
         };
         assert!(valid.require_strict_graph_a().is_ok());
 
-        let mut run_sum = valid.clone();
-        run_sum.prepared_numerator_schedule =
-            Some(PreparedNumeratorSchedule::StagedGroupDirect { output_rows: 1 });
-        run_sum.prepared_numerator_run_sum = Some(ResidentNumeratorRunSumTelemetry {
-            identity: [0xcd; 32],
-            target_group: 0,
-            victim_group: 12,
-            run_count: 17,
-            scratch_words_per_coordinate: 8_388_048,
-        });
-        assert!(run_sum.require_strict_graph_a().is_ok());
-
-        let mut missing_run_sum = run_sum.clone();
+        let mut missing_run_sum = valid.clone();
         missing_run_sum.prepared_numerator_run_sum = None;
         assert!(missing_run_sum.require_strict_graph_a().is_err());
 
-        let mut incomplete_run_sum = run_sum.clone();
+        let mut incomplete_run_sum = valid.clone();
         incomplete_run_sum
             .prepared_numerator_run_sum
             .as_mut()
@@ -3344,7 +3342,7 @@ mod tests {
             .identity = [0; 32];
         assert!(incomplete_run_sum.require_strict_graph_a().is_err());
 
-        let mut reversed_run_sum = run_sum.clone();
+        let mut reversed_run_sum = valid.clone();
         let reversed_receipt = reversed_run_sum
             .prepared_numerator_run_sum
             .as_mut()
@@ -3353,9 +3351,32 @@ mod tests {
         reversed_receipt.victim_group = 0;
         assert!(reversed_run_sum.require_strict_graph_a().is_err());
 
-        let mut packed_with_run_sum = valid.clone();
-        packed_with_run_sum.prepared_numerator_run_sum = run_sum.prepared_numerator_run_sum;
+        let mut adaptive_packed = valid.clone();
+        adaptive_packed.prepared_numerator_schedule =
+            Some(PreparedNumeratorSchedule::StagedPackedSingleWrite {
+                packed_output_rows: 1,
+            });
+        adaptive_packed.prepared_numerator_run_sum = None;
+        assert!(adaptive_packed.require_strict_graph_a().is_ok());
+
+        let mut packed_with_run_sum = adaptive_packed.clone();
+        packed_with_run_sum.prepared_numerator_run_sum = valid.prepared_numerator_run_sum;
         assert!(packed_with_run_sum.require_strict_graph_a().is_err());
+
+        let mut packed_control = adaptive_packed;
+        packed_control.protocol_policy = Some(
+            ProtocolPlanPolicy::replacement_v1_packed_numerator_measurement_control(0x1234, 2048),
+        );
+        assert!(packed_control.require_strict_graph_a().is_ok());
+
+        let mut direct_with_packed_receipt = valid.clone();
+        direct_with_packed_receipt.prepared_numerator_schedule =
+            packed_control.prepared_numerator_schedule;
+        assert!(direct_with_packed_receipt.require_strict_graph_a().is_err());
+
+        let mut packed_with_direct_receipt = packed_control;
+        packed_with_direct_receipt.prepared_numerator_schedule = valid.prepared_numerator_schedule;
+        assert!(packed_with_direct_receipt.require_strict_graph_a().is_err());
 
         let mut missing_composition_execution = valid.clone();
         missing_composition_execution

@@ -16,6 +16,7 @@
 //!   gpu_bench --program path/to/compiled.json --iterations N --backend cuda|simd \
 //!             [--engine legacy|gpu-native] \
 //!             [--resident-backend legacy-resident|replacement-v1] \
+//!             [--packed-numerator-measurement-control] \
 //!             [--compiled-composition-vertical-checkpoint] \
 //!             [--reps 3] [--pipeline <depth>] [--reuse-input] [--adapt-only] \
 //!             [--require-proof-byte-equal] [--require-gpu-native-architecture] \
@@ -53,6 +54,10 @@
 //! eager end-to-end checkpoint. It is a correctness diagnostic: the default captured
 //! path is unchanged, the SIMD byte oracle is mandatory, and its timing is always
 //! labeled indicative/non-formal.
+//! `--packed-numerator-measurement-control` selects the replacement backend's one
+//! explicit packed numerator A/B baseline. Without it, replacement-v1 remains on its
+//! production adaptive run-sum-or-packed policy. The control requires the same strict
+//! CUDA gpu-native ArenaGraph admission as production replacement-v1.
 //! `--require-proof-mutation-rejected` retains a verifier-form clone of repetition 0,
 //! waits for the original to verify, adds one to the always-present memory-id
 //! interaction claimed sum, and requires rejection. This is a verifier-integrity
@@ -101,6 +106,7 @@
 //!   proof_mutation_required, proof_mutation_kind,
 //!   proof_mutation_rejected, proof_mutation_error_class,
 //!   gpu_resident_backend_requested,
+//!   gpu_packed_numerator_measurement_control_requested,
 //!   gpu_pcs_driver_architecture, gpu_pcs_runtime_mode,
 //!   gpu_pcs_stage_started, gpu_pcs_stage_finished,
 //!   gpu_pcs_batched_tree_decommit, gpu_pcs_driver_complete,
@@ -262,6 +268,60 @@ where
     Ok(selected)
 }
 
+fn parse_packed_numerator_measurement_control_args<I, S>(args: I) -> Result<bool, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    const FLAG: &str = "--packed-numerator-measurement-control";
+    const VALUE_FORM: &str = "--packed-numerator-measurement-control=";
+    let mut selected = false;
+    for argument in args {
+        let argument = argument.as_ref();
+        if argument.starts_with(VALUE_FORM) {
+            return Err(format!("{FLAG} is a value-less flag"));
+        }
+        if argument != FLAG {
+            continue;
+        }
+        if selected {
+            return Err(format!("{FLAG} may be passed only once"));
+        }
+        selected = true;
+    }
+    Ok(selected)
+}
+
+fn packed_numerator_measurement_control_gate(
+    enabled: bool,
+    backend: &str,
+    selected_engine: &str,
+    resident_backend: ResidentBackend,
+    architecture_required: bool,
+    runtime_mode: RequiredCudaPcsRuntimeMode,
+) -> Result<(), &'static str> {
+    if !enabled {
+        return Ok(());
+    }
+    if backend != "cuda" {
+        return Err("--packed-numerator-measurement-control requires --backend cuda");
+    }
+    if selected_engine != "gpu-native" {
+        return Err("--packed-numerator-measurement-control requires --engine gpu-native");
+    }
+    if resident_backend != ResidentBackend::ReplacementV1 {
+        return Err(
+            "--packed-numerator-measurement-control requires --resident-backend replacement-v1",
+        );
+    }
+    if !architecture_required || runtime_mode != RequiredCudaPcsRuntimeMode::ArenaGraph {
+        return Err(
+            "--packed-numerator-measurement-control requires --require-gpu-native-architecture and --require-gpu-pcs-runtime-mode arena-graph",
+        );
+    }
+    Ok(())
+}
+
 fn compiled_composition_vertical_checkpoint_gate(
     enabled: bool,
     resident_backend: ResidentBackend,
@@ -389,9 +449,7 @@ fn record_fleet_proof_telemetry(telemetry: &FleetResidentProofTelemetry) {
 fn prove_gpu_native(input: ProverInput, params: ProverParameters) -> BenchProof {
     GPU_NATIVE_CUDA.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let prover = slot.get_or_insert_with(|| {
-            GpuCairoProver::new(gpu_native_prover_config()).expect("gpu-native config")
-        });
+        let prover = slot.get_or_insert_with(new_gpu_native_prover);
         let proof = if let Some(socket) = fleet_pow_socket() {
             assert!(
                 prover.config().strict,
@@ -514,6 +572,16 @@ fn gpu_native_prover_config() -> GpuProverConfig {
     config
 }
 
+fn new_gpu_native_prover() -> GpuCairoProver<Blake2sMerkleChannel> {
+    let config = gpu_native_prover_config();
+    if packed_numerator_measurement_control() {
+        GpuCairoProver::new_packed_numerator_measurement_control(config)
+            .expect("packed numerator measurement control config")
+    } else {
+        GpuCairoProver::new(config).expect("gpu-native config")
+    }
+}
+
 fn arg(name: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     args.iter()
@@ -535,6 +603,11 @@ fn compiled_composition_vertical_checkpoint() -> bool {
         .unwrap_or_else(|error| panic!("{error}"))
 }
 
+fn packed_numerator_measurement_control() -> bool {
+    parse_packed_numerator_measurement_control_args(std::env::args())
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
 fn enforce_resident_backend_invocation() {
     resident_backend_gate(
         requested_resident_backend(),
@@ -542,6 +615,18 @@ fn enforce_resident_backend_invocation() {
         required_gpu_pcs_runtime_mode(),
     )
     .unwrap_or_else(|error| panic!("GPU resident backend gate failed: {error}"));
+}
+
+fn enforce_packed_numerator_measurement_control_invocation(backend: &str) {
+    packed_numerator_measurement_control_gate(
+        packed_numerator_measurement_control(),
+        backend,
+        &engine(),
+        requested_resident_backend(),
+        gpu_native_architecture_required(),
+        required_gpu_pcs_runtime_mode(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 }
 
 fn gpu_native_architecture_required() -> bool {
@@ -1297,6 +1382,8 @@ fn record_context(backend: &str) -> serde_json::Value {
         "nproc": nproc(),
         "host_mem_gb": round3(host_mem_gb()),
         "gpu_resident_backend_requested": requested_resident_backend().cli_name(),
+        "gpu_packed_numerator_measurement_control_requested":
+            packed_numerator_measurement_control(),
         "gpu_native_architecture_required": architecture_required,
         "gpu_pcs_required_runtime_mode": required_mode.map(RequiredCudaPcsRuntimeMode::cli_name),
         "gpu_native_architecture_gate_passed": (architecture_required && !vertical_checkpoint)
@@ -2109,10 +2196,7 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
     // Warm-up on the main thread. Legacy admission installs any unset migration
     // defaults; replacement admission is env-write-free. Both complete one-time
     // CUDA/AOT setup before per-thread construction.
-    drop(
-        GpuCairoProver::<Blake2sMerkleChannel>::new(gpu_native_prover_config())
-            .expect("warm-up gpu prover"),
-    );
+    drop(new_gpu_native_prover());
 
     let loaded = source.load();
     let pie_n_steps = loaded.pie_n_steps;
@@ -2130,9 +2214,7 @@ fn run_resident_concurrent(source: &InputSource, backend: &str, n: usize) {
             .enumerate()
             .map(|(i, input)| {
                 scope.spawn(move || {
-                    let mut prover =
-                        GpuCairoProver::<Blake2sMerkleChannel>::new(gpu_native_prover_config())
-                            .expect("per-thread gpu prover");
+                    let mut prover = new_gpu_native_prover();
                     let t = Instant::now();
                     let params = prover_params(variant);
                     let proof = if prover.config().strict {
@@ -2547,6 +2629,7 @@ fn main() {
         _ => {}
     }
     let backend = arg("--backend").unwrap_or_else(|| "cuda".to_string());
+    enforce_packed_numerator_measurement_control_invocation(&backend);
     enforce_resident_backend_invocation();
     enforce_gpu_native_architecture_invocation(&backend);
     let reuse_input = flag("--reuse-input");
@@ -2817,8 +2900,9 @@ mod tests {
         cairo_verification_error_class, claimed_graph_submit_gap_ns,
         compiled_composition_vertical_checkpoint_gate, configure_graph_submit_policy,
         configure_resident_backend, graph_capture_claim_admissible, graph_submit_gap_average_ns,
-        initial_proof_byte_equal, mutate_claimed_sum,
-        parse_compiled_composition_vertical_checkpoint_args, parse_resident_backend_args,
+        initial_proof_byte_equal, mutate_claimed_sum, packed_numerator_measurement_control_gate,
+        parse_compiled_composition_vertical_checkpoint_args,
+        parse_packed_numerator_measurement_control_args, parse_resident_backend_args,
         pcs_telemetry_json, performance_claim_admissible_for, proof_byte_equal_gate_passes,
         proof_mutation_gate_passes, quantile, simd_reference_gate_passes,
         simd_reference_reuse_input_gate_passes, throughput_mhz, validate_gpu_native_architecture,
@@ -2934,6 +3018,90 @@ mod tests {
             ],
         ] {
             assert!(parse_compiled_composition_vertical_checkpoint_args(args).is_err());
+        }
+    }
+
+    #[test]
+    fn packed_numerator_measurement_control_parser_is_exact_and_default_off() {
+        assert!(!parse_packed_numerator_measurement_control_args(["gpu_bench"]).unwrap());
+        assert!(parse_packed_numerator_measurement_control_args([
+            "gpu_bench",
+            "--packed-numerator-measurement-control",
+        ])
+        .unwrap());
+        for args in [
+            vec!["gpu_bench", "--packed-numerator-measurement-control=true"],
+            vec![
+                "gpu_bench",
+                "--packed-numerator-measurement-control",
+                "--packed-numerator-measurement-control",
+            ],
+        ] {
+            assert!(parse_packed_numerator_measurement_control_args(args).is_err());
+        }
+    }
+
+    #[test]
+    fn packed_numerator_measurement_control_is_replacement_only() {
+        assert!(packed_numerator_measurement_control_gate(
+            true,
+            "cuda",
+            "gpu-native",
+            ResidentBackend::ReplacementV1,
+            true,
+            RequiredCudaPcsRuntimeMode::ArenaGraph,
+        )
+        .is_ok());
+        assert!(packed_numerator_measurement_control_gate(
+            false,
+            "simd",
+            "legacy",
+            ResidentBackend::LegacyResident,
+            false,
+            RequiredCudaPcsRuntimeMode::DetachedEager,
+        )
+        .is_ok());
+        for invalid in [
+            (
+                "simd",
+                "gpu-native",
+                ResidentBackend::ReplacementV1,
+                true,
+                RequiredCudaPcsRuntimeMode::ArenaGraph,
+            ),
+            (
+                "cuda",
+                "legacy",
+                ResidentBackend::ReplacementV1,
+                true,
+                RequiredCudaPcsRuntimeMode::ArenaGraph,
+            ),
+            (
+                "cuda",
+                "gpu-native",
+                ResidentBackend::LegacyResident,
+                true,
+                RequiredCudaPcsRuntimeMode::ArenaGraph,
+            ),
+            (
+                "cuda",
+                "gpu-native",
+                ResidentBackend::ReplacementV1,
+                false,
+                RequiredCudaPcsRuntimeMode::ArenaGraph,
+            ),
+            (
+                "cuda",
+                "gpu-native",
+                ResidentBackend::ReplacementV1,
+                true,
+                RequiredCudaPcsRuntimeMode::DetachedEager,
+            ),
+        ] {
+            assert!(packed_numerator_measurement_control_gate(
+                true, invalid.0, invalid.1, invalid.2, invalid.3, invalid.4,
+            )
+            .is_err());
         }
     }
 

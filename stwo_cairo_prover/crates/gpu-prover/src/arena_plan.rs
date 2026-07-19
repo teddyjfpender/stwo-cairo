@@ -694,10 +694,12 @@ pub enum QuotientNumeratorSchedule {
     /// Coefficient-inclusive replacement schedule: materialize each required
     /// LDE into arena-owned epoch roles, then write every useful row once.
     StagedPackedSingleWrite = 2,
+    /// One launch owns each exact denominator group and writes its rows once.
+    StagedGroupDirect = 3,
     /// Replacement controller: use staged group-direct only when setup seals a
     /// native run-sum binding; otherwise consume the same manifest and memory
     /// through staged packed single-write.
-    StagedRunSumOrPacked = 3,
+    StagedRunSumOrPacked = 4,
 }
 
 impl QuotientNumeratorSchedule {
@@ -706,6 +708,7 @@ impl QuotientNumeratorSchedule {
             Self::LegacyBatches => "legacy-batches",
             Self::HybridSingleWrite => "hybrid-single-write",
             Self::StagedPackedSingleWrite => "staged-packed-single-write",
+            Self::StagedGroupDirect => "staged-group-direct",
             Self::StagedRunSumOrPacked => "staged-run-sum-or-packed",
         }
     }
@@ -713,7 +716,7 @@ impl QuotientNumeratorSchedule {
     const fn uses_staged_manifest(self) -> bool {
         matches!(
             self,
-            Self::StagedPackedSingleWrite | Self::StagedRunSumOrPacked
+            Self::StagedPackedSingleWrite | Self::StagedGroupDirect | Self::StagedRunSumOrPacked
         )
     }
 }
@@ -1710,6 +1713,7 @@ impl ProtocolGeometry {
                 }
             }
             QuotientNumeratorSchedule::StagedPackedSingleWrite
+            | QuotientNumeratorSchedule::StagedGroupDirect
             | QuotientNumeratorSchedule::StagedRunSumOrPacked => {
                 if self.identity.resident_backend != ResidentBackend::ReplacementV1 {
                     return Err(ArenaPlanError::InvalidProtocolGeometry(
@@ -11523,10 +11527,16 @@ mod tests {
     #[test]
     fn adaptive_numerator_schedule_reuses_staged_manifest() {
         let schedule = QuotientNumeratorSchedule::StagedRunSumOrPacked;
-        assert_eq!(schedule as u8, 3);
+        assert_eq!(QuotientNumeratorSchedule::StagedGroupDirect as u8, 3);
+        assert_eq!(
+            QuotientNumeratorSchedule::StagedGroupDirect.cli_name(),
+            "staged-group-direct"
+        );
+        assert_eq!(schedule as u8, 4);
         assert_eq!(schedule.cli_name(), "staged-run-sum-or-packed");
         assert!(schedule.uses_staged_manifest());
         assert!(QuotientNumeratorSchedule::StagedPackedSingleWrite.uses_staged_manifest());
+        assert!(QuotientNumeratorSchedule::StagedGroupDirect.uses_staged_manifest());
         assert!(!QuotientNumeratorSchedule::LegacyBatches.uses_staged_manifest());
     }
 

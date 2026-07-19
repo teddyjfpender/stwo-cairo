@@ -29,7 +29,9 @@ use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTraceVariant;
 use stwo_cairo_dev_utils::utils::get_compiled_cairo_program_path;
 use stwo_cairo_dev_utils::vm_utils::{run_and_adapt, ProgramType};
-use stwo_cairo_gpu_prover::arena_plan::CommitmentTreeId;
+use stwo_cairo_gpu_prover::arena_plan::{
+    CommitmentTreeId, QuotientNumeratorSchedule, ResidentBackend,
+};
 use stwo_cairo_gpu_prover::graphs::GraphSegment;
 use stwo_cairo_gpu_prover::protocol_discovery::interaction_claim_from_flattened;
 use stwo_cairo_gpu_prover::resident_runtime::{ResidentGraphRuntime, ResidentRuntimeError};
@@ -323,6 +325,7 @@ fn smoke_single_resident_proof_boundary_stepped() {
 #[ignore = "requires an explicit CUDA resident vertical run"]
 fn smoke_quotient_numerator_vertical_eager() {
     let mut config = GpuProverConfig::default();
+    config.resident_backend = ResidentBackend::ReplacementV1;
     config.strict = true;
     let mut prover = GpuCairoProver::<Blake2sMerkleChannel>::new(config).unwrap();
 
@@ -347,12 +350,34 @@ fn smoke_quotient_numerator_vertical_eager() {
     assert_eq!(receipt.output_rows, 18_210_768);
     assert_eq!(receipt.output_words, 72_843_072);
     assert_eq!(receipt.validation_d2h_bytes, 291_372_288);
-    assert!(matches!(
-        receipt.schedule,
-        PreparedNumeratorSchedule::StagedPackedSingleWrite {
-            packed_output_rows: 18_210_768
+    assert_eq!(
+        receipt.planned_schedule,
+        QuotientNumeratorSchedule::StagedRunSumOrPacked
+    );
+    match receipt.schedule {
+        PreparedNumeratorSchedule::StagedGroupDirect {
+            output_rows: 18_210_768,
+        } => {
+            assert!(receipt.run_sum_identity.is_some());
+            assert_eq!(receipt.run_sum_target_group, Some(0));
+            assert_eq!(receipt.run_sum_victim_group, Some(13));
+            assert_eq!(receipt.run_sum_run_count, Some(17));
+            assert_eq!(
+                receipt.run_sum_scratch_words_per_coordinate,
+                Some(4_194_256)
+            );
         }
-    ));
+        PreparedNumeratorSchedule::StagedPackedSingleWrite {
+            packed_output_rows: 18_210_768,
+        } => {
+            assert_eq!(receipt.run_sum_identity, None);
+            assert_eq!(receipt.run_sum_target_group, None);
+            assert_eq!(receipt.run_sum_victim_group, None);
+            assert_eq!(receipt.run_sum_run_count, None);
+            assert_eq!(receipt.run_sum_scratch_words_per_coordinate, None);
+        }
+        other => panic!("unexpected adaptive numerator schedule: {other:?}"),
+    }
     assert_ne!(receipt.shape_digest, [0; 32]);
     assert_ne!(receipt.output_digest, [0; 32]);
     eprintln!("quotient-numerator vertical receipt: {receipt:?}");

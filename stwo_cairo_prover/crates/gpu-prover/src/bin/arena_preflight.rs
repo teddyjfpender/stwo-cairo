@@ -201,13 +201,9 @@ fn validate_selected_policy(
         ));
     }
     if selected_backend == ResidentBackend::ReplacementV1
-        && policy
-            != ProtocolPlanPolicy::replacement_v1(
-                policy.kernel_manifest_hash,
-                policy.composition_max_kernel_instrs,
-            )
+        && !policy.matches_replacement_v1_measurement_contract()
     {
-        return Err("replacement-v1 policy drifted from its immutable tuple".to_owned());
+        return Err("replacement-v1 measurement contract drifted".to_owned());
     }
     Ok(())
 }

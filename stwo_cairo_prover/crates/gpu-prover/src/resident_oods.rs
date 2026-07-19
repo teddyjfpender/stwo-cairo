@@ -344,6 +344,7 @@ impl<'a> ResidentOodsPipeline<'a> {
         let staged_schedule = matches!(
             numerator_plan.schedule,
             QuotientNumeratorSchedule::StagedPackedSingleWrite
+                | QuotientNumeratorSchedule::StagedGroupDirect
                 | QuotientNumeratorSchedule::StagedRunSumOrPacked
         );
         if staged_schedule != numerator_plan.staged_single_write.is_some() {
@@ -381,6 +382,7 @@ impl<'a> ResidentOodsPipeline<'a> {
                 )?
             }
             QuotientNumeratorSchedule::StagedPackedSingleWrite
+            | QuotientNumeratorSchedule::StagedGroupDirect
             | QuotientNumeratorSchedule::StagedRunSumOrPacked => {
                 let staged = numerator_plan.staged_single_write.as_ref().ok_or(
                     ResidentOodsError::StagedNumeratorBinding(
@@ -478,7 +480,16 @@ impl<'a> ResidentOodsPipeline<'a> {
                         }
                     }
                 } else {
-                    PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write(
+                    let prepare_staged = match numerator_plan.schedule {
+                        QuotientNumeratorSchedule::StagedPackedSingleWrite => {
+                            PreparedQuotientNumeratorGraph::prepare_staged_packed_single_write
+                        }
+                        QuotientNumeratorSchedule::StagedGroupDirect => {
+                            PreparedQuotientNumeratorGraph::prepare_staged_group_direct
+                        }
+                        _ => unreachable!("staged schedule was validated above"),
+                    };
+                    let prepared = prepare_staged(
                         arena,
                         numerator_plan.config,
                         &numerator_columns,
@@ -491,7 +502,15 @@ impl<'a> ResidentOodsPipeline<'a> {
                         forward_twiddles,
                         &numerator_plan.slots,
                         &overflow_roles,
-                    )?
+                    )?;
+                    if numerator_run_sum_telemetry(&prepared)
+                        .is_some_and(|receipt| !receipt.is_complete())
+                    {
+                        return Err(ResidentOodsError::StagedNumeratorBinding(
+                            "explicit group-direct constructor returned an incomplete run-sum receipt",
+                        ));
+                    }
+                    prepared
                 }
             }
         };
@@ -506,6 +525,9 @@ impl<'a> ResidentOodsPipeline<'a> {
             ) | (
                 QuotientNumeratorSchedule::StagedPackedSingleWrite,
                 PreparedNumeratorSchedule::StagedPackedSingleWrite { .. }
+            ) | (
+                QuotientNumeratorSchedule::StagedGroupDirect,
+                PreparedNumeratorSchedule::StagedGroupDirect { .. }
             ) | (
                 QuotientNumeratorSchedule::StagedRunSumOrPacked,
                 PreparedNumeratorSchedule::StagedGroupDirect { .. }
@@ -524,20 +546,31 @@ impl<'a> ResidentOodsPipeline<'a> {
             };
             if prepared_output_rows != Some(staged.packed_output_rows()) {
                 return Err(ResidentOodsError::StagedNumeratorBinding(
-                    "prepared staged row count differs from the sealed arena manifest",
+                    "prepared staged output row count differs from the sealed arena manifest",
                 ));
             }
         }
-        if numerator_plan.schedule == QuotientNumeratorSchedule::StagedRunSumOrPacked
-            && matches!(
-                numerator.schedule(),
-                PreparedNumeratorSchedule::StagedGroupDirect { .. }
-            )
-            && !numerator_run_sum_telemetry(&numerator)
-                .is_some_and(ResidentNumeratorRunSumTelemetry::is_complete)
-        {
+        let prepared_schedule = numerator.schedule();
+        let run_sum = numerator_run_sum_telemetry(&numerator);
+        let run_sum_matches = match numerator_plan.schedule {
+            QuotientNumeratorSchedule::StagedRunSumOrPacked => match (prepared_schedule, run_sum) {
+                (PreparedNumeratorSchedule::StagedGroupDirect { .. }, Some(receipt)) => {
+                    receipt.is_complete()
+                }
+                (PreparedNumeratorSchedule::StagedPackedSingleWrite { .. }, None) => true,
+                _ => false,
+            },
+            QuotientNumeratorSchedule::StagedGroupDirect => {
+                matches!(
+                    prepared_schedule,
+                    PreparedNumeratorSchedule::StagedGroupDirect { .. }
+                ) && run_sum.is_none_or(ResidentNumeratorRunSumTelemetry::is_complete)
+            }
+            _ => run_sum.is_none(),
+        };
+        if !run_sum_matches {
             return Err(ResidentOodsError::StagedNumeratorBinding(
-                "adaptive group-direct schedule has no complete run-sum receipt",
+                "planned numerator schedule and run-sum receipt disagree",
             ));
         }
         if !schedule_matches {
