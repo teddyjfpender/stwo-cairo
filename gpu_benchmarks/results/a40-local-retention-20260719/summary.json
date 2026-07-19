@@ -1,0 +1,60 @@
+{
+  "schema": "stwo.a40.local_retention.v1",
+  "snapshot_date": "2026-07-19",
+  "provider": {
+    "development_pod_id": "wn3nd7oe1mzczc",
+    "development_pod_name": "cuda-stwo-dev",
+    "gpu": "A40",
+    "status": "EXITED",
+    "runtime_present": false,
+    "active_compute_cost_usd_per_hour": 0,
+    "prior_one_shot_pods": [
+      {
+        "id": "72ajgrz5n590t8",
+        "local_ledger_state": "terminated",
+        "provider_state": "not_found"
+      },
+      {
+        "id": "5n1ct5ie4990yf",
+        "local_ledger_state": "terminated",
+        "provider_state": "not_found"
+      }
+    ]
+  },
+  "local_corpus": {
+    "files": 302,
+    "bytes": 51891263,
+    "tree_sha256": "9edc4c67c714eeae072d65164aa0c6ee15b50b15da8d6d5e752643ecd1f92b57",
+    "primary_a40_evidence_files": 257,
+    "primary_a40_evidence_bytes": 51317747,
+    "raw_nsys_reports": 4,
+    "nsys_sqlite_exports": 4
+  },
+  "source_retention": {
+    "remote_only_source_changes": 0,
+    "stwo_a40_head": "0d7b4cc2d6c18a29ffb7f16d3062d2304adb4cd9",
+    "stwo_pushed_descendant": "526b489db96a23fb9d044dc3fe61f839a6062f67",
+    "stwo_cairo_pushed_descendant": "be3e7e550f892909a912e04ebc0ac8fb65ed40cc"
+  },
+  "headline_component_result": {
+    "scope": "SN3 retained numerator to ordinary quotient to FRI input",
+    "candidate_p50_ms": 92.7936019897461,
+    "direct_p50_ms": 335.3551940917969,
+    "speedup_p50": 3.613990478878645,
+    "paired_wins": 20,
+    "paired_samples": 20,
+    "validated_bytes": 671080592,
+    "end_to_end_mhz_claim": false
+  },
+  "byte_retention": {
+    "source_and_measurement_outputs_local": true,
+    "generated_build_products_hash_only": [
+      "retained benchmark executable",
+      "libstwo_cuda_kernels.a",
+      "aot_pack.bin",
+      "aot_index.rs",
+      "July 18 Relation test executable",
+      "July 18 Quotient test executable"
+    ]
+  }
+}
