@@ -408,7 +408,12 @@ fn coefficient_buffer(
                 && buffer.purpose == BufferPurpose::CompositionCoefficients
                 && buffer.ordinal == ordinal
         }
-        OpenedColumnSource::Preprocessed { .. } => false,
+        OpenedColumnSource::Preprocessed { ordinal } => {
+            buffer.component.is_none()
+                && buffer.part.is_none()
+                && buffer.purpose == BufferPurpose::PreprocessedCoefficients
+                && buffer.ordinal == ordinal
+        }
     })
 }
 

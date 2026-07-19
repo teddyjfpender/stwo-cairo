@@ -12976,6 +12976,12 @@ mod tests {
             memory_ledger.arena_allocation_bytes,
             arena.total_words() * core::mem::size_of::<u32>()
         );
+        let physical_memory =
+            crate::memory_ledger::PhysicalMemoryLedger::json(&arena, usize::MAX).unwrap();
+        assert_eq!(
+            physical_memory["arena_allocation_bytes"].as_u64(),
+            Some(u64::try_from(memory_ledger.arena_allocation_bytes).unwrap())
+        );
         assert_eq!(memory_ledger.epochs.len(), ProofEpoch::ALL.len());
         arena.validate_aliases().unwrap();
         assert_eq!(
