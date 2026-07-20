@@ -74,6 +74,92 @@
 {"ts": "2026-07-10T19:59:18+00:00", "event": "stop", "pod_id": "9wxsb3p361mtb1", "gpu": "H100 SXM", "usd_hr": 2.99}
 {"ts": "2026-07-10T20:58:25+00:00", "event": "create", "pod_id": "hmi6q8t4htnud2", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "phase-c gates + first SN2 resident bench"}
 {"ts": "2026-07-11T00:46:35+00:00", "event": "stop", "pod_id": "hmi6q8t4htnud2", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-13T21:30:42+00:00", "event": "create", "pod_id": "uhd32v8kbyd9wz", "gpu": "RTX 3090", "usd_hr": 0.22, "purpose": "gpu-lab-mvp-confirmation"}
+{"ts": "2026-07-13T21:37:34+00:00", "event": "terminate", "pod_id": "uhd32v8kbyd9wz", "gpu": "RTX 3090", "usd_hr": 0.22}
+{"ts": "2026-07-13T21:38:47+00:00", "event": "create", "pod_id": "148k698ey3tsn6", "gpu": "RTX 3090", "usd_hr": 0.22, "purpose": "gpu-lab-mvp-sanitizer"}
+{"ts": "2026-07-13T21:40:58+00:00", "event": "terminate", "pod_id": "148k698ey3tsn6", "gpu": "RTX 3090", "usd_hr": 0.22}
+{"ts": "2026-07-14T15:54:14+00:00", "event": "create", "pod_id": "6go3thwfdolmyl", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "replacement-v1-sn2-sealed"}
+{"ts": "2026-07-14T15:54:51+00:00", "event": "stop", "pod_id": "6go3thwfdolmyl", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-14T15:56:49+00:00", "event": "resume", "pod_id": "6go3thwfdolmyl", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-14T15:57:24+00:00", "event": "stop", "pod_id": "6go3thwfdolmyl", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-14T15:57:54+00:00", "event": "stop", "pod_id": "6go3thwfdolmyl", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-14T15:58:33+00:00", "event": "terminate", "pod_id": "6go3thwfdolmyl", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-14T15:58:41+00:00", "event": "create", "pod_id": "18xeucem35u4r4", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "replacement-v1-sn2-sealed"}
+{"ts": "2026-07-14T15:59:29+00:00", "event": "stop", "pod_id": "18xeucem35u4r4", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-14T16:02:11+00:00", "event": "terminate", "pod_id": "18xeucem35u4r4", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-14T16:16:11+00:00", "event": "create", "pod_id": "vr03w5t2o2sw0w", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "replacement-v1-sn2-sealed"}
+{"ts": "2026-07-14T16:17:06+00:00", "event": "stop", "pod_id": "vr03w5t2o2sw0w", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-14T16:17:35+00:00", "event": "terminate", "pod_id": "vr03w5t2o2sw0w", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-14T16:20:03+00:00", "event": "create", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "replacement-v1-sn2-sealed"}
+{"ts": "2026-07-15T12:46:37+00:00", "event": "create", "pod_id": "paf05rp08b0ys9", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "replacement-v1-sn2-sealed-headline"}
+{"ts": "2026-07-15T12:53:48+00:00", "event": "terminate", "pod_id": "paf05rp08b0ys9", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-15T21:10:45+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-16T16:52:25+00:00", "event": "terminate", "pod_id": "iyalzj7nzaq6vu", "gpu": "RTX 3090", "note": "open-failure"}
+{"ts": "2026-07-16T16:54:55+00:00", "event": "create", "pod_id": "2oskwrlqq2frgo", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease"}
+{"ts": "2026-07-16T17:11:18+00:00", "event": "run", "pod_id": "2oskwrlqq2frgo", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-accept-correctness", "note": "PASS"}
+{"ts": "2026-07-16T19:07:57+00:00", "event": "terminate", "pod_id": "2oskwrlqq2frgo", "gpu": "RTX 4090", "note": "explicit-close"}
+{"ts": "2026-07-16T23:29:30+00:00", "event": "create", "pod_id": "0et8tvvldd6znh", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease"}
+{"ts": "2026-07-16T23:30:08+00:00", "event": "terminate", "pod_id": "0et8tvvldd6znh", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-16T23:42:35+00:00", "event": "create", "pod_id": "ozldh51xqgtjpy", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease"}
+{"ts": "2026-07-16T23:44:46+00:00", "event": "terminate", "pod_id": "ozldh51xqgtjpy", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T00:08:29+00:00", "event": "create", "pod_id": "58znro5zwf35kv", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T00:18:32+00:00", "event": "terminate", "pod_id": "58znro5zwf35kv", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T00:29:17+00:00", "event": "create", "pod_id": "0vzaoiyz2g7iu6", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T00:30:03+00:00", "event": "terminate", "pod_id": "0vzaoiyz2g7iu6", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T00:32:33+00:00", "event": "create", "pod_id": "ueqqv0zhp7xyqc", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T00:33:52+00:00", "event": "terminate", "pod_id": "ueqqv0zhp7xyqc", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T00:35:02+00:00", "event": "create", "pod_id": "siijk7o1v5pdug", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T00:35:48+00:00", "event": "terminate", "pod_id": "siijk7o1v5pdug", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T00:38:39+00:00", "event": "create", "pod_id": "gw2qp8z7g6dtth", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T00:39:14+00:00", "event": "terminate", "pod_id": "gw2qp8z7g6dtth", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T00:40:32+00:00", "event": "create", "pod_id": "vbuoswvhmvzcmb", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T00:50:35+00:00", "event": "terminate", "pod_id": "vbuoswvhmvzcmb", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T01:12:04+00:00", "event": "create", "pod_id": "jumnnciauvmoim", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T01:13:46+00:00", "event": "terminate", "pod_id": "jumnnciauvmoim", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T01:22:44+00:00", "event": "create", "pod_id": "l86xsgrndmbe48", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T01:23:45+00:00", "event": "terminate", "pod_id": "l86xsgrndmbe48", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T01:52:42+00:00", "event": "create", "pod_id": "kmctp1ff5u9xa8", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T02:02:47+00:00", "event": "terminate", "pod_id": "kmctp1ff5u9xa8", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T02:45:53+00:00", "event": "create", "pod_id": "dfegyo9k22imrm", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T02:46:53+00:00", "event": "terminate", "pod_id": "dfegyo9k22imrm", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T02:56:10+00:00", "event": "create", "pod_id": "0hz2btvzugenmx", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T02:57:28+00:00", "event": "terminate", "pod_id": "0hz2btvzugenmx", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T03:02:53+00:00", "event": "create", "pod_id": "6kwgnhy3ed4on9", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T03:03:50+00:00", "event": "terminate", "pod_id": "6kwgnhy3ed4on9", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T03:06:21+00:00", "event": "create", "pod_id": "pskrtyloq8y7az", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "profile": "consumer-4090-bootstrap", "qualification_eligible": false}
+{"ts": "2026-07-17T03:07:21+00:00", "event": "terminate", "pod_id": "pskrtyloq8y7az", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T03:22:35+00:00", "event": "create", "pod_id": "q8k5hu83qzbd6z", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "persistence_scope": "lease-local-container-disk", "profile": "consumer-4090-bootstrap", "qualification": false, "qualification_eligible": false}
+{"ts": "2026-07-17T03:23:21+00:00", "event": "terminate", "pod_id": "q8k5hu83qzbd6z", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T03:53:23+00:00", "event": "create", "pod_id": "mlbjgrx275z21d", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "persistence_scope": "lease-local-container-disk", "profile": "consumer-4090-bootstrap", "qualification": false, "qualification_eligible": false}
+{"ts": "2026-07-17T03:54:31+00:00", "event": "terminate", "pod_id": "mlbjgrx275z21d", "gpu": "RTX 4090", "note": "open-failure"}
+{"ts": "2026-07-17T03:59:33+00:00", "event": "create", "pod_id": "ylpwt628wpl022", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "persistence_scope": "lease-local-container-disk", "profile": "consumer-4090-bootstrap", "qualification": false, "qualification_eligible": false}
+{"ts": "2026-07-17T05:34:41+00:00", "event": "terminate", "pod_id": "ylpwt628wpl022", "gpu": "RTX 4090", "note": "lease-local-runtime-attestation-failed"}
+{"ts": "2026-07-17T05:35:45+00:00", "event": "create", "pod_id": "82aldi2jup9vfq", "gpu": "RTX 4090", "usd_hr": 0.69, "purpose": "gpu-lab-bounded-lease", "formal": false, "image_digest": "sha256:82d75acd177789c2d84232be35f003a7e959b75c35da57ab35ab6ed68e9cad6a", "image_digest_authority": "requested-reference-not-runtime-attested", "lane": "consumer-development", "persistence_scope": "lease-local-container-disk", "profile": "consumer-4090-bootstrap", "qualification": false, "qualification_eligible": false}
+{"ts": "2026-07-17T07:46:24+00:00", "event": "terminate", "pod_id": "82aldi2jup9vfq", "gpu": "RTX 4090", "note": "lease-local-runtime-attestation-failed"}
+{"ts": "2026-07-18T17:13:32+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "pod-run-sn2-vertical-20260718-r2"}
+{"ts": "2026-07-18T17:23:32+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-18T17:32:40+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "pod-run-sn2-vertical-20260718-r3"}
+{"ts": "2026-07-18T17:38:22+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-18T17:49:44+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "pod-run-sn2-vertical-abba-20260718-r1"}
+{"ts": "2026-07-18T17:54:31+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-18T18:17:48+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "pod-run-sn2-vertical-abba-fused-20260718-r3"}
+{"ts": "2026-07-18T18:20:36+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-18T18:21:54+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "pod-run-sn2-vertical-abba-fused-20260718-r4"}
+{"ts": "2026-07-18T18:23:57+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "note": "admission-failure"}
+{"ts": "2026-07-18T18:25:14+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "pod-run-sn2-vertical-abba-fused-20260718-r5"}
+{"ts": "2026-07-18T18:39:09+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-18T18:41:15+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "pod-run-sn2-vertical-abba-fused-20260718-r6"}
+{"ts": "2026-07-18T18:48:03+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-18T18:58:58+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "pod-run-sn2-vertical-abba-fused-20260718-r7"}
+{"ts": "2026-07-18T19:12:07+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-18T19:29:39+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "pod-run-sn2-vertical-nsys-fused-20260718-r1"}
+{"ts": "2026-07-18T19:31:57+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-18T19:36:56+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "pod-run-sn2-vertical-nsys-fused-20260718-r2"}
+{"ts": "2026-07-18T19:44:32+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
+{"ts": "2026-07-18T22:50:46+00:00", "event": "create", "pod_id": "72ajgrz5n590t8", "gpu": "A40", "usd_hr": 0.44, "purpose": "sn2-5mhz-cheap-ab"}
+{"ts": "2026-07-18T23:12:25+00:00", "event": "terminate", "pod_id": "72ajgrz5n590t8", "gpu": "A40", "usd_hr": 0.44}
+{"ts": "2026-07-18T23:33:26+00:00", "event": "create", "pod_id": "5n1ct5ie4990yf", "gpu": "A40", "usd_hr": 0.44, "purpose": "sn2-5mhz-composition-repair"}
+{"ts": "2026-07-18T23:56:19+00:00", "event": "terminate", "pod_id": "5n1ct5ie4990yf", "gpu": "A40", "usd_hr": 0.44}
 {"ts": "2026-07-19T17:51:27+00:00", "event": "stop", "pod_id": "wn3nd7oe1mzczc", "gpu": "A40", "usd_hr": 0.44}
 {"ts": "2026-07-19T17:53:12+00:00", "event": "resume", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99, "purpose": "current-source adaptive SN2 byte equality and same-binary packed control"}
 {"ts": "2026-07-19T18:09:21+00:00", "event": "stop", "pod_id": "cm23moreysf4tb", "gpu": "H100 SXM", "usd_hr": 2.99}
